@@ -22,7 +22,8 @@ use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
 use sai_query::Durability;
 use sai_vfs::{
     FileContents, FileKey, PackageFileEntry, PackageFilesSnapshot, PackageKey, PackageRelativePath,
-    PackageSourceDirectory, SnapshotFile, SourceFile, VfsInputSnapshot, WorkspaceSnapshot,
+    PackageSourceDirectory, SnapshotFile, SourceFile, VfsInputSnapshot, WitFilesSnapshot,
+    WorkspaceSnapshot,
 };
 use sha2::{Digest, Sha256};
 use unicode_width::UnicodeWidthChar;
@@ -595,6 +596,8 @@ fn run_check(
     }
     let mut package_graph = None;
     let mut locked_source_dependencies = Vec::new();
+    let mut locked_active_packages = Vec::new();
+    let mut locked_root_directory = None;
     if check_locked_mode(command)
         && let Some(manifest) = parsed_manifest.as_ref()
     {
@@ -618,6 +621,8 @@ fn run_check(
             CheckLockPreflight::Continue {
                 graph,
                 source_dependencies,
+                active_packages,
+                root_directory,
                 diagnostics: lock_diagnostics,
                 warnings,
             } => {
@@ -625,6 +630,8 @@ fn run_check(
                 total_warnings = total_warnings.saturating_add(warnings);
                 package_graph = Some(graph);
                 locked_source_dependencies = source_dependencies;
+                locked_active_packages = active_packages;
+                locked_root_directory = Some(root_directory);
             }
             CheckLockPreflight::Stop {
                 diagnostics: lock_diagnostics,
@@ -694,8 +701,86 @@ fn run_check(
         sai_driver::target_cfg_for_check(&target).ok()
     });
     let mut check_source_budget = CheckWorkspaceSourceBudget::default();
+    let mut check_wit_budget = CheckWorkspaceWitBudget::default();
     let mut dependency_workspace_inputs = Vec::new();
     let mut dependency_source_files = Vec::new();
+    let mut graph_package_manifests = Vec::new();
+    let mut wit_directory_inputs = Vec::new();
+    if let (Some(root_package_key), Some(root_identity), Some(manifest_source)) = (
+        root_package_key.as_deref(),
+        root_identity.as_deref(),
+        manifest_source.as_ref(),
+    ) {
+        graph_package_manifests.push(CheckPackageManifestInput {
+            package_key: root_package_key.to_owned(),
+            source: Arc::clone(manifest_source),
+            role: sai_package::manifest::PackageRole::Root,
+        });
+
+        if let Some(manifest) = parsed_manifest.as_ref()
+            && let Some(wit_directory) = check_manifest_wit_directory(manifest)
+        {
+            let root_directory = match locked_root_directory.take() {
+                Some(directory) => Some(directory),
+                None => match sai_package::local_source::LocalPackageDirectory::open(&package_root)
+                {
+                    Ok(directory)
+                        if directory.manifest_bytes().as_ref() == manifest_source.as_ref() =>
+                    {
+                        Some(directory)
+                    }
+                    Ok(_) => {
+                        let reason = "package manifest changed during directory capture";
+                        diagnostics.push(check_dependency_source_read_failed(
+                            &format!(
+                                "could not safely capture the root package directory for WIT loading: {reason}"
+                            ),
+                            root_identity,
+                            &manifest_display_path,
+                            reason,
+                        ));
+                        total_errors = total_errors.saturating_add(1);
+                        None
+                    }
+                    Err(error) => {
+                        let reason = local_package_error_reason(&error);
+                        diagnostics.push(check_dependency_source_read_failed(
+                            &format!(
+                                "could not safely capture the root package directory for WIT loading: {reason}"
+                            ),
+                            root_identity,
+                            &manifest_display_path,
+                            &reason,
+                        ));
+                        total_errors = total_errors.saturating_add(1);
+                        None
+                    }
+                },
+            };
+            if let Some(directory) = root_directory {
+                let root_wit_directory = CheckLockedWitDirectory {
+                    package_key: PackageKey::new(root_package_key.to_owned())
+                        .expect("the parsed root package key is valid"),
+                    package_identity: root_identity.to_owned(),
+                    wit_directory,
+                    directory,
+                    is_root_package: true,
+                };
+                match check_locked_wit_directory_inputs(
+                    std::slice::from_ref(&root_wit_directory),
+                    cancellation,
+                    &mut check_wit_budget,
+                ) {
+                    Ok(inputs) => {
+                        total_errors = total_errors.saturating_add(inputs.errors);
+                        diagnostics.extend(inputs.diagnostics);
+                        wit_directory_inputs.extend(inputs.packages);
+                    }
+                    Err(()) => return report_interrupted(parsed, stdout, stderr),
+                }
+            }
+        }
+    }
     if !locked_source_dependencies.is_empty() {
         match check_locked_dependency_source_inputs(
             &locked_source_dependencies,
@@ -707,6 +792,27 @@ fn run_check(
                 diagnostics.extend(inputs.diagnostics);
                 dependency_workspace_inputs = inputs.packages;
                 dependency_source_files = inputs.source_files;
+            }
+            Err(()) => return report_interrupted(parsed, stdout, stderr),
+        }
+    }
+    if !locked_active_packages.is_empty() {
+        graph_package_manifests.extend(locked_active_packages.iter().map(|package| {
+            CheckPackageManifestInput {
+                package_key: package.package_key.as_str().to_owned(),
+                source: Arc::clone(&package.directory.manifest_bytes()),
+                role: sai_package::manifest::PackageRole::Dependency,
+            }
+        }));
+        match check_locked_active_wit_directory_inputs(
+            &locked_active_packages,
+            cancellation,
+            &mut check_wit_budget,
+        ) {
+            Ok(inputs) => {
+                total_errors = total_errors.saturating_add(inputs.errors);
+                diagnostics.extend(inputs.diagnostics);
+                wit_directory_inputs.extend(inputs.packages);
             }
             Err(()) => return report_interrupted(parsed, stdout, stderr),
         }
@@ -1151,6 +1257,8 @@ fn run_check(
                                     dependency_workspace_integrated = true;
                                     let tree_result = module_tree_workspace_check_diagnostics(
                                         &workspace_inputs,
+                                        &graph_package_manifests,
+                                        &wit_directory_inputs,
                                         include_source_lines,
                                         target_cfg.as_ref(),
                                         package_graph.take(),
@@ -1446,6 +1554,8 @@ fn run_check(
         workspace_inputs.append(&mut dependency_workspace_inputs);
         let tree_result = module_tree_workspace_check_diagnostics(
             &workspace_inputs,
+            &graph_package_manifests,
+            &wit_directory_inputs,
             include_source_lines,
             dependency_target_cfg.as_ref(),
             package_graph.take(),
@@ -1460,9 +1570,15 @@ fn run_check(
         );
         dependency_workspace_integrated = true;
     }
-    if !dependency_workspace_integrated && !dependency_workspace_inputs.is_empty() {
+    if !dependency_workspace_integrated
+        && (!dependency_workspace_inputs.is_empty()
+            || !graph_package_manifests.is_empty()
+            || !wit_directory_inputs.is_empty())
+    {
         let tree_result = module_tree_workspace_check_diagnostics(
             &dependency_workspace_inputs,
+            &graph_package_manifests,
+            &wit_directory_inputs,
             include_source_lines,
             dependency_target_cfg.as_ref(),
             package_graph.take(),
@@ -1713,6 +1829,8 @@ enum CheckLockPreflight {
     Continue {
         graph: sai_driver::package_graph::PackageGraph,
         source_dependencies: Vec<CheckLockedDependencySource>,
+        active_packages: Vec<CheckLockedDependencyPackage>,
+        root_directory: sai_package::local_source::LocalPackageDirectory,
         diagnostics: Vec<CheckDiagnostic>,
         warnings: usize,
     },
@@ -1728,6 +1846,49 @@ struct CheckLockedDependencySource {
     package_key: PackageKey,
     package_identity: String,
     directory: sai_package::local_source::LocalPackageDirectory,
+}
+
+struct CheckLockedDependencyPackage {
+    package_key: PackageKey,
+    package_identity: String,
+    form: sai_driver::package_graph::PackageForm,
+    directory: sai_package::local_source::LocalPackageDirectory,
+}
+
+struct CheckLockedWitDirectory {
+    package_key: PackageKey,
+    package_identity: String,
+    wit_directory: sai_package::package_path::ContentPackagePath,
+    directory: sai_package::local_source::LocalPackageDirectory,
+    is_root_package: bool,
+}
+
+impl CheckLockedWitDirectory {
+    fn source_ref(&self, path: &str) -> String {
+        if self.is_root_package {
+            path.to_owned()
+        } else {
+            dependency_source_ref(&self.package_identity, path)
+        }
+    }
+}
+
+struct CheckPackageManifestInput {
+    package_key: String,
+    source: Arc<[u8]>,
+    role: sai_package::manifest::PackageRole,
+}
+
+struct CheckWitDirectoryPackageInput {
+    package_key: PackageKey,
+    files: WitFilesSnapshot,
+    file_inputs: Vec<(PackageRelativePath, Arc<[u8]>)>,
+}
+
+struct CheckLockedWitDirectoryInputs {
+    packages: Vec<CheckWitDirectoryPackageInput>,
+    diagnostics: Vec<CheckDiagnostic>,
+    errors: usize,
 }
 
 enum CheckLockLocalPreflight {
@@ -2638,7 +2799,7 @@ fn check_locked_preflight(
     };
     let mut source_canonicalizer =
         match sai_package::lock_source_canonicalizer::LockSourceIdentityCanonicalizer::new(
-            root_directory,
+            root_directory.clone(),
             root_package_version,
             &parsed_lock,
         ) {
@@ -2766,6 +2927,7 @@ fn check_locked_preflight(
         .collect::<std::collections::BTreeSet<_>>();
     let mut dependency_metadata = std::collections::BTreeMap::new();
     let mut active_source_directories = Vec::new();
+    let mut active_package_directories = Vec::new();
     let mut package_cache = None;
     for plan in &source_plans {
         let pinned = !plan.path_pins.is_empty();
@@ -3227,6 +3389,11 @@ fn check_locked_preflight(
                 active_source_directories
                     .push((plan.package_version.clone(), dependency_directory.clone()));
             }
+            active_package_directories.push((
+                plan.package_version.clone(),
+                metadata.form,
+                dependency_directory,
+            ));
             dependency_metadata.insert(plan.package_version.clone(), metadata);
         }
     }
@@ -3277,9 +3444,34 @@ fn check_locked_preflight(
             }
         })
         .collect();
+    let active_packages = active_package_directories
+        .into_iter()
+        .map(|(package_version, form, directory)| {
+            let node = graph
+                .nodes()
+                .iter()
+                .find(|node| {
+                    node.identity() == package_version.package()
+                        && node.version() == package_version.version()
+                })
+                .expect("every active package has a graph node");
+            CheckLockedDependencyPackage {
+                package_key: node.key().clone(),
+                package_identity: format!(
+                    "{}@{}",
+                    package_version.package(),
+                    package_version.version()
+                ),
+                form,
+                directory,
+            }
+        })
+        .collect();
     CheckLockPreflight::Continue {
         graph,
         source_dependencies,
+        active_packages,
+        root_directory,
         diagnostics,
         warnings,
     }
@@ -3739,6 +3931,347 @@ impl CheckWorkspaceSourceBudget {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CheckWorkspaceWitBudget {
+    entry_count: u64,
+    path_bytes: u64,
+    wit_file_count: u64,
+    total_wit_file_bytes: u64,
+    exhausted: bool,
+}
+
+impl Default for CheckWorkspaceWitBudget {
+    fn default() -> Self {
+        let limits = sai_package::local_source::LocalPackageWitDirectorySnapshotLimits::default();
+        Self {
+            entry_count: limits.entry_count,
+            path_bytes: limits.path_bytes,
+            wit_file_count: limits.wit_file_count,
+            total_wit_file_bytes: limits.total_wit_file_bytes,
+            exhausted: false,
+        }
+    }
+}
+
+impl CheckWorkspaceWitBudget {
+    fn snapshot_limits(self) -> sai_package::local_source::LocalPackageWitDirectorySnapshotLimits {
+        sai_package::local_source::LocalPackageWitDirectorySnapshotLimits {
+            entry_count: self.entry_count,
+            path_bytes: self.path_bytes,
+            wit_file_count: self.wit_file_count,
+            total_wit_file_bytes: self.total_wit_file_bytes,
+        }
+    }
+
+    fn exhaust(&mut self) {
+        self.entry_count = 0;
+        self.path_bytes = 0;
+        self.wit_file_count = 0;
+        self.total_wit_file_bytes = 0;
+        self.exhausted = true;
+    }
+
+    fn consume_snapshot_progress(
+        &mut self,
+        progress: sai_package::local_source::LocalPackageWitDirectorySnapshotProgress,
+    ) {
+        self.entry_count = self
+            .entry_count
+            .saturating_sub(progress.inspected_entry_count);
+        self.path_bytes = self
+            .path_bytes
+            .saturating_sub(progress.inspected_path_bytes);
+        self.wit_file_count = self.wit_file_count.saturating_sub(progress.wit_file_count);
+        self.total_wit_file_bytes = self
+            .total_wit_file_bytes
+            .saturating_sub(progress.wit_file_bytes_read);
+    }
+}
+
+fn check_manifest_wit_directory(
+    manifest: &sai_package::manifest::PackageParseOutput,
+) -> Option<sai_package::package_path::ContentPackagePath> {
+    manifest.file().declarations.iter().find_map(|declaration| {
+        let sai_package::manifest::PackageDeclaration::Wit(path) = &declaration.value else {
+            return None;
+        };
+        sai_package::package_path::ContentPackagePath::parse(path.as_ref()).ok()
+    })
+}
+
+fn check_locked_active_wit_directory_inputs(
+    packages: &[CheckLockedDependencyPackage],
+    cancellation: &CancellationToken,
+    budget: &mut CheckWorkspaceWitBudget,
+) -> Result<CheckLockedWitDirectoryInputs, ()> {
+    let directories = packages
+        .iter()
+        .filter(|package| package.form == sai_driver::package_graph::PackageForm::Artifact)
+        .filter_map(|package| {
+            let manifest = package
+                .directory
+                .parse_manifest(sai_package::manifest::PackageRole::Dependency);
+            let wit_directory = check_manifest_wit_directory(&manifest)?;
+            Some(CheckLockedWitDirectory {
+                package_key: package.package_key.clone(),
+                package_identity: package.package_identity.clone(),
+                wit_directory,
+                directory: package.directory.clone(),
+                is_root_package: false,
+            })
+        })
+        .collect::<Vec<_>>();
+    check_locked_wit_directory_inputs(&directories, cancellation, budget)
+}
+
+fn check_locked_wit_directory_inputs(
+    directories: &[CheckLockedWitDirectory],
+    cancellation: &CancellationToken,
+    budget: &mut CheckWorkspaceWitBudget,
+) -> Result<CheckLockedWitDirectoryInputs, ()> {
+    let mut result = CheckLockedWitDirectoryInputs {
+        packages: Vec::with_capacity(directories.len()),
+        diagnostics: Vec::new(),
+        errors: 0,
+    };
+
+    for package in directories {
+        if cancellation.is_cancelled() {
+            return Err(());
+        }
+        let mut progress =
+            sai_package::local_source::LocalPackageWitDirectorySnapshotProgress::default();
+        let snapshot = package
+            .directory
+            .read_wit_directory_snapshot_with_limits_progress_and_cancel(
+                &package.wit_directory,
+                budget.snapshot_limits(),
+                &mut progress,
+                || cancellation.is_cancelled(),
+            );
+        budget.consume_snapshot_progress(progress);
+        let snapshot = match snapshot {
+            Ok(snapshot) => snapshot,
+            Err(sai_package::local_source::LocalPackageWitDirectorySnapshotError::Interrupted) => {
+                return Err(());
+            }
+            Err(
+                sai_package::local_source::LocalPackageWitDirectorySnapshotError::LimitExceeded(
+                    limit,
+                ),
+            ) => {
+                let file_limit_only = matches!(
+                    limit,
+                    sai_package::local_source::LocalPackageWitDirectorySnapshotLimit::WitFileBytes
+                );
+                if !file_limit_only {
+                    budget.exhaust();
+                }
+                result.diagnostics.push(check_dependency_source_error(
+                    "IMPLEMENTATION_LIMIT_EXCEEDED",
+                    &format!(
+                        "WIT directory `{}` for {} exceeds the supported snapshot limits ({limit:?})",
+                        package.wit_directory, package.package_identity
+                    ),
+                    &package.package_identity,
+                ));
+                result.errors = result.errors.saturating_add(1);
+                result.packages.push(CheckWitDirectoryPackageInput {
+                    package_key: package.package_key.clone(),
+                    files: WitFilesSnapshot::not_applicable(),
+                    file_inputs: Vec::new(),
+                });
+                if !file_limit_only {
+                    break;
+                }
+                continue;
+            }
+            Err(
+                sai_package::local_source::LocalPackageWitDirectorySnapshotError::PlatformNotSupported,
+            ) => {
+                let path = package.source_ref(package.wit_directory.as_str());
+                result.diagnostics.push(check_dependency_source_read_failed(
+                    "the declared WIT directory cannot be inspected safely on this platform",
+                    &package.package_identity,
+                    &path,
+                    "platform not supported",
+                ));
+                result.errors = result.errors.saturating_add(1);
+                result.packages.push(CheckWitDirectoryPackageInput {
+                    package_key: package.package_key.clone(),
+                    files: WitFilesSnapshot::not_applicable(),
+                    file_inputs: Vec::new(),
+                });
+                continue;
+            }
+            Err(
+                sai_package::local_source::LocalPackageWitDirectorySnapshotError::Directory(error),
+            ) => {
+                let reason = local_package_error_reason(&error);
+                let path = package.source_ref(package.wit_directory.as_str());
+                result.diagnostics.push(check_dependency_source_read_failed(
+                    &format!("could not safely read the declared WIT directory: {reason}"),
+                    &package.package_identity,
+                    &path,
+                    &reason,
+                ));
+                result.errors = result.errors.saturating_add(1);
+                result.packages.push(CheckWitDirectoryPackageInput {
+                    package_key: package.package_key.clone(),
+                    files: WitFilesSnapshot::not_applicable(),
+                    file_inputs: Vec::new(),
+                });
+                continue;
+            }
+            Err(
+                sai_package::local_source::LocalPackageWitDirectorySnapshotError::InvalidWitEntryPath,
+            ) => {
+                let path = package.source_ref(package.wit_directory.as_str());
+                result.diagnostics.push(check_dependency_source_read_failed(
+                    "the declared WIT directory path is invalid",
+                    &package.package_identity,
+                    &path,
+                    "invalid WIT directory path",
+                ));
+                result.errors = result.errors.saturating_add(1);
+                result.packages.push(CheckWitDirectoryPackageInput {
+                    package_key: package.package_key.clone(),
+                    files: WitFilesSnapshot::not_applicable(),
+                    file_inputs: Vec::new(),
+                });
+                continue;
+            }
+        };
+
+        if !matches!(
+            snapshot.directory(),
+            sai_package::local_source::LocalPackageWitDirectoryStatus::Present
+        ) {
+            let status = match snapshot.directory() {
+                sai_package::local_source::LocalPackageWitDirectoryStatus::Missing => "missing",
+                sai_package::local_source::LocalPackageWitDirectoryStatus::NotDirectory => {
+                    "not a directory"
+                }
+                sai_package::local_source::LocalPackageWitDirectoryStatus::Symlink {
+                    component,
+                } => {
+                    result.diagnostics.push(check_dependency_source_error(
+                        "WIT_DIR_NOT_FOUND",
+                        &format!(
+                            "declared WIT directory `{}` for {} contains symlink component `{component}`",
+                            package.wit_directory, package.package_identity
+                        ),
+                        &package.package_identity,
+                    ));
+                    result.errors = result.errors.saturating_add(1);
+                    result.packages.push(CheckWitDirectoryPackageInput {
+                        package_key: package.package_key.clone(),
+                        files: WitFilesSnapshot::not_applicable(),
+                        file_inputs: Vec::new(),
+                    });
+                    continue;
+                }
+                sai_package::local_source::LocalPackageWitDirectoryStatus::Present => {
+                    unreachable!("present WIT directory handled above")
+                }
+            };
+            result.diagnostics.push(check_dependency_source_error(
+                "WIT_DIR_NOT_FOUND",
+                &format!(
+                    "declared WIT directory `{}` for {} is {status}",
+                    package.wit_directory, package.package_identity
+                ),
+                &package.package_identity,
+            ));
+            result.errors = result.errors.saturating_add(1);
+            result.packages.push(CheckWitDirectoryPackageInput {
+                package_key: package.package_key.clone(),
+                files: WitFilesSnapshot::not_applicable(),
+                file_inputs: Vec::new(),
+            });
+            continue;
+        }
+
+        let mut files = Vec::new();
+        let mut file_inputs = Vec::new();
+        let mut non_regular = None;
+        let mut invalid_entry = None;
+        for entry in snapshot.entries() {
+            if cancellation.is_cancelled() {
+                return Err(());
+            }
+            if entry.kind() != sai_package::local_source::LocalPackageWitEntryKind::File {
+                non_regular.get_or_insert(entry.path().to_owned());
+                continue;
+            }
+            let path = match PackageRelativePath::new(entry.path().to_owned()) {
+                Ok(path) => path,
+                Err(_) => {
+                    invalid_entry =
+                        Some((entry.path().to_owned(), "invalid package-relative path"));
+                    break;
+                }
+            };
+            let Some(bytes) = entry.bytes_arc() else {
+                invalid_entry = Some((entry.path().to_owned(), "file content is missing"));
+                break;
+            };
+            files.push(path.clone());
+            file_inputs.push((path, bytes));
+        }
+        if let Some((path, reason)) = invalid_entry {
+            result.diagnostics.push(check_dependency_source_read_failed(
+                &format!(
+                    "WIT entry `{path}` for {} could not be read: {reason}",
+                    package.package_identity
+                ),
+                &package.package_identity,
+                &package.source_ref(&path),
+                reason,
+            ));
+            result.errors = result.errors.saturating_add(1);
+            result.packages.push(CheckWitDirectoryPackageInput {
+                package_key: package.package_key.clone(),
+                files: WitFilesSnapshot::not_applicable(),
+                file_inputs: Vec::new(),
+            });
+            continue;
+        }
+        if let Some(path) = non_regular {
+            result.diagnostics.push(check_dependency_source_read_failed(
+                &format!(
+                    "WIT entry `{path}` for {} is not a regular file",
+                    package.package_identity
+                ),
+                &package.package_identity,
+                &package.source_ref(&path),
+                "not a regular file",
+            ));
+            result.errors = result.errors.saturating_add(1);
+        }
+        let files = match WitFilesSnapshot::listed(package.wit_directory.as_str(), files) {
+            Ok(files) => files,
+            Err(_) => {
+                let path = package.source_ref(package.wit_directory.as_str());
+                result.diagnostics.push(check_dependency_source_read_failed(
+                    "the declared WIT directory produced an invalid tracked file inventory",
+                    &package.package_identity,
+                    &path,
+                    "invalid tracked file inventory",
+                ));
+                result.errors = result.errors.saturating_add(1);
+                WitFilesSnapshot::not_applicable()
+            }
+        };
+        result.packages.push(CheckWitDirectoryPackageInput {
+            package_key: package.package_key.clone(),
+            files,
+            file_inputs,
+        });
+    }
+    Ok(result)
+}
+
 fn check_locked_dependency_source_inputs(
     dependencies: &[CheckLockedDependencySource],
     cancellation: &CancellationToken,
@@ -3960,6 +4493,40 @@ fn check_dependency_source_error(
     )
 }
 
+fn check_dependency_source_read_failed(
+    message: &str,
+    package_identity: &str,
+    path: &str,
+    reason: &str,
+) -> CheckDiagnostic {
+    let mut data = ValueObject::new();
+    data.insert("path".to_owned(), Value::String(path.to_owned()));
+    data.insert("reason".to_owned(), Value::String(reason.to_owned()));
+    let mut diagnostic =
+        check_dependency_source_error("SOURCE_READ_FAILED", message, package_identity);
+    diagnostic.diagnostic.data = Some(source_value_object_json(&data));
+    diagnostic
+}
+
+fn local_package_error_reason(error: &sai_package::local_source::LocalPackageError) -> String {
+    use sai_package::local_source::LocalPackageError;
+
+    match error {
+        LocalPackageError::RelativeDirectory => "relative package directory".to_owned(),
+        LocalPackageError::Io { kind, .. } => kind.to_string(),
+        LocalPackageError::NotDirectory => "not a directory".to_owned(),
+        LocalPackageError::DirectoryChanged => "directory changed".to_owned(),
+        LocalPackageError::PlatformNotSupported => "platform not supported".to_owned(),
+        LocalPackageError::MissingManifest => "package manifest missing".to_owned(),
+        LocalPackageError::ManifestNotFile => "package manifest is not a regular file".to_owned(),
+        LocalPackageError::ManifestTooLarge => "package manifest is too large".to_owned(),
+    }
+}
+
+fn dependency_source_ref(package_identity: &str, path: &str) -> String {
+    format!("dep:{package_identity}/{path}")
+}
+
 struct CheckModuleTreePackageInput {
     package_key: String,
     source_directory: String,
@@ -4034,6 +4601,8 @@ fn check_module_tree_workspace_exceeds_limits(
 
 fn module_tree_workspace_check_diagnostics(
     inputs: &[CheckModuleTreePackageInput],
+    package_manifests: &[CheckPackageManifestInput],
+    wit_packages: &[CheckWitDirectoryPackageInput],
     include_source_lines: bool,
     target_cfg: Option<&TargetCfg>,
     package_graph: Option<sai_driver::package_graph::PackageGraph>,
@@ -4058,6 +4627,7 @@ fn module_tree_workspace_check_diagnostics(
     let package_graph_for_scopes = package_graph.clone();
     let mut vfs_files = Vec::new();
     let mut package_file_inputs = Vec::with_capacity(inputs.len());
+    let mut wit_file_inputs = Vec::with_capacity(wit_packages.len());
     let mut package_ids = Vec::with_capacity(inputs.len());
     let mut package_keys = HashSet::with_capacity(inputs.len());
 
@@ -4092,10 +4662,52 @@ fn module_tree_workspace_check_diagnostics(
         package_ids.push((package_id, source_directory));
     }
 
+    for manifest in package_manifests {
+        let package_key = PackageKey::new(manifest.package_key.clone())
+            .map_err(|error| format!("invalid manifest package key: {error:?}"))?;
+        let package_id = database
+            .intern_package(package_key.as_str())
+            .map_err(|error| format!("could not intern manifest package key: {error:?}"))?;
+        database
+            .set_package_manifest(
+                package_id,
+                Arc::clone(&manifest.source),
+                manifest.role,
+                Durability::Low,
+            )
+            .map_err(|error| format!("could not set package manifest input: {error:?}"))?;
+    }
+
+    let mut wit_package_keys = HashSet::with_capacity(wit_packages.len());
+    for package in wit_packages {
+        if !wit_package_keys.insert(package.package_key.clone()) {
+            return Err(format!(
+                "duplicate WIT inventory for package {}",
+                package.package_key.as_str()
+            ));
+        }
+        database
+            .intern_package(package.package_key.as_str())
+            .map_err(|error| format!("could not intern WIT package key: {error:?}"))?;
+        for (path, bytes) in &package.file_inputs {
+            let key =
+                FileKey::from_package_path(package.package_key.as_str().to_owned(), path.clone())
+                    .map_err(|error| format!("invalid WIT file path: {error:?}"))?;
+            vfs_files.push((key, FileContents::Bytes(Arc::clone(bytes)), Durability::Low));
+        }
+        wit_file_inputs.push((
+            package.package_key.clone(),
+            package.files.clone(),
+            Durability::Low,
+        ));
+    }
+
     let input_snapshot = VfsInputSnapshot::new(vfs_files)
-        .map_err(|error| format!("invalid package source inputs: {error:?}"))?
+        .map_err(|error| format!("invalid package file inputs: {error:?}"))?
         .with_package_files(package_file_inputs)
-        .map_err(|error| format!("invalid package source inventory inputs: {error:?}"))?;
+        .map_err(|error| format!("invalid package source inventory inputs: {error:?}"))?
+        .with_wit_files(wit_file_inputs)
+        .map_err(|error| format!("invalid package WIT inventory inputs: {error:?}"))?;
     database
         .replace_vfs_snapshot(None, &input_snapshot)
         .map_err(|error| format!("could not set package source inputs: {error:?}"))?;
@@ -11168,10 +11780,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        CancellationAwareStdin, CheckDiagnostic, CheckLockedDependencySource,
-        CheckModuleTreePackageInput, CheckWorkspaceSourceBudget, CliDiagnostic, CliLocation,
-        CliPosition, CliSourceIndex, EXPLAIN_CODE_SUMMARIES, PackageKey, RenderedSourceLine,
-        StdinBroker, StdinReadError, check_locked_dependency_source_inputs,
+        CancellationAwareStdin, CheckDiagnostic, CheckLockedDependencyPackage,
+        CheckLockedDependencySource, CheckLockedWitDirectory, CheckModuleTreePackageInput,
+        CheckWorkspaceSourceBudget, CheckWorkspaceWitBudget, CliDiagnostic, CliLocation,
+        CliPosition, CliSourceIndex, EXPLAIN_CODE_SUMMARIES, PackageKey, PackageRelativePath,
+        RenderedSourceLine, StdinBroker, StdinReadError, check_locked_active_wit_directory_inputs,
+        check_locked_dependency_source_inputs, check_locked_wit_directory_inputs,
         check_module_tree_workspace_exceeds_limits, cli_position, compare_check_diagnostics,
         fmt_path_selection_signature, human_file_path, internal_fmt_diagnostic, parse_args,
         phase1_package_collection_order, read_file_limited_with_progress, relative_path,
@@ -11431,6 +12045,352 @@ mod tests {
             ["SOURCE_READ_FAILED", "IMPLEMENTATION_LIMIT_EXCEEDED"]
         );
         assert!(budget.exhausted);
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn check_wit_inputs_track_root_and_active_artifact_bytes_and_paths() {
+        let temporary = TestDirectory::new();
+        let root_path = temporary.child("root");
+        let artifact_path = temporary.child("artifact");
+        let source_path = temporary.child("source");
+        fs::create_dir_all(root_path.join("wit")).expect("create root WIT directory");
+        fs::create_dir_all(artifact_path.join("api")).expect("create artifact WIT directory");
+        fs::create_dir_all(source_path.join("api")).expect("create source WIT directory");
+        fs::write(
+            root_path.join("sai.package"),
+            "package acme:root @ 1.0.0\nsource \"src\"\nwit \"wit\"\ntargets { wasm32-wasi }\n",
+        )
+        .expect("write root manifest");
+        fs::write(root_path.join("wit/z.wit"), b"root z\n").expect("write root z WIT");
+        fs::write(root_path.join("wit/a.wit"), b"root a\n").expect("write root a WIT");
+        fs::write(
+            artifact_path.join("sai.package"),
+            "package acme:artifact @ 1.0.0\nwit \"api\"\ntargets { wasm32-wasi }\n",
+        )
+        .expect("write artifact manifest");
+        fs::write(artifact_path.join("api/z.wit"), b"artifact z\n").expect("write artifact z WIT");
+        fs::write(artifact_path.join("api/a.wit"), b"artifact a\n").expect("write artifact a WIT");
+        fs::write(
+            source_path.join("sai.package"),
+            "package acme:source @ 1.0.0\nsource \"src\"\nwit \"api\"\ntargets { wasm32-wasi }\n",
+        )
+        .expect("write source manifest");
+        fs::write(source_path.join("api/should-not-load.wit"), b"source WIT")
+            .expect("write source WIT");
+
+        let open_directory = |path: &Path| {
+            sai_package::local_source::LocalPackageDirectory::open(
+                fs::canonicalize(path).expect("canonical package directory"),
+            )
+            .expect("open package directory capability")
+        };
+        let root = CheckLockedWitDirectory {
+            package_key: PackageKey::new("acme:root#1").expect("root key is valid"),
+            package_identity: "acme:root@1.0.0".to_owned(),
+            wit_directory: sai_package::package_path::ContentPackagePath::parse("wit")
+                .expect("root WIT path is valid"),
+            directory: open_directory(&root_path),
+            is_root_package: true,
+        };
+        let artifact = CheckLockedDependencyPackage {
+            package_key: PackageKey::new("acme:artifact#1").expect("artifact key is valid"),
+            package_identity: "acme:artifact@1.0.0".to_owned(),
+            form: PackageForm::Artifact,
+            directory: open_directory(&artifact_path),
+        };
+        let source = CheckLockedDependencyPackage {
+            package_key: PackageKey::new("acme:source#1").expect("source key is valid"),
+            package_identity: "acme:source@1.0.0".to_owned(),
+            form: PackageForm::Source,
+            directory: open_directory(&source_path),
+        };
+        let mut budget = CheckWorkspaceWitBudget::default();
+
+        let root_inputs = check_locked_wit_directory_inputs(
+            std::slice::from_ref(&root),
+            &CancellationToken::default(),
+            &mut budget,
+        )
+        .expect("root WIT scan is not cancelled");
+        let artifact_inputs = check_locked_active_wit_directory_inputs(
+            &[artifact, source],
+            &CancellationToken::default(),
+            &mut budget,
+        )
+        .expect("active dependency WIT scan is not cancelled");
+
+        assert_eq!(root_inputs.errors, 0);
+        assert_eq!(artifact_inputs.errors, 0);
+        assert_eq!(root_inputs.packages.len(), 1);
+        assert_eq!(artifact_inputs.packages.len(), 1);
+        for (input, directory, expected) in [
+            (
+                &root_inputs.packages[0],
+                "wit",
+                [
+                    ("wit/a.wit", &b"root a\n"[..]),
+                    ("wit/z.wit", &b"root z\n"[..]),
+                ],
+            ),
+            (
+                &artifact_inputs.packages[0],
+                "api",
+                [
+                    ("api/a.wit", &b"artifact a\n"[..]),
+                    ("api/z.wit", &b"artifact z\n"[..]),
+                ],
+            ),
+        ] {
+            let sai_vfs::WitFilesSnapshot::Listed {
+                directory: found_directory,
+                files,
+            } = &input.files
+            else {
+                panic!("present WIT directory must have a tracked inventory");
+            };
+            assert_eq!(found_directory, directory);
+            assert_eq!(
+                files
+                    .iter()
+                    .map(PackageRelativePath::as_str)
+                    .collect::<Vec<_>>(),
+                expected.iter().map(|(path, _)| *path).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                input
+                    .file_inputs
+                    .iter()
+                    .map(|(path, bytes)| (path.as_str(), bytes.as_ref()))
+                    .collect::<Vec<_>>(),
+                expected.to_vec()
+            );
+        }
+        assert!(
+            !artifact_inputs
+                .packages
+                .iter()
+                .any(|package| package.package_key.as_str() == "acme:source#1")
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn check_wit_inputs_distinguish_empty_and_missing_directories() {
+        let temporary = TestDirectory::new();
+        let empty_path = temporary.child("empty");
+        let missing_path = temporary.child("missing");
+        fs::create_dir_all(empty_path.join("api")).expect("create empty WIT directory");
+        fs::create_dir_all(&missing_path).expect("create missing-directory package root");
+        let manifest = "package acme:check @ 1.0.0\nwit \"api\"\ntargets { wasm32-wasi }\n";
+        fs::write(empty_path.join("sai.package"), manifest).expect("write empty manifest");
+        fs::write(missing_path.join("sai.package"), manifest).expect("write missing manifest");
+        let open_directory = |path: &Path| {
+            sai_package::local_source::LocalPackageDirectory::open(
+                fs::canonicalize(path).expect("canonical package directory"),
+            )
+            .expect("open package directory capability")
+        };
+        let directories = [
+            CheckLockedWitDirectory {
+                package_key: PackageKey::new("acme:empty#1").expect("empty key is valid"),
+                package_identity: "acme:empty@1.0.0".to_owned(),
+                wit_directory: sai_package::package_path::ContentPackagePath::parse("api")
+                    .expect("WIT path is valid"),
+                directory: open_directory(&empty_path),
+                is_root_package: false,
+            },
+            CheckLockedWitDirectory {
+                package_key: PackageKey::new("acme:missing#1").expect("missing key is valid"),
+                package_identity: "acme:missing@1.0.0".to_owned(),
+                wit_directory: sai_package::package_path::ContentPackagePath::parse("api")
+                    .expect("WIT path is valid"),
+                directory: open_directory(&missing_path),
+                is_root_package: false,
+            },
+        ];
+        let mut budget = CheckWorkspaceWitBudget::default();
+
+        let result = check_locked_wit_directory_inputs(
+            &directories,
+            &CancellationToken::default(),
+            &mut budget,
+        )
+        .expect("WIT scan is not cancelled");
+
+        assert_eq!(result.errors, 1);
+        assert_eq!(result.diagnostics[0].diagnostic.code, "WIT_DIR_NOT_FOUND");
+        assert_eq!(
+            result.diagnostics[0].package.as_deref(),
+            Some("acme:missing@1.0.0")
+        );
+        assert!(matches!(
+            &result.packages[0].files,
+            sai_vfs::WitFilesSnapshot::Listed { directory, files }
+                if directory == "api" && files.is_empty()
+        ));
+        assert_eq!(
+            result.packages[1].files,
+            sai_vfs::WitFilesSnapshot::NotApplicable
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn check_wit_inputs_reject_non_regular_wit_candidates_without_following_them() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = TestDirectory::new();
+        let package_path = temporary.child("package");
+        fs::create_dir_all(package_path.join("api/directory.wit"))
+            .expect("create directory WIT candidate");
+        fs::create_dir_all(package_path.join("api")).expect("create WIT directory");
+        fs::write(
+            package_path.join("sai.package"),
+            "package acme:nonregular @ 1.0.0\nwit \"api\"\ntargets { wasm32-wasi }\n",
+        )
+        .expect("write package manifest");
+        fs::write(package_path.join("api/good.wit"), b"good bytes")
+            .expect("write regular WIT file");
+        let outside = temporary.child("outside.wit");
+        fs::write(&outside, b"must not be followed").expect("write outside symlink target");
+        symlink(outside, package_path.join("api/linked.wit")).expect("create WIT symlink");
+        let directory = sai_package::local_source::LocalPackageDirectory::open(
+            fs::canonicalize(&package_path).expect("canonical package directory"),
+        )
+        .expect("open package directory capability");
+        let input = CheckLockedWitDirectory {
+            package_key: PackageKey::new("acme:nonregular#1").expect("package key is valid"),
+            package_identity: "acme:nonregular@1.0.0".to_owned(),
+            wit_directory: sai_package::package_path::ContentPackagePath::parse("api")
+                .expect("WIT path is valid"),
+            directory,
+            is_root_package: false,
+        };
+        let mut budget = CheckWorkspaceWitBudget::default();
+
+        let result = check_locked_wit_directory_inputs(
+            std::slice::from_ref(&input),
+            &CancellationToken::default(),
+            &mut budget,
+        )
+        .expect("WIT scan is not cancelled");
+
+        assert_eq!(result.errors, 1);
+        assert_eq!(result.diagnostics[0].diagnostic.code, "SOURCE_READ_FAILED");
+        assert!(
+            result.diagnostics[0]
+                .diagnostic
+                .message
+                .contains("not a regular file")
+        );
+        assert_eq!(
+            result.diagnostics[0].diagnostic.data.as_deref(),
+            Some(
+                r#"{"path":"dep:acme:nonregular@1.0.0/api/directory.wit","reason":"not a regular file"}"#
+            ),
+            "SOURCE_READ_FAILED exposes the offending source reference and reason"
+        );
+        assert!(matches!(
+            &result.packages[0].files,
+            sai_vfs::WitFilesSnapshot::Listed { files, .. }
+                if files.iter().map(PackageRelativePath::as_str).collect::<Vec<_>>()
+                    == ["api/good.wit"]
+        ));
+        assert_eq!(result.packages[0].file_inputs.len(), 1);
+        assert_eq!(result.packages[0].file_inputs[0].1.as_ref(), b"good bytes");
+
+        let root_input = CheckLockedWitDirectory {
+            package_key: input.package_key.clone(),
+            package_identity: input.package_identity.clone(),
+            wit_directory: input.wit_directory.clone(),
+            directory: input.directory.clone(),
+            is_root_package: true,
+        };
+        let mut root_budget = CheckWorkspaceWitBudget::default();
+        let root_result = check_locked_wit_directory_inputs(
+            std::slice::from_ref(&root_input),
+            &CancellationToken::default(),
+            &mut root_budget,
+        )
+        .expect("root WIT scan is not cancelled");
+        assert_eq!(
+            root_result.diagnostics[0].diagnostic.data.as_deref(),
+            Some(r#"{"path":"api/directory.wit","reason":"not a regular file"}"#),
+            "root diagnostic paths match the root VFS namespace and have no dependency prefix"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn check_wit_inputs_share_workspace_limits_and_poll_cancellation() {
+        let temporary = TestDirectory::new();
+        let make_package = |name: &str| {
+            let path = temporary.child(name);
+            fs::create_dir_all(path.join("wit")).expect("create WIT directory");
+            fs::write(
+                path.join("sai.package"),
+                format!("package acme:{name} @ 1.0.0\nwit \"wit\"\ntargets {{ wasm32-wasi }}\n"),
+            )
+            .expect("write package manifest");
+            fs::write(path.join("wit/api.wit"), b"data").expect("write WIT file");
+            CheckLockedWitDirectory {
+                package_key: PackageKey::new(format!("acme:{name}#1"))
+                    .expect("package key is valid"),
+                package_identity: format!("acme:{name}@1.0.0"),
+                wit_directory: sai_package::package_path::ContentPackagePath::parse("wit")
+                    .expect("WIT path is valid"),
+                directory: sai_package::local_source::LocalPackageDirectory::open(
+                    fs::canonicalize(path).expect("canonical package directory"),
+                )
+                .expect("open package directory capability"),
+                is_root_package: false,
+            }
+        };
+        let packages = [make_package("first"), make_package("second")];
+        let mut budget = CheckWorkspaceWitBudget {
+            total_wit_file_bytes: 6,
+            ..CheckWorkspaceWitBudget::default()
+        };
+
+        let result = check_locked_wit_directory_inputs(
+            &packages,
+            &CancellationToken::default(),
+            &mut budget,
+        )
+        .expect("WIT scan is not cancelled");
+
+        assert_eq!(result.errors, 1);
+        assert_eq!(
+            result.diagnostics[0].diagnostic.code,
+            "IMPLEMENTATION_LIMIT_EXCEEDED"
+        );
+        assert!(matches!(
+            &result.packages[0].files,
+            sai_vfs::WitFilesSnapshot::Listed { .. }
+        ));
+        assert_eq!(
+            result.packages[1].files,
+            sai_vfs::WitFilesSnapshot::NotApplicable
+        );
+        assert!(budget.exhausted);
+
+        let cancellation = CancellationToken::default();
+        cancellation.cancel();
+        let mut budget = CheckWorkspaceWitBudget::default();
+        assert!(check_locked_wit_directory_inputs(&packages, &cancellation, &mut budget).is_err());
     }
 
     struct PartiallyFailingReader {
