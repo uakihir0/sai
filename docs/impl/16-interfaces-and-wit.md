@@ -775,6 +775,8 @@ Names synthesized by a WIT `use` of another interface's type also occupy the con
 
 For imported WIT, collisions are resolved by §16.4.2 and give at most `WIT_ITEM_SHADOWED`.
 
+**Implementation progress (IR-617).** The Phase 1 driver now checks generated cross-interface `use` aliases against each other and local interface items. It collects aliases only from mapped boundary types, uses the printer's identifier escaping for target ordering, and anchors findings at the full referenced type path. Existing item/name errors, incompatible roots, omitted local types, and cyclic interfaces are excluded. A collision poisons its later item and dependent items; later collision candidates are recomputed without aliases from newly omitted items. Collision findings already discovered are retained in deterministic discovery order even if a later collision omits an earlier alias owner. This conservative order-sensitive choice and its review item are recorded under IR-617 in [implementation-review.md](../design/implementation-review.md). The collector currently sees Phase 1 interface diagnostics; integration with future world checks and generation diagnostics remains pending.
+
 ### 16.6.5 Uses between interfaces
 
 `interface_uses(P)` computes the edges between local interfaces:
