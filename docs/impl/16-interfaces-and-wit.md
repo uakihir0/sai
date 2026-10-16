@@ -923,6 +923,8 @@ pub struct WitFnRef {
 
 The `WitIfaceRef` of a local interface of the root refers to `Generated(root)`, which is the package that the component's WIT contains ([07](07-component-lowering.md) §7.1.1).
 
+**Implementation progress (IR-625).** `sai_resolve::InterfaceRedirects` builds lookup tables for selected interface-function matches and accepted resource bindings. It ignores later duplicate impls, unsupported functions, and unvalidated or unresolved resource candidates. Applying these redirects to resolved owners and preserving each original resolution remains.
+
 ### 16.7.5 Opaque resources
 
 `AdtFlags` (impl/03 §3.6.4) gains `IS_HANDLE`. It is set for view resources and for resources declared in local interfaces. A record construction `R(f: e, …)` (a `Call` whose callee resolves to a record type, impl/03 §3.7.12) whose callee resolves, after the redirect, to an `IS_HANDLE` type is `OPAQUE_RESOURCE_CONSTRUCTION` (spec/13 §13.7.4), at the callee path. It is reported by `typeck` in place of the field checks of impl/03 §3.7.12, and the arguments are still checked by synthesis. Constructors are called as functions (§16.4.4).
