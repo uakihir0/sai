@@ -395,6 +395,14 @@ Regressions cover transitive public paths in associated types and method
 signatures for both trait and impl owners, plus foreign private and missing
 member errors.
 
+**Interface/resource member type paths over validated source closures (IR-570).**
+Direct interface declaration and resource-method type paths now accept the
+validated active-source closure and record its fingerprint on the aggregate
+result. Package-local resolution remains available. Regressions cover an
+interface alias, function signature, and resource-method signature through a
+transitive-only re-export, exact foreign identity, private and missing-member
+errors, and requester mismatch rejection.
+
 When a foreign-interface re-export candidate precedes a known local candidate
 with the same name, this bridge uses the successful local candidate while
 retaining the foreign-interface item as deferred; a complete package resolver
