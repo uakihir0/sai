@@ -364,6 +364,14 @@ public resolution, foreign private and missing member errors, and rejection
 when the closure belongs to another package collection. Expression lookup and
 diagnostic construction remain separate.
 
+**Predicate-owner type paths over validated source closures (IR-566).**
+Invariant targets and body annotations plus refined and refinement-bearing
+distinct type paths now have closure-aware entry points. Their shared result
+records the closure fingerprint, while package-local entry points and
+predicate/expression channels keep their existing behavior. Regressions cover
+transitive public, foreign private, and missing members for both adapter
+families; diagnostic mapping remains separate.
+
 When a foreign-interface re-export candidate precedes a known local candidate
 with the same name, this bridge uses the successful local candidate while
 retaining the foreign-interface item as deferred; a complete package resolver
