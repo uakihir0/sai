@@ -3064,6 +3064,7 @@ dependencies = [
  "sai_stable_hash",
  "sai_syntax",
  "sai_vfs",
+ "sai_wit",
 ]
 
 [[package]]

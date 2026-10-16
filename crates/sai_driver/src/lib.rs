@@ -87,9 +87,13 @@ use sai_vfs::{
     VfsInputUpdate, VfsInputs, WitFilesSnapshot, WorkspaceSnapshot, WorkspaceSnapshotError,
     WorkspaceSnapshotId,
 };
+use sai_wit::{
+    EMBEDDED_WASI_VERSION, LoadedWasiPackage, WitUnit, WitUnitIdentityError, WitUnitKind, WitView,
+    WitViewError, WitWasiLoadError, load_embedded_wasi_package,
+};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Owns the query runtime and the session state for the implemented frontend.
 ///
@@ -118,6 +122,12 @@ pub struct RootDatabase {
     type_owner_paths: TypeOwnerPathQueries,
     declared_requirements: DeclaredRequirementsQueries,
     package_graph: InputQuery<u8, Option<PackageGraph>>,
+    wasi_packages: WasiPackageQueries,
+    wasi_views: WasiViewQueries,
+    #[allow(dead_code)]
+    /// Keeps the per-view path interners explicit in session state and
+    /// available to adjacent driver queries as WIT scope integration lands.
+    wasi_def_paths: Arc<Mutex<HashMap<String, Arc<DefPathInterner>>>>,
 }
 
 /// A semantically usable direct requirement retained from `sai.package`.
@@ -323,6 +333,140 @@ impl DeclaredRequirementsQueries {
         )?;
         Ok(Self { input, query })
     }
+}
+
+#[derive(Clone)]
+struct WasiPackageQueryOutput {
+    identity: Fingerprint,
+    result: Result<Arc<LoadedWasiPackage>, WitWasiLoadError>,
+}
+
+impl PartialEq for WasiPackageQueryOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.result == other.result
+    }
+}
+
+impl Eq for WasiPackageQueryOutput {}
+
+impl StableHash for WasiPackageQueryOutput {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        // The unit identity is canonical and excludes session-local symbols.
+        // The embedded catalog is immutable for this compiler build.
+        self.identity.stable_hash(hasher);
+    }
+}
+
+struct WasiPackageQueries {
+    query: DerivedQuery<WitUnit, WasiPackageQueryOutput>,
+}
+
+impl WasiPackageQueries {
+    fn new(symbols: Arc<Interner>) -> Result<Self, QueryError> {
+        let query = DerivedQuery::new(
+            "embedded_wasi_package",
+            move |_database: &mut QueryDatabase, unit: &WitUnit| {
+                Ok(WasiPackageQueryOutput {
+                    identity: fingerprint(unit),
+                    result: load_embedded_wasi_package(unit, &symbols).map(Arc::new),
+                })
+            },
+        )?;
+        Ok(Self { query })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WasiViewBuildFailure {
+    Load(WitWasiLoadError),
+    View(WitViewError),
+}
+
+#[derive(Clone)]
+struct WasiViewQueryOutput {
+    identity: Fingerprint,
+    result: Result<Arc<WitView>, WasiViewBuildFailure>,
+}
+
+impl PartialEq for WasiViewQueryOutput {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity && self.result == other.result
+    }
+}
+
+impl Eq for WasiViewQueryOutput {}
+
+impl StableHash for WasiViewQueryOutput {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        // Query identity is derived from the canonical WitUnit key, never from
+        // session-local package, symbol, or DefId values in the cached result.
+        self.identity.stable_hash(hasher);
+    }
+}
+
+struct WasiViewQueries {
+    query: DerivedQuery<WitUnit, WasiViewQueryOutput>,
+}
+
+impl WasiViewQueries {
+    fn new(
+        package_query: DerivedQuery<WitUnit, WasiPackageQueryOutput>,
+        packages: Arc<PackageInterner>,
+        symbols: Arc<Interner>,
+        def_paths: Arc<Mutex<HashMap<String, Arc<DefPathInterner>>>>,
+    ) -> Result<Self, QueryError> {
+        let query = DerivedQuery::new(
+            "wasi_root_view",
+            move |database: &mut QueryDatabase, unit: &WitUnit| {
+                let package = package_query.get(database, unit.clone())?;
+                let result = match &package.result {
+                    Err(error) => Err(WasiViewBuildFailure::Load(error.clone())),
+                    Ok(loaded) => {
+                        match persistent_wasi_view_def_paths(unit, &packages, &symbols, &def_paths)
+                        {
+                            Err(error) => Err(WasiViewBuildFailure::View(error)),
+                            Ok(def_paths) => WitView::build(
+                                loaded.root().clone(),
+                                &packages,
+                                &symbols,
+                                def_paths,
+                            )
+                            .map(Arc::new)
+                            .map_err(WasiViewBuildFailure::View),
+                        }
+                    }
+                };
+                Ok(WasiViewQueryOutput {
+                    identity: package.identity,
+                    result,
+                })
+            },
+        )?;
+        Ok(Self { query })
+    }
+}
+
+fn persistent_wasi_view_def_paths(
+    unit: &WitUnit,
+    packages: &PackageInterner,
+    symbols: &Interner,
+    interner_by_unit: &Mutex<HashMap<String, Arc<DefPathInterner>>>,
+) -> Result<Arc<DefPathInterner>, WitViewError> {
+    let mut interner_by_unit = interner_by_unit
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(def_paths) = interner_by_unit.get(unit.stable_key()) {
+        return Ok(Arc::clone(def_paths));
+    }
+
+    let package = packages
+        .intern(unit.stable_key())
+        .map_err(WitViewError::PackageId)?;
+    let def_paths = Arc::new(
+        DefPathInterner::new(package, packages, symbols).map_err(WitViewError::DefPathInterner)?,
+    );
+    interner_by_unit.insert(unit.stable_key().to_owned(), Arc::clone(&def_paths));
+    Ok(def_paths)
 }
 
 fn manifest_matches_package_key(
@@ -1079,6 +1223,66 @@ pub enum RootDatabaseError {
         found_package_key: String,
         found_path: String,
     },
+}
+
+/// Failure while creating a WASI unit owned by this compiler session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WasiWitUnitError {
+    Symbol(sai_intern::InternError),
+    InvalidEmbeddedVersion,
+    NotWasi,
+    Identity(WitUnitIdentityError),
+}
+
+impl std::fmt::Display for WasiWitUnitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Symbol(error) => {
+                write!(formatter, "could not intern WASI package name: {error:?}")
+            }
+            Self::InvalidEmbeddedVersion => {
+                formatter.write_str("the embedded WASI version is invalid")
+            }
+            Self::NotWasi => formatter.write_str("the WIT unit is not a WASI unit"),
+            Self::Identity(error) => write!(formatter, "invalid embedded WASI unit: {error:?}"),
+        }
+    }
+}
+
+impl std::error::Error for WasiWitUnitError {}
+
+/// Failure returned by the tracked embedded-WASI package or root-view queries.
+///
+/// Loader and view-construction errors are ordinary result values from the
+/// query graph. Only query-runtime failures are represented by `Query`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WasiWitQueryError {
+    Query(QueryError),
+    Unit(WasiWitUnitError),
+    Load(WitWasiLoadError),
+    View(WitViewError),
+}
+
+impl std::fmt::Display for WasiWitQueryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Query(error) => write!(formatter, "WASI query failed: {error}"),
+            Self::Unit(error) => error.fmt(formatter),
+            Self::Load(error) => error.fmt(formatter),
+            Self::View(error) => write!(formatter, "WASI view construction failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for WasiWitQueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Query(error) => Some(error),
+            Self::Unit(error) => Some(error),
+            Self::Load(error) => Some(error),
+            Self::View(error) => Some(error),
+        }
+    }
 }
 
 /// A failure while assembling snapshot-bound inputs for Phase 1 collection.
@@ -5755,6 +5959,14 @@ impl RootDatabase {
         let package_graph =
             InputQuery::<u8, Option<PackageGraph>>::new("package_graph", Durability::Medium)?;
         package_graph.set(&mut query_database, 0, None)?;
+        let wasi_packages = WasiPackageQueries::new(Arc::clone(&symbols))?;
+        let wasi_def_paths = Arc::new(Mutex::new(HashMap::new()));
+        let wasi_views = WasiViewQueries::new(
+            wasi_packages.query.clone(),
+            Arc::clone(&packages),
+            Arc::clone(&symbols),
+            Arc::clone(&wasi_def_paths),
+        )?;
         Ok(Self {
             query_database,
             vfs,
@@ -5770,6 +5982,9 @@ impl RootDatabase {
             type_owner_paths,
             declared_requirements,
             package_graph,
+            wasi_packages,
+            wasi_views,
+            wasi_def_paths,
         })
     }
 
@@ -5787,6 +6002,89 @@ impl RootDatabase {
     /// Interns a stable package key for this session.
     pub fn intern_package(&self, package_key: &str) -> Result<PackageId, PackageIdError> {
         self.packages.intern(package_key)
+    }
+
+    /// Creates a catalog-backed WASI unit using this database's symbol
+    /// interner so later WIT queries can validate it against this session.
+    pub fn wasi_unit(&self, package_name: &str) -> Result<WitUnit, WasiWitUnitError> {
+        let package = self
+            .symbols
+            .intern(package_name)
+            .map_err(WasiWitUnitError::Symbol)?;
+        let version = Version::parse(EMBEDDED_WASI_VERSION)
+            .map_err(|_| WasiWitUnitError::InvalidEmbeddedVersion)?;
+        WitUnit::wasi(package, &self.symbols, &version).map_err(WasiWitUnitError::Identity)
+    }
+
+    fn canonical_wasi_unit(&self, unit: &WitUnit) -> Result<WitUnit, WasiWitUnitError> {
+        let WitUnitKind::Wasi { .. } = unit.kind() else {
+            return Err(WasiWitUnitError::NotWasi);
+        };
+        let Some(identity) = unit.canonical_name().strip_prefix("wasi:") else {
+            return Err(WasiWitUnitError::Identity(
+                WitUnitIdentityError::PackageKeyMismatch,
+            ));
+        };
+        let Some((package_name, version)) = identity.rsplit_once('@') else {
+            return Err(WasiWitUnitError::Identity(
+                WitUnitIdentityError::PackageKeyMismatch,
+            ));
+        };
+        let version =
+            Version::parse(version).map_err(|_| WasiWitUnitError::InvalidEmbeddedVersion)?;
+        let package = self
+            .symbols
+            .intern(package_name)
+            .map_err(WasiWitUnitError::Symbol)?;
+        let canonical =
+            WitUnit::wasi(package, &self.symbols, &version).map_err(WasiWitUnitError::Identity)?;
+        if canonical.stable_key() != unit.stable_key()
+            || canonical.canonical_name() != unit.canonical_name()
+        {
+            return Err(WasiWitUnitError::Identity(
+                WitUnitIdentityError::PackageKeyMismatch,
+            ));
+        }
+        Ok(canonical)
+    }
+
+    /// Returns the tracked embedded package loader result for one WASI unit.
+    ///
+    /// Invalid units and embedded-source failures are returned as values from
+    /// the query; they do not poison the query runtime.
+    pub fn loaded_wasi_package(
+        &mut self,
+        unit: WitUnit,
+    ) -> Result<Arc<LoadedWasiPackage>, WasiWitQueryError> {
+        let unit = self
+            .canonical_wasi_unit(&unit)
+            .map_err(WasiWitQueryError::Unit)?;
+        let output = self
+            .wasi_packages
+            .query
+            .get(&mut self.query_database, unit)
+            .map_err(WasiWitQueryError::Query)?;
+        output.result.clone().map_err(WasiWitQueryError::Load)
+    }
+
+    /// Returns the cached stable SAI-facing view of an embedded WASI root.
+    ///
+    /// The loaded root package is a tracked dependency of the view query.
+    /// Every view retains one append-only `DefPathInterner` for this unit
+    /// throughout the database session, so recomputation reuses its `DefId`s.
+    pub fn wasi_view(&mut self, unit: WitUnit) -> Result<Arc<WitView>, WasiWitQueryError> {
+        let unit = self
+            .canonical_wasi_unit(&unit)
+            .map_err(WasiWitQueryError::Unit)?;
+        let output = self
+            .wasi_views
+            .query
+            .get(&mut self.query_database, unit)
+            .map_err(WasiWitQueryError::Query)?;
+        output.result.clone().map_err(|failure| match failure {
+            WasiViewBuildFailure::Load(error) => WasiWitQueryError::Load(error),
+            WasiViewBuildFailure::View(error) => WasiWitQueryError::View(error),
+        })
     }
 
     /// Sets the exact `sai.package` bytes used by
@@ -29712,5 +30010,221 @@ mod tests {
             tree.modules[1].parent_dir,
             Some(sai_resolve::ModuleId::ROOT)
         );
+    }
+
+    #[test]
+    fn tracked_wasi_queries_load_and_build_every_catalog_root() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+
+        for package_name in sai_wit::EMBEDDED_WASI_PACKAGE_NAMES {
+            let unit = database
+                .wasi_unit(package_name)
+                .expect("catalog name makes a unit");
+            let loaded = database
+                .loaded_wasi_package(unit.clone())
+                .expect("catalog package loads");
+            assert_eq!(
+                loaded.closure().last().expect("closure contains its root"),
+                &unit
+            );
+            assert_eq!(loaded.root().unit, unit);
+
+            let view = database
+                .wasi_view(unit.clone())
+                .expect("catalog root builds a view");
+            assert_eq!(view.unit, unit);
+            assert!(
+                !view.defs.is_empty(),
+                "wasi:{package_name} should expose definitions"
+            );
+        }
+    }
+
+    #[test]
+    fn wasi_view_query_caches_and_rebuilds_with_the_same_definition_ids() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let unit = database.wasi_unit("cli").expect("CLI is in the catalog");
+        let cached = database
+            .wasi_view(unit.clone())
+            .expect("CLI root view builds");
+        let cached_again = database
+            .wasi_view(unit.clone())
+            .expect("cached CLI root view is available");
+        assert!(
+            Arc::ptr_eq(&cached, &cached_again),
+            "unchanged query inputs should reuse the cached view value"
+        );
+
+        let loaded = database
+            .loaded_wasi_package(unit.clone())
+            .expect("CLI package is loaded");
+        let def_paths = database
+            .wasi_def_paths
+            .lock()
+            .expect("view path map is not poisoned")
+            .get(unit.stable_key())
+            .cloned()
+            .expect("view query retained its path interner");
+        let rebuilt = WitView::build(
+            loaded.root().clone(),
+            &database.packages,
+            &database.symbols,
+            def_paths,
+        )
+        .expect("rebuilding the view reuses its retained path interner");
+        assert_eq!(view_definition_ids(&cached), view_definition_ids(&rebuilt));
+        assert_eq!(
+            sai_stable_hash::fingerprint(cached.as_ref()),
+            sai_stable_hash::fingerprint(&rebuilt)
+        );
+    }
+
+    #[test]
+    fn wasi_view_fingerprint_is_stable_across_database_sessions() {
+        let mut first_database = RootDatabase::new().expect("first session initializes");
+        let first_unit = first_database
+            .wasi_unit("filesystem")
+            .expect("filesystem is in the catalog");
+        let first_view = first_database
+            .wasi_view(first_unit)
+            .expect("first-session view builds");
+
+        let mut second_database = RootDatabase::new().expect("second session initializes");
+        let second_unit = second_database
+            .wasi_unit("filesystem")
+            .expect("filesystem is in the catalog");
+        let second_view = second_database
+            .wasi_view(second_unit)
+            .expect("second-session view builds");
+
+        assert_eq!(
+            sai_stable_hash::fingerprint(first_view.as_ref()),
+            sai_stable_hash::fingerprint(second_view.as_ref())
+        );
+        assert_eq!(
+            view_stable_definitions(&first_view),
+            view_stable_definitions(&second_view)
+        );
+    }
+
+    #[test]
+    fn invalid_wasi_query_results_do_not_poison_the_query_runtime() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let package = database
+            .intern_package("acme:invalid-wit#1")
+            .expect("package key is valid");
+        let package_version = MvsPackageVersion::new(
+            "acme:invalid-wit",
+            Version::parse("1.0.0").expect("test version is valid"),
+        )
+        .expect("package identity is valid");
+        let non_wasi = WitUnit::dir(package, &database.packages, &package_version)
+            .expect("directory unit matches package key");
+
+        assert!(matches!(
+            database.wasi_view(non_wasi),
+            Err(WasiWitQueryError::Unit(WasiWitUnitError::NotWasi))
+        ));
+        let unit = database.wasi_unit("io").expect("io is in the catalog");
+        assert!(
+            database.wasi_view(unit).is_ok(),
+            "a result-valued loader failure must leave subsequent queries usable"
+        );
+    }
+
+    #[test]
+    fn wasi_queries_canonicalize_foreign_session_units_in_both_call_orders() {
+        let foreign_database = RootDatabase::new().expect("foreign session initializes");
+        let foreign_unit = foreign_database
+            .wasi_unit("cli")
+            .expect("CLI is in the catalog");
+
+        let mut foreign_first = RootDatabase::new().expect("first local session initializes");
+        for index in 0..32 {
+            foreign_first
+                .symbols
+                .intern(&format!("foreign-session-prefix-{index}"))
+                .expect("test symbol is interned");
+        }
+        let foreign_symbol = match foreign_unit.kind() {
+            WitUnitKind::Wasi { package } => package,
+            _ => unreachable!("foreign unit is a WASI root"),
+        };
+        assert_ne!(
+            foreign_first
+                .symbols
+                .resolve(foreign_symbol)
+                .ok()
+                .as_deref(),
+            Some("cli"),
+            "the test must give the foreign session a different local symbol meaning"
+        );
+        let local_unit = foreign_first
+            .wasi_unit("cli")
+            .expect("CLI is in the local catalog");
+        let foreign_first_view = foreign_first
+            .wasi_view(foreign_unit.clone())
+            .expect("foreign identity canonicalizes before the first query");
+        let local_view = foreign_first
+            .wasi_view(local_unit.clone())
+            .expect("local CLI view remains available");
+        assert!(Arc::ptr_eq(&foreign_first_view, &local_view));
+        let loaded = foreign_first
+            .loaded_wasi_package(local_unit.clone())
+            .expect("local CLI package remains available");
+        assert_eq!(loaded.root().unit, local_unit);
+
+        let mut local_first = RootDatabase::new().expect("second local session initializes");
+        for index in 0..32 {
+            local_first
+                .symbols
+                .intern(&format!("foreign-session-prefix-{index}"))
+                .expect("test symbol is interned");
+        }
+        let local_unit = local_first
+            .wasi_unit("cli")
+            .expect("CLI is in the local catalog");
+        let local_loaded = local_first
+            .loaded_wasi_package(local_unit.clone())
+            .expect("local package loads before the foreign request");
+        let foreign_loaded = local_first
+            .loaded_wasi_package(foreign_unit.clone())
+            .expect("foreign identity canonicalizes to the same local package");
+        assert!(Arc::ptr_eq(&local_loaded, &foreign_loaded));
+        let local_view = local_first
+            .wasi_view(local_unit.clone())
+            .expect("local view builds before the foreign request");
+        let foreign_view = local_first
+            .wasi_view(foreign_unit)
+            .expect("foreign identity canonicalizes to the cached local view");
+        assert!(Arc::ptr_eq(&local_view, &foreign_view));
+    }
+
+    fn view_definition_ids(view: &WitView) -> Vec<DefId> {
+        let mut ids = Vec::new();
+        for interface in view.interfaces.values() {
+            ids.push(interface.def);
+            ids.extend(interface.members.values().map(|member| member.def));
+            ids.extend(interface.shadowed.iter().map(|shadow| shadow.winner));
+        }
+        for world in view.worlds.values() {
+            ids.push(world.def);
+            ids.extend(world.import_fns.values().copied());
+        }
+        ids.sort_by_key(|id| id.index);
+        ids
+    }
+
+    fn view_stable_definitions(view: &WitView) -> Vec<(u128, String)> {
+        view.defs
+            .iter_enumerated()
+            .filter_map(|(_, definition)| definition.as_ref())
+            .map(|definition| {
+                (
+                    definition.path_hash.raw(),
+                    definition.canonical_path.clone(),
+                )
+            })
+            .collect()
     }
 }
