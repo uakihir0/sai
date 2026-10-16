@@ -842,6 +842,10 @@ The redirect is never applied to these owners (§16.7.4), so the query cannot be
 
 Generic parameters of an implementing function, the conformance of signatures and the members of bound resources are checked later by `interface_impl_check` (§16.7.2). Those checks need `fn_sig` and `inherent_impls`, which depend on the redirect.
 
+**Implementation progress (IR-622).** The Phase 1 driver now supplies local, active source-dependency, and WIT-view interface members to the `sai_resolve` collector, and `sai check` reports its matching diagnostics. Local members use the effective Phase 1 interface scope and HIR declaration order; WIT members use model item order. Impl descriptors use root-first module-path generation order. A complete resolved path on an associated-type RHS supplies its `DefId` to the collector, while an unresolved or non-path RHS still satisfies item-name matching without inventing a binding. The driver validates the source and WIT closures against the current package collection and workspace snapshot and rebinds collector locations to that snapshot. Resolution results also carry the originating database session token to reject cross-session reuse. IR-619 remains the owner of wrong-kind target diagnostics.
+
+The source-dependency integration is exercised through the driver closure API. The current Stage 0 `sai check` exits at its existing import/use-resolution gate before source-dependency interface targets can reach this adapter. Resource binding validation, interface conformance, and redirect remain pending; see [implementation-review.md](../design/implementation-review.md) under IR-622 for the recorded decisions and review items.
+
 ### 16.7.2 Items and conformance
 
 `interface_impl_check(X)` checks one interface impl `X` that §16.7.1 matched. For each pair of an interface function `F` and an implementing function `G`:
