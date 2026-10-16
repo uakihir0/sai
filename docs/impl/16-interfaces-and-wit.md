@@ -142,7 +142,7 @@ Values carry their diagnostics, and the driver collects them as impl/01 §1.9 st
    - the `export world` text and its span;
    - the identity and the version.
 
-   An edit to another field of `sai.package` leaves every query of this chapter green.
+   An edit to another field of `sai.package` leaves every query of this chapter green when it preserves these projected values. In particular, an edit before `export world` that moves its byte span changes `wit_contract`, even when the world spelling is unchanged, so the updated span remains available for diagnostics.
 6. **Early cutoff.** `generated_wit_text` is compared by value. Editing a function body of a source dependency recomputes its `generated_wit_text`, but leaves the text equal, so the views and checks of its dependents stay green.
 
 ### 16.1.5 Stages
