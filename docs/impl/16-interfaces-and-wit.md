@@ -1465,3 +1465,9 @@ See [implementation-review.md](../design/implementation-review.md) for the decis
 A dedicated same-direction conversion-collision check for direct world functions was not added: representable lowercase snake-case SAI names map injectively to WIT kebab-case names. Repeated written world-item keys and collisions between functions and interfaces remain for the not-yet-implemented §16.8.3 elaborated-world checks.
 
 See [implementation-review.md](../design/implementation-review.md) for the decision record, verification, review status, human review items, and remaining scope.
+
+### IR-621: Collect interface impl item matches in `sai_resolve`
+
+The `sai_resolve` collector now handles ordered duplicate-target selection, unsupported interface functions, and name/kind matching of impl functions and resource bindings. It reports duplicate, extra, repeated, and missing items at the specified target/item locations. Wrong-kind target diagnostics remain owned by IR-619, and unresolved resource binding types are matched by name without creating a duplicate missing-item finding. The collector is data-only and is not yet connected to Phase 1 or `sai check`.
+
+See [implementation-review.md](../design/implementation-review.md) for the decision record, verification, review status, human review items, and remaining scope.
