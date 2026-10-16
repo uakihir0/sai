@@ -1,6 +1,12 @@
 #![forbid(unsafe_code)]
 
 pub mod package_graph;
+mod wit_package_queries;
+
+use wit_package_queries::WitPackageQueries;
+pub use wit_package_queries::{
+    WitPackageFailure, WitPackageQueryError, WitPackageResult, WitPackageSourceFailure,
+};
 
 use crate::package_graph::{PackageForm, PackageGraph, PackageGraphRole};
 use sai_diagnostics::{
@@ -88,9 +94,12 @@ use sai_vfs::{
     WorkspaceSnapshotId,
 };
 use sai_wit::{
-    EMBEDDED_WASI_VERSION, GeneratedText, LoadedWasiPackage, WitContract, WitContractError,
-    WitContractField, WitUnit, WitUnitIdentityError, WitUnitKind, WitView, WitViewError,
-    WitWasiLoadError, load_embedded_wasi_package,
+    EMBEDDED_WASI_CATALOG, EMBEDDED_WASI_VERSION, GeneratedText, LoadedWasiPackage,
+    LoadedWitPackage, WitContract, WitContractError, WitContractField, WitPackageEdge,
+    WitPackageGraph, WitPackageGraphError, WitPackageLoadError, WitPackageLoadFailure,
+    WitPackageNode, WitSourceFile, WitUnit, WitUnitIdentityError, WitUnitKind, WitView,
+    WitViewError, WitWasiLoadError, embedded_wasi_package, load_embedded_wasi_package,
+    load_wit_package_closure,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -126,6 +135,7 @@ pub struct RootDatabase {
     generated_wit_texts: GeneratedWitTextQueries,
     wit_units: WitUnitOfQueries,
     package_graph: InputQuery<u8, Option<PackageGraph>>,
+    wit_packages: WitPackageQueries,
     wasi_packages: WasiPackageQueries,
     wasi_views: WasiViewQueries,
     #[allow(dead_code)]
@@ -6452,6 +6462,15 @@ impl RootDatabase {
             package_graph.clone(),
             Arc::clone(&packages),
         )?;
+        let wit_packages = WitPackageQueries::new(
+            vfs.clone(),
+            wit_contracts.query.clone(),
+            generated_wit_texts.query.clone(),
+            wit_units.query.clone(),
+            package_graph.clone(),
+            Arc::clone(&packages),
+            Arc::clone(&symbols),
+        )?;
         let wasi_packages = WasiPackageQueries::new(Arc::clone(&symbols))?;
         let wasi_def_paths = Arc::new(Mutex::new(HashMap::new()));
         let wasi_views = WasiViewQueries::new(
@@ -6478,6 +6497,7 @@ impl RootDatabase {
             generated_wit_texts,
             wit_units,
             package_graph,
+            wit_packages,
             wasi_packages,
             wasi_views,
             wasi_def_paths,
