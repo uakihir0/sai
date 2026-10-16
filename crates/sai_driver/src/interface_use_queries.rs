@@ -36,7 +36,9 @@ use sai_ty::boundary::{
     BoundaryAlias, BoundaryDefinition, BoundaryType, BoundaryTypeContext, BoundaryTypeOutcome,
     IncompatibleReason, Position, boundary_type_with_references,
 };
-use sai_ty::iface::{InterfaceCheckError, InterfaceCheckIssue, interface_item_check};
+use sai_ty::iface::{
+    InterfaceCheckError, InterfaceCheckIssue, InterfaceCheckIssueKind, interface_item_check,
+};
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
 use sai_wit::{WitViewDefKind, WitViewEntity, wit_name_to_sai};
 use std::collections::{HashMap, HashSet};
@@ -1795,6 +1797,63 @@ fn append_interface_boundary_diagnostics(
     };
     let owner_path_candidates = owner_test_only_path_candidates(owner);
     let mut has_incompatible_boundary = false;
+
+    // The receiver is not emitted as a boundary parameter, but its type must
+    // still be the enclosing resource. The syntax-only interface check owns
+    // non-borrow receivers; resolve borrowed receivers here so `Self`, a
+    // resource path, and a known module alias compare by definition identity.
+    let resource_receiver = match owner.node {
+        OwnerNode::InterfaceItem(item) => match item.kind {
+            InterfaceItemKind::ResourceMember {
+                resource,
+                role: MemberRole::Method,
+                sig,
+                ..
+            } => sig
+                .params
+                .first()
+                .filter(|parameter| parameter.is_self)
+                .map(|parameter| (resource.to_def_id(), parameter.ty)),
+            _ => None,
+        },
+        _ => None,
+    };
+    if let Some((expected_resource, receiver_ty)) = resource_receiver
+        && matches!(receiver_ty.kind, TyKind::Borrow(_, _))
+    {
+        let invalid_receiver = match boundary_type_with_references(
+            &boundary_context,
+            owner_id,
+            receiver_ty,
+            Position::Param,
+        )
+        .outcome
+        {
+            BoundaryTypeOutcome::Mapped(BoundaryType::Borrow(resource)) => {
+                resource != expected_resource
+            }
+            BoundaryTypeOutcome::Mapped(_) | BoundaryTypeOutcome::Incompatible(_) => true,
+            BoundaryTypeOutcome::Suppressed | BoundaryTypeOutcome::Deferred => false,
+        };
+        if invalid_receiver {
+            let issue = InterfaceCheckIssue {
+                owner: owner_id,
+                kind: InterfaceCheckIssueKind::InvalidResourceReceiver,
+                span: receiver_ty.span,
+                name: None,
+                suggestion: None,
+                related_span: None,
+            };
+            append_interface_item_diagnostics(
+                vec![issue],
+                source_ref,
+                source,
+                snapshot,
+                diagnostics,
+            )?;
+            has_incompatible_boundary = true;
+        }
+    }
 
     for (ty, position) in interface_boundary_roots(owner) {
         let conversion = boundary_type_with_references(&boundary_context, owner_id, ty, position);

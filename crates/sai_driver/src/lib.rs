@@ -27866,6 +27866,149 @@ mod tests {
     }
 
     #[test]
+    fn interface_check_accepts_resource_receiver_identity_and_known_aliases() {
+        let root = concat!(
+            "type FileAlias = api.File\n",
+            "type FileAlias2 = FileAlias\n",
+            "interface api {\n",
+            "  resource File {\n",
+            "    fn direct(self: borrow Self)\n",
+            "    fn mutable(self: borrow mut Self)\n",
+            "    fn named(self: borrow File)\n",
+            "    fn aliased(self: borrow FileAlias2)\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+
+        assert!(
+            collection
+                .interface_check_diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::WitIncompatibleType),
+            "{:?}",
+            collection.interface_check_diagnostics()
+        );
+        let api = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| owner.kind == TopLevelOwnerKind::Interface)
+            .expect("the fixture declares one local interface");
+        let api = api.owner.def_id;
+        assert!(
+            collection
+                .interface_uses()
+                .uses
+                .get(&api)
+                .is_none_or(Vec::is_empty),
+            "receiver-only paths do not create emitted interface-use edges"
+        );
+    }
+
+    #[test]
+    fn interface_check_rejects_resource_receiver_identity_mismatches_at_the_full_type() {
+        let root = concat!(
+            "type OtherAlias = other.Other\n",
+            "type ScalarAlias = U32\n",
+            "interface other {\n",
+            "  resource Other {}\n",
+            "}\n",
+            "interface api {\n",
+            "  resource File {\n",
+            "    fn wrong_resource(self: borrow OtherAlias)\n",
+            "    fn wrong_scalar_alias(self: borrow ScalarAlias)\n",
+            "    fn wrong_scalar(self: borrow U32)\n",
+            "    fn wrong_outer(self: File)\n",
+            "    fn unresolved(self: borrow Missing)\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let mut receiver_diagnostics = collection
+            .interface_check_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitIncompatibleType)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receiver_diagnostics.len(),
+            4,
+            "known mismatches and the existing non-borrow check are diagnosed, but unresolved types do not cascade: {:?}",
+            collection.interface_check_diagnostics()
+        );
+        receiver_diagnostics.sort_by_key(|diagnostic| {
+            diagnostic
+                .primary()
+                .expect("receiver diagnostic has a primary")
+                .span
+                .range
+                .start()
+        });
+        let receiver_texts = receiver_diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let span = diagnostic
+                    .primary()
+                    .expect("receiver diagnostic has a primary")
+                    .span;
+                root.get(span.range.start().to_usize()..span.range.end().to_usize())
+                    .expect("receiver diagnostic span is in source")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receiver_texts,
+            [
+                "borrow OtherAlias",
+                "borrow ScalarAlias",
+                "borrow U32",
+                "File"
+            ]
+        );
+        assert!(
+            receiver_diagnostics
+                .iter()
+                .take(3)
+                .all(|diagnostic| diagnostic.message
+                    == "resource methods must borrow their resource receiver")
+        );
+        let api = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == TopLevelOwnerKind::Interface)
+            .nth(1)
+            .expect("the fixture declares other and api interfaces")
+            .owner
+            .def_id;
+        assert!(
+            collection
+                .interface_uses()
+                .uses
+                .get(&api)
+                .is_none_or(Vec::is_empty),
+            "receiver-only aliases do not create emitted interface-use edges"
+        );
+    }
+
+    #[test]
     fn interface_check_reports_generated_use_alias_from_foreign_wit() {
         let root = concat!(
             "use acme:codec/iface as codec\n",
