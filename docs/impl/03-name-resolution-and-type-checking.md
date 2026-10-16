@@ -827,8 +827,17 @@ trait and impl header adapter maps typed private and missing member failures
 through the same snapshot-aware mapper. `TraitImplHeaderResolution` exposes a
 separate optional channel, leaving package-local path resolution and existing
 test-only results unchanged. `sai check` collects diagnostics from trait and
-impl headers alongside the previously mapped owner families; associated
-members remain a separate follow-up.
+impl headers alongside the previously mapped owner families. Associated
+members retain child-owned path results and diagnostics, recorded in IR-577.
+
+**Trait/impl associated-member type-path diagnostics (IR-577).** The
+closure-aware trait/impl member adapter maps typed private and missing member
+failures independently for each associated type or method child owner.
+`TraitImplMemberTestOnlyResolution` exposes a separate optional diagnostic
+channel, preserving the child's typed paths, test-only diagnostics, and
+local/expression results. Package-local callers retain typed path errors
+without snapshot-bound diagnostics. `sai check` collects each child result and
+reports parent-owner analysis failures once. The command remains incomplete.
 
 **Qualified missing-member diagnostics (IR-545).** The module path walker
 retains the exact `ModuleTarget` when a member is missing. The driver emits a
