@@ -89,6 +89,7 @@ use sai_resolve::prelude::{
 use sai_resolve::use_target_diagnostics::{
     UseTargetDiagnosticsError, collect_local_use_target_diagnostics,
 };
+use sai_resolve::{InterfaceUseReference, InterfaceUses, InterfaceUsesInput, interface_uses};
 use sai_resolve::{ModuleId, ModuleTree, ModuleTreeQueries, ModuleTreeQueryError};
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher, fingerprint};
 use sai_syntax::ast::{self, AstNode, AstToken};
@@ -3244,6 +3245,7 @@ pub struct InterfaceTestOnlyResolutions {
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
     member_scope_closure_fingerprint: Option<Fingerprint>,
+    interface_uses: Result<InterfaceUses, OwnerControlFlowResolutionError>,
     owners: Vec<InterfaceOwnerTestOnlyResolution>,
 }
 
@@ -3282,6 +3284,12 @@ impl InterfaceTestOnlyResolutions {
 
     pub fn owners(&self) -> &[InterfaceOwnerTestOnlyResolution] {
         &self.owners
+    }
+
+    /// Local interface-use edges and cycle diagnostics from the original,
+    /// target-filtered type-path resolutions collected with these owners.
+    pub fn interface_uses(&self) -> Result<&InterfaceUses, &OwnerControlFlowResolutionError> {
+        self.interface_uses.as_ref()
     }
 }
 
@@ -3858,6 +3866,118 @@ fn interface_member_kind(kind: ItemTreeKind) -> Option<InterfaceMemberKind> {
         ItemTreeKind::InterfaceFn => Some(InterfaceMemberKind::Function),
         _ => None,
     }
+}
+
+fn interface_generation_order(
+    module_tree: &ModuleTree,
+    descriptors: Vec<TopLevelOwnerDescriptor>,
+    symbols: &Interner,
+) -> Result<Vec<TopLevelOwnerDescriptor>, OwnerControlFlowResolutionError> {
+    let mut module_paths = HashMap::with_capacity(module_tree.modules.len());
+    for module in &module_tree.modules {
+        let path = module
+            .path
+            .iter()
+            .map(|segment| {
+                symbols
+                    .resolve(*segment)
+                    .map(|name| name.to_string())
+                    .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if module_paths.insert(module.file, path).is_some() {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+    }
+
+    let mut ordered = descriptors
+        .into_iter()
+        .enumerate()
+        .map(|(source_order, descriptor)| {
+            let module_path = module_paths
+                .get(&descriptor.file)
+                .ok_or(OwnerControlFlowResolutionError::ModuleTreeMismatch)?;
+            Ok((module_path, source_order, descriptor))
+        })
+        .collect::<Result<Vec<_>, OwnerControlFlowResolutionError>>()?;
+    ordered.sort_by(|left, right| left.0.cmp(right.0).then_with(|| left.1.cmp(&right.1)));
+    Ok(ordered
+        .into_iter()
+        .map(|(_, _, descriptor)| descriptor)
+        .collect())
+}
+
+fn local_interface_type_member_owners(
+    scopes: &Phase1PackageScopes,
+    interface_owners: &[TopLevelOwnerDescriptor],
+) -> HashMap<DefId, sai_hir::LocalDefId> {
+    let interface_owner_ids = interface_owners
+        .iter()
+        .map(|descriptor| (descriptor.owner.def_id.to_def_id(), descriptor.owner.def_id))
+        .collect::<HashMap<_, _>>();
+    let mut member_owners = HashMap::new();
+    for (interface, scope) in &scopes.interfaces {
+        let Some(&interface_owner) = interface_owner_ids.get(interface) else {
+            continue;
+        };
+        for binding in scope.members.values() {
+            let Res::Def(kind, member) = binding.res else {
+                continue;
+            };
+            if matches!(
+                kind,
+                DefKind::Struct
+                    | DefKind::Enum
+                    | DefKind::Distinct
+                    | DefKind::Refined
+                    | DefKind::Alias
+                    | DefKind::Resource
+            ) {
+                member_owners.entry(member).or_insert(interface_owner);
+            }
+        }
+    }
+    member_owners
+}
+
+fn append_interface_use_references(
+    references: &mut Vec<InterfaceUseReference>,
+    interface: sai_hir::LocalDefId,
+    candidates: &[OwnerPathHead<'_>],
+    resolution: &TypeOwnerPathResolution,
+    interface_type_members: &HashMap<DefId, sai_hir::LocalDefId>,
+    inputs: &CurrentOwnerInputs,
+) -> Result<(), OwnerControlFlowResolutionError> {
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.kind == OwnerPathKind::Type)
+    {
+        let Some(PathRes {
+            base: Res::Def(_, target),
+            ..
+        }) = resolution.paths().get(&candidate.hir_id)
+        else {
+            continue;
+        };
+        let Some(&to) = interface_type_members.get(target) else {
+            continue;
+        };
+        let Some(location) = sai_diagnostics::Location::from_decoded_source(
+            inputs.source_ref.clone(),
+            sai_diagnostics::Span::new(candidate.span.file, candidate.span.range),
+            &inputs.source,
+        ) else {
+            return Err(OwnerControlFlowResolutionError::InvalidSourceLocation(
+                OwnerId { def_id: interface },
+            ));
+        };
+        references.push(InterfaceUseReference {
+            from: interface,
+            to,
+            location,
+        });
+    }
+    Ok(())
 }
 
 fn collect_interface_owner_test_only_paths(
@@ -12670,6 +12790,19 @@ impl RootDatabase {
         self.resolve_interface_test_only_paths_inner(collection, module_tree, snapshot, None)
     }
 
+    /// Collects local interface-use edges and cycle diagnostics from the
+    /// original type-path resolutions of target-filtered interface owners.
+    pub fn resolve_interface_uses(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<InterfaceUses, OwnerControlFlowResolutionError> {
+        let resolutions =
+            self.resolve_interface_test_only_paths(collection, module_tree, snapshot)?;
+        resolutions.interface_uses().cloned().map_err(Clone::clone)
+    }
+
     /// Resolves interface declaration and resource-method type paths through
     /// a validated active-source member-scope closure.
     pub fn resolve_interface_test_only_paths_with_member_scopes(
@@ -12706,13 +12839,17 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
-        let descriptors = collection
-            .scopes
-            .top_level_owners
-            .iter()
-            .copied()
-            .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Interface)
-            .collect::<Vec<_>>();
+        let descriptors = interface_generation_order(
+            module_tree,
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Interface)
+                .collect(),
+            &self.symbols,
+        )?;
         let mut indexed_scopes =
             Vec::with_capacity(1 + member_scopes.map_or(0, |scopes| scopes.source_packages.len()));
         indexed_scopes.push(collection.scopes());
@@ -12731,6 +12868,14 @@ impl RootDatabase {
             .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let mut owners = Vec::with_capacity(descriptors.len());
+        let local_interface_type_members =
+            local_interface_type_member_owners(collection.scopes(), &descriptors);
+        let interface_ids = descriptors
+            .iter()
+            .map(|descriptor| descriptor.owner.def_id)
+            .collect::<Vec<_>>();
+        let mut interface_use_references = Vec::new();
+        let mut interface_package_identity = None;
 
         for descriptor in descriptors {
             let inputs = match self.current_owner_inputs(
@@ -12749,9 +12894,15 @@ impl RootDatabase {
                     continue;
                 }
             };
+            interface_package_identity =
+                interface_package_identity.or_else(|| inputs.source_ref.package.clone());
 
             let analysis: Result<
-                (Vec<InterfaceMemberTestOnlyResolution>, Vec<Diagnostic>),
+                (
+                    Vec<InterfaceMemberTestOnlyResolution>,
+                    Vec<Diagnostic>,
+                    Vec<InterfaceUseReference>,
+                ),
                 OwnerControlFlowResolutionError,
             > = (|| {
                 let parent_descriptor = find_top_level_owner_descriptor(
@@ -12849,6 +13000,7 @@ impl RootDatabase {
 
                 let module_scope = module_scope_for_file(collection, module_tree, descriptor.file)?;
                 let mut members = Vec::with_capacity(member_entries.len());
+                let mut owner_interface_use_references = Vec::new();
                 for (entry, member_owner) in member_entries
                     .into_iter()
                     .zip(parent_members.iter().copied())
@@ -12906,6 +13058,18 @@ impl RootDatabase {
                             Some(&module_members),
                             Some(&source_graph_packages),
                         ));
+                        if let Ok(resolution) = type_path_resolution.as_ref().expect(
+                            "type-path resolution is initialized before interface-use collection",
+                        ) {
+                            append_interface_use_references(
+                                &mut owner_interface_use_references,
+                                descriptor.owner.def_id,
+                                &candidates,
+                                resolution,
+                                &local_interface_type_members,
+                                &inputs,
+                            )?;
+                        }
                         let (path_resolution, diagnostics) =
                             collect_interface_owner_test_only_paths(
                                 member_owner,
@@ -13006,6 +13170,20 @@ impl RootDatabase {
                                                 Some(&module_members),
                                                 Some(&source_graph_packages),
                                             ));
+                                        if let Ok(resolution) =
+                                            type_path_resolution.as_ref().expect(
+                                                "type-path resolution is initialized before interface-use collection",
+                                            )
+                                        {
+                                            append_interface_use_references(
+                                                &mut owner_interface_use_references,
+                                                descriptor.owner.def_id,
+                                                &candidates,
+                                                resolution,
+                                                &local_interface_type_members,
+                                                &inputs,
+                                            )?;
+                                        }
                                         Ok(collect_interface_owner_test_only_paths(
                                             method_owner,
                                             InterfaceMemberKind::ResourceMethod,
@@ -13090,11 +13268,16 @@ impl RootDatabase {
                     });
                 }
 
-                Ok((members, parent_hir.diagnostics.to_vec()))
+                Ok((
+                    members,
+                    parent_hir.diagnostics.to_vec(),
+                    owner_interface_use_references,
+                ))
             })();
 
             match analysis {
-                Ok((mut members, lowering_diagnostics)) => {
+                Ok((mut members, lowering_diagnostics, use_references)) => {
+                    interface_use_references.extend(use_references);
                     if let Some(member_scopes) = member_scopes {
                         for member in &mut members {
                             member.module_path_diagnostics =
@@ -13149,12 +13332,46 @@ impl RootDatabase {
             }
         }
 
+        let package_identity = interface_package_identity.unwrap_or_else(|| {
+            collection
+                .package_key
+                .as_str()
+                .split_once('#')
+                .map_or(collection.package_key.as_str(), |(identity, _)| identity)
+                .to_owned()
+        });
+        let interface_uses = (|| {
+            for owner in &owners {
+                if let Some(error) = &owner.error {
+                    return Err(error.clone());
+                }
+                for member in &owner.members {
+                    if let Err(error) = &member.type_path_resolution {
+                        return Err(error.clone());
+                    }
+                    if let Some(error) = &member.resource_methods_error {
+                        return Err(error.clone());
+                    }
+                    for method in &member.resource_methods {
+                        if let Err(error) = &method.type_path_resolution {
+                            return Err(error.clone());
+                        }
+                    }
+                }
+            }
+            Ok(interface_uses(InterfaceUsesInput {
+                package: package_identity,
+                interfaces: interface_ids,
+                references: interface_use_references,
+            }))
+        })();
         Ok(InterfaceTestOnlyResolutions {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
             member_scope_closure_fingerprint: member_scopes
                 .map(|scopes| scopes.closure_fingerprint),
+            interface_uses,
             owners,
         })
     }
@@ -26941,6 +27158,260 @@ mod tests {
                 "resource method parameters and block locals shadow the imported alias"
             );
         }
+    }
+
+    #[test]
+    fn interface_use_collection_resolves_local_edges_and_reports_cycles() {
+        let root = concat!(
+            "interface first {\n",
+            "  type Request = second.Response\n",
+            "}\n",
+            "interface second {\n",
+            "  type Response = first.Request\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let interfaces = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == TopLevelOwnerKind::Interface)
+            .map(|owner| owner.owner.def_id)
+            .collect::<Vec<_>>();
+        assert_eq!(interfaces.len(), 2);
+        let [first, second] = interfaces.as_slice() else {
+            unreachable!("the fixture declares two interfaces");
+        };
+
+        let result = database
+            .resolve_interface_uses(&collection, &module_tree, &snapshot)
+            .expect("local interface-use paths resolve");
+        assert_eq!(result.uses.len(), 2);
+        assert_eq!(result.uses[first].len(), 1);
+        assert_eq!(result.uses[first][0].0, *second);
+        assert_eq!(result.uses[second].len(), 1);
+        assert_eq!(result.uses[second][0].0, *first);
+        let first_reference = root
+            .find("second.Response")
+            .expect("first interface references the second");
+        let second_reference = root
+            .find("first.Request")
+            .expect("second interface references the first");
+        assert_eq!(
+            result.uses[first][0].1.range.start(),
+            sai_vfs::TextSize::new(first_reference as u32)
+        );
+        assert_eq!(
+            result.uses[second][0].1.range.start(),
+            sai_vfs::TextSize::new(second_reference as u32)
+        );
+        assert_eq!(result.cyclic.len(), 2);
+        assert_eq!(result.diagnostics.len(), 1);
+        let diagnostic = &result.diagnostics[0];
+        assert_eq!(diagnostic.code, sai_diagnostics::Code::InterfaceUseCycle);
+        assert_eq!(diagnostic.package.as_deref(), Some("acme:phase1@1.0.0"));
+        assert_eq!(
+            diagnostic
+                .primary()
+                .expect("cycle diagnostic has a primary location")
+                .span
+                .range
+                .start(),
+            sai_diagnostics::TextSize::new(first_reference as u32)
+        );
+        assert_eq!(diagnostic.children().len(), 1);
+        assert_eq!(
+            diagnostic.children()[0]
+                .location
+                .as_ref()
+                .expect("cycle continuation has a location")
+                .span
+                .range
+                .start(),
+            sai_diagnostics::TextSize::new(second_reference as u32)
+        );
+    }
+
+    #[test]
+    fn interface_use_cycle_witness_uses_first_source_reference() {
+        let root = concat!(
+            "interface a {\n",
+            "  type X = Bool\n",
+            "  type Y = Bool\n",
+            "  fn consume(first: b.Request, second: c.Response)\n",
+            "}\n",
+            "interface b { type Request = a.X }\n",
+            "interface c { type Response = a.Y }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let interfaces = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == TopLevelOwnerKind::Interface)
+            .map(|owner| owner.owner.def_id)
+            .collect::<Vec<_>>();
+        assert_eq!(interfaces.len(), 3);
+        let [a, b, c] = interfaces.as_slice() else {
+            unreachable!("the fixture declares three interfaces");
+        };
+
+        let result = database
+            .resolve_interface_uses(&collection, &module_tree, &snapshot)
+            .expect("local interface-use paths resolve");
+        let a_uses = &result.uses[a];
+        assert_eq!(a_uses.len(), 2);
+        assert_eq!(a_uses[0].0, *b);
+        assert_eq!(a_uses[1].0, *c);
+
+        let first_reference = root
+            .find("b.Request")
+            .expect("first parameter references interface b");
+        let second_reference = root
+            .find("c.Response")
+            .expect("second parameter references interface c");
+        assert_eq!(
+            a_uses[0].1.range.start(),
+            sai_vfs::TextSize::new(first_reference as u32)
+        );
+        assert_eq!(
+            a_uses[1].1.range.start(),
+            sai_vfs::TextSize::new(second_reference as u32)
+        );
+        assert_eq!(result.diagnostics.len(), 1);
+        let diagnostic = &result.diagnostics[0];
+        assert_eq!(
+            diagnostic
+                .primary()
+                .expect("cycle diagnostic has a primary location")
+                .span
+                .range
+                .start(),
+            sai_diagnostics::TextSize::new(first_reference as u32)
+        );
+        assert_eq!(diagnostic.children().len(), 1);
+        let continuation = root
+            .find("a.X")
+            .expect("interface b closes the first cycle");
+        assert_eq!(
+            diagnostic.children()[0]
+                .location
+                .as_ref()
+                .expect("cycle continuation has a location")
+                .span
+                .range
+                .start(),
+            sai_diagnostics::TextSize::new(continuation as u32)
+        );
+    }
+
+    #[test]
+    fn interface_generation_order_sorts_nested_module_paths() {
+        let (database, module_tree, snapshot, _) =
+            phase1_fixture(b"interface root {}\n", b"interface child {}\n");
+        let mut database = database;
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let descriptors = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .copied()
+            .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Interface)
+            .collect::<Vec<_>>();
+        assert_eq!(descriptors.len(), 2);
+        let root_descriptor = descriptors
+            .iter()
+            .copied()
+            .find(|descriptor| descriptor.file == module_tree.modules[0].file)
+            .expect("root interface descriptor exists");
+        let deep_descriptor = descriptors
+            .iter()
+            .copied()
+            .find(|descriptor| descriptor.file == module_tree.modules[1].file)
+            .expect("child interface descriptor exists");
+
+        let mut ordered_tree = module_tree;
+        let a = database.symbols.intern("a").expect("module symbol interns");
+        let b = database.symbols.intern("b").expect("module symbol interns");
+        ordered_tree.modules[1].path = vec![a, b];
+        let shallow_file = FileId::new(u32::MAX - 1);
+        let mut shallow_module = ordered_tree.modules[1].clone();
+        shallow_module.file = shallow_file;
+        shallow_module.path = vec![a];
+        ordered_tree.modules.push(shallow_module);
+        let shallow_descriptor = TopLevelOwnerDescriptor {
+            file: shallow_file,
+            ..deep_descriptor
+        };
+
+        let ordered = interface_generation_order(
+            &ordered_tree,
+            vec![root_descriptor, deep_descriptor, shallow_descriptor],
+            &database.symbols,
+        )
+        .expect("generation order resolves module paths");
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|descriptor| descriptor.file)
+                .collect::<Vec<_>>(),
+            [
+                root_descriptor.file,
+                shallow_descriptor.file,
+                deep_descriptor.file,
+            ]
+        );
+    }
+
+    #[test]
+    fn interface_use_collection_propagates_incomplete_type_path_resolution() {
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(b"interface api { type Request = Bool }\n", b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        database.primitive_prelude = Err(PrimitivePreludeBuildError::DuplicateName(
+            "injected test failure",
+        ));
+
+        assert_eq!(
+            database.resolve_interface_uses(&collection, &module_tree, &snapshot),
+            Err(OwnerControlFlowResolutionError::PrimitivePrelude(
+                PrimitivePreludeBuildError::DuplicateName("injected test failure"),
+            ))
+        );
     }
 
     #[test]
