@@ -693,7 +693,7 @@ Interface items and world items have no bodies. The parser reports a `{` after a
 | an explicit discriminant `= INT` | `WIT_EXPLICIT_DISCRIMINANT` | `interface_check`, at the variant; not for an enum that got `INVALID_FLAGS_ENUM` |
 | a record without fields, an enum without variants, a flags type without flags | `WIT_EMPTY_TYPE` | `interface_check`, at the item name |
 | a case with a tuple payload of two or more types, or a record payload | `WIT_INCOMPATIBLE_TYPE` | `interface_check`, at the payload |
-| `@repr` on an interface type | `WIT_INCOMPATIBLE_TYPE` | `interface_check`, at the attribute |
+| `@repr` on an interface type | `WIT_INCOMPATIBLE_TYPE` | attribute target validation ([02](02-frontend-ast-hir.md) §2.10.2), at the attribute |
 | a resource member with an invalid receiver or constructor (§16.6.2) | `WIT_INCOMPATIBLE_TYPE` | `interface_check` |
 | a type without a WIT mapping (§16.6.3) | `WIT_INCOMPATIBLE_TYPE` | `interface_check` |
 | a name without a WIT name (§16.6.3) | `WIT_NAME_NOT_REPRESENTABLE` | `interface_check`, at the name |

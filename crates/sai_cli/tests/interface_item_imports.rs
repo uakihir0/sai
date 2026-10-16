@@ -507,3 +507,75 @@ fn check_reports_wit_discriminants_and_payload_shapes_at_full_spans() {
         "{stdout}"
     );
 }
+
+#[test]
+fn check_reports_interface_repr_at_the_full_attribute_span_once() {
+    let directory = TestDirectory::new();
+    let package = directory.path().join("package");
+    let source_directory = package.join("src");
+    fs::create_dir_all(&source_directory).expect("create package source directory");
+    fs::write(
+        package.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n\n",
+            "targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write package manifest");
+    let source = concat!(
+        "pub interface api {\n",
+        "  @repr(C)\n",
+        "  type Record { value: U32 }\n",
+        "  @repr(C)\n",
+        "  enum Kind { Ready }\n",
+        "}\n",
+    );
+    fs::write(source_directory.join("lib.sai"), source).expect("write interface types");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(package)
+        .args(["--format=json", "check"])
+        .output()
+        .expect("run sai check");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
+    let incompatible = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"WIT_INCOMPATIBLE_TYPE\""))
+        .collect::<Vec<_>>();
+    assert_eq!(incompatible.len(), 2, "{stdout}");
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""))
+            .count(),
+        1,
+        "{stdout}"
+    );
+    let repr_spans = source.match_indices("@repr(C)").collect::<Vec<_>>();
+    assert_eq!(repr_spans.len(), 2);
+    for ((diagnostic, (start, text)), expected) in incompatible
+        .iter()
+        .zip(repr_spans)
+        .zip(["@repr(C)", "@repr(C)"])
+    {
+        assert_eq!(text, expected);
+        let end = start + text.len();
+        assert!(
+            diagnostic.contains(&format!("\"start\":{{\"byte\":{start},")),
+            "diagnostic should start at the full {text:?} attribute: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&format!("\"end\":{{\"byte\":{end},")),
+            "diagnostic should end at the full {text:?} attribute: {diagnostic}"
+        );
+    }
+    assert!(
+        stdout.contains("\"type\":\"summary\",\"errors\":3,"),
+        "{stdout}"
+    );
+}
