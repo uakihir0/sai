@@ -8704,7 +8704,9 @@ impl RootDatabase {
     }
 
     /// Partially resolves type paths and diagnoses test-only references in
-    /// direct top-level struct, alias, enum, and resource declarations.
+    /// direct top-level struct, alias, enum, unrefined distinct, and resource
+    /// declarations. Refinement-bearing distinct declarations use the
+    /// predicate-owner adapter.
     ///
     /// Generic parameters precede the exact file's module scope, which
     /// precedes primitive Prelude entries. Other misses remain deferred for
@@ -8770,19 +8772,27 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
+        let refinement_distinct_owners = collection
+            .scopes
+            .refinement_predicate_owners
+            .iter()
+            .filter(|descriptor| descriptor.kind == RefinementPredicateOwnerKind::Distinct)
+            .map(|descriptor| descriptor.owner)
+            .collect::<HashSet<_>>();
         let descriptors = collection
             .scopes
             .top_level_owners
             .iter()
             .copied()
-            .filter(|descriptor| {
-                matches!(
-                    descriptor.kind,
-                    TopLevelOwnerKind::Struct
-                        | TopLevelOwnerKind::Alias
-                        | TopLevelOwnerKind::Enum
-                        | TopLevelOwnerKind::Resource
-                )
+            .filter(|descriptor| match descriptor.kind {
+                TopLevelOwnerKind::Struct
+                | TopLevelOwnerKind::Alias
+                | TopLevelOwnerKind::Enum
+                | TopLevelOwnerKind::Resource => true,
+                TopLevelOwnerKind::Distinct => {
+                    !refinement_distinct_owners.contains(&descriptor.owner)
+                }
+                _ => false,
             })
             .collect::<Vec<_>>();
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
@@ -8834,6 +8844,7 @@ impl RootDatabase {
                     TopLevelOwnerKind::Struct => ItemTreeKind::Struct,
                     TopLevelOwnerKind::Alias => ItemTreeKind::Alias,
                     TopLevelOwnerKind::Enum => ItemTreeKind::Enum,
+                    TopLevelOwnerKind::Distinct => ItemTreeKind::Distinct,
                     TopLevelOwnerKind::Resource => ItemTreeKind::Resource,
                     _ => {
                         return Err(
@@ -20965,9 +20976,11 @@ mod tests {
                       impl middle.api {}\n\
                       unsafe extern \"wasm\" module \"env\" { fn transitive_extern(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo); }\n\
                       fn qualified_signature(value: middle.api.PublicType, hidden: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType.Associated {}\n\
+                      distinct ForeignPlain<Public: middle.api.PublicType, Private: leaf_model.PrivateType, Missing: middle.api.PublicTypo> = middle.api.PublicType\n\
                       const QUALIFIED_FOREIGN: middle.api.PublicType = { let nested: middle.api.PublicType = 0; 0 }\n\
                       const PRIVATE_FOREIGN: leaf_model.PrivateType = 0\n\
-                      const MISSING_FOREIGN: middle.api.PublicTypo = 0\n",
+                      const MISSING_FOREIGN: middle.api.PublicTypo = 0\n\
+                      ",
                 ),
                 (
                     "local.sai",
@@ -21928,6 +21941,89 @@ mod tests {
             })
         }
         assert!(
+            owner_named(&database, results.owners(), "ForeignDistinct").is_none(),
+            "refinement-bearing distinct paths remain owned by the predicate adapter"
+        );
+        let plain_distinct = owner_named(&database, results.owners(), "ForeignPlain")
+            .expect("unrefined distinct owner is collected");
+        assert_eq!(plain_distinct.kind(), TopLevelOwnerKind::Distinct);
+        let plain_distinct_paths = plain_distinct
+            .path_resolution()
+            .expect("unrefined distinct type paths resolve");
+        assert_eq!(
+            plain_distinct_paths
+                .paths()
+                .values()
+                .filter(|path| {
+                    path.base == expected_deep_public_type
+                        && path.resolved_segments == 3
+                        && path.segment_count == 3
+                })
+                .count(),
+            2,
+            "both the unrefined distinct base and generic bound resolve through the transitive source closure"
+        );
+        let plain_distinct_start = source_text
+            .find("distinct ForeignPlain")
+            .expect("unrefined distinct declaration is in the root source");
+        let plain_distinct_end = source_text[plain_distinct_start..]
+            .find('\n')
+            .expect("unrefined distinct declaration has a line ending")
+            + plain_distinct_start;
+        let plain_distinct_source = &source_text[plain_distinct_start..plain_distinct_end];
+        let plain_distinct_private = plain_distinct_paths
+            .module_path_errors()
+            .iter()
+            .find(|entry| matches!(entry.error(), ModulePathError::InaccessibleMember { .. }))
+            .expect("unrefined distinct generic rejects a private member");
+        assert!(matches!(
+            plain_distinct_private.error(),
+            ModulePathError::InaccessibleMember { name, span, .. }
+                if database.resolve_symbol(name).is_ok_and(|name| name.as_ref() == "PrivateType")
+                    && span.range == member_range(
+                        plain_distinct_source,
+                        plain_distinct_start,
+                        "leaf_model.PrivateType",
+                        "PrivateType"
+                    )
+        ));
+        assert!(matches!(
+            plain_distinct_paths
+                .paths()
+                .get(&plain_distinct_private.hir_id()),
+            Some(PathRes {
+                base: Res::Err,
+                resolved_segments: 2,
+                segment_count: 2,
+            })
+        ));
+        let plain_distinct_missing = plain_distinct_paths
+            .module_path_errors()
+            .iter()
+            .find(|entry| matches!(entry.error(), ModulePathError::MissingMember { .. }))
+            .expect("unrefined distinct generic retains a missing-member error");
+        assert!(matches!(
+            plain_distinct_missing.error(),
+            ModulePathError::MissingMember { name, span, .. }
+                if database.resolve_symbol(name).is_ok_and(|name| name.as_ref() == "PublicTypo")
+                    && span.range == member_range(
+                        plain_distinct_source,
+                        plain_distinct_start,
+                        "middle.api.PublicTypo",
+                        "PublicTypo"
+                    )
+        ));
+        assert!(matches!(
+            plain_distinct_paths
+                .paths()
+                .get(&plain_distinct_missing.hir_id()),
+            Some(PathRes {
+                base: Res::Err,
+                resolved_segments: 3,
+                segment_count: 3,
+            })
+        ));
+        assert!(
             owner_named(&database, results.owners(), "FromPrimitive")
                 .expect("primitive alias owner is collected")
                 .path_resolution()
@@ -22540,6 +22636,7 @@ mod tests {
             "type PrimitiveShadow<U32> = U32\n",
             "type Array = U32\n",
             "type ArrayShadow = Array\n",
+            "distinct PlainDistinct = Fixture\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let parsed = database
@@ -22565,6 +22662,38 @@ mod tests {
         let test_only_results = database
             .resolve_type_owner_paths(&collection, &module_tree, &snapshot)
             .expect("test-only type heads and generic precedence resolve together");
+        assert_eq!(
+            test_only_results
+                .owners()
+                .last()
+                .map(TypeOwnerResolution::kind),
+            Some(TopLevelOwnerKind::Distinct),
+            "the package-local adapter includes an unrefined distinct owner"
+        );
+        let plain_distinct_test_only = test_only_results
+            .owners()
+            .last()
+            .expect("unrefined distinct is the final type owner");
+        let plain_distinct_diagnostics = plain_distinct_test_only
+            .test_only_diagnostics()
+            .expect("unrefined distinct test-only diagnostics succeed");
+        assert_eq!(plain_distinct_diagnostics.len(), 1);
+        assert_eq!(
+            plain_distinct_diagnostics[0].code,
+            sai_diagnostics::Code::TestDependencyOutsideTest,
+            "the unrefined distinct's test-only base is diagnosed"
+        );
+        let plain_distinct_rejected = plain_distinct_test_only
+            .test_only_path_resolution()
+            .expect("unrefined distinct rejected path result succeeds");
+        assert_eq!(plain_distinct_rejected.paths().len(), 1);
+        assert!(
+            plain_distinct_rejected
+                .paths()
+                .values()
+                .all(|path| path.base == Res::Err),
+            "the unrefined distinct's test-only base receives an error sentinel"
+        );
         assert!(
             test_only_results.owners()[5]
                 .test_only_diagnostics()
@@ -22655,6 +22784,7 @@ mod tests {
                 TopLevelOwnerKind::Alias,
                 TopLevelOwnerKind::Alias,
                 TopLevelOwnerKind::Alias,
+                TopLevelOwnerKind::Distinct,
             ]
         );
         assert!(
@@ -22662,6 +22792,18 @@ mod tests {
                 .test_only_diagnostics()
                 .is_ok_and(|items| items.is_empty())),
             "ordinary import metadata produces no test-only diagnostics"
+        );
+        assert!(
+            results
+                .owners()
+                .last()
+                .expect("unrefined distinct is the final type owner")
+                .path_resolution()
+                .expect("unrefined distinct type path succeeds")
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::Alias, _))),
+            "the package-local adapter resolves an unrefined distinct base"
         );
 
         let alias = results.owners()[0]
