@@ -4760,6 +4760,15 @@
 - **Human review:** **Review required:** Confirm that a name-matched function still redirects after its signature check is skipped due to forbidden generics, while rejected resource candidates never redirect; and that the maps are lookup-only with no stable iteration contract. When path application is implemented, review that `AssocFn` kind is preserved and the original interface identity remains available to WIT boundary conversion and generation.
 - **Remaining scope:** Apply the mappings once to eligible owners' resolved paths, keep impl-target and resource-binding owners on unredirected resolution to avoid cycles, handle `Self` for local resource members, and retain the original identities needed by boundary checking and WIT generation.
 
+### IR-625A: Preserve the associated-function kind in redirect results
+
+- **Decision:** Rewrite an implemented interface function as `Res::Def(DefKind::AssocFn, G)`. Keep the original interface function `DefId` separately for WIT identity recovery.
+- **Reason:** Impl functions are associated owners (`ItemTreeKind::AssocFn` / `DefPathData::AssocFn`), not module-level `Fn` definitions. Reusing `DefKind::Fn` would send later type and call resolution through the wrong definition kind.
+- **Verification:** Inspected `DefKind`, `ImplItemKind::Fn`, and the impl-item path construction; the redirect helper regression verifies that it stores a target `DefId`, and the path-application step will assert the `AssocFn` kind directly.
+- **Review:** A hostile redirect-architecture review identified the mismatch in the original plan. The plan now names `AssocFn`; follow-up implementation review will verify the rewritten `Res` and retained source identity.
+- **Human review:** **Review required:** Confirm that an interface function redirect must carry the implementation item's associated-function kind while retaining the original interface function identity for WIT calls and generation.
+- **Remaining scope:** Apply the redirect to one original `PathRes` and retain its original `Res` before integrating it into eligible owners.
+
 ### IR-619: Diagnose resolved interface impl targets of the wrong kind
 
 - **Decision:** Extend the snapshot-bound Phase 1 trait/impl header result with per-owner interface-target diagnostics. For `ImplKind::Interface`, inspect its complete HIR target path only when the existing type-path result covers every segment. Resolve qualified suffixes through the validated active source member scopes and WIT views when those closures are supplied. Accept only `DefKind::Interface`; report `IMPL_TARGET_NOT_INTERFACE` at the full target path for other resolved bindings. Skip absent, partial, `Err`, and unresolved `TestOnly` results so name-resolution failures do not cascade. Feed the diagnostic channel into the normal `sai check` owner-diagnostic collection.

@@ -896,7 +896,7 @@ pub redirected: HashMap<HirId, DefId>,     // path → its original resolution, 
 
 In every owner of a package `P`, except the interface impl items and their `type R = C` owners, `resolve_owner` applies `interface_impls(P).redirect` after a path resolves:
 
-1. An interface function `F` that `P` implements becomes `Res::Def(DefKind::Fn, G)`.
+1. An interface function `F` that `P` implements becomes `Res::Def(DefKind::AssocFn, G)`, because `G` is an associated function declared inside an impl.
 2. A resource `R` (abstract or view) that `P` binds becomes `Res::Def(DefKind::Resource, C)`. `Self` in the members of a local resource `R` denotes `C`.
 3. In each case the original `DefId` is stored in `redirected` under the path's `HirId`.
 
