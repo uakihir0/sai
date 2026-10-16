@@ -764,8 +764,10 @@ The current SAI subset rejects record-shaped variant payloads as a whole (§16.6
    ```
 
    `package_wit_names(P)` also reports `WIT_NAME_NOT_REPRESENTABLE` for the names of interfaces and worlds. An interface or world whose name failed has no entry. Its owner is poisoned for generation (§16.10.1).
-2. **Inside an interface**, the types and functions of the interface, the members of each resource, the fields of each record, the cases of each enum, and the parameters of each function. These are checked by `interface_check`.
+2. **Inside an interface**, the types (including resource declarations) and functions of the interface share one scope. Each resource's members, each record's fields, each enum's cases, and each function's parameters have their own scope. These are checked by `interface_check`.
 3. **Inside a world**, the imports and the exports. These are checked by `world_check` on the elaborated world (§16.8.3).
+
+Names synthesized by a WIT `use` of another interface's type also occupy the containing interface scope. Check those aliases after boundary-type analysis identifies the types actually emitted; generic bounds and other non-boundary paths do not create WIT `use` statements.
 
 For imported WIT, collisions are resolved by §16.4.2 and give at most `WIT_ITEM_SHADOWED`.
 

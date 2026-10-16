@@ -3,7 +3,10 @@ use sai_hir::items::{HirOwner, InterfaceItemKind, MemberRole, OwnerNode, Variant
 use sai_hir::types::Name;
 use sai_hir::{OwnerId, Span};
 use sai_intern::{Interner, LookupError};
-use sai_resolve::{sai_identifier_to_wit_name, suggested_representable_name};
+use sai_resolve::{
+    WitNameDefinition, sai_identifier_to_wit_name, suggested_representable_name,
+    wit_name_collisions,
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum InterfaceCheckIssueKind {
@@ -15,6 +18,7 @@ pub enum InterfaceCheckIssueKind {
     InvalidFlagsEnum,
     InvalidResourceReceiver,
     WitNameNotRepresentable,
+    WitNameCollision,
 }
 
 impl InterfaceCheckIssueKind {
@@ -27,6 +31,7 @@ impl InterfaceCheckIssueKind {
             Self::InvalidFlagsEnum => Code::InvalidFlagsEnum,
             Self::InvalidResourceReceiver => Code::WitIncompatibleType,
             Self::WitNameNotRepresentable => Code::WitNameNotRepresentable,
+            Self::WitNameCollision => Code::WitNameCollision,
         }
     }
 
@@ -46,6 +51,7 @@ impl InterfaceCheckIssueKind {
             }
             Self::InvalidResourceReceiver => "resource methods must borrow their resource receiver",
             Self::WitNameNotRepresentable => "SAI name cannot be represented as a WIT name",
+            Self::WitNameCollision => "multiple declarations map to the same WIT name",
         }
     }
 
@@ -59,6 +65,7 @@ impl InterfaceCheckIssueKind {
             Self::InvalidFlagsEnum => "invalid flags enum",
             Self::InvalidResourceReceiver => "invalid resource receiver",
             Self::WitNameNotRepresentable => "not representable as a WIT name",
+            Self::WitNameCollision => "colliding WIT name",
         }
     }
 }
@@ -71,6 +78,7 @@ pub struct InterfaceCheckIssue {
     pub span: Span,
     pub name: Option<String>,
     pub suggestion: Option<String>,
+    pub related_span: Option<Span>,
 }
 
 impl InterfaceCheckIssue {
@@ -81,6 +89,9 @@ impl InterfaceCheckIssue {
             }
             (InterfaceCheckIssueKind::WitNameNotRepresentable, None) => {
                 "unnamed interface parameters cannot be represented as WIT names".to_owned()
+            }
+            (InterfaceCheckIssueKind::WitNameCollision, Some(name)) => {
+                format!("multiple declarations map to WIT name `{name}`")
             }
             _ => self.kind.message().to_owned(),
         }
@@ -108,22 +119,39 @@ pub fn interface_item_check(
     push_name_issue(&mut issues, item.owner_id, item.name, symbols)?;
     match item.kind {
         InterfaceItemKind::Struct { fields, .. } => {
+            let mut field_names = Vec::with_capacity(fields.len());
             for field in fields {
-                push_name_issue(&mut issues, item.owner_id, field.name, symbols)?;
+                if let Some(definition) =
+                    push_name_issue(&mut issues, item.owner_id, field.name, symbols)?
+                {
+                    field_names.push(definition);
+                }
             }
+            push_name_collisions(&mut issues, field_names);
         }
         InterfaceItemKind::Enum { variants, .. } => {
+            let mut case_names = Vec::with_capacity(variants.len());
             for variant in variants {
-                push_name_issue(&mut issues, item.owner_id, variant.name, symbols)?;
+                if let Some(definition) =
+                    push_name_issue(&mut issues, item.owner_id, variant.name, symbols)?
+                {
+                    case_names.push(definition);
+                }
             }
+            push_name_collisions(&mut issues, case_names);
         }
         InterfaceItemKind::Fn { sig, .. } | InterfaceItemKind::ResourceMember { sig, .. } => {
+            let mut parameter_names = Vec::with_capacity(sig.params.len());
             for param in sig.params {
                 if param.is_self {
                     continue;
                 }
                 if let Some(name) = param.name {
-                    push_name_issue(&mut issues, item.owner_id, name, symbols)?;
+                    if let Some(definition) =
+                        push_name_issue(&mut issues, item.owner_id, name, symbols)?
+                    {
+                        parameter_names.push(definition);
+                    }
                 } else {
                     issues.push(InterfaceCheckIssue {
                         owner: item.owner_id,
@@ -131,9 +159,11 @@ pub fn interface_item_check(
                         span: param.span,
                         name: None,
                         suggestion: None,
+                        related_span: None,
                     });
                 }
             }
+            push_name_collisions(&mut issues, parameter_names);
         }
         InterfaceItemKind::Alias { .. }
         | InterfaceItemKind::Refined { .. }
@@ -146,6 +176,7 @@ pub fn interface_item_check(
             span,
             name: None,
             suggestion: None,
+            related_span: None,
         });
     }
     if let Some(span) = item.where_clause_span {
@@ -155,6 +186,7 @@ pub fn interface_item_check(
             span,
             name: None,
             suggestion: None,
+            related_span: None,
         });
     }
     if let InterfaceItemKind::ResourceMember {
@@ -174,6 +206,7 @@ pub fn interface_item_check(
                     span: receiver.ty.span,
                     name: None,
                     suggestion: None,
+                    related_span: None,
                 });
             }
         }
@@ -185,6 +218,7 @@ pub fn interface_item_check(
             span: clause,
             name: None,
             suggestion: None,
+            related_span: None,
         });
     }
     let flags_invalid = match item.kind {
@@ -205,6 +239,7 @@ pub fn interface_item_check(
                     span: variant.span,
                     name: None,
                     suggestion: None,
+                    related_span: None,
                 });
             }
         }
@@ -216,6 +251,7 @@ pub fn interface_item_check(
             span: item.name.span,
             name: None,
             suggestion: None,
+            related_span: None,
         });
     }
     if let InterfaceItemKind::Enum { variants, .. } = item.kind {
@@ -232,6 +268,7 @@ pub fn interface_item_check(
                     span: variant.payload_span.unwrap_or(variant.span),
                     name: None,
                     suggestion: None,
+                    related_span: None,
                 });
             }
         }
@@ -244,25 +281,45 @@ fn push_name_issue(
     owner: OwnerId,
     name: Name,
     symbols: &Interner,
-) -> Result<(), InterfaceCheckError> {
+) -> Result<Option<WitNameDefinition>, InterfaceCheckError> {
     if name.is_error() {
-        return Ok(());
+        return Ok(None);
     }
     let source_name = symbols
         .resolve(name.sym)
         .map_err(InterfaceCheckError::SymbolLookup)?;
-    if sai_identifier_to_wit_name(&source_name).is_some() {
-        return Ok(());
-    }
     let source_name = source_name.to_string();
-    issues.push(InterfaceCheckIssue {
+    if sai_identifier_to_wit_name(&source_name).is_none() {
+        issues.push(InterfaceCheckIssue {
+            owner,
+            kind: InterfaceCheckIssueKind::WitNameNotRepresentable,
+            span: name.span,
+            suggestion: suggested_representable_name(&source_name),
+            name: Some(source_name.clone()),
+            related_span: None,
+        });
+    }
+    Ok(Some(WitNameDefinition {
+        source_name,
         owner,
-        kind: InterfaceCheckIssueKind::WitNameNotRepresentable,
         span: name.span,
-        suggestion: suggested_representable_name(&source_name),
-        name: Some(source_name),
-    });
-    Ok(())
+    }))
+}
+
+fn push_name_collisions(
+    issues: &mut Vec<InterfaceCheckIssue>,
+    definitions: impl IntoIterator<Item = WitNameDefinition>,
+) {
+    for collision in wit_name_collisions(definitions) {
+        issues.push(InterfaceCheckIssue {
+            owner: collision.later_owner,
+            kind: InterfaceCheckIssueKind::WitNameCollision,
+            span: collision.later_span,
+            name: Some(collision.wit_name),
+            suggestion: None,
+            related_span: Some(collision.earlier_span),
+        });
+    }
 }
 
 fn invalid_flags_enum_issue(
@@ -291,6 +348,7 @@ fn invalid_flags_enum_issue(
         span,
         name: None,
         suggestion: None,
+        related_span: None,
     })
 }
 
@@ -687,6 +745,60 @@ mod tests {
         assert_eq!(
             issues[0].message(),
             "SAI name `User_Id` cannot be represented as a WIT name"
+        );
+    }
+
+    #[test]
+    fn interface_local_name_collisions_retain_the_first_declaration_span() {
+        let (ids, symbols) = test_ids();
+        let ty = Ty {
+            hir_id: ids.hir,
+            kind: TyKind::Err,
+            span: span(60, 63),
+        };
+        let fields = [
+            FieldDef {
+                hir_id: ids.hir,
+                def_id: ids.owner.def_id,
+                vis: Visibility::Pub,
+                name: name(&symbols, "fetch_user", 10, 20),
+                ty: &ty,
+            },
+            FieldDef {
+                hir_id: ids.hir,
+                def_id: ids.owner.def_id,
+                vis: Visibility::Pub,
+                name: name(&symbols, "FetchUser", 30, 39),
+                ty: &ty,
+            },
+            FieldDef {
+                hir_id: ids.hir,
+                def_id: ids.owner.def_id,
+                vis: Visibility::Pub,
+                name: name(&symbols, "FetchUser", 40, 49),
+                ty: &ty,
+            },
+        ];
+        let issues = check_item_kind(
+            &ids,
+            name(&symbols, "Record", 0, 6),
+            InterfaceItemKind::Struct {
+                generics: EMPTY_GENERICS,
+                fields: &fields,
+            },
+            false,
+            &symbols,
+        )
+        .expect("HIR symbols resolve");
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].kind, InterfaceCheckIssueKind::WitNameCollision);
+        assert_eq!(issues[0].name.as_deref(), Some("fetch-user"));
+        assert_eq!(issues[0].span, span(30, 39));
+        assert_eq!(issues[0].related_span, Some(span(10, 20)));
+        assert_eq!(
+            issues[0].message(),
+            "multiple declarations map to WIT name `fetch-user`"
         );
     }
 

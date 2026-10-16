@@ -27426,6 +27426,198 @@ mod tests {
     }
 
     #[test]
+    fn interface_check_collision_related_location_rebinds_to_newer_snapshot() {
+        let root = concat!(
+            "pub interface api {\n",
+            "  type FetchUser = U32\n",
+            "  fn fetch_user()\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("interface collision checks collect");
+        let collision = collection
+            .interface_check_diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitNameCollision)
+            .expect("the interface declarations collide");
+        assert_eq!(
+            collision
+                .primary()
+                .expect("collision has a primary location")
+                .file
+                .snapshot,
+            Some(17)
+        );
+        assert!(matches!(
+            &collision.related()[..],
+            [sai_diagnostics::Related::DeclaredHere { location, .. }]
+                if location.file.snapshot == Some(17)
+        ));
+        let fingerprint = collection.interface_uses_fingerprint();
+        let package_key = collection.package_key().clone();
+        let cached_memo = database
+            .interface_uses
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("interface-use query memo is available");
+
+        let newer_snapshot = snapshot_with_version(&snapshot, 18);
+        let rebound_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &newer_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("the same collision rebinds for a newer snapshot");
+        let rebound = rebound_collection
+            .interface_check_diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitNameCollision)
+            .expect("the rebound collision is present");
+        assert_eq!(
+            rebound
+                .primary()
+                .expect("collision has a primary location")
+                .file
+                .snapshot,
+            Some(18)
+        );
+        assert!(matches!(
+            &rebound.related()[..],
+            [sai_diagnostics::Related::DeclaredHere { location, .. }]
+                if location.file.snapshot == Some(18)
+        ));
+        assert_eq!(
+            rebound_collection.interface_uses_fingerprint(),
+            fingerprint,
+            "snapshot rebinding must not change the stable result fingerprint"
+        );
+        let rebound_memo = database
+            .interface_uses
+            .query
+            .get(&mut database.query_database, package_key)
+            .expect("interface-use query memo remains available");
+        assert!(
+            Arc::ptr_eq(&cached_memo, &rebound_memo),
+            "version-only snapshot changes reuse the detached diagnostic memo"
+        );
+    }
+
+    #[test]
+    fn interface_check_collision_related_location_changes_stable_fingerprint() {
+        let root_before = concat!(
+            "pub interface api {\n",
+            "  type FetchUser = U32\n",
+            "  fn fetch_user()\n",
+            "}\n",
+        );
+        let root_after = concat!(
+            "pub interface api {\n",
+            "  type  FetchUser = U32\n",
+            " fn fetch_user()\n",
+            "}\n",
+        );
+        let (database, module_tree, snapshot, _) = phase1_fixture(root_before.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let mut database = database;
+        let first_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("the original interface checks collect");
+        let first_diagnostic = first_collection
+            .interface_check_diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitNameCollision)
+            .expect("the original declarations collide");
+        let first_primary_start = first_diagnostic
+            .primary()
+            .expect("collision has a primary location")
+            .span
+            .range
+            .start();
+        let first_related_start = match &first_diagnostic.related()[..] {
+            [sai_diagnostics::Related::DeclaredHere { location, .. }] => {
+                location.span.range.start()
+            }
+            related => panic!("collision has exactly one earlier declaration: {related:?}"),
+        };
+        let first_message = first_diagnostic.message.clone();
+        let first_fingerprint = first_collection.interface_uses_fingerprint();
+        assert_eq!(
+            root_before.as_bytes().get(
+                first_primary_start.to_usize()..first_primary_start.to_usize() + "fetch_user".len()
+            ),
+            Some(b"fetch_user".as_slice()),
+            "the primary location names the later function"
+        );
+
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture_with_database(database, root_after.as_bytes(), b"");
+        let second_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("the shifted interface checks collect");
+        let second_diagnostic = second_collection
+            .interface_check_diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitNameCollision)
+            .expect("the shifted declarations still collide");
+        let second_primary_start = second_diagnostic
+            .primary()
+            .expect("collision has a primary location")
+            .span
+            .range
+            .start();
+        let second_related_start = match &second_diagnostic.related()[..] {
+            [sai_diagnostics::Related::DeclaredHere { location, .. }] => {
+                location.span.range.start()
+            }
+            related => panic!("collision has exactly one earlier declaration: {related:?}"),
+        };
+
+        assert_eq!(second_diagnostic.message, first_message);
+        assert_eq!(
+            second_primary_start, first_primary_start,
+            "the later function's primary byte location is unchanged"
+        );
+        assert_eq!(
+            root_after.as_bytes().get(
+                second_primary_start.to_usize()
+                    ..second_primary_start.to_usize() + "fetch_user".len()
+            ),
+            Some(b"fetch_user".as_slice()),
+            "the primary location still names the later function"
+        );
+        assert_eq!(
+            second_related_start.to_usize(),
+            first_related_start.to_usize() + 1,
+            "the earlier type name shifted by one byte"
+        );
+        assert_ne!(
+            second_collection.interface_uses_fingerprint(),
+            first_fingerprint,
+            "a related declaration span change must invalidate the stable result fingerprint"
+        );
+    }
+
+    #[test]
     fn interface_check_reports_generic_lists_and_where_clauses_at_full_spans() {
         let root = concat!(
             "pub interface api {\n",
@@ -27436,7 +27628,7 @@ mod tests {
             "  resource Handle {\n",
             "    fn method<T>() where T: Copy\n",
             "  }\n",
-            "  type Plain { value: U32 }\n",
+            "  type Ordinary { value: U32 }\n",
             "  fn plain()\n",
             "}\n",
         );

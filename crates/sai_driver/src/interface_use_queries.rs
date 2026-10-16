@@ -9,10 +9,13 @@ use super::{
     owner_test_only_path_candidates, owner_type_generic_resolutions,
     resolve_partial_type_owner_paths,
 };
-use sai_diagnostics::{Child, ChildKind, Diagnostic, Location, Severity, SourceRef, Value};
+use sai_diagnostics::{
+    Child, ChildKind, Diagnostic, Location, Related, Severity, SourceRef, Value,
+};
 use sai_hir::arena::HirArena;
 use sai_hir::item_tree::ItemTreeKind;
-use sai_hir::items::{HirOwner, InterfaceItemKind, ItemKind, OwnerNode};
+use sai_hir::items::{HirOwner, InterfaceItemKind, ItemKind, MemberRole, OwnerNode};
+use sai_hir::types::Name;
 use sai_hir::{DefPathError, DefPathHash, DefPathInternerError, LocalDefId, OwnerId, Symbol};
 use sai_intern::{Interner, PackageInterner};
 use sai_query::{DerivedQuery, QueryDatabase, QueryError};
@@ -20,7 +23,10 @@ use sai_resolve::module_member_lookup::ModuleMemberIndex;
 use sai_resolve::package_scopes::{
     PackageScopesError, Phase1PackageScopes, Res, TopLevelOwnerKind,
 };
-use sai_resolve::{InterfaceUseReference, InterfaceUses, InterfaceUsesInput, interface_uses};
+use sai_resolve::{
+    InterfaceUseReference, InterfaceUses, InterfaceUsesInput, WitNameDefinition, interface_uses,
+    wit_name_collisions,
+};
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher};
 use sai_ty::iface::{InterfaceCheckError, InterfaceCheckIssue, interface_item_check};
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
@@ -255,6 +261,98 @@ fn append_interface_item_diagnostics(
                 })
                 .expect("unbound diagnostics accept help children");
         }
+        if let Some(earlier_span) = issue.related_span {
+            let related_location = Location::from_decoded_source(
+                source_ref.clone(),
+                sai_diagnostics::Span::new(earlier_span.file, earlier_span.range),
+                source,
+            )
+            .ok_or_else(|| {
+                InterfaceUsesQueryError::Collection(
+                    OwnerControlFlowResolutionError::InvalidSourceLocation(issue.owner),
+                )
+            })?;
+            diagnostic
+                .push_related(Related::DeclaredHere {
+                    location: related_location,
+                    what: "earlier declaration".to_owned(),
+                })
+                .expect("unbound diagnostics accept related locations");
+        }
+        diagnostics.push(diagnostic);
+    }
+    Ok(())
+}
+
+fn wit_name_definition(
+    name: Name,
+    owner: OwnerId,
+    symbols: &Interner,
+) -> Result<Option<WitNameDefinition>, InterfaceUsesQueryError> {
+    if name.is_error() {
+        return Ok(None);
+    }
+    let source_name = symbols
+        .resolve(name.sym)
+        .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+        .map_err(InterfaceUsesQueryError::Collection)?;
+    Ok(Some(WitNameDefinition {
+        source_name: source_name.to_string(),
+        owner,
+        span: name.span,
+    }))
+}
+
+fn append_wit_name_collision_diagnostics(
+    definitions: impl IntoIterator<Item = WitNameDefinition>,
+    source_ref: &SourceRef,
+    source: &sai_vfs::SourceFile,
+    snapshot: &WorkspaceSnapshot,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<(), InterfaceUsesQueryError> {
+    for collision in wit_name_collisions(definitions) {
+        let snapshot_file = snapshot.file(collision.later_span.file).ok_or_else(|| {
+            InterfaceUsesQueryError::Collection(
+                OwnerControlFlowResolutionError::MissingSnapshotFile(collision.later_span.file),
+            )
+        })?;
+        let location = Location::from_decoded_source(
+            source_ref.clone(),
+            sai_diagnostics::Span::new(collision.later_span.file, collision.later_span.range),
+            source,
+        )
+        .ok_or_else(|| {
+            InterfaceUsesQueryError::Collection(
+                OwnerControlFlowResolutionError::InvalidSourceLocation(collision.later_owner),
+            )
+        })?;
+        let earlier_location = Location::from_decoded_source(
+            source_ref.clone(),
+            sai_diagnostics::Span::new(collision.earlier_span.file, collision.earlier_span.range),
+            source,
+        )
+        .ok_or_else(|| {
+            InterfaceUsesQueryError::Collection(
+                OwnerControlFlowResolutionError::InvalidSourceLocation(collision.later_owner),
+            )
+        })?;
+        let mut diagnostic = Diagnostic::new(
+            sai_diagnostics::Code::WitNameCollision,
+            Severity::Error,
+            format!(
+                "multiple declarations map to WIT name `{}`",
+                collision.wit_name
+            ),
+            Some(location),
+        );
+        diagnostic.primary_label = "colliding WIT name".to_owned();
+        diagnostic.package = snapshot_file.package().map(str::to_owned);
+        diagnostic
+            .push_related(Related::DeclaredHere {
+                location: earlier_location,
+                what: "earlier declaration".to_owned(),
+            })
+            .expect("unbound diagnostics accept related locations");
         diagnostics.push(diagnostic);
     }
     Ok(())
@@ -428,6 +526,7 @@ fn collect_interface_uses_input(
             module_scope_with_interface_members(module_scope, scopes, descriptor.owner)
                 .map_err(InterfaceUsesQueryError::Collection)?;
         let mut owner_references = Vec::new();
+        let mut interface_item_names = Vec::with_capacity(member_entries.len());
         for (entry, member_owner) in member_entries
             .into_iter()
             .zip(parent_members.iter().copied())
@@ -465,6 +564,16 @@ fn collect_interface_uses_input(
                     sai_hir::lower::HirLoweringError::ItemTreeEntryMismatch,
                 ))
             })?;
+            let OwnerNode::InterfaceItem(item) = member_hir.node else {
+                return Err(InterfaceUsesQueryError::Collection(
+                    OwnerControlFlowResolutionError::Lowering(
+                        sai_hir::lower::HirLoweringError::ItemTreeEntryMismatch,
+                    ),
+                ));
+            };
+            if let Some(definition) = wit_name_definition(item.name, member_owner, symbols)? {
+                interface_item_names.push(definition);
+            }
             collect_owner_references(
                 &mut owner_references,
                 descriptor.owner.def_id,
@@ -515,6 +624,7 @@ fn collect_interface_uses_input(
                     ),
                 ));
             }
+            let mut resource_member_names = Vec::with_capacity(method_entries.len());
             for (method_entry, method_owner) in method_entries
                 .into_iter()
                 .zip(resource_members.iter().copied())
@@ -550,6 +660,13 @@ fn collect_interface_uses_input(
                     &prepared.snapshot,
                     &mut interface_check_diagnostics,
                 )?;
+                if let OwnerNode::InterfaceItem(item) = method_hir.node
+                    && let InterfaceItemKind::ResourceMember { role, .. } = item.kind
+                    && role != MemberRole::Constructor
+                    && let Some(definition) = wit_name_definition(item.name, method_owner, symbols)?
+                {
+                    resource_member_names.push(definition);
+                }
                 collect_owner_references(
                     &mut owner_references,
                     descriptor.owner.def_id,
@@ -565,7 +682,21 @@ fn collect_interface_uses_input(
                     inputs,
                 )?;
             }
+            append_wit_name_collision_diagnostics(
+                resource_member_names,
+                &inputs.source_ref,
+                &inputs.source,
+                &prepared.snapshot,
+                &mut interface_check_diagnostics,
+            )?;
         }
+        append_wit_name_collision_diagnostics(
+            interface_item_names,
+            &inputs.source_ref,
+            &inputs.source,
+            &prepared.snapshot,
+            &mut interface_check_diagnostics,
+        )?;
         references.extend(owner_references);
     }
 
@@ -755,6 +886,21 @@ fn stable_interface_uses_fingerprint(
         diagnostic.code.as_str().stable_hash(&mut hasher);
         diagnostic.message.stable_hash(&mut hasher);
         hash_optional_location(diagnostic.primary(), &sources, &mut hasher)?;
+        hasher.write_len(u64::try_from(diagnostic.related().len()).unwrap_or(u64::MAX));
+        for related in diagnostic.related() {
+            match related {
+                Related::DeclaredHere { location, what } => {
+                    hasher.write_tag(1);
+                    what.stable_hash(&mut hasher);
+                    hash_optional_location(Some(location), &sources, &mut hasher)?;
+                }
+                _ => {
+                    return Err(InterfaceUsesQueryError::DiagnosticTemplate(
+                        "unsupported related interface-check diagnostic".to_owned(),
+                    ));
+                }
+            }
+        }
     }
     Ok(hasher.finish())
 }

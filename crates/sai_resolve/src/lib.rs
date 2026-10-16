@@ -14,12 +14,14 @@ pub mod use_path;
 pub mod use_target;
 pub mod use_target_diagnostics;
 pub mod wit_name;
+pub mod wit_name_collisions;
 
 pub use interface_uses::{
     InterfaceUseReference, InterfaceUses, InterfaceUsesInput, interface_uses,
 };
 pub use package_wit_names::{PackageWitNames, PackageWitNamesError, package_wit_names};
 pub use wit_name::{sai_identifier_to_wit_name, suggested_representable_name};
+pub use wit_name_collisions::{WitNameCollision, WitNameDefinition, wit_name_collisions};
 
 use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Value};
 use sai_intern::{InternError, Interner, PackageId, PackageIdError, PackageInterner, Symbol};

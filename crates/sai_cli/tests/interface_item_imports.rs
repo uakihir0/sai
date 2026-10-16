@@ -235,6 +235,182 @@ fn check_reports_package_wit_name_collisions_and_counts_them() {
 }
 
 #[test]
+fn check_reports_interface_wit_name_collisions_only_within_each_scope() {
+    let directory = TestDirectory::new();
+    let package = directory.path().join("package");
+    let source_directory = package.join("src");
+    fs::create_dir_all(&source_directory).expect("create package source directory");
+    fs::write(
+        package.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n\n",
+            "targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write package manifest");
+    let source = concat!(
+        "pub interface api {\n",
+        "    type FetchUser = U32\n",
+        "    type Fetch__User = U32\n",
+        "    fn fetch_user()\n",
+        "    type FirstRecord { value: U32 }\n",
+        "    type SecondRecord { value: U32 }\n",
+        "    enum FirstState { Ready }\n",
+        "    enum SecondState { Ready }\n",
+        "    fn first(value: U32)\n",
+        "    fn second(value: U32)\n",
+        "    resource FirstResource {\n",
+        "        fn get(self: borrow Self)\n",
+        "    }\n",
+        "    fn first_resource()\n",
+        "    resource SecondResource {\n",
+        "        fn get(self: borrow Self)\n",
+        "    }\n",
+        "}\n",
+    );
+    fs::write(source_directory.join("lib.sai"), source)
+        .expect("write interface with scoped WIT names");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(package)
+        .args(["--format=json", "check"])
+        .output()
+        .expect("run sai check");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
+    let collisions = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"WIT_NAME_COLLISION\""))
+        .collect::<Vec<_>>();
+    assert_eq!(collisions.len(), 2, "{stdout}");
+
+    let earlier_start = source
+        .find("FetchUser")
+        .expect("the earlier type name is present");
+    let earlier_end = earlier_start + "FetchUser".len();
+    let later_start = source
+        .find("fetch_user")
+        .expect("the later function name is present");
+    let later_end = later_start + "fetch_user".len();
+    assert!(
+        collisions[0].contains(&format!(
+            "\"primary\":{{\"file\":{{\"path\":\"src/lib.sai\",\"package\":\"acme:check@0.1.0\",\"snapshot\":null}},\"start\":{{\"byte\":{later_start},"
+        )),
+        "the collision primary should point to the later function name: {}",
+        collisions[0]
+    );
+    assert!(
+        collisions[0].contains(&format!("\"end\":{{\"byte\":{later_end},")),
+        "the collision primary should span the complete function name: {}",
+        collisions[0]
+    );
+    assert!(
+        collisions[0].contains("\"what\":\"earlier declaration\""),
+        "{}",
+        collisions[0]
+    );
+    let related = collisions[0]
+        .split("\"related\":[")
+        .nth(1)
+        .expect("the collision has a related earlier declaration");
+    assert!(
+        related.starts_with(
+            "{\"kind\":\"declared_here\",\"location\":{\"file\":{\"path\":\"src/lib.sai\",\"package\":\"acme:check@0.1.0\",\"snapshot\":null},"
+        ),
+        "{related}"
+    );
+    assert!(
+        related.contains(&format!("\"start\":{{\"byte\":{earlier_start},")),
+        "the related location should start at the earlier type name: {related}"
+    );
+    assert!(
+        related.contains(&format!("\"end\":{{\"byte\":{earlier_end},")),
+        "the related location should span the complete type name: {related}"
+    );
+    let resource_primary_start = source
+        .find("first_resource")
+        .expect("the later function is present");
+    let resource_primary_end = resource_primary_start + "first_resource".len();
+    assert!(
+        collisions[1].contains(&format!(
+            "\"primary\":{{\"file\":{{\"path\":\"src/lib.sai\",\"package\":\"acme:check@0.1.0\",\"snapshot\":null}},\"start\":{{\"byte\":{resource_primary_start},"
+        )),
+        "the resource/function collision should point to the later function: {}",
+        collisions[1]
+    );
+    assert!(
+        collisions[1].contains(&format!("\"end\":{{\"byte\":{resource_primary_end},")),
+        "the resource/function collision should span the full function name: {}",
+        collisions[1]
+    );
+    let resource_related = collisions[1]
+        .split("\"related\":[")
+        .nth(1)
+        .expect("the resource/function collision has an earlier location");
+    let resource_earlier_start = source
+        .find("FirstResource")
+        .expect("the earlier resource is present");
+    let resource_earlier_end = resource_earlier_start + "FirstResource".len();
+    assert!(
+        resource_related.starts_with(
+            "{\"kind\":\"declared_here\",\"location\":{\"file\":{\"path\":\"src/lib.sai\",\"package\":\"acme:check@0.1.0\",\"snapshot\":null},"
+        ),
+        "{resource_related}"
+    );
+    assert!(
+        resource_related.contains(&format!("\"start\":{{\"byte\":{resource_earlier_start},")),
+        "the related location should start at the resource name: {resource_related}"
+    );
+    assert!(
+        resource_related.contains(&format!("\"end\":{{\"byte\":{resource_earlier_end},")),
+        "the related location should span the full resource name: {resource_related}"
+    );
+
+    let unrepresentable = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"WIT_NAME_NOT_REPRESENTABLE\""))
+        .collect::<Vec<_>>();
+    assert_eq!(unrepresentable.len(), 1, "{stdout}");
+    let unrepresentable_start = source
+        .find("Fetch__User")
+        .expect("the unrepresentable type name is present");
+    let unrepresentable_end = unrepresentable_start + "Fetch__User".len();
+    assert!(
+        unrepresentable[0].contains(&format!("\"start\":{{\"byte\":{unrepresentable_start},")),
+        "the unrepresentable name diagnostic should point to Fetch__User: {}",
+        unrepresentable[0]
+    );
+    assert!(
+        unrepresentable[0].contains(&format!("\"end\":{{\"byte\":{unrepresentable_end},")),
+        "the unrepresentable name diagnostic should span Fetch__User: {}",
+        unrepresentable[0]
+    );
+
+    for code in [
+        "DUPLICATE_BINDING",
+        "EXPECTED_TOKEN",
+        "INTERNAL_COMPILER_ERROR",
+    ] {
+        assert!(
+            !stdout.contains(&format!("\"code\":\"{code}\"")),
+            "{code} should not be reported:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("\"type\":\"summary\",\"errors\":4,"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\"stage\":0,\"feature\":\"sai check\""),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn check_reports_unrepresentable_interface_names_and_accepts_raw_keyword_names() {
     let directory = TestDirectory::new();
     let package = directory.path().join("package");
@@ -465,7 +641,7 @@ fn check_reports_generic_interface_types_functions_and_resource_members_once() {
         "  resource Handle {\n",
         "    fn method<T>() where T: Copy\n",
         "  }\n",
-        "  type Plain { value: U32 }\n",
+        "  type Ordinary { value: U32 }\n",
         "  fn plain()\n",
         "}\n",
     );
