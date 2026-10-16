@@ -2449,6 +2449,7 @@ pub struct ConstOwnerResolutions {
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
+    member_scope_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<ConstOwnerResolution>,
 }
 
@@ -2465,6 +2466,20 @@ impl ConstOwnerResolutions {
         self.snapshot_id == collection.snapshot_id
             && self.target_cfg == collection.target_cfg
             && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn matches_member_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && member_scopes.matches_collection(collection)
+            && self.member_scope_closure_fingerprint == Some(member_scopes.closure_fingerprint)
+    }
+
+    pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
+        self.member_scope_closure_fingerprint
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -6667,6 +6682,34 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<ConstOwnerResolutions, OwnerControlFlowResolutionError> {
+        self.resolve_const_owner_paths_inner(collection, module_tree, snapshot, None)
+    }
+
+    /// Resolves const-owner type prefixes through a validated active-source
+    /// member-scope closure. Other owner results remain identical to the
+    /// package-local analysis bridge.
+    pub fn resolve_const_owner_paths_with_member_scopes(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> Result<ConstOwnerResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.resolve_const_owner_paths_inner(collection, module_tree, snapshot, Some(member_scopes))
+    }
+
+    fn resolve_const_owner_paths_inner(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+    ) -> Result<ConstOwnerResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
         }
@@ -6674,8 +6717,22 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
-        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
-        let source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let mut indexed_scopes =
+            Vec::with_capacity(1 + member_scopes.map_or(0, |scopes| scopes.source_packages.len()));
+        indexed_scopes.push(collection.scopes());
+        if let Some(member_scopes) = member_scopes {
+            indexed_scopes.extend(
+                member_scopes
+                    .source_packages
+                    .iter()
+                    .map(Phase1ModuleMemberScopePackage::scopes),
+            );
+        }
+        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let source_graph_packages = member_scopes
+            .map(|scopes| &scopes.source_graph_packages)
+            .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let descriptors = collection
             .scopes
@@ -6810,7 +6867,7 @@ impl RootDatabase {
                                     module_scope,
                                     Some(&module_members),
                                     descriptor.owner.def_id.package(),
-                                    Some(&source_graph_packages),
+                                    Some(source_graph_packages),
                                 )))
                             }
                             (Err(error), _, _) => Err(error.clone()),
@@ -6927,6 +6984,8 @@ impl RootDatabase {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
+            member_scope_closure_fingerprint: member_scopes
+                .map(|scopes| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -20456,7 +20515,10 @@ mod tests {
                       type FromPrimitive = U32\n\
                       type GenericPrimitive<U32> = U32\n\
                       type FromModule = Array\n\
-                      fn qualified_signature(value: middle.api.PublicType, hidden: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType.Associated {}\n",
+                      fn qualified_signature(value: middle.api.PublicType, hidden: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType.Associated {}\n\
+                      const QUALIFIED_FOREIGN: middle.api.PublicType = { let nested: middle.api.PublicType = 0; 0 }\n\
+                      const PRIVATE_FOREIGN: leaf_model.PrivateType = 0\n\
+                      const MISSING_FOREIGN: middle.api.PublicTypo = 0\n",
                 ),
                 (
                     "local.sai",
@@ -20678,30 +20740,53 @@ mod tests {
             .file(root_tree.modules[0].file)
             .expect("root function source is in the snapshot")
             .source();
-        let member_range = |qualified_name: &str, member: &str| {
-            let start = function_source
-                .text()
-                .rfind(qualified_name)
-                .expect("qualified name occurs in the function source")
-                + qualified_name.len()
-                - member.len();
-            sai_diagnostics::TextRange::new(
-                sai_diagnostics::TextSize::new(start as u32),
-                sai_diagnostics::TextSize::new((start + member.len()) as u32),
-            )
-            .expect("member source range is ordered")
-        };
+        let source_text = function_source.text();
+        let signature_start = source_text
+            .find("fn qualified_signature")
+            .expect("function signature is in the root source");
+        let signature_end = source_text[signature_start..]
+            .find('\n')
+            .expect("function signature has a line ending")
+            + signature_start;
+        let signature_source = &source_text[signature_start..signature_end];
+        let member_range =
+            |source: &str, source_offset: usize, qualified_name: &str, member: &str| {
+                let start = source_offset
+                    + source
+                        .rfind(qualified_name)
+                        .expect("qualified name occurs in the source")
+                    + qualified_name.len()
+                    - member.len();
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + member.len()) as u32),
+                )
+                .expect("member source range is ordered")
+            };
         let private_error = function_paths
             .module_path_errors()
             .iter()
             .find(|entry| matches!(entry.error(), ModulePathError::InaccessibleMember { .. }))
             .expect("foreign private signature member is rejected");
-        assert!(matches!(
-            private_error.error(),
-            ModulePathError::InaccessibleMember { name, span, .. }
-                if database.resolve_symbol(name).is_ok_and(|name| name.as_ref() == "PrivateType")
-                    && span.range == member_range("leaf_model.PrivateType", "PrivateType")
-        ));
+        let ModulePathError::InaccessibleMember { name, span, .. } = private_error.error() else {
+            panic!("foreign private signature member reports an inaccessible-member error");
+        };
+        assert_eq!(
+            database
+                .resolve_symbol(name)
+                .expect("member name is interned")
+                .as_ref(),
+            "PrivateType"
+        );
+        assert_eq!(
+            span.range,
+            member_range(
+                signature_source,
+                signature_start,
+                "leaf_model.PrivateType",
+                "PrivateType"
+            )
+        );
         assert!(matches!(
             function_paths.paths().get(&private_error.hir_id()),
             Some(PathRes {
@@ -20715,14 +20800,129 @@ mod tests {
             .iter()
             .find(|entry| matches!(entry.error(), ModulePathError::MissingMember { .. }))
             .expect("missing transitive signature member is retained");
-        assert!(matches!(
-            missing_error.error(),
-            ModulePathError::MissingMember { name, span, .. }
-                if database.resolve_symbol(name).is_ok_and(|name| name.as_ref() == "PublicTypo")
-                    && span.range == member_range("middle.api.PublicTypo", "PublicTypo")
-        ));
+        let ModulePathError::MissingMember { name, span, .. } = missing_error.error() else {
+            panic!("missing signature member reports a missing-member error");
+        };
+        assert_eq!(
+            database
+                .resolve_symbol(name)
+                .expect("member name is interned")
+                .as_ref(),
+            "PublicTypo"
+        );
+        assert_eq!(
+            span.range,
+            member_range(
+                signature_source,
+                signature_start,
+                "middle.api.PublicTypo",
+                "PublicTypo"
+            )
+        );
         assert!(matches!(
             function_paths.paths().get(&missing_error.hir_id()),
+            Some(PathRes {
+                base: Res::Err,
+                resolved_segments: 3,
+                segment_count: 3,
+            })
+        ));
+
+        let const_results = database
+            .resolve_const_owner_paths_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("const type paths resolve through transitive member scopes");
+        assert!(const_results.matches_member_scopes(&root_collection, &member_scopes));
+        assert_eq!(
+            const_results.member_scope_closure_fingerprint(),
+            Some(member_scopes.closure_fingerprint())
+        );
+        assert!(matches!(
+            database.resolve_const_owner_paths_with_member_scopes(
+                &middle_collection,
+                &middle_tree,
+                &snapshot,
+                &member_scopes,
+            ),
+            Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(key)
+            )) if key.as_str() == "acme:middle#1"
+        ));
+        assert_eq!(const_results.owners().len(), 3);
+        let qualified_const = const_results.owners()[0]
+            .type_path_resolution()
+            .expect("qualified const path result succeeds")
+            .expect("const has a type path result");
+        assert!(
+            qualified_const
+                .paths()
+                .values()
+                .filter(|path| {
+                    matches!(path.base, Res::Def(DefKind::Alias, _))
+                        && path.resolved_segments == 3
+                        && path.segment_count == 3
+                })
+                .count()
+                >= 2,
+            "public transitive interface members resolve in const types and initializer bodies"
+        );
+        assert!(qualified_const.module_path_errors().is_empty());
+
+        let private_const = const_results.owners()[1]
+            .type_path_resolution()
+            .expect("private const path result succeeds")
+            .expect("const has a type path result");
+        let private_const_error = private_const
+            .module_path_errors()
+            .iter()
+            .find(|entry| matches!(entry.error(), ModulePathError::InaccessibleMember { .. }))
+            .expect("foreign private const member is rejected");
+        assert!(matches!(
+            private_const_error.error(),
+            ModulePathError::InaccessibleMember { name, span, .. }
+                if database.resolve_symbol(name).is_ok_and(|name| name.as_ref() == "PrivateType")
+                    && span.range == member_range(
+                        source_text,
+                        0,
+                        "leaf_model.PrivateType",
+                        "PrivateType"
+                    )
+        ));
+        assert!(matches!(
+            private_const.paths().get(&private_const_error.hir_id()),
+            Some(PathRes {
+                base: Res::Err,
+                resolved_segments: 2,
+                segment_count: 2,
+            })
+        ));
+
+        let missing_const = const_results.owners()[2]
+            .type_path_resolution()
+            .expect("missing const path result succeeds")
+            .expect("const has a type path result");
+        let missing_const_error = missing_const
+            .module_path_errors()
+            .iter()
+            .find(|entry| matches!(entry.error(), ModulePathError::MissingMember { .. }))
+            .expect("missing transitive const member is retained");
+        assert!(matches!(
+            missing_const_error.error(),
+            ModulePathError::MissingMember { name, span, .. }
+                if database.resolve_symbol(name).is_ok_and(|name| name.as_ref() == "PublicTypo")
+                    && span.range == member_range(
+                        source_text,
+                        0,
+                        "middle.api.PublicTypo",
+                        "PublicTypo"
+                    )
+        ));
+        assert!(matches!(
+            missing_const.paths().get(&missing_const_error.hir_id()),
             Some(PathRes {
                 base: Res::Err,
                 resolved_segments: 3,
