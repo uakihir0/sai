@@ -353,7 +353,9 @@ foreign visibility through canonical module/interface definitions, and
 records the closure fingerprint on the result. The existing
 `resolve_function_owner_analyses` entry point remains package-local. The
 closure-aware function bridge retains private and missing member failures as
-typed path errors; final diagnostic mapping and CLI consumption remain later
+typed path errors and additionally maps them to snapshot-bound diagnostics.
+`sai check` consumes these diagnostics alongside top-level type-owner
+diagnostics; equivalent mapping for the other owner families remains later
 work.
 
 **Const type paths over validated source closures (IR-565).** The driver
@@ -787,6 +789,18 @@ builds the active-source closure for each package, and emits the resulting
 lookup for primary and foreign declaration locations. The command still reports
 `FEATURE_NOT_IMPLEMENTED` and does not claim complete analysis or produce a
 success result record.
+
+**Function type-path member diagnostics (IR-573).** The closure-aware
+free-function adapter maps typed private and missing source-member errors to
+snapshot-bound diagnostics through the same mapper used by top-level type
+owners. `FunctionOwnerResolution` exposes this optional diagnostic channel
+separately from label, local, module, expression, and test-only results;
+package-local calls retain their existing typed path errors for callers to map
+with their own snapshot context. Driver and CLI regressions cover both
+signature paths and body type annotations. `sai check` collects these function
+diagnostics alongside the top-level type-owner diagnostics and passes both
+through the existing package-aware source renderer. The command continues to
+report `FEATURE_NOT_IMPLEMENTED`.
 
 **Qualified missing-member diagnostics (IR-545).** The module path walker
 retains the exact `ModuleTarget` when a member is missing. The driver emits a
