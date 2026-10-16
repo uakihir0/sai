@@ -555,6 +555,18 @@ impl DefPathInterner {
         Ok(id)
     }
 
+    /// Atomically interns an ordered set of paths, preserving input order for
+    /// paths that are new to this interner.
+    ///
+    /// The whole batch uses one lock acquisition so concurrent callers cannot
+    /// interleave their allocations. All paths are validated before mutation.
+    pub fn intern_ordered_paths(
+        &self,
+        paths: Vec<DefPath>,
+    ) -> Result<Vec<LocalDefId>, DefPathInternerError> {
+        self.intern_paths(paths)
+    }
+
     /// Intern a closure or async-block definition below its lexical parent.
     ///
     /// The caller supplies the preorder disambiguator assigned within the
@@ -961,6 +973,7 @@ pub enum Mutability {
 mod tests {
     use super::*;
     use sai_intern::{IndexVec, PackageInterner};
+    use std::sync::Barrier;
     use std::thread;
 
     fn def_path(
@@ -1702,5 +1715,49 @@ mod tests {
 
         assert!(ids.iter().all(|id| *id == ids[0]));
         assert_eq!(paths.len(), Ok(1));
+    }
+
+    #[test]
+    fn concurrent_ordered_path_batches_do_not_interleave_allocations() {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:app#1.0").unwrap();
+        let symbols = Interner::new();
+        let paths = Arc::new(DefPathInterner::new(package, &packages, &symbols).unwrap());
+        let barrier = Arc::new(Barrier::new(3));
+        let batches = [
+            vec![
+                def_path(package, &packages, &symbols, "Alpha"),
+                def_path(package, &packages, &symbols, "Beta"),
+            ],
+            vec![
+                def_path(package, &packages, &symbols, "Gamma"),
+                def_path(package, &packages, &symbols, "Delta"),
+            ],
+        ];
+        let workers = batches
+            .into_iter()
+            .map(|batch| {
+                let paths = Arc::clone(&paths);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    paths
+                        .intern_ordered_paths(batch)
+                        .expect("batch interns atomically")
+                })
+            })
+            .collect::<Vec<_>>();
+        barrier.wait();
+        let ids = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("worker completes"))
+            .collect::<Vec<_>>();
+
+        for batch in &ids {
+            assert_eq!(batch[1].index.raw(), batch[0].index.raw() + 1);
+        }
+        let first = ids[0][0].index.raw();
+        let second = ids[1][0].index.raw();
+        assert!(first + 2 == second || second + 2 == first);
     }
 }

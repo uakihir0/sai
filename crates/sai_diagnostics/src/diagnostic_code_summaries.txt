@@ -197,7 +197,7 @@ INVALID_OVERRIDE|hard|379|`use artifact` on a package that is not hybrid
 INVALID_PACKAGE_FILE_PATH|hard|380|A file path in fetched content violates §3.4.3
 INVALID_PACKAGE_NAME|hard|381|A package identity that is not `namespace:name` or has a segment longer than 64 bytes
 INVALID_PACKAGE_PATH|hard|382|A path in `sai.package` violates §1.6.1
-INVALID_RAW_IDENT|hard|143|`r#self`, `r#Self`, or `r#_`
+INVALID_RAW_IDENT|hard|143|`r#_`
 INVALID_RESOURCE_BINDING|hard|144|`type R = C` where `C` is not a non-generic local resource, or `C` is bound twice (§13.3.3)
 INVALID_SELF_TYPE|hard|145|Invalid type for a self parameter (§3.5)
 INVALID_SIZE|hard|383|A unit other than `B`, `KiB`, `MiB`, a zero size, or an overflowing size

@@ -2420,11 +2420,11 @@ impl<'a> Lexer<'a> {
                 )?;
                 flags.insert(TokenFlags::HAS_ERROR);
             }
-            if raw && matches!(name, "self" | "Self" | "_") {
+            if raw && name == "_" {
                 self.report_at(
                     Code::InvalidRawIdent,
                     Severity::Error,
-                    "r#self, r#Self, and r#_ are not valid raw identifiers",
+                    "r#_ is not a valid raw identifier",
                     start + 1,
                     end,
                 )?;
@@ -3367,11 +3367,11 @@ impl<'a> Lexer<'a> {
         }
 
         if raw {
-            if matches!(name, "self" | "Self" | "_") {
+            if name == "_" {
                 self.report_at(
                     Code::InvalidRawIdent,
                     Severity::Error,
-                    "r#self, r#Self, and r#_ are not valid raw identifiers",
+                    "r#_ is not a valid raw identifier",
                     start,
                     end,
                 )?;
@@ -4991,7 +4991,7 @@ mod tests {
 
     #[test]
     fn classifies_case_after_raw_prefix_and_leading_underscores() {
-        let output = lex_text("_Foo __init ___ r#type r#self");
+        let output = lex_text("_Foo __init ___ r#type r#_");
 
         assert_eq!(
             kinds(&output),
@@ -5007,6 +5007,9 @@ mod tests {
         );
         assert!(output.tokens[3].flags.contains(TokenFlags::RAW));
         assert_eq!(output.errors[0].code, Code::InvalidRawIdent);
+
+        let valid_self = lex_text("r#self r#Self");
+        assert!(valid_self.errors.is_empty());
     }
 
     #[test]

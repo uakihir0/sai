@@ -164,7 +164,7 @@ Codes owned by the language specification (`spec/`). 344 codes.
 | `INVALID_LINE_ENDING` | error | [02](02-lexical-structure.md) | Lone CR |
 | `INVALID_LINK_NAME` | error | [12](12-unsafe-and-ffi.md) | The symbol name of an `extern "C"` function is not a C identifier (§12.9.1) |
 | `INVALID_MODULE_NAME` | error | [04](04-modules-and-names.md) | A directory or file name in `<source>` is not a valid module segment, or is `lib` outside the root file |
-| `INVALID_RAW_IDENT` | error | [02](02-lexical-structure.md) | `r#self`, `r#Self`, or `r#_` |
+| `INVALID_RAW_IDENT` | error | [02](02-lexical-structure.md) | `r#_` |
 | `INVALID_RESOURCE_BINDING` | error | [13](13-components-and-wit.md) | `type R = C` where `C` is not a non-generic local resource, or `C` is bound twice (§13.3.3) |
 | `INVALID_SELF_TYPE` | error | [03](03-grammar.md) | Invalid type for a self parameter (§3.5) |
 | `INVALID_TEST_NAME` | error | [14](14-testing.md) | An empty test name, or one that contains a character of the general category `Cc` (§14.2.3) |

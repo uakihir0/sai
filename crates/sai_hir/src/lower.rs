@@ -11379,7 +11379,7 @@ fn lower_name_spelling(
 }
 
 fn invalid_raw_identifier(written: &str) -> bool {
-    matches!(written.strip_prefix("r#"), Some("self" | "Self" | "_"))
+    written.strip_prefix("r#") == Some("_")
 }
 
 fn const_path_has_invalid_raw_identifier(path: ast::ConstPath) -> bool {
@@ -17699,7 +17699,7 @@ mod tests {
     #[test]
     fn lowers_binding_modes_at_patterns_and_normalized_names() {
         let file = crate::FileId::new(67);
-        let source = "fn f() { match value { item => (), var mutable => (), borrow borrowed => (), borrow mut mutable_ref => (), named @ _ => (), outer @ (inner) => (), null => (), r#null => (), r#self => (), cafe\u{301} => (), r#Self => (), r#Self..=4 => () } }";
+        let source = "fn f() { match value { item => (), var mutable => (), borrow borrowed => (), borrow mut mutable_ref => (), named @ _ => (), outer @ (inner) => (), null => (), r#null => (), r#self => (), cafe\u{301} => (), r#Self => (), r#Self..=4 => (), r#_ => () } }";
         let (snapshot, parsed, ast_ids) = parse_file(file, source);
         assert!(
             parsed
@@ -17725,7 +17725,7 @@ mod tests {
             .filter_map(ast::MatchArm::cast)
             .filter_map(|arm| arm.pattern())
             .collect::<Vec<_>>();
-        assert_eq!(patterns.len(), 12);
+        assert_eq!(patterns.len(), 13);
 
         let arena = HirArena::new();
         let symbols = Interner::new();
@@ -17811,7 +17811,13 @@ mod tests {
                 .as_ref(),
             "null"
         );
-        assert!(binding_parts(lowered[8]).0.sym.is_error());
+        assert_eq!(
+            symbols
+                .resolve(binding_parts(lowered[8]).0.sym)
+                .unwrap()
+                .as_ref(),
+            "self"
+        );
         assert_eq!(
             symbols
                 .resolve(binding_parts(lowered[9]).0.sym)
@@ -17819,14 +17825,15 @@ mod tests {
                 .as_ref(),
             "café"
         );
-        assert_eq!(lowered[10].kind, PatKind::Err);
-        assert_eq!(lowered[11].kind, PatKind::Err);
+        assert!(matches!(lowered[10].kind, PatKind::Ctor { .. }));
+        assert!(matches!(lowered[11].kind, PatKind::Range { .. }));
+        assert!(binding_parts(lowered[12]).0.sym.is_error());
         assert_eq!(
             lowered
                 .iter()
                 .map(|pattern| pattern.hir_id.local_id.raw())
                 .collect::<Vec<_>>(),
-            [1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 14]
+            [1, 2, 3, 4, 5, 7, 9, 10, 11, 12, 13, 16, 19]
         );
         let ast::Pattern::At(outer_at) = &patterns[5] else {
             panic!("sixth pattern is an at pattern");
@@ -17842,8 +17849,8 @@ mod tests {
         );
 
         let map = source_map.finish();
-        assert_eq!(map.node_to_syntax().len(), 15);
-        assert_eq!(map.binding_to_syntax().len(), 11);
+        assert_eq!(map.node_to_syntax().len(), 20);
+        assert_eq!(map.binding_to_syntax().len(), 12);
 
         fn collect_bindings(pattern: &ast::Pattern, bindings: &mut Vec<ast::BindingPat>) {
             match pattern {
@@ -18606,7 +18613,7 @@ mod tests {
             "Some() => (), ",
             "http.Status.Ok(code: var named, payload, ..) => (), ",
             "app.Result.Left(.Ready) => (), ",
-            "r#Self() => () ",
+            "app.r#_() => () ",
             "} }",
         );
         let (snapshot, parsed, ast_ids) = parse_file(file, source);
@@ -26089,7 +26096,7 @@ mod tests {
             (238, "effect audit\n", false),
             (239, "effect audit covers { net.connect\n", true),
             (240, "effect audit covers { alloc, null }\n", true),
-            (241, "effect audit covers { alloc, r#self }\n", true),
+            (241, "effect audit covers { alloc, r#_ }\n", true),
         ] {
             let file = crate::FileId::new(file_id);
             let (snapshot, parsed, ast_ids) = parse_file(file, source);
@@ -26730,7 +26737,7 @@ mod tests {
     #[test]
     fn function_owner_recovers_invalid_raw_function_names() {
         let file = crate::FileId::new(231);
-        let source = "fn r#self() {}\n";
+        let source = "fn r#_() {}\n";
         let (snapshot, parsed, ast_ids) = parse_file(file, source);
         assert!(
             parsed

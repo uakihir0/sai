@@ -393,28 +393,30 @@ Each unit that loads successfully has a **view package**. A view package is a `P
 | function `f` | `[Interface(i), ValueNs(f)]` | `Fn` |
 | function `f` of a world | `[World(w), WorldItem { import, name: f }]` | `WorldFn` |
 
-`WorldFn` is a new `DefKind` ([03](03-name-resolution-and-type-checking.md) §3.4.1). It is also used for the function items of local worlds (§16.8.2). `DefPathHash` is computed from the key string of the view package and the `DefPath`, as for any package. `DefIndex`es are assigned in `DefPathHash` order (impl/02 §2.8.2). The `DefId`s of a view are therefore stable across sessions and do not depend on query order.
+`WorldFn` is a new `DefKind` ([03](03-name-resolution-and-type-checking.md) §3.4.1). It is also used for the function items of local worlds (§16.8.2). `DefPathHash` is computed from the key string of the view package and the `DefPath`, as for any package. A view package retains one `DefPathInterner` for the compiler session. Its first population atomically interns candidates in `DefPathHash` order, making initial `DefIndex` assignment reproducible and preventing concurrent builds from interleaving allocations. Later builds reuse IDs for existing paths and append newly seen paths; removed definitions leave vacant indices. A `DefId` also carries its session-local interner scope, so cross-session identity is compared by `DefPathHash`, not by the runtime `DefId` value.
 
 ```rust
 pub struct WitView {
     pub unit: WitUnit,
     pub package: PackageId,                               // the view package
-    pub interfaces: BTreeMap<SmolStr, ViewInterface>,     // key: the WIT name
-    pub worlds: BTreeMap<SmolStr, ViewWorld>,
-    pub defs: IndexVec<DefIndex, ViewDef>,                // every DefId, with the model entity it stands for
+    pub interfaces: BTreeMap<String, ViewInterface>,      // key: the WIT name
+    pub worlds: BTreeMap<String, ViewWorld>,
+    pub defs: IndexVec<DefIndex, Option<ViewDef>>,        // current entity; None for a removed definition
 }
 pub struct ViewInterface {
     pub def: DefId,
     pub wit: WitIfaceIdx,
     pub sai_name: Symbol,
-    pub members: BTreeMap<Symbol, ViewMember>,            // SAI name → type or function
+    pub members: BTreeMap<String, ViewMember>,            // SAI name → type or function
     pub shadowed: Vec<Shadowed>,                          // §16.4.5
     pub origin: Option<DefId>,                            // Generated units only: the SAI interface (§16.4.7)
 }
 pub struct ViewMember { pub def: DefId, pub kind: DefKind, pub item: WitItemIdx, pub unsupported: Option<Unsupported> }
-pub struct ViewWorld { pub def: DefId, pub wit: WitWorldIdx, pub sai_name: Symbol, pub import_fns: BTreeMap<Symbol, DefId> }
-pub struct Shadowed { pub wit_name: SmolStr, pub resource: Option<SmolStr>, pub winner: DefId }
+pub struct ViewWorld { pub def: DefId, pub wit: WitWorldIdx, pub sai_name: Symbol, pub import_fns: BTreeMap<String, DefId> }
+pub struct Shadowed { pub wit_name: String, pub resource: Option<String>, pub winner: DefId }
 ```
+
+The driver creates and retains the view package's path interner, then passes it to each view build. A runtime `DefId` remains valid for the same path across recomputations in that session; a removed path resolves to no current definition.
 
 `sai_ty::iface` answers the item queries of [03](03-name-resolution-and-type-checking.md) for view `DefId`s: `adt_def`, `type_of`, `fn_sig`, `generics_of`, `predicates_of` (always empty), `inherent_impls`, `flags_def` and `view_derives`. No query of impl/03 reads HIR for a view `DefId`.
 
@@ -1277,3 +1279,16 @@ The codes below are defined in [spec/13](../spec/13-components-and-wit.md) or in
 - **Review:** Hostile review found that the first hook type used `String` where the normative sample still said `SmolStr`; the contract was updated to `String`, matching the implementation choice. It also requested an end-to-end source-input parse regression, which now passes. Independent hostile re-review found no remaining actionable findings.
 - **Human review:** **Review required:** Confirm owned `String` origins in place of `SmolStr`, the single-file canonical generated-text boundary, and including origin mappings and completeness in value equality so query early cutoff rebuilds dependent views when provenance changes.
 - **Remaining scope:** Feed generated snapshots into `Generated(P)` package loading; then construct stable view `DefId`s and connect them to package scopes and name resolution.
+
+### IR-584: Build stable SAI-facing WIT views
+
+`WitView` now builds view definitions for interfaces, worlds, items, record fields, enum/variant cases, resource members, flags methods, and world functions. It exposes interface members and world import functions by canonical SAI names, records losing names in WIT order, and attaches generated-interface origins. Each view build receives the compiler-session `DefPathInterner` for its package. The first build interns definitions in `DefPathHash` order; later builds reuse existing indices, append new paths, and leave tombstones for removed definitions.
+
+The name converter preserves WIT-to-SAI source spelling, including `r#` for strict or reserved words, while view keys, symbols, and definition paths store semantic names without the raw prefix. Resource constructors map to `new` and win over a static member named `new`. Generated origin mappings must be a one-to-one mapping of generated interfaces to distinct source definitions in the source package; the first unknown origin follows input order.
+
+- **Decision:** Require a caller-owned persistent path interner per view package; sort candidates by `(DefPathHash, canonical path)` and atomically batch intern them before first allocation and on rebuilds. Preserve indices across rebuilds and keep removed indices as `None`. Validate generated origins before allocating any definition paths, require distinct source `DefId`s, and report unknown origins in input order. Map constructor members to `new`, apply the documented constructor shadowing precedence, and use semantic identifiers internally after textual keyword escaping.
+- **Reason:** A fresh interner per recomputation would assign different scoped runtime `DefId`s and defeat incremental equality within a compiler session. One atomic batch prevents concurrent builds from interleaving sorted path allocation. Tombstones avoid silently assigning a removed identity to a different entity. Validation before interning keeps failed generated snapshots from mutating persistent query state. Distinct source identities make the generated-origin lookup unambiguous, and input-order validation avoids randomized hash iteration in diagnostics. SAI raw identifier prefixes are source syntax, so placing them in HIR `Symbol`s or semantic `DefPath` components would create a name that cannot resolve to the identifier HIR lowers.
+- **Verification:** `cargo test -p sai_wit --locked --quiet` passes all 78 tests. Regressions cover stable order across model/interner sessions, persistent `DefId` reuse, foreign-scope rejection, tombstones, constructor/static-name precedence, semantic keyword symbols, generated-origin cardinality/package/source-identity checks, deterministic error choice, and no interner mutation after invalid origins. Raw `r#self` and upper-context `r#Self` are accepted and lower to semantic names; `r#_` remains invalid. Focused syntax, HIR, and diagnostics suites pass (416, 296, and 63 tests). `cargo test --workspace --locked --quiet` passes all 2,642 tests; formatting and `git diff --check` pass. Strict workspace Clippy is blocked by existing warnings in `sai_hir`, `sai_resolve`, and `sai_package`; package-scoped Clippy also reaches those dependencies and is blocked by the same warnings.
+- **Review:** The first hostile review found constructor spelling/precedence, raw semantic names, origin package/cardinality and source-package checks, duplicate source origins, nondeterministic unknown-origin selection, and concurrent path interleaving. All were fixed and covered by regressions. Final hostile re-review found no actionable findings.
+- **Human review:** **Review required:** Confirm that raw `r#self` and `r#Self` must be accepted so all WIT names emitted by spec/13 §13.8.3 remain representable; only `r#_` stays invalid. Also review the persistent session interner, atomic batch allocation and tombstone strategy, constructor precedence, semantic-name storage, and strict one-to-one generated-origin mapping.
+- **Remaining scope:** Add stable hashing and query wiring for `WitView`, connect its definitions and member data to the resolver/type-query boundaries, load the embedded WASI source catalog, and continue the remaining WIT pipeline in §16.

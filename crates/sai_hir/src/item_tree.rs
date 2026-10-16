@@ -2468,9 +2468,7 @@ fn name_symbol<N: AstNode>(
 ) -> Result<Symbol, ItemTreeError> {
     let text = node_text(source, name.syntax())?;
     let raw_name = text.strip_prefix("r#");
-    if matches!(raw_name, Some("self" | "Self" | "_"))
-        || (raw_name.is_none() && sai_syntax::is_reserved_identifier(text))
-    {
+    if raw_name == Some("_") || (raw_name.is_none() && sai_syntax::is_reserved_identifier(text)) {
         return Ok(Symbol::ERROR);
     }
     let text = raw_name.unwrap_or(text);
@@ -3608,7 +3606,7 @@ mod tests {
     #[test]
     fn invalid_and_reserved_item_names_use_the_error_symbol() {
         for (index, (source, diagnostic)) in [
-            ("fn r#self() {}\n", sai_diagnostics::Code::InvalidRawIdent),
+            ("fn r#_() {}\n", sai_diagnostics::Code::InvalidRawIdent),
             ("fn null() {}\n", sai_diagnostics::Code::NoNull),
         ]
         .into_iter()
@@ -3625,6 +3623,27 @@ mod tests {
                 "ItemTree agrees with HIR name recovery for {source:?}"
             );
         }
+    }
+
+    #[test]
+    fn raw_self_spellings_are_valid_item_names() {
+        let source = "fn r#self() {}\ntype r#Self = Unit\n";
+        let (parsed, symbols, tree) = collect(source, FileId::new(710));
+
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .all(|error| error.code != sai_diagnostics::Code::InvalidRawIdent)
+        );
+        assert_eq!(tree.items.len(), 2);
+        assert!(tree.items.iter().all(|item| !item.name.is_error()));
+        let names = tree
+            .items
+            .iter()
+            .map(|item| symbols.resolve(item.name).unwrap().as_ref().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["self", "Self"]);
     }
 
     #[test]

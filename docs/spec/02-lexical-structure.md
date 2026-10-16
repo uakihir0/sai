@@ -81,7 +81,7 @@ IdentContinue ::= XID_Continue
 4. **Case classification** (D-LEX-02): if the first character, after removing the raw prefix `r#` and any leading `_` characters, is uppercase (General Category Lu or Lt), the identifier is a `UIDENT`. Otherwise it is a `LIDENT`. `_Foo` is a `UIDENT`, `__init` is a `LIDENT`, and an identifier consisting only of underscores (`__`) is a `LIDENT`.
    - Note: a leading `_` means "allowed to be unused" (it exempts the name from the lint `UNUSED_VARIABLE`), so using `_Foo` as a type name is discouraged.
 5. An identifier that contains non-ASCII characters is subject to the lint `NON_ASCII_IDENTIFIER` (warning). The following names MUST be ASCII (`NON_ASCII_PUBLIC_NAME`, D-LEX-03): items that are `pub` or `export`; `pub` fields and the variants of `pub` enums; modules; interfaces and worlds, and every name declared inside them, because they all become WIT names. Package names are ASCII by the syntax of `PkgSeg` (§2.9). Because module names come from file names, file names MUST be ASCII as well.
-6. A raw identifier `r#name` is used to write an identifier spelled like a keyword. The identifier's name is the part after `r#`. `r#self`, `r#Self`, and `r#_` are not allowed (`INVALID_RAW_IDENT`). Putting `r#` on a name that is not a keyword is the lint `UNNECESSARY_RAW_IDENT` (warning).
+6. A raw identifier `r#name` is used to write an identifier spelled like a keyword. The identifier's name is the part after `r#`. `r#self` and `r#Self` are allowed so WIT names remain representable; `r#_` is not allowed (`INVALID_RAW_IDENT`). Putting `r#` on a name that is not a keyword is the lint `UNNECESSARY_RAW_IDENT` (warning).
 7. There is no limit on identifier length. An implementation MUST handle identifiers of at least 1024 bytes.
 
 ## 2.5 Keywords
@@ -320,7 +320,7 @@ If the first line of a file starts with `#!`, that line is ignored. This is for 
 | `NON_ASCII_IDENTIFIER` | warning (lint) | non-ASCII identifier |
 | `NON_ASCII_PUBLIC_NAME` | error | non-ASCII character in a public name or module name |
 | `UNNECESSARY_RAW_IDENT` | warning (lint) | unnecessary `r#` |
-| `INVALID_RAW_IDENT` | error | `r#self`, `r#Self`, or `r#_` |
+| `INVALID_RAW_IDENT` | error | `r#_` |
 | `RESERVED_WORD` | error | use of a reserved word |
 | `NO_NULL` | error | use of `null` / `nil` / `undefined` |
 | `NO_EXCEPTIONS` | error | use of `try` / `catch` / `throw` |

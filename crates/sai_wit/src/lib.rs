@@ -7,12 +7,14 @@ mod generated;
 mod model;
 mod source_scan;
 mod stable_hash;
+mod view;
 
 pub use closure::*;
 pub use convert::*;
 pub use dependency::*;
 pub use generated::*;
 pub use model::*;
+pub use view::*;
 
 use sai_hir::{PackageId, Symbol};
 use sai_intern::{Interner, LookupError, PackageIdError, PackageInterner};
