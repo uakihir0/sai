@@ -7910,6 +7910,38 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
+        self.resolve_extern_function_predicates_inner(collection, module_tree, snapshot, None)
+    }
+
+    /// Resolves extern function type prefixes through a validated active-source
+    /// member-scope closure. Predicate and expression results remain unchanged.
+    pub fn resolve_extern_function_predicates_with_member_scopes(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.resolve_extern_function_predicates_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+        )
+    }
+
+    fn resolve_extern_function_predicates_inner(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+    ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
         }
@@ -7917,8 +7949,22 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
-        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
-        let source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let mut indexed_scopes =
+            Vec::with_capacity(1 + member_scopes.map_or(0, |scopes| scopes.source_packages.len()));
+        indexed_scopes.push(collection.scopes());
+        if let Some(member_scopes) = member_scopes {
+            indexed_scopes.extend(
+                member_scopes
+                    .source_packages
+                    .iter()
+                    .map(Phase1ModuleMemberScopePackage::scopes),
+            );
+        }
+        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let source_graph_packages = member_scopes
+            .map(|scopes| &scopes.source_graph_packages)
+            .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let descriptors = &collection.scopes.extern_function_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
@@ -8185,7 +8231,8 @@ impl RootDatabase {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
-            member_scope_closure_fingerprint: None,
+            member_scope_closure_fingerprint: member_scopes
+                .map(|scopes| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -20630,6 +20677,7 @@ mod tests {
                       invariant U32 { { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true } }\n\
                       type ForeignRefined = U32 where { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true }\n\
                       distinct ForeignDistinct = U32 where { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true }\n\
+                      unsafe extern \"wasm\" module \"env\" { fn transitive_extern(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo); }\n\
                       fn qualified_signature(value: middle.api.PublicType, hidden: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType.Associated {}\n\
                       const QUALIFIED_FOREIGN: middle.api.PublicType = { let nested: middle.api.PublicType = 0; 0 }\n\
                       const PRIVATE_FOREIGN: leaf_model.PrivateType = 0\n\
@@ -21139,6 +21187,50 @@ mod tests {
                     })
                 ));
             };
+
+        let extern_results = database
+            .resolve_extern_function_predicates_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("extern type paths resolve through transitive member scopes");
+        assert!(extern_results.matches_member_scopes(&root_collection, &member_scopes));
+        assert_eq!(
+            extern_results.member_scope_closure_fingerprint(),
+            Some(member_scopes.closure_fingerprint())
+        );
+        assert!(matches!(
+            database.resolve_extern_function_predicates_with_member_scopes(
+                &middle_collection,
+                &middle_tree,
+                &snapshot,
+                &member_scopes,
+            ),
+            Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(key)
+            )) if key.as_str() == "acme:middle#1"
+        ));
+        assert_eq!(extern_results.owners().len(), 1);
+        let extern_path = extern_results.owners()[0]
+            .type_path_resolution()
+            .expect("extern type path result succeeds")
+            .expect("extern owner has type paths");
+        let extern_start = source_text
+            .find("fn transitive_extern")
+            .expect("transitive extern signature appears in the root source");
+        let extern_line_start = source_text[..extern_start]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let extern_line_end = source_text[extern_start..]
+            .find('\n')
+            .map_or(source_text.len(), |index| extern_start + index);
+        assert_foreign_predicate_paths(
+            extern_path,
+            &source_text[extern_line_start..extern_line_end],
+            extern_line_start,
+        );
 
         let invariant_results = database
             .resolve_invariant_owner_predicates_with_member_scopes(
