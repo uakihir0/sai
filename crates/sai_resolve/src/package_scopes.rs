@@ -13,6 +13,7 @@
 //! in the item tree.
 
 use super::{ChildEntry, ModuleData, ModuleId, ModuleTree};
+use crate::module_member_lookup::{ModuleMemberIndex, ModuleMemberLookup, ModuleTarget};
 use crate::module_target::{ModuleTargetError, resolve_foreign_module_target};
 use crate::prelude::PrimTy;
 use crate::use_binding::{UseBindingNameError, derive_use_binding_name};
@@ -30,8 +31,9 @@ use sai_hir::item_tree::{
     interface_member_path_component, interface_member_path_disambiguator,
 };
 use sai_hir::{
-    BindingId, DefId, DefPath, DefPathData, DefPathError, DefPathInterner, DefPathInternerError,
-    DisambiguatedDefPathData, LocalDefId, OwnerId, PackageId, Symbol, Visibility,
+    BindingId, DefId, DefPath, DefPathData, DefPathError, DefPathHash, DefPathInterner,
+    DefPathInternerError, DisambiguatedDefPathData, LocalDefId, OwnerId, PackageId, Symbol,
+    Visibility,
 };
 use sai_intern::{InternError, Interner, LookupError, PackageIdError, PackageInterner};
 use sai_syntax::{
@@ -39,6 +41,7 @@ use sai_syntax::{
     ast::{self, AstNode, AstToken},
 };
 use sai_vfs::{FileId, PackageKey, SourceFile, Span, TextRange, TextSize};
+use sai_wit::{ViewInterface, WitUnitKind, WitView, WitViewOriginIdentity};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -149,6 +152,13 @@ enum PendingItemTarget {
     ForeignModule {
         package_scope_index: usize,
         module: ModuleId,
+    },
+    WitInterface {
+        view_index: usize,
+        interface: DefId,
+        /// Present when a source interface was replaced by this generated
+        /// view using its canonical origin identity.
+        source_interface: Option<DefId>,
     },
     LocalInterface(DefId),
     Deferred,
@@ -344,6 +354,33 @@ pub struct ForeignPackageScope<'a> {
     pub module_tree: &'a ModuleTree,
     /// The source package's finalized module members and canonical
     /// definition identities.
+    pub scopes: &'a Phase1PackageScopes,
+}
+
+/// A graph-validated WIT view available in the active package closure.
+///
+/// Keep WIT scopes separate from [`ForeignPackageScope`]: a WIT package has
+/// no source module tree or source-backed `Binding`s. For a generated view,
+/// `source_def_paths` is the retained interner for the source package whose
+/// interfaces appear in the view's canonical `origin_identity` values.
+/// `directly_visible` distinguishes package identities that source code may
+/// name from transitive views used only to replace re-exported source
+/// interfaces with their owning package's generated view.
+pub struct ForeignWitViewScope<'a> {
+    pub visible_identity: &'a str,
+    pub view: &'a WitView,
+    pub source_def_paths: Option<&'a DefPathInterner>,
+    pub directly_visible: bool,
+}
+
+/// A validated source scope retained only to distinguish omitted generated
+/// interface members from genuinely unknown members.
+///
+/// These scopes do not make transitive package identities importable. They
+/// only answer whether a member of a source interface replaced by a generated
+/// WIT view exists in that interface's source package.
+pub struct ForeignSourceMemberScope<'a> {
+    pub module_tree: &'a ModuleTree,
     pub scopes: &'a Phase1PackageScopes,
 }
 
@@ -892,6 +929,148 @@ fn validate_foreign_package_scopes(
     Ok(())
 }
 
+fn validate_unavailable_wit_identities(
+    unavailable_identities: &[String],
+    _foreign_scopes: &[ForeignPackageScope<'_>],
+    foreign_wit_views: &[ForeignWitViewScope<'_>],
+) -> Result<(), PackageScopesError> {
+    let mut identities = HashSet::with_capacity(unavailable_identities.len());
+    for identity in unavailable_identities {
+        let key =
+            PackageKey::new(format!("{identity}#1")).map_err(PackageScopesError::PackageKey)?;
+        let canonical_identity = key
+            .as_str()
+            .split_once('#')
+            .map_or(key.as_str(), |(identity, _)| identity);
+        if canonical_identity != identity
+            || !identities.insert(identity.as_str())
+            || foreign_wit_views
+                .iter()
+                .any(|foreign| foreign.visible_identity == identity)
+        {
+            return Err(PackageScopesError::ForeignPackageScopeMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn validate_foreign_source_member_scopes(
+    source_scopes: &[ForeignSourceMemberScope<'_>],
+    packages: &PackageInterner,
+) -> Result<(), PackageScopesError> {
+    let mut package_ids = HashSet::with_capacity(source_scopes.len());
+    for source in source_scopes {
+        let package = source.module_tree.package;
+        packages.resolve(package)?;
+        if !package_ids.insert(package)
+            || source.module_tree.modules.is_empty()
+            || source.module_tree.modules.len() != source.scopes.modules.len()
+            || source
+                .scopes
+                .modules
+                .iter()
+                .any(|module| module.module_def_id.package() != package)
+            || source
+                .scopes
+                .interfaces
+                .keys()
+                .any(|interface| interface.package != package)
+        {
+            return Err(PackageScopesError::ForeignPackageScopeMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn validate_foreign_wit_views(
+    wit_views: &[ForeignWitViewScope<'_>],
+    packages: &PackageInterner,
+    symbols: &Interner,
+) -> Result<(), PackageScopesError> {
+    let mut identities = HashSet::with_capacity(wit_views.len());
+    for scope in wit_views {
+        if !identities.insert(scope.visible_identity) {
+            return Err(PackageScopesError::ForeignPackageScopeMismatch);
+        }
+        let view_package = packages.resolve(scope.view.package)?;
+        if view_package.as_ref() != scope.view.unit.stable_key() {
+            return Err(PackageScopesError::ForeignPackageScopeMismatch);
+        }
+        let unit_identity = scope
+            .view
+            .unit
+            .canonical_name()
+            .split_once('@')
+            .map(|(identity, _)| identity)
+            .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+        if unit_identity != scope.visible_identity {
+            return Err(PackageScopesError::ForeignPackageScopeMismatch);
+        }
+
+        match scope.view.unit.kind() {
+            WitUnitKind::Generated { package } => {
+                if package_identity(package, packages)? != scope.visible_identity {
+                    return Err(PackageScopesError::ForeignPackageScopeMismatch);
+                }
+                let has_origins = scope.view.interfaces.values().any(|interface| {
+                    interface.origin.is_some() || interface.origin_identity.is_some()
+                });
+                if has_origins && scope.source_def_paths.is_none() {
+                    return Err(PackageScopesError::ForeignPackageScopeMismatch);
+                }
+                if let Some(source_def_paths) = scope.source_def_paths
+                    && source_def_paths.package() != package
+                {
+                    return Err(PackageScopesError::ForeignPackageScopeMismatch);
+                }
+                if has_origins {
+                    for interface in scope.view.interfaces.values() {
+                        match (interface.origin, interface.origin_identity.as_ref()) {
+                            (Some(origin), Some(expected)) => {
+                                if &generated_origin_identity(origin, scope, packages, symbols)?
+                                    != expected
+                                {
+                                    return Err(PackageScopesError::ForeignPackageScopeMismatch);
+                                }
+                            }
+                            (None, None) => {}
+                            (Some(_), None) | (None, Some(_)) => {
+                                return Err(PackageScopesError::ForeignPackageScopeMismatch);
+                            }
+                        }
+                    }
+                }
+            }
+            WitUnitKind::Dir { package } => {
+                if scope.source_def_paths.is_some()
+                    || package_identity(package, packages)? != scope.visible_identity
+                {
+                    return Err(PackageScopesError::ForeignPackageScopeMismatch);
+                }
+            }
+            WitUnitKind::Wasi { .. } => {
+                if scope.source_def_paths.is_some() {
+                    return Err(PackageScopesError::ForeignPackageScopeMismatch);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn package_identity(
+    package: PackageId,
+    packages: &PackageInterner,
+) -> Result<String, PackageScopesError> {
+    let key = PackageKey::new(packages.resolve(package)?.to_string())
+        .map_err(PackageScopesError::PackageKey)?;
+    Ok(key
+        .as_str()
+        .split_once('#')
+        .map_or(key.as_str(), |(identity, _)| identity)
+        .to_owned())
+}
+
 /// Resolves package-local use aliases and item imports.
 ///
 /// Local module and interface targets have member lookup; module `pub use`
@@ -947,12 +1126,133 @@ pub fn collect_module_alias_bindings_with_foreign_scopes(
     is_root_package: bool,
     foreign_scopes: &[ForeignPackageScope<'_>],
 ) -> Result<Vec<Diagnostic>, PackageScopesError> {
+    collect_module_alias_bindings_with_foreign_wit_views(
+        module_tree,
+        module_inputs,
+        scopes,
+        packages,
+        symbols,
+        def_paths,
+        requirements,
+        target_cfg,
+        analyzes_tests,
+        is_root_package,
+        foreign_scopes,
+        &[],
+    )
+}
+
+/// Resolves local imports and imports from active source or WIT dependencies.
+///
+/// `foreign_scopes` retains the source-only contract of the legacy entrypoint.
+/// `foreign_wit_views` contains distinct graph-validated WIT views. Generated
+/// views carry the source package interner needed to compare source interfaces
+/// with canonical `origin_identity` values.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_module_alias_bindings_with_foreign_wit_views(
+    module_tree: &ModuleTree,
+    module_inputs: &BTreeMap<ModuleId, FilteredModule<'_>>,
+    scopes: &mut Phase1PackageScopes,
+    packages: &PackageInterner,
+    symbols: &Interner,
+    def_paths: &DefPathInterner,
+    requirements: Option<&[PackageUseRequirement]>,
+    target_cfg: &TargetCfg,
+    analyzes_tests: bool,
+    is_root_package: bool,
+    foreign_scopes: &[ForeignPackageScope<'_>],
+    foreign_wit_views: &[ForeignWitViewScope<'_>],
+) -> Result<Vec<Diagnostic>, PackageScopesError> {
+    collect_module_alias_bindings_with_foreign_wit_views_and_unavailable_identities(
+        module_tree,
+        module_inputs,
+        scopes,
+        packages,
+        symbols,
+        def_paths,
+        requirements,
+        target_cfg,
+        analyzes_tests,
+        is_root_package,
+        foreign_scopes,
+        foreign_wit_views,
+        &[],
+    )
+}
+
+/// Resolves local imports and imports from active source or WIT dependencies.
+///
+/// `foreign_scopes` and `foreign_wit_views` describe available validated
+/// dependencies. `unavailable_wit_identities` names direct WIT dependencies
+/// whose active producer or package loading failed semantically. Imports from
+/// those dependencies remain deferred so a failed producer does not look like
+/// an unsupported dependency feature.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_module_alias_bindings_with_foreign_wit_views_and_unavailable_identities(
+    module_tree: &ModuleTree,
+    module_inputs: &BTreeMap<ModuleId, FilteredModule<'_>>,
+    scopes: &mut Phase1PackageScopes,
+    packages: &PackageInterner,
+    symbols: &Interner,
+    def_paths: &DefPathInterner,
+    requirements: Option<&[PackageUseRequirement]>,
+    target_cfg: &TargetCfg,
+    analyzes_tests: bool,
+    is_root_package: bool,
+    foreign_scopes: &[ForeignPackageScope<'_>],
+    foreign_wit_views: &[ForeignWitViewScope<'_>],
+    unavailable_wit_identities: &[String],
+) -> Result<Vec<Diagnostic>, PackageScopesError> {
+    collect_module_alias_bindings_with_foreign_wit_views_unavailable_and_source_scopes(
+        module_tree,
+        module_inputs,
+        scopes,
+        packages,
+        symbols,
+        def_paths,
+        requirements,
+        target_cfg,
+        analyzes_tests,
+        is_root_package,
+        foreign_scopes,
+        foreign_wit_views,
+        unavailable_wit_identities,
+        &[],
+    )
+}
+
+/// Resolves imports with the validated source-scope closure used by
+/// Generated-view omission checks.
+#[allow(clippy::too_many_arguments)]
+pub fn collect_module_alias_bindings_with_foreign_wit_views_unavailable_and_source_scopes(
+    module_tree: &ModuleTree,
+    module_inputs: &BTreeMap<ModuleId, FilteredModule<'_>>,
+    scopes: &mut Phase1PackageScopes,
+    packages: &PackageInterner,
+    symbols: &Interner,
+    def_paths: &DefPathInterner,
+    requirements: Option<&[PackageUseRequirement]>,
+    target_cfg: &TargetCfg,
+    analyzes_tests: bool,
+    is_root_package: bool,
+    foreign_scopes: &[ForeignPackageScope<'_>],
+    foreign_wit_views: &[ForeignWitViewScope<'_>],
+    unavailable_wit_identities: &[String],
+    foreign_source_member_scopes: &[ForeignSourceMemberScope<'_>],
+) -> Result<Vec<Diagnostic>, PackageScopesError> {
     if module_tree.modules.len() != scopes.modules.len()
         || def_paths.package() != module_tree.package
     {
         return Err(PackageScopesError::PackageMismatch);
     }
     validate_foreign_package_scopes(foreign_scopes, packages)?;
+    validate_foreign_wit_views(foreign_wit_views, packages, symbols)?;
+    validate_unavailable_wit_identities(
+        unavailable_wit_identities,
+        foreign_scopes,
+        foreign_wit_views,
+    )?;
+    validate_foreign_source_member_scopes(foreign_source_member_scopes, packages)?;
     if module_tree.modules.is_empty() {
         return Ok(Vec::new());
     }
@@ -968,6 +1268,12 @@ pub fn collect_module_alias_bindings_with_foreign_scopes(
     if foreign_scopes
         .iter()
         .any(|foreign| foreign.visible_identity == current_package_identity)
+        || foreign_wit_views
+            .iter()
+            .any(|foreign| foreign.visible_identity == current_package_identity)
+        || unavailable_wit_identities
+            .iter()
+            .any(|identity| identity == current_package_identity)
     {
         return Err(PackageScopesError::ForeignPackageScopeMismatch);
     }
@@ -978,6 +1284,7 @@ pub fn collect_module_alias_bindings_with_foreign_scopes(
         .collect::<Vec<_>>();
     let mut diagnostics = Vec::new();
     let mut pending_items = Vec::new();
+    let mut reported_shadowed_interfaces = HashSet::new();
 
     for raw_module_id in 0..module_tree.modules.len() {
         let module_id = ModuleId::from_raw(
@@ -1066,15 +1373,36 @@ pub fn collect_module_alias_bindings_with_foreign_scopes(
                     | "wasi:random"
                     | "wasi:sockets"
             );
-            let foreign_classification = if !is_current_package && !is_known_toolchain_package {
-                requirements.map(|_| match requirement {
-                    None => (PendingItemTarget::UnknownPackage, None),
-                    Some(_) if inactive_targets.is_some() => (
+            let foreign_wit_view_index = foreign_wit_views.iter().position(|foreign| {
+                foreign.directly_visible && foreign.visible_identity == parsed.package_identity
+            });
+            let foreign_source_scope_index = foreign_scopes
+                .iter()
+                .position(|foreign| foreign.visible_identity == parsed.package_identity);
+            let unavailable_wit_view = unavailable_wit_identities
+                .iter()
+                .any(|identity| identity == &parsed.package_identity);
+            let foreign_classification = if !is_current_package {
+                if inactive_targets.is_some() {
+                    Some((
                         PendingItemTarget::Inactive,
                         inactive_targets.map(|targets| targets.as_ref()),
-                    ),
-                    Some(_) => (PendingItemTarget::StageGated, None),
-                })
+                    ))
+                } else if foreign_wit_view_index.is_some() || foreign_source_scope_index.is_some() {
+                    // The view list is supplied from the validated active
+                    // package graph. Embedded WASI units need no manifest
+                    // requirement; package views are checked by the caller.
+                    Some((PendingItemTarget::StageGated, None))
+                } else if unavailable_wit_view {
+                    Some((PendingItemTarget::Deferred, None))
+                } else if !is_known_toolchain_package {
+                    requirements.map(|_| match requirement {
+                        None => (PendingItemTarget::UnknownPackage, None),
+                        Some(_) => (PendingItemTarget::StageGated, None),
+                    })
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -1129,7 +1457,115 @@ pub fn collect_module_alias_bindings_with_foreign_scopes(
                         ));
                     }
                     PendingItemTarget::StageGated => {
-                        if let Some((package_scope_index, foreign)) =
+                        let generated_wit_view = foreign_wit_view_index
+                            .and_then(|index| {
+                                foreign_wit_views.get(index).map(|scope| (index, scope))
+                            })
+                            .filter(|(_, scope)| {
+                                matches!(scope.view.unit.kind(), WitUnitKind::Generated { .. })
+                            });
+                        let generated_wit_world = if let (Some((_, scope)), [world_name]) =
+                            (generated_wit_view, parsed.segments.as_slice())
+                        {
+                            let requested_name =
+                                canonical_wit_path_name(&symbols.resolve(*world_name)?);
+                            view_has_wit_path_world(scope.view, &requested_name)
+                        } else {
+                            false
+                        };
+                        let active_wit_view = foreign_wit_view_index
+                            .and_then(|index| {
+                                foreign_wit_views.get(index).map(|view| (index, view))
+                            })
+                            .filter(|(_, scope)| {
+                                !matches!(scope.view.unit.kind(), WitUnitKind::Generated { .. })
+                            });
+                        if generated_wit_world {
+                            diagnostics.push(use_binding_diagnostic(
+                                Code::InvalidUseTarget,
+                                Severity::Error,
+                                format!(
+                                    "`{}` names a WIT world, which cannot be imported with `use`",
+                                    entry.pkg_path
+                                ),
+                                "WIT world",
+                                source_location(input, path_range)?,
+                                &package_identity,
+                            ));
+                            resolved_foreign_target = Some((None, PendingItemTarget::Unavailable));
+                        } else if let Some((view_index, wit_scope)) = active_wit_view {
+                            let view = wit_scope.view;
+                            let target_location = source_location(input, path_range)?;
+                            let resolved = match parsed.segments.as_slice() {
+                                [] => {
+                                    diagnostics.push(use_binding_diagnostic(
+                                        Code::InvalidUseTarget,
+                                        Severity::Error,
+                                        format!(
+                                            "`{}` does not name an importable WIT interface",
+                                            entry.pkg_path
+                                        ),
+                                        "invalid use target",
+                                        target_location.clone(),
+                                        &package_identity,
+                                    ));
+                                    (None, PendingItemTarget::Unavailable)
+                                }
+                                [interface_name] => {
+                                    let requested_name = symbols.resolve(*interface_name)?;
+                                    let requested_name = canonical_wit_path_name(&requested_name);
+                                    if let Some(interface) =
+                                        view_interface_by_wit_path_name(view, &requested_name)
+                                    {
+                                        (
+                                            Some(Res::Def(DefKind::Interface, interface.def)),
+                                            PendingItemTarget::WitInterface {
+                                                view_index,
+                                                interface: interface.def,
+                                                source_interface: None,
+                                            },
+                                        )
+                                    } else if view_has_wit_path_world(view, &requested_name) {
+                                        diagnostics.push(use_binding_diagnostic(
+                                            Code::InvalidUseTarget,
+                                            Severity::Error,
+                                            format!(
+                                                "`{}` names a WIT world, which cannot be imported with `use`",
+                                                entry.pkg_path
+                                            ),
+                                            "WIT world",
+                                            target_location,
+                                            &package_identity,
+                                        ));
+                                        (None, PendingItemTarget::Unavailable)
+                                    } else {
+                                        diagnostics.push(unknown_wit_item_diagnostic(
+                                            &parsed,
+                                            view,
+                                            target_location,
+                                            &package_identity,
+                                            symbols,
+                                        )?);
+                                        (None, PendingItemTarget::Unavailable)
+                                    }
+                                }
+                                _ => {
+                                    diagnostics.push(
+                                        crate::use_target_diagnostics::unknown_module_diagnostic(
+                                            entry,
+                                            &parsed,
+                                            Vec::new(),
+                                            Vec::new(),
+                                            source_location(input, path_range)?,
+                                            &package_identity,
+                                            symbols,
+                                        )?,
+                                    );
+                                    (None, PendingItemTarget::Unavailable)
+                                }
+                            };
+                            resolved_foreign_target = Some(resolved);
+                        } else if let Some((package_scope_index, foreign)) =
                             foreign_scopes.iter().enumerate().find(|(_, foreign)| {
                                 foreign.visible_identity == parsed.package_identity
                             })
@@ -1160,8 +1596,29 @@ pub fn collect_module_alias_bindings_with_foreign_scopes(
                                     matched_prefix,
                                     module_candidates,
                                 }) => {
-                                    if let Some(interface_visibility) =
-                                        foreign_interface_visibility(foreign, &parsed)
+                                    let generated_wit_view = foreign_wit_view_index
+                                        .and_then(|index| {
+                                            foreign_wit_views.get(index).map(|scope| (index, scope))
+                                        })
+                                        .filter(|(_, scope)| {
+                                            matches!(
+                                                scope.view.unit.kind(),
+                                                WitUnitKind::Generated { .. }
+                                            )
+                                        });
+                                    let source_interface = if let Some(source_interface) =
+                                        foreign_interface(foreign, &parsed)
+                                    {
+                                        Some(source_interface)
+                                    } else if let Some((_, view_scope)) = generated_wit_view {
+                                        foreign_interface_by_generated_wit_path(
+                                            foreign, &parsed, view_scope, packages, symbols,
+                                        )?
+                                    } else {
+                                        None
+                                    };
+                                    if let Some((interface_visibility, interface_def)) =
+                                        source_interface
                                     {
                                         if interface_visibility == Visibility::Private {
                                             diagnostics.push(use_binding_diagnostic(
@@ -1175,6 +1632,75 @@ pub fn collect_module_alias_bindings_with_foreign_scopes(
                                                 source_location(input, path_range)?,
                                                 &package_identity,
                                             ));
+                                            resolved_foreign_target =
+                                                Some((None, PendingItemTarget::Unavailable));
+                                        } else if let Some((view_index, view_scope)) =
+                                            generated_view_for_source_interface(
+                                                foreign_wit_views,
+                                                &parsed.package_identity,
+                                                interface_def,
+                                            )
+                                        {
+                                            let has_origins =
+                                                view_scope.view.interfaces.values().any(
+                                                    |interface| interface.origin_identity.is_some(),
+                                                );
+                                            let matching_interface = if has_origins {
+                                                let origin = generated_origin_identity(
+                                                    interface_def,
+                                                    view_scope,
+                                                    packages,
+                                                    symbols,
+                                                )?;
+                                                view_scope.view.interfaces.values().find(
+                                                    |interface| {
+                                                        interface.origin_identity.as_ref()
+                                                            == Some(&origin)
+                                                    },
+                                                )
+                                            } else {
+                                                None
+                                            };
+                                            if let Some(interface) = matching_interface {
+                                                resolved_foreign_target = Some((
+                                                    Some(Res::Def(
+                                                        DefKind::Interface,
+                                                        interface.def,
+                                                    )),
+                                                    PendingItemTarget::WitInterface {
+                                                        view_index,
+                                                        interface: interface.def,
+                                                        source_interface: Some(interface_def),
+                                                    },
+                                                ));
+                                            } else {
+                                                // The source interface was
+                                                // omitted from the generated
+                                                // view owned by its package.
+                                                // Its errors belong there.
+                                                resolved_foreign_target = Some((
+                                                    Some(Res::Err),
+                                                    PendingItemTarget::Unavailable,
+                                                ));
+                                            }
+                                        } else if interface_def.package
+                                            != foreign.module_tree.package
+                                            && (!foreign_wit_views.is_empty()
+                                                || !unavailable_wit_identities.is_empty())
+                                        {
+                                            // The source package publicly
+                                            // re-exported an interface from a
+                                            // transitive dependency whose
+                                            // generated view is unavailable.
+                                            resolved_foreign_target =
+                                                Some((None, PendingItemTarget::Deferred));
+                                        } else if unavailable_wit_view {
+                                            // Keep source modules and their
+                                            // declarations usable while a
+                                            // failed Generated producer
+                                            // prevents interface replacement.
+                                            resolved_foreign_target =
+                                                Some((None, PendingItemTarget::Deferred));
                                         } else {
                                             diagnostics.push(
                                                 stage_feature_not_implemented_diagnostic(
@@ -1185,22 +1711,29 @@ pub fn collect_module_alias_bindings_with_foreign_scopes(
                                                     &package_identity,
                                                 ),
                                             );
+                                            resolved_foreign_target =
+                                                Some((None, PendingItemTarget::Unavailable));
                                         }
                                     } else {
-                                        diagnostics.push(
-                                            crate::use_target_diagnostics::unknown_module_diagnostic(
-                                                entry,
-                                                &parsed,
-                                                matched_prefix,
-                                                module_candidates,
-                                                source_location(input, path_range)?,
-                                                &package_identity,
-                                                symbols,
-                                            )?,
-                                        );
+                                        if unavailable_wit_view {
+                                            resolved_foreign_target =
+                                                Some((None, PendingItemTarget::Deferred));
+                                        } else {
+                                            diagnostics.push(
+                                                crate::use_target_diagnostics::unknown_module_diagnostic(
+                                                    entry,
+                                                    &parsed,
+                                                    matched_prefix,
+                                                    module_candidates,
+                                                    source_location(input, path_range)?,
+                                                    &package_identity,
+                                                    symbols,
+                                                )?,
+                                            );
+                                            resolved_foreign_target =
+                                                Some((None, PendingItemTarget::Unavailable));
+                                        }
                                     }
-                                    resolved_foreign_target =
-                                        Some((None, PendingItemTarget::Unavailable));
                                 }
                                 Err(ModuleTargetError::MissingRootModule) => {
                                     resolved_foreign_target =
@@ -1226,6 +1759,9 @@ pub fn collect_module_alias_bindings_with_foreign_scopes(
                                 &package_identity,
                             ));
                         }
+                    }
+                    PendingItemTarget::Deferred => {
+                        resolved_foreign_target = Some((None, PendingItemTarget::Deferred));
                     }
                     PendingItemTarget::UnknownPackage => {
                         let identity_range =
@@ -1301,6 +1837,31 @@ pub fn collect_module_alias_bindings_with_foreign_scopes(
                     }
                 }
             };
+            // An omitted Generated interface already has diagnostics owned
+            // by its source package. Keep its `Err` binding in this scope so
+            // later references do not acquire a second unresolved-name error.
+            let retain_error_binding =
+                target == PendingItemTarget::Unavailable && target_res == Some(Res::Err);
+
+            if let PendingItemTarget::WitInterface {
+                view_index,
+                interface,
+                ..
+            } = target
+                && reported_shadowed_interfaces.insert(interface)
+            {
+                if let Some(view_scope) = foreign_wit_views.get(view_index)
+                    && let Some(view_interface) = view_interface_by_def(view_scope.view, interface)
+                    && !view_interface.shadowed.is_empty()
+                {
+                    diagnostics.push(wit_item_shadowed_diagnostic(
+                        view_interface,
+                        source_location(input, path_range)?,
+                        &package_identity,
+                        symbols,
+                    )?);
+                }
+            }
 
             if let Some(binding_name) = binding_name {
                 let name = binding_name.symbol();
@@ -1401,7 +1962,7 @@ pub fn collect_module_alias_bindings_with_foreign_scopes(
                         matches!(
                             target,
                             PendingItemTarget::UnknownPackage | PendingItemTarget::StageGated
-                        ),
+                        ) || retain_error_binding,
                     )?;
                 }
             }
@@ -1449,7 +2010,7 @@ pub fn collect_module_alias_bindings_with_foreign_scopes(
                     matches!(
                         target,
                         PendingItemTarget::UnknownPackage | PendingItemTarget::StageGated
-                    ),
+                    ) || retain_error_binding,
                 )?;
                 pending_items.push(PendingLocalUseItem {
                     module: module_id,
@@ -1473,6 +2034,10 @@ pub fn collect_module_alias_bindings_with_foreign_scopes(
         scopes,
         pending_items,
         foreign_scopes,
+        foreign_wit_views,
+        foreign_source_member_scopes,
+        unavailable_wit_identities,
+        packages,
         symbols,
         &package_identity,
         &mut diagnostics,
@@ -1536,6 +2101,10 @@ fn resolve_local_use_items(
     scopes: &mut Phase1PackageScopes,
     pending: Vec<PendingLocalUseItem>,
     foreign_scopes: &[ForeignPackageScope<'_>],
+    foreign_wit_views: &[ForeignWitViewScope<'_>],
+    foreign_source_member_scopes: &[ForeignSourceMemberScope<'_>],
+    unavailable_wit_identities: &[String],
+    packages: &PackageInterner,
     symbols: &Interner,
     package_identity: &str,
     diagnostics: &mut Vec<Diagnostic>,
@@ -1565,11 +2134,28 @@ fn resolve_local_use_items(
             .push(index);
     }
 
+    let requesting_package = scopes
+        .modules
+        .first()
+        .ok_or(PackageScopesError::InvalidModuleTree)?
+        .module_def_id
+        .package();
+    let wit_member_index = ModuleMemberIndex::new_with_wit_views(
+        std::iter::empty(),
+        foreign_wit_views.iter().map(|scope| scope.view),
+        symbols,
+    );
     let mut resolver = LocalModuleMemberResolver {
         module_inputs,
         scopes,
         pending: &pending,
         foreign_scopes,
+        foreign_wit_views,
+        foreign_source_member_scopes,
+        unavailable_wit_identities,
+        packages,
+        wit_member_index,
+        requesting_package,
         pub_use_candidates,
         memo: HashMap::new(),
         stack: Vec::new(),
@@ -1813,6 +2399,9 @@ enum LocalMemberLookup {
     Missing,
     Deferred,
     Found(Binding),
+    /// A dependency-owned error makes this binding unavailable. Keep its
+    /// error resolution in scope to prevent a second unresolved-name error.
+    FoundSuppressed(Binding),
     Failed,
     Cycle,
 }
@@ -1834,6 +2423,12 @@ struct LocalModuleMemberResolver<'a> {
     scopes: &'a mut Phase1PackageScopes,
     pending: &'a [PendingLocalUseItem],
     foreign_scopes: &'a [ForeignPackageScope<'a>],
+    foreign_wit_views: &'a [ForeignWitViewScope<'a>],
+    foreign_source_member_scopes: &'a [ForeignSourceMemberScope<'a>],
+    unavailable_wit_identities: &'a [String],
+    packages: &'a PackageInterner,
+    wit_member_index: ModuleMemberIndex<'a>,
+    requesting_package: PackageId,
     pub_use_candidates: HashMap<(ModuleId, Symbol), Vec<usize>>,
     memo: HashMap<(ModuleId, Symbol), LocalMemberMemo>,
     stack: Vec<LocalMemberFrame>,
@@ -1888,6 +2483,17 @@ impl LocalModuleMemberResolver<'_> {
             } => {
                 self.lookup_foreign_module_member(package_scope_index, module, item.source_name)?
             }
+            PendingItemTarget::WitInterface {
+                view_index,
+                interface,
+                source_interface,
+            } => self.lookup_wit_interface_member(
+                view_index,
+                interface,
+                source_interface,
+                item.source_name,
+                item.binding_span,
+            )?,
             PendingItemTarget::LocalInterface(interface) => {
                 self.lookup_interface_member(interface, item.source_name)?
             }
@@ -1914,8 +2520,9 @@ impl LocalModuleMemberResolver<'_> {
             .ok_or(PackageScopesError::InvalidModuleTree)?;
         debug_assert_eq!(recorded_import.item_index, Some(item.item_index));
         debug_assert_eq!(recorded_import.name, item.binding_name);
-        let target_binding = match result {
-            LocalMemberLookup::Found(binding) => binding,
+        let (target_binding, retain_error_binding) = match result {
+            LocalMemberLookup::Found(binding) => (binding, false),
+            LocalMemberLookup::FoundSuppressed(binding) => (binding, true),
             LocalMemberLookup::Cycle => {
                 self.set_import_res(item.module, item.import, Res::Err)?;
                 return Ok(());
@@ -1928,21 +2535,33 @@ impl LocalModuleMemberResolver<'_> {
             LocalMemberLookup::Deferred => return Ok(()),
         };
 
-        let is_foreign_target = matches!(item.target, PendingItemTarget::ForeignModule { .. });
+        let is_foreign_target = matches!(
+            item.target,
+            PendingItemTarget::ForeignModule { .. } | PendingItemTarget::WitInterface { .. }
+        );
         if is_foreign_target && !item.is_pub && target_binding.visibility == Visibility::Private {
             self.report_private_item(item)?;
             self.set_import_res(item.module, item.import, Res::Err)?;
+            if retain_error_binding {
+                self.retain_import_for_conflicts(item.module, item.import)?;
+            }
             return Ok(());
         }
 
         if item.is_pub && target_binding.visibility != Visibility::Pub {
             self.report_private_reexport(item)?;
             self.set_import_res(item.module, item.import, Res::Err)?;
+            if retain_error_binding {
+                self.retain_import_for_conflicts(item.module, item.import)?;
+            }
             return Ok(());
         }
 
         let res = target_binding.res;
         self.set_import_res(item.module, item.import, res)?;
+        if retain_error_binding {
+            self.retain_import_for_conflicts(item.module, item.import)?;
+        }
         let visibility = if item.is_pub {
             Visibility::Pub
         } else {
@@ -2013,12 +2632,153 @@ impl LocalModuleMemberResolver<'_> {
             .modules
             .get(module.raw() as usize)
             .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
-        Ok(module_scope
-            .members
-            .get(&name)
-            .cloned()
-            .map(LocalMemberLookup::Found)
-            .unwrap_or(LocalMemberLookup::Missing))
+        let Some(mut binding) = module_scope.members.get(&name).cloned() else {
+            return Ok(LocalMemberLookup::Missing);
+        };
+        let Res::Def(DefKind::Interface, source_interface) = binding.res else {
+            return Ok(LocalMemberLookup::Found(binding));
+        };
+        let Some((_, view_scope)) = generated_view_for_source_interface(
+            self.foreign_wit_views,
+            foreign.visible_identity,
+            source_interface,
+        ) else {
+            let wit_resolution_is_active =
+                !self.foreign_wit_views.is_empty() || !self.unavailable_wit_identities.is_empty();
+            if (source_interface.package != foreign.module_tree.package && wit_resolution_is_active)
+                || self
+                    .unavailable_wit_identities
+                    .iter()
+                    .any(|identity| identity == foreign.visible_identity)
+            {
+                // A source dependency may publicly re-export an interface
+                // owned by a transitive package, or its Generated producer
+                // may have failed. Do not leak the source definition when
+                // its WIT replacement cannot be selected.
+                return Ok(LocalMemberLookup::Deferred);
+            }
+            return Ok(LocalMemberLookup::Found(binding));
+        };
+        let has_origins = view_scope
+            .view
+            .interfaces
+            .values()
+            .any(|interface| interface.origin_identity.is_some());
+        if !has_origins {
+            // A Generated view without origins has no source interface
+            // replacement. The source package owns the interface diagnostics.
+            binding.res = Res::Err;
+            return Ok(LocalMemberLookup::FoundSuppressed(binding));
+        }
+        let origin =
+            generated_origin_identity(source_interface, view_scope, self.packages, self.symbols)?;
+        let Some(view_interface) = view_scope
+            .view
+            .interfaces
+            .values()
+            .find(|interface| interface.origin_identity.as_ref() == Some(&origin))
+        else {
+            binding.res = Res::Err;
+            return Ok(LocalMemberLookup::FoundSuppressed(binding));
+        };
+        binding.res = Res::Def(DefKind::Interface, view_interface.def);
+        Ok(LocalMemberLookup::Found(binding))
+    }
+
+    fn lookup_wit_interface_member(
+        &self,
+        view_index: usize,
+        interface: DefId,
+        source_interface: Option<DefId>,
+        name: Symbol,
+        import_span: Span,
+    ) -> Result<LocalMemberLookup, PackageScopesError> {
+        let scope = self
+            .foreign_wit_views
+            .get(view_index)
+            .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+        let view_interface = view_interface_by_def(scope.view, interface)
+            .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+        if source_interface.is_some() && view_interface.origin_identity.is_none() {
+            return Err(PackageScopesError::ForeignPackageScopeMismatch);
+        }
+        let target = ModuleTarget::from_res(Res::Def(DefKind::Interface, interface))
+            .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+        match self
+            .wit_member_index
+            .lookup_target(target, name, self.requesting_package)
+        {
+            ModuleMemberLookup::WitMember(res) => Ok(LocalMemberLookup::Found(Binding {
+                res,
+                // WIT declarations do not have source spans. This temporary
+                // binding is only carried through the import/re-export
+                // algorithm and points at the user's import site.
+                name_span: import_span,
+                origin: BindingOrigin::Decl,
+                visibility: Visibility::Pub,
+            })),
+            ModuleMemberLookup::Missing => {
+                if let Some(source_interface) = source_interface {
+                    self.lookup_omitted_generated_member(scope, source_interface, name, import_span)
+                } else {
+                    Ok(LocalMemberLookup::Missing)
+                }
+            }
+            ModuleMemberLookup::NotModule => Ok(LocalMemberLookup::Missing),
+            ModuleMemberLookup::Found(_) | ModuleMemberLookup::Inaccessible(_) => {
+                Err(PackageScopesError::ForeignPackageScopeMismatch)
+            }
+        }
+    }
+
+    fn lookup_omitted_generated_member(
+        &self,
+        view_scope: &ForeignWitViewScope<'_>,
+        source_interface: DefId,
+        name: Symbol,
+        import_span: Span,
+    ) -> Result<LocalMemberLookup, PackageScopesError> {
+        let source_def_paths = view_scope
+            .source_def_paths
+            .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+        if !matches!(view_scope.view.unit.kind(), WitUnitKind::Generated { .. })
+            || source_def_paths.package() != source_interface.package
+        {
+            return Err(PackageScopesError::ForeignPackageScopeMismatch);
+        }
+        let source_package_scopes = self
+            .foreign_scopes
+            .iter()
+            .find(|foreign| foreign.module_tree.package == source_interface.package)
+            .map(|foreign| foreign.scopes)
+            .or_else(|| {
+                self.foreign_source_member_scopes
+                    .iter()
+                    .find(|source| source.module_tree.package == source_interface.package)
+                    .map(|source| source.scopes)
+            });
+        let Some(source_package_scopes) = source_package_scopes else {
+            // A transitive source scope is not needed to resolve present WIT
+            // members. Without it, defer rather than inventing a missing
+            // source item or reporting an unresolved-name cascade.
+            return Ok(LocalMemberLookup::Deferred);
+        };
+        let source_scope = source_package_scopes
+            .interfaces
+            .get(&source_interface)
+            .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+        let Some(source_member) = source_scope.members.get(&name) else {
+            return Ok(LocalMemberLookup::Missing);
+        };
+        Ok(LocalMemberLookup::FoundSuppressed(Binding {
+            res: Res::Err,
+            // The omitted source member is known only by its name here; its
+            // source span belongs to the dependency, so use the consumer
+            // import location for the temporary re-export binding.
+            name_span: import_span,
+            origin: BindingOrigin::Decl,
+            visibility: source_member.visibility,
+        }))
     }
 
     fn lookup(
@@ -2076,6 +2836,17 @@ impl LocalModuleMemberResolver<'_> {
                     module,
                     edge.source_name,
                 )?,
+                PendingItemTarget::WitInterface {
+                    view_index,
+                    interface,
+                    source_interface,
+                } => self.lookup_wit_interface_member(
+                    view_index,
+                    interface,
+                    source_interface,
+                    edge.source_name,
+                    edge.binding_span,
+                )?,
                 PendingItemTarget::LocalInterface(interface) => {
                     self.lookup_interface_member(interface, edge.source_name)?
                 }
@@ -2103,10 +2874,41 @@ impl LocalModuleMemberResolver<'_> {
                     self.memo.insert(key, LocalMemberMemo::Done(result.clone()));
                     return Ok(result);
                 }
+                LocalMemberLookup::FoundSuppressed(binding)
+                    if binding.visibility == Visibility::Pub =>
+                {
+                    self.set_import_res(edge.module, edge.import, Res::Err)?;
+                    self.retain_import_for_conflicts(edge.module, edge.import)?;
+                    let result = LocalMemberLookup::FoundSuppressed(Binding {
+                        res: Res::Err,
+                        name_span: edge.binding_span,
+                        origin: BindingOrigin::PubUse {
+                            import: edge.import,
+                        },
+                        visibility: Visibility::Pub,
+                    });
+                    self.memo.insert(key, LocalMemberMemo::Done(result.clone()));
+                    return Ok(result);
+                }
                 LocalMemberLookup::Found(_) => {
                     self.report_private_reexport(&edge)?;
                     self.set_import_res(edge.module, edge.import, Res::Err)?;
                     saw_failed = true;
+                }
+                LocalMemberLookup::FoundSuppressed(binding) => {
+                    self.report_private_reexport(&edge)?;
+                    self.set_import_res(edge.module, edge.import, Res::Err)?;
+                    self.retain_import_for_conflicts(edge.module, edge.import)?;
+                    let result = LocalMemberLookup::FoundSuppressed(Binding {
+                        res: Res::Err,
+                        name_span: edge.binding_span,
+                        origin: BindingOrigin::PubUse {
+                            import: edge.import,
+                        },
+                        visibility: binding.visibility,
+                    });
+                    self.memo.insert(key, LocalMemberMemo::Done(result.clone()));
+                    return Ok(result);
                 }
                 LocalMemberLookup::Missing | LocalMemberLookup::Failed => {
                     self.report_unresolved_import(&edge)?;
@@ -2230,6 +3032,11 @@ impl LocalModuleMemberResolver<'_> {
             PendingItemTarget::LocalInterface(interface) => {
                 self.suggested_interface_member_names(interface, &name)?
             }
+            PendingItemTarget::WitInterface {
+                view_index,
+                interface,
+                ..
+            } => self.suggested_wit_interface_member_names(view_index, interface, &name)?,
             PendingItemTarget::Deferred
             | PendingItemTarget::Inactive
             | PendingItemTarget::Unavailable
@@ -2383,6 +3190,37 @@ impl LocalModuleMemberResolver<'_> {
             .collect())
     }
 
+    fn suggested_wit_interface_member_names(
+        &self,
+        view_index: usize,
+        interface: DefId,
+        name: &str,
+    ) -> Result<Vec<String>, PackageScopesError> {
+        let scope = self
+            .foreign_wit_views
+            .get(view_index)
+            .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+        let interface = view_interface_by_def(scope.view, interface)
+            .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+        let mut ranked = interface
+            .members
+            .keys()
+            .filter(|spelling| !is_reserved_type_name(spelling))
+            .map(|spelling| (damerau_levenshtein(name, spelling), spelling.clone()))
+            .filter(|(distance, _)| *distance <= 2)
+            .collect::<Vec<_>>();
+        ranked.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+        });
+        Ok(ranked
+            .into_iter()
+            .take(3)
+            .map(|(_, spelling)| spelling)
+            .collect())
+    }
+
     fn suggested_interface_member_names(
         &self,
         interface: DefId,
@@ -2491,6 +3329,24 @@ impl LocalModuleMemberResolver<'_> {
         Ok(())
     }
 
+    fn retain_import_for_conflicts(
+        &mut self,
+        module: ModuleId,
+        import: ImportIndex,
+    ) -> Result<(), PackageScopesError> {
+        let module_scope = self
+            .scopes
+            .modules
+            .get_mut(module.raw() as usize)
+            .ok_or(PackageScopesError::MissingModuleInput(module))?;
+        let binding = module_scope
+            .imports
+            .get_mut(import.0 as usize)
+            .ok_or(PackageScopesError::InvalidModuleTree)?;
+        binding.retain_for_conflicts = true;
+        Ok(())
+    }
+
     fn location(&self, module: ModuleId, span: Span) -> Result<Location, PackageScopesError> {
         let input = self
             .module_inputs
@@ -2567,10 +3423,10 @@ fn local_interface_target(
     }
 }
 
-fn foreign_interface_visibility(
+fn foreign_interface(
     foreign: &ForeignPackageScope<'_>,
     path: &ParsedUsePath,
-) -> Option<Visibility> {
+) -> Option<(Visibility, DefId)> {
     let interface_name = path.segments.last().copied()?;
     let parent_path = &path.segments[..path.segments.len() - 1];
     let module_index = foreign
@@ -2578,13 +3434,309 @@ fn foreign_interface_visibility(
         .modules
         .iter()
         .position(|module| module.path.as_slice() == parent_path)?;
-    let binding = foreign
+    let module_scope = foreign.scopes.modules.get(module_index)?;
+    let binding = module_scope
+        .members
+        .get(&interface_name)
+        .or_else(|| module_scope.declared.get(&interface_name))?;
+    match binding.res {
+        Res::Def(DefKind::Interface, def_id) => Some((binding.visibility, def_id)),
+        Res::Def(_, _) | Res::Local(_) | Res::PrimTy(_) | Res::Err | Res::TestOnly(_) => None,
+    }
+}
+
+fn generated_view_for_source_interface<'view, 'data>(
+    foreign_wit_views: &'view [ForeignWitViewScope<'data>],
+    fallback_visible_identity: &str,
+    source_interface: DefId,
+) -> Option<(usize, &'view ForeignWitViewScope<'data>)> {
+    foreign_wit_views
+        .iter()
+        .enumerate()
+        .find(|(_, scope)| match scope.view.unit.kind() {
+            WitUnitKind::Generated { package } => match scope.source_def_paths {
+                Some(source_def_paths) => source_def_paths.package() == source_interface.package,
+                None => {
+                    package == source_interface.package
+                        || (scope.directly_visible
+                            && scope.visible_identity == fallback_visible_identity)
+                }
+            },
+            WitUnitKind::Dir { .. } | WitUnitKind::Wasi { .. } => false,
+        })
+}
+
+fn foreign_interface_by_generated_wit_path(
+    foreign: &ForeignPackageScope<'_>,
+    path: &ParsedUsePath,
+    view_scope: &ForeignWitViewScope<'_>,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) -> Result<Option<(Visibility, DefId)>, PackageScopesError> {
+    let Some(interface_name) = path.segments.last().copied() else {
+        return Ok(None);
+    };
+    let requested_name = canonical_wit_path_name(&symbols.resolve(interface_name)?);
+    let Some(view_interface) = view_interface_by_wit_path_name(view_scope.view, &requested_name)
+    else {
+        return Ok(None);
+    };
+    let Some(expected_origin) = view_interface.origin_identity.as_ref() else {
+        return Ok(None);
+    };
+    let parent_path = &path.segments[..path.segments.len() - 1];
+    let Some(module_index) = foreign
+        .module_tree
+        .modules
+        .iter()
+        .position(|module| module.path.as_slice() == parent_path)
+    else {
+        return Ok(None);
+    };
+    let module_scope = foreign
         .scopes
         .modules
-        .get(module_index)?
-        .declared
-        .get(&interface_name)?;
-    matches!(binding.res, Res::Def(DefKind::Interface, _)).then_some(binding.visibility)
+        .get(module_index)
+        .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
+    for binding in module_scope
+        .members
+        .values()
+        .chain(module_scope.declared.values())
+    {
+        let Res::Def(DefKind::Interface, source_interface) = binding.res else {
+            continue;
+        };
+        if view_scope
+            .source_def_paths
+            .is_none_or(|source_def_paths| source_def_paths.package() != source_interface.package)
+        {
+            // A re-export may point to a transitive owner's source package.
+            // Do not ask this view's source interner to canonicalize it.
+            continue;
+        }
+        if &generated_origin_identity(source_interface, view_scope, packages, symbols)?
+            == expected_origin
+        {
+            return Ok(Some((binding.visibility, source_interface)));
+        }
+    }
+    Ok(None)
+}
+
+fn view_interface_by_wit_path_name<'a>(
+    view: &'a WitView,
+    canonical_name: &str,
+) -> Option<&'a ViewInterface> {
+    view.interfaces.values().find(|interface| {
+        canonical_wit_path_name(&view.model.interfaces[interface.wit].name) == canonical_name
+    })
+}
+
+fn view_has_wit_path_world(view: &WitView, canonical_name: &str) -> bool {
+    view.worlds
+        .values()
+        .any(|world| canonical_wit_path_name(&view.model.worlds[world.wit].name) == canonical_name)
+}
+
+fn view_interface_by_def(view: &WitView, def: DefId) -> Option<&ViewInterface> {
+    view.interfaces
+        .values()
+        .find(|interface| interface.def == def)
+}
+
+/// WIT package path segments use lowercase kebab-case, while the WIT model
+/// retains all-uppercase words in their original spelling.
+fn canonical_wit_path_name(name: &str) -> String {
+    name.split('-')
+        .map(|word| {
+            if word.bytes().any(|byte| byte.is_ascii_alphabetic())
+                && word
+                    .bytes()
+                    .filter(u8::is_ascii_alphabetic)
+                    .all(|byte| byte.is_ascii_uppercase())
+            {
+                word.to_ascii_lowercase()
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn generated_origin_identity(
+    source_def: DefId,
+    scope: &ForeignWitViewScope<'_>,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) -> Result<WitViewOriginIdentity, PackageScopesError> {
+    let Some(source_def_paths) = scope.source_def_paths else {
+        return Err(PackageScopesError::ForeignPackageScopeMismatch);
+    };
+    let path = match source_def_paths.resolve_def_id(source_def) {
+        Ok(Some(path)) => path,
+        Ok(None)
+        | Err(DefPathInternerError::ForeignDefinitionId | DefPathInternerError::WrongPackage) => {
+            return Err(PackageScopesError::ForeignPackageScopeMismatch);
+        }
+        Err(error) => return Err(PackageScopesError::DefPath(error)),
+    };
+    if !matches!(
+        path.data().last().map(|component| &component.data),
+        Some(DefPathData::Interface(_))
+    ) {
+        return Err(PackageScopesError::ForeignPackageScopeMismatch);
+    }
+    let canonical_path = canonical_source_interface_path(path.data(), symbols)?;
+    let path_hash = DefPathHash::compute(&path, packages, symbols)
+        .map_err(PackageScopesError::DefPathValidation)?;
+    Ok(WitViewOriginIdentity {
+        path_hash,
+        canonical_path,
+    })
+}
+
+fn canonical_source_interface_path(
+    components: &[DisambiguatedDefPathData],
+    symbols: &Interner,
+) -> Result<String, PackageScopesError> {
+    let mut output = String::new();
+    for component in components {
+        let (tag, symbol) = match component.data {
+            DefPathData::Module(name) => ("module", name),
+            DefPathData::Interface(name) => ("interface", name),
+            _ => return Err(PackageScopesError::ForeignPackageScopeMismatch),
+        };
+        let spelling = symbols.resolve(symbol)?;
+        output.push_str(tag);
+        output.push('[');
+        output.push_str(&spelling.len().to_string());
+        output.push(':');
+        output.push_str(&spelling);
+        output.push(';');
+        output.push_str(&component.disambiguator.to_string());
+        output.push_str("]/");
+    }
+    Ok(output)
+}
+
+fn unknown_wit_item_diagnostic(
+    path: &ParsedUsePath,
+    view: &WitView,
+    location: Location,
+    package_identity: &str,
+    symbols: &Interner,
+) -> Result<Diagnostic, PackageScopesError> {
+    let name = path
+        .segments
+        .last()
+        .copied()
+        .map(|name| symbols.resolve(name).map(|name| name.to_string()))
+        .transpose()?
+        .unwrap_or_default();
+    let mut candidates = view
+        .interfaces
+        .values()
+        .map(|interface| canonical_wit_path_name(&view.model.interfaces[interface.wit].name))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+    candidates.dedup();
+    let mut ranked = candidates
+        .into_iter()
+        .map(|candidate| (damerau_levenshtein(&name, &candidate), candidate))
+        .filter(|(distance, _)| *distance <= 2)
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
+    });
+    let candidates = ranked
+        .into_iter()
+        .take(3)
+        .map(|(_, candidate)| candidate)
+        .collect::<Vec<_>>();
+    let mut diagnostic = use_binding_diagnostic(
+        Code::UnknownWitItem,
+        Severity::Error,
+        format!(
+            "WIT package `{}` has no interface named `{name}`",
+            path.package_identity
+        ),
+        "unknown WIT item",
+        location,
+        package_identity,
+    );
+    diagnostic
+        .data
+        .insert("name".to_owned(), Value::String(name));
+    diagnostic.data.insert(
+        "candidates".to_owned(),
+        Value::Array(candidates.iter().cloned().map(Value::String).collect()),
+    );
+    if !candidates.is_empty() {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Help,
+                message: format!(
+                    "similar interfaces: {}",
+                    candidates
+                        .iter()
+                        .map(|candidate| format!("`{candidate}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                location: None,
+            })
+            .expect("diagnostics without a source snapshot accept help children");
+    }
+    Ok(diagnostic)
+}
+
+fn wit_item_shadowed_diagnostic(
+    interface: &ViewInterface,
+    location: Location,
+    package_identity: &str,
+    symbols: &Interner,
+) -> Result<Diagnostic, PackageScopesError> {
+    let interface_name = symbols.resolve(interface.sai_name)?;
+    let descriptions = interface
+        .shadowed
+        .iter()
+        .map(|shadow| {
+            if let Some(resource) = &shadow.resource {
+                format!(
+                    "static function `{}` of resource `{resource}` is shadowed by its constructor",
+                    shadow.wit_name
+                )
+            } else {
+                format!(
+                    "WIT item `{}` is shadowed by the winning item",
+                    shadow.wit_name
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    let mut diagnostic = use_binding_diagnostic(
+        Code::WitItemShadowed,
+        Severity::Warning,
+        format!(
+            "some items of imported interface `{interface_name}` are inaccessible: {}",
+            descriptions.join("; ")
+        ),
+        "shadowed WIT item",
+        location,
+        package_identity,
+    );
+    diagnostic.data.insert(
+        "interface".to_owned(),
+        Value::String(interface_name.to_string()),
+    );
+    diagnostic.data.insert(
+        "shadowed".to_owned(),
+        Value::Array(descriptions.into_iter().map(Value::String).collect()),
+    );
+    Ok(diagnostic)
 }
 
 /// Names that can be shadowed by a module-level declaration or module alias.
@@ -3925,8 +5077,13 @@ mod tests {
     use sai_hir::attrs::TargetCfg;
     use sai_hir::item_tree::{ItemTree, TargetFilterResult};
     use sai_intern::PackageInterner;
+    use sai_package::{mvs::MvsPackageVersion, version::Version};
     use sai_syntax::{Parse, ast};
     use sai_vfs::{SnapshotFile, WorkspaceSnapshot};
+    use sai_wit::{
+        WitIndexVec, WitInterface, WitItem, WitItemKind, WitPackage, WitPackageName, WitUnit,
+        WitView, WitWorld, load_embedded_wasi_package,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -3986,7 +5143,10 @@ mod tests {
         visible_identity: String,
         tree: ModuleTree,
         scopes: Phase1PackageScopes,
-        _def_paths: DefPathInterner,
+        codec_def_id: DefId,
+        root_codec_def_id: DefId,
+        terminal_input_def_id: DefId,
+        def_paths: DefPathInterner,
     }
 
     impl ForeignScopeFixture {
@@ -4062,6 +5222,18 @@ mod tests {
                 .symbols
                 .intern("codec")
                 .expect("interface name interns");
+            let terminal_input_name = consumer
+                .symbols
+                .intern("terminal_input")
+                .expect("interface name interns");
+            let entry_name = consumer
+                .symbols
+                .intern("Entry")
+                .expect("interface member name interns");
+            let run_name = consumer
+                .symbols
+                .intern("run")
+                .expect("interface member name interns");
             let public_res = Res::Def(
                 DefKind::Struct,
                 intern_path(
@@ -4109,13 +5281,41 @@ mod tests {
                 intern_path(
                     package,
                     &api_path,
-                    DefPathData::TypeNs(codec_name),
+                    DefPathData::Interface(codec_name),
                     0,
                     &consumer.packages,
                     &consumer.symbols,
                     &def_paths,
                 )
                 .expect("foreign interface path")
+                .to_def_id(),
+            );
+            let root_codec_res = Res::Def(
+                DefKind::Interface,
+                intern_path(
+                    package,
+                    &[],
+                    DefPathData::Interface(codec_name),
+                    0,
+                    &consumer.packages,
+                    &consumer.symbols,
+                    &def_paths,
+                )
+                .expect("foreign root interface path")
+                .to_def_id(),
+            );
+            let terminal_input_res = Res::Def(
+                DefKind::Interface,
+                intern_path(
+                    package,
+                    &api_path,
+                    DefPathData::Interface(terminal_input_name),
+                    0,
+                    &consumer.packages,
+                    &consumer.symbols,
+                    &def_paths,
+                )
+                .expect("foreign kebab interface path")
                 .to_def_id(),
             );
             let dummy_span = Span::new(FileId::new(901), TextRange::empty(TextSize::new(0)));
@@ -4178,6 +5378,12 @@ mod tests {
                     imports: Vec::new(),
                 })
                 .collect::<Vec<_>>();
+            let root_scope = &mut module_scopes[ModuleId::ROOT.raw() as usize];
+            root_scope.declared.insert(
+                codec_name,
+                binding(root_codec_res, Visibility::Pub, BindingOrigin::Decl),
+            );
+            root_scope.members = root_scope.declared.clone();
             let api_scope = &mut module_scopes[1];
             api_scope.declared.insert(
                 public_name,
@@ -4195,6 +5401,10 @@ mod tests {
                 codec_name,
                 binding(interface_res, Visibility::Pub, BindingOrigin::Decl),
             );
+            api_scope.declared.insert(
+                terminal_input_name,
+                binding(terminal_input_res, Visibility::Pub, BindingOrigin::Decl),
+            );
             api_scope.members = api_scope.declared.clone();
             api_scope.members.insert(
                 forwarded_name,
@@ -4206,9 +5416,81 @@ mod tests {
                     },
                 ),
             );
+            let Res::Def(DefKind::Interface, codec_def_id) = interface_res else {
+                unreachable!("foreign interface binding has interface resolution")
+            };
+            let Res::Def(DefKind::Interface, root_codec_def_id) = root_codec_res else {
+                unreachable!("foreign root interface binding has interface resolution")
+            };
+            let Res::Def(DefKind::Interface, terminal_input_def_id) = terminal_input_res else {
+                unreachable!("foreign kebab interface binding has interface resolution")
+            };
+            let source_interface_scope = |interface_name: Symbol| {
+                let interface_path = [
+                    DisambiguatedDefPathData {
+                        data: DefPathData::Module(api),
+                        disambiguator: 0,
+                    },
+                    DisambiguatedDefPathData {
+                        data: DefPathData::Interface(interface_name),
+                        disambiguator: 0,
+                    },
+                ];
+                let entry_res = Res::Def(
+                    DefKind::Struct,
+                    intern_path(
+                        package,
+                        &interface_path,
+                        DefPathData::TypeNs(entry_name),
+                        0,
+                        &consumer.packages,
+                        &consumer.symbols,
+                        &def_paths,
+                    )
+                    .expect("foreign interface member path")
+                    .to_def_id(),
+                );
+                let run_res = Res::Def(
+                    DefKind::Fn,
+                    intern_path(
+                        package,
+                        &interface_path,
+                        DefPathData::ValueNs(run_name),
+                        0,
+                        &consumer.packages,
+                        &consumer.symbols,
+                        &def_paths,
+                    )
+                    .expect("foreign interface function path")
+                    .to_def_id(),
+                );
+                InterfaceScope {
+                    members: HashMap::from([
+                        (
+                            entry_name,
+                            binding(entry_res, Visibility::Pub, BindingOrigin::Decl),
+                        ),
+                        (
+                            run_name,
+                            binding(run_res, Visibility::Pub, BindingOrigin::Decl),
+                        ),
+                    ]),
+                }
+            };
+            let mut interface_scopes = HashMap::from([(
+                root_codec_def_id,
+                InterfaceScope {
+                    members: HashMap::new(),
+                },
+            )]);
+            interface_scopes.insert(codec_def_id, source_interface_scope(codec_name));
+            interface_scopes.insert(
+                terminal_input_def_id,
+                source_interface_scope(terminal_input_name),
+            );
             let scopes = Phase1PackageScopes {
                 modules: module_scopes,
-                interfaces: HashMap::new(),
+                interfaces: interface_scopes,
                 exports: BTreeMap::new(),
                 top_level_owners: Vec::new(),
                 function_owners: Vec::new(),
@@ -4221,7 +5503,10 @@ mod tests {
                 visible_identity: "acme:foreign".to_owned(),
                 tree,
                 scopes,
-                _def_paths: def_paths,
+                codec_def_id,
+                root_codec_def_id,
+                terminal_input_def_id,
+                def_paths,
             }
         }
 
@@ -4416,6 +5701,48 @@ mod tests {
             is_root_package: bool,
             foreign_scopes: &[ForeignPackageScope<'_>],
         ) -> (Phase1PackageScopes, DefPathInterner) {
+            self.collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+                module_sources,
+                requirements,
+                analyzes_tests,
+                is_root_package,
+                foreign_scopes,
+                &[],
+            )
+        }
+
+        fn collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+            &self,
+            module_sources: &[(&str, &str)],
+            requirements: Option<&[PackageUseRequirement]>,
+            analyzes_tests: bool,
+            is_root_package: bool,
+            foreign_scopes: &[ForeignPackageScope<'_>],
+            foreign_wit_views: &[ForeignWitViewScope<'_>],
+        ) -> (Phase1PackageScopes, DefPathInterner) {
+            self.collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views_unavailable_and_source_scopes(
+                module_sources,
+                requirements,
+                analyzes_tests,
+                is_root_package,
+                foreign_scopes,
+                foreign_wit_views,
+                &[],
+                &[],
+            )
+        }
+
+        fn collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views_unavailable_and_source_scopes(
+            &self,
+            module_sources: &[(&str, &str)],
+            requirements: Option<&[PackageUseRequirement]>,
+            analyzes_tests: bool,
+            is_root_package: bool,
+            foreign_scopes: &[ForeignPackageScope<'_>],
+            foreign_wit_views: &[ForeignWitViewScope<'_>],
+            unavailable_wit_identities: &[String],
+            foreign_source_member_scopes: &[ForeignSourceMemberScope<'_>],
+        ) -> (Phase1PackageScopes, DefPathInterner) {
             struct ExtraInput {
                 module_name: Symbol,
                 file: FileId,
@@ -4560,20 +5887,24 @@ mod tests {
                 )
                 .expect("local use targets collect"),
             );
-            let local_import_diagnostics = collect_module_alias_bindings_with_foreign_scopes(
-                &tree,
-                &inputs,
-                &mut scopes,
-                &self.packages,
-                &self.symbols,
-                &paths,
-                requirements,
-                &self.target_cfg,
-                analyzes_tests,
-                is_root_package,
-                foreign_scopes,
-            )
-            .expect("local and foreign use items collect");
+            let local_import_diagnostics =
+                collect_module_alias_bindings_with_foreign_wit_views_unavailable_and_source_scopes(
+                    &tree,
+                    &inputs,
+                    &mut scopes,
+                    &self.packages,
+                    &self.symbols,
+                    &paths,
+                    requirements,
+                    &self.target_cfg,
+                    analyzes_tests,
+                    is_root_package,
+                    foreign_scopes,
+                    foreign_wit_views,
+                    unavailable_wit_identities,
+                    foreign_source_member_scopes,
+                )
+                .expect("local and foreign use items collect");
             scopes.diagnostics.extend(local_import_diagnostics);
             (scopes, paths)
         }
@@ -4581,6 +5912,1232 @@ mod tests {
 
     fn text<'a>(symbols: &'a Interner, symbol: Symbol) -> String {
         symbols.resolve(symbol).unwrap().to_string()
+    }
+
+    fn wasi_view(fixture: &Fixture, package_name: &str) -> WitView {
+        let package = fixture
+            .symbols
+            .intern(package_name)
+            .expect("WASI package name");
+        let unit = WitUnit::wasi(
+            package,
+            &fixture.symbols,
+            &Version::parse("0.2.3").expect("WASI version"),
+        )
+        .expect("embedded WASI unit");
+        let model = load_embedded_wasi_package(&unit, &fixture.symbols)
+            .expect("embedded WASI package loads")
+            .root()
+            .clone();
+        let view_package = fixture
+            .packages
+            .intern(unit.stable_key())
+            .expect("WIT view package interns");
+        let paths = Arc::new(
+            DefPathInterner::new(view_package, &fixture.packages, &fixture.symbols)
+                .expect("WIT view interner"),
+        );
+        WitView::build(model, &fixture.packages, &fixture.symbols, paths).expect("WIT view builds")
+    }
+
+    fn generated_test_view(
+        fixture: &Fixture,
+        source_def_paths: &DefPathInterner,
+        interface_name: &str,
+        origin: DefId,
+    ) -> WitView {
+        generated_test_view_with_world(fixture, source_def_paths, interface_name, origin, &[])
+    }
+
+    fn generated_test_view_with_world(
+        fixture: &Fixture,
+        source_def_paths: &DefPathInterner,
+        interface_name: &str,
+        origin: DefId,
+        world_names: &[&str],
+    ) -> WitView {
+        generated_test_view_for_package(
+            fixture,
+            source_def_paths,
+            "acme:foreign",
+            interface_name,
+            origin,
+            world_names,
+        )
+    }
+
+    fn generated_test_view_for_package(
+        fixture: &Fixture,
+        source_def_paths: &DefPathInterner,
+        package_identity: &str,
+        interface_name: &str,
+        origin: DefId,
+        world_names: &[&str],
+    ) -> WitView {
+        let package = source_def_paths.package();
+        let selected = MvsPackageVersion::new(
+            package_identity,
+            Version::parse("1.0.0").expect("generated package version"),
+        )
+        .expect("selected package version");
+        let unit =
+            WitUnit::generated(package, &fixture.packages, &selected).expect("generated WIT unit");
+        let mut items = WitIndexVec::new();
+        items
+            .push(WitItem {
+                name: "entry".to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                kind: WitItemKind::Record(Vec::new()),
+                unsupported: None,
+                span: None,
+            })
+            .expect("WIT item appends");
+        items
+            .push(WitItem {
+                name: "run".to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                kind: WitItemKind::Func(sai_wit::WitFunc {
+                    params: Vec::new(),
+                    result: None,
+                    is_async: false,
+                }),
+                unsupported: None,
+                span: None,
+            })
+            .expect("WIT item appends");
+        let mut interfaces = WitIndexVec::new();
+        interfaces
+            .push(WitInterface {
+                name: interface_name.to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                items,
+                span: None,
+            })
+            .expect("WIT interface appends");
+        let mut worlds = WitIndexVec::new();
+        for world_name in world_names {
+            worlds
+                .push(WitWorld {
+                    name: (*world_name).to_owned(),
+                    docs: None,
+                    since: None,
+                    deprecated: None,
+                    imports: Vec::new(),
+                    exports: Vec::new(),
+                    includes: Vec::new(),
+                    source_order: Vec::new(),
+                    unsupported: None,
+                    span: None,
+                })
+                .expect("WIT world appends");
+        }
+        let (namespace, name) = package_identity
+            .split_once(':')
+            .expect("WIT package has a namespace");
+        let model = WitPackage {
+            unit: unit.clone(),
+            name: WitPackageName {
+                namespace: namespace.to_owned(),
+                name: name.to_owned(),
+                version: Some(Version::parse("1.0.0").expect("generated package version")),
+            },
+            interfaces,
+            worlds,
+        };
+        let view_package = fixture
+            .packages
+            .intern(unit.stable_key())
+            .expect("generated view package interns");
+        let view_paths = Arc::new(
+            DefPathInterner::new(view_package, &fixture.packages, &fixture.symbols)
+                .expect("generated view interner"),
+        );
+        WitView::build_with_origins(
+            model,
+            &fixture.packages,
+            &fixture.symbols,
+            view_paths,
+            source_def_paths,
+            &[(interface_name.to_owned(), origin)],
+        )
+        .expect("generated view builds")
+    }
+
+    #[test]
+    fn generated_wit_kebab_path_resolves_source_interface_by_origin() {
+        let fixture = Fixture::new(
+            concat!(
+                "use acme:foreign/api/terminal-input\n",
+                "use acme:foreign/api/terminal-input.{Entry as Imported}\n",
+                "use acme:foreign/api.{terminal_input as ImportedInterface}\n",
+                "use acme:foreign/api/terminal_input_alias\n",
+            ),
+            "wasm32-core",
+        );
+        let mut foreign = ForeignScopeFixture::new(&fixture);
+        let terminal_input_alias = fixture.symbols.intern("terminal_input_alias").unwrap();
+        let terminal_input = fixture.symbols.intern("terminal_input").unwrap();
+        let alias_binding = foreign.scopes.modules[1].members[&terminal_input].clone();
+        foreign.scopes.modules[1]
+            .members
+            .insert(terminal_input_alias, alias_binding);
+        let view = generated_test_view(
+            &fixture,
+            &foreign.def_paths,
+            "terminal-input",
+            foreign.terminal_input_def_id,
+        );
+        let wit_scopes = [ForeignWitViewScope {
+            visible_identity: "acme:foreign",
+            view: &view,
+            source_def_paths: Some(&foreign.def_paths),
+            directly_visible: true,
+        }];
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &wit_scopes,
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let terminal_input = fixture.symbols.intern("terminal_input").unwrap();
+        let imported = fixture.symbols.intern("Imported").unwrap();
+        let imported_interface = fixture.symbols.intern("ImportedInterface").unwrap();
+        let reexported_interface = fixture.symbols.intern("terminal_input_alias").unwrap();
+        let interface = &view.interfaces["terminal-input"];
+        assert_eq!(
+            root.scope[&terminal_input].res,
+            Res::Def(DefKind::Interface, interface.def),
+            "the kebab WIT path binds the generated interface's SAI name"
+        );
+        assert_eq!(
+            root.scope[&imported].res,
+            Res::Def(DefKind::Struct, interface.members["Entry"].def),
+            "the item list resolves through the generated view"
+        );
+        assert_eq!(
+            root.scope[&imported_interface].res,
+            Res::Def(DefKind::Interface, interface.def),
+            "an item list from the source module replaces its source interface with the generated view"
+        );
+        assert_eq!(
+            root.scope[&reexported_interface].res,
+            Res::Def(DefKind::Interface, interface.def),
+            "qualified lookup sees public interface aliases stored in the finalized member scope"
+        );
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            !matches!(
+                diagnostic.code,
+                Code::UnknownModule
+                    | Code::FeatureNotImplemented
+                    | Code::PrivateItem
+                    | Code::UnresolvedImport
+            )
+        }));
+    }
+
+    #[test]
+    fn transitive_source_interface_reexports_use_the_owning_generated_view() {
+        let fixture = Fixture::new(
+            concat!(
+                "use acme:foreign/api.{remote_codec as Imported}\n",
+                "use acme:foreign/api/remote_codec\n",
+                "use acme:foreign/api/terminal-input as local_interface\n",
+            ),
+            "wasm32-core",
+        );
+        let mut foreign = ForeignScopeFixture::new(&fixture);
+        let origin_package = fixture
+            .packages
+            .intern("acme:origin#1")
+            .expect("transitive source package interns");
+        let origin_def_paths =
+            DefPathInterner::new(origin_package, &fixture.packages, &fixture.symbols)
+                .expect("transitive definition path interner");
+        let api = fixture.symbols.intern("api").unwrap();
+        let shared = fixture.symbols.intern("shared").unwrap();
+        let source_interface = intern_path(
+            origin_package,
+            &[DisambiguatedDefPathData {
+                data: DefPathData::Module(api),
+                disambiguator: 0,
+            }],
+            DefPathData::Interface(shared),
+            0,
+            &fixture.packages,
+            &fixture.symbols,
+            &origin_def_paths,
+        )
+        .expect("transitive source interface path")
+        .to_def_id();
+        let reexported_name = fixture.symbols.intern("remote_codec").unwrap();
+        let mut reexported_binding =
+            foreign.scopes.modules[1].members[&fixture.symbols.intern("codec").unwrap()].clone();
+        reexported_binding.res = Res::Def(DefKind::Interface, source_interface);
+        foreign.scopes.modules[1]
+            .members
+            .insert(reexported_name, reexported_binding);
+
+        let direct_view = generated_test_view(
+            &fixture,
+            &foreign.def_paths,
+            "terminal-input",
+            foreign.terminal_input_def_id,
+        );
+        let origin_view = generated_test_view_for_package(
+            &fixture,
+            &origin_def_paths,
+            "acme:origin",
+            "shared",
+            source_interface,
+            &[],
+        );
+        let wit_scopes = [
+            ForeignWitViewScope {
+                visible_identity: "acme:foreign",
+                view: &direct_view,
+                source_def_paths: Some(&foreign.def_paths),
+                directly_visible: true,
+            },
+            ForeignWitViewScope {
+                visible_identity: "acme:origin",
+                view: &origin_view,
+                source_def_paths: Some(&origin_def_paths),
+                directly_visible: false,
+            },
+        ];
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &wit_scopes,
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let imported = fixture.symbols.intern("Imported").unwrap();
+        let qualified = fixture.symbols.intern("remote_codec").unwrap();
+        let local_interface = fixture.symbols.intern("local_interface").unwrap();
+        let expected = Res::Def(DefKind::Interface, origin_view.interfaces["shared"].def);
+        assert_eq!(root.scope[&imported].res, expected);
+        assert_eq!(root.scope[&qualified].res, expected);
+        assert_eq!(
+            root.scope[&local_interface].res,
+            Res::Def(
+                DefKind::Interface,
+                direct_view.interfaces["terminal-input"].def
+            ),
+            "the direct interface remains resolvable beside an unrelated transitive re-export"
+        );
+        assert!(
+            scopes.diagnostics.iter().all(|diagnostic| {
+                !matches!(
+                    diagnostic.code,
+                    Code::UnresolvedImport | Code::UnknownModule | Code::FeatureNotImplemented
+                )
+            }),
+            "the transitive interface resolves through its owning Generated view"
+        );
+
+        let (source_only_scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_scopes(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+            );
+        assert_eq!(
+            source_only_scopes.modules[ModuleId::ROOT.raw() as usize].scope[&imported].res,
+            Res::Def(DefKind::Interface, source_interface),
+            "the source-only compatibility entrypoint keeps its historical re-export binding when no WIT closure was supplied"
+        );
+    }
+
+    #[test]
+    fn transitive_generated_view_without_origins_still_owns_its_source_package() {
+        let fixture = Fixture::new(
+            "use acme:foreign/api/remote_codec as omitted\n",
+            "wasm32-core",
+        );
+        let mut foreign = ForeignScopeFixture::new(&fixture);
+        let origin_package = fixture
+            .packages
+            .intern("acme:origin#1")
+            .expect("transitive source package interns");
+        let origin_def_paths =
+            DefPathInterner::new(origin_package, &fixture.packages, &fixture.symbols)
+                .expect("transitive definition path interner");
+        let api = fixture.symbols.intern("api").unwrap();
+        let shared = fixture.symbols.intern("shared").unwrap();
+        let source_interface = intern_path(
+            origin_package,
+            &[DisambiguatedDefPathData {
+                data: DefPathData::Module(api),
+                disambiguator: 0,
+            }],
+            DefPathData::Interface(shared),
+            0,
+            &fixture.packages,
+            &fixture.symbols,
+            &origin_def_paths,
+        )
+        .expect("transitive source interface path")
+        .to_def_id();
+        let remote_codec = fixture.symbols.intern("remote_codec").unwrap();
+        let mut reexported_binding =
+            foreign.scopes.modules[1].members[&fixture.symbols.intern("codec").unwrap()].clone();
+        reexported_binding.res = Res::Def(DefKind::Interface, source_interface);
+        foreign.scopes.modules[1]
+            .members
+            .insert(remote_codec, reexported_binding);
+
+        let direct_view =
+            generated_test_view(&fixture, &foreign.def_paths, "codec", foreign.codec_def_id);
+        let mut transitive_view = generated_test_view_for_package(
+            &fixture,
+            &origin_def_paths,
+            "acme:origin",
+            "shared",
+            source_interface,
+            &[],
+        );
+        for interface in transitive_view.interfaces.values_mut() {
+            interface.origin = None;
+            interface.origin_identity = None;
+        }
+        let wit_scopes = [
+            ForeignWitViewScope {
+                visible_identity: "acme:foreign",
+                view: &direct_view,
+                source_def_paths: Some(&foreign.def_paths),
+                directly_visible: true,
+            },
+            ForeignWitViewScope {
+                visible_identity: "acme:origin",
+                view: &transitive_view,
+                source_def_paths: None,
+                directly_visible: false,
+            },
+        ];
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &wit_scopes,
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let omitted = fixture.symbols.intern("omitted").unwrap();
+        assert_eq!(
+            root.scope[&omitted].res,
+            Res::Err,
+            "the transitive Generated view is selected by its owner package even without origins"
+        );
+        assert!(
+            scopes.diagnostics.iter().all(|diagnostic| {
+                diagnostic.code != Code::UnknownModule
+                    && diagnostic.code != Code::FeatureNotImplemented
+            }),
+            "the owning Generated view determines omission without a misleading source-path error"
+        );
+    }
+
+    #[test]
+    fn transitive_omitted_member_uses_its_owner_source_scope() {
+        let fixture = Fixture::new(
+            concat!(
+                "use acme:foreign/api/remote_codec.{run as omitted_run}\n",
+                "use acme:foreign/api/remote_codec.{NotThere}\n",
+            ),
+            "wasm32-core",
+        );
+        let mut foreign = ForeignScopeFixture::new(&fixture);
+        let origin_package = fixture
+            .packages
+            .intern("acme:origin#1")
+            .expect("transitive source package interns");
+        let origin_def_paths =
+            DefPathInterner::new(origin_package, &fixture.packages, &fixture.symbols)
+                .expect("transitive definition path interner");
+        let shared = fixture.symbols.intern("shared").unwrap();
+        let run = fixture.symbols.intern("run").unwrap();
+        let source_interface = intern_path(
+            origin_package,
+            &[],
+            DefPathData::Interface(shared),
+            0,
+            &fixture.packages,
+            &fixture.symbols,
+            &origin_def_paths,
+        )
+        .expect("transitive source interface path")
+        .to_def_id();
+        let source_run = intern_path(
+            origin_package,
+            &[DisambiguatedDefPathData {
+                data: DefPathData::Interface(shared),
+                disambiguator: 0,
+            }],
+            DefPathData::ValueNs(run),
+            0,
+            &fixture.packages,
+            &fixture.symbols,
+            &origin_def_paths,
+        )
+        .expect("transitive source item path")
+        .to_def_id();
+        let remote_codec = fixture.symbols.intern("remote_codec").unwrap();
+        let mut reexported_binding =
+            foreign.scopes.modules[1].members[&fixture.symbols.intern("codec").unwrap()].clone();
+        reexported_binding.res = Res::Def(DefKind::Interface, source_interface);
+        foreign.scopes.modules[1]
+            .members
+            .insert(remote_codec, reexported_binding);
+
+        let direct_view =
+            generated_test_view(&fixture, &foreign.def_paths, "codec", foreign.codec_def_id);
+        let mut transitive_view = generated_test_view_for_package(
+            &fixture,
+            &origin_def_paths,
+            "acme:origin",
+            "shared",
+            source_interface,
+            &[],
+        );
+        transitive_view
+            .interfaces
+            .get_mut("shared")
+            .unwrap()
+            .members
+            .remove("run")
+            .expect("test omits a source member from generated WIT");
+        let wit_scopes = [
+            ForeignWitViewScope {
+                visible_identity: "acme:foreign",
+                view: &direct_view,
+                source_def_paths: Some(&foreign.def_paths),
+                directly_visible: true,
+            },
+            ForeignWitViewScope {
+                visible_identity: "acme:origin",
+                view: &transitive_view,
+                source_def_paths: Some(&origin_def_paths),
+                directly_visible: false,
+            },
+        ];
+
+        let root_id = intern_module_def_path(
+            origin_package,
+            &[],
+            &fixture.packages,
+            &fixture.symbols,
+            &origin_def_paths,
+        )
+        .expect("transitive package root path");
+        let origin_tree = ModuleTree {
+            package: origin_package,
+            modules: vec![ModuleData {
+                path: Vec::new(),
+                file: FileId::new(80),
+                parent_dir: None,
+                children: BTreeMap::new(),
+            }],
+            namespaces: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let origin_scopes = Phase1PackageScopes {
+            modules: vec![Phase1ModuleScopes {
+                module_def_id: root_id,
+                declared: HashMap::new(),
+                members: HashMap::new(),
+                scope: HashMap::new(),
+                imports: Vec::new(),
+            }],
+            interfaces: HashMap::from([(
+                source_interface,
+                InterfaceScope {
+                    members: HashMap::from([(
+                        run,
+                        Binding {
+                            res: Res::Def(DefKind::Fn, source_run),
+                            name_span: foreign.scopes.interfaces[&foreign.codec_def_id].members
+                                [&fixture.symbols.intern("run").unwrap()]
+                                .name_span,
+                            origin: BindingOrigin::Decl,
+                            visibility: Visibility::Pub,
+                        },
+                    )]),
+                },
+            )]),
+            exports: BTreeMap::new(),
+            top_level_owners: Vec::new(),
+            function_owners: Vec::new(),
+            invariant_owners: Vec::new(),
+            refinement_predicate_owners: Vec::new(),
+            extern_function_owners: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        let source_member_scopes = [ForeignSourceMemberScope {
+            module_tree: &origin_tree,
+            scopes: &origin_scopes,
+        }];
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views_unavailable_and_source_scopes(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &wit_scopes,
+                &[],
+                &source_member_scopes,
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let known_omitted = fixture.symbols.intern("omitted_run").unwrap();
+        assert_eq!(
+            root.scope[&known_omitted].res,
+            Res::Err,
+            "an omitted item that exists in the transitive source interface is retained without an unresolved import"
+        );
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::UnresolvedImport)
+                .count(),
+            1,
+            "an absent member still reports an unresolved import"
+        );
+    }
+
+    #[test]
+    fn unavailable_generated_view_keeps_source_modules_available() {
+        let fixture = Fixture::new(
+            concat!(
+                "use acme:foreign/api as api_module\n",
+                "use acme:foreign/api/codec as codec_alias\n",
+                "use acme:foreign/api.{codec as codec_item}\n",
+            ),
+            "wasm32-core",
+        );
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let unavailable = ["acme:foreign".to_owned()];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views_unavailable_and_source_scopes(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &[],
+                &unavailable,
+                &[],
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let api = fixture.symbols.intern("api_module").unwrap();
+        let codec = fixture.symbols.intern("codec_alias").unwrap();
+        let codec_item = fixture.symbols.intern("codec_item").unwrap();
+        assert!(matches!(root.scope[&api].res, Res::Def(DefKind::Module, _)));
+        assert!(
+            !root.scope.contains_key(&codec),
+            "source interface replacement is deferred when its Generated view failed"
+        );
+        assert!(
+            !root.scope.contains_key(&codec_item),
+            "item-list imports also defer an interface whose Generated view failed"
+        );
+        assert!(
+            scopes.diagnostics.is_empty(),
+            "an unavailable Generated producer does not turn valid source module access into a dependency error"
+        );
+    }
+
+    #[test]
+    fn generated_wit_world_paths_precede_source_interface_fallback() {
+        let fixture = Fixture::new(
+            concat!(
+                "use acme:foreign/command as world_only\n",
+                "use acme:foreign/codec as interface_world_collision\n",
+            ),
+            "wasm32-core",
+        );
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let view = generated_test_view_with_world(
+            &fixture,
+            &foreign.def_paths,
+            "codec",
+            foreign.root_codec_def_id,
+            &["command", "codec"],
+        );
+        let wit_scopes = [ForeignWitViewScope {
+            visible_identity: "acme:foreign",
+            view: &view,
+            source_def_paths: Some(&foreign.def_paths),
+            directly_visible: true,
+        }];
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &wit_scopes,
+            );
+
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidUseTarget)
+                .count(),
+            2,
+            "a world is invalid both alone and when a source interface has the same name"
+        );
+        assert!(
+            scopes.diagnostics.iter().all(|diagnostic| {
+                diagnostic.code != Code::UnknownModule
+                    && diagnostic.code != Code::FeatureNotImplemented
+            }),
+            "the generated view owns its WIT world paths before source fallback"
+        );
+    }
+
+    #[test]
+    fn generated_views_without_origins_do_not_require_source_path_interners() {
+        let fixture = Fixture::new("use acme:foreign/api/codec as codec_alias\n", "wasm32-core");
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let mut view =
+            generated_test_view(&fixture, &foreign.def_paths, "codec", foreign.codec_def_id);
+        let interface = view.interfaces.get_mut("codec").unwrap();
+        interface.origin = None;
+        interface.origin_identity = None;
+        let wit_scopes = [ForeignWitViewScope {
+            visible_identity: "acme:foreign",
+            view: &view,
+            source_def_paths: None,
+            directly_visible: true,
+        }];
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &wit_scopes,
+            );
+
+        assert!(scopes.diagnostics.is_empty());
+        let codec_alias = fixture.symbols.intern("codec_alias").unwrap();
+        assert_eq!(
+            scopes.modules[ModuleId::ROOT.raw() as usize].scope[&codec_alias].res,
+            Res::Err,
+            "a generated view without origins treats the source interface as unavailable without requiring its interner"
+        );
+    }
+
+    #[test]
+    fn generated_interface_lookup_rejects_same_package_wrong_source_interner() {
+        let fixture = Fixture::new("", "wasm32-core");
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let view = generated_test_view(
+            &fixture,
+            &foreign.def_paths,
+            "terminal-input",
+            foreign.terminal_input_def_id,
+        );
+        let wrong_source_def_paths = DefPathInterner::new(
+            foreign.def_paths.package(),
+            &fixture.packages,
+            &fixture.symbols,
+        )
+        .expect("same-package source interner");
+        let scope = ForeignWitViewScope {
+            visible_identity: "acme:foreign",
+            view: &view,
+            source_def_paths: Some(&wrong_source_def_paths),
+            directly_visible: true,
+        };
+
+        assert!(
+            matches!(
+                generated_origin_identity(
+                    foreign.terminal_input_def_id,
+                    &scope,
+                    &fixture.packages,
+                    &fixture.symbols
+                ),
+                Err(PackageScopesError::ForeignPackageScopeMismatch)
+            ),
+            "an interface DefId missing from a same-package interner is an invariant failure, not an omitted interface"
+        );
+    }
+
+    #[test]
+    fn omitted_generated_members_suppress_only_confirmed_source_items() {
+        let fixture = Fixture::new(
+            concat!(
+                "use acme:foreign/api/codec.{Entry as Omitted}\n",
+                "pub use acme:foreign/api/codec.{Entry as Reexported}\n",
+                "pub use acme:foreign/api/codec.{run as PrivateReexported}\n",
+                "use acme:foreign/api/codec.{NotThere as Unknown}\n",
+            ),
+            "wasm32-core",
+        );
+        let mut foreign = ForeignScopeFixture::new(&fixture);
+        let run = fixture.symbols.intern("run").unwrap();
+        foreign
+            .scopes
+            .interfaces
+            .get_mut(&foreign.codec_def_id)
+            .unwrap()
+            .members
+            .get_mut(&run)
+            .unwrap()
+            .visibility = Visibility::Private;
+        let view = generated_test_view(&fixture, &foreign.def_paths, "codec", foreign.codec_def_id);
+        let mut view = view;
+        let members = &mut view.interfaces.get_mut("codec").unwrap().members;
+        members
+            .remove("Entry")
+            .expect("test removes an item present in the source scope");
+        members
+            .remove("run")
+            .expect("test removes the private source item");
+        let wit_scopes = [ForeignWitViewScope {
+            visible_identity: "acme:foreign",
+            view: &view,
+            source_def_paths: Some(&foreign.def_paths),
+            directly_visible: true,
+        }];
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+                &[(
+                    "bridge",
+                    "use acme:phase1.{PrivateReexported as Repeated}\n",
+                )],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &wit_scopes,
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let omitted = fixture.symbols.intern("Omitted").unwrap();
+        let reexported = fixture.symbols.intern("Reexported").unwrap();
+        let private_reexported = fixture.symbols.intern("PrivateReexported").unwrap();
+        let repeated = fixture.symbols.intern("Repeated").unwrap();
+        let unknown = fixture.symbols.intern("Unknown").unwrap();
+        assert_eq!(
+            root.imports
+                .iter()
+                .find(|import| import.name == omitted)
+                .expect("omitted item import is retained")
+                .res,
+            Res::Err
+        );
+        assert_eq!(
+            root.imports
+                .iter()
+                .find(|import| import.name == reexported)
+                .expect("omitted re-export is retained")
+                .res,
+            Res::Err
+        );
+        assert_eq!(root.members[&reexported].res, Res::Err);
+        let private_reexport_import = root
+            .imports
+            .iter()
+            .find(|import| import.name == private_reexported)
+            .expect("private omitted re-export is retained");
+        assert_eq!(private_reexport_import.res, Res::Err);
+        assert!(
+            private_reexport_import.retain_for_conflicts,
+            "the privacy diagnostic still retains its error binding"
+        );
+        let bridge = &scopes.modules[ModuleId::from_raw(1).raw() as usize];
+        assert_eq!(
+            bridge.scope.get(&repeated).map(|binding| binding.res),
+            Some(Res::Err),
+            "a later sibling-module import observes the retained error binding; imports: {:?}; diagnostics: {:?}",
+            bridge.imports,
+            scopes.diagnostics
+        );
+        assert_eq!(
+            root.imports
+                .iter()
+                .find(|import| import.name == unknown)
+                .expect("unknown item import is retained")
+                .res,
+            Res::Err
+        );
+        let unresolved = scopes
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == Code::UnresolvedImport)
+            .collect::<Vec<_>>();
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(
+            unresolved[0].data.get("name"),
+            Some(&Value::String("NotThere".to_owned())),
+            "only the arbitrary misspelling remains unresolved"
+        );
+    }
+
+    #[test]
+    fn wit_views_resolve_aliases_items_reexports_and_shadow_warnings() {
+        let fixture = Fixture::new(
+            concat!(
+                "use acme:foreign/api/codec as codec_alias\n",
+                "use acme:foreign/api/codec.{Entry as Imported, run as imported_run}\n",
+                "pub use acme:foreign/api/codec.{Entry as Reexported}\n",
+            ),
+            "wasm32-core",
+        );
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let mut view =
+            generated_test_view(&fixture, &foreign.def_paths, "codec", foreign.codec_def_id);
+        let interface = view.interfaces.get_mut("codec").unwrap();
+        interface.shadowed.push(sai_wit::Shadowed {
+            wit_name: "new".to_owned(),
+            resource: Some("entry".to_owned()),
+            winner: interface.members["Entry"].def,
+        });
+        let wit_scopes = [ForeignWitViewScope {
+            visible_identity: "acme:foreign",
+            view: &view,
+            source_def_paths: Some(&foreign.def_paths),
+            directly_visible: true,
+        }];
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &wit_scopes,
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let alias = fixture.symbols.intern("codec_alias").unwrap();
+        let imported = fixture.symbols.intern("Imported").unwrap();
+        let imported_run = fixture.symbols.intern("imported_run").unwrap();
+        let reexported = fixture.symbols.intern("Reexported").unwrap();
+        let interface = &view.interfaces["codec"];
+        let entry = &interface.members["Entry"];
+        let run = &interface.members["run"];
+
+        assert_eq!(
+            root.scope[&alias].res,
+            Res::Def(DefKind::Interface, interface.def),
+            "a source interface is replaced by its generated view using canonical provenance"
+        );
+        assert_eq!(
+            root.scope[&imported].res,
+            Res::Def(DefKind::Struct, entry.def)
+        );
+        assert_eq!(
+            root.scope[&imported_run].res,
+            Res::Def(DefKind::Fn, run.def)
+        );
+        assert_eq!(
+            root.scope[&reexported].res,
+            Res::Def(DefKind::Struct, entry.def)
+        );
+        assert_eq!(root.members[&reexported].visibility, Visibility::Pub);
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::WitItemShadowed)
+                .count(),
+            1,
+            "one warning is emitted for the first binding of a view interface"
+        );
+        assert!(
+            scopes.diagnostics.iter().all(|diagnostic| {
+                !matches!(
+                    diagnostic.code,
+                    Code::FeatureNotImplemented | Code::PrivateItem | Code::PrivateReexport
+                )
+            }),
+            "the active generated view owns the WIT interface and item bindings"
+        );
+    }
+
+    #[test]
+    fn direct_wit_views_report_unknown_items_and_reject_worlds_and_package_roots() {
+        let fixture = Fixture::new(
+            concat!(
+                "use wasi:cli as root_alias\n",
+                "use wasi:cli/command as world_alias\n",
+                "use wasi:cli/terminal-input\n",
+                "use wasi:cli/not-an-interface as missing\n",
+            ),
+            "wasm32-core",
+        );
+        let view = wasi_view(&fixture, "cli");
+        let wit_scopes = [ForeignWitViewScope {
+            visible_identity: "wasi:cli",
+            view: &view,
+            source_def_paths: None,
+            directly_visible: true,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+                &[],
+                Some(&[]),
+                false,
+                true,
+                &[],
+                &wit_scopes,
+            );
+
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InvalidUseTarget)
+                .count(),
+            2,
+            "the WIT package root and world are not importable interfaces"
+        );
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::UnknownWitItem)
+                .count(),
+            1
+        );
+        let terminal_input = fixture.symbols.intern("terminal_input").unwrap();
+        let imported_interface = view
+            .interfaces
+            .values()
+            .find(|interface| interface.sai_name == terminal_input)
+            .expect("WASI CLI terminal-input interface exists");
+        assert_eq!(
+            scopes.modules[ModuleId::ROOT.raw() as usize].scope[&terminal_input].res,
+            Res::Def(DefKind::Interface, imported_interface.def),
+            "a kebab-case WIT path segment binds the interface's SAI name"
+        );
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            !matches!(
+                diagnostic.code,
+                Code::FeatureNotImplemented | Code::UnknownModule
+            )
+        }));
+    }
+
+    #[test]
+    fn missing_generated_origin_suppresses_duplicate_path_diagnostics() {
+        let fixture = Fixture::new(
+            concat!(
+                "use acme:foreign/api/codec as codec_alias\n",
+                "use acme:foreign/api.{codec as omitted}\n",
+            ),
+            "wasm32-core",
+        );
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let api = fixture.symbols.intern("api").unwrap();
+        let other = fixture.symbols.intern("other").unwrap();
+        let api_path = [DisambiguatedDefPathData {
+            data: DefPathData::Module(api),
+            disambiguator: 0,
+        }];
+        let other_origin = intern_path(
+            foreign.def_paths.package(),
+            &api_path,
+            DefPathData::Interface(other),
+            0,
+            &fixture.packages,
+            &fixture.symbols,
+            &foreign.def_paths,
+        )
+        .expect("unrelated generated origin path")
+        .to_def_id();
+        let view = generated_test_view(&fixture, &foreign.def_paths, "other", other_origin);
+        let foreign_scopes = [foreign.scope()];
+        let wit_scopes = [ForeignWitViewScope {
+            visible_identity: "acme:foreign",
+            view: &view,
+            source_def_paths: Some(&foreign.def_paths),
+            directly_visible: true,
+        }];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &wit_scopes,
+            );
+        let alias = fixture.symbols.intern("codec_alias").unwrap();
+        let omitted = fixture.symbols.intern("omitted").unwrap();
+
+        assert_eq!(
+            scopes.modules[ModuleId::ROOT.raw() as usize].scope[&alias].res,
+            Res::Err,
+            "an omitted source interface retains an error binding without a diagnostic"
+        );
+        assert_eq!(
+            scopes.modules[ModuleId::ROOT.raw() as usize].scope[&omitted].res,
+            Res::Err,
+            "an omitted source interface from a module item list retains an error binding"
+        );
+        assert!(
+            scopes.diagnostics.iter().all(|diagnostic| {
+                !matches!(
+                    diagnostic.code,
+                    Code::UnknownModule
+                        | Code::FeatureNotImplemented
+                        | Code::PrivateItem
+                        | Code::UnresolvedImport
+                )
+            }),
+            "the dependency's own generated-WIT errors own the missing origin"
+        );
+    }
+
+    #[test]
+    fn inactive_dependency_keeps_its_diagnostic_owner_before_wit_lookup() {
+        let fixture = Fixture::new("use acme:foreign/api/codec as codec_alias\n", "wasm32-core");
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let view = generated_test_view(&fixture, &foreign.def_paths, "codec", foreign.codec_def_id);
+        let foreign_scopes = [foreign.scope()];
+        let wit_scopes = [ForeignWitViewScope {
+            visible_identity: "acme:foreign",
+            view: &view,
+            source_def_paths: Some(&foreign.def_paths),
+            directly_visible: true,
+        }];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: Some(Arc::from(["wasm64-core".to_owned()])),
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &wit_scopes,
+            );
+
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::InactiveDependency)
+                .count(),
+            1
+        );
+        assert!(scopes.diagnostics.iter().all(|diagnostic| {
+            !matches!(
+                diagnostic.code,
+                Code::FeatureNotImplemented | Code::PrivateItem | Code::UnknownModule
+            )
+        }));
+        assert!(
+            scopes.modules[ModuleId::ROOT.raw() as usize]
+                .imports
+                .iter()
+                .any(|import| import.inactive && import.res == Res::Err)
+        );
     }
 
     #[test]

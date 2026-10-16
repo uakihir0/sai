@@ -96,16 +96,16 @@ pub struct WitPackageResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct WitPackageQueryValue {
-    package: Arc<LoadedWitPackage>,
-    generated_texts: Arc<[(WitUnit, Arc<GeneratedText>)]>,
+pub(super) struct WitPackageQueryValue {
+    pub(super) package: Arc<LoadedWitPackage>,
+    pub(super) generated_texts: Arc<[(WitUnit, Arc<GeneratedText>)]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct WitPackageQueryOutput {
-    identity: Fingerprint,
-    selected_version: Option<String>,
-    result: Result<WitPackageQueryValue, WitPackageFailure>,
+pub(super) struct WitPackageQueryOutput {
+    pub(super) identity: Fingerprint,
+    pub(super) selected_version: Option<String>,
+    pub(super) result: Result<WitPackageQueryValue, WitPackageFailure>,
 }
 
 impl StableHash for WitPackageQueryOutput {
@@ -213,7 +213,7 @@ fn stable_hash_wit_package_failure(failure: &WitPackageFailure, hasher: &mut Sta
 }
 
 pub(super) struct WitPackageQueries {
-    query: DerivedQuery<WitUnit, WitPackageQueryOutput>,
+    pub(super) query: DerivedQuery<WitUnit, WitPackageQueryOutput>,
 }
 
 impl WitPackageQueries {
@@ -253,6 +253,226 @@ impl WitPackageQueries {
         )?;
         Ok(Self { query })
     }
+}
+
+/// Errors returned by the tracked WIT-view query.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WitViewQueryError {
+    InvalidUnit(String),
+    Query(QueryError),
+    Package(WitPackageFailure),
+    View(WitViewError),
+    GeneratedSnapshotMissing { canonical_unit: String },
+}
+
+impl From<WitPackageQueryError> for WitViewQueryError {
+    fn from(error: WitPackageQueryError) -> Self {
+        match error {
+            WitPackageQueryError::InvalidUnit(reason) => Self::InvalidUnit(reason),
+            WitPackageQueryError::Query(error) => Self::Query(error),
+        }
+    }
+}
+
+impl std::fmt::Display for WitViewQueryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidUnit(reason) => write!(formatter, "invalid WIT unit: {reason}"),
+            Self::Query(error) => write!(formatter, "WIT view query failed: {error}"),
+            Self::Package(error) => write!(formatter, "WIT package loading failed: {error:?}"),
+            Self::View(error) => write!(formatter, "WIT view construction failed: {error}"),
+            Self::GeneratedSnapshotMissing { canonical_unit } => write!(
+                formatter,
+                "loaded Generated unit `{canonical_unit}` has no tracked text snapshot"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WitViewQueryError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Query(error) => Some(error),
+            Self::View(error) => Some(error),
+            Self::InvalidUnit(_) | Self::Package(_) | Self::GeneratedSnapshotMissing { .. } => None,
+        }
+    }
+}
+
+pub(super) fn validate_generated_origin_definitions(
+    origins: &[(String, DefId)],
+    source_def_paths: &DefPathInterner,
+) -> Result<(), WitViewError> {
+    for (interface, def) in origins {
+        match source_def_paths.resolve_def_id(*def).map_err(|error| {
+            WitViewError::GeneratedOriginPath {
+                interface: interface.clone(),
+                error,
+            }
+        })? {
+            Some(_) => {}
+            None => {
+                return Err(WitViewError::GeneratedOriginDefinitionNotFound {
+                    interface: interface.clone(),
+                    def: *def,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WitViewQueryOutput {
+    package_identity: Fingerprint,
+    result: Result<Arc<WitView>, WitViewQueryError>,
+}
+
+impl StableHash for WitViewQueryOutput {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        // Fingerprinting the package-query output retains exact selected
+        // versions throughout the closure, even though WitUnit's query key
+        // uses compatibility-line identity.
+        self.package_identity.stable_hash(hasher);
+        match &self.result {
+            Ok(view) => {
+                hasher.write_tag(0xC1);
+                view.stable_hash(hasher);
+            }
+            Err(error) => {
+                hasher.write_tag(match error {
+                    WitViewQueryError::InvalidUnit(_) => 0x01,
+                    WitViewQueryError::Query(_) => 0x02,
+                    WitViewQueryError::Package(_) => 0x03,
+                    WitViewQueryError::View(_) => 0x04,
+                    WitViewQueryError::GeneratedSnapshotMissing { .. } => 0x05,
+                });
+            }
+        }
+    }
+}
+
+pub(super) struct WitViewQueries {
+    query: DerivedQuery<WitUnit, WitViewQueryOutput>,
+}
+
+impl WitViewQueries {
+    pub(super) fn new(
+        package_query: DerivedQuery<WitUnit, WitPackageQueryOutput>,
+        packages: Arc<PackageInterner>,
+        symbols: Arc<Interner>,
+        source_def_paths: Arc<Mutex<HashMap<PackageId, Arc<DefPathInterner>>>>,
+        source_def_path_generations: InputQuery<String, u64>,
+        view_def_paths: Arc<Mutex<HashMap<String, Arc<DefPathInterner>>>>,
+    ) -> Result<Self, QueryError> {
+        let query = DerivedQuery::new(
+            "wit_view",
+            move |database: &mut QueryDatabase, unit: &WitUnit| {
+                let package = package_query.get(database, unit.clone())?;
+                if let Ok(value) = &package.result {
+                    let package_unit = &value.package.root().unit;
+                    let has_generated_origins = value
+                        .generated_texts
+                        .iter()
+                        .find(|(generated_unit, _)| {
+                            generated_unit.stable_key() == package_unit.stable_key()
+                                && generated_unit.canonical_name() == package_unit.canonical_name()
+                        })
+                        .is_some_and(|(_, generated)| !generated.origins.is_empty());
+                    if matches!(package_unit.kind(), WitUnitKind::Generated { .. })
+                        && has_generated_origins
+                    {
+                        // The source path interner is populated by Phase 1
+                        // collection rather than a query. Track its append-only
+                        // definition count so a view built before that collection
+                        // is retried when its generated origins become resolvable.
+                        let _ = source_def_path_generations
+                            .get_opt(database, value.package.root().unit.stable_key().to_owned())?;
+                    }
+                }
+                let package_identity = fingerprint(&package);
+                let result = package
+                    .result
+                    .as_ref()
+                    .map_err(|failure| WitViewQueryError::Package(failure.clone()))
+                    .and_then(|value| {
+                        build_wit_view(
+                            value,
+                            &packages,
+                            &symbols,
+                            &source_def_paths,
+                            &view_def_paths,
+                        )
+                    });
+                Ok(WitViewQueryOutput {
+                    package_identity,
+                    result,
+                })
+            },
+        )?;
+        Ok(Self { query })
+    }
+}
+
+fn build_wit_view(
+    package: &WitPackageQueryValue,
+    packages: &PackageInterner,
+    symbols: &Interner,
+    source_def_paths: &Mutex<HashMap<PackageId, Arc<DefPathInterner>>>,
+    view_def_paths: &Mutex<HashMap<String, Arc<DefPathInterner>>>,
+) -> Result<Arc<WitView>, WitViewQueryError> {
+    let model = package.package.root();
+    let unit = &model.unit;
+
+    let view = match unit.kind() {
+        WitUnitKind::Generated {
+            package: source_package,
+        } => {
+            let generated = package
+                .generated_texts
+                .iter()
+                .find(|(generated_unit, _)| {
+                    generated_unit.stable_key() == unit.stable_key()
+                        && generated_unit.canonical_name() == unit.canonical_name()
+                })
+                .map(|(_, generated)| generated)
+                .ok_or_else(|| WitViewQueryError::GeneratedSnapshotMissing {
+                    canonical_unit: unit.canonical_name().to_owned(),
+                })?;
+            let view_def_paths =
+                super::persistent_wit_view_def_paths(unit, packages, symbols, view_def_paths)
+                    .map_err(WitViewQueryError::View)?;
+            if generated.origins.is_empty() {
+                WitView::build(model.clone(), packages, symbols, view_def_paths)
+            } else {
+                let source_def_paths = source_def_paths
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&source_package)
+                    .cloned()
+                    .ok_or(WitViewQueryError::View(
+                        WitViewError::GeneratedOriginInternerRequired,
+                    ))?;
+                WitView::build_with_origins(
+                    model.clone(),
+                    packages,
+                    symbols,
+                    view_def_paths,
+                    &source_def_paths,
+                    &generated.origins,
+                )
+            }
+        }
+        WitUnitKind::Dir { .. } | WitUnitKind::Wasi { .. } => {
+            let view_def_paths =
+                super::persistent_wit_view_def_paths(unit, packages, symbols, view_def_paths)
+                    .map_err(WitViewQueryError::View)?;
+            WitView::build(model.clone(), packages, symbols, view_def_paths)
+        }
+    }
+    .map(Arc::new)
+    .map_err(WitViewQueryError::View)?;
+    Ok(view)
 }
 
 fn load_wasi_wit_package(
@@ -1573,6 +1793,509 @@ mod tests {
             "acme:root@1.2.3"
         );
     }
+
+    fn seed_source_interface(database: &mut RootDatabase, package: PackageId, name: &str) -> DefId {
+        let def_paths = if let Some(def_paths) = database.def_paths.get(&package) {
+            Arc::clone(def_paths)
+        } else {
+            let def_paths = Arc::new(
+                DefPathInterner::new(package, &database.packages, &database.symbols)
+                    .expect("source package path interner is valid"),
+            );
+            database.def_paths.insert(package, Arc::clone(&def_paths));
+            def_paths
+        };
+        database
+            .wit_source_def_paths
+            .lock()
+            .expect("shared source path map is not poisoned")
+            .insert(package, Arc::clone(&def_paths));
+        let symbol = database
+            .symbols
+            .intern(name)
+            .expect("source interface name interns");
+        let path = DefPath::new(
+            package,
+            vec![sai_hir::DisambiguatedDefPathData {
+                data: DefPathData::Interface(symbol),
+                disambiguator: 0,
+            }],
+            &database.packages,
+            &database.symbols,
+        )
+        .expect("source interface path is valid");
+        def_paths
+            .intern(path)
+            .expect("source interface path interns")
+            .to_def_id()
+    }
+
+    #[test]
+    fn dir_view_query_caches_and_reuses_definition_ids_after_input_changes() {
+        let (mut database, _, _, unit) = root_dir_database();
+        set_root_wit_source(
+            &mut database,
+            b"package acme:root@1.2.3;\ninterface api { ping: func(); }",
+        );
+
+        let first = database.wit_view(&unit).expect("root WIT view builds");
+        let cached = database
+            .wit_view(&unit)
+            .expect("cached root WIT view is available");
+        assert!(Arc::ptr_eq(&first, &cached));
+        let api_def = first.interfaces["api"].def;
+        let ping_def = first.interfaces["api"].members["ping"].def;
+        let first_fingerprint = sai_stable_hash::fingerprint(first.as_ref());
+
+        set_root_wit_source(
+            &mut database,
+            b"package acme:root@1.2.3;\ninterface api { ping: func() -> u32; }\ninterface extra {}",
+        );
+        let refreshed = database
+            .wit_view(&unit)
+            .expect("tracked WIT file changes rebuild the view");
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        assert_eq!(refreshed.interfaces["api"].def, api_def);
+        assert_eq!(refreshed.interfaces["api"].members["ping"].def, ping_def);
+        assert!(refreshed.interfaces.contains_key("extra"));
+        assert_ne!(
+            first_fingerprint,
+            sai_stable_hash::fingerprint(refreshed.as_ref())
+        );
+    }
+
+    #[test]
+    fn wit_view_returns_loader_failures_as_values_and_recovers_after_fixing_input() {
+        let (mut database, _, _, unit) = root_dir_database();
+        set_root_wit_source(&mut database, b"this is not a WIT package");
+
+        assert!(matches!(
+            database.wit_view(&unit),
+            Err(WitViewQueryError::Package(WitPackageFailure::Load(error)))
+                if matches!(error.failure(), WitPackageLoadFailure::Parse(_))
+        ));
+
+        set_root_wit_source(&mut database, b"package acme:root@1.2.3;\ninterface api {}");
+        assert!(
+            database.wit_view(&unit).is_ok(),
+            "a tracked load failure must not poison a later valid view"
+        );
+    }
+
+    #[test]
+    fn generated_view_tracks_origin_only_changes_and_rejects_invalid_origins() {
+        let (mut database, package, selected, _) = root_dir_database();
+        let unit = WitUnit::generated(package, &database.packages, &selected)
+            .expect("explicit generated root is valid");
+        let first_origin = seed_source_interface(&mut database, package, "Canvas");
+        let second_origin = seed_source_interface(&mut database, package, "DrawingSurface");
+        let generated_text = "package acme:root@1.2.3;\ninterface canvas { ping: func(); }";
+        database
+            .set_generated_wit_text(
+                package,
+                GeneratedText {
+                    text: Arc::from(generated_text),
+                    complete: true,
+                    origins: Arc::from([("canvas".to_owned(), first_origin)]),
+                },
+                Durability::Low,
+            )
+            .expect("initial generated snapshot is accepted");
+
+        let first = database.wit_view(&unit).expect("generated view builds");
+        assert_eq!(first.interfaces["canvas"].origin, Some(first_origin));
+        let first_identity = first.interfaces["canvas"]
+            .origin_identity
+            .clone()
+            .expect("generated origin has stable identity");
+        let interface_def = first.interfaces["canvas"].def;
+
+        database
+            .set_generated_wit_text(
+                package,
+                GeneratedText {
+                    text: Arc::from(generated_text),
+                    complete: true,
+                    origins: Arc::from([("canvas".to_owned(), second_origin)]),
+                },
+                Durability::Low,
+            )
+            .expect("origin-only generated snapshot change is accepted");
+        let changed = database
+            .wit_view(&unit)
+            .expect("origin-only change invalidates the generated view");
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed.interfaces["canvas"].origin, Some(second_origin));
+        assert_eq!(changed.interfaces["canvas"].def, interface_def);
+        assert_ne!(
+            changed.interfaces["canvas"].origin_identity.as_ref(),
+            Some(&first_identity)
+        );
+
+        let view_interner = database
+            .wit_view_def_paths
+            .lock()
+            .expect("view path map is not poisoned")
+            .get(unit.stable_key())
+            .cloned()
+            .expect("generated view retains its persistent path interner");
+        let definitions_before_invalid_input =
+            view_interner.len().expect("view path interner is readable");
+        database
+            .set_generated_wit_text(
+                package,
+                GeneratedText {
+                    text: Arc::from(generated_text),
+                    complete: true,
+                    origins: Arc::from([("unknown".to_owned(), second_origin)]),
+                },
+                Durability::Low,
+            )
+            .expect("unknown origin name is retained for view validation");
+        assert!(matches!(
+            database.wit_view(&unit),
+            Err(WitViewQueryError::View(WitViewError::UnknownGeneratedOrigin(name)))
+                if name == "unknown"
+        ));
+        assert_eq!(
+            view_interner
+                .len()
+                .expect("view path interner remains readable"),
+            definitions_before_invalid_input,
+            "invalid origins must fail before allocating view definition paths"
+        );
+    }
+
+    #[test]
+    fn generated_view_requires_the_retained_source_package_interner() {
+        let (mut database, package, selected, _) = root_dir_database();
+        let unit = WitUnit::generated(package, &database.packages, &selected)
+            .expect("explicit generated root is valid");
+        let origin = DefId::from_foreign(
+            package,
+            sai_hir::IndexVec::<sai_hir::DefIndex, ()>::new()
+                .push(())
+                .expect("foreign definition index"),
+        );
+        database
+            .set_generated_wit_text(
+                package,
+                GeneratedText {
+                    text: Arc::from("package acme:root@1.2.3;\ninterface canvas {}"),
+                    complete: true,
+                    origins: Arc::from([("canvas".to_owned(), origin)]),
+                },
+                Durability::Low,
+            )
+            .expect("package-local origin passes the input boundary");
+
+        assert!(matches!(
+            database.wit_view(&unit),
+            Err(WitViewQueryError::View(
+                WitViewError::GeneratedOriginInternerRequired
+            ))
+        ));
+        assert!(
+            !database
+                .wit_view_def_paths
+                .lock()
+                .expect("view path map is not poisoned")
+                .contains_key(unit.stable_key()),
+            "missing source path provenance must not allocate view session state"
+        );
+    }
+
+    #[test]
+    fn generated_view_without_origins_does_not_require_a_source_interner() {
+        let (mut database, package, selected, _) = root_dir_database();
+        let unit = WitUnit::generated(package, &database.packages, &selected)
+            .expect("explicit generated root is valid");
+        database
+            .set_generated_wit_text(
+                package,
+                GeneratedText {
+                    text: Arc::from("package acme:root@1.2.3;\nworld app {}"),
+                    complete: true,
+                    origins: Arc::from([]),
+                },
+                Durability::Low,
+            )
+            .expect("generated snapshot without origins is accepted");
+
+        let view = database
+            .wit_view(&unit)
+            .expect("originless generated view needs no source interner");
+        assert!(view.interfaces.is_empty());
+        assert!(view.worlds.contains_key("app"));
+        assert!(
+            !database
+                .wit_source_def_paths
+                .lock()
+                .expect("source path map is not poisoned")
+                .contains_key(&package)
+        );
+    }
+
+    #[test]
+    fn generated_origin_lookup_failure_is_not_cached_before_interner_repair() {
+        let (mut database, package, selected, _) = root_dir_database();
+        let unit = WitUnit::generated(package, &database.packages, &selected)
+            .expect("explicit generated root is valid");
+        let origin = seed_source_interface(&mut database, package, "Canvas");
+        let retained_source_paths = database
+            .wit_source_def_paths
+            .lock()
+            .expect("source path map is not poisoned")
+            .get(&package)
+            .cloned()
+            .expect("source path interner is retained");
+        let unrelated_source_paths = Arc::new(
+            DefPathInterner::new(package, &database.packages, &database.symbols)
+                .expect("replacement source path interner is valid"),
+        );
+        database
+            .wit_source_def_paths
+            .lock()
+            .expect("source path map is not poisoned")
+            .insert(package, unrelated_source_paths);
+        database
+            .set_generated_wit_text(
+                package,
+                GeneratedText {
+                    text: Arc::from("package acme:root@1.2.3;\ninterface canvas {}"),
+                    complete: true,
+                    origins: Arc::from([("canvas".to_owned(), origin)]),
+                },
+                Durability::Low,
+            )
+            .expect("generated origin snapshot is accepted");
+
+        assert!(matches!(
+            database.wit_view(&unit),
+            Err(WitViewQueryError::View(WitViewError::GeneratedOriginPath {
+                error: DefPathInternerError::ForeignDefinitionId,
+                ..
+            }))
+        ));
+        assert!(
+            !database
+                .wit_view_def_paths
+                .lock()
+                .expect("view path map is not poisoned")
+                .contains_key(unit.stable_key()),
+            "an unresolved origin must fail before the derived view query"
+        );
+
+        database
+            .wit_source_def_paths
+            .lock()
+            .expect("source path map is not poisoned")
+            .insert(package, retained_source_paths);
+        let recovered = database
+            .wit_view(&unit)
+            .expect("view succeeds when the retained interner owns the origin");
+        assert_eq!(recovered.interfaces["canvas"].origin, Some(origin));
+    }
+
+    #[test]
+    fn wit_view_refreshes_the_exact_active_version_under_a_compatible_key() {
+        let (mut database, root, _, old_unit) = root_dir_database();
+        set_root_wit_source(&mut database, b"package acme:root@1.2.3;\ninterface api {}");
+        let first = database
+            .wit_view(&old_unit)
+            .expect("initial exact-version view builds");
+        let api_def = first.interfaces["api"].def;
+        let first_fingerprint = sai_stable_hash::fingerprint(first.as_ref());
+
+        database
+            .set_package_graph(Some(graph([root_node(
+                "acme:root#1",
+                "acme:root",
+                "1.2.4",
+                [],
+            )])))
+            .expect("updated active version is tracked");
+        database
+            .set_package_manifest(
+                root,
+                Arc::from(&b"package acme:root @ 1.2.4\nsource \"src\"\nwit \"wit\"\n"[..]),
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("updated package contract is tracked");
+        set_root_wit_source(&mut database, b"package acme:root@1.2.4;\ninterface api {}");
+
+        let refreshed = database
+            .wit_view(&old_unit)
+            .expect("stale compatibility-key view rebinds to current selection");
+        assert_eq!(refreshed.unit.canonical_name(), "acme:root@1.2.4");
+        assert_eq!(refreshed.interfaces["api"].def, api_def);
+        assert_ne!(
+            first_fingerprint,
+            sai_stable_hash::fingerprint(refreshed.as_ref()),
+            "exact selected versions participate in the view fingerprint"
+        );
+    }
+
+    #[test]
+    fn wit_view_tracks_exact_versions_of_reachable_dependencies() {
+        let (mut database, root, _, root_unit) = root_dir_database();
+        let dependency = database
+            .intern_package("acme:dep#2")
+            .expect("dependency package key interns");
+        let edge = PackageGraphEdge::new(
+            PackageKey::new("acme:dep#2").expect("dependency key is valid"),
+            "acme:dep",
+        )
+        .expect("active dependency edge is valid");
+        let set_graph = |database: &mut RootDatabase, dependency_version: &str| {
+            database
+                .set_package_graph(Some(graph([
+                    root_node("acme:root#1", "acme:root", "1.2.3", [edge.clone()]),
+                    source_node(
+                        "acme:dep#2",
+                        "acme:dep",
+                        dependency_version,
+                        PackageForm::Source,
+                    ),
+                ])))
+                .expect("updated active package graph is tracked");
+        };
+        set_graph(&mut database, "2.4.1");
+        database
+            .set_package_manifest(
+                root,
+                Arc::from(&b"package acme:root @ 1.2.3\nsource \"src\"\nwit \"wit\"\n"[..]),
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("root contract is tracked");
+        database
+            .set_package_manifest(
+                dependency,
+                Arc::from(&b"package acme:dep @ 2.4.1\nsource \"src\"\n"[..]),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("dependency contract is tracked");
+        set_root_wit_source(
+            &mut database,
+            b"package acme:root@1.2.3;\nworld app { import acme:dep/api; }",
+        );
+        database
+            .set_generated_wit_text(
+                dependency,
+                GeneratedText {
+                    text: Arc::from("package acme:dep@2.4.1;\ninterface api {}"),
+                    complete: true,
+                    origins: Arc::from([]),
+                },
+                Durability::Low,
+            )
+            .expect("first dependency WIT snapshot is tracked");
+        let first = database
+            .wit_view(&root_unit)
+            .expect("root view loads its active generated dependency");
+
+        set_graph(&mut database, "2.4.2");
+        database
+            .set_package_manifest(
+                dependency,
+                Arc::from(&b"package acme:dep @ 2.4.2\nsource \"src\"\n"[..]),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("updated dependency contract is tracked");
+        database
+            .set_generated_wit_text(
+                dependency,
+                GeneratedText {
+                    text: Arc::from("package acme:dep@2.4.2;\ninterface api {}"),
+                    complete: true,
+                    origins: Arc::from([]),
+                },
+                Durability::Low,
+            )
+            .expect("updated exact dependency snapshot is tracked");
+        let refreshed = database
+            .wit_view(&root_unit)
+            .expect("reachable same-line version change refreshes the view query");
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        assert_eq!(refreshed.unit.canonical_name(), "acme:root@1.2.3");
+    }
+
+    #[test]
+    fn wit_view_canonicalizes_foreign_session_units_and_shares_wasi_interner() {
+        let (mut local, local_package, selected, local_unit) = root_dir_database();
+        set_root_wit_source(&mut local, b"package acme:root@1.2.3;\ninterface api {}");
+
+        let mut foreign = RootDatabase::new().expect("foreign driver initializes");
+        foreign
+            .intern_package("acme:filler#1")
+            .expect("foreign filler package interns first");
+        let foreign_package = foreign
+            .intern_package("acme:root#1")
+            .expect("foreign root package interns");
+        foreign
+            .set_package_graph(Some(graph([root_node(
+                "acme:root#1",
+                "acme:root",
+                "1.2.3",
+                [],
+            )])))
+            .expect("foreign active graph is set");
+        foreign
+            .set_package_manifest(
+                foreign_package,
+                Arc::from(&b"package acme:root @ 1.2.3\nsource \"src\"\nwit \"wit\"\n"[..]),
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("foreign contract is tracked");
+        set_root_wit_source(&mut foreign, b"package acme:root@1.2.3;\ninterface api {}");
+        let foreign_unit = WitUnit::dir(foreign_package, &foreign.packages, &selected)
+            .expect("foreign WIT unit is valid");
+        assert_ne!(local_package, foreign_package);
+
+        let foreign_first = local
+            .wit_view(&foreign_unit)
+            .expect("foreign WIT unit is reconstructed locally");
+        let local_view = local
+            .wit_view(&local_unit)
+            .expect("local unit reaches the same canonical query key");
+        assert!(Arc::ptr_eq(&foreign_first, &local_view));
+        assert_eq!(foreign_first.unit.canonical_name(), "acme:root@1.2.3");
+        assert_eq!(
+            foreign_first
+                .package_key(&local.packages)
+                .expect("local view package key"),
+            local_unit.stable_key()
+        );
+
+        let wasi = local.wasi_unit("io").expect("known embedded WASI unit");
+        let generic_wasi_view = local
+            .wit_view(&wasi)
+            .expect("generic WIT view query can build an embedded root");
+        let compatibility_wasi_view = local
+            .wasi_view(wasi.clone())
+            .expect("existing WASI view API remains available");
+        assert!(Arc::ptr_eq(&generic_wasi_view, &compatibility_wasi_view));
+
+        let foreign_symbols = RootDatabase::new().expect("foreign symbol session initializes");
+        for index in 0..16 {
+            foreign_symbols
+                .symbols
+                .intern(&format!("foreign-wasi-prefix-{index}"))
+                .expect("foreign prefix symbol interns");
+        }
+        let foreign_wasi = foreign_symbols
+            .wasi_unit("io")
+            .expect("foreign-session WASI unit is valid");
+        let canonical_wasi_view = local
+            .wit_view(&foreign_wasi)
+            .expect("foreign WASI symbols are reconstructed from canonical identity");
+        assert!(Arc::ptr_eq(&generic_wasi_view, &canonical_wasi_view));
+    }
 }
 
 impl RootDatabase {
@@ -1599,5 +2322,52 @@ impl RootDatabase {
                 generated_texts: Arc::from([]),
             }),
         }
+    }
+
+    /// Builds the tracked SAI-facing view of a WIT unit and its loaded root
+    /// package. Incoming units are reconstructed from their canonical identity
+    /// so session-local package and symbol IDs cannot alias another database.
+    pub fn wit_view(&mut self, unit: &WitUnit) -> Result<Arc<WitView>, WitViewQueryError> {
+        let unit = canonicalize_wit_unit(unit, &self.packages, &self.symbols)
+            .map_err(WitViewQueryError::from)?;
+        if let WitUnitKind::Generated { package } = unit.kind() {
+            let package_name = self
+                .packages
+                .resolve(package)
+                .map_err(|error| WitViewQueryError::InvalidUnit(format!("{error:?}")))?;
+            let package_key = PackageKey::new(package_name.as_ref())
+                .map_err(|error| WitViewQueryError::InvalidUnit(format!("{error:?}")))?;
+            let generated = self
+                .generated_wit_texts
+                .query
+                .get(&mut self.query_database, package_key)
+                .map_err(WitViewQueryError::Query)?;
+            if let Some(generated) = generated
+                .as_ref()
+                .as_ref()
+                .filter(|generated| !generated.origins.is_empty())
+            {
+                // Source DefPathInterner contents are session state rather
+                // than a query input. Validate origin IDs before querying so
+                // a temporarily missing path cannot become a cached failure.
+                let source_def_paths = self
+                    .wit_source_def_paths
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&package)
+                    .cloned()
+                    .ok_or(WitViewQueryError::View(
+                        WitViewError::GeneratedOriginInternerRequired,
+                    ))?;
+                validate_generated_origin_definitions(&generated.origins, &source_def_paths)
+                    .map_err(WitViewQueryError::View)?;
+            }
+        }
+        let output = self
+            .wit_views
+            .query
+            .get(&mut self.query_database, unit)
+            .map_err(WitViewQueryError::Query)?;
+        output.result.clone()
     }
 }
