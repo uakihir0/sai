@@ -2425,13 +2425,15 @@ impl OwnerTestOnlyPathResolution {
 /// Partial type-head and test-only path results for one direct trait or impl
 /// header.
 ///
-/// This pass checks only declaration-header references; qualified member
-/// suffixes and associated members remain for later resolution.
+/// This pass checks declaration-header references. Qualified target suffixes
+/// resolve when an active source or WIT member-scope closure is supplied;
+/// associated members remain for their separate analysis pass.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraitImplHeaderResolution {
     owner: OwnerId,
     kind: TopLevelOwnerKind,
     type_path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
+    interface_impl_target_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
@@ -2451,6 +2453,19 @@ impl TraitImplHeaderResolution {
         &self,
     ) -> Result<&TypeOwnerPathResolution, &OwnerControlFlowResolutionError> {
         self.type_path_resolution.as_ref()
+    }
+
+    /// Returns snapshot-bound diagnostics for interface impls whose resolved
+    /// target path does not name an interface.
+    ///
+    /// Unresolved targets remain owned by name resolution and do not produce
+    /// this diagnostic.
+    pub fn interface_impl_target_diagnostics(
+        &self,
+    ) -> Result<&[Diagnostic], &OwnerControlFlowResolutionError> {
+        self.interface_impl_target_diagnostics
+            .as_ref()
+            .map(Vec::as_slice)
     }
 
     /// Returns snapshot-bound type member diagnostics for headers analyzed
@@ -2488,6 +2503,7 @@ pub struct TraitImplHeaderResolutions {
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
     member_scope_closure_fingerprint: Option<Fingerprint>,
+    wit_view_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<TraitImplHeaderResolution>,
 }
 
@@ -2518,6 +2534,20 @@ impl TraitImplHeaderResolutions {
 
     pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
         self.member_scope_closure_fingerprint
+    }
+
+    pub fn matches_wit_view_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && wit_view_scopes.matches_collection(collection)
+            && self.wit_view_closure_fingerprint == Some(wit_view_scopes.closure_fingerprint)
+    }
+
+    pub const fn wit_view_closure_fingerprint(&self) -> Option<Fingerprint> {
+        self.wit_view_closure_fingerprint
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -6037,6 +6067,61 @@ fn owner_type_generic_resolutions(owner: &HirOwner<'_>) -> HashMap<Symbol, Res> 
             .or_insert(Res::Def(kind, parameter.def_id.to_def_id()));
     }
     resolutions
+}
+
+fn interface_impl_target_diagnostics(
+    owner: OwnerId,
+    hir_owner: &HirOwner<'_>,
+    paths: &TypeOwnerPathResolution,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Vec<Diagnostic>, OwnerControlFlowResolutionError> {
+    let target_path = match hir_owner.node {
+        OwnerNode::Item(item) => match item.kind {
+            ItemKind::Impl {
+                kind: ImplKind::Interface { path },
+                ..
+            } => path,
+            _ => return Ok(Vec::new()),
+        },
+        _ => return Ok(Vec::new()),
+    };
+    let Some(resolution) = paths.paths.get(&target_path.hir_id) else {
+        // An unresolved target is reported by name resolution. Do not add a
+        // second diagnostic when no resolved path result is available.
+        return Ok(Vec::new());
+    };
+    if resolution.resolved_segments != resolution.segment_count {
+        // A partially resolved path still belongs to the later member-path
+        // diagnostic channel and cannot yet be classified by its final kind.
+        return Ok(Vec::new());
+    }
+    match resolution.base {
+        Res::Def(DefKind::Interface, _) => return Ok(Vec::new()),
+        Res::Err | Res::TestOnly(_) => return Ok(Vec::new()),
+        _ => {}
+    }
+
+    let location = sai_diagnostics::Location::from_decoded_source(
+        inputs.source_ref.clone(),
+        sai_diagnostics::Span::new(target_path.span.file, target_path.span.range),
+        &inputs.source,
+    )
+    .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        owner,
+    ))?;
+    let mut diagnostic = Diagnostic::new(
+        sai_diagnostics::Code::ImplTargetNotInterface,
+        sai_diagnostics::Severity::Error,
+        "interface implementation target does not resolve to an interface",
+        Some(location),
+    );
+    diagnostic.primary_label = "expected an interface".to_owned();
+    diagnostic.package = inputs.source_ref.package.clone();
+    let diagnostic = diagnostic
+        .with_workspace_snapshot(snapshot)
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    Ok(vec![diagnostic])
 }
 
 fn resolve_type_owner_module_paths(
@@ -12059,7 +12144,7 @@ impl RootDatabase {
     ///
     /// The pass checks declaration generics, bounds, where clauses,
     /// supertraits, impl self types, and impl trait/interface targets. It does
-    /// not resolve qualified member suffixes or process associated members.
+    /// not process associated members.
     pub fn resolve_trait_impl_header_test_only_paths(
         &mut self,
         collection: &Phase1PackageScopesCollection,
@@ -12070,6 +12155,7 @@ impl RootDatabase {
             collection,
             module_tree,
             snapshot,
+            None,
             None,
         )
     }
@@ -12093,6 +12179,32 @@ impl RootDatabase {
             module_tree,
             snapshot,
             Some(member_scopes),
+            None,
+        )
+    }
+
+    /// Resolves trait and impl header type prefixes through active source
+    /// member scopes and foreign WIT views from the same package graph.
+    pub fn resolve_trait_impl_header_test_only_paths_with_member_scopes_and_wit_views(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<TraitImplHeaderResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.validate_active_wit_view_scopes(collection, snapshot, wit_view_scopes)?;
+        self.resolve_trait_impl_header_test_only_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+            Some(wit_view_scopes),
         )
     }
 
@@ -12102,6 +12214,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
         member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
     ) -> Result<TraitImplHeaderResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
@@ -12121,7 +12234,16 @@ impl RootDatabase {
                     .map(Phase1ModuleMemberScopePackage::scopes),
             );
         }
-        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let symbols = Arc::clone(&self.symbols);
+        let module_members = if let Some(wit_view_scopes) = wit_view_scopes {
+            let wit_views = wit_view_scopes
+                .views()
+                .map(|view| view.view.as_ref())
+                .collect::<Vec<_>>();
+            ModuleMemberIndex::new_with_wit_views(indexed_scopes, wit_views, &symbols)
+        } else {
+            ModuleMemberIndex::new(indexed_scopes)
+        };
         let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
         let source_graph_packages = member_scopes
             .map(|scopes| &scopes.source_graph_packages)
@@ -12154,6 +12276,7 @@ impl RootDatabase {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
                         type_path_resolution: Err(error.clone()),
+                        interface_impl_target_diagnostics: Ok(Vec::new()),
                         module_path_diagnostics: Err(error.clone()),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error),
@@ -12166,6 +12289,7 @@ impl RootDatabase {
             let analysis: Result<
                 (
                     Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
+                    Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
                     Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
                     Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
                 ),
@@ -12259,6 +12383,16 @@ impl RootDatabase {
                     )),
                     (_, Err(error)) => Err(error),
                 };
+                let interface_impl_target_diagnostics = match type_path_resolution.as_ref() {
+                    Ok(paths) => interface_impl_target_diagnostics(
+                        descriptor.owner,
+                        &hir_owner,
+                        paths,
+                        &inputs,
+                        snapshot,
+                    ),
+                    Err(_) => Ok(Vec::new()),
+                };
                 let mut path_resolution = OwnerTestOnlyPathResolution {
                     owner: descriptor.owner,
                     paths: HashMap::new(),
@@ -12280,11 +12414,21 @@ impl RootDatabase {
                     Ok(_) => Ok(path_resolution),
                     Err(error) => Err(error.clone()),
                 };
-                Ok((type_path_resolution, path_resolution, diagnostics))
+                Ok((
+                    type_path_resolution,
+                    interface_impl_target_diagnostics,
+                    path_resolution,
+                    diagnostics,
+                ))
             })();
 
             match analysis {
-                Ok((type_path_resolution, path_resolution, diagnostics)) => {
+                Ok((
+                    type_path_resolution,
+                    interface_impl_target_diagnostics,
+                    path_resolution,
+                    diagnostics,
+                )) => {
                     let module_path_diagnostics =
                         match (member_scopes, type_path_resolution.as_ref()) {
                             (Some(member_scopes), Ok(path_resolution)) => Some(
@@ -12307,6 +12451,7 @@ impl RootDatabase {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
                         type_path_resolution,
+                        interface_impl_target_diagnostics,
                         module_path_diagnostics,
                         test_only_path_resolution: path_resolution,
                         test_only_diagnostics: diagnostics,
@@ -12318,6 +12463,7 @@ impl RootDatabase {
                         owner: descriptor.owner,
                         kind: descriptor.kind,
                         type_path_resolution: Err(error.clone()),
+                        interface_impl_target_diagnostics: Ok(Vec::new()),
                         module_path_diagnostics: Err(error.clone()),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error),
@@ -12333,6 +12479,7 @@ impl RootDatabase {
             collection_input_fingerprint: collection.input_fingerprint,
             member_scope_closure_fingerprint: member_scopes
                 .map(|scopes| scopes.closure_fingerprint),
+            wit_view_closure_fingerprint: wit_view_scopes.map(|scopes| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -19608,6 +19755,216 @@ mod tests {
                 .all(|owner| owner.test_only_diagnostics().is_ok()),
             "subsequent trait and impl headers continue resolving"
         );
+    }
+
+    #[test]
+    fn interface_impl_target_kind_diagnostics_skip_interfaces_and_unresolved_paths() {
+        let source = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "interface api {}\n",
+            "impl api {}\n",
+            "impl child_alias.not_interface {}\n",
+            "impl missing {}\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(source.as_bytes(), b"fn not_interface() {}\n");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 scopes collect");
+        let results = database
+            .resolve_trait_impl_header_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("impl targets resolve");
+        assert_eq!(results.owners().len(), 3);
+
+        let diagnostic_owners = results
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .interface_impl_target_diagnostics()
+                    .expect("interface target diagnostic analysis succeeds")
+            })
+            .collect::<Vec<_>>();
+        assert!(diagnostic_owners[0].is_empty(), "interface target passes");
+        assert_eq!(diagnostic_owners[1].len(), 1);
+        let diagnostic = &diagnostic_owners[1][0];
+        assert_eq!(
+            diagnostic.code,
+            sai_diagnostics::Code::ImplTargetNotInterface
+        );
+        assert_eq!(
+            diagnostic.primary().map(|location| location.span.range),
+            Some(
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(
+                        source.find("child_alias.not_interface").unwrap() as u32,
+                    ),
+                    sai_diagnostics::TextSize::new(
+                        (source.find("child_alias.not_interface").unwrap()
+                            + "child_alias.not_interface".len()) as u32,
+                    ),
+                )
+                .expect("target span is ordered")
+            ),
+            "the primary span covers the complete non-interface target path"
+        );
+        assert!(diagnostic.has_workspace_snapshot());
+        assert!(
+            diagnostic_owners[2].is_empty(),
+            "unresolved target does not cascade"
+        );
+
+        let stale_snapshot = phase1_snapshot_from_vfs(&mut database, &module_tree, 18);
+        assert!(matches!(
+            database.resolve_trait_impl_header_test_only_paths(
+                &collection,
+                &module_tree,
+                &stale_snapshot,
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+        ));
+    }
+
+    #[test]
+    fn interface_impl_target_kind_resolves_members_from_active_wit_views() {
+        let source = "use acme:codec/api as api\nimpl api.run {}\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let root_key = PackageKey::new("acme:phase1#1").expect("root key is valid");
+        let codec_key = PackageKey::new("acme:codec#1").expect("WIT package key is valid");
+        let codec = database
+            .intern_package(codec_key.as_str())
+            .expect("WIT package interns");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                PackageGraphNode::new(
+                    root_key,
+                    "acme:phase1",
+                    Version::parse("1.0.0").expect("root version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:codec#1", "acme:codec")],
+                )
+                .expect("root graph node is valid"),
+                PackageGraphNode::new(
+                    codec_key.clone(),
+                    "acme:codec",
+                    Version::parse("1.0.0").expect("WIT package version is valid"),
+                    PackageForm::Artifact,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                )
+                .expect("WIT package graph node is valid"),
+            ],
+        )
+        .expect("package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        database
+            .set_package_manifest(
+                codec,
+                Arc::from(
+                    &b"package acme:codec @ 1.0.0\n\
+                      artifact component {}\n\
+                      wit \"wit\"\n"[..],
+                ),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("WIT package manifest is recorded");
+        database
+            .set_wit_files(
+                codec_key.clone(),
+                WitFilesSnapshot::listed(
+                    "wit",
+                    [PackageRelativePath::new("wit/api.wit").expect("WIT path is valid")],
+                )
+                .expect("WIT inventory is valid"),
+                Durability::Low,
+            )
+            .expect("WIT inventory is recorded");
+        database
+            .set_file_contents(
+                FileKey::new(codec_key.as_str(), "wit/api.wit").expect("WIT file key is valid"),
+                Arc::from(&b"package acme:codec@1.0.0; interface api { run: func(); }"[..]),
+                Durability::Low,
+            )
+            .expect("WIT source is recorded");
+        let wit_view_scopes = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target_cfg, &graph)
+            .expect("active WIT view loads");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_view_scopes,
+            )
+            .expect("Phase 1 scopes include the active WIT view");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty source member closure validates");
+        let resolutions = database
+            .resolve_trait_impl_header_test_only_paths_with_member_scopes_and_wit_views(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("WIT interface member resolves in the impl target");
+
+        assert!(resolutions.matches_collection(&collection));
+        assert!(resolutions.matches_member_scopes(&collection, &member_scopes));
+        assert!(resolutions.matches_wit_view_scopes(&collection, &wit_view_scopes));
+        assert_eq!(resolutions.owners().len(), 1);
+        let owner = &resolutions.owners()[0];
+        let paths = owner
+            .type_path_resolution()
+            .expect("impl target type paths resolve");
+        let path = paths
+            .paths()
+            .values()
+            .next()
+            .expect("qualified impl target is retained");
+        assert_eq!(path.resolved_segments, 2);
+        assert!(matches!(path.base, Res::Def(DefKind::Fn, _)));
+        let diagnostics = owner
+            .interface_impl_target_diagnostics()
+            .expect("target-kind diagnostic analysis succeeds");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::ImplTargetNotInterface
+        );
+        let start = source.find("api.run").expect("full target path is present");
+        assert_eq!(
+            diagnostics[0].primary().map(|location| location.span.range),
+            Some(
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + "api.run".len()) as u32),
+                )
+                .expect("target path span is ordered")
+            )
+        );
+        assert!(diagnostics[0].has_workspace_snapshot());
     }
 
     #[test]

@@ -17,7 +17,7 @@ use sai_diagnostics::{EXPLAIN_CODE_SUMMARIES, SourceRef, Value, ValueObject};
 use sai_driver::new_package::{
     NewPackageError, NewPackageReceipt, create_new_package_with_cancellation,
 };
-use sai_driver::{CancellationToken, RootDatabase, TargetCfg};
+use sai_driver::{CancellationToken, Phase1ActiveWitViewScopes, RootDatabase, TargetCfg};
 use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
 use sai_query::Durability;
 use sai_vfs::{
@@ -5026,6 +5026,8 @@ fn module_tree_workspace_check_diagnostics(
             BTreeMap::<PackageKey, sai_driver::Phase1ModuleMemberScopePackage>::new();
         let mut finalized_collections =
             BTreeMap::<PackageKey, sai_driver::Phase1PackageScopesCollection>::new();
+        let mut finalized_wit_view_scopes =
+            BTreeMap::<PackageKey, Phase1ActiveWitViewScopes>::new();
         for index in collection_order {
             let (_, _, module_tree, source_by_key) = &package_trees[index];
             let input = &inputs[index];
@@ -5053,8 +5055,50 @@ fn module_tree_workspace_check_diagnostics(
                     )
                 })
                 .unwrap_or_default();
-            let collection = database
-                .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+            let active_wit_view_scopes = package_graph_for_scopes
+                .as_ref()
+                .filter(|graph| {
+                    graph.node(&package_key).is_some_and(|node| {
+                        node.form() == sai_driver::package_graph::PackageForm::Source
+                    })
+                })
+                .map(|graph| {
+                    database.collect_active_wit_view_scopes(
+                        module_tree,
+                        &workspace_snapshot,
+                        target_cfg,
+                        graph,
+                    )
+                })
+                .transpose()
+                .map_err(|error| format!("active WIT view closure failed: {error:?}"))?;
+            let collection = if let Some(wit_view_scopes) = &active_wit_view_scopes {
+                database
+                    .collect_phase1_package_scopes_with_manifest_and_foreign_scopes_and_wit_views(
+                        module_tree,
+                        &workspace_snapshot,
+                        target_cfg,
+                        sai_driver::Phase1BuildContext {
+                            is_root_package: input.is_root_package,
+                            is_root_core_module_build: input.is_root_package
+                                && matches!(
+                                    target_cfg.target_name(),
+                                    "wasm32-core" | "wasm64-core"
+                                ),
+                            is_test_build: false,
+                            analyzes_tests: input.is_root_package && input.analyzes_tests,
+                        },
+                        Arc::clone(&input.manifest_source),
+                        if input.is_root_package {
+                            sai_package::manifest::PackageRole::Root
+                        } else {
+                            sai_package::manifest::PackageRole::Dependency
+                        },
+                        &direct_foreign_scopes,
+                        wit_view_scopes,
+                    )
+            } else {
+                database.collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
                     module_tree,
                     &workspace_snapshot,
                     target_cfg,
@@ -5073,7 +5117,8 @@ fn module_tree_workspace_check_diagnostics(
                     },
                     &direct_foreign_scopes,
                 )
-                .map_err(|error| format!("Phase 1 collection failed: {error:?}"))?;
+            }
+            .map_err(|error| format!("Phase 1 collection failed: {error:?}"))?;
             let phase1 = collection.scopes();
             let (phase1_diagnostics, phase1_errors, phase1_warnings, phase1_infos) =
                 phase1_check_diagnostics(
@@ -5114,6 +5159,9 @@ fn module_tree_workspace_check_diagnostics(
                     package_key.clone(),
                     collection.module_member_scope_package(),
                 );
+                if let Some(wit_view_scopes) = active_wit_view_scopes {
+                    finalized_wit_view_scopes.insert(package_key.clone(), wit_view_scopes);
+                }
                 finalized_collections.insert(package_key, collection);
             }
         }
@@ -5188,13 +5236,24 @@ fn module_tree_workspace_check_diagnostics(
                         &member_scopes,
                     )
                     .map_err(|error| format!("extern function owner analysis failed: {error:?}"))?;
-                let trait_impl_header_resolutions = database
-                    .resolve_trait_impl_header_test_only_paths_with_member_scopes(
-                        collection,
-                        module_tree,
-                        &workspace_snapshot,
-                        &member_scopes,
-                    )
+                let trait_impl_header_resolutions =
+                    if let Some(wit_view_scopes) = finalized_wit_view_scopes.get(&package_key) {
+                        database
+                        .resolve_trait_impl_header_test_only_paths_with_member_scopes_and_wit_views(
+                            collection,
+                            module_tree,
+                            &workspace_snapshot,
+                            &member_scopes,
+                            wit_view_scopes,
+                        )
+                    } else {
+                        database.resolve_trait_impl_header_test_only_paths_with_member_scopes(
+                            collection,
+                            module_tree,
+                            &workspace_snapshot,
+                            &member_scopes,
+                        )
+                    }
                     .map_err(|error| format!("trait/impl header analysis failed: {error:?}"))?;
                 let trait_impl_member_resolutions = database
                     .resolve_trait_impl_member_test_only_paths_with_member_scopes(
@@ -5296,6 +5355,21 @@ fn module_tree_workspace_check_diagnostics(
                     }
                 }
                 for owner in trait_impl_header_resolutions.owners() {
+                    match owner.interface_impl_target_diagnostics() {
+                        Ok(diagnostics_for_owner) => {
+                            owner_diagnostics.extend(diagnostics_for_owner.iter().cloned())
+                        }
+                        Err(error) => {
+                            diagnostics.push(check_diagnostic_with_package(
+                                check_internal_diagnostic(
+                                    &format!("interface impl target analysis failed: {error:?}"),
+                                    None,
+                                ),
+                                Some(&input.package_identity),
+                            ));
+                            errors = errors.saturating_add(1);
+                        }
+                    }
                     match owner.module_path_diagnostics() {
                         Ok(Some(diagnostics_for_owner)) => {
                             owner_diagnostics.extend(diagnostics_for_owner.iter().cloned())

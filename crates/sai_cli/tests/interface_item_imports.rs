@@ -97,6 +97,122 @@ fn check_resolves_local_interface_member_imports_but_keeps_check_incomplete() {
 }
 
 #[test]
+fn check_reports_non_interface_impl_targets_but_accepts_wit_view_interfaces() {
+    let directory = TestDirectory::new();
+    let package = directory.path().join("package");
+    let dependency = package.join("dep");
+    let source_directory = package.join("src");
+    let wit_directory = dependency.join("wit");
+    fs::create_dir_all(&source_directory).expect("create package source directory");
+    fs::create_dir_all(&wit_directory).expect("create dependency WIT directory");
+    fs::create_dir_all(dependency.join("dist")).expect("create dependency artifact directory");
+    fs::write(
+        package.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n",
+            "targets { wasm32-wasi }\n",
+            "requires { acme:codec @ ^1 from path \"dep\" }\n"
+        ),
+    )
+    .expect("write package manifest");
+    fs::write(
+        dependency.join("sai.package"),
+        concat!(
+            "package acme:codec @ 1.0.0\n",
+            "wit \"wit\"\n",
+            "export world host\n",
+            "targets { wasm32-wasi }\n",
+            "artifact component { wasm32-wasi \"dist/codec.wasm\" }\n"
+        ),
+    )
+    .expect("write WIT dependency manifest");
+    fs::write(
+        wit_directory.join("api.wit"),
+        "package acme:codec@1.0.0;\ninterface api { run: func(); }\nworld host { export api; }\n",
+    )
+    .expect("write WIT view interface");
+    fs::write(dependency.join("dist/codec.wasm"), b"component")
+        .expect("write dependency component artifact");
+    fs::write(
+        package.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:check @ 0.1.0\n",
+            "    targets { wasm32-wasi }\n",
+            "    requires acme:codec @ ^1 -> 1.0.0 from path \"dep\"\n",
+            "\n",
+            "package acme:codec @ 1.0.0\n",
+            "    source path \"dep\"\n"
+        ),
+    )
+    .expect("write complete format-2 path lock");
+    let source = concat!(
+        "use acme:codec/api as api\n",
+        "fn not_interface() {}\n",
+        "impl api {}\n",
+        "impl api.run {}\n",
+        "impl not_interface {}\n",
+        "impl missing {}\n",
+    );
+    fs::write(source_directory.join("lib.sai"), source)
+        .expect("write interface implementation targets");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(package)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
+    let diagnostics = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"IMPL_TARGET_NOT_INTERFACE\""))
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 2, "{stdout}");
+    for target in ["api.run", "not_interface"] {
+        let start = source
+            .find(&format!("impl {target}"))
+            .expect("non-interface implementation target exists")
+            + "impl ".len();
+        let end = start + target.len();
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.contains(&format!("\"start\":{{\"byte\":{start},"))
+                    && diagnostic.contains(&format!("\"end\":{{\"byte\":{end},"))
+            }),
+            "expected a full-path diagnostic for {target} in {stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("\"code\":\"WRONG_NAME_KIND\""),
+        "the target-kind diagnostic replaces WRONG_NAME_KIND instead of duplicating it: {stdout}"
+    );
+    assert!(
+        diagnostics[0].contains("\"path\":\"src/lib.sai\"")
+            && diagnostics[0].contains("\"package\":\"acme:check@0.1.0\""),
+        "{}",
+        diagnostics[0]
+    );
+    assert!(
+        stdout.contains("\"stage\":0,\"feature\":\"sai check\"")
+            && stdout.contains("\"type\":\"summary\""),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn check_reports_tracked_interface_use_cycle_diagnostics() {
     let directory = TestDirectory::new();
     let package = directory.path().join("package");
