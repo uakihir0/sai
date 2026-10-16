@@ -289,6 +289,7 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
             "  missing: leaf_model.PublicTypo\n",
             "  hidden_missing: leaf_model.PrivatType\n",
             "}\n",
+            "fn middle_signature(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) { let body_private: leaf_model.PrivateType = 0; let body_missing: leaf_model.PublicTypo = 0; }\n",
         ),
     )
     .expect("write middle package scopes and type owner");
@@ -303,6 +304,7 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
             "pub interface api {\n",
             "  type PublicTppe = U32\n",
             "  type PublicType = U32\n",
+            "  type PrivateType = U32\n",
             "  type PublicTypoC = U32\n",
             "  type PublicTypoB = U32\n",
             "  type PublicTypoA = U32\n",
@@ -355,15 +357,16 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         .lines()
         .filter(|line| line.contains("\"code\":\"PRIVATE_ITEM\""))
         .collect::<Vec<_>>();
-    assert_eq!(private_diagnostics.len(), 1, "{stdout}");
-    let private = private_diagnostics[0];
+    assert_eq!(private_diagnostics.len(), 3, "{stdout}");
     let middle_source = concat!(
         "use acme:leaf/model as leaf_model\n",
         "pub use acme:leaf.{api}\n",
         "type MiddleRecord {\n",
         "  value: leaf_model.PrivateType\n",
-        "  missing: leaf_model.MissingType\n",
+        "  missing: leaf_model.PublicTypo\n",
+        "  hidden_missing: leaf_model.PrivatType\n",
         "}\n",
+        "fn middle_signature(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) { let body_private: leaf_model.PrivateType = 0; let body_missing: leaf_model.PublicTypo = 0; }\n",
     );
     let reference_start = middle_source
         .find("PrivateType")
@@ -372,6 +375,13 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
     let declaration_start = leaf_model_source
         .find("PrivateType")
         .expect("private declaration exists");
+    let private = private_diagnostics
+        .iter()
+        .find(|line| {
+            line.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
+                && line.contains(&format!("\"start\":{{\"byte\":{reference_start},"))
+        })
+        .expect("the middle package private member diagnostic is present");
     assert!(
         private.contains("\"package\":\"acme:middle@1.0.0\"")
             && private.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
@@ -388,20 +398,85 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
             )),
         "the foreign declaration is attached at its exact source location: {private}"
     );
+    let function_start = middle_source
+        .find("fn middle_signature")
+        .expect("function signature exists");
+    let function_end = middle_source[function_start..]
+        .find('\n')
+        .expect("function line has a line ending")
+        + function_start;
+    let function_line = &middle_source[function_start..function_end];
+    let body_start_in_function = function_line
+        .find('{')
+        .expect("function body starts on the same line");
+    let function_signature = &function_line[..body_start_in_function];
+    let function_body = &function_line[body_start_in_function..];
+    let function_private_start = function_start
+        + function_signature
+            .rfind("PrivateType")
+            .expect("function signature private reference exists");
+    let function_body_private_start = function_start
+        + body_start_in_function
+        + function_body
+            .rfind("PrivateType")
+            .expect("function body private reference exists");
+    assert_eq!(
+        private_diagnostics
+            .iter()
+            .filter(|line| line.contains(&format!("\"start\":{{\"byte\":{function_private_start},")))
+            .count(),
+        1,
+        "the function private member is reported exactly once: {stdout}"
+    );
+    let function_private = private_diagnostics
+        .iter()
+        .find(|line| {
+            line.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
+                && line.contains(&format!("\"start\":{{\"byte\":{function_private_start},"))
+        })
+        .expect("the middle function private member diagnostic is present");
+    assert!(
+        function_private.contains("\"package\":\"acme:middle@1.0.0\"")
+            && function_private.contains("\"what\":\"private member declared here\"")
+            && function_private.contains(
+                "\"path\":\"dep:acme:leaf@1.0.0/src/model.sai\",\"package\":\"acme:leaf@1.0.0\""
+            ),
+        "{function_private}"
+    );
+    assert_eq!(
+        private_diagnostics
+            .iter()
+            .filter(|line| {
+                line.contains(&format!(
+                    "\"start\":{{\"byte\":{function_body_private_start},"
+                ))
+            })
+            .count(),
+        1,
+        "the function body private member is reported exactly once: {stdout}"
+    );
+    let function_body_private = private_diagnostics
+        .iter()
+        .find(|line| {
+            line.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
+                && line.contains(&format!(
+                    "\"start\":{{\"byte\":{function_body_private_start},"
+                ))
+        })
+        .expect("the middle function body private member diagnostic is present");
+    assert!(
+        function_body_private.contains("\"package\":\"acme:middle@1.0.0\"")
+            && function_body_private.contains("\"what\":\"private member declared here\"")
+            && function_body_private.contains(
+                "\"path\":\"dep:acme:leaf@1.0.0/src/model.sai\",\"package\":\"acme:leaf@1.0.0\""
+            ),
+        "{function_body_private}"
+    );
     let unresolved_diagnostics = stdout
         .lines()
         .filter(|line| line.contains("\"code\":\"UNRESOLVED_NAME\""))
         .collect::<Vec<_>>();
-    assert_eq!(unresolved_diagnostics.len(), 3, "{stdout}");
-    let middle_source = concat!(
-        "use acme:leaf/model as leaf_model\n",
-        "pub use acme:leaf.{api}\n",
-        "type MiddleRecord {\n",
-        "  value: leaf_model.PrivateType\n",
-        "  missing: leaf_model.PublicTypo\n",
-        "  hidden_missing: leaf_model.PrivatType\n",
-        "}\n",
-    );
+    assert_eq!(unresolved_diagnostics.len(), 5, "{stdout}");
     let missing_start = middle_source
         .find("PublicTypo")
         .expect("missing reference exists");
@@ -409,7 +484,7 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         .iter()
         .find(|line| {
             line.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
-                && line.contains("PublicTypo")
+                && line.contains(&format!("\"start\":{{\"byte\":{missing_start},"))
         })
         .expect("missing member diagnostic is present");
     assert!(
@@ -446,6 +521,64 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
     assert!(
         root_missing.contains("similar names: `PublicType`, `PublicTypoC`, `PublicTypoB`"),
         "the help child preserves the same ordered, capped candidates: {root_missing}"
+    );
+    let function_missing_start = function_start
+        + function_signature
+            .rfind("PublicTypo")
+            .expect("function signature missing reference exists");
+    assert_eq!(
+        unresolved_diagnostics
+            .iter()
+            .filter(|line| line.contains(&format!("\"start\":{{\"byte\":{function_missing_start},")))
+            .count(),
+        1,
+        "the function missing member is reported exactly once: {stdout}"
+    );
+    let function_missing = unresolved_diagnostics
+        .iter()
+        .find(|line| {
+            line.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
+                && line.contains(&format!("\"start\":{{\"byte\":{function_missing_start},"))
+        })
+        .expect("the middle function missing member diagnostic is present exactly once");
+    assert!(
+        function_missing.contains("\"package\":\"acme:middle@1.0.0\"")
+            && function_missing.contains("no item `PublicTypo` in module `acme:leaf@1.0.0/model`")
+            && function_missing.contains("\"candidates\":[\"PublicType\"]"),
+        "{function_missing}"
+    );
+    let function_body_missing_start = function_start
+        + body_start_in_function
+        + function_body
+            .rfind("PublicTypo")
+            .expect("function body missing reference exists");
+    assert_eq!(
+        unresolved_diagnostics
+            .iter()
+            .filter(|line| {
+                line.contains(&format!(
+                    "\"start\":{{\"byte\":{function_body_missing_start},"
+                ))
+            })
+            .count(),
+        1,
+        "the function body missing member is reported exactly once: {stdout}"
+    );
+    let function_body_missing = unresolved_diagnostics
+        .iter()
+        .find(|line| {
+            line.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
+                && line.contains(&format!(
+                    "\"start\":{{\"byte\":{function_body_missing_start},"
+                ))
+        })
+        .expect("the middle function body missing member diagnostic is present");
+    assert!(
+        function_body_missing.contains("\"package\":\"acme:middle@1.0.0\"")
+            && function_body_missing
+                .contains("no item `PublicTypo` in module `acme:leaf@1.0.0/model`")
+            && function_body_missing.contains("\"candidates\":[\"PublicType\"]"),
+        "{function_body_missing}"
     );
     assert!(
         !stdout.contains("\"stage\":3,\"feature\":\"dependencies\""),

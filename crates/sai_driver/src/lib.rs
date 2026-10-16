@@ -1287,6 +1287,7 @@ pub struct FunctionOwnerResolution {
     local_resolution: Result<Option<LocalResolution>, FunctionOwnerResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, FunctionOwnerResolutionError>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, FunctionOwnerResolutionError>,
+    module_path_diagnostics: Result<Option<Vec<Diagnostic>>, FunctionOwnerResolutionError>,
     test_only_path_resolution:
         Result<Option<OwnerTestOnlyPathResolution>, FunctionOwnerResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, FunctionOwnerResolutionError>,
@@ -1332,6 +1333,17 @@ impl FunctionOwnerResolution {
         self.type_path_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
+    }
+
+    /// Returns snapshot-bound diagnostics for typed member failures when this
+    /// owner was resolved with a validated active-source closure. Package-local
+    /// calls leave diagnostic mapping to their caller.
+    pub fn module_path_diagnostics(
+        &self,
+    ) -> Result<Option<&[Diagnostic]>, &FunctionOwnerResolutionError> {
+        self.module_path_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.as_deref())
     }
 
     pub fn test_only_path_resolution(
@@ -6448,8 +6460,9 @@ impl RootDatabase {
     }
 
     /// Resolves function-owner type prefixes through a validated active-source
-    /// member-scope closure. Other owner results remain identical to the
-    /// package-local analysis bridge.
+    /// member-scope closure and maps typed member failures to snapshot-bound
+    /// diagnostics. Other owner results remain identical to the package-local
+    /// analysis bridge.
     pub fn resolve_function_owner_analyses_with_member_scopes(
         &mut self,
         collection: &Phase1PackageScopesCollection,
@@ -6521,6 +6534,7 @@ impl RootDatabase {
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
+                                module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
@@ -6541,6 +6555,7 @@ impl RootDatabase {
                 let mut local_resolution = None;
                 let mut module_resolution = None;
                 let mut type_path_resolution = None;
+                let mut module_path_diagnostics = None;
                 let mut test_only_path_resolution = None;
                 let mut test_only_diagnostics = None;
                 let resolution = (|| {
@@ -6637,6 +6652,23 @@ impl RootDatabase {
                             (_, _, Err(error)) => Err(error),
                         },
                     );
+                    module_path_diagnostics = match (member_scopes, type_path_resolution.as_ref()) {
+                        (Some(member_scopes), Some(Ok(Some(path_resolution)))) => Some(
+                            self.type_owner_module_path_diagnostics(
+                                descriptor.owner,
+                                path_resolution,
+                                &inputs,
+                                Some(&module_members),
+                                snapshot,
+                                &collection.target_cfg,
+                                Some(member_scopes),
+                            )
+                            .map(Some),
+                        ),
+                        (Some(_), Some(Err(error))) => Some(Err(error.clone())),
+                        (Some(_), Some(Ok(None)) | None) => Some(Ok(Some(Vec::new()))),
+                        (None, _) => None,
+                    };
                     match hir_owner.body {
                         Some(body) => {
                             let labels = resolve_owner_control_flow(
@@ -6717,6 +6749,11 @@ impl RootDatabase {
                     module_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let type_path_resolution =
                     type_path_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let module_path_diagnostics =
+                    module_path_diagnostics.unwrap_or_else(|| match &type_path_resolution {
+                        Err(error) => Err(error.clone()),
+                        Ok(_) => Ok(None),
+                    });
                 let test_only_path_resolution =
                     test_only_path_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let test_only_diagnostics =
@@ -6727,6 +6764,7 @@ impl RootDatabase {
                     local_resolution,
                     module_resolution,
                     type_path_resolution,
+                    module_path_diagnostics,
                     test_only_path_resolution,
                     test_only_diagnostics,
                     lowering_diagnostics,
@@ -11618,6 +11656,13 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         assert_eq!(resolved.owners().len(), 3);
+        assert!(
+            resolved.owners().iter().all(|owner| owner
+                .module_path_diagnostics()
+                .expect("package-local calls retain their own typed path channel")
+                .is_none()),
+            "package-local calls do not construct snapshot-bound member diagnostics"
+        );
 
         let root_local = resolved.owners()[0]
             .local_resolution()
@@ -20975,7 +21020,7 @@ mod tests {
                       }\n\
                       impl middle.api {}\n\
                       unsafe extern \"wasm\" module \"env\" { fn transitive_extern(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo); }\n\
-                      fn qualified_signature(value: middle.api.PublicType, hidden: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType.Associated {}\n\
+                      fn qualified_signature(value: middle.api.PublicType, hidden: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType.Associated { let body_private: leaf_model.PrivateType = 0; let body_missing: middle.api.PublicTypo = 0; }\n\
                       distinct ForeignPlain<Public: middle.api.PublicType, Private: leaf_model.PrivateType, Missing: middle.api.PublicTypo> = middle.api.PublicType\n\
                       const QUALIFIED_FOREIGN: middle.api.PublicType = { let nested: middle.api.PublicType = 0; 0 }\n\
                       const PRIVATE_FOREIGN: leaf_model.PrivateType = 0\n\
@@ -21268,8 +21313,8 @@ mod tests {
         );
         assert_eq!(
             function_paths.module_path_errors().len(),
-            2,
-            "private and missing foreign members remain as typed path errors: {:?}",
+            4,
+            "signature and body private/missing foreign members remain as typed path errors: {:?}",
             function_paths.module_path_errors()
         );
         let function_source = snapshot
@@ -21284,7 +21329,13 @@ mod tests {
             .find('\n')
             .expect("function signature has a line ending")
             + signature_start;
-        let signature_source = &source_text[signature_start..signature_end];
+        let function_source_line = &source_text[signature_start..signature_end];
+        let body_offset_in_line = function_source_line
+            .find('{')
+            .expect("function body begins on the same source line");
+        let signature_source = &function_source_line[..body_offset_in_line];
+        let body_source = &function_source_line[body_offset_in_line..];
+        let body_source_offset = signature_start + body_offset_in_line;
         let member_range =
             |source: &str, source_offset: usize, qualified_name: &str, member: &str| {
                 let start = source_offset
@@ -21304,7 +21355,13 @@ mod tests {
             .iter()
             .find(|entry| matches!(entry.error(), ModulePathError::InaccessibleMember { .. }))
             .expect("foreign private signature member is rejected");
-        let ModulePathError::InaccessibleMember { name, span, .. } = private_error.error() else {
+        let ModulePathError::InaccessibleMember {
+            name,
+            span: private_span,
+            declaration_span,
+            ..
+        } = private_error.error()
+        else {
             panic!("foreign private signature member reports an inaccessible-member error");
         };
         assert_eq!(
@@ -21315,7 +21372,7 @@ mod tests {
             "PrivateType"
         );
         assert_eq!(
-            span.range,
+            private_span.range,
             member_range(
                 signature_source,
                 signature_start,
@@ -21336,7 +21393,12 @@ mod tests {
             .iter()
             .find(|entry| matches!(entry.error(), ModulePathError::MissingMember { .. }))
             .expect("missing transitive signature member is retained");
-        let ModulePathError::MissingMember { name, span, .. } = missing_error.error() else {
+        let ModulePathError::MissingMember {
+            name,
+            span: missing_span,
+            ..
+        } = missing_error.error()
+        else {
             panic!("missing signature member reports a missing-member error");
         };
         assert_eq!(
@@ -21347,7 +21409,7 @@ mod tests {
             "PublicTypo"
         );
         assert_eq!(
-            span.range,
+            missing_span.range,
             member_range(
                 signature_source,
                 signature_start,
@@ -21363,6 +21425,148 @@ mod tests {
                 segment_count: 3,
             })
         ));
+        let body_private_span = member_range(
+            body_source,
+            body_source_offset,
+            "leaf_model.PrivateType",
+            "PrivateType",
+        );
+        let body_missing_span = member_range(
+            body_source,
+            body_source_offset,
+            "middle.api.PublicTypo",
+            "PublicTypo",
+        );
+        assert!(
+            function_paths
+                .module_path_errors()
+                .iter()
+                .any(|entry| matches!(
+                    entry.error(),
+                    ModulePathError::InaccessibleMember { span, .. }
+                        if span.range == body_private_span
+                )),
+            "the body annotation's private path remains a typed member error"
+        );
+        assert!(
+            function_paths
+                .module_path_errors()
+                .iter()
+                .any(|entry| matches!(
+                    entry.error(),
+                    ModulePathError::MissingMember { span, .. }
+                        if span.range == body_missing_span
+                )),
+            "the body annotation's missing path remains a typed member error"
+        );
+        let function_diagnostics = function_results.owners()[0]
+            .module_path_diagnostics()
+            .expect("function member diagnostics resolve")
+            .expect("the closure-aware adapter maps member failures");
+        assert_eq!(function_diagnostics.len(), 4);
+        let function_private_diagnostic = function_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::PrivateItem)
+            .expect("private function type member becomes PRIVATE_ITEM");
+        assert_eq!(
+            function_private_diagnostic
+                .primary()
+                .map(|location| &location.span),
+            Some(&sai_diagnostics::Span::new(
+                private_span.file,
+                private_span.range
+            ))
+        );
+        assert!(
+            function_private_diagnostic
+                .related()
+                .iter()
+                .any(|related| matches!(
+                    related,
+                    Related::DeclaredHere { location, .. }
+                        if location.span
+                            == sai_diagnostics::Span::new(
+                                declaration_span.file,
+                                declaration_span.range
+                            )
+                )),
+            "the private function type diagnostic retains the foreign declaration location"
+        );
+        let function_body_private_diagnostic = function_diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::PrivateItem
+                    && diagnostic
+                        .primary()
+                        .is_some_and(|location| location.span.range == body_private_span)
+            })
+            .expect("body private type member becomes PRIVATE_ITEM at its annotation");
+        assert!(
+            function_body_private_diagnostic
+                .related()
+                .iter()
+                .any(|related| matches!(
+                    related,
+                    Related::DeclaredHere { location, .. }
+                        if location.span
+                            == sai_diagnostics::Span::new(
+                                declaration_span.file,
+                                declaration_span.range
+                            )
+                )),
+            "the body private type diagnostic keeps its foreign declaration location"
+        );
+        let function_missing_diagnostic = function_diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::UnresolvedName
+                    && diagnostic
+                        .primary()
+                        .is_some_and(|location| location.span.range == missing_span.range)
+            })
+            .expect("missing function type member becomes UNRESOLVED_NAME");
+        assert_eq!(
+            function_missing_diagnostic
+                .primary()
+                .map(|location| &location.span),
+            Some(&sai_diagnostics::Span::new(
+                missing_span.file,
+                missing_span.range
+            )),
+            "the function unresolved-name diagnostic points at the failed suffix"
+        );
+        assert_eq!(
+            function_missing_diagnostic.data.get("candidates"),
+            Some(&sai_diagnostics::Value::Array(vec![
+                sai_diagnostics::Value::String("PublicType".to_owned())
+            ])),
+            "function member suggestions use the visible re-export target"
+        );
+        let function_body_missing_diagnostic = function_diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::UnresolvedName
+                    && diagnostic
+                        .primary()
+                        .is_some_and(|location| location.span.range == body_missing_span)
+            })
+            .expect("body missing type member becomes UNRESOLVED_NAME at its annotation");
+        assert_eq!(
+            function_body_missing_diagnostic
+                .primary()
+                .map(|location| &location.span),
+            Some(&sai_diagnostics::Span::new(
+                missing_span.file,
+                body_missing_span
+            ))
+        );
+        assert_eq!(
+            function_body_missing_diagnostic.data.get("candidates"),
+            Some(&sai_diagnostics::Value::Array(vec![
+                sai_diagnostics::Value::String("PublicType".to_owned())
+            ])),
+            "body member suggestions use the visible re-export target"
+        );
 
         let const_results = database
             .resolve_const_owner_paths_with_member_scopes(
