@@ -1927,6 +1927,7 @@ pub struct TraitImplMemberTestOnlyResolutions {
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
+    member_scope_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<TraitImplMemberOwnerResolution>,
 }
 
@@ -1943,6 +1944,20 @@ impl TraitImplMemberTestOnlyResolutions {
         self.snapshot_id == collection.snapshot_id
             && self.target_cfg == collection.target_cfg
             && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn matches_member_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && member_scopes.matches_collection(collection)
+            && self.member_scope_closure_fingerprint == Some(member_scopes.closure_fingerprint)
+    }
+
+    pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
+        self.member_scope_closure_fingerprint
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -9854,6 +9869,43 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<TraitImplMemberTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        self.resolve_trait_impl_member_test_only_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            None,
+        )
+    }
+
+    /// Resolves associated trait and impl type paths through a validated
+    /// active-source member-scope closure.
+    pub fn resolve_trait_impl_member_test_only_paths_with_member_scopes(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> Result<TraitImplMemberTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.resolve_trait_impl_member_test_only_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+        )
+    }
+
+    fn resolve_trait_impl_member_test_only_paths_inner(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+    ) -> Result<TraitImplMemberTestOnlyResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
         }
@@ -9861,8 +9913,22 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
-        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
-        let source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let mut indexed_scopes =
+            Vec::with_capacity(1 + member_scopes.map_or(0, |scopes| scopes.source_packages.len()));
+        indexed_scopes.push(collection.scopes());
+        if let Some(member_scopes) = member_scopes {
+            indexed_scopes.extend(
+                member_scopes
+                    .source_packages
+                    .iter()
+                    .map(Phase1ModuleMemberScopePackage::scopes),
+            );
+        }
+        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let source_graph_packages = member_scopes
+            .map(|scopes| &scopes.source_graph_packages)
+            .unwrap_or(&local_source_graph_packages);
         let descriptors = collection
             .scopes
             .top_level_owners
@@ -10260,6 +10326,8 @@ impl RootDatabase {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
+            member_scope_closure_fingerprint: member_scopes
+                .map(|scopes| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -20745,8 +20813,14 @@ mod tests {
                       invariant U32 { { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true } }\n\
                       type ForeignRefined = U32 where { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true }\n\
                       distinct ForeignDistinct = U32 where { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true }\n\
-                      trait ForeignHeader<Public: middle.api.PublicType, Private: leaf_model.PrivateType, Missing: middle.api.PublicTypo> {}\n\
-                      impl middle.api.PublicType for leaf_model.PrivateType where Self: middle.api.PublicTypo {}\n\
+                      trait ForeignHeader<Public: middle.api.PublicType, Private: leaf_model.PrivateType, Missing: middle.api.PublicTypo> {\n\
+                        type ForeignAssociated: middle.api.PublicType\n\
+                        fn foreign_member(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo)\n\
+                      }\n\
+                      impl middle.api.PublicType for leaf_model.PrivateType where Self: middle.api.PublicTypo {\n\
+                        type ForeignImplAssociated = middle.api.PublicType\n\
+                        fn foreign_impl_member(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo) {}\n\
+                      }\n\
                       impl middle.api {}\n\
                       unsafe extern \"wasm\" module \"env\" { fn transitive_extern(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo); }\n\
                       fn qualified_signature(value: middle.api.PublicType, hidden: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType.Associated {}\n\
@@ -20871,6 +20945,45 @@ mod tests {
             )
             .expect("deep scopes collect");
         let deep_member_package = deep_collection.module_member_scope_package();
+        let api_symbol = database
+            .symbols
+            .intern("api")
+            .expect("interface name is interned");
+        let public_type_symbol = database
+            .symbols
+            .intern("PublicType")
+            .expect("member type name is interned");
+        let deep_root_scope = deep_collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("deep root module scope exists");
+        let deep_interface_def = match deep_root_scope
+            .members
+            .get(&api_symbol)
+            .expect("deep package declares api")
+            .res
+        {
+            Res::Def(DefKind::Interface, def_id) => def_id,
+            other => panic!("deep api resolves to an interface, got {other:?}"),
+        };
+        let deep_interface_scope = deep_collection
+            .scopes()
+            .interfaces
+            .get(&deep_interface_def)
+            .expect("deep interface member scope exists");
+        let expected_deep_public_type = deep_interface_scope
+            .members
+            .get(&public_type_symbol)
+            .expect("deep api declares PublicType")
+            .res;
+        assert!(
+            matches!(
+                expected_deep_public_type,
+                Res::Def(DefKind::Alias, def_id) if def_id.package == deep_tree.package
+            ),
+            "the positive transitive member has the deep package identity"
+        );
+        let expected_deep_interface = Res::Def(DefKind::Interface, deep_interface_def);
         let middle_manifest: Arc<[u8]> =
             Arc::from(&b"package acme:middle @ 1.0.0\nrequires { acme:deep @ ^1 }\n"[..]);
         let middle_collection = database
@@ -21202,11 +21315,11 @@ mod tests {
             |paths: &TypeOwnerPathResolution, source: &str, source_offset: usize| {
                 assert!(
                     paths.paths().values().any(|path| {
-                        matches!(path.base, Res::Def(DefKind::Alias, _))
+                        path.base == expected_deep_public_type
                             && path.resolved_segments == 3
                             && path.segment_count == 3
                     }),
-                    "public transitive interface members resolve from predicate type paths"
+                    "public transitive interface members resolve to the canonical deep DefId"
                 );
                 assert_eq!(paths.module_path_errors().len(), 2);
                 let private_error = paths
@@ -21334,7 +21447,7 @@ mod tests {
                         .type_path_resolution()
                         .expect("interface impl header result succeeds");
                     paths.paths().values().any(|path| {
-                        matches!(path.base, Res::Def(DefKind::Interface, _))
+                        path.base == expected_deep_interface
                             && path.resolved_segments == 2
                             && path.segment_count == 2
                     })
@@ -21348,6 +21461,146 @@ mod tests {
                 .module_path_errors()
                 .is_empty(),
             "a transitive public interface target has no lookup errors"
+        );
+
+        let member_results = database
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("trait and impl member paths resolve through transitive member scopes");
+        assert!(member_results.matches_member_scopes(&root_collection, &member_scopes));
+        assert_eq!(
+            member_results.member_scope_closure_fingerprint(),
+            Some(member_scopes.closure_fingerprint())
+        );
+        assert!(matches!(
+            database.resolve_trait_impl_member_test_only_paths_with_member_scopes(
+                &middle_collection,
+                &middle_tree,
+                &snapshot,
+                &member_scopes,
+            ),
+            Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(key)
+            )) if key.as_str() == "acme:middle#1"
+        ));
+        assert_eq!(member_results.owners().len(), 3);
+        assert!(
+            member_results
+                .owners()
+                .iter()
+                .all(|owner| owner.error().is_none())
+        );
+        assert_eq!(
+            member_results
+                .owners()
+                .iter()
+                .map(|owner| owner.kind())
+                .collect::<Vec<_>>(),
+            [
+                TopLevelOwnerKind::Trait,
+                TopLevelOwnerKind::Impl,
+                TopLevelOwnerKind::Impl
+            ],
+            "trait and both impl owners keep independent member collections"
+        );
+        let trait_members = member_results.owners()[0].members();
+        assert_eq!(trait_members.len(), 2);
+        assert_eq!(
+            trait_members
+                .iter()
+                .map(|member| member.kind())
+                .collect::<Vec<_>>(),
+            [
+                TraitImplMemberKind::TraitAssociatedType,
+                TraitImplMemberKind::TraitMethod
+            ]
+        );
+        assert!(
+            trait_members[0]
+                .type_path_resolution()
+                .expect("trait associated type paths resolve")
+                .paths()
+                .values()
+                .any(|path| path.base == expected_deep_public_type
+                    && path.resolved_segments == 3
+                    && path.segment_count == 3),
+            "trait associated type bounds resolve through the transitive interface"
+        );
+        assert!(
+            trait_members[0]
+                .type_path_resolution()
+                .expect("trait associated type paths resolve")
+                .module_path_errors()
+                .is_empty()
+        );
+        let trait_method_paths = trait_members[1]
+            .type_path_resolution()
+            .expect("trait method type paths resolve");
+        let trait_method_start = source_text
+            .find("fn foreign_member")
+            .expect("transitive trait method appears in the root source");
+        let trait_method_line_start = source_text[..trait_method_start]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let trait_method_line_end = source_text[trait_method_start..]
+            .find('\n')
+            .map_or(source_text.len(), |index| trait_method_start + index);
+        assert_foreign_predicate_paths(
+            trait_method_paths,
+            &source_text[trait_method_line_start..trait_method_line_end],
+            trait_method_line_start,
+        );
+
+        let impl_members = member_results.owners()[1].members();
+        assert_eq!(impl_members.len(), 2);
+        assert_eq!(
+            impl_members
+                .iter()
+                .map(|member| member.kind())
+                .collect::<Vec<_>>(),
+            [
+                TraitImplMemberKind::ImplAssociatedType,
+                TraitImplMemberKind::ImplMethod
+            ]
+        );
+        assert!(
+            impl_members[0]
+                .type_path_resolution()
+                .expect("impl associated type paths resolve")
+                .paths()
+                .values()
+                .any(|path| path.base == expected_deep_public_type
+                    && path.resolved_segments == 3
+                    && path.segment_count == 3),
+            "impl associated type definitions resolve through the transitive interface"
+        );
+        assert!(
+            impl_members[0]
+                .type_path_resolution()
+                .expect("impl associated type paths resolve")
+                .module_path_errors()
+                .is_empty()
+        );
+        let impl_method_paths = impl_members[1]
+            .type_path_resolution()
+            .expect("impl method type paths resolve");
+        let impl_method_start = source_text
+            .find("fn foreign_impl_member")
+            .expect("transitive impl method appears in the root source");
+        let impl_method_line_start = source_text[..impl_method_start]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let impl_method_line_end = source_text[impl_method_start..]
+            .find('\n')
+            .map_or(source_text.len(), |index| impl_method_start + index);
+        assert_foreign_predicate_paths(
+            impl_method_paths,
+            &source_text[impl_method_line_start..impl_method_line_end],
+            impl_method_line_start,
         );
 
         let extern_results = database
