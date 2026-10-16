@@ -18,6 +18,36 @@ mod index_sealed {
     }
 }
 
+/// A WIT stability version, including its complete SemVer prerelease and
+/// build metadata.
+///
+/// Build metadata does not affect version precedence, but is retained so
+/// canonical WIT output can preserve the annotation's complete version. The
+/// SemVer representation also accepts numeric prerelease identifiers longer
+/// than `u64`, as required by the WIT grammar.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct WitStabilityVersion {
+    version: semver::Version,
+}
+
+impl WitStabilityVersion {
+    pub fn parse(value: &str) -> Result<Self, semver::Error> {
+        Ok(Self {
+            version: semver::Version::parse(value)?,
+        })
+    }
+
+    pub fn cmp_precedence(&self, other: &Self) -> std::cmp::Ordering {
+        self.version.cmp_precedence(&other.version)
+    }
+}
+
+impl std::fmt::Display for WitStabilityVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.version.fmt(formatter)
+    }
+}
+
 /// A WIT model index whose numeric value is local to one typed vector.
 pub trait WitIndex: index_sealed::Sealed + Copy + Eq + std::fmt::Debug {
     const STABLE_TAG: u8;
@@ -208,7 +238,6 @@ impl WitIndex for WitWorldIdx {
 
 impl WitWorldIdx {
     /// Creates a world index from its zero-based vector position.
-    #[cfg(test)]
     pub(crate) const fn from_raw(raw: u32) -> Self {
         Self(raw)
     }
@@ -284,7 +313,9 @@ pub struct WitInterface {
     /// The WIT name, in kebab case.
     pub name: String,
     pub docs: Option<Arc<str>>,
-    pub deprecated: Option<Version>,
+    /// The version when this item became stable, if declared by WIT.
+    pub since: Option<WitStabilityVersion>,
+    pub deprecated: Option<WitStabilityVersion>,
     /// Items in WIT order: types first, followed by functions.
     pub items: WitIndexVec<WitItemIdx, WitItem>,
     /// Absent for embedded and generated units.
@@ -296,7 +327,8 @@ pub struct WitInterface {
 pub struct WitItem {
     pub name: String,
     pub docs: Option<Arc<str>>,
-    pub deprecated: Option<Version>,
+    pub since: Option<WitStabilityVersion>,
+    pub deprecated: Option<WitStabilityVersion>,
     pub kind: WitItemKind,
     pub unsupported: Option<Unsupported>,
     pub span: Option<WitSpan>,
@@ -338,7 +370,8 @@ pub struct WitMember {
     pub kind: WitMemberKind,
     pub func: WitFunc,
     pub docs: Option<Arc<str>>,
-    pub deprecated: Option<Version>,
+    pub since: Option<WitStabilityVersion>,
+    pub deprecated: Option<WitStabilityVersion>,
     pub unsupported: Option<Unsupported>,
 }
 
@@ -394,6 +427,9 @@ pub enum WitType {
 pub struct WitTypeRef {
     pub interface: WitIfaceRef,
     pub item: WitItemIdx,
+    /// The referenced WIT item name. The index alone cannot recover this
+    /// spelling when the reference points into another package.
+    pub item_name: String,
 }
 
 /// A reference to an interface in a WIT unit.
@@ -401,6 +437,8 @@ pub struct WitTypeRef {
 pub struct WitIfaceRef {
     pub unit: WitUnit,
     pub interface: WitIfaceIdx,
+    /// The interface's WIT name, retained for package-local printing.
+    pub name: String,
 }
 
 /// A WIT world and its resolved imports and exports.
@@ -408,10 +446,19 @@ pub struct WitIfaceRef {
 pub struct WitWorld {
     pub name: String,
     pub docs: Option<Arc<str>>,
+    pub since: Option<WitStabilityVersion>,
+    pub deprecated: Option<WitStabilityVersion>,
     /// Imports in the order produced by `wit-parser` world elaboration.
     pub imports: Vec<WitWorldItem>,
     /// Exports in the order produced by `wit-parser` world elaboration.
     pub exports: Vec<WitWorldItem>,
+    /// Included worlds in source or generation order.
+    pub includes: Vec<WitWorldRef>,
+    /// The source or generation order interleaving `imports` and `exports`.
+    ///
+    /// Each entry points into the corresponding vector. An empty vector is
+    /// accepted for hand-built models and prints imports followed by exports.
+    pub source_order: Vec<WitWorldItemOrder>,
     pub unsupported: Option<Unsupported>,
     /// Absent for embedded and generated units.
     pub span: Option<WitSpan>,
@@ -420,12 +467,69 @@ pub struct WitWorld {
 /// An interface or function exposed by a WIT world.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WitWorldItem {
-    Interface(WitIfaceRef),
+    Interface {
+        reference: WitIfaceRef,
+        since: Option<WitStabilityVersion>,
+        deprecated: Option<WitStabilityVersion>,
+    },
     Func {
         name: String,
         func: WitFunc,
         unsupported: Option<Unsupported>,
+        since: Option<WitStabilityVersion>,
+        deprecated: Option<WitStabilityVersion>,
     },
+}
+
+/// Which world item vector a source-order entry indexes.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum WitWorldItemDirection {
+    Import,
+    Export,
+    Include,
+}
+
+/// A reference into one of a world's ordered import/export vectors.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct WitWorldItemOrder {
+    pub direction: WitWorldItemDirection,
+    pub index: u32,
+}
+
+impl WitWorldItemOrder {
+    pub const fn import(index: u32) -> Self {
+        Self {
+            direction: WitWorldItemDirection::Import,
+            index,
+        }
+    }
+
+    pub const fn export(index: u32) -> Self {
+        Self {
+            direction: WitWorldItemDirection::Export,
+            index,
+        }
+    }
+
+    pub const fn include(index: u32) -> Self {
+        Self {
+            direction: WitWorldItemDirection::Include,
+            index,
+        }
+    }
+}
+
+/// A reference to a world in a WIT unit.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct WitWorldRef {
+    pub unit: WitUnit,
+    pub world: WitWorldIdx,
+    /// The referenced WIT world name.
+    pub name: String,
+    /// Names renamed by a WIT `include ... with { ... }` declaration.
+    pub names: Vec<(String, String)>,
+    pub since: Option<WitStabilityVersion>,
+    pub deprecated: Option<WitStabilityVersion>,
 }
 
 /// A source file and byte range in the original WIT input.
@@ -453,8 +557,8 @@ pub enum Unsupported {
 mod tests {
     use super::{
         Unsupported, WitCase, WitField, WitIfaceIdx, WitIfaceRef, WitIndexVec, WitInterface,
-        WitItem, WitItemIdx, WitItemKind, WitPackage, WitPackageName, WitType, WitTypeRef, WitUnit,
-        WitWorldIdx,
+        WitItem, WitItemIdx, WitItemKind, WitPackage, WitPackageName, WitStabilityVersion, WitType,
+        WitTypeRef, WitUnit, WitWorldIdx,
     };
     use sai_intern::Interner;
     use sai_package::version::Version;
@@ -470,10 +574,26 @@ mod tests {
         WitInterface {
             name: name.to_owned(),
             docs: None,
+            since: None,
             deprecated: None,
             items: WitIndexVec::new(),
             span: None,
         }
+    }
+
+    #[test]
+    fn stability_versions_preserve_unbounded_prereleases_and_ignore_build_precedence() {
+        let long = WitStabilityVersion::parse("1.0.0-18446744073709551616+build.7")
+            .expect("SemVer permits arbitrarily long numeric prerelease identifiers");
+        assert_eq!(long.to_string(), "1.0.0-18446744073709551616+build.7");
+        let smaller = WitStabilityVersion::parse("1.0.0-9").expect("valid prerelease version");
+        assert_eq!(long.cmp_precedence(&smaller), std::cmp::Ordering::Greater);
+        let same_precedence = WitStabilityVersion::parse("1.0.0-18446744073709551616+other")
+            .expect("valid build metadata");
+        assert_eq!(
+            long.cmp_precedence(&same_precedence),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[test]
@@ -511,6 +631,7 @@ mod tests {
             .map(|name| WitItem {
                 name: name.to_owned(),
                 docs: None,
+                since: None,
                 deprecated: None,
                 kind: WitItemKind::Enum(Vec::new()),
                 unsupported: None,
@@ -559,8 +680,10 @@ mod tests {
             interface: WitIfaceRef {
                 unit: wasi_unit("io"),
                 interface: WitIfaceIdx::from_raw(2),
+                name: "streams".to_owned(),
             },
             item: WitItemIdx::from_raw(7),
+            item_name: "input-stream".to_owned(),
         };
         let ty = WitType::List(Box::new(WitType::Named(reference)));
 
@@ -570,8 +693,10 @@ mod tests {
                 interface: WitIfaceRef {
                     unit: wasi_unit("io"),
                     interface: WitIfaceIdx::from_raw(2),
+                    name: "streams".to_owned(),
                 },
                 item: WitItemIdx::from_raw(7),
+                item_name: "input-stream".to_owned(),
             })))
         );
         assert_eq!(
@@ -594,8 +719,10 @@ mod tests {
                 interface: WitIfaceRef {
                     unit: wasi_unit("io"),
                     interface: WitIfaceIdx::from_raw(0),
+                    name: "streams".to_owned(),
                 },
                 item: WitItemIdx::from_raw(0),
+                item_name: "input-stream".to_owned(),
             })),
         };
 

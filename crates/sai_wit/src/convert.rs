@@ -3,15 +3,16 @@
 use crate::{
     ParsedWitPackageGroup, Unsupported, WitCase, WitField, WitFunc, WitIfaceIdx, WitIfaceRef,
     WitIndexVec, WitInterface, WitItem, WitItemIdx, WitItemKind, WitMember, WitMemberKind,
-    WitPackage, WitPackageName, WitSourceLocation, WitSpan, WitType, WitTypeRef, WitUnit,
-    WitUnitKind, WitWorld, WitWorldIdx, WitWorldItem,
+    WitPackage, WitPackageName, WitSourceLocation, WitSpan, WitStabilityVersion, WitType,
+    WitTypeRef, WitUnit, WitUnitKind, WitWorld, WitWorldIdx, WitWorldItem, WitWorldItemOrder,
+    WitWorldRef,
 };
 use sai_package::version::Version;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use wit_parser::{
     Function, FunctionKind, Handle, InterfaceId, PackageId as ParserPackageId, Resolve, Span,
-    Stability, Type, TypeDefKind, TypeId, TypeOwner, WorldItem, WorldKey,
+    Stability, Type, TypeDefKind, TypeId, TypeOwner, WorldId, WorldItem, WorldKey,
 };
 
 /// A failure while converting a resolved parser package into the query model.
@@ -30,6 +31,7 @@ pub enum WitModelError {
     InvalidVersion(String),
     TooManyDefinitions,
     MissingInterface,
+    MissingWorld,
     MissingItem,
     UnmappedSourceSpan,
     InvalidType(String),
@@ -60,6 +62,9 @@ impl fmt::Display for WitModelError {
             Self::MissingInterface => {
                 formatter.write_str("WIT reference names an interface outside the loaded package")
             }
+            Self::MissingWorld => {
+                formatter.write_str("WIT reference names a world outside the loaded package")
+            }
             Self::MissingItem => {
                 formatter.write_str("WIT reference names a type outside the loaded package")
             }
@@ -78,6 +83,23 @@ impl fmt::Display for WitModelError {
 }
 
 impl std::error::Error for WitModelError {}
+
+#[derive(Clone, Debug)]
+struct SourceWorldInclude {
+    source_world: String,
+    target_package: String,
+    target_world: String,
+    names: Vec<(String, String)>,
+    since: Option<WitStabilityVersion>,
+    deprecated: Option<WitStabilityVersion>,
+    source_start: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SourceWorldItems {
+    imports: HashMap<String, u32>,
+    exports: HashMap<String, u32>,
+}
 
 /// A short-lived loader context for constructing one package model at a time.
 ///
@@ -121,6 +143,8 @@ impl WitResolveContext {
             });
         }
 
+        let source_world_includes = capture_source_world_includes(&parsed, &self.package_units)?;
+        let source_world_items = capture_source_world_items(&parsed);
         let group = parsed.group;
         let source_map = group.source_map;
         let source_offset = resolve.push_source_map(source_map);
@@ -154,6 +178,29 @@ impl WitResolveContext {
         );
         self.named_result_function_spans
             .extend(named_result_function_spans);
+        let source_world_includes = source_world_includes
+            .into_iter()
+            .map(|mut include| {
+                include.source_start = include
+                    .source_start
+                    .checked_add(source_offset)
+                    .expect("Resolve source spans are bounded");
+                include
+            })
+            .collect::<Vec<_>>();
+        let source_world_items = source_world_items
+            .into_iter()
+            .map(|(name, mut items)| {
+                (name, {
+                    for start in items.imports.values_mut().chain(items.exports.values_mut()) {
+                        *start = start
+                            .checked_add(source_offset)
+                            .expect("Resolve source spans are bounded");
+                    }
+                    items
+                })
+            })
+            .collect::<HashMap<_, _>>();
 
         model_package(
             resolve,
@@ -163,8 +210,146 @@ impl WitResolveContext {
             &self.source_mappings,
             &self.named_result_function_spans,
             &package_name,
+            &source_world_includes,
+            &source_world_items,
         )
     }
+}
+
+fn capture_source_world_items(parsed: &ParsedWitPackageGroup) -> HashMap<String, SourceWorldItems> {
+    parsed
+        .group
+        .main
+        .worlds
+        .iter()
+        .map(|(_, world)| {
+            let mut items = SourceWorldItems::default();
+            for (key, item) in &world.imports {
+                if let (Some(name), Some(start)) = (
+                    source_world_item_name(&parsed.group.main, key, item),
+                    span_start(item.span()),
+                ) {
+                    items.imports.insert(name, start);
+                }
+            }
+            for (key, item) in &world.exports {
+                if let (Some(name), Some(start)) = (
+                    source_world_item_name(&parsed.group.main, key, item),
+                    span_start(item.span()),
+                ) {
+                    items.exports.insert(name, start);
+                }
+            }
+            (world.name.clone(), items)
+        })
+        .collect()
+}
+
+fn source_world_item_name(
+    package: &wit_parser::UnresolvedPackage,
+    key: &WorldKey,
+    item: &WorldItem,
+) -> Option<String> {
+    match item {
+        WorldItem::Interface { id, .. } => package
+            .interfaces
+            .get(*id)
+            .and_then(|interface| interface.name.clone())
+            .or_else(|| match key {
+                WorldKey::Name(name) => Some(name.clone()),
+                WorldKey::Interface(_) => None,
+            }),
+        WorldItem::Function(function) => Some(function.name.clone()),
+        WorldItem::Type { .. } => None,
+    }
+}
+
+fn capture_source_world_includes(
+    parsed: &ParsedWitPackageGroup,
+    package_units: &HashMap<ParserPackageId, WitUnit>,
+) -> Result<Vec<SourceWorldInclude>, WitModelError> {
+    let local_package = parsed.unit().canonical_name().to_owned();
+    let mut result = Vec::new();
+    for (_, world) in parsed.group.main.worlds.iter() {
+        for include in &world.includes {
+            if matches!(include.stability, Stability::Unstable { .. }) {
+                continue;
+            }
+            let (target_package, target_world) =
+                if let Some(reference) = parsed.foreign_reference_for_parser_span(include.span) {
+                    let target_unit = reference
+                        .resolved_unit
+                        .as_ref()
+                        .or_else(|| package_unit_for_foreign_reference(reference, package_units))
+                        .ok_or(WitModelError::MissingWorld)?;
+                    (
+                        target_unit.canonical_name().to_owned(),
+                        reference.item.clone(),
+                    )
+                } else {
+                    let target = parsed
+                        .group
+                        .main
+                        .worlds
+                        .get(include.id)
+                        .ok_or(WitModelError::MissingWorld)?;
+                    (local_package.clone(), target.name.clone())
+                };
+            let (since, deprecated) = stability(&include.stability)?;
+            result.push(SourceWorldInclude {
+                source_world: world.name.clone(),
+                target_package,
+                target_world,
+                names: include
+                    .names
+                    .iter()
+                    .map(|name| (name.name.clone(), name.as_.clone()))
+                    .collect(),
+                since,
+                deprecated,
+                source_start: include.span.start(),
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn package_unit_for_foreign_reference<'a>(
+    reference: &crate::WitForeignReference,
+    package_units: &'a HashMap<ParserPackageId, WitUnit>,
+) -> Option<&'a WitUnit> {
+    let requested_version = reference
+        .version
+        .as_deref()
+        .map(|version| {
+            Version::parse(
+                version
+                    .split_once('+')
+                    .map_or(version, |(without_build, _)| without_build),
+            )
+        })
+        .transpose()
+        .ok()?;
+    let mut matches = package_units
+        .values()
+        .filter_map(|unit| {
+            let (identity, version) = unit.canonical_name().rsplit_once('@')?;
+            if identity != reference.identity {
+                return None;
+            }
+            let selected_version = Version::parse(version).ok()?;
+            if requested_version.as_ref().is_some_and(|requested| {
+                requested.compatibility_line() != selected_version.compatibility_line()
+                    || requested > &selected_version
+            }) {
+                return None;
+            }
+            Some(unit)
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| left.canonical_name().cmp(right.canonical_name()));
+    matches.dedup();
+    (matches.len() == 1).then(|| matches[0])
 }
 
 fn model_package(
@@ -175,6 +360,8 @@ fn model_package(
     source_mappings: &[(u32, crate::WitSourceMapping)],
     named_result_function_spans: &HashSet<(u32, u32)>,
     package_name: &wit_parser::PackageName,
+    source_world_includes: &[SourceWorldInclude],
+    source_world_items: &HashMap<String, SourceWorldItems>,
 ) -> Result<WitPackage, WitModelError> {
     let version = package_name
         .version
@@ -228,7 +415,7 @@ fn model_package(
                 }
             };
             let docs = docs(&definition.docs.contents);
-            let deprecated = deprecated(&definition.stability)?;
+            let (since, deprecated) = stability(&definition.stability)?;
             let span = source_span(definition.span, &unit, source_mappings);
 
             let (kind, unsupported) = if owner_interface != *interface_id {
@@ -257,6 +444,7 @@ fn model_package(
             items.push(WitItem {
                 name: name.clone(),
                 docs,
+                since,
                 deprecated,
                 kind,
                 unsupported,
@@ -291,7 +479,8 @@ fn model_package(
                     kind: member_kind,
                     func,
                     docs: docs(&function.docs.contents),
-                    deprecated: deprecated(&function.stability)?,
+                    since: stability(&function.stability)?.0,
+                    deprecated: stability(&function.stability)?.1,
                     unsupported,
                 });
             } else {
@@ -307,7 +496,8 @@ fn model_package(
                 free_functions.push(WitItem {
                     name: function.name.clone(),
                     docs: docs(&function.docs.contents),
-                    deprecated: deprecated(&function.stability)?,
+                    since: stability(&function.stability)?.0,
+                    deprecated: stability(&function.stability)?.1,
                     kind: WitItemKind::Func(func),
                     unsupported,
                     span: source_span(function.span, &unit, source_mappings),
@@ -319,7 +509,8 @@ fn model_package(
         interfaces.push(WitInterface {
             name: wit_interface_name.clone(),
             docs: docs(&parser_interface.docs.contents),
-            deprecated: deprecated(&parser_interface.stability)?,
+            since: stability(&parser_interface.stability)?.0,
+            deprecated: stability(&parser_interface.stability)?.1,
             items: WitIndexVec::try_from_vec(items)
                 .map_err(|_| WitModelError::TooManyDefinitions)?,
             span: interface_span,
@@ -330,6 +521,7 @@ fn model_package(
     let mut worlds = Vec::with_capacity(world_ids.len());
     for (name, world_id) in package.worlds.iter() {
         let world = &resolve.worlds[*world_id];
+        let (since, deprecated) = stability(&world.stability)?;
         let mut unsupported = None;
         let imports = world_items(
             &world.imports,
@@ -353,11 +545,78 @@ fn model_package(
             named_result_function_spans,
             &mut unsupported,
         )?;
+        let mut includes = Vec::new();
+        let mut source_order = Vec::with_capacity(imports.len() + exports.len());
+        let direct_items = source_world_items.get(name);
+        for (index, (item, _)) in imports.iter().enumerate() {
+            if let Some(start) =
+                direct_items.and_then(|items| items.imports.get(world_item_name(item)))
+            {
+                source_order.push((
+                    Some(*start),
+                    WitWorldItemOrder::import(
+                        u32::try_from(index).map_err(|_| WitModelError::TooManyDefinitions)?,
+                    ),
+                ));
+            }
+        }
+        for (index, (item, _)) in exports.iter().enumerate() {
+            if let Some(start) =
+                direct_items.and_then(|items| items.exports.get(world_item_name(item)))
+            {
+                source_order.push((
+                    Some(*start),
+                    WitWorldItemOrder::export(
+                        u32::try_from(index).map_err(|_| WitModelError::TooManyDefinitions)?,
+                    ),
+                ));
+            }
+        }
+        for include in source_world_includes
+            .iter()
+            .filter(|include| include.source_world == *name)
+        {
+            let target = world_reference_named(
+                resolve,
+                package_units,
+                &include.target_package,
+                &include.target_world,
+            )?;
+            includes.push(WitWorldRef {
+                names: include.names.clone(),
+                since: include.since.clone(),
+                deprecated: include.deprecated.clone(),
+                ..target
+            });
+            source_order.push((
+                Some(include.source_start),
+                WitWorldItemOrder::include(
+                    u32::try_from(includes.len() - 1)
+                        .map_err(|_| WitModelError::TooManyDefinitions)?,
+                ),
+            ));
+        }
+        source_order.sort_by_key(|(start, order)| {
+            (
+                start.unwrap_or(u32::MAX),
+                match order.direction {
+                    crate::WitWorldItemDirection::Import => 0_u8,
+                    crate::WitWorldItemDirection::Export => 1_u8,
+                    crate::WitWorldItemDirection::Include => 2_u8,
+                },
+                order.index,
+            )
+        });
+        let source_order = source_order.into_iter().map(|(_, order)| order).collect();
         worlds.push(WitWorld {
             name: name.clone(),
             docs: docs(&world.docs.contents),
-            imports,
-            exports,
+            since,
+            deprecated,
+            imports: imports.into_iter().map(|(item, _)| item).collect(),
+            exports: exports.into_iter().map(|(item, _)| item).collect(),
+            includes,
+            source_order,
             unsupported,
             span: source_span(world.span, &unit, source_mappings),
         });
@@ -750,6 +1009,10 @@ fn type_reference(
         .name
         .as_deref()
         .ok_or(WitModelError::MissingItem)?;
+    let interface_name = parser_interface
+        .name
+        .as_deref()
+        .ok_or(WitModelError::MissingInterface)?;
     let item = parser_interface
         .types
         .keys()
@@ -759,8 +1022,10 @@ fn type_reference(
         interface: WitIfaceRef {
             unit: unit.clone(),
             interface,
+            name: interface_name.to_owned(),
         },
         item: item_index(item)?,
+        item_name: name.to_owned(),
     })
 }
 
@@ -773,18 +1038,22 @@ fn build_type_references(
         let Some(unit) = package_units.get(&package_id).cloned() else {
             continue;
         };
-        for (interface_position, interface_id) in package.interfaces.values().copied().enumerate() {
+        for (interface_position, (interface_name, interface_id)) in
+            package.interfaces.iter().enumerate()
+        {
             let interface_index = interface_index(interface_position)?;
-            let interface = &resolve.interfaces[interface_id];
-            for (item_position, type_id) in interface.types.values().copied().enumerate() {
-                let definition = &resolve.types[type_id];
-                if definition.owner == TypeOwner::Interface(interface_id) {
-                    references.entry(type_id).or_insert(WitTypeRef {
+            let interface = &resolve.interfaces[*interface_id];
+            for (item_position, (item_name, type_id)) in interface.types.iter().enumerate() {
+                let definition = &resolve.types[*type_id];
+                if definition.owner == TypeOwner::Interface(*interface_id) {
+                    references.entry(*type_id).or_insert(WitTypeRef {
                         interface: WitIfaceRef {
                             unit: unit.clone(),
                             interface: interface_index,
+                            name: interface_name.clone(),
                         },
                         item: item_index(item_position)?,
+                        item_name: item_name.clone(),
                     });
                 }
             }
@@ -1063,6 +1332,13 @@ fn resource_member_name(function: &Function) -> Result<(WitMemberKind, String), 
     Ok((kind, name.to_owned()))
 }
 
+fn world_item_name(item: &WitWorldItem) -> &str {
+    match item {
+        WitWorldItem::Interface { reference, .. } => &reference.name,
+        WitWorldItem::Func { name, .. } => name,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn world_items(
     items: &wit_parser::IndexMap<WorldKey, WorldItem>,
@@ -1074,22 +1350,30 @@ fn world_items(
     unsupported_types: &HashMap<TypeId, Option<Unsupported>>,
     named_result_function_spans: &HashSet<(u32, u32)>,
     unsupported: &mut Option<Unsupported>,
-) -> Result<Vec<WitWorldItem>, WitModelError> {
+) -> Result<Vec<(WitWorldItem, Option<u32>)>, WitModelError> {
     let mut result = Vec::with_capacity(items.len());
     for (key, item) in items {
         match item {
-            WorldItem::Interface { id, .. } => {
+            WorldItem::Interface {
+                id,
+                stability: item_stability,
+                ..
+            } => {
                 let interface = &resolve.interfaces[*id];
                 if interface.name.is_none() {
                     *unsupported =
                         first_unsupported(*unsupported, Some(Unsupported::InlineInterface));
                     continue;
                 }
-                result.push(WitWorldItem::Interface(interface_reference(
-                    resolve,
-                    *id,
-                    package_units,
-                )?));
+                let (since, deprecated) = stability(item_stability)?;
+                result.push((
+                    WitWorldItem::Interface {
+                        reference: interface_reference(resolve, *id, package_units)?,
+                        since,
+                        deprecated,
+                    },
+                    span_start(item.span()),
+                ));
             }
             WorldItem::Function(function) => {
                 let name = match key {
@@ -1100,6 +1384,7 @@ fn world_items(
                         continue;
                     }
                 };
+                let source_start = span_start(function.span);
                 let (function, found) = function_model(
                     function,
                     resolve,
@@ -1109,11 +1394,16 @@ fn world_items(
                     unsupported_types,
                     named_result_function_spans,
                 )?;
-                result.push(WitWorldItem::Func {
-                    name,
-                    func: function,
-                    unsupported: found,
-                });
+                result.push((
+                    WitWorldItem::Func {
+                        name,
+                        func: function,
+                        unsupported: found,
+                        since: stability(&item.stability(resolve))?.0,
+                        deprecated: stability(&item.stability(resolve))?.1,
+                    },
+                    source_start,
+                ));
             }
             WorldItem::Type { .. } => {
                 *unsupported = first_unsupported(*unsupported, Some(Unsupported::WorldType));
@@ -1148,22 +1438,80 @@ fn interface_reference(
     Ok(WitIfaceRef {
         unit,
         interface: interface_index(raw_interface_index)?,
+        name: parser_interface
+            .name
+            .clone()
+            .ok_or(WitModelError::MissingInterface)?,
     })
 }
 
-fn deprecated(stability: &Stability) -> Result<Option<Version>, WitModelError> {
-    let version = match stability {
-        Stability::Unknown => None,
-        Stability::Unstable { deprecated, .. } | Stability::Stable { deprecated, .. } => {
-            deprecated.as_ref()
-        }
+fn world_reference(
+    resolve: &Resolve,
+    world_id: WorldId,
+    package_units: &HashMap<ParserPackageId, WitUnit>,
+) -> Result<WitWorldRef, WitModelError> {
+    let parser_world = &resolve.worlds[world_id];
+    let package_id = parser_world.package.ok_or(WitModelError::MissingWorld)?;
+    let unit = package_units
+        .get(&package_id)
+        .ok_or(WitModelError::MissingWorld)?
+        .clone();
+    let raw_world_index = resolve.packages[package_id]
+        .worlds
+        .values()
+        .position(|candidate| *candidate == world_id)
+        .ok_or(WitModelError::MissingWorld)?;
+    Ok(WitWorldRef {
+        unit,
+        world: world_index(raw_world_index)?,
+        name: parser_world.name.clone(),
+        names: Vec::new(),
+        since: None,
+        deprecated: None,
+    })
+}
+
+fn world_reference_named(
+    resolve: &Resolve,
+    package_units: &HashMap<ParserPackageId, WitUnit>,
+    package_name: &str,
+    world_name: &str,
+) -> Result<WitWorldRef, WitModelError> {
+    let (package_id, _) = package_units
+        .iter()
+        .find(|(_, unit)| unit.canonical_name() == package_name)
+        .ok_or(WitModelError::MissingWorld)?;
+    let world_id = resolve.packages[*package_id]
+        .worlds
+        .get(world_name)
+        .copied()
+        .ok_or(WitModelError::MissingWorld)?;
+    world_reference(resolve, world_id, package_units)
+}
+
+fn span_start(span: Span) -> Option<u32> {
+    span.is_known().then(|| span.start())
+}
+
+fn stability(
+    stability: &Stability,
+) -> Result<(Option<WitStabilityVersion>, Option<WitStabilityVersion>), WitModelError> {
+    let (since, deprecated) = match stability {
+        Stability::Unknown => (None, None),
+        Stability::Unstable { deprecated, .. } => (None, deprecated.as_ref()),
+        Stability::Stable { since, deprecated } => (Some(since), deprecated.as_ref()),
     };
-    version
-        .map(|version| {
-            Version::parse(&version.to_string())
-                .map_err(|_| WitModelError::InvalidVersion(version.to_string()))
-        })
-        .transpose()
+    fn convert<T: ToString>(
+        version: Option<&T>,
+    ) -> Result<Option<WitStabilityVersion>, WitModelError> {
+        version
+            .map(|version| {
+                WitStabilityVersion::parse(&version.to_string())
+                    .map_err(|_| WitModelError::InvalidVersion(version.to_string()))
+            })
+            .transpose()
+    }
+    Ok((convert(since)?, convert(deprecated)?))
 }
 
 fn source_span(
@@ -1210,6 +1558,12 @@ fn item_index(index: usize) -> Result<WitItemIdx, WitModelError> {
         .map_err(|_| WitModelError::TooManyDefinitions)
 }
 
+fn world_index(index: usize) -> Result<WitWorldIdx, WitModelError> {
+    u32::try_from(index)
+        .map(WitWorldIdx::from_raw)
+        .map_err(|_| WitModelError::TooManyDefinitions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1217,7 +1571,8 @@ mod tests {
     };
     use crate::{
         Unsupported, WitIfaceIdx, WitItemIdx, WitItemKind, WitSourceFile, WitSourceLocation,
-        WitType, WitUnit, WitWorldIdx, WitWorldItem, parse_source_files,
+        WitStabilityVersion, WitType, WitUnit, WitWorldIdx, WitWorldItem, WitWorldItemDirection,
+        parse_source_files, print_wit,
     };
     use sai_intern::PackageInterner;
     use sai_package::{mvs::MvsPackageVersion, version::Version};
@@ -1319,7 +1674,7 @@ mod tests {
         assert_eq!(package.worlds.len(), 1);
         assert!(matches!(
             package.worlds[WitWorldIdx::from_raw(0)].imports[0],
-            WitWorldItem::Interface(_)
+            WitWorldItem::Interface { .. }
         ));
         assert_eq!(
             package.worlds[WitWorldIdx::from_raw(0)]
@@ -1328,6 +1683,191 @@ mod tests {
                 .map(|span| span.path.as_str()),
             Some("z-world.wit")
         );
+    }
+
+    #[test]
+    fn preserves_interleaved_world_import_export_order() {
+        let parsed = parse_source_files(
+            dir_unit(),
+            [WitSourceFile::new(
+                "world-order.wit",
+                "package acme:graphics@1.2.3;\nworld app { import first: func(); export middle: func(); import last: func(); }",
+            )],
+        )
+        .expect("valid WIT parses");
+        let mut context = WitResolveContext::default();
+        let mut resolve = Resolve::default();
+        let package = context
+            .push_package(&mut resolve, parsed)
+            .expect("self-contained package resolves");
+        let world = package
+            .worlds
+            .iter()
+            .find(|world| world.name == "app")
+            .expect("app world is retained");
+
+        assert_eq!(
+            world
+                .source_order
+                .iter()
+                .map(|entry| entry.direction)
+                .collect::<Vec<_>>(),
+            [
+                WitWorldItemDirection::Import,
+                WitWorldItemDirection::Export,
+                WitWorldItemDirection::Import,
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_world_includes_and_stability_annotations() {
+        let parsed = parse_source_files(
+            dir_unit(),
+            [WitSourceFile::new(
+                "world-includes.wit",
+                "package acme:graphics@1.2.3;\n\
+                 @since(version = 0.1.0+build.7)\n\
+                 interface api {\n\
+                   @since(version = 1.0.0-18446744073709551616+build.7)\n\
+                   call: func();\n\
+                 }\n\
+                 world base { import inherited: func(); }\n\
+                 @since(version = 0.1.0)\n\
+                 @deprecated(version = 1.1.0)\n\
+                 world app {\n\
+                   @since(version = 0.2.0)\n\
+                   import before: func();\n\
+                   @since(version = 0.3.0)\n\
+                   @deprecated(version = 1.0.0)\n\
+                   include base with { inherited as renamed }\n\
+                   @since(version = 0.4.0)\n\
+                   export api;\n\
+                   @since(version = 0.5.0)\n\
+                   import after: func();\n\
+                 }",
+            )],
+        )
+        .expect("valid WIT parses");
+        let mut context = WitResolveContext::default();
+        let mut resolve = Resolve::default();
+        let package = context
+            .push_package(&mut resolve, parsed)
+            .expect("self-contained package resolves");
+
+        let version = |value| WitStabilityVersion::parse(value).expect("valid test version");
+        let api = package
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "api")
+            .expect("api interface is retained");
+        assert_eq!(api.since, Some(version("0.1.0+build.7")));
+        assert_eq!(
+            api.items[WitItemIdx::from_raw(0)].since,
+            Some(version("1.0.0-18446744073709551616+build.7"))
+        );
+
+        let world = package
+            .worlds
+            .iter()
+            .find(|world| world.name == "app")
+            .expect("app world is retained");
+        assert_eq!(world.since, Some(version("0.1.0")));
+        assert_eq!(world.deprecated, Some(version("1.1.0")));
+        assert_eq!(world.includes.len(), 1);
+        assert_eq!(world.includes[0].name, "base");
+        assert_eq!(
+            world.includes[0].names,
+            [("inherited".to_owned(), "renamed".to_owned())]
+        );
+        assert_eq!(world.includes[0].since, Some(version("0.3.0")));
+        assert_eq!(world.includes[0].deprecated, Some(version("1.0.0")));
+        assert_eq!(
+            world
+                .source_order
+                .iter()
+                .map(|entry| entry.direction)
+                .collect::<Vec<_>>(),
+            [
+                WitWorldItemDirection::Import,
+                WitWorldItemDirection::Include,
+                WitWorldItemDirection::Export,
+                WitWorldItemDirection::Import,
+            ]
+        );
+
+        let imported_functions = world
+            .imports
+            .iter()
+            .filter_map(|item| match item {
+                WitWorldItem::Func {
+                    name,
+                    since,
+                    deprecated,
+                    ..
+                } => Some((name.as_str(), since.as_ref(), deprecated.as_ref())),
+                WitWorldItem::Interface { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            imported_functions
+                .iter()
+                .any(|(name, since, _)| *name == "renamed" && since.is_none())
+        );
+        assert!(
+            imported_functions
+                .iter()
+                .any(|(name, since, _)| { *name == "before" && *since == Some(&version("0.2.0")) })
+        );
+        assert!(
+            imported_functions
+                .iter()
+                .any(|(name, since, _)| { *name == "after" && *since == Some(&version("0.5.0")) })
+        );
+
+        assert!(world.exports.iter().any(|item| matches!(
+            item,
+            WitWorldItem::Interface {
+                reference,
+                since: Some(since),
+                ..
+            } if reference.unit == package.unit
+                && reference.name == "api"
+                && since == &version("0.4.0")
+        )));
+    }
+
+    #[test]
+    fn omits_unstable_includes_before_printing_the_resolved_model() {
+        let source = "\
+package acme:graphics@1.2.3;
+world base { import hidden: func(); }
+world app {
+    @unstable(feature = hidden-api)
+    @deprecated(version = 1.0.0)
+    include base;
+}
+";
+        let parsed = parse_source_files(
+            dir_unit(),
+            [WitSourceFile::new("unstable-include.wit", source)],
+        )
+        .expect("valid WIT parses");
+        let mut context = WitResolveContext::default();
+        let mut resolve = Resolve::default();
+        let package = context
+            .push_package(&mut resolve, parsed)
+            .expect("unstable include is filtered by the resolver");
+        let app = package
+            .worlds
+            .iter()
+            .find(|world| world.name == "app")
+            .expect("stable app world is retained");
+
+        assert!(app.includes.is_empty());
+        assert!(app.imports.is_empty());
+        assert!(app.source_order.is_empty());
+        assert!(!print_wit(&package).contains("include base"));
     }
 
     #[test]
@@ -1364,8 +1904,10 @@ mod tests {
                 interface: crate::WitIfaceRef {
                     unit: package.unit.clone(),
                     interface: crate::WitIfaceIdx::from_raw(0),
+                    name: "drawing".to_owned(),
                 },
                 item: crate::WitItemIdx::from_raw(0),
+                item_name: "canvas".to_owned(),
             }))
         );
         assert_eq!(
@@ -1548,6 +2090,47 @@ mod tests {
     }
 
     #[test]
+    fn direct_push_resolves_external_world_includes_to_an_existing_dependency() {
+        let dependency_unit = dir_unit_for("acme:dependency", "acme:dependency#1", "1.4.12");
+        let dependency_source = "\
+package acme:dependency@1.4.12;
+world %interface { import dependency-fn: func(); }
+";
+        let root_unit = dir_unit_for("acme:root", "acme:root#1", "1.0.0");
+        let root_source = "\
+package acme:root@1.0.0;
+world app { include acme:dependency/%interface@1.4.12; }
+";
+        let mut context = WitResolveContext::default();
+        let mut resolve = Resolve::default();
+
+        let dependency = parse_source_files(
+            dependency_unit.clone(),
+            [WitSourceFile::new("dependency.wit", dependency_source)],
+        )
+        .expect("dependency WIT parses");
+        context
+            .push_package(&mut resolve, dependency)
+            .expect("dependency is pushed first");
+
+        let root = parse_source_files(root_unit, [WitSourceFile::new("root.wit", root_source)])
+            .expect("root WIT parses");
+        let package = context
+            .push_package(&mut resolve, root)
+            .expect("an existing Resolve dependency resolves the external include");
+        let world = package
+            .worlds
+            .iter()
+            .find(|world| world.name == "app")
+            .expect("app world is retained");
+
+        assert_eq!(world.includes.len(), 1);
+        assert_eq!(world.includes[0].unit, dependency_unit);
+        assert_eq!(world.includes[0].name, "interface");
+        assert_eq!(world.includes[0].world.raw(), 0);
+    }
+
+    #[test]
     fn retains_named_results_as_unsupported_on_functions_members_and_world_items() {
         let source = "package acme:graphics@1.2.3;\ninterface drawing { result-values: func() -> (left: u32, right: string); map-before-results: func(value: map<string, u32>) -> (left: u32, right: string); async-before-map: async func(value: map<string, u32>); single: func() -> (answer: bool); ordinary: func() -> tuple<u32, string>; resource canvas { convert: func() -> (left: u32, right: string); make: static func() -> (%func: u32, handle: string); } } world app { import required: func() -> (value: u32, error: string); }";
         let parsed = parse_source_files(
@@ -1630,6 +2213,7 @@ mod tests {
                 name,
                 func,
                 unsupported: Some(Unsupported::NamedResults),
+                ..
             } if name == "required" && func.result.is_none()
         ));
     }

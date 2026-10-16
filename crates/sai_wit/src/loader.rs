@@ -508,6 +508,53 @@ mod tests {
     }
 
     #[test]
+    fn resolves_external_world_includes_to_the_exact_selected_unit() {
+        let packages = PackageInterner::new();
+        let (root, root_version) = package_unit("acme:root", "1.0.0", &packages);
+        let (dependency, dependency_version) = package_unit("acme:dependency", "1.4.12", &packages);
+        let graph = WitPackageGraph::new(
+            root.clone(),
+            [
+                WitPackageNode::new(root.clone(), root_version).expect("root node"),
+                WitPackageNode::new(dependency.clone(), dependency_version.clone())
+                    .expect("dependency node"),
+            ],
+            [WitPackageEdge::new(
+                root.clone(),
+                "acme:dependency",
+                dependency_version,
+                Some(dependency.clone()),
+            )],
+        )
+        .expect("valid package graph");
+
+        for target in ["acme:dependency/base@1.2.0", "acme:dependency/base"] {
+            let loaded = load_wit_package_closure(root.clone(), &graph, |unit| {
+                let source = if unit == &root {
+                    format!("package acme:root@1.0.0;\nworld app {{\n  include {target};\n}}")
+                } else {
+                    "package acme:dependency@1.4.12;\nworld base { import inherited: func(); }"
+                        .to_owned()
+                };
+                Ok::<_, &'static str>(vec![WitSourceFile::new("package.wit", source.into_bytes())])
+            })
+            .expect("versionless and compatible references resolve");
+            let world = loaded
+                .root()
+                .worlds
+                .iter()
+                .find(|world| world.name == "app")
+                .expect("app world is retained");
+            assert_eq!(world.includes.len(), 1);
+            assert_eq!(
+                world.includes[0].unit.canonical_name(),
+                "acme:dependency@1.4.12"
+            );
+            assert_eq!(world.includes[0].name, "base");
+        }
+    }
+
+    #[test]
     fn attributes_source_failures_to_the_unit_whose_inputs_failed() {
         let packages = PackageInterner::new();
         let (root, root_version) = package_unit("acme:root", "1.2.3", &packages);

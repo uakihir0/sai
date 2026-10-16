@@ -14,6 +14,8 @@ pub(super) struct SourceScan {
 pub(super) struct ForeignReference {
     pub identity: String,
     pub version: Option<String>,
+    /// The semantic WIT item name with any `%` escape removed.
+    pub item: String,
     pub range: Range<usize>,
     pub version_range: Option<Range<usize>>,
     pub item_range: Range<usize>,
@@ -301,7 +303,7 @@ fn parse_foreign_reference(
     let range_start = namespace.range.start;
     let namespace = wit_identifier_text(source, namespace)?;
     let package = wit_identifier_text(source, package)?;
-    wit_identifier_text(source, interface)?;
+    let item = wit_identifier_text(source, interface)?.to_owned();
 
     let (range_end, version, version_range) = match tokens.get(start_index + 5) {
         Some(token) if token.kind == TokenKind::Punctuation(b'@') => {
@@ -319,6 +321,7 @@ fn parse_foreign_reference(
     Some(ForeignReference {
         identity: format!("{namespace}:{package}"),
         version,
+        item,
         range: range_start..range_end,
         version_range,
         item_range: interface.range.clone(),
@@ -632,7 +635,7 @@ fn is_wit_identifier(source: &str, token: &Token) -> bool {
     (explicit || !is_wit_keyword(identifier)) && wit_parser::validate_id(identifier).is_ok()
 }
 
-fn is_wit_keyword(identifier: &str) -> bool {
+pub(super) fn is_wit_keyword(identifier: &str) -> bool {
     matches!(
         identifier,
         "use"
@@ -1015,7 +1018,7 @@ interface shapes {
     fn scans_foreign_references_in_use_include_import_and_export_forms() {
         let source = r#"
 package root:app@1.0.0;
-use acme:types/model@1.2.3.{Thing};
+use acme:types/%model@1.2.3.{Thing};
 world app {
     include acme:worlds/base@2.0.0;
     import wasi:cli/stdout@0.2.3;
@@ -1027,11 +1030,12 @@ world app {
         assert_eq!(references.len(), 4);
         assert_eq!(references[0].identity, "acme:types");
         assert_eq!(references[0].version.as_deref(), Some("1.2.3"));
+        assert_eq!(references[0].item, "model");
         assert_eq!(
             &source[references[0].range.clone()],
-            "acme:types/model@1.2.3"
+            "acme:types/%model@1.2.3"
         );
-        assert_eq!(&source[references[0].item_range.clone()], "model");
+        assert_eq!(&source[references[0].item_range.clone()], "%model");
         assert_eq!(references[1].identity, "acme:worlds");
         assert_eq!(references[1].version.as_deref(), Some("2.0.0"));
         assert_eq!(

@@ -3190,6 +3190,7 @@ dependencies = [
  "sai_intern",
  "sai_package",
  "sai_stable_hash",
+ "semver",
  "unicode-ident",
  "wit-parser",
 ]

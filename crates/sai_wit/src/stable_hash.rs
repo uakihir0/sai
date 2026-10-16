@@ -4,6 +4,7 @@ use crate::{
     Unsupported, WitCase, WitField, WitFunc, WitIfaceIdx, WitIfaceRef, WitIndex, WitIndexVec,
     WitInterface, WitItem, WitItemIdx, WitItemKind, WitMember, WitMemberKind, WitPackage,
     WitPackageName, WitSpan, WitType, WitTypeRef, WitWorld, WitWorldIdx, WitWorldItem,
+    WitWorldItemDirection, WitWorldItemOrder, WitWorldRef,
 };
 use sai_stable_hash::{StableHash, StableHasher};
 
@@ -18,7 +19,7 @@ macro_rules! stable_struct {
     };
 }
 
-fn stable_version(version: &Option<sai_package::version::Version>, hasher: &mut StableHasher) {
+fn stable_version<T: ToString>(version: &Option<T>, hasher: &mut StableHasher) {
     version
         .as_ref()
         .map(ToString::to_string)
@@ -81,6 +82,7 @@ impl StableHash for WitInterface {
         hasher.write_tag(0xC2);
         self.name.stable_hash(hasher);
         self.docs.stable_hash(hasher);
+        stable_version(&self.since, hasher);
         stable_version(&self.deprecated, hasher);
         self.items.stable_hash(hasher);
         self.span.stable_hash(hasher);
@@ -92,6 +94,7 @@ impl StableHash for WitItem {
         hasher.write_tag(0xC3);
         self.name.stable_hash(hasher);
         self.docs.stable_hash(hasher);
+        stable_version(&self.since, hasher);
         stable_version(&self.deprecated, hasher);
         self.kind.stable_hash(hasher);
         self.unsupported.stable_hash(hasher);
@@ -149,6 +152,7 @@ impl StableHash for WitMember {
         self.kind.stable_hash(hasher);
         self.func.stable_hash(hasher);
         self.docs.stable_hash(hasher);
+        stable_version(&self.since, hasher);
         stable_version(&self.deprecated, hasher);
         self.unsupported.stable_hash(hasher);
     }
@@ -229,16 +233,55 @@ impl StableHash for WitType {
     }
 }
 
-stable_struct!(WitTypeRef, 0xCB, interface, item);
-stable_struct!(WitIfaceRef, 0xCC, unit, interface);
+stable_struct!(WitTypeRef, 0xCB, interface, item, item_name);
+stable_struct!(WitIfaceRef, 0xCC, unit, interface, name);
+
+impl StableHash for WitWorldItemDirection {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD0);
+        hasher.write_tag(match self {
+            Self::Import => 0x01,
+            Self::Export => 0x02,
+            Self::Include => 0x03,
+        });
+    }
+}
+
+impl StableHash for WitWorldItemOrder {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD1);
+        self.direction.stable_hash(hasher);
+        self.index.stable_hash(hasher);
+    }
+}
+
+impl StableHash for WitWorldRef {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD2);
+        self.unit.stable_hash(hasher);
+        self.world.stable_hash(hasher);
+        self.name.stable_hash(hasher);
+        hasher.write_len(u64::try_from(self.names.len()).unwrap_or(u64::MAX));
+        for (name, alias) in &self.names {
+            name.stable_hash(hasher);
+            alias.stable_hash(hasher);
+        }
+        stable_version(&self.since, hasher);
+        stable_version(&self.deprecated, hasher);
+    }
+}
 
 impl StableHash for WitWorld {
     fn stable_hash(&self, hasher: &mut StableHasher) {
         hasher.write_tag(0xCD);
         self.name.stable_hash(hasher);
         self.docs.stable_hash(hasher);
+        stable_version(&self.since, hasher);
+        stable_version(&self.deprecated, hasher);
         self.imports.stable_hash(hasher);
         self.exports.stable_hash(hasher);
+        self.includes.stable_hash(hasher);
+        self.source_order.stable_hash(hasher);
         self.unsupported.stable_hash(hasher);
         self.span.stable_hash(hasher);
     }
@@ -248,19 +291,29 @@ impl StableHash for WitWorldItem {
     fn stable_hash(&self, hasher: &mut StableHasher) {
         hasher.write_tag(0xCE);
         match self {
-            Self::Interface(reference) => {
+            Self::Interface {
+                reference,
+                since,
+                deprecated,
+            } => {
                 hasher.write_tag(0x01);
                 reference.stable_hash(hasher);
+                stable_version(since, hasher);
+                stable_version(deprecated, hasher);
             }
             Self::Func {
                 name,
                 func,
                 unsupported,
+                since,
+                deprecated,
             } => {
                 hasher.write_tag(0x02);
                 name.stable_hash(hasher);
                 func.stable_hash(hasher);
                 unsupported.stable_hash(hasher);
+                stable_version(since, hasher);
+                stable_version(deprecated, hasher);
             }
         }
     }

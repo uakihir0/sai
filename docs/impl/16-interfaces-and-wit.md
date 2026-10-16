@@ -213,7 +213,7 @@ The VFS currently stores this listing as sorted package-relative paths under a v
 3. **One package.** The files MUST declare exactly one WIT package (package/01 §1.6.3 item 2). A second package declaration, including a nested `package … { }` block, is `WIT_PARSE_ERROR` at that declaration.
 4. **Name and version.** The package name `namespace:name` MUST equal the identity of `P`, and its version MUST equal the version of `P`. A difference, including a missing version, is `WIT_PACKAGE_MISMATCH` (package/01 §1.6.3 item 3), at the package declaration. The unit still loads, under the name and version of `P`.
 5. **Resolution.** Foreign references are resolved by §16.2.3. The package is then pushed into a `wit_parser::Resolve` that already contains the units of its closure (§16.2.4). A validation error of `wit-parser`, such as an unknown type, a duplicate name or an invalid `use`, is `WIT_PARSE_ERROR` at the reported location when the API supplies a structured source location. In the pinned `wit-parser` 0.246.0, `Resolve::push` returns private `anyhow` error types whose spans are not exposed; those semantic validation errors retain their message but currently have no primary source range. Do not recover a range by parsing the rendered error text.
-6. **Features.** The `Resolve` is created with no features enabled, so `wit-parser` removes every item gated by `@unstable` (spec/13 §13.7.3, N-D-34). `@since` is ignored, and `@deprecated` is recorded in the model.
+6. **Features.** The `Resolve` is created with no features enabled, so `wit-parser` removes every item gated by `@unstable` (spec/13 §13.7.3, N-D-34). `@since` is ignored by semantic checks but retained with `@deprecated` so the canonical printer can preserve the original stability annotations.
 
 The pinned `wit-parser` release does not parse named function results. Before parsing, a WIT-aware lexical pass skips comments and strings, rewrites `-> (name: type)` to the single result type, and rewrites `-> (name: type, name: type, …)` to an equivalent `tuple<type, type, …>`. Only the latter is recorded as `NamedResults` and modeled with `result: None`, matching spec/13 §13.9.2. Duplicate labels, invalid identifiers, unexpected characters and non-ASCII whitespace are left intact for `wit-parser` to reject. The pass retains a byte-boundary map from rewritten parser text to original text; parser errors and model spans therefore still point to original files and byte ranges. Result type syntax and references remain visible to `wit-parser` validation.
 
@@ -308,17 +308,20 @@ pub struct WitPackage {
     pub worlds: WitIndexVec<WitWorldIdx, WitWorld>,
 }
 pub struct WitPackageName { pub namespace: String, pub name: String, pub version: Option<Version> }
+pub struct WitStabilityVersion;              // complete SemVer text, including unbounded prerelease and build metadata
 pub struct WitInterface {
     pub name: String,                        // the WIT name (kebab case)
     pub docs: Option<Arc<str>>,
-    pub deprecated: Option<Version>,
+    pub since: Option<WitStabilityVersion>,
+    pub deprecated: Option<WitStabilityVersion>,
     pub items: WitIndexVec<WitItemIdx, WitItem>,
     pub span: Option<WitSpan>,               // None in embedded and generated units
 }
 pub struct WitItem {
     pub name: String,
     pub docs: Option<Arc<str>>,
-    pub deprecated: Option<Version>,
+    pub since: Option<WitStabilityVersion>,
+    pub deprecated: Option<WitStabilityVersion>,
     pub kind: WitItemKind,
     pub unsupported: Option<Unsupported>,    // §16.3.3
     pub span: Option<WitSpan>,
@@ -333,7 +336,7 @@ pub enum WitItemKind {
     Used(WitTypeRef),                        // `use other.{t}` or `use other.{t as u}`
     Func(WitFunc),
 }
-pub struct WitMember { pub name: String, pub kind: WitMemberKind, pub func: WitFunc, pub docs: Option<Arc<str>>, pub deprecated: Option<Version>, pub unsupported: Option<Unsupported> }
+pub struct WitMember { pub name: String, pub kind: WitMemberKind, pub func: WitFunc, pub docs: Option<Arc<str>>, pub since: Option<WitStabilityVersion>, pub deprecated: Option<WitStabilityVersion>, pub unsupported: Option<Unsupported> }
 pub enum WitMemberKind { Constructor, Method, Static }
 pub struct WitFunc { pub params: Vec<(String, WitType)>, pub result: Option<WitType>, pub is_async: bool }
 pub enum WitType {
@@ -347,23 +350,40 @@ pub enum WitType {
     Future(Option<Box<WitType>>), Stream(Option<Box<WitType>>),
     Unsupported(Unsupported),                 // error-context, fixed list, map
 }
-pub struct WitTypeRef { pub interface: WitIfaceRef, pub item: WitItemIdx }
-pub struct WitIfaceRef { pub unit: WitUnit, pub interface: WitIfaceIdx }
+pub struct WitTypeRef { pub interface: WitIfaceRef, pub item: WitItemIdx, pub item_name: String }
+pub struct WitIfaceRef { pub unit: WitUnit, pub interface: WitIfaceIdx, pub name: String }
 pub struct WitWorld {
     pub name: String,
     pub docs: Option<Arc<str>>,
+    pub since: Option<WitStabilityVersion>,
+    pub deprecated: Option<WitStabilityVersion>,
     pub imports: Vec<WitWorldItem>,           // as elaborated by `wit-parser`, in its order
     pub exports: Vec<WitWorldItem>,
+    pub includes: Vec<WitWorldRef>,
+    pub source_order: Vec<WitWorldItemOrder>, // import/export/include entries in source or generation order
     pub unsupported: Option<Unsupported>,
     pub span: Option<WitSpan>,
 }
-pub enum WitWorldItem { Interface(WitIfaceRef), Func { name: String, func: WitFunc, unsupported: Option<Unsupported> } }
+pub enum WitWorldItem {
+    Interface { reference: WitIfaceRef, since: Option<WitStabilityVersion>, deprecated: Option<WitStabilityVersion> },
+    Func { name: String, func: WitFunc, unsupported: Option<Unsupported>, since: Option<WitStabilityVersion>, deprecated: Option<WitStabilityVersion> },
+}
+pub struct WitWorldRef {
+    pub unit: WitUnit,
+    pub world: WitWorldIdx,
+    pub name: String,
+    pub names: Vec<(String, String)>,        // names renamed by `include ... with`
+    pub since: Option<WitStabilityVersion>,
+    pub deprecated: Option<WitStabilityVersion>,
+}
+pub enum WitWorldItemDirection { Import, Export, Include }
+pub struct WitWorldItemOrder { pub direction: WitWorldItemDirection, pub index: u32 }
 pub enum Unsupported { ErrorContext, FixedList, Map, NamedResults, Async, Future, Stream, WorldType, InlineInterface }
 ```
 
-A `WitIndexVec<I, T>` keeps its backing vector private, creates an `I` only when appending, and uses checked 32-bit indices. Its local sealed index trait prevents interface, world and item indices from being mixed; the `sai_intern::Idx` trait cannot be implemented outside its owning crate. Model strings are owned `String`s so query values do not retain parser storage or add a small-string dependency. Every model type has a manual stable-hash encoding with explicit type and variant tags; vector encodings include their index-domain tag, span endpoints use fixed-width integers, and package `Version`s use their canonical display form.
+A `WitIndexVec<I, T>` keeps its backing vector private, creates an `I` only when appending, and uses checked 32-bit indices. Its local sealed index trait prevents interface, world and item indices from being mixed; the `sai_intern::Idx` trait cannot be implemented outside its owning crate. Model strings are owned `String`s so query values do not retain parser storage or add a small-string dependency. Every model type has a manual stable-hash encoding with explicit type and variant tags; vector encodings include their index-domain tag, span endpoints use fixed-width integers, and package `Version`s use their canonical display form. `WitStabilityVersion` retains complete SemVer prerelease and build text, accepts unbounded numeric prerelease identifiers, and compares precedence without build metadata.
 
-A function with several named results gets `result: None` and `unsupported: Some(NamedResults)`, including resource members and world functions. A function with one named result keeps that result type and is supported. A type of another unit is referenced by `WitTypeRef`. The model of a unit therefore never copies a definition of another unit, and nominal identity follows the referenced unit (§16.4.1).
+A function with several named results gets `result: None` and `unsupported: Some(NamedResults)`, including resource members and world functions. A function with one named result keeps that result type and is supported. A type of another unit is referenced by `WitTypeRef`. `WitIfaceRef.name` and `WitTypeRef.item_name` retain the WIT spellings because the canonical printer receives one package model, not the complete closure. The model of a unit therefore never copies a definition of another unit, and nominal identity follows the referenced unit (§16.4.1).
 
 ### 16.3.2 Order
 
@@ -374,7 +394,7 @@ The **WIT order** of a unit is the order that `wit-parser` assigns when it is fe
 - the members of a resource in declaration order;
 - the imports and exports of a world in the order of the elaborated `World::imports` and `World::exports` of `wit-parser`.
 
-Generated units have the generation order of §16.10.1, because the printer writes them in that order.
+The `imports` and `exports` vectors retain that elaborated order. `source_order` points to the directly written items and includes in source order, excluding items inherited through include expansion. Includes and interface world items are captured before `Resolve::push`, because the pinned parser consumes include entries and can clear an interface reference's resolved span. Generated units have the generation order of §16.10.1, because the printer writes them in that order.
 
 ### 16.3.3 Unsupported constructs
 
@@ -400,7 +420,7 @@ An interface that appears in a world, an elaborated world or a component world i
 
 ### 16.3.4 The canonical printer
 
-`sai_wit::print_wit(&WitPackage) -> String` writes the text of a package by the rules of spec/13 §13.11.2, §13.11.3 and §13.11.4. It writes interfaces, worlds and items in model order. It is used only for generated units (§16.10.1), whose model is already in generation order. The text of a `Dir` unit is always the file as written. The printer has no options, and its output is a pure function of the model.
+`sai_wit::print_wit(&WitPackage) -> String` writes the text of a package by the rules of spec/13 §13.11.2, §13.11.3 and §13.11.4. It writes interfaces, worlds and items in model order. A world's `source_order` interleaves its import, export and include vectors. Cross-interface `use` statements are computed from item type references, grouped and sorted by the rendered path, with member names sorted byte-wise. It preserves retained `@since` and `@deprecated` annotations, and treats a deprecation without its source `since` version as a model invariant failure. It is used only for generated units (§16.10.1), whose model is already in generation order. The text of a `Dir` unit is always the file as written. The printer has no options, and its output is a pure function of the model. Generated models omit unsupported types before printing; because the model no longer contains enough information to reconstruct such a type, encountering one is an invariant failure.
 
 ---
 
@@ -563,6 +583,8 @@ pub struct InterfaceScope { pub members: BTreeMap<Symbol, Binding> }
 This field is filled in Phase 1 when the walk reaches an interface. Its members are the names of its type declarations, enum declarations, resources and function heads (spec/04 §4.8.1). A second item with the same name is `DUPLICATE_BINDING` on the later name.
 
 The interface is bound in its module as `Res::Def(DefKind::Interface, def)`. A `use` or a path that names it as a module alias gets `Res::Module(def)`. In the owners of the interface's items and resource members, an **interface rib** with `members` is pushed between the item's own ribs and the module scope. Names therefore resolve in the order members, module scope, prelude (spec/04 §4.8.1). Interface members are not members of the module, so `use self.T` naming an interface member is `UNRESOLVED_IMPORT`.
+
+**Foreign WIT views.** Phase 1 receives graph-validated `WitView`s separately from source package scopes. A `Dir` view resolves external interface paths directly by WIT name. A `Generated` view maps the WIT path back to its source interface through `origin_identity`, while member lookup and resulting definitions still use the generated view. For a name omitted from `Generated(Q)`, the source interface scope distinguishes a source member already diagnosed in `Q` (bind `Res::Err`, with no consumer diagnostic) from a genuinely unknown item. A generated view without origins does not require a source path interner; when origins exist, the retained interner must be from the source package that owns them. Non-regular `.wit` entries and unavailable view producers do not fabricate member scopes.
 
 ### 16.4.9 Printing a view
 
@@ -1129,7 +1151,7 @@ pub struct GeneratedWit {
    - Its items are included in source order.
    - Types come from `boundary_type` (§16.6.3), which uses the original resolutions, so a bound resource appears as `R`.
    - Resource members keep their roles.
-   - Documentation comments and `@deprecated` are carried over.
+   - Documentation comments and `@deprecated` are carried over. WIT `@since` and `@deprecated` versions are preserved when reading authored WIT. SAI `@deprecated` has no version or introduction history, so generated WIT records the selected package version for both `since` and `deprecated`, marking the item deprecated in that generated snapshot.
    - The `use` statements are derived from the references, one per referenced interface (spec/13 §13.11.3).
 3. **Worlds.** All local worlds are included after all interfaces, in generation order. Their items are taken as written, not elaborated (spec/13 §13.11.1). An `include` prints as `include`.
 4. **References.** References to WASI and to dependencies are written with the selected versions (spec/13 §13.11.4).

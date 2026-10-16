@@ -9,5 +9,6 @@ sai_hir = { path = "../sai_hir" }
 sai_intern = { path = "../sai_intern" }
 sai_package = { path = "../sai_package" }
 sai_stable_hash = { path = "../sai_stable_hash" }
+semver.workspace = true
 unicode-ident.workspace = true
 wit-parser = { version = "=0.246.0", default-features = false, features = ["std"] }

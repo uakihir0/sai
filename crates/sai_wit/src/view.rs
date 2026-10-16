@@ -1644,6 +1644,7 @@ mod tests {
             WitItem {
                 name: "user-profile".to_owned(),
                 docs: None,
+                since: None,
                 deprecated: None,
                 kind: WitItemKind::Record(vec![
                     WitField {
@@ -1663,6 +1664,7 @@ mod tests {
             WitItem {
                 name: "status".to_owned(),
                 docs: None,
+                since: None,
                 deprecated: None,
                 kind: WitItemKind::Variant(vec![
                     WitCase {
@@ -1682,6 +1684,7 @@ mod tests {
             WitItem {
                 name: "get-user".to_owned(),
                 docs: None,
+                since: None,
                 deprecated: None,
                 kind: WitItemKind::Func(crate::WitFunc {
                     params: Vec::new(),
@@ -1694,6 +1697,7 @@ mod tests {
             WitItem {
                 name: "resource".to_owned(),
                 docs: None,
+                since: None,
                 deprecated: None,
                 kind: WitItemKind::Resource(vec![
                     WitMember {
@@ -1705,6 +1709,7 @@ mod tests {
                             is_async: false,
                         },
                         docs: None,
+                        since: None,
                         deprecated: None,
                         unsupported: None,
                     },
@@ -1717,6 +1722,7 @@ mod tests {
                             is_async: false,
                         },
                         docs: None,
+                        since: None,
                         deprecated: None,
                         unsupported: None,
                     },
@@ -1729,6 +1735,7 @@ mod tests {
                             is_async: false,
                         },
                         docs: None,
+                        since: None,
                         deprecated: None,
                         unsupported: None,
                     },
@@ -1739,6 +1746,7 @@ mod tests {
             WitItem {
                 name: "permissions".to_owned(),
                 docs: None,
+                since: None,
                 deprecated: None,
                 kind: WitItemKind::Flags(vec!["read".to_owned(), "write".to_owned()]),
                 unsupported: None,
@@ -1757,6 +1765,7 @@ mod tests {
             WitInterface {
                 name: "files".to_owned(),
                 docs: None,
+                since: None,
                 deprecated: None,
                 items: item_vec,
                 span: None,
@@ -1764,6 +1773,7 @@ mod tests {
             WitInterface {
                 name: "metadata".to_owned(),
                 docs: None,
+                since: None,
                 deprecated: None,
                 items: WitIndexVec::new(),
                 span: None,
@@ -1772,6 +1782,7 @@ mod tests {
         if reverse {
             interfaces.reverse();
         }
+        let first_interface_name = interfaces[0].name.clone();
         let mut interface_vec = WitIndexVec::<WitIfaceIdx, _>::new();
         for interface in interfaces {
             interface_vec.push(interface).unwrap();
@@ -1781,6 +1792,8 @@ mod tests {
             WitWorld {
                 name: "client".to_owned(),
                 docs: None,
+                since: None,
+                deprecated: None,
                 imports: vec![
                     WitWorldItem::Func {
                         name: "connect".to_owned(),
@@ -1790,8 +1803,10 @@ mod tests {
                             is_async: false,
                         },
                         unsupported: None,
+                        since: None,
+                        deprecated: None,
                     },
-                    interface_ref(&unit, 0),
+                    interface_ref(&unit, 0, &first_interface_name),
                 ],
                 exports: vec![WitWorldItem::Func {
                     name: "shutdown".to_owned(),
@@ -1801,15 +1816,27 @@ mod tests {
                         is_async: false,
                     },
                     unsupported: None,
+                    since: None,
+                    deprecated: None,
                 }],
+                includes: Vec::new(),
+                source_order: vec![
+                    crate::WitWorldItemOrder::import(0),
+                    crate::WitWorldItemOrder::import(1),
+                    crate::WitWorldItemOrder::export(0),
+                ],
                 unsupported: None,
                 span: None,
             },
             WitWorld {
                 name: "server".to_owned(),
                 docs: None,
+                since: None,
+                deprecated: None,
                 imports: Vec::new(),
                 exports: Vec::new(),
+                includes: Vec::new(),
+                source_order: Vec::new(),
                 unsupported: None,
                 span: None,
             },
@@ -1834,11 +1861,16 @@ mod tests {
         }
     }
 
-    fn interface_ref(unit: &WitUnit, index: u32) -> WitWorldItem {
-        WitWorldItem::Interface(crate::WitIfaceRef {
-            unit: unit.clone(),
-            interface: crate::WitIfaceIdx::from_raw(index),
-        })
+    fn interface_ref(unit: &WitUnit, index: u32, name: &str) -> WitWorldItem {
+        WitWorldItem::Interface {
+            reference: crate::WitIfaceRef {
+                unit: unit.clone(),
+                interface: crate::WitIfaceIdx::from_raw(index),
+                name: name.to_owned(),
+            },
+            since: None,
+            deprecated: None,
+        }
     }
 
     fn built(reverse: bool, pad_interners: bool) -> WitView {
@@ -2094,6 +2126,7 @@ mod tests {
             .push(WitItem {
                 name: "type".to_owned(),
                 docs: None,
+                since: None,
                 deprecated: None,
                 kind: WitItemKind::Func(crate::WitFunc {
                     params: Vec::new(),
@@ -2457,6 +2490,8 @@ mod tests {
                 is_async: false,
             },
             unsupported: None,
+            since: None,
+            deprecated: None,
         };
         model.worlds[crate::WitWorldIdx::from_raw(0)]
             .imports

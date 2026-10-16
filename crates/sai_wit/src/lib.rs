@@ -7,6 +7,7 @@ mod dependency;
 mod generated;
 mod loader;
 mod model;
+mod printer;
 mod source_scan;
 mod stable_hash;
 mod stable_view_hash;
@@ -21,6 +22,7 @@ pub use dependency::*;
 pub use generated::*;
 pub use loader::*;
 pub use model::*;
+pub use printer::*;
 pub use view::*;
 pub use wasi::*;
 pub use wasi_loader::*;
@@ -296,10 +298,15 @@ pub struct WitForeignReference {
     pub identity: String,
     /// The optional SemVer text written after the interface or world name.
     pub version: Option<String>,
+    /// WIT interface or world name after the package slash.
+    pub item: String,
     /// Original source file and complete package-reference byte range.
     pub location: WitSourceLocation,
     version_range: Option<Range<usize>>,
     item_range: Range<usize>,
+    /// Exact package selected by the active graph after version compatibility
+    /// and missing-version resolution.
+    pub(crate) resolved_unit: Option<WitUnit>,
 }
 
 /// A parsed WIT package group whose foreign references have been checked
@@ -421,6 +428,44 @@ impl ParsedWitPackageGroup {
     /// Returns foreign package references in source-file and lexical order.
     pub fn foreign_references(&self) -> &[WitForeignReference] {
         &self.foreign_references
+    }
+
+    pub(crate) fn location_for_parser_span(
+        &self,
+        span: wit_parser::Span,
+    ) -> Option<WitSourceLocation> {
+        let start = span.start();
+        let end = span.end();
+        self.source_mappings
+            .iter()
+            .find(|source| {
+                start >= source.offset
+                    && end
+                        <= source
+                            .offset
+                            .saturating_add(u32::try_from(source.parser_len).unwrap_or(u32::MAX))
+            })
+            .and_then(|source| {
+                let start = usize::try_from(start.checked_sub(source.offset)?).ok()?;
+                let end = usize::try_from(end.checked_sub(source.offset)?).ok()?;
+                Some(WitSourceLocation {
+                    path: source.path.clone(),
+                    range: *source.parser_to_source.get(start)?
+                        ..*source.parser_to_source.get(end)?,
+                })
+            })
+    }
+
+    pub(crate) fn foreign_reference_for_parser_span(
+        &self,
+        span: wit_parser::Span,
+    ) -> Option<&WitForeignReference> {
+        let location = self.location_for_parser_span(span)?;
+        self.foreign_references.iter().find(|reference| {
+            reference.location.path == location.path
+                && reference.location.range.start <= location.range.start
+                && location.range.end <= reference.location.range.end
+        })
     }
 }
 
@@ -553,12 +598,14 @@ fn parse_source_texts(
                 .map(|reference| WitForeignReference {
                     identity: reference.identity,
                     version: reference.version,
+                    item: reference.item,
                     location: WitSourceLocation {
                         path: source.path.clone(),
                         range: reference.range,
                     },
                     version_range: reference.version_range,
                     item_range: reference.item_range,
+                    resolved_unit: None,
                 }),
         );
         named_result_function_spans.extend(scan.named_result_function_ranges.into_iter().map(
@@ -734,6 +781,7 @@ pub fn resolve_package_references(
         .map(|source| (source.path.as_str(), source))
         .collect::<HashMap<_, _>>();
     let mut rewrites = Vec::with_capacity(parsed.foreign_references.len());
+    let mut resolved_units = Vec::with_capacity(parsed.foreign_references.len());
     let mut direct_dependencies = Vec::new();
     let mut seen_dependencies = HashSet::new();
 
@@ -771,6 +819,7 @@ pub fn resolve_package_references(
                 kind: WitReferenceResolutionErrorKind::Reference(error),
                 location: Some(reference.location.clone()),
             })?;
+        resolved_units.push(target.unit().clone());
 
         let replacement_range;
         let replacement;
@@ -835,13 +884,23 @@ pub fn resolve_package_references(
         }
     }
 
-    let normalized = parse_source_texts(unit, parsed.source_texts, &rewrites).map_err(|error| {
-        let location = error.location().cloned();
-        WitReferenceResolutionError {
-            kind: WitReferenceResolutionErrorKind::Reparse(error),
-            location,
-        }
-    })?;
+    let mut normalized =
+        parse_source_texts(unit, parsed.source_texts, &rewrites).map_err(|error| {
+            let location = error.location().cloned();
+            WitReferenceResolutionError {
+                kind: WitReferenceResolutionErrorKind::Reparse(error),
+                location,
+            }
+        })?;
+    if normalized.foreign_references.len() != resolved_units.len() {
+        return Err(WitReferenceResolutionError {
+            kind: WitReferenceResolutionErrorKind::InvalidSourceRange,
+            location: None,
+        });
+    }
+    for (reference, resolved_unit) in normalized.foreign_references.iter_mut().zip(resolved_units) {
+        reference.resolved_unit = Some(resolved_unit);
+    }
 
     Ok(ResolvedWitPackageGroup {
         parsed: normalized,
