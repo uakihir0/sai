@@ -4457,6 +4457,14 @@ fn module_tree_workspace_check_diagnostics(
                         &member_scopes,
                     )
                     .map_err(|error| format!("trait/impl member analysis failed: {error:?}"))?;
+                let interface_resolutions = database
+                    .resolve_interface_test_only_paths_with_member_scopes(
+                        collection,
+                        module_tree,
+                        &workspace_snapshot,
+                        &member_scopes,
+                    )
+                    .map_err(|error| format!("interface member analysis failed: {error:?}"))?;
                 let mut owner_diagnostics = Vec::new();
                 for owner in resolutions.owners() {
                     match owner.module_path_diagnostics() {
@@ -4581,6 +4589,71 @@ fn module_tree_workspace_check_diagnostics(
                                     Some(&input.package_identity),
                                 ));
                                 errors = errors.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+                for owner in interface_resolutions.owners() {
+                    if let Some(error) = owner.error() {
+                        diagnostics.push(check_diagnostic_with_package(
+                            check_internal_diagnostic(
+                                &format!("interface owner analysis failed: {error:?}"),
+                                None,
+                            ),
+                            Some(&input.package_identity),
+                        ));
+                        errors = errors.saturating_add(1);
+                        continue;
+                    }
+                    for member in owner.members() {
+                        match member.module_path_diagnostics() {
+                            Ok(Some(diagnostics_for_member)) => {
+                                owner_diagnostics.extend(diagnostics_for_member.iter().cloned())
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                diagnostics.push(check_diagnostic_with_package(
+                                    check_internal_diagnostic(
+                                        &format!(
+                                            "interface member type path processing failed: {error:?}"
+                                        ),
+                                        None,
+                                    ),
+                                    Some(&input.package_identity),
+                                ));
+                                errors = errors.saturating_add(1);
+                            }
+                        }
+                        if let Some(error) = member.resource_methods_error() {
+                            diagnostics.push(check_diagnostic_with_package(
+                                check_internal_diagnostic(
+                                    &format!(
+                                        "interface resource method analysis failed: {error:?}"
+                                    ),
+                                    None,
+                                ),
+                                Some(&input.package_identity),
+                            ));
+                            errors = errors.saturating_add(1);
+                        }
+                        for method in member.resource_methods() {
+                            match method.module_path_diagnostics() {
+                                Ok(Some(diagnostics_for_method)) => {
+                                    owner_diagnostics.extend(diagnostics_for_method.iter().cloned())
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    diagnostics.push(check_diagnostic_with_package(
+                                        check_internal_diagnostic(
+                                            &format!(
+                                                "interface resource method type path processing failed: {error:?}"
+                                            ),
+                                            None,
+                                        ),
+                                        Some(&input.package_identity),
+                                    ));
+                                    errors = errors.saturating_add(1);
+                                }
                             }
                         }
                     }

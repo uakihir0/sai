@@ -263,6 +263,13 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
     .expect("write root package manifest");
     let root_source = concat!(
         "use acme:middle as middle\n",
+        "interface root_api {\n",
+        "  type RootAlias = middle.api.PublicTypo\n",
+        "  fn root_interface_member(missing: middle.api.PublicTypo)\n",
+        "  resource RootRemote {\n",
+        "    fn root_resource_member(missing: middle.api.PublicTypo)\n",
+        "  }\n",
+        "}\n",
         "type Record {\n",
         "  public: middle.api.PublicType\n",
         "}\n",
@@ -305,6 +312,12 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         concat!(
             "use acme:leaf/model as leaf_model\n",
             "pub use acme:leaf.{api}\n",
+            "interface middle_api {\n",
+            "  fn middle_interface_member(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) -> leaf_model.PublicType\n",
+            "  resource MiddleRemote {\n",
+            "    fn middle_resource_member(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) -> leaf_model.PublicType\n",
+            "  }\n",
+            "}\n",
             "type MiddleRecord {\n",
             "  value: leaf_model.PrivateType\n",
             "  missing: leaf_model.PublicTypo\n",
@@ -394,10 +407,16 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         .lines()
         .filter(|line| line.contains("\"code\":\"PRIVATE_ITEM\""))
         .collect::<Vec<_>>();
-    assert_eq!(private_diagnostics.len(), 7, "{stdout}");
+    assert_eq!(private_diagnostics.len(), 9, "{stdout}");
     let middle_source = concat!(
         "use acme:leaf/model as leaf_model\n",
         "pub use acme:leaf.{api}\n",
+        "interface middle_api {\n",
+        "  fn middle_interface_member(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) -> leaf_model.PublicType\n",
+        "  resource MiddleRemote {\n",
+        "    fn middle_resource_member(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) -> leaf_model.PublicType\n",
+        "  }\n",
+        "}\n",
         "type MiddleRecord {\n",
         "  value: leaf_model.PrivateType\n",
         "  missing: leaf_model.PublicTypo\n",
@@ -568,7 +587,70 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         .lines()
         .filter(|line| line.contains("\"code\":\"UNRESOLVED_NAME\""))
         .collect::<Vec<_>>();
-    assert_eq!(unresolved_diagnostics.len(), 18, "{stdout}");
+    assert_eq!(unresolved_diagnostics.len(), 23, "{stdout}");
+    for (owner_name, owner_source) in [
+        ("interface member", "fn middle_interface_member"),
+        ("resource method", "fn middle_resource_member"),
+    ] {
+        let owner_start = middle_source
+            .find(owner_source)
+            .unwrap_or_else(|| panic!("{owner_name} source exists"));
+        let owner_end = middle_source[owner_start..]
+            .find('\n')
+            .map_or(middle_source.len(), |index| owner_start + index);
+        let owner_line = &middle_source[owner_start..owner_end];
+        let private_start = owner_start
+            + owner_line
+                .find("PrivateType")
+                .unwrap_or_else(|| panic!("{owner_name} has a private member path"));
+        let missing_start = owner_start
+            + owner_line
+                .find("PublicTypo")
+                .unwrap_or_else(|| panic!("{owner_name} has a missing member path"));
+        let private = private_diagnostics
+            .iter()
+            .find(|line| line.contains(&format!("\"start\":{{\"byte\":{private_start},")))
+            .unwrap_or_else(|| panic!("{owner_name} private path is reported: {stdout}"));
+        assert!(
+            private.contains("\"package\":\"acme:middle@1.0.0\"")
+                && private.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
+                && private.contains("\"what\":\"private member declared here\"")
+                && private.contains(
+                    "\"path\":\"dep:acme:leaf@1.0.0/src/model.sai\",\"package\":\"acme:leaf@1.0.0\""
+                )
+                && private.contains(&format!(
+                    "\"start\":{{\"byte\":{declaration_start},\"line\":2"
+                )),
+            "{private}"
+        );
+        assert_eq!(
+            private_diagnostics
+                .iter()
+                .filter(|line| line.contains(&format!("\"start\":{{\"byte\":{private_start},")))
+                .count(),
+            1,
+            "{owner_name} private path is reported exactly once: {stdout}"
+        );
+        let missing = unresolved_diagnostics
+            .iter()
+            .find(|line| line.contains(&format!("\"start\":{{\"byte\":{missing_start},")))
+            .unwrap_or_else(|| panic!("{owner_name} missing path is reported: {stdout}"));
+        assert!(
+            missing.contains("\"package\":\"acme:middle@1.0.0\"")
+                && missing.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
+                && missing.contains("no item `PublicTypo` in module `acme:leaf@1.0.0/model`")
+                && missing.contains("\"candidates\":[\"PublicType\"]"),
+            "{missing}"
+        );
+        assert_eq!(
+            unresolved_diagnostics
+                .iter()
+                .filter(|line| line.contains(&format!("\"start\":{{\"byte\":{missing_start},")))
+                .count(),
+            1,
+            "{owner_name} missing path is reported exactly once: {stdout}"
+        );
+    }
     for (owner_name, owner_source) in [
         ("invariant", "invariant U32"),
         ("refined type", "type MiddleRefined"),
@@ -683,6 +765,9 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         ("impl member", "fn root_impl_member"),
         ("trait associated type", "type RootMissingAssociated"),
         ("impl associated type", "type RootMissingImplAssociated"),
+        ("interface member", "fn root_interface_member"),
+        ("interface resource method", "fn root_resource_member"),
+        ("interface alias", "type RootAlias"),
     ] {
         let owner_start = root_source
             .find(owner_source)

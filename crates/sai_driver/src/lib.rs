@@ -2044,6 +2044,7 @@ pub struct InterfaceResourceMethodTestOnlyResolution {
     resource_owner: OwnerId,
     owner: OwnerId,
     type_path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
+    module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
@@ -2066,6 +2067,19 @@ impl InterfaceResourceMethodTestOnlyResolution {
         &self,
     ) -> Result<&TypeOwnerPathResolution, &OwnerControlFlowResolutionError> {
         self.type_path_resolution.as_ref()
+    }
+
+    /// Returns snapshot-bound type member diagnostics for this resource method
+    /// when analyzed with a validated active-source closure.
+    ///
+    /// Package-local adapters leave this channel absent so callers can keep
+    /// mapping their typed path results with their own snapshot context.
+    pub fn module_path_diagnostics(
+        &self,
+    ) -> Result<Option<&[Diagnostic]>, &OwnerControlFlowResolutionError> {
+        self.module_path_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.as_deref())
     }
 
     pub fn test_only_path_resolution(
@@ -2091,6 +2105,7 @@ pub struct InterfaceMemberTestOnlyResolution {
     owner: OwnerId,
     kind: InterfaceMemberKind,
     type_path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
+    module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     lowering_diagnostics: Vec<Diagnostic>,
@@ -2115,6 +2130,19 @@ impl InterfaceMemberTestOnlyResolution {
         &self,
     ) -> Result<&TypeOwnerPathResolution, &OwnerControlFlowResolutionError> {
         self.type_path_resolution.as_ref()
+    }
+
+    /// Returns snapshot-bound type member diagnostics for this interface
+    /// declaration when analyzed with a validated active-source closure.
+    ///
+    /// Package-local adapters leave this channel absent so callers can keep
+    /// mapping their typed path results with their own snapshot context.
+    pub fn module_path_diagnostics(
+        &self,
+    ) -> Result<Option<&[Diagnostic]>, &OwnerControlFlowResolutionError> {
+        self.module_path_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.as_deref())
     }
 
     pub fn test_only_path_resolution(
@@ -11028,6 +11056,7 @@ impl RootDatabase {
                                             resource_owner: member_owner,
                                             owner: method_owner,
                                             type_path_resolution,
+                                            module_path_diagnostics: Ok(None),
                                             test_only_path_resolution: path_resolution,
                                             test_only_diagnostics,
                                             lowering_diagnostics: method_lowering_diagnostics,
@@ -11067,6 +11096,7 @@ impl RootDatabase {
                         owner: member_owner,
                         kind,
                         type_path_resolution,
+                        module_path_diagnostics: Ok(None),
                         test_only_path_resolution,
                         test_only_diagnostics,
                         lowering_diagnostics,
@@ -11079,7 +11109,43 @@ impl RootDatabase {
             })();
 
             match analysis {
-                Ok((members, lowering_diagnostics)) => {
+                Ok((mut members, lowering_diagnostics)) => {
+                    if let Some(member_scopes) = member_scopes {
+                        for member in &mut members {
+                            member.module_path_diagnostics =
+                                match member.type_path_resolution.as_ref() {
+                                    Ok(path_resolution) => self
+                                        .type_owner_module_path_diagnostics(
+                                            member.owner,
+                                            path_resolution,
+                                            &inputs,
+                                            Some(&module_members),
+                                            snapshot,
+                                            &collection.target_cfg,
+                                            Some(member_scopes),
+                                        )
+                                        .map(Some),
+                                    Err(error) => Err(error.clone()),
+                                };
+                            for method in &mut member.resource_methods {
+                                method.module_path_diagnostics =
+                                    match method.type_path_resolution.as_ref() {
+                                        Ok(path_resolution) => self
+                                            .type_owner_module_path_diagnostics(
+                                                method.owner,
+                                                path_resolution,
+                                                &inputs,
+                                                Some(&module_members),
+                                                snapshot,
+                                                &collection.target_cfg,
+                                                Some(member_scopes),
+                                            )
+                                            .map(Some),
+                                        Err(error) => Err(error.clone()),
+                                    };
+                            }
+                        }
+                    }
                     owners.push(InterfaceOwnerTestOnlyResolution {
                         owner: descriptor.owner,
                         error: None,
@@ -21180,6 +21246,7 @@ mod tests {
                       interface api {\n\
                         type Request = U32\n\
                         type Qualified = middle.api.PublicType\n\
+                        type MissingQualified = middle.api.PublicTypo\n\
                         fn foreign_interface_member(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType\n\
                         resource Remote {\n\
                           fn foreign_resource_member(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType\n\
@@ -22151,7 +22218,7 @@ mod tests {
                 let private = diagnostics
                     .iter()
                     .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::PrivateItem)
-                    .expect("private predicate type becomes PRIVATE_ITEM");
+                    .expect("private type member becomes PRIVATE_ITEM");
                 assert_eq!(
                     private.primary().map(|location| &location.span),
                     Some(&sai_diagnostics::Span::new(
@@ -22173,7 +22240,7 @@ mod tests {
                 let missing = diagnostics
                     .iter()
                     .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnresolvedName)
-                    .expect("missing type becomes UNRESOLVED_NAME");
+                    .expect("missing type member becomes UNRESOLVED_NAME");
                 assert_eq!(
                     missing.primary().map(|location| &location.span),
                     Some(&sai_diagnostics::Span::new(
@@ -22197,7 +22264,7 @@ mod tests {
                 let missing = diagnostics
                     .iter()
                     .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnresolvedName)
-                    .expect("missing type becomes UNRESOLVED_NAME");
+                    .expect("missing type member becomes UNRESOLVED_NAME");
                 assert_eq!(
                     missing.primary().map(|location| &location.span),
                     Some(&sai_diagnostics::Span::new(
@@ -23271,6 +23338,7 @@ mod tests {
             [
                 InterfaceMemberKind::Alias,
                 InterfaceMemberKind::Alias,
+                InterfaceMemberKind::Alias,
                 InterfaceMemberKind::Function,
                 InterfaceMemberKind::Resource,
             ]
@@ -23290,7 +23358,35 @@ mod tests {
             interface_alias_paths.module_path_errors().is_empty(),
             "the public transitive interface alias produces no member lookup errors"
         );
-        let interface_function_paths = foreign_interface.members()[2]
+        let missing_interface_alias_start = source_text
+            .find("type MissingQualified")
+            .expect("transitive interface alias with a missing member exists");
+        let missing_interface_alias_line_start = source_text[..missing_interface_alias_start]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let missing_interface_alias_line_end = source_text[missing_interface_alias_start..]
+            .find('\n')
+            .map_or(source_text.len(), |index| {
+                missing_interface_alias_start + index
+            });
+        assert_missing_type_member_diagnostic(
+            foreign_interface.members()[2]
+                .module_path_diagnostics()
+                .expect("interface alias diagnostics resolve")
+                .expect("the closure-aware interface adapter maps type failures"),
+            &source_text[missing_interface_alias_line_start..missing_interface_alias_line_end],
+            missing_interface_alias_line_start,
+        );
+        assert!(
+            foreign_interface.members()[2]
+                .type_path_resolution()
+                .expect("interface alias type paths resolve")
+                .module_path_errors()
+                .iter()
+                .any(|error| matches!(error.error(), ModulePathError::MissingMember { .. })),
+            "interface type declarations keep typed missing-member failures"
+        );
+        let interface_function_paths = foreign_interface.members()[3]
             .type_path_resolution()
             .expect("interface function type paths resolve through the closure");
         let interface_function_start = source_text
@@ -23307,7 +23403,23 @@ mod tests {
             &source_text[interface_function_line_start..interface_function_line_end],
             interface_function_line_start,
         );
-        let interface_resource = &foreign_interface.members()[3];
+        assert_type_member_diagnostics(
+            foreign_interface.members()[3]
+                .module_path_diagnostics()
+                .expect("interface function member diagnostics resolve")
+                .expect("the closure-aware interface adapter maps type failures"),
+            &source_text[interface_function_line_start..interface_function_line_end],
+            interface_function_line_start,
+        );
+        assert!(
+            foreign_interface.members()[1]
+                .module_path_diagnostics()
+                .expect("interface alias diagnostics resolve")
+                .expect("closure-aware interface diagnostics are available")
+                .is_empty(),
+            "a valid transitive interface alias produces no mapped path diagnostics"
+        );
+        let interface_resource = &foreign_interface.members()[4];
         assert!(interface_resource.resource_methods_error().is_none());
         assert_eq!(interface_resource.resource_methods().len(), 1);
         let interface_resource_method = &interface_resource.resource_methods()[0];
@@ -23331,6 +23443,28 @@ mod tests {
             resource_method_paths,
             &source_text[resource_method_line_start..resource_method_line_end],
             resource_method_line_start,
+        );
+        assert_type_member_diagnostics(
+            interface_resource_method
+                .module_path_diagnostics()
+                .expect("resource method diagnostics resolve")
+                .expect("the closure-aware interface adapter maps type failures"),
+            &source_text[resource_method_line_start..resource_method_line_end],
+            resource_method_line_start,
+        );
+        let package_local_interfaces = database
+            .resolve_interface_test_only_paths(&root_collection, &root_tree, &snapshot)
+            .expect("package-local interface results remain available");
+        assert!(
+            package_local_interfaces.owners()[0].members()[3]
+                .module_path_diagnostics()
+                .expect("package-local interface member diagnostic channel remains healthy")
+                .is_none()
+                && package_local_interfaces.owners()[0].members()[4].resource_methods()[0]
+                    .module_path_diagnostics()
+                    .expect("package-local resource method diagnostic channel remains healthy")
+                    .is_none(),
+            "package-local interface calls leave member and method diagnostics unmapped"
         );
 
         let world_source_file = root_tree.modules[0].file;
