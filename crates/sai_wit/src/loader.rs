@@ -5,8 +5,9 @@
 
 use crate::{
     WitClosureError, WitModelError, WitPackage, WitPackageGraph, WitPackageGraphError,
-    WitParseError, WitReferenceResolutionError, WitResolveContext, WitSourceFile, WitUnit,
-    parse_source_files, resolve_package_references, wit_unit_closure,
+    WitParseError, WitReferenceResolutionError, WitReferenceResolutionErrorKind, WitResolveContext,
+    WitSourceFile, WitSourceLocation, WitUnit, parse_source_files, resolve_package_references,
+    wit_unit_closure,
 };
 use sai_stable_hash::{StableHash, StableHasher};
 use std::collections::HashMap;
@@ -104,6 +105,85 @@ pub struct WitPackageLoadError<E> {
     failure: WitPackageLoadFailure<E>,
 }
 
+/// A registered WIT diagnostic code represented without depending on the
+/// diagnostics crate.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum WitPackageDiagnosticCode {
+    /// A WIT source failed to parse or validate.
+    ParseError,
+    /// The declared WIT package identity or version differs from its unit.
+    PackageMismatch,
+}
+
+impl WitPackageDiagnosticCode {
+    /// Returns the canonical diagnostic code name for driver integration.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ParseError => "WIT_PARSE_ERROR",
+            Self::PackageMismatch => "WIT_PACKAGE_MISMATCH",
+        }
+    }
+}
+
+/// The diagnostic severity used by WIT package loading.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum WitPackageDiagnosticSeverity {
+    /// WIT loading failures prevent the package from being used.
+    Error,
+}
+
+impl WitPackageDiagnosticSeverity {
+    /// Returns the canonical severity name for driver integration.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+        }
+    }
+}
+
+/// A WIT diagnostic that can be bound to the failing unit's current source
+/// snapshot by the driver.
+///
+/// `location.path` is the direct-child path supplied to `wit_parser`, and its
+/// range is measured in original source bytes. The template deliberately
+/// carries no session-local `FileId` or `SourceRef`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WitPackageDiagnosticTemplate {
+    unit: WitUnit,
+    code: WitPackageDiagnosticCode,
+    severity: WitPackageDiagnosticSeverity,
+    message: String,
+    location: Option<WitSourceLocation>,
+}
+
+impl WitPackageDiagnosticTemplate {
+    /// Returns the unit that owns this diagnostic.
+    pub fn unit(&self) -> &WitUnit {
+        &self.unit
+    }
+
+    /// Returns the registered diagnostic code.
+    pub fn code(&self) -> WitPackageDiagnosticCode {
+        self.code
+    }
+
+    /// Returns the hard diagnostic severity.
+    pub fn severity(&self) -> WitPackageDiagnosticSeverity {
+        self.severity
+    }
+
+    /// Returns the parser or validation message without rendering a location.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Returns the source path and original-byte range when the failure can
+    /// be attributed to one WIT file.
+    pub fn location(&self) -> Option<&WitSourceLocation> {
+        self.location.as_ref()
+    }
+}
+
 impl<E> WitPackageLoadError<E> {
     /// Returns the unit whose own loading failed.
     pub fn unit(&self) -> &WitUnit {
@@ -113,6 +193,81 @@ impl<E> WitPackageLoadError<E> {
     /// Returns the typed loading failure.
     pub fn failure(&self) -> &WitPackageLoadFailure<E> {
         &self.failure
+    }
+
+    /// Converts a WIT content failure to a source-independent diagnostic
+    /// template, but only when this error belongs to `requested_unit`.
+    ///
+    /// Loading a parent can fail because a dependency failed. In that case
+    /// this returns `None`; the dependency's own query emits the diagnostic,
+    /// preventing the same failure from being reported once per parent.
+    ///
+    /// Non-content failures (for example, an unavailable input or an invalid
+    /// package graph) do not become `WIT_PARSE_ERROR` diagnostics here.
+    pub fn diagnostic_template_for(
+        &self,
+        requested_unit: &WitUnit,
+    ) -> Option<WitPackageDiagnosticTemplate> {
+        if self.unit != *requested_unit {
+            return None;
+        }
+
+        let (code, message, location) = match &self.failure {
+            WitPackageLoadFailure::Parse(error) => (
+                WitPackageDiagnosticCode::ParseError,
+                error.to_string(),
+                error.location().cloned(),
+            ),
+            WitPackageLoadFailure::ReferenceResolution(error) => {
+                let (code, location) = match error.kind() {
+                    WitReferenceResolutionErrorKind::PackageMismatch { .. } => (
+                        WitPackageDiagnosticCode::PackageMismatch,
+                        error.location().cloned(),
+                    ),
+                    WitReferenceResolutionErrorKind::NestedPackage
+                    | WitReferenceResolutionErrorKind::InvalidVersion(_)
+                    | WitReferenceResolutionErrorKind::Reference(_) => (
+                        WitPackageDiagnosticCode::ParseError,
+                        error.location().cloned(),
+                    ),
+                    // These variants indicate a broken source-range mapping
+                    // or an unexpected failure after rewriting valid source.
+                    WitReferenceResolutionErrorKind::InvalidSourceRange
+                    | WitReferenceResolutionErrorKind::Reparse(_) => return None,
+                };
+                (code, error.to_string(), location)
+            }
+            WitPackageLoadFailure::Model(error) => match error {
+                WitModelError::NestedPackages { location, .. } => (
+                    WitPackageDiagnosticCode::ParseError,
+                    error.to_string(),
+                    location.clone(),
+                ),
+                WitModelError::PackageMismatch { location, .. } => (
+                    WitPackageDiagnosticCode::PackageMismatch,
+                    error.to_string(),
+                    location.clone(),
+                ),
+                // wit-parser 0.246.0 keeps the semantic error's span in
+                // private anyhow context. Its rendered text is not a stable
+                // source-location API, so preserve the message only.
+                WitModelError::Resolve(_) => (
+                    WitPackageDiagnosticCode::ParseError,
+                    error.to_string(),
+                    None,
+                ),
+                _ => return None,
+            },
+            _ => return None,
+        };
+
+        Some(WitPackageDiagnosticTemplate {
+            unit: self.unit.clone(),
+            code,
+            severity: WitPackageDiagnosticSeverity::Error,
+            message,
+            location,
+        })
     }
 }
 
@@ -290,6 +445,20 @@ mod tests {
         .expect("known embedded unit")
     }
 
+    fn reference_resolution_failure(
+        unit: WitUnit,
+        kind: WitReferenceResolutionErrorKind,
+        location: Option<WitSourceLocation>,
+    ) -> WitPackageLoadError<()> {
+        WitPackageLoadError {
+            unit,
+            failure: WitPackageLoadFailure::ReferenceResolution(WitReferenceResolutionError {
+                kind,
+                location,
+            }),
+        }
+    }
+
     #[test]
     fn loads_reachable_models_in_first_reference_post_order() {
         let packages = PackageInterner::new();
@@ -376,6 +545,210 @@ mod tests {
             error.failure(),
             &WitPackageLoadFailure::Source("dependency input unavailable")
         );
+    }
+
+    #[test]
+    fn parser_failure_becomes_a_path_and_byte_range_template() {
+        let packages = PackageInterner::new();
+        let (root, root_version) = package_unit("acme:root", "1.0.0", &packages);
+        let graph = WitPackageGraph::new(
+            root.clone(),
+            [WitPackageNode::new(root.clone(), root_version).expect("root node")],
+            [],
+        )
+        .expect("valid package graph");
+        let source = "package acme:root@1.0.0;\ninterface {";
+        let error = load_wit_package_closure(root.clone(), &graph, |_unit| {
+            Ok::<_, &'static str>(vec![WitSourceFile::new(
+                "broken.wit",
+                source.as_bytes().to_vec(),
+            )])
+        })
+        .expect_err("malformed WIT must fail");
+
+        let template = error
+            .diagnostic_template_for(&root)
+            .expect("the failing root owns its diagnostic");
+        assert_eq!(template.unit(), &root);
+        assert_eq!(template.code(), WitPackageDiagnosticCode::ParseError);
+        assert_eq!(template.severity(), WitPackageDiagnosticSeverity::Error);
+        assert_eq!(template.code().as_str(), "WIT_PARSE_ERROR");
+        assert_eq!(template.severity().as_str(), "error");
+        let location = template.location().expect("parser span is retained");
+        assert_eq!(location.path, "broken.wit");
+        assert_eq!(&source[location.range.clone()], "{");
+    }
+
+    #[test]
+    fn package_identity_mismatch_uses_its_registered_diagnostic_code() {
+        let packages = PackageInterner::new();
+        let (root, root_version) = package_unit("acme:root", "1.0.0", &packages);
+        let graph = WitPackageGraph::new(
+            root.clone(),
+            [WitPackageNode::new(root.clone(), root_version).expect("root node")],
+            [],
+        )
+        .expect("valid package graph");
+        let source = "package acme:other@1.0.0;";
+        let error = load_wit_package_closure(root.clone(), &graph, |_unit| {
+            Ok::<_, &'static str>(vec![WitSourceFile::new(
+                "mismatch.wit",
+                source.as_bytes().to_vec(),
+            )])
+        })
+        .expect_err("wrong WIT package identity must fail");
+
+        let template = error
+            .diagnostic_template_for(&root)
+            .expect("the failing root owns its diagnostic");
+        assert_eq!(template.code(), WitPackageDiagnosticCode::PackageMismatch);
+        let location = template.location().expect("package declaration is located");
+        assert_eq!(location.path, "mismatch.wit");
+        assert_eq!(&source[location.range.clone()], "acme:other@1.0.0");
+    }
+
+    #[test]
+    fn user_reference_failures_keep_diagnostic_codes_and_source_locations() {
+        let packages = PackageInterner::new();
+        let (root, _) = package_unit("acme:root", "1.0.0", &packages);
+        let location = WitSourceLocation {
+            path: "reference.wit".to_owned(),
+            range: 12..19,
+        };
+        let cases = [
+            (
+                WitReferenceResolutionErrorKind::NestedPackage,
+                WitPackageDiagnosticCode::ParseError,
+            ),
+            (
+                WitReferenceResolutionErrorKind::InvalidVersion("1.2".to_owned()),
+                WitPackageDiagnosticCode::ParseError,
+            ),
+            (
+                WitReferenceResolutionErrorKind::Reference(
+                    crate::WitPackageReferenceError::UnknownWasiPackage {
+                        package_identity: "wasi:missing".into(),
+                    },
+                ),
+                WitPackageDiagnosticCode::ParseError,
+            ),
+        ];
+
+        for (kind, expected_code) in cases {
+            let error = reference_resolution_failure(root.clone(), kind, Some(location.clone()));
+            let template = error
+                .diagnostic_template_for(&root)
+                .expect("user WIT reference errors have diagnostics");
+            assert_eq!(template.code(), expected_code);
+            assert_eq!(template.location(), Some(&location));
+        }
+    }
+
+    #[test]
+    fn internal_reference_mapping_failures_do_not_become_user_diagnostics() {
+        let packages = PackageInterner::new();
+        let (root, _) = package_unit("acme:root", "1.0.0", &packages);
+        let parse_error = parse_source_files(
+            root.clone(),
+            [WitSourceFile::new(
+                "normalized.wit",
+                "package acme:root@1.0.0;\ninterface {",
+            )],
+        )
+        .expect_err("fixture must provide an underlying parser error");
+        let location = Some(WitSourceLocation {
+            path: "normalized.wit".to_owned(),
+            range: 0..1,
+        });
+
+        for kind in [
+            WitReferenceResolutionErrorKind::InvalidSourceRange,
+            WitReferenceResolutionErrorKind::Reparse(parse_error),
+        ] {
+            let error = reference_resolution_failure(root.clone(), kind, location.clone());
+            assert_eq!(
+                error.diagnostic_template_for(&root),
+                None,
+                "internal source-mapping failure must be handled as an implementation error"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_push_semantic_failure_remains_locationless() {
+        let packages = PackageInterner::new();
+        let (root, root_version) = package_unit("acme:root", "1.0.0", &packages);
+        let graph = WitPackageGraph::new(
+            root.clone(),
+            [WitPackageNode::new(root.clone(), root_version).expect("root node")],
+            [],
+        )
+        .expect("valid package graph");
+        let error = load_wit_package_closure(root.clone(), &graph, |_unit| {
+            Ok::<_, &'static str>(vec![WitSourceFile::new(
+                "semantic.wit",
+                b"package acme:root@1.0.0;\n@since(version = 2.0.0) interface api {}".to_vec(),
+            )])
+        })
+        .expect_err("invalid @since semantic gate must fail");
+
+        assert!(
+            matches!(
+                error.failure(),
+                WitPackageLoadFailure::Model(WitModelError::Resolve(_))
+            ),
+            "failure should come from Resolve::push: {error}"
+        );
+        let template = error
+            .diagnostic_template_for(&root)
+            .expect("semantic WIT failure owns a diagnostic");
+        assert_eq!(template.code(), WitPackageDiagnosticCode::ParseError);
+        assert_eq!(template.location(), None);
+    }
+
+    #[test]
+    fn dependency_failure_template_is_emitted_only_for_the_failing_unit() {
+        let packages = PackageInterner::new();
+        let (root, root_version) = package_unit("acme:root", "1.0.0", &packages);
+        let (dependency, dependency_version) = package_unit("acme:dependency", "1.0.0", &packages);
+        let graph = WitPackageGraph::new(
+            root.clone(),
+            [
+                WitPackageNode::new(root.clone(), root_version).expect("root node"),
+                WitPackageNode::new(dependency.clone(), dependency_version.clone())
+                    .expect("dependency node"),
+            ],
+            [WitPackageEdge::new(
+                root.clone(),
+                "acme:dependency",
+                dependency_version,
+                Some(dependency.clone()),
+            )],
+        )
+        .expect("valid package graph");
+        let dependency_source = "package acme:dependency@1.0.0;\ninterface {";
+        let error = load_wit_package_closure(root.clone(), &graph, |unit| {
+            let source = if unit == &root {
+                "package acme:root@1.0.0;\nworld app { import acme:dependency/api; }"
+            } else {
+                dependency_source
+            };
+            Ok::<_, &'static str>(vec![WitSourceFile::new(
+                "package.wit",
+                source.as_bytes().to_vec(),
+            )])
+        })
+        .expect_err("dependency syntax error must fail the closure");
+
+        assert_eq!(error.unit(), &dependency);
+        assert_eq!(error.diagnostic_template_for(&root), None);
+        let template = error
+            .diagnostic_template_for(&dependency)
+            .expect("the failing dependency owns its diagnostic");
+        assert_eq!(template.unit(), &dependency);
+        let location = template.location().expect("dependency error is located");
+        assert_eq!(location.path, "package.wit");
+        assert_eq!(&dependency_source[location.range.clone()], "{");
     }
 
     #[test]
