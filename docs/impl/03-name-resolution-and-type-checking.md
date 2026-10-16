@@ -387,6 +387,14 @@ remains available. Regressions cover a trait generic bound, an impl trait
 target and self type, an interface-impl target, and a `where` bound through a
 transitive-only package, including foreign private and missing member errors.
 
+**Trait/impl associated-member type paths over validated source closures (IR-569).**
+Trait and impl associated type and method type paths now use the validated
+active-source closure. The aggregate result retains the closure fingerprint,
+while each child owner keeps its own type-path and diagnostic results.
+Regressions cover transitive public paths in associated types and method
+signatures for both trait and impl owners, plus foreign private and missing
+member errors.
+
 When a foreign-interface re-export candidate precedes a known local candidate
 with the same name, this bridge uses the successful local candidate while
 retaining the foreign-interface item as deferred; a complete package resolver
