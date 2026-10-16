@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod interface_impls;
+pub mod interface_redirect;
 pub mod interface_uses;
 pub mod module_member_lookup;
 pub mod module_path;
@@ -24,6 +25,7 @@ pub use interface_impls::{
     InterfaceImplTarget, InterfaceImplTypeResolution, InterfaceImplUnsupportedFunction,
     InterfaceImpls, InterfaceImplsInput, collect_interface_impls,
 };
+pub use interface_redirect::InterfaceRedirects;
 pub use interface_uses::{
     InterfaceUseReference, InterfaceUses, InterfaceUsesInput, interface_uses,
 };
