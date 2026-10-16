@@ -11,6 +11,15 @@ pub(super) struct SourceScan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ForeignReference {
+    pub identity: String,
+    pub version: Option<String>,
+    pub range: Range<usize>,
+    pub version_range: Option<Range<usize>>,
+    pub item_range: Range<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct Token {
     kind: TokenKind,
     range: Range<usize>,
@@ -219,6 +228,164 @@ pub(super) fn scan_source(source: &str) -> SourceScan {
         package_name_range,
         nested_package_ranges,
         named_result_function_ranges,
+    }
+}
+
+pub(super) fn scan_foreign_references(source: &str) -> Vec<ForeignReference> {
+    let tokens = lex(source);
+    let world_external_directive_indices = world_external_directive_indices(source, &tokens);
+    let mut references = Vec::new();
+
+    for (index, token) in tokens.iter().enumerate() {
+        let is_use = is_identifier(source, token, "use");
+        if !is_use && !world_external_directive_indices.contains(&index) {
+            continue;
+        }
+        if let Some(reference) = parse_foreign_reference(source, &tokens, index + 1) {
+            references.push(reference);
+        }
+    }
+
+    references
+}
+
+fn world_external_directive_indices(source: &str, tokens: &[Token]) -> HashSet<usize> {
+    let mut indices = HashSet::new();
+    for (world_index, token) in tokens.iter().enumerate() {
+        if !is_identifier(source, token, "world") {
+            continue;
+        }
+        let Some(open_index) = tokens.get(world_index + 2).and_then(|token| {
+            (token.kind == TokenKind::Punctuation(b'{')).then_some(world_index + 2)
+        }) else {
+            continue;
+        };
+        let Some(close_index) = matching_delimiter(tokens, open_index, b'{', b'}') else {
+            continue;
+        };
+
+        let mut depth = 1_u32;
+        for index in open_index + 1..close_index {
+            let token = &tokens[index];
+            if depth == 1
+                && (is_identifier(source, token, "import")
+                    || is_identifier(source, token, "export")
+                    || is_identifier(source, token, "include"))
+            {
+                indices.insert(index);
+            }
+            match token.kind {
+                TokenKind::Punctuation(b'{') => depth += 1,
+                TokenKind::Punctuation(b'}') => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    indices
+}
+
+fn parse_foreign_reference(
+    source: &str,
+    tokens: &[Token],
+    start_index: usize,
+) -> Option<ForeignReference> {
+    let namespace = tokens.get(start_index)?;
+    let colon = tokens.get(start_index + 1)?;
+    let package = tokens.get(start_index + 2)?;
+    let slash = tokens.get(start_index + 3)?;
+    let interface = tokens.get(start_index + 4)?;
+    if colon.kind != TokenKind::Punctuation(b':') || slash.kind != TokenKind::Punctuation(b'/') {
+        return None;
+    }
+
+    let range_start = namespace.range.start;
+    let namespace = wit_identifier_text(source, namespace)?;
+    let package = wit_identifier_text(source, package)?;
+    wit_identifier_text(source, interface)?;
+
+    let (range_end, version, version_range) = match tokens.get(start_index + 5) {
+        Some(token) if token.kind == TokenKind::Punctuation(b'@') => {
+            let version_start = tokens.get(start_index + 6)?.range.start;
+            let version_end = semver_end(source, version_start)?;
+            (
+                version_end,
+                Some(source[version_start..version_end].to_owned()),
+                Some(version_start..version_end),
+            )
+        }
+        _ => (interface.range.end, None, None),
+    };
+
+    Some(ForeignReference {
+        identity: format!("{namespace}:{package}"),
+        version,
+        range: range_start..range_end,
+        version_range,
+        item_range: interface.range.clone(),
+    })
+}
+
+fn wit_identifier_text<'a>(source: &'a str, token: &Token) -> Option<&'a str> {
+    if !is_wit_identifier(source, token) {
+        return None;
+    }
+    Some(
+        source[token.range.clone()]
+            .strip_prefix('%')
+            .unwrap_or(&source[token.range.clone()]),
+    )
+}
+
+fn semver_end(source: &str, start: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut cursor = take_decimal_component(bytes, start)?;
+    for _ in 0..2 {
+        if bytes.get(cursor) != Some(&b'.') {
+            return None;
+        }
+        cursor = take_decimal_component(bytes, cursor + 1)?;
+    }
+
+    if bytes.get(cursor) == Some(&b'-') {
+        cursor = take_semver_identifiers(bytes, cursor + 1)?;
+    }
+    if bytes.get(cursor) == Some(&b'+') {
+        cursor = take_semver_identifiers(bytes, cursor + 1)?;
+    }
+    Some(cursor)
+}
+
+fn take_decimal_component(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut cursor = start;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+        cursor += 1;
+    }
+    (cursor > start).then_some(cursor)
+}
+
+fn take_semver_identifiers(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut cursor = start;
+    let mut has_identifier = false;
+    loop {
+        let component_start = cursor;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            cursor += 1;
+        }
+        if cursor == component_start {
+            return has_identifier.then_some(cursor);
+        }
+        has_identifier = true;
+        if bytes.get(cursor) != Some(&b'.')
+            || !bytes
+                .get(cursor + 1)
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        {
+            return Some(cursor);
+        }
+        cursor += 1;
     }
 }
 
@@ -682,7 +849,7 @@ fn is_keylike_continue(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::scan_source;
+    use super::{scan_foreign_references, scan_source};
 
     #[test]
     fn ignores_package_keywords_inside_comments_and_strings() {
@@ -842,5 +1009,114 @@ interface shapes {
         let scan = scan_source(source);
         assert_eq!(scan.named_result_function_ranges.len(), 1);
         assert!(scan.parser_text.contains("\"not-a-label\""));
+    }
+
+    #[test]
+    fn scans_foreign_references_in_use_include_import_and_export_forms() {
+        let source = r#"
+package root:app@1.0.0;
+use acme:types/model@1.2.3.{Thing};
+world app {
+    include acme:worlds/base@2.0.0;
+    import wasi:cli/stdout@0.2.3;
+    export wasi:http/types;
+}
+"#;
+
+        let references = scan_foreign_references(source);
+        assert_eq!(references.len(), 4);
+        assert_eq!(references[0].identity, "acme:types");
+        assert_eq!(references[0].version.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            &source[references[0].range.clone()],
+            "acme:types/model@1.2.3"
+        );
+        assert_eq!(&source[references[0].item_range.clone()], "model");
+        assert_eq!(references[1].identity, "acme:worlds");
+        assert_eq!(references[1].version.as_deref(), Some("2.0.0"));
+        assert_eq!(
+            &source[references[1].range.clone()],
+            "acme:worlds/base@2.0.0"
+        );
+        assert_eq!(references[2].identity, "wasi:cli");
+        assert_eq!(references[2].version.as_deref(), Some("0.2.3"));
+        assert_eq!(
+            &source[references[2].range.clone()],
+            "wasi:cli/stdout@0.2.3"
+        );
+        assert_eq!(references[3].identity, "wasi:http");
+        assert_eq!(references[3].version, None);
+        assert_eq!(&source[references[3].range.clone()], "wasi:http/types");
+    }
+
+    #[test]
+    fn scans_prerelease_and_build_version_text() {
+        let source = "use acme:types/model@1.2.3-alpha.1+build.7.{Thing};";
+        let references = scan_foreign_references(source);
+
+        assert_eq!(references.len(), 1);
+        assert_eq!(
+            references[0].version.as_deref(),
+            Some("1.2.3-alpha.1+build.7")
+        );
+        assert_eq!(
+            &source[references[0].range.clone()],
+            "acme:types/model@1.2.3-alpha.1+build.7"
+        );
+    }
+
+    #[test]
+    fn version_ranges_skip_comments_between_at_and_version() {
+        let source = "use acme:types/model@ /* version */ 1.2.3.{Thing};";
+        let references = scan_foreign_references(source);
+
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].version.as_deref(), Some("1.2.3"));
+        let version_range = references[0]
+            .version_range
+            .as_ref()
+            .expect("explicit version has a token range");
+        assert_eq!(&source[version_range.clone()], "1.2.3");
+        assert_eq!(
+            &source[references[0].range.clone()],
+            "acme:types/model@ /* version */ 1.2.3"
+        );
+    }
+
+    #[test]
+    fn ignores_comments_strings_and_package_declarations() {
+        let source = r#"
+// use fake:comment/interface@1.0.0.{Thing};
+/* include fake:comment/world; /* import fake:nested/path; */ */
+package fake:root@1.0.0;
+package fake:nested { interface hidden {} }
+@doc("use fake:string/interface; import fake:string/path;")
+world app {
+    import local-api;
+    export local-api;
+    import acme:real/api;
+}
+"#;
+        let references = scan_foreign_references(source);
+
+        assert_eq!(references.len(), 1);
+        assert_eq!(references[0].identity, "acme:real");
+        assert_eq!(references[0].version, None);
+        assert_eq!(&source[references[0].range.clone()], "acme:real/api");
+    }
+
+    #[test]
+    fn foreign_reference_offsets_are_utf8_byte_ranges() {
+        let prefix = "// 日本語のコメント\n";
+        let reference_text = "wasi:io/error@0.2.1";
+        let source = format!("{prefix}world app {{ import {reference_text}; }}");
+        let references = scan_foreign_references(&source);
+
+        assert_eq!(references.len(), 1);
+        assert_eq!(
+            references[0].range.start,
+            prefix.len() + "world app { import ".len()
+        );
+        assert_eq!(&source[references[0].range.clone()], reference_text);
     }
 }

@@ -1,17 +1,22 @@
 #![forbid(unsafe_code)]
 
+mod closure;
 mod convert;
+mod dependency;
 mod model;
 mod source_scan;
 mod stable_hash;
 
+pub use closure::*;
 pub use convert::*;
+pub use dependency::*;
 pub use model::*;
 
 use sai_hir::{PackageId, Symbol};
 use sai_intern::{Interner, LookupError, PackageIdError, PackageInterner};
 use sai_package::{mvs::MvsPackageVersion, version::Version};
 use sai_stable_hash::{StableHash, StableHasher};
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -268,11 +273,116 @@ pub struct ParsedWitPackageGroup {
     unit: WitUnit,
     group: UnresolvedPackageGroup,
     source_names: Vec<String>,
+    source_texts: Vec<WitSourceText>,
     source_mappings: Vec<WitSourceMapping>,
+    foreign_references: Vec<WitForeignReference>,
     package_name_location: Option<WitSourceLocation>,
     nested_package_locations: Vec<WitSourceLocation>,
     named_result_function_spans: Vec<Range<u32>>,
 }
+
+#[derive(Clone, Debug)]
+struct WitSourceText {
+    path: String,
+    text: String,
+}
+
+/// A foreign WIT package reference in one source file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WitForeignReference {
+    /// Package namespace and name, without the referenced interface or world.
+    pub identity: String,
+    /// The optional SemVer text written after the interface or world name.
+    pub version: Option<String>,
+    /// Original source file and complete package-reference byte range.
+    pub location: WitSourceLocation,
+    version_range: Option<Range<usize>>,
+    item_range: Range<usize>,
+}
+
+/// A parsed WIT package group whose foreign references have been checked
+/// against the active package graph and normalized to selected versions.
+#[derive(Debug)]
+pub struct ResolvedWitPackageGroup {
+    parsed: ParsedWitPackageGroup,
+    direct_dependencies: Vec<WitUnit>,
+}
+
+impl ResolvedWitPackageGroup {
+    /// Returns the package group with foreign package names normalized to the
+    /// versions selected by the package graph.
+    pub fn parsed(&self) -> &ParsedWitPackageGroup {
+        &self.parsed
+    }
+
+    /// Returns direct foreign units in first-reference order, without
+    /// duplicates or self-references.
+    pub fn direct_dependencies(&self) -> &[WitUnit] {
+        &self.direct_dependencies
+    }
+
+    /// Returns the normalized parser group and its ordered direct units.
+    pub fn into_parts(self) -> (ParsedWitPackageGroup, Vec<WitUnit>) {
+        (self.parsed, self.direct_dependencies)
+    }
+}
+
+/// A failure while resolving and normalizing foreign WIT references.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WitReferenceResolutionError {
+    kind: WitReferenceResolutionErrorKind,
+    location: Option<WitSourceLocation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WitReferenceResolutionErrorKind {
+    NestedPackage,
+    PackageMismatch { expected: String, actual: String },
+    InvalidVersion(String),
+    Reference(WitPackageReferenceError),
+    Reparse(WitParseError),
+    InvalidSourceRange,
+}
+
+impl WitReferenceResolutionError {
+    /// Returns the category and details of the failure.
+    pub fn kind(&self) -> &WitReferenceResolutionErrorKind {
+        &self.kind
+    }
+
+    /// Returns the original location of the failing reference, when available.
+    pub fn location(&self) -> Option<&WitSourceLocation> {
+        self.location.as_ref()
+    }
+}
+
+impl fmt::Display for WitReferenceResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            WitReferenceResolutionErrorKind::NestedPackage => {
+                formatter.write_str("WIT package groups cannot contain nested packages")
+            }
+            WitReferenceResolutionErrorKind::PackageMismatch { expected, actual } => write!(
+                formatter,
+                "WIT package declaration `{actual}` does not match expected package `{expected}`"
+            ),
+            WitReferenceResolutionErrorKind::InvalidVersion(version) => {
+                write!(formatter, "invalid WIT package version `{version}`")
+            }
+            WitReferenceResolutionErrorKind::Reference(error) => {
+                write!(formatter, "{error}")
+            }
+            WitReferenceResolutionErrorKind::Reparse(error) => {
+                write!(formatter, "failed to parse normalized WIT package: {error}")
+            }
+            WitReferenceResolutionErrorKind::InvalidSourceRange => {
+                formatter.write_str("WIT reference scanner produced an invalid source range")
+            }
+        }
+    }
+}
+
+impl std::error::Error for WitReferenceResolutionError {}
 
 impl fmt::Debug for ParsedWitPackageGroup {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -282,6 +392,7 @@ impl fmt::Debug for ParsedWitPackageGroup {
             .field("main_name", &self.group.main.name)
             .field("nested_count", &self.group.nested.len())
             .field("source_names", &self.source_names)
+            .field("foreign_references", &self.foreign_references)
             .field("package_name_location", &self.package_name_location)
             .field("nested_package_locations", &self.nested_package_locations)
             .finish()
@@ -303,6 +414,11 @@ impl ParsedWitPackageGroup {
 
     pub fn source_names(&self) -> impl Iterator<Item = &str> {
         self.source_names.iter().map(String::as_str)
+    }
+
+    /// Returns foreign package references in source-file and lexical order.
+    pub fn foreign_references(&self) -> &[WitForeignReference] {
+        &self.foreign_references
     }
 }
 
@@ -350,29 +466,55 @@ pub fn parse_source_files(
             })?;
     }
 
-    let source_names = files
+    let source_texts = files
+        .into_iter()
+        .map(|file| {
+            let contents = String::from_utf8(file.contents).map_err(|error| {
+                let valid_up_to = error.utf8_error().valid_up_to();
+                let end = (valid_up_to + 1).min(error.as_bytes().len());
+                WitParseError {
+                    kind: WitParseErrorKind::InvalidUtf8 { valid_up_to },
+                    location: Some(WitSourceLocation {
+                        path: file.relative_path.clone(),
+                        range: valid_up_to..end,
+                    }),
+                }
+            })?;
+            Ok(WitSourceText {
+                path: file.relative_path,
+                text: contents,
+            })
+        })
+        .collect::<Result<Vec<_>, WitParseError>>()?;
+
+    parse_source_texts(unit, source_texts, &[])
+}
+
+fn parse_source_texts(
+    unit: WitUnit,
+    source_texts: Vec<WitSourceText>,
+    rewrites: &[SourceRewrite],
+) -> Result<ParsedWitPackageGroup, WitParseError> {
+    let source_names = source_texts
         .iter()
-        .map(|file| file.relative_path.clone())
+        .map(|source| source.path.clone())
         .collect();
     let mut source_map = SourceMap::new();
-    let mut source_mappings = Vec::with_capacity(files.len());
+    let mut source_mappings = Vec::with_capacity(source_texts.len());
+    let mut foreign_references = Vec::new();
     let mut parser_size = 0usize;
     let mut package_name_location = None;
     let mut nested_package_locations = Vec::new();
     let mut named_result_function_spans = Vec::new();
-    for file in files {
-        let contents = String::from_utf8(file.contents).map_err(|error| {
-            let valid_up_to = error.utf8_error().valid_up_to();
-            let end = (valid_up_to + 1).min(error.as_bytes().len());
-            WitParseError {
-                kind: WitParseErrorKind::InvalidUtf8 { valid_up_to },
-                location: Some(WitSourceLocation {
-                    path: file.relative_path.clone(),
-                    range: valid_up_to..end,
-                }),
-            }
-        })?;
-        let scan = source_scan::scan_source(&contents);
+    for source in &source_texts {
+        let (parser_source, rewritten_to_original) =
+            rewrite_source(source, rewrites).map_err(|_| WitParseError {
+                kind: WitParseErrorKind::Parse(
+                    "WIT source rewrite produced an invalid source range".to_owned(),
+                ),
+                location: None,
+            })?;
+        let scan = source_scan::scan_source(&parser_source);
         let parser_offset = u32::try_from(parser_size).expect("source size was bounded to u32");
         parser_size = parser_size
             .checked_add(scan.parser_text.len())
@@ -383,26 +525,40 @@ pub fn parse_source_files(
                 location: None,
             })?;
         let mapping = WitSourceMapping {
-            path: file.relative_path.clone(),
+            path: source.path.clone(),
             offset: parser_offset,
             parser_len: scan.parser_text.len(),
-            parser_to_source: scan.parser_to_source,
+            parser_to_source: scan
+                .parser_to_source
+                .iter()
+                .map(|offset| rewritten_to_original[*offset])
+                .collect(),
         };
         if package_name_location.is_none() {
-            package_name_location =
-                scan.package_name_range
-                    .clone()
-                    .map(|range| WitSourceLocation {
-                        path: file.relative_path.clone(),
-                        range,
-                    });
+            package_name_location = scan
+                .package_name_range
+                .clone()
+                .map(|range| source_location(source, &rewritten_to_original, range));
         }
-        nested_package_locations.extend(scan.nested_package_ranges.into_iter().map(|range| {
-            WitSourceLocation {
-                path: file.relative_path.clone(),
-                range,
-            }
-        }));
+        nested_package_locations.extend(
+            scan.nested_package_ranges
+                .into_iter()
+                .map(|range| source_location(source, &rewritten_to_original, range)),
+        );
+        foreign_references.extend(
+            source_scan::scan_foreign_references(&source.text)
+                .into_iter()
+                .map(|reference| WitForeignReference {
+                    identity: reference.identity,
+                    version: reference.version,
+                    location: WitSourceLocation {
+                        path: source.path.clone(),
+                        range: reference.range,
+                    },
+                    version_range: reference.version_range,
+                    item_range: reference.item_range,
+                }),
+        );
         named_result_function_spans.extend(scan.named_result_function_ranges.into_iter().map(
             |range| {
                 let start = mapping
@@ -415,7 +571,7 @@ pub fn parse_source_files(
                     ..end.expect("group source spans are bounded")
             },
         ));
-        source_map.push_str(&file.relative_path, scan.parser_text);
+        source_map.push_str(&source.path, scan.parser_text);
         source_mappings.push(mapping);
     }
 
@@ -424,13 +580,271 @@ pub fn parse_source_files(
             unit,
             group,
             source_names,
+            source_texts,
             source_mappings,
+            foreign_references,
             package_name_location,
             nested_package_locations,
             named_result_function_spans,
         }),
         Err((_, error)) => Err(map_parse_error(&source_mappings, error)),
     }
+}
+
+#[derive(Clone, Debug)]
+struct SourceRewrite {
+    path: String,
+    range: Range<usize>,
+    mapped_range: Range<usize>,
+    replacement: String,
+}
+
+fn rewrite_source(
+    source: &WitSourceText,
+    rewrites: &[SourceRewrite],
+) -> Result<(String, Vec<usize>), ()> {
+    let mut source_rewrites = rewrites
+        .iter()
+        .filter(|rewrite| rewrite.path == source.path)
+        .collect::<Vec<_>>();
+    source_rewrites.sort_by(|left, right| {
+        left.range
+            .start
+            .cmp(&right.range.start)
+            .then_with(|| left.range.end.cmp(&right.range.end))
+    });
+
+    let mut text = String::with_capacity(source.text.len());
+    let mut rewritten_to_original = vec![0];
+    let mut source_cursor = 0;
+    for rewrite in source_rewrites {
+        if rewrite.range.start < source_cursor
+            || rewrite.range.end < rewrite.range.start
+            || rewrite.range.end > source.text.len()
+            || !source.text.is_char_boundary(rewrite.range.start)
+            || !source.text.is_char_boundary(rewrite.range.end)
+            || rewrite.mapped_range.start > rewrite.mapped_range.end
+            || rewrite.mapped_range.end > source.text.len()
+            || !source.text.is_char_boundary(rewrite.mapped_range.start)
+            || !source.text.is_char_boundary(rewrite.mapped_range.end)
+        {
+            return Err(());
+        }
+        append_original_mapping(
+            &source.text,
+            source_cursor..rewrite.range.start,
+            &mut text,
+            &mut rewritten_to_original,
+        );
+        append_replacement_mapping(
+            &rewrite.replacement,
+            rewrite.mapped_range.start,
+            rewrite.mapped_range.end,
+            &mut text,
+            &mut rewritten_to_original,
+        );
+        source_cursor = rewrite.range.end;
+    }
+    append_original_mapping(
+        &source.text,
+        source_cursor..source.text.len(),
+        &mut text,
+        &mut rewritten_to_original,
+    );
+
+    Ok((text, rewritten_to_original))
+}
+
+fn append_original_mapping(
+    source: &str,
+    range: Range<usize>,
+    output: &mut String,
+    rewritten_to_original: &mut Vec<usize>,
+) {
+    *rewritten_to_original
+        .last_mut()
+        .expect("source map has an initial boundary") = range.start;
+    output.push_str(&source[range.clone()]);
+    rewritten_to_original.extend((range.start..range.end).map(|offset| offset + 1));
+}
+
+fn append_replacement_mapping(
+    replacement: &str,
+    source_start: usize,
+    source_end: usize,
+    output: &mut String,
+    rewritten_to_original: &mut Vec<usize>,
+) {
+    *rewritten_to_original
+        .last_mut()
+        .expect("source map has an initial boundary") = source_start;
+    output.push_str(replacement);
+    rewritten_to_original.extend((0..replacement.len()).map(|offset| {
+        if offset + 1 == replacement.len() {
+            source_end
+        } else {
+            source_start
+        }
+    }));
+}
+
+fn source_location(
+    source: &WitSourceText,
+    rewritten_to_original: &[usize],
+    range: Range<usize>,
+) -> WitSourceLocation {
+    WitSourceLocation {
+        path: source.path.clone(),
+        range: rewritten_to_original[range.start]..rewritten_to_original[range.end],
+    }
+}
+
+/// Resolve and normalize each foreign WIT reference in a parsed package.
+///
+/// References are checked against active direct package edges, then rewritten
+/// to the exact selected version before the parser group is returned. A
+/// package's own qualified WIT references become local interface or world
+/// references so the parser does not treat a package as depending on itself.
+pub fn resolve_package_references(
+    parsed: ParsedWitPackageGroup,
+    graph: &WitPackageGraph,
+) -> Result<ResolvedWitPackageGroup, WitReferenceResolutionError> {
+    let unit = parsed.unit.clone();
+    if let Some(location) = parsed.nested_package_locations.first() {
+        return Err(WitReferenceResolutionError {
+            kind: WitReferenceResolutionErrorKind::NestedPackage,
+            location: Some(location.clone()),
+        });
+    }
+    let actual_package_name = parsed.group.main.name.to_string();
+    if actual_package_name != unit.canonical_name() {
+        return Err(WitReferenceResolutionError {
+            kind: WitReferenceResolutionErrorKind::PackageMismatch {
+                expected: unit.canonical_name().to_owned(),
+                actual: actual_package_name,
+            },
+            location: parsed.package_name_location.clone(),
+        });
+    }
+    let source_by_path = parsed
+        .source_texts
+        .iter()
+        .map(|source| (source.path.as_str(), source))
+        .collect::<HashMap<_, _>>();
+    let mut rewrites = Vec::with_capacity(parsed.foreign_references.len());
+    let mut direct_dependencies = Vec::new();
+    let mut seen_dependencies = HashSet::new();
+
+    for reference in &parsed.foreign_references {
+        let source = source_by_path
+            .get(reference.location.path.as_str())
+            .copied()
+            .ok_or_else(|| WitReferenceResolutionError {
+                kind: WitReferenceResolutionErrorKind::InvalidSourceRange,
+                location: Some(reference.location.clone()),
+            })?;
+        let requested_version = reference
+            .version
+            .as_deref()
+            .map(|version| {
+                // SemVer build metadata has no precedence and SAI's canonical
+                // package versions intentionally omit it. The WIT parser has
+                // already validated the complete version token.
+                Version::parse(
+                    version
+                        .split_once('+')
+                        .map_or(version, |(without_build, _)| without_build),
+                )
+            })
+            .transpose()
+            .map_err(|_| WitReferenceResolutionError {
+                kind: WitReferenceResolutionErrorKind::InvalidVersion(
+                    reference.version.clone().unwrap_or_default(),
+                ),
+                location: Some(reference.location.clone()),
+            })?;
+        let target = graph
+            .resolve_direct_reference(&unit, &reference.identity, requested_version.as_ref())
+            .map_err(|error| WitReferenceResolutionError {
+                kind: WitReferenceResolutionErrorKind::Reference(error),
+                location: Some(reference.location.clone()),
+            })?;
+
+        let replacement_range;
+        let replacement;
+        if target.unit() == &unit {
+            if reference.item_range.start < reference.location.range.start
+                || reference.item_range.end > reference.location.range.end
+                || reference.item_range.start > reference.item_range.end
+            {
+                return Err(WitReferenceResolutionError {
+                    kind: WitReferenceResolutionErrorKind::InvalidSourceRange,
+                    location: Some(reference.location.clone()),
+                });
+            }
+            replacement_range = reference.location.range.clone();
+            let mapped_range = reference.item_range.clone();
+            replacement = source.text[reference.item_range.clone()].to_owned();
+            rewrites.push(SourceRewrite {
+                path: reference.location.path.clone(),
+                range: replacement_range,
+                mapped_range,
+                replacement,
+            });
+            if target.unit() != &unit && seen_dependencies.insert(target.unit().clone()) {
+                direct_dependencies.push(target.unit().clone());
+            }
+            continue;
+        } else if let Some(version) = &reference.version {
+            let version_range = reference
+                .version_range
+                .clone()
+                .filter(|range| {
+                    range.start >= reference.location.range.start
+                        && range.end <= reference.location.range.end
+                        && range.start < range.end
+                        && source.text.get(range.clone()) == Some(version.as_str())
+                })
+                .ok_or_else(|| WitReferenceResolutionError {
+                    kind: WitReferenceResolutionErrorKind::InvalidSourceRange,
+                    location: Some(reference.location.clone()),
+                })?;
+            if version_range.start <= reference.location.range.start {
+                return Err(WitReferenceResolutionError {
+                    kind: WitReferenceResolutionErrorKind::InvalidSourceRange,
+                    location: Some(reference.location.clone()),
+                });
+            }
+            replacement_range = version_range;
+            replacement = target.selected_version().to_string();
+        } else {
+            replacement_range = reference.location.range.end..reference.location.range.end;
+            replacement = format!("@{}", target.selected_version());
+        }
+        rewrites.push(SourceRewrite {
+            path: reference.location.path.clone(),
+            mapped_range: replacement_range.clone(),
+            range: replacement_range,
+            replacement,
+        });
+
+        if target.unit() != &unit && seen_dependencies.insert(target.unit().clone()) {
+            direct_dependencies.push(target.unit().clone());
+        }
+    }
+
+    let normalized = parse_source_texts(unit, parsed.source_texts, &rewrites).map_err(|error| {
+        let location = error.location().cloned();
+        WitReferenceResolutionError {
+            kind: WitReferenceResolutionErrorKind::Reparse(error),
+            location,
+        }
+    })?;
+
+    Ok(ResolvedWitPackageGroup {
+        parsed: normalized,
+        direct_dependencies,
+    })
 }
 
 fn is_direct_wit_filename(path: &str) -> bool {
@@ -485,9 +899,11 @@ fn map_parse_error(sources: &[WitSourceMapping], error: ParseError) -> WitParseE
 #[cfg(test)]
 mod tests {
     use super::{
-        ParsedWitPackageGroup, WitParseError, WitSourceFile, WitSourceLocation, WitUnit,
-        parse_source_files,
+        ParsedWitPackageGroup, ResolvedWitPackageGroup, WitParseError,
+        WitReferenceResolutionErrorKind, WitResolveContext, WitSourceFile, WitSourceLocation,
+        WitUnit, parse_source_files, resolve_package_references,
     };
+    use super::{WitPackageEdge, WitPackageGraph, WitPackageNode};
     use sai_intern::{Interner, PackageInterner};
     use sai_package::{mvs::MvsPackageVersion, version::Version};
     use sai_stable_hash::StableHash;
@@ -507,6 +923,63 @@ mod tests {
 
     fn parse(files: impl IntoIterator<Item = WitSourceFile>) -> ParsedWitPackageGroup {
         parse_source_files(dir_unit(), files).expect("valid WIT source files")
+    }
+
+    fn package_parts(
+        identity: &str,
+        version: &str,
+    ) -> (WitUnit, WitPackageNode, MvsPackageVersion) {
+        let selected = MvsPackageVersion::new(
+            identity,
+            Version::parse(version).expect("valid test version"),
+        )
+        .expect("valid test package identity");
+        let packages = PackageInterner::new();
+        let key = format!("{}#{}", identity, selected.version().compatibility_line());
+        let package = packages.intern(&key).expect("valid package key");
+        let unit =
+            WitUnit::dir(package, &packages, &selected).expect("unit matches selected version");
+        let node =
+            WitPackageNode::new(unit.clone(), selected.clone()).expect("node matches package");
+        (unit, node, selected)
+    }
+
+    fn package_graph(
+        root_identity: &str,
+        root_version: &str,
+        dependencies: &[(&str, &str)],
+    ) -> (WitUnit, WitPackageGraph) {
+        let (root, root_node, _) = package_parts(root_identity, root_version);
+        let mut nodes = vec![root_node];
+        let mut edges = Vec::new();
+        for (identity, version) in dependencies {
+            let (unit, node, selected) = package_parts(identity, version);
+            nodes.push(node);
+            edges.push(WitPackageEdge::new(
+                root.clone(),
+                *identity,
+                selected,
+                Some(unit),
+            ));
+        }
+        let graph =
+            WitPackageGraph::new(root.clone(), nodes, edges).expect("valid WIT package graph");
+        (root, graph)
+    }
+
+    fn parse_for_unit(unit: WitUnit, path: &str, source: &str) -> ParsedWitPackageGroup {
+        parse_source_files(unit, [WitSourceFile::new(path, source)])
+            .expect("valid WIT source files")
+    }
+
+    fn resolved(
+        unit: WitUnit,
+        graph: &WitPackageGraph,
+        path: &str,
+        source: &str,
+    ) -> ResolvedWitPackageGroup {
+        resolve_package_references(parse_for_unit(unit, path, source), graph)
+            .expect("foreign WIT references resolve")
     }
 
     #[test]
@@ -648,6 +1121,258 @@ mod tests {
             package.source_names().collect::<Vec<_>>(),
             ["does-not-exist-on-disk.wit"]
         );
+    }
+
+    #[test]
+    fn resolves_references_in_first_use_order_and_normalizes_selected_versions() {
+        let (root, graph) = package_graph(
+            "acme:root",
+            "1.0.0",
+            &[("acme:first", "1.4.12"), ("acme:second", "0.9.3")],
+        );
+        let source = "\
+package acme:root@1.0.0;
+world app {
+    import acme:first/api@1.2.0;
+    import acme:second/base;
+    export acme:first/other@1.4.12;
+}
+";
+
+        let resolved = resolved(root, &graph, "root.wit", source);
+
+        assert_eq!(
+            resolved
+                .direct_dependencies()
+                .iter()
+                .map(WitUnit::canonical_name)
+                .collect::<Vec<_>>(),
+            ["acme:first@1.4.12", "acme:second@0.9.3"]
+        );
+        assert_eq!(
+            resolved
+                .parsed()
+                .foreign_references()
+                .iter()
+                .map(|reference| reference.version.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("1.2.0"), None, Some("1.4.12")]
+        );
+        let package_names = resolved
+            .parsed
+            .group
+            .main
+            .foreign_deps
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(package_names, ["acme:first@1.4.12", "acme:second@0.9.3"]);
+    }
+
+    #[test]
+    fn reports_version_and_missing_dependency_errors_at_original_utf8_ranges() {
+        let (root, graph) = package_graph("acme:root", "1.0.0", &[("acme:dep", "1.4.0")]);
+        let source =
+            "// 日本語\npackage acme:root@1.0.0;\nworld app { import acme:dep/api@1.5.0; }";
+        let error =
+            resolve_package_references(parse_for_unit(root.clone(), "version.wit", source), &graph)
+                .expect_err("a newer requested package version is invalid");
+        let location = error.location().expect("version error has a source range");
+        assert_eq!(location.path, "version.wit");
+        assert_eq!(&source[location.range.clone()], "acme:dep/api@1.5.0");
+        assert!(error.to_string().contains("newer than the build-provided"));
+
+        let source = "package acme:root@1.0.0;\nworld app { import acme:missing/api; }";
+        let error = resolve_package_references(parse_for_unit(root, "missing.wit", source), &graph)
+            .expect_err("undeclared package references are rejected");
+        let location = error
+            .location()
+            .expect("missing reference has a source range");
+        assert_eq!(&source[location.range.clone()], "acme:missing/api");
+        assert!(
+            error
+                .to_string()
+                .contains("add a dependency on `acme:missing`")
+        );
+    }
+
+    #[test]
+    fn accepts_build_metadata_and_comments_between_at_and_version() {
+        let (root, graph) = package_graph("acme:root", "1.0.0", &[("acme:dep", "1.4.123")]);
+        let source = "\
+package acme:root@1.0.0;
+world app {
+    import acme:dep/api@ /* selected version */ 1.4.123+build.7;
+}
+";
+        let resolved = resolved(root, &graph, "version.wit", source);
+
+        assert_eq!(
+            resolved.direct_dependencies(),
+            &[graph
+                .nodes()
+                .iter()
+                .find(|node| node.package_identity() == "acme:dep")
+                .expect("graph contains the dependency")
+                .unit()
+                .clone()]
+        );
+        assert_eq!(
+            resolved
+                .parsed
+                .group
+                .main
+                .foreign_deps
+                .keys()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["acme:dep@1.4.123"]
+        );
+        let reference = &resolved.parsed.foreign_references()[0];
+        assert_eq!(reference.version.as_deref(), Some("1.4.123+build.7"));
+        assert_eq!(
+            &source[reference.location.range.clone()],
+            "acme:dep/api@ /* selected version */ 1.4.123+build.7"
+        );
+    }
+
+    #[test]
+    fn validates_package_declaration_before_foreign_references() {
+        let (root, graph) = package_graph("acme:root", "1.0.0", &[]);
+        let source = "\
+package acme:other@1.0.0;
+world app { import acme:missing/api; }
+";
+        let error = resolve_package_references(
+            parse_for_unit(root.clone(), "mismatch.wit", source),
+            &graph,
+        )
+        .expect_err("package identity mismatch precedes missing references");
+        assert!(matches!(
+            error.kind(),
+            WitReferenceResolutionErrorKind::PackageMismatch { .. }
+        ));
+        let location = error.location().expect("package mismatch is located");
+        assert_eq!(location.path, "mismatch.wit");
+        assert_eq!(&source[location.range.clone()], "acme:other@1.0.0");
+
+        let source = "\
+package acme:root@1.0.0;
+package acme:nested { interface hidden {} }
+world app { import acme:missing/api; }
+";
+        let error = resolve_package_references(parse_for_unit(root, "nested.wit", source), &graph)
+            .expect_err("nested package is reported before foreign references");
+        assert!(matches!(
+            error.kind(),
+            WitReferenceResolutionErrorKind::NestedPackage
+        ));
+        let location = error.location().expect("nested package is located");
+        assert_eq!(location.path, "nested.wit");
+        assert_eq!(&source[location.range.clone()], "acme:nested");
+    }
+
+    #[test]
+    fn normalizes_qualified_self_references_to_local_wit_items() {
+        let (root, graph) = package_graph("acme:root", "1.0.0", &[]);
+        let source = "\
+package acme:root@1.0.0;
+interface api { type value = u32; }
+interface client { use acme:root/api.{value}; }
+world app { import acme:root/api; include acme:root/base; }
+world base {}
+";
+        let resolved = resolved(root, &graph, "self.wit", source);
+
+        assert!(resolved.direct_dependencies().is_empty());
+        assert!(
+            resolved.parsed.group.main.foreign_deps.is_empty(),
+            "self references must be parsed as local WIT items"
+        );
+    }
+
+    #[test]
+    fn preserves_source_byte_mappings_after_version_normalization() {
+        let (root, graph) = package_graph("acme:root", "1.0.0", &[("acme:dep", "1.4.123")]);
+        let source = "\
+// 日本語
+package acme:root@1.0.0;
+world app { import acme:dep/api@1.2.0; }
+interface api { read: func() -> (left: u32, right: u32); }
+";
+        let resolved = resolved(root, &graph, "mapped.wit", source);
+        let mapping = &resolved.parsed.source_mappings[0];
+
+        assert_eq!(mapping.parser_to_source.len(), mapping.parser_len + 1);
+        assert!(
+            mapping
+                .parser_to_source
+                .windows(2)
+                .all(|pair| pair[0] <= pair[1])
+        );
+        let original_reference = source
+            .find("acme:dep/api@1.2.0")
+            .expect("source contains the foreign reference");
+        let original_version_start = original_reference + "acme:dep/api@".len();
+        let normalized_version_end = original_version_start + "1.4.123".len();
+        assert_eq!(
+            mapping.parser_to_source[original_version_start],
+            original_version_start
+        );
+        assert_eq!(
+            mapping.parser_to_source[normalized_version_end],
+            original_version_start + "1.2.0".len()
+        );
+        assert!(
+            resolved
+                .parsed
+                .group
+                .main
+                .foreign_deps
+                .keys()
+                .any(|name| name.to_string() == "acme:dep@1.4.123")
+        );
+        let named_result_span = resolved
+            .parsed
+            .named_result_function_spans
+            .first()
+            .expect("named result function is retained");
+        let original_function_range = mapping.parser_to_source[named_result_span.start as usize]
+            ..mapping.parser_to_source[named_result_span.end as usize];
+        assert_eq!(&source[original_function_range], "read");
+    }
+
+    #[test]
+    fn normalized_foreign_packages_push_after_the_selected_dependency() {
+        let (root, graph) = package_graph("acme:root", "1.0.0", &[("acme:dep", "1.4.12")]);
+        let dependency = graph
+            .nodes()
+            .iter()
+            .find(|node| node.package_identity() == "acme:dep")
+            .expect("graph contains the selected dependency")
+            .unit()
+            .clone();
+        let dependency_source = "package acme:dep@1.4.12;\ninterface api { type value = u32; }";
+        let dependency_package = parse_for_unit(dependency, "dependency.wit", dependency_source);
+
+        let root_source = "\
+package acme:root@1.0.0;
+world app { import acme:dep/api@1.2.0; }
+";
+        let normalized_root = resolved(root, &graph, "root.wit", root_source);
+        let (parsed_root, direct_dependencies) = normalized_root.into_parts();
+
+        let mut resolve = wit_parser::Resolve::default();
+        let mut context = WitResolveContext::default();
+        context
+            .push_package(&mut resolve, dependency_package)
+            .expect("selected dependency package parses");
+        context
+            .push_package(&mut resolve, parsed_root)
+            .expect("normalized foreign package name resolves");
+
+        assert_eq!(direct_dependencies.len(), 1);
+        assert_eq!(resolve.packages.len(), 2);
     }
 
     #[test]
