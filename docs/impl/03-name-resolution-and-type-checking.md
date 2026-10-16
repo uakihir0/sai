@@ -811,6 +811,17 @@ calls continue to expose typed errors without constructing diagnostics.
 `sai check` renders const diagnostics alongside function and top-level
 type-owner results; the command remains incomplete.
 
+**Predicate-owner type-path member diagnostics (IR-575).** The closure-aware
+invariant, refined/distinct, and extern-function adapters map typed private and
+missing source-member failures through the same snapshot-aware mapper.
+`PredicateOwnerResolution` exposes the result in a separate optional channel,
+so predicate, local, module, and test-only results remain independent.
+Package-local calls retain typed path errors without constructing mapped
+diagnostics. `sai check` renders predicate-owner diagnostics alongside the
+existing type, function, and const diagnostics. Locked CLI coverage exercises
+transitive re-export paths from invariant/refined predicates and an extern
+signature; the command remains incomplete.
+
 **Qualified missing-member diagnostics (IR-545).** The module path walker
 retains the exact `ModuleTarget` when a member is missing. The driver emits a
 snapshot-bound `UNRESOLVED_NAME` at that segment with the canonical package
