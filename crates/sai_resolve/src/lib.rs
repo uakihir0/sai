@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod interface_impls;
 pub mod interface_uses;
 pub mod module_member_lookup;
 pub mod module_path;
@@ -16,6 +17,12 @@ pub mod use_target_diagnostics;
 pub mod wit_name;
 pub mod wit_name_collisions;
 
+pub use interface_impls::{
+    InterfaceImpl, InterfaceImplFunction, InterfaceImplInput, InterfaceImplInterface,
+    InterfaceImplInterfaceItem, InterfaceImplInterfaceItemKind, InterfaceImplItem,
+    InterfaceImplItemKind, InterfaceImplResource, InterfaceImplTarget,
+    InterfaceImplUnsupportedFunction, InterfaceImpls, InterfaceImplsInput, collect_interface_impls,
+};
 pub use interface_uses::{
     InterfaceUseReference, InterfaceUses, InterfaceUsesInput, interface_uses,
 };
