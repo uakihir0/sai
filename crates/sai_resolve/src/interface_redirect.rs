@@ -1,10 +1,12 @@
 //! Lookup tables for the interface-item redirects of impl/16 §16.7.4.
 //!
-//! This module only builds the redirect candidates. Applying them to owner
-//! path resolutions is a separate resolver step.
+//! This module builds redirect candidates and applies them to one original
+//! owner path map. Callers select eligible owners and provide unredirected
+//! results; the helper does not decide where redirects apply.
 
 use crate::interface_impls::InterfaceImpls;
-use sai_hir::DefId;
+use crate::package_scopes::{DefKind, PathRes, Res};
+use sai_hir::{DefId, HirId};
 use std::collections::HashMap;
 
 /// Accepted interface-item targets for one package.
@@ -69,6 +71,54 @@ impl InterfaceRedirects {
     pub fn resource_target(&self, resource: DefId) -> Option<DefId> {
         self.resources.get(&resource).copied()
     }
+
+    /// Applies at most one redirect to each path in an original owner result.
+    ///
+    /// Interface functions become associated functions, and bound resources
+    /// become their implementation resources. The returned `redirected` map
+    /// records the original resolution for every path whose resolution
+    /// changed, so later phases can recover its interface identity.
+    ///
+    /// The lookup is always performed against each path's original
+    /// resolution. A target is never looked up again, even if it is itself a
+    /// key in `resources`.
+    ///
+    /// The caller is responsible for invoking this only for eligible owners,
+    /// using their unredirected resolution map. In particular, interface impl
+    /// targets and associated-type RHS owners must not be redirected.
+    pub fn apply_to_paths(
+        &self,
+        original_paths: &HashMap<HirId, PathRes>,
+    ) -> (HashMap<HirId, PathRes>, HashMap<HirId, Res>) {
+        let mut paths = original_paths.clone();
+        let mut redirected = HashMap::new();
+
+        for (&hir_id, original) in original_paths {
+            let target = match original.base {
+                Res::Def(DefKind::Fn, def) => self
+                    .function_target(def)
+                    .map(|target| Res::Def(DefKind::AssocFn, target)),
+                Res::Def(DefKind::Resource, def) => self
+                    .resource_target(def)
+                    .map(|target| Res::Def(DefKind::Resource, target)),
+                _ => None,
+            };
+            let Some(target) = target else {
+                continue;
+            };
+            if target == original.base {
+                continue;
+            }
+
+            paths
+                .get_mut(&hir_id)
+                .expect("cloned path map retains every original key")
+                .base = target;
+            redirected.insert(hir_id, original.base);
+        }
+
+        (paths, redirected)
+    }
 }
 
 #[cfg(test)]
@@ -79,8 +129,10 @@ mod tests {
         InterfaceImplTypeResolution,
     };
     use sai_diagnostics::Location;
-    use sai_hir::{DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, LocalDefId};
-    use sai_intern::{Interner, PackageId, PackageInterner};
+    use sai_hir::{
+        DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, LocalDefId, OwnerId,
+    };
+    use sai_intern::{BindingId, Interner, ItemLocalId, PackageId, PackageInterner};
     use sai_vfs::{FileId, Span, TextRange, TextSize};
     use std::sync::Arc;
 
@@ -416,5 +468,119 @@ mod tests {
 
         let redirects = InterfaceRedirects::from_impls(&result);
         assert_eq!(redirects.function_target(interface_fn), None);
+    }
+
+    fn path_id(local: LocalDefId) -> HirId {
+        HirId {
+            owner: OwnerId { def_id: local },
+            local_id: ItemLocalId::default(),
+        }
+    }
+
+    fn path_res(base: Res, resolved_segments: u32, segment_count: u32) -> PathRes {
+        PathRes {
+            base,
+            resolved_segments,
+            segment_count,
+        }
+    }
+
+    #[test]
+    fn applies_function_and_resource_redirects_and_records_original_resolutions() {
+        let mut fixture = Fixture::new();
+        let interface_fn = fixture.local("interface-fn").to_def_id();
+        let impl_fn = fixture.local("impl-fn").to_def_id();
+        let interface_resource = fixture.local("interface-resource").to_def_id();
+        let impl_resource = fixture.local("impl-resource").to_def_id();
+        let function_path = path_id(fixture.local("function-owner"));
+        let resource_path = path_id(fixture.local("resource-owner"));
+        let original_function = Res::Def(DefKind::Fn, interface_fn);
+        let original_resource = Res::Def(DefKind::Resource, interface_resource);
+        let original_paths = HashMap::from([
+            (function_path, path_res(original_function, 2, 3)),
+            (resource_path, path_res(original_resource, 1, 2)),
+        ]);
+        let redirects = InterfaceRedirects {
+            functions: HashMap::from([(interface_fn, impl_fn)]),
+            resources: HashMap::from([(interface_resource, impl_resource)]),
+        };
+
+        let (paths, redirected) = redirects.apply_to_paths(&original_paths);
+
+        assert_eq!(
+            paths[&function_path],
+            path_res(Res::Def(DefKind::AssocFn, impl_fn), 2, 3)
+        );
+        assert_eq!(
+            paths[&resource_path],
+            path_res(Res::Def(DefKind::Resource, impl_resource), 1, 2)
+        );
+        assert_eq!(redirected.get(&function_path), Some(&original_function));
+        assert_eq!(redirected.get(&resource_path), Some(&original_resource));
+        assert_eq!(redirected.len(), 2);
+    }
+
+    #[test]
+    fn leaves_unmatched_and_nonmatching_resolution_kinds_unchanged() {
+        let mut fixture = Fixture::new();
+        let interface_fn = fixture.local("interface-fn").to_def_id();
+        let interface_resource = fixture.local("interface-resource").to_def_id();
+        let unmatched_fn = fixture.local("unmatched-fn").to_def_id();
+        let function_path = path_id(fixture.local("function-owner"));
+        let resource_path = path_id(fixture.local("resource-owner"));
+        let other_kind_path = path_id(fixture.local("other-kind-owner"));
+        let local_path = path_id(fixture.local("local-owner"));
+        let error_path = path_id(fixture.local("error-owner"));
+        let original_paths = HashMap::from([
+            (
+                function_path,
+                path_res(Res::Def(DefKind::Fn, unmatched_fn), 1, 2),
+            ),
+            (
+                resource_path,
+                path_res(Res::Def(DefKind::Struct, interface_resource), 1, 1),
+            ),
+            (
+                other_kind_path,
+                path_res(Res::Def(DefKind::AssocFn, interface_fn), 2, 2),
+            ),
+            (local_path, path_res(Res::Local(BindingId::default()), 1, 1)),
+            (error_path, path_res(Res::Err, 0, 1)),
+        ]);
+        let redirects = InterfaceRedirects {
+            functions: HashMap::from([(interface_fn, fixture.local("impl-fn").to_def_id())]),
+            resources: HashMap::from([(
+                interface_resource,
+                fixture.local("impl-resource").to_def_id(),
+            )]),
+        };
+
+        let (paths, redirected) = redirects.apply_to_paths(&original_paths);
+
+        assert_eq!(paths, original_paths);
+        assert!(redirected.is_empty());
+    }
+
+    #[test]
+    fn resource_redirect_uses_one_lookup_from_the_original_resolution() {
+        let mut fixture = Fixture::new();
+        let resource = fixture.local("resource").to_def_id();
+        let first_target = fixture.local("first-target").to_def_id();
+        let second_target = fixture.local("second-target").to_def_id();
+        let path = path_id(fixture.local("owner"));
+        let original = Res::Def(DefKind::Resource, resource);
+        let original_paths = HashMap::from([(path, path_res(original, 3, 4))]);
+        let redirects = InterfaceRedirects {
+            functions: HashMap::new(),
+            resources: HashMap::from([(resource, first_target), (first_target, second_target)]),
+        };
+
+        let (paths, redirected) = redirects.apply_to_paths(&original_paths);
+
+        assert_eq!(
+            paths[&path],
+            path_res(Res::Def(DefKind::Resource, first_target), 3, 4)
+        );
+        assert_eq!(redirected.get(&path), Some(&original));
     }
 }
