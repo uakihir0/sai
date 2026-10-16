@@ -5,6 +5,7 @@
 
 use crate::WitSourceFile;
 use sai_hir::{DefId, PackageId};
+use sai_stable_hash::{StableHash, StableHasher};
 use std::sync::Arc;
 
 /// The synthetic direct-child filename used for generated WIT source.
@@ -15,10 +16,11 @@ pub const GENERATED_WIT_FILENAME: &str = "generated.wit";
 
 /// The generated WIT text and the source declarations represented by it.
 ///
-/// Equality and hashing compare all three fields by value. In particular,
-/// origins participate in equality because a view can need rebuilding when
-/// declarations retain identical WIT spelling but map to different SAI
-/// definitions.
+/// Equality and the standard `Hash` implementation compare all three fields
+/// by value. The cross-session [`StableHash`] omits session-local `DefId`
+/// identities but retains origin names. Origins still participate in equality
+/// because a view can need rebuilding when declarations retain identical WIT
+/// spelling but map to different SAI definitions.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct GeneratedText {
     /// Canonical WIT text for one source package.
@@ -42,6 +44,24 @@ impl GeneratedText {
             files: Arc::from([file]),
             complete: self.complete,
             origins: Arc::clone(&self.origins),
+        }
+    }
+}
+
+impl StableHash for GeneratedText {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xE8);
+        self.text.stable_hash(hasher);
+        self.complete.stable_hash(hasher);
+
+        // DefIds are session-local. Their value equality still participates
+        // in query early cutoff, but only the stable WIT interface names are
+        // included in this cross-session fingerprint. The resulting hash may
+        // collide for different session-local origins; query values are also
+        // compared by Eq before an old result is reused.
+        hasher.write_len(u64::try_from(self.origins.len()).unwrap_or(u64::MAX));
+        for (name, _) in self.origins.iter() {
+            name.stable_hash(hasher);
         }
     }
 }
@@ -127,6 +147,33 @@ mod tests {
             ..equal.clone()
         };
         assert_ne!(left, incomplete);
+    }
+
+    #[test]
+    fn generated_text_stable_hash_excludes_session_local_origin_ids() {
+        let packages = PackageInterner::new();
+        let package = packages.intern("acme:graphics#1").expect("package id");
+        let mut definitions = IndexVec::<DefIndex, ()>::new();
+        let first_index = definitions.push(()).expect("definition index");
+        let second_index = definitions.push(()).expect("definition index");
+        let first_origin = DefId::from_foreign(package, first_index);
+        let second_origin = DefId::from_foreign(package, second_index);
+        let first = GeneratedText {
+            text: Arc::from("package acme:graphics@1.2.3;\ninterface canvas {}\n"),
+            complete: true,
+            origins: Arc::from([("canvas".to_owned(), first_origin)]),
+        };
+        let second = GeneratedText {
+            origins: Arc::from([("canvas".to_owned(), second_origin)]),
+            ..first.clone()
+        };
+
+        assert_ne!(first, second);
+        assert_eq!(
+            sai_stable_hash::fingerprint(&first),
+            sai_stable_hash::fingerprint(&second),
+            "session-local DefIds must not enter a stable fingerprint"
+        );
     }
 
     #[test]

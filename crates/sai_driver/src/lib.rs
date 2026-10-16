@@ -88,9 +88,9 @@ use sai_vfs::{
     WorkspaceSnapshotId,
 };
 use sai_wit::{
-    EMBEDDED_WASI_VERSION, LoadedWasiPackage, WitContract, WitContractError, WitContractField,
-    WitUnit, WitUnitIdentityError, WitUnitKind, WitView, WitViewError, WitWasiLoadError,
-    load_embedded_wasi_package,
+    EMBEDDED_WASI_VERSION, GeneratedText, LoadedWasiPackage, WitContract, WitContractError,
+    WitContractField, WitUnit, WitUnitIdentityError, WitUnitKind, WitView, WitViewError,
+    WitWasiLoadError, load_embedded_wasi_package,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -123,6 +123,7 @@ pub struct RootDatabase {
     type_owner_paths: TypeOwnerPathQueries,
     declared_requirements: DeclaredRequirementsQueries,
     wit_contracts: WitContractQueries,
+    generated_wit_texts: GeneratedWitTextQueries,
     wit_units: WitUnitOfQueries,
     package_graph: InputQuery<u8, Option<PackageGraph>>,
     wasi_packages: WasiPackageQueries,
@@ -523,6 +524,59 @@ impl WitContractQueries {
             },
         )?;
         Ok(Self { query })
+    }
+}
+
+struct GeneratedWitTextQueries {
+    input: InputQuery<PackageKey, GeneratedText>,
+    query: DerivedQuery<PackageKey, Option<Arc<GeneratedText>>>,
+}
+
+impl GeneratedWitTextQueries {
+    fn new() -> Result<Self, QueryError> {
+        let input = InputQuery::<PackageKey, GeneratedText>::new(
+            "generated_wit_text_input",
+            Durability::Low,
+        )?;
+        let query_input = input.clone();
+        let query = DerivedQuery::new(
+            "generated_wit_text",
+            move |database: &mut QueryDatabase, key: &PackageKey| {
+                query_input.get_opt(database, key.clone())
+            },
+        )?;
+        Ok(Self { input, query })
+    }
+}
+
+/// Errors returned while setting or reading the tracked generated-WIT input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GeneratedWitTextError {
+    Package(PackageIdError),
+    PackageKey(PackageKeyError),
+    OriginPackageMismatch {
+        origin_index: usize,
+        expected_package_key: String,
+        found_package_key: Option<String>,
+    },
+    Query(QueryError),
+}
+
+impl From<PackageIdError> for GeneratedWitTextError {
+    fn from(error: PackageIdError) -> Self {
+        Self::Package(error)
+    }
+}
+
+impl From<PackageKeyError> for GeneratedWitTextError {
+    fn from(error: PackageKeyError) -> Self {
+        Self::PackageKey(error)
+    }
+}
+
+impl From<QueryError> for GeneratedWitTextError {
+    fn from(error: QueryError) -> Self {
+        Self::Query(error)
     }
 }
 
@@ -6389,6 +6443,7 @@ impl RootDatabase {
         let type_owner_paths = TypeOwnerPathQueries::new()?;
         let declared_requirements = DeclaredRequirementsQueries::new()?;
         let wit_contracts = WitContractQueries::new(declared_requirements.input.clone())?;
+        let generated_wit_texts = GeneratedWitTextQueries::new()?;
         let package_graph =
             InputQuery::<u8, Option<PackageGraph>>::new("package_graph", Durability::Medium)?;
         package_graph.set(&mut query_database, 0, None)?;
@@ -6420,6 +6475,7 @@ impl RootDatabase {
             type_owner_paths,
             declared_requirements,
             wit_contracts,
+            generated_wit_texts,
             wit_units,
             package_graph,
             wasi_packages,
@@ -6705,6 +6761,72 @@ impl RootDatabase {
                 error,
             },
         })
+    }
+
+    /// Sets the tracked generated-WIT snapshot produced for one package.
+    ///
+    /// The value includes canonical text, completeness, and session-local
+    /// source-interface origins. All three participate in the input's value
+    /// equality, so an origin-only update invalidates queries that consume
+    /// this snapshot.
+    pub fn set_generated_wit_text(
+        &mut self,
+        package: PackageId,
+        generated: GeneratedText,
+        durability: Durability,
+    ) -> Result<bool, GeneratedWitTextError> {
+        let package_name = self.packages.resolve(package)?;
+        let package_key = PackageKey::new(package_name.as_ref())?;
+        for (origin_index, (_, origin)) in generated.origins.iter().enumerate() {
+            if origin.package != package {
+                let found_package_key = self
+                    .packages
+                    .resolve(origin.package)
+                    .ok()
+                    .map(|name| name.to_string());
+                return Err(GeneratedWitTextError::OriginPackageMismatch {
+                    origin_index,
+                    expected_package_key: package_name.to_string(),
+                    found_package_key,
+                });
+            }
+        }
+        self.generated_wit_texts
+            .input
+            .set_at_durability(&mut self.query_database, package_key, generated, durability)
+            .map_err(GeneratedWitTextError::from)
+    }
+
+    /// Removes a generated-WIT snapshot and invalidates readers that observed
+    /// its presence.
+    pub fn remove_generated_wit_text(
+        &mut self,
+        package: PackageId,
+    ) -> Result<bool, GeneratedWitTextError> {
+        let package_name = self.packages.resolve(package)?;
+        let package_key = PackageKey::new(package_name.as_ref())?;
+        self.generated_wit_texts
+            .input
+            .remove(&mut self.query_database, package_key)
+            .map_err(GeneratedWitTextError::from)
+    }
+
+    /// Returns the current generated-WIT snapshot as a tracked query value.
+    ///
+    /// `None` means no generation result has been supplied for this package;
+    /// the generic WIT package loader reports that condition as a typed
+    /// failure rather than interpreting it as an empty package.
+    pub fn generated_wit_text(
+        &mut self,
+        package: PackageId,
+    ) -> Result<Option<Arc<GeneratedText>>, GeneratedWitTextError> {
+        let package_name = self.packages.resolve(package)?;
+        let package_key = PackageKey::new(package_name.as_ref())?;
+        self.generated_wit_texts
+            .query
+            .get(&mut self.query_database, package_key)
+            .map(|generated| generated.as_ref().clone())
+            .map_err(GeneratedWitTextError::from)
     }
 
     /// Interns a stable file key and returns its session-local file ID.
@@ -31147,6 +31269,137 @@ mod tests {
                 "wasi:{package_name} should expose definitions"
             );
         }
+    }
+
+    #[test]
+    fn generated_wit_snapshots_are_tracked_by_package_and_compare_origins() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let package = database
+            .intern_package("acme:graphics#1")
+            .expect("package key is valid");
+        let mut definitions = sai_hir::IndexVec::<sai_hir::DefIndex, ()>::new();
+        let first_origin = sai_hir::DefId::from_foreign(
+            package,
+            definitions.push(()).expect("first definition index"),
+        );
+        let second_origin = sai_hir::DefId::from_foreign(
+            package,
+            definitions.push(()).expect("second definition index"),
+        );
+        let first = GeneratedText {
+            text: Arc::from("package acme:graphics@1.2.3;\ninterface canvas {}\n"),
+            complete: true,
+            origins: Arc::from([("canvas".to_owned(), first_origin)]),
+        };
+
+        assert!(
+            database
+                .generated_wit_text(package)
+                .expect("missing input is a tracked None")
+                .is_none()
+        );
+        assert!(
+            database
+                .set_generated_wit_text(package, first.clone(), Durability::Low)
+                .expect("generated snapshot input is accepted")
+        );
+        let first_snapshot = database
+            .generated_wit_text(package)
+            .expect("generated snapshot is readable")
+            .expect("generated snapshot was set");
+        assert_eq!(*first_snapshot, first);
+
+        let changed_origin = GeneratedText {
+            origins: Arc::from([("canvas".to_owned(), second_origin)]),
+            ..first.clone()
+        };
+        assert!(
+            database
+                .set_generated_wit_text(package, changed_origin.clone(), Durability::Low)
+                .expect("origin-only update is accepted")
+        );
+        let changed_snapshot = database
+            .generated_wit_text(package)
+            .expect("origin update is tracked")
+            .expect("generated snapshot remains present");
+        assert_eq!(*changed_snapshot, changed_origin);
+        assert!(
+            !Arc::ptr_eq(&first_snapshot, &changed_snapshot),
+            "origin-only changes must not be cut off by the stable fingerprint"
+        );
+
+        assert!(
+            database
+                .remove_generated_wit_text(package)
+                .expect("generated snapshot can be removed")
+        );
+        assert!(
+            database
+                .generated_wit_text(package)
+                .expect("removal invalidates the reader")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn generated_wit_snapshots_reject_foreign_package_and_session_origins() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let package = database
+            .intern_package("acme:graphics#1")
+            .expect("package key is valid");
+        let other_package = database
+            .intern_package("acme:other#1")
+            .expect("other package key is valid");
+        let mut definitions = sai_hir::IndexVec::<sai_hir::DefIndex, ()>::new();
+        let foreign_package_origin = sai_hir::DefId::from_foreign(
+            other_package,
+            definitions.push(()).expect("definition index"),
+        );
+        let wrong_package = GeneratedText {
+            text: Arc::from("package acme:graphics@1.2.3;\ninterface canvas {}\n"),
+            complete: true,
+            origins: Arc::from([("canvas".to_owned(), foreign_package_origin)]),
+        };
+        assert!(matches!(
+            database.set_generated_wit_text(package, wrong_package, Durability::Low),
+            Err(GeneratedWitTextError::OriginPackageMismatch {
+                origin_index: 0,
+                expected_package_key,
+                found_package_key: Some(found_package_key),
+            }) if expected_package_key == "acme:graphics#1" && found_package_key == "acme:other#1"
+        ));
+
+        let foreign_database = RootDatabase::new().expect("foreign session initializes");
+        let foreign_package = foreign_database
+            .intern_package("acme:graphics#1")
+            .expect("matching foreign package key is valid");
+        let mut foreign_definitions = sai_hir::IndexVec::<sai_hir::DefIndex, ()>::new();
+        let foreign_origin = sai_hir::DefId::from_foreign(
+            foreign_package,
+            foreign_definitions
+                .push(())
+                .expect("foreign definition index"),
+        );
+        let wrong_session = GeneratedText {
+            text: Arc::from("package acme:graphics@1.2.3;\ninterface canvas {}\n"),
+            complete: true,
+            origins: Arc::from([("canvas".to_owned(), foreign_origin)]),
+        };
+        assert!(matches!(
+            database.set_generated_wit_text(package, wrong_session, Durability::Low),
+            Err(GeneratedWitTextError::OriginPackageMismatch {
+                origin_index: 0,
+                expected_package_key,
+                found_package_key: None,
+            }) if expected_package_key == "acme:graphics#1"
+        ));
+        assert!(
+            database
+                .generated_wit_text(package)
+                .expect("invalid origins do not poison tracked input")
+                .is_none(),
+            "a rejected snapshot must not be stored"
+        );
     }
 
     #[test]
