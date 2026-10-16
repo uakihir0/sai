@@ -2937,6 +2937,21 @@ mod tests {
                 .any(|diagnostic| diagnostic.code == Code::FeatureNotImplemented)
         );
 
+        let outside_interface = AttributeTarget::new(TargetKind::Enum);
+        let (outside_interface, _) =
+            validate_source_at_stage("@flags\nenum Bits { One }\n", outside_interface, 4);
+        assert_eq!(outside_interface.flags, None);
+        let outside_flags = outside_interface
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::InvalidFlagsEnum)
+            .expect("flags outside an interface have their dedicated diagnostic");
+        let location = outside_flags
+            .primary()
+            .expect("flags target diagnostic has a source location");
+        assert_eq!(location.span.range.start().raw(), 0);
+        assert_eq!(location.span.range.end().raw(), "@flags".len() as u32);
+
         for source in [
             "@flags()\nenum Bits { One }\n",
             "@flags(foo)\nenum Bits { One }\n",

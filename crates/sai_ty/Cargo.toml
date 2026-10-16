@@ -9,3 +9,7 @@ sai_diagnostics = { path = "../sai_diagnostics" }
 sai_hir = { path = "../sai_hir" }
 sai_resolve = { path = "../sai_resolve" }
 sai_wit = { path = "../sai_wit" }
+
+[dev-dependencies]
+sai_intern = { path = "../sai_intern" }
+sai_vfs = { path = "../sai_vfs" }
