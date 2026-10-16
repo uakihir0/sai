@@ -151,9 +151,15 @@ fn check_reports_non_interface_impl_targets_but_accepts_wit_view_interfaces() {
     .expect("write complete format-2 path lock");
     let source = concat!(
         "use acme:codec/api as api\n",
+        "interface local_api {\n",
+        "  fn run()\n",
+        "  fn stop()\n",
+        "}\n",
         "fn not_interface() {}\n",
+        "impl api { fn run() {} }\n",
         "impl api {}\n",
         "impl api.run {}\n",
+        "impl local_api { fn run() {} fn run() {} fn extra() {} }\n",
         "impl not_interface {}\n",
         "impl missing {}\n",
     );
@@ -198,6 +204,47 @@ fn check_reports_non_interface_impl_targets_but_accepts_wit_view_interfaces() {
     assert!(
         !stdout.contains("\"code\":\"WRONG_NAME_KIND\""),
         "the target-kind diagnostic replaces WRONG_NAME_KIND instead of duplicating it: {stdout}"
+    );
+    let repeated_and_extra = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"INTERFACE_IMPL_EXTRA_ITEM\""))
+        .collect::<Vec<_>>();
+    assert_eq!(repeated_and_extra.len(), 2, "{stdout}");
+    let repeated_run_start = source.match_indices("run").nth(3).unwrap().0;
+    assert!(
+        repeated_and_extra
+            .iter()
+            .any(|line| line.contains(&format!("\"start\":{{\"byte\":{repeated_run_start},"))),
+        "repeated item reports its later name: {stdout}"
+    );
+    let extra_start = source.find("extra").expect("local extra item exists");
+    assert!(
+        repeated_and_extra
+            .iter()
+            .any(|line| line.contains(&format!("\"start\":{{\"byte\":{extra_start},"))),
+        "extra item reports its name: {stdout}"
+    );
+    let missing = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"INTERFACE_IMPL_MISSING_ITEM\""))
+        .collect::<Vec<_>>();
+    assert_eq!(missing.len(), 1, "{stdout}");
+    let local_target_start = source.find("impl local_api").unwrap() + "impl ".len();
+    assert!(
+        missing[0].contains(&format!("\"start\":{{\"byte\":{local_target_start},")),
+        "missing item points at its implementation target: {}",
+        missing[0]
+    );
+    let duplicate = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"DUPLICATE_INTERFACE_IMPL\""))
+        .collect::<Vec<_>>();
+    assert_eq!(duplicate.len(), 1, "{stdout}");
+    let second_api_target = source.match_indices("impl api").nth(1).unwrap().0 + "impl ".len();
+    assert!(
+        duplicate[0].contains(&format!("\"start\":{{\"byte\":{second_api_target},")),
+        "duplicate target points at the later WIT-view target: {}",
+        duplicate[0]
     );
     assert!(
         diagnostics[0].contains("\"path\":\"src/lib.sai\"")

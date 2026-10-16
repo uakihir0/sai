@@ -2436,6 +2436,7 @@ fn owner_resolution_error_tag(error: &OwnerControlFlowResolutionError) -> u8 {
     match error {
         OwnerControlFlowResolutionError::Query(_) => 0,
         OwnerControlFlowResolutionError::PrimitivePrelude(_) => 1,
+        OwnerControlFlowResolutionError::SessionMismatch => 33,
         OwnerControlFlowResolutionError::SnapshotMismatch => 2,
         OwnerControlFlowResolutionError::ModuleTreeMismatch => 3,
         OwnerControlFlowResolutionError::ModuleMemberScopes(_) => 4,
@@ -2465,6 +2466,8 @@ fn owner_resolution_error_tag(error: &OwnerControlFlowResolutionError) -> u8 {
         OwnerControlFlowResolutionError::Labels(_) => 28,
         OwnerControlFlowResolutionError::Locals(_) => 29,
         OwnerControlFlowResolutionError::MissingInterfaceScope(_) => 30,
+        OwnerControlFlowResolutionError::MissingInterfaceImplTarget(_) => 31,
+        OwnerControlFlowResolutionError::InterfaceImplDiagnosticSourceMismatch { .. } => 32,
     }
 }
 

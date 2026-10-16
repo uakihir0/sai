@@ -92,7 +92,12 @@ use sai_resolve::prelude::{
 use sai_resolve::use_target_diagnostics::{
     UseTargetDiagnosticsError, collect_local_use_target_diagnostics,
 };
-use sai_resolve::{InterfaceUseReference, InterfaceUses, InterfaceUsesInput, interface_uses};
+use sai_resolve::{
+    InterfaceImplInput, InterfaceImplInterface, InterfaceImplInterfaceItem,
+    InterfaceImplInterfaceItemKind, InterfaceImplItem, InterfaceImplItemKind, InterfaceImplTarget,
+    InterfaceImplUnsupportedFunction, InterfaceImpls, InterfaceImplsInput, InterfaceUseReference,
+    InterfaceUses, InterfaceUsesInput, collect_interface_impls, interface_uses,
+};
 use sai_resolve::{ModuleId, ModuleTree, ModuleTreeQueries, ModuleTreeQueryError};
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher, fingerprint};
 use sai_syntax::ast::{self, AstNode, AstToken};
@@ -106,11 +111,11 @@ use sai_vfs::{
 };
 use sai_wit::{
     EMBEDDED_WASI_CATALOG, EMBEDDED_WASI_VERSION, GeneratedText, LoadedWasiPackage,
-    LoadedWitPackage, WitContract, WitContractError, WitContractField, WitPackageEdge,
+    LoadedWitPackage, Unsupported, WitContract, WitContractError, WitContractField, WitPackageEdge,
     WitPackageGraph, WitPackageGraphError, WitPackageLoadError, WitPackageLoadFailure,
     WitPackageNode, WitSourceFile, WitUnit, WitUnitIdentityError, WitUnitKind, WitView,
-    WitViewError, WitWasiLoadError, embedded_wasi_package, load_embedded_wasi_package,
-    load_wit_package_closure,
+    WitViewDefKind, WitViewError, WitWasiLoadError, embedded_wasi_package,
+    load_embedded_wasi_package, load_wit_package_closure,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2505,6 +2510,7 @@ pub struct TraitImplHeaderResolutions {
     member_scope_closure_fingerprint: Option<Fingerprint>,
     wit_view_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<TraitImplHeaderResolution>,
+    session_token: SessionToken,
 }
 
 impl TraitImplHeaderResolutions {
@@ -2517,7 +2523,8 @@ impl TraitImplHeaderResolutions {
     }
 
     pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
-        self.snapshot_id == collection.snapshot_id
+        self.session_token == collection.session_token
+            && self.snapshot_id == collection.snapshot_id
             && self.target_cfg == collection.target_cfg
             && self.collection_input_fingerprint == collection.input_fingerprint
     }
@@ -3085,6 +3092,7 @@ pub struct TraitImplMemberTestOnlyResolutions {
     collection_input_fingerprint: Fingerprint,
     member_scope_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<TraitImplMemberOwnerResolution>,
+    session_token: SessionToken,
 }
 
 impl TraitImplMemberTestOnlyResolutions {
@@ -3097,7 +3105,8 @@ impl TraitImplMemberTestOnlyResolutions {
     }
 
     pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
-        self.snapshot_id == collection.snapshot_id
+        self.session_token == collection.session_token
+            && self.snapshot_id == collection.snapshot_id
             && self.target_cfg == collection.target_cfg
             && self.collection_input_fingerprint == collection.input_fingerprint
     }
@@ -3773,6 +3782,7 @@ impl ConstOwnerResolutions {
 pub enum OwnerControlFlowResolutionError {
     Query(QueryError),
     PrimitivePrelude(PrimitivePreludeBuildError),
+    SessionMismatch,
     SnapshotMismatch,
     ModuleTreeMismatch,
     ModuleMemberScopes(Phase1ModuleMemberScopeError),
@@ -3786,6 +3796,10 @@ pub enum OwnerControlFlowResolutionError {
     PackageId(PackageIdError),
     MissingDefPath(OwnerId),
     MissingTargetDefPath(DefId),
+    MissingInterfaceImplTarget(DefId),
+    InterfaceImplDiagnosticSourceMismatch {
+        file_path: Option<String>,
+    },
     DescriptorNotInCurrentTarget {
         owner: OwnerId,
         file: FileId,
@@ -6067,6 +6081,255 @@ fn owner_type_generic_resolutions(owner: &HirOwner<'_>) -> HashMap<Symbol, Res> 
             .or_insert(Res::Def(kind, parameter.def_id.to_def_id()));
     }
     resolutions
+}
+
+fn local_interface_impl_interfaces(
+    database: &mut RootDatabase,
+    collection: &Phase1PackageScopesCollection,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<HashMap<DefId, InterfaceImplInterface>, OwnerControlFlowResolutionError> {
+    let mut interfaces = HashMap::new();
+    let owner_index = index_top_level_owner_descriptors(collection);
+    for descriptor in collection
+        .scopes
+        .top_level_owners
+        .iter()
+        .copied()
+        .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Interface)
+    {
+        let inputs =
+            database.current_owner_inputs(snapshot, descriptor.file, &collection.target_cfg)?;
+        if inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&ItemTreeKind::Interface) {
+            return Err(
+                OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                    owner: descriptor.owner,
+                    file: descriptor.file,
+                },
+            );
+        }
+        let def_paths = database
+            .def_paths
+            .get(&descriptor.owner.def_id.package())
+            .cloned()
+            .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                descriptor.owner,
+            ))?;
+        let expected_path = def_paths
+            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+            .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+            .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                descriptor.owner,
+            ))?;
+        let arena = HirArena::new();
+        let context = HirLoweringContext::new(
+            &inputs.ast_ids,
+            snapshot,
+            &inputs.root,
+            &arena,
+            &database.symbols,
+            &def_paths,
+        );
+        let owner_descriptor = find_top_level_owner_descriptor(
+            &owner_index,
+            descriptor.owner,
+            descriptor.file,
+            descriptor.item_id,
+            TopLevelOwnerKind::Interface,
+        )?;
+        let (hir_owner, _) = lower_top_level_owner(
+            owner_descriptor,
+            &expected_path,
+            &inputs.filtered_item_tree,
+            &inputs.retained_item_kinds,
+            &context,
+        )?;
+        let parent_members = match hir_owner.node {
+            OwnerNode::Item(item) => match item.kind {
+                ItemKind::Interface { items } => items,
+                _ => {
+                    return Err(OwnerControlFlowResolutionError::TopLevelOwnerKindMismatch {
+                        owner: descriptor.owner,
+                        file: descriptor.file,
+                        descriptor: TopLevelOwnerKind::Interface,
+                        current: ItemTreeKind::Interface,
+                    });
+                }
+            },
+            _ => {
+                return Err(
+                    OwnerControlFlowResolutionError::TopLevelOwnerDescriptorMismatch {
+                        owner: descriptor.owner,
+                        file: descriptor.file,
+                    },
+                );
+            }
+        };
+        let parent_entry = inputs
+            .filtered_item_tree
+            .items
+            .iter()
+            .find(|entry| {
+                entry.ast_id == descriptor.item_id && entry.kind == ItemTreeKind::Interface
+            })
+            .ok_or(
+                OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                    owner: descriptor.owner,
+                    file: descriptor.file,
+                },
+            )?;
+        let member_entries = parent_entry
+            .children
+            .iter()
+            .filter(|entry| interface_member_kind(entry.kind).is_some())
+            .collect::<Vec<_>>();
+        if member_entries.len() != parent_members.len() {
+            return Err(OwnerControlFlowResolutionError::Lowering(
+                HirLoweringError::ItemTreeEntryMismatch,
+            ));
+        }
+        let interface_scope = collection
+            .scopes
+            .interfaces
+            .get(&descriptor.owner.def_id.to_def_id())
+            .ok_or(OwnerControlFlowResolutionError::MissingInterfaceScope(
+                descriptor.owner,
+            ))?;
+        let effective_members = interface_scope
+            .members
+            .values()
+            .filter_map(|binding| match binding.res {
+                Res::Def(DefKind::Fn | DefKind::Resource, def) => Some(def),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut items = Vec::new();
+        for (entry, member_owner) in member_entries
+            .into_iter()
+            .zip(parent_members.iter().copied())
+        {
+            if !effective_members.contains(&member_owner.def_id.to_def_id()) {
+                continue;
+            }
+            let member_path = def_paths
+                .resolve_def_id(member_owner.def_id.to_def_id())
+                .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                    member_owner,
+                ))?;
+            let (member_hir, _) = lower_interface_item_owner(
+                member_owner,
+                &member_path,
+                &hir_owner,
+                descriptor.item_id,
+                entry.ast_id,
+                &inputs.filtered_item_tree,
+                &context,
+            )
+            .map_err(OwnerControlFlowResolutionError::Lowering)?;
+            let OwnerNode::InterfaceItem(item) = member_hir.node else {
+                return Err(OwnerControlFlowResolutionError::Lowering(
+                    HirLoweringError::ItemTreeEntryMismatch,
+                ));
+            };
+            if item.name.is_error() {
+                continue;
+            }
+            let name = database
+                .symbols
+                .resolve(item.name.sym)
+                .map_err(OwnerControlFlowResolutionError::SymbolLookup)?
+                .to_string();
+            let kind = match item.kind {
+                HirInterfaceItemKind::Fn { sig, .. } => InterfaceImplInterfaceItemKind::Function {
+                    unsupported: sig
+                        .is_async
+                        .then_some(InterfaceImplUnsupportedFunction::AsyncBeforeStage5),
+                },
+                HirInterfaceItemKind::Resource { .. } => InterfaceImplInterfaceItemKind::Resource,
+                _ => continue,
+            };
+            items.push(InterfaceImplInterfaceItem {
+                def: member_owner.def_id.to_def_id(),
+                name,
+                kind,
+            });
+        }
+        interfaces.insert(
+            descriptor.owner.def_id.to_def_id(),
+            InterfaceImplInterface {
+                def: descriptor.owner.def_id.to_def_id(),
+                items,
+            },
+        );
+    }
+    Ok(interfaces)
+}
+
+fn wit_view_interface_impl_interfaces(
+    wit_view_scopes: &Phase1ActiveWitViewScopes,
+) -> HashMap<DefId, InterfaceImplInterface> {
+    let mut interfaces = HashMap::new();
+    for foreign in wit_view_scopes.views() {
+        for view_interface in foreign.view.interfaces.values() {
+            let model_interface = &foreign.view.model.interfaces[view_interface.wit];
+            let mut members_by_item = HashMap::with_capacity(view_interface.members.len());
+            for (canonical_name, member) in &view_interface.members {
+                members_by_item.insert(member.item, (canonical_name, member));
+            }
+            let mut items = Vec::new();
+            for (item_index, _) in model_interface.items.iter_enumerated() {
+                let Some((canonical_name, member)) = members_by_item.get(&item_index) else {
+                    continue;
+                };
+                let kind = match member.kind {
+                    WitViewDefKind::Fn => {
+                        let unsupported = member.unsupported.map(|unsupported| match unsupported {
+                            Unsupported::Async => {
+                                InterfaceImplUnsupportedFunction::AsyncBeforeStage5
+                            }
+                            unsupported => InterfaceImplUnsupportedFunction::Wit(unsupported),
+                        });
+                        InterfaceImplInterfaceItemKind::Function { unsupported }
+                    }
+                    WitViewDefKind::Resource => InterfaceImplInterfaceItemKind::Resource,
+                    _ => continue,
+                };
+                items.push(InterfaceImplInterfaceItem {
+                    def: member.def,
+                    name: (*canonical_name).clone(),
+                    kind,
+                });
+            }
+            interfaces.insert(
+                view_interface.def,
+                InterfaceImplInterface {
+                    def: view_interface.def,
+                    items,
+                },
+            );
+        }
+    }
+    interfaces
+}
+
+fn interface_impl_source_location(
+    owner: OwnerId,
+    span: sai_hir::Span,
+    inputs: &CurrentOwnerInputs,
+) -> Result<sai_diagnostics::Location, OwnerControlFlowResolutionError> {
+    if span.file != inputs.filtered_item_tree.file {
+        return Err(OwnerControlFlowResolutionError::InvalidSourceLocation(
+            owner,
+        ));
+    }
+    sai_diagnostics::Location::from_decoded_source(
+        inputs.source_ref.clone(),
+        sai_diagnostics::Span::new(span.file, span.range),
+        &inputs.source,
+    )
+    .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        owner,
+    ))
 }
 
 fn interface_impl_target_diagnostics(
@@ -12139,6 +12402,360 @@ impl RootDatabase {
         })
     }
 
+    /// Collects interface implementation matches from the already-resolved
+    /// trait/impl header pass.
+    ///
+    /// This adapter runs after Phase 1 collection so it can use the validated
+    /// active source and WIT-view closures. HIR names and spans are lowered
+    /// transiently from `snapshot`; only `sai_resolve`'s data-only result and
+    /// snapshot-bound diagnostics escape.
+    pub fn collect_interface_impls_with_header_resolutions(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+        header_resolutions: &TraitImplHeaderResolutions,
+        member_resolutions: &TraitImplMemberTestOnlyResolutions,
+    ) -> Result<InterfaceImpls, OwnerControlFlowResolutionError> {
+        if collection.session_token != self.session_token {
+            return Err(OwnerControlFlowResolutionError::SessionMismatch);
+        }
+        if collection.snapshot_id != snapshot.id() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if !member_resolutions.matches_snapshot(snapshot) {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+        if !member_scopes.matches_collection(collection)
+            || !header_resolutions.matches_member_scopes(collection, member_scopes)
+            || !member_resolutions.matches_member_scopes(collection, member_scopes)
+            || !header_resolutions.matches_snapshot(snapshot)
+        {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        match wit_view_scopes {
+            Some(scopes) => {
+                self.validate_active_wit_view_scopes(collection, snapshot, scopes)?;
+                if !header_resolutions.matches_wit_view_scopes(collection, scopes) {
+                    return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                        Phase1ModuleMemberScopeError::PackageGraphMismatch(
+                            collection.package_key.clone(),
+                        ),
+                    ));
+                }
+            }
+            None if header_resolutions.wit_view_closure_fingerprint.is_some() => {
+                return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                    Phase1ModuleMemberScopeError::PackageGraphMismatch(
+                        collection.package_key.clone(),
+                    ),
+                ));
+            }
+            None => {}
+        }
+
+        let mut interfaces = local_interface_impl_interfaces(self, collection, snapshot)?;
+        for source_package in &member_scopes.source_packages {
+            let source_collection = &source_package.collection;
+            if source_collection.snapshot_id != snapshot.id()
+                || source_collection.target_cfg != collection.target_cfg
+            {
+                return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                    Phase1ModuleMemberScopeError::PackageGraphMismatch(
+                        source_collection.package_key.clone(),
+                    ),
+                ));
+            }
+            interfaces.extend(local_interface_impl_interfaces(
+                self,
+                source_collection,
+                snapshot,
+            )?);
+        }
+        if let Some(wit_view_scopes) = wit_view_scopes {
+            interfaces.extend(wit_view_interface_impl_interfaces(wit_view_scopes));
+        }
+
+        let mut header_by_owner = HashMap::with_capacity(header_resolutions.owners.len());
+        for owner in &header_resolutions.owners {
+            if header_by_owner.insert(owner.owner, owner).is_some() {
+                return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+            }
+        }
+        let mut impl_associated_type_resolutions = HashMap::new();
+        for owner in member_resolutions.owners() {
+            for member in owner.members() {
+                if member.kind() != TraitImplMemberKind::ImplAssociatedType {
+                    continue;
+                }
+                if impl_associated_type_resolutions
+                    .insert(member.owner(), member)
+                    .is_some()
+                {
+                    return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+                }
+            }
+        }
+
+        let owner_index = index_top_level_owner_descriptors(collection);
+        let mut impls = Vec::new();
+        let mut diagnostic_owners = HashMap::new();
+        let mut package = None;
+        let impl_descriptors = interface_generation_order(
+            module_tree,
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Impl)
+                .collect(),
+            &self.symbols,
+        )?;
+        for descriptor in impl_descriptors {
+            let header = header_by_owner.get(&descriptor.owner).ok_or(
+                OwnerControlFlowResolutionError::TopLevelOwnerDescriptorMismatch {
+                    owner: descriptor.owner,
+                    file: descriptor.file,
+                },
+            )?;
+            if header.kind != TopLevelOwnerKind::Impl {
+                return Err(OwnerControlFlowResolutionError::TopLevelOwnerKindMismatch {
+                    owner: descriptor.owner,
+                    file: descriptor.file,
+                    descriptor: TopLevelOwnerKind::Impl,
+                    current: ItemTreeKind::Impl,
+                });
+            }
+            let inputs =
+                self.current_owner_inputs(snapshot, descriptor.file, &collection.target_cfg)?;
+            package.get_or_insert_with(|| {
+                inputs
+                    .source_ref
+                    .package
+                    .clone()
+                    .unwrap_or_else(|| collection.package_key.as_str().to_owned())
+            });
+            diagnostic_owners
+                .entry((
+                    inputs.source_ref.path.clone(),
+                    inputs.source_ref.package.clone(),
+                ))
+                .or_insert(descriptor.owner);
+            if inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&ItemTreeKind::Impl) {
+                return Err(
+                    OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                        owner: descriptor.owner,
+                        file: descriptor.file,
+                    },
+                );
+            }
+            let def_paths = self
+                .def_paths
+                .get(&descriptor.owner.def_id.package())
+                .cloned()
+                .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                    descriptor.owner,
+                ))?;
+            let expected_path = def_paths
+                .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                    descriptor.owner,
+                ))?;
+            let arena = HirArena::new();
+            let context = HirLoweringContext::new(
+                &inputs.ast_ids,
+                snapshot,
+                &inputs.root,
+                &arena,
+                &self.symbols,
+                &def_paths,
+            );
+            let owner_descriptor = find_top_level_owner_descriptor(
+                &owner_index,
+                descriptor.owner,
+                descriptor.file,
+                descriptor.item_id,
+                TopLevelOwnerKind::Impl,
+            )?;
+            let (hir_owner, _) = lower_top_level_owner(
+                owner_descriptor,
+                &expected_path,
+                &inputs.filtered_item_tree,
+                &inputs.retained_item_kinds,
+                &context,
+            )?;
+            let (target_path, item_owners) = match hir_owner.node {
+                OwnerNode::Item(item) => match item.kind {
+                    ItemKind::Impl {
+                        kind: ImplKind::Interface { path },
+                        items,
+                        ..
+                    } => (path, items),
+                    _ => continue,
+                },
+                _ => {
+                    return Err(
+                        OwnerControlFlowResolutionError::TopLevelOwnerDescriptorMismatch {
+                            owner: descriptor.owner,
+                            file: descriptor.file,
+                        },
+                    );
+                }
+            };
+            let target_resolution = header
+                .type_path_resolution()
+                .ok()
+                .and_then(|resolution| resolution.paths.get(&target_path.hir_id))
+                .filter(|resolution| resolution.resolved_segments == resolution.segment_count);
+            let target = match target_resolution.map(|resolution| resolution.base) {
+                None | Some(Res::Err | Res::TestOnly(_)) => InterfaceImplTarget::Unresolved,
+                Some(Res::Def(DefKind::Interface, def)) => {
+                    InterfaceImplTarget::Interface(interfaces.get(&def).cloned().ok_or(
+                        OwnerControlFlowResolutionError::MissingInterfaceImplTarget(def),
+                    )?)
+                }
+                Some(_) => InterfaceImplTarget::WrongKind,
+            };
+            let target_location =
+                interface_impl_source_location(descriptor.owner, target_path.span, &inputs)?;
+            let parent_entry = inputs
+                .filtered_item_tree
+                .items
+                .iter()
+                .find(|entry| {
+                    entry.ast_id == descriptor.item_id && entry.kind == ItemTreeKind::Impl
+                })
+                .ok_or(
+                    OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                        owner: descriptor.owner,
+                        file: descriptor.file,
+                    },
+                )?;
+            let item_entries = parent_entry
+                .children
+                .iter()
+                .filter(|entry| {
+                    matches!(entry.kind, ItemTreeKind::AssocType | ItemTreeKind::AssocFn)
+                })
+                .collect::<Vec<_>>();
+            if item_entries.len() != item_owners.len() {
+                return Err(OwnerControlFlowResolutionError::Lowering(
+                    HirLoweringError::ItemTreeEntryMismatch,
+                ));
+            }
+            let mut items = Vec::with_capacity(item_owners.len());
+            for (entry, item_owner) in item_entries.into_iter().zip(item_owners.iter().copied()) {
+                let expected_item_path = def_paths
+                    .resolve_def_id(item_owner.def_id.to_def_id())
+                    .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                    .ok_or(OwnerControlFlowResolutionError::MissingDefPath(item_owner))?;
+                let (item_hir, _) = lower_impl_item_owner(
+                    item_owner,
+                    &expected_item_path,
+                    &hir_owner,
+                    descriptor.item_id,
+                    entry.ast_id,
+                    &inputs.filtered_item_tree,
+                    &context,
+                )
+                .map_err(OwnerControlFlowResolutionError::Lowering)?;
+                let OwnerNode::ImplItem(item) = item_hir.node else {
+                    return Err(OwnerControlFlowResolutionError::Lowering(
+                        HirLoweringError::ItemTreeEntryMismatch,
+                    ));
+                };
+                if item.name.is_error() {
+                    continue;
+                }
+                let name = self
+                    .symbols
+                    .resolve(item.name.sym)
+                    .map_err(OwnerControlFlowResolutionError::SymbolLookup)?
+                    .to_string();
+                let kind = match item.kind {
+                    ImplItemKind::Fn { .. } => InterfaceImplItemKind::Function,
+                    ImplItemKind::AssocType { ty } => {
+                        let resolved_type = match ty.kind {
+                            TyKind::Path(path) => impl_associated_type_resolutions
+                                .get(&item.owner_id)
+                                .and_then(|resolution| resolution.type_path_resolution().ok())
+                                .and_then(|resolution| resolution.paths().get(&path.hir_id))
+                                .filter(|resolution| {
+                                    resolution.resolved_segments == resolution.segment_count
+                                })
+                                .and_then(|resolution| match resolution.base {
+                                    Res::Def(_, def) => Some(def),
+                                    _ => None,
+                                }),
+                            _ => None,
+                        };
+                        InterfaceImplItemKind::AssociatedType { resolved_type }
+                    }
+                };
+                items.push(InterfaceImplItem {
+                    def: item.owner_id.def_id,
+                    name,
+                    kind,
+                    name_location: interface_impl_source_location(
+                        item.owner_id,
+                        item.name.span,
+                        &inputs,
+                    )?,
+                    item_span: sai_vfs::Span::new(item.span.file, item.span.range),
+                });
+            }
+            impls.push(InterfaceImplInput {
+                impl_def: descriptor.owner.def_id,
+                target,
+                target_location,
+                items,
+            });
+        }
+
+        let mut collected = collect_interface_impls(InterfaceImplsInput {
+            package: package.unwrap_or_else(|| {
+                collection
+                    .package_key
+                    .as_str()
+                    .split_once('#')
+                    .map_or(collection.package_key.as_str(), |(identity, _)| identity)
+                    .to_owned()
+            }),
+            impls,
+        });
+        for diagnostic in &mut collected.diagnostics {
+            let Some(primary) = diagnostic.primary() else {
+                return Err(
+                    OwnerControlFlowResolutionError::InterfaceImplDiagnosticSourceMismatch {
+                        file_path: None,
+                    },
+                );
+            };
+            let owner = diagnostic_owners
+                .get(&(primary.file.path.clone(), primary.file.package.clone()))
+                .copied()
+                .ok_or_else(|| {
+                    OwnerControlFlowResolutionError::InterfaceImplDiagnosticSourceMismatch {
+                        file_path: Some(primary.file.path.clone()),
+                    }
+                })?;
+            *diagnostic = diagnostic
+                .clone()
+                .with_workspace_snapshot(snapshot)
+                .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+        }
+        Ok(collected)
+    }
+
     /// Resolves partial type heads and diagnoses test-only references in
     /// direct trait and impl headers.
     ///
@@ -12481,6 +13098,7 @@ impl RootDatabase {
                 .map(|scopes| scopes.closure_fingerprint),
             wit_view_closure_fingerprint: wit_view_scopes.map(|scopes| scopes.closure_fingerprint),
             owners,
+            session_token: self.session_token.clone(),
         })
     }
 
@@ -12979,6 +13597,7 @@ impl RootDatabase {
             member_scope_closure_fingerprint: member_scopes
                 .map(|scopes| scopes.closure_fingerprint),
             owners,
+            session_token: self.session_token.clone(),
         })
     }
 
@@ -19832,8 +20451,552 @@ mod tests {
     }
 
     #[test]
+    fn interface_impl_collection_matches_local_items_and_keeps_target_diagnostics_single_owned() {
+        let source = concat!(
+            "interface api {\n",
+            "  fn run()\n",
+            "  fn stop()\n",
+            "}\n",
+            "fn not_interface() {}\n",
+            "impl api {\n",
+            "  fn run() {}\n",
+            "  fn run() {}\n",
+            "  fn extra() {}\n",
+            "}\n",
+            "impl api {}\n",
+            "impl not_interface { fn should_skip() {} }\n",
+            "impl missing { fn should_skip() {} }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("local interface impl source collects");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty source member closure validates");
+        let header_resolutions = database
+            .resolve_trait_impl_header_test_only_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("local impl targets resolve");
+        let member_resolutions = database
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("impl associated types resolve");
+
+        let collected = database
+            .collect_interface_impls_with_header_resolutions(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                None,
+                &header_resolutions,
+                &member_resolutions,
+            )
+            .expect("interface impl items collect");
+
+        assert_eq!(collected.impls.len(), 4);
+        assert_eq!(collected.by_interface.len(), 1);
+        assert_eq!(
+            collected
+                .impls
+                .iter()
+                .map(|implementation| implementation.interface.is_some())
+                .collect::<Vec<_>>(),
+            [true, true, false, false],
+            "wrong-kind and unresolved targets preserve records without item matching"
+        );
+        assert_eq!(
+            collected
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::InterfaceImplExtraItem,
+                sai_diagnostics::Code::InterfaceImplExtraItem,
+                sai_diagnostics::Code::InterfaceImplMissingItem,
+                sai_diagnostics::Code::DuplicateInterfaceImpl,
+            ],
+            "repeated, extra, missing, and duplicate diagnostics follow source/spec order"
+        );
+        assert!(
+            collected
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.has_workspace_snapshot()),
+            "collector diagnostics are rebound to the active workspace snapshot"
+        );
+        let repeated_start = source.match_indices("run").nth(2).unwrap().0;
+        assert_eq!(
+            collected.diagnostics[0]
+                .primary()
+                .map(|location| location.span.range.start()),
+            Some(sai_diagnostics::TextSize::new(repeated_start as u32)),
+            "the repeated-item primary location points at the later name"
+        );
+        let extra_start = source.find("extra").expect("extra item exists");
+        assert_eq!(
+            collected.diagnostics[1]
+                .primary()
+                .map(|location| location.span.range.start()),
+            Some(sai_diagnostics::TextSize::new(extra_start as u32))
+        );
+        let first_target_start = source.find("impl api").unwrap() + "impl ".len();
+        assert_eq!(
+            collected.diagnostics[2]
+                .primary()
+                .map(|location| location.span.range.start()),
+            Some(sai_diagnostics::TextSize::new(first_target_start as u32)),
+            "missing items point at the full implementation target"
+        );
+        let second_target_start = source[first_target_start + 1..]
+            .find("impl api")
+            .map(|offset| first_target_start + 1 + offset + "impl ".len())
+            .expect("second interface impl target exists");
+        assert_eq!(
+            collected.diagnostics[3]
+                .primary()
+                .map(|location| location.span.range.start()),
+            Some(sai_diagnostics::TextSize::new(second_target_start as u32)),
+            "duplicate target diagnostic points at the later target"
+        );
+        match &collected.diagnostics[3].related()[0] {
+            sai_diagnostics::Related::DeclaredHere { location, .. } => assert_eq!(
+                location.span.range.start(),
+                sai_diagnostics::TextSize::new(first_target_start as u32),
+                "duplicate target relates to the first target"
+            ),
+            other => panic!("duplicate target has an unexpected related fact: {other:?}"),
+        }
+
+        let target_diagnostics = header_resolutions
+            .owners()
+            .iter()
+            .flat_map(|owner| {
+                owner
+                    .interface_impl_target_diagnostics()
+                    .expect("header target-kind diagnostics resolve")
+                    .iter()
+            })
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::ImplTargetNotInterface)
+            .collect::<Vec<_>>();
+        assert_eq!(target_diagnostics.len(), 1);
+        assert_eq!(
+            target_diagnostics[0]
+                .primary()
+                .map(|location| location.span.range.start()),
+            Some(sai_diagnostics::TextSize::new(
+                (source.find("impl not_interface").unwrap() + "impl ".len()) as u32
+            )),
+            "IR-619 alone diagnoses the resolved wrong-kind target"
+        );
+        assert!(
+            collected
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::ImplTargetNotInterface),
+            "the collector does not create a duplicate target-kind diagnostic"
+        );
+
+        let stale_snapshot = phase1_snapshot_from_vfs(&mut database, &module_tree, 18);
+        assert!(matches!(
+            database.collect_interface_impls_with_header_resolutions(
+                &collection,
+                &module_tree,
+                &stale_snapshot,
+                &member_scopes,
+                None,
+                &header_resolutions,
+                &member_resolutions,
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+        ));
+    }
+
+    #[test]
+    fn interface_impl_collection_records_resolved_resource_bindings() {
+        let source = concat!(
+            "resource Concrete {}\n",
+            "interface api { resource Handle {} }\n",
+            "impl api { type Handle = Concrete }\n",
+            "interface unresolved_api { resource Thing {} }\n",
+            "impl unresolved_api { type Thing = missing }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("local resource binding source collects");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty source member closure validates");
+        let header_resolutions = database
+            .resolve_trait_impl_header_test_only_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("interface targets resolve");
+        let member_resolutions = database
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("associated type RHS paths resolve");
+
+        let collected = database
+            .collect_interface_impls_with_header_resolutions(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                None,
+                &header_resolutions,
+                &member_resolutions,
+            )
+            .expect("resolved binding identities are collected");
+
+        assert_eq!(collected.impls.len(), 2);
+        let api_symbol = database
+            .symbols
+            .intern("api")
+            .expect("interface name interns");
+        let resource_symbol = database
+            .symbols
+            .intern("Handle")
+            .expect("abstract resource name interns");
+        let concrete_symbol = database
+            .symbols
+            .intern("Concrete")
+            .expect("implementation resource name interns");
+        let module_scope = &collection.scopes.modules[0].scope;
+        let interface_def = match module_scope
+            .get(&api_symbol)
+            .expect("local interface binding exists")
+            .res
+        {
+            Res::Def(DefKind::Interface, def) => def,
+            other => panic!("api resolves to a local interface, got {other:?}"),
+        };
+        let interface_resource = match collection.scopes.interfaces[&interface_def]
+            .members
+            .get(&resource_symbol)
+            .expect("interface resource binding exists")
+            .res
+        {
+            Res::Def(DefKind::Resource, def) => def,
+            other => panic!("Handle resolves to an interface resource, got {other:?}"),
+        };
+        let implementation_type = match module_scope
+            .get(&concrete_symbol)
+            .expect("local implementation resource binding exists")
+            .res
+        {
+            Res::Def(DefKind::Resource, def) => def,
+            other => panic!("Concrete resolves to a top-level resource, got {other:?}"),
+        };
+        assert_eq!(collected.impls[0].resources.len(), 1);
+        assert_eq!(collected.impls[0].resources[0].resource, interface_resource);
+        assert_eq!(
+            collected.impls[0].resources[0].implementation_type,
+            implementation_type
+        );
+        let binding_start = source.find("type Handle = Concrete").unwrap();
+        assert_eq!(
+            collected.impls[0].resources[0].binding_span.range.start(),
+            sai_diagnostics::TextSize::new(binding_start as u32),
+            "the resource record retains the full binding span"
+        );
+        assert!(
+            collected.impls[1].resources.is_empty(),
+            "an unresolved RHS does not invent a resource identity"
+        );
+        assert!(
+            collected.diagnostics.is_empty(),
+            "an unresolved RHS still satisfies item-name matching without a missing-item cascade"
+        );
+    }
+
+    #[test]
+    fn interface_impl_collection_rejects_cross_session_resolution_results() {
+        let source = b"interface api {}\nimpl api {}\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source, b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("first package graph is recorded");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("first session package scopes collect");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("first session member scopes collect");
+        let header_resolutions = database
+            .resolve_trait_impl_header_test_only_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("first session header paths resolve");
+        let member_resolutions = database
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("first session impl-item paths resolve");
+
+        let other_database = RootDatabase::new().expect("second session initializes");
+        other_database
+            .intern_package("padding:package#1")
+            .expect("padding package interns before source definitions");
+        other_database
+            .symbols
+            .intern("padding")
+            .expect("padding symbol interns before source definitions");
+        let (mut other_database, other_tree, _, _) =
+            phase1_fixture_with_database(other_database, source, b"");
+        other_database
+            .set_package_graph(Some(graph.clone()))
+            .expect("second package graph is recorded");
+        let other_collection = other_database
+            .collect_phase1_package_scopes_collection(
+                &other_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("equivalent second-session scopes collect");
+        let other_member_scopes = other_database
+            .collect_active_source_member_scopes(&other_collection, &graph, &[])
+            .expect("equivalent second-session member scopes collect");
+        let other_header_resolutions = other_database
+            .resolve_trait_impl_header_test_only_paths_with_member_scopes(
+                &other_collection,
+                &other_tree,
+                &snapshot,
+                &other_member_scopes,
+            )
+            .expect("equivalent second-session header paths resolve");
+        let other_member_resolutions = other_database
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes(
+                &other_collection,
+                &other_tree,
+                &snapshot,
+                &other_member_scopes,
+            )
+            .expect("equivalent second-session impl-item paths resolve");
+
+        assert!(!other_header_resolutions.matches_collection(&collection));
+        assert!(!other_member_resolutions.matches_collection(&collection));
+        assert!(matches!(
+            database.collect_interface_impls_with_header_resolutions(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                None,
+                &other_header_resolutions,
+                &other_member_resolutions,
+            ),
+            Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(_)
+            ))
+        ));
+        assert!(matches!(
+            other_database.collect_interface_impls_with_header_resolutions(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                None,
+                &header_resolutions,
+                &member_resolutions,
+            ),
+            Err(OwnerControlFlowResolutionError::SessionMismatch)
+        ));
+    }
+
+    #[test]
+    fn interface_impl_collection_uses_source_dependency_interface_members() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (_, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", b"use acme:dep as dep\nimpl dep.api {}\n")],
+        );
+        let (_, dependency_tree, dependency_snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:dep#1",
+            "acme:dep@1.0.0",
+            &[("lib.sai", b"pub interface api {\n  fn run()\n}\n")],
+        );
+        snapshot_files.extend(dependency_snapshot_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              requires { acme:dep @ ^1 }\n"[..],
+        );
+        let dependency_manifest: Arc<[u8]> = Arc::from(&b"package acme:dep @ 1.0.0\n"[..]);
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:dep#1", "acme:dep")],
+                ),
+                graph_node(
+                    "acme:dep#1",
+                    "acme:dep",
+                    "1.0.0",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("source dependency graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let dependency_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &dependency_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                dependency_manifest,
+                PackageRole::Dependency,
+                &[],
+            )
+            .expect("source dependency interface scopes collect");
+        let dependency_member_package = dependency_collection.module_member_scope_package();
+        let root_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &root_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &[dependency_member_package.as_foreign_package_scopes("acme:dep")],
+            )
+            .expect("root can bind the source dependency interface");
+        let member_scopes = database
+            .collect_active_source_member_scopes(
+                &root_collection,
+                &graph,
+                &[dependency_member_package],
+            )
+            .expect("source dependency closure validates");
+        let header_resolutions = database
+            .resolve_trait_impl_header_test_only_paths_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("external interface target resolves");
+        let member_resolutions = database
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("external impl associated types resolve");
+        let header_owner = header_resolutions
+            .owners()
+            .first()
+            .expect("one interface impl header exists");
+        let target_paths = header_owner
+            .type_path_resolution()
+            .expect("external target path resolves");
+        let target = target_paths.paths().values().next().unwrap_or_else(|| {
+            panic!("external target resolution has no paths: {target_paths:#?}")
+        });
+        assert!(matches!(target.base, Res::Def(DefKind::Interface, _)));
+
+        let collected = database
+            .collect_interface_impls_with_header_resolutions(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+                None,
+                &header_resolutions,
+                &member_resolutions,
+            )
+            .expect("source dependency interface metadata is available");
+        assert_eq!(collected.impls.len(), 1);
+        assert!(collected.impls[0].interface.is_some());
+        assert_eq!(collected.diagnostics.len(), 1);
+        assert_eq!(
+            collected.diagnostics[0].code,
+            sai_diagnostics::Code::InterfaceImplMissingItem
+        );
+        assert_eq!(
+            collected.diagnostics[0]
+                .primary()
+                .map(|location| location.span.range.start()),
+            Some(sai_diagnostics::TextSize::new(
+                "use acme:dep as dep\nimpl ".len() as u32
+            )),
+            "missing dependency member points at the root target"
+        );
+        assert!(collected.diagnostics[0].has_workspace_snapshot());
+    }
+
+    #[test]
     fn interface_impl_target_kind_resolves_members_from_active_wit_views() {
-        let source = "use acme:codec/api as api\nimpl api.run {}\n";
+        let source = "use acme:codec/api as api\nimpl api.run {}\nimpl api { fn run() {} }\n";
         let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
         let root_key = PackageKey::new("acme:phase1#1").expect("root key is valid");
@@ -19933,7 +21096,7 @@ mod tests {
         assert!(resolutions.matches_collection(&collection));
         assert!(resolutions.matches_member_scopes(&collection, &member_scopes));
         assert!(resolutions.matches_wit_view_scopes(&collection, &wit_view_scopes));
-        assert_eq!(resolutions.owners().len(), 1);
+        assert_eq!(resolutions.owners().len(), 2);
         let owner = &resolutions.owners()[0];
         let paths = owner
             .type_path_resolution()
@@ -19965,6 +21128,37 @@ mod tests {
             )
         );
         assert!(diagnostics[0].has_workspace_snapshot());
+
+        let member_resolutions = database
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("WIT-targeted impl associated types resolve");
+        let collected = database
+            .collect_interface_impls_with_header_resolutions(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                Some(&wit_view_scopes),
+                &resolutions,
+                &member_resolutions,
+            )
+            .expect("WIT-view interface impl items collect");
+        assert_eq!(collected.impls.len(), 2);
+        assert!(collected.impls[0].interface.is_none());
+        assert!(collected.impls[1].interface.is_some());
+        assert!(collected.diagnostics.is_empty());
+        assert!(
+            collected
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::ImplTargetNotInterface),
+            "the existing resolved-path owner remains the sole target-kind diagnostic"
+        );
     }
 
     #[test]
@@ -29671,6 +30865,41 @@ mod tests {
                 shallow_descriptor.file,
                 deep_descriptor.file,
             ]
+        );
+
+        let impl_root_descriptor = TopLevelOwnerDescriptor {
+            kind: TopLevelOwnerKind::Impl,
+            ..root_descriptor
+        };
+        let impl_deep_descriptor = TopLevelOwnerDescriptor {
+            kind: TopLevelOwnerKind::Impl,
+            ..deep_descriptor
+        };
+        let impl_shallow_descriptor = TopLevelOwnerDescriptor {
+            kind: TopLevelOwnerKind::Impl,
+            ..shallow_descriptor
+        };
+        let ordered_impls = interface_generation_order(
+            &ordered_tree,
+            vec![
+                impl_root_descriptor,
+                impl_deep_descriptor,
+                impl_shallow_descriptor,
+            ],
+            &database.symbols,
+        )
+        .expect("impl generation order resolves module paths");
+        assert_eq!(
+            ordered_impls
+                .iter()
+                .map(|descriptor| descriptor.file)
+                .collect::<Vec<_>>(),
+            [
+                impl_root_descriptor.file,
+                impl_shallow_descriptor.file,
+                impl_deep_descriptor.file,
+            ],
+            "interface impl candidates use root-first module-path generation order"
         );
     }
 
