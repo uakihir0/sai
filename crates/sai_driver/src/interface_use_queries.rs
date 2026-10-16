@@ -247,6 +247,10 @@ fn append_interface_item_diagnostics(
                 "WIT interface types must not be empty",
                 "empty WIT interface type",
             ),
+            sai_diagnostics::Code::WitIncompatibleType => (
+                "WIT aliases cannot have refinement clauses",
+                "unsupported refinement clause",
+            ),
             _ => {
                 return Err(InterfaceUsesQueryError::Collection(
                     OwnerControlFlowResolutionError::InvalidSourceLocation(issue.owner),

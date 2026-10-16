@@ -27444,15 +27444,49 @@ mod tests {
             )
             .expect("Phase 1 interface scopes collect");
         let diagnostics = collection.interface_check_diagnostics();
-        assert_eq!(diagnostics.len(), 9, "{diagnostics:?}");
+        let generic_diagnostics = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::GenericInterfaceItem)
+            .collect::<Vec<_>>();
+        assert_eq!(generic_diagnostics.len(), 9, "{diagnostics:?}");
+        let refinement_diagnostics = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitIncompatibleType)
+            .collect::<Vec<_>>();
+        assert_eq!(refinement_diagnostics.len(), 1, "{diagnostics:?}");
+        let refinement = refinement_diagnostics[0]
+            .primary()
+            .expect("refinement finding has a primary location");
+        let alias_generic_start = root
+            .find("type Refined<T>")
+            .expect("generic refined alias is present")
+            + "type Refined".len();
+        let generic_refined_index = diagnostics
+            .iter()
+            .position(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::GenericInterfaceItem
+                    && diagnostic.primary().is_some_and(|primary| {
+                        primary.span.range.start().to_usize() == alias_generic_start
+                    })
+            })
+            .expect("refined alias generic finding is present");
+        let refinement_index = diagnostics
+            .iter()
+            .position(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitIncompatibleType)
+            .expect("refinement finding is present");
         assert!(
-            diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::GenericInterfaceItem),
-            "{diagnostics:?}"
+            generic_refined_index < refinement_index,
+            "interface item restrictions are reported in §16.6.1 row order"
+        );
+        assert_eq!(
+            root.get(
+                refinement.span.range.start().to_usize()..refinement.span.range.end().to_usize()
+            ),
+            Some("where true"),
+            "the incompatible-type diagnostic covers the alias refinement clause"
         );
 
-        let mut spans = diagnostics
+        let mut spans = generic_diagnostics
             .iter()
             .map(|diagnostic| {
                 let primary = diagnostic

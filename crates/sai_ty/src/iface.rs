@@ -33,6 +33,13 @@ pub fn interface_item_check(owner: &HirOwner<'_>) -> Vec<InterfaceCheckIssue> {
             span,
         });
     }
+    if let InterfaceItemKind::Refined { clause, .. } = item.kind {
+        issues.push(InterfaceCheckIssue {
+            owner: item.owner_id,
+            code: Code::WitIncompatibleType,
+            span: clause,
+        });
+    }
     if is_empty_wit_type(&item.kind) {
         issues.push(InterfaceCheckIssue {
             owner: item.owner_id,

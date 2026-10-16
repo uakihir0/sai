@@ -390,8 +390,25 @@ fn check_reports_generic_interface_types_functions_and_resource_members_once() {
         );
         search_from = end;
     }
+    let incompatible_diagnostics = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"WIT_INCOMPATIBLE_TYPE\""))
+        .collect::<Vec<_>>();
+    assert_eq!(incompatible_diagnostics.len(), 1, "{stdout}");
+    let refinement_start = source
+        .find("where true")
+        .expect("alias refinement is present");
+    let refinement_end = refinement_start + "where true".len();
     assert!(
-        stdout.contains("\"type\":\"summary\",\"errors\":10,"),
+        incompatible_diagnostics[0].contains(&format!("\"start\":{{\"byte\":{refinement_start},")),
+        "{incompatible_diagnostics:?}"
+    );
+    assert!(
+        incompatible_diagnostics[0].contains(&format!("\"end\":{{\"byte\":{refinement_end},")),
+        "{incompatible_diagnostics:?}"
+    );
+    assert!(
+        stdout.contains("\"type\":\"summary\",\"errors\":11,"),
         "{stdout}"
     );
     assert!(
