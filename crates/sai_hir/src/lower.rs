@@ -2115,12 +2115,8 @@ fn lower_world_ref<'hir>(
     )?))
 }
 
-/// Lower one direct type, enum, resource, or function member of an interface.
-///
-/// The HIR parent, ItemTree entry, and source-ordered child owner must all
-/// identify the same interface declaration. Nested resource members receive
-/// their paths here and are lowered as separate owners.
-fn interface_item_restriction_spans(
+/// Return the complete generic-parameter and `where` clause ranges, when any.
+fn item_restriction_spans(
     syntax: &SyntaxNode,
     source_map: &HirSourceMapBuilder<'_>,
 ) -> Result<(Option<Span>, Option<Span>), HirLoweringError> {
@@ -2168,6 +2164,11 @@ fn interface_item_restriction_spans(
     Ok((generic_params_span, where_clause_span))
 }
 
+/// Lower one direct type, enum, resource, or function member of an interface.
+///
+/// The HIR parent, ItemTree entry, and source-ordered child owner must all
+/// identify the same interface declaration. Nested resource members receive
+/// their paths here and are lowered as separate owners.
 pub fn lower_interface_item_owner<'hir>(
     owner: OwnerId,
     expected_path: &DefPath,
@@ -2383,7 +2384,7 @@ pub fn lower_interface_item_owner<'hir>(
     )?
     .with_def_path_interner(context.def_paths);
     let (generic_params_span, where_clause_span) =
-        interface_item_restriction_spans(&item_syntax, &source_map)?;
+        item_restriction_spans(&item_syntax, &source_map)?;
     let name = lower_item_name(item_name_syntax, &item_syntax, context.symbols, &source_map)?;
     if name.sym != interface_item_entry.name {
         return Err(HirLoweringError::ItemTreeEntryMismatch);
@@ -3003,7 +3004,7 @@ pub fn lower_interface_resource_member_owner<'hir>(
     };
     let span = source_map.span_for(function.syntax(), SpanCtxt::Root)?;
     let (generic_params_span, where_clause_span) =
-        interface_item_restriction_spans(function.syntax(), &source_map)?;
+        item_restriction_spans(function.syntax(), &source_map)?;
     let item = context.arena.alloc_interface_item(InterfaceItem {
         owner_id: owner,
         interface: interface_owner.id.def_id,
@@ -3683,6 +3684,8 @@ pub fn lower_impl_item_owner<'hir>(
                 vis: crate::Visibility::Private,
                 kind: ImplItemKind::AssocType { ty },
                 span,
+                generic_params_span: None,
+                where_clause_span: None,
             });
             let source_map = source_map.finish();
             let diagnostics = source_map.diagnostics(context.snapshot)?;
@@ -3716,6 +3719,8 @@ pub fn lower_impl_item_owner<'hir>(
                 &mut source_map,
             )?;
             let span = source_map.span_for(function.syntax(), SpanCtxt::Root)?;
+            let (generic_params_span, where_clause_span) =
+                item_restriction_spans(function.syntax(), &source_map)?;
             let item = context.arena.alloc_impl_item(ImplItem {
                 owner_id: owner,
                 impl_def,
@@ -3727,6 +3732,8 @@ pub fn lower_impl_item_owner<'hir>(
                     has_body: function.body().is_some(),
                 },
                 span,
+                generic_params_span,
+                where_clause_span,
             });
             let source_map = source_map.finish();
             let diagnostics = source_map.diagnostics(context.snapshot)?;
@@ -22996,6 +23003,18 @@ mod tests {
                     assert_eq!(sig.ensures.len(), 1);
                     assert_eq!(generics.params.len(), 1);
                     assert_eq!(generics.where_preds.len(), 1);
+                    assert_eq!(
+                        item.generic_params_span
+                            .map(|span| span.range)
+                            .map(|range| &source[range.start().to_usize()..range.end().to_usize()]),
+                        Some("<T: Clone>")
+                    );
+                    assert_eq!(
+                        item.where_clause_span
+                            .map(|span| span.range)
+                            .map(|range| &source[range.start().to_usize()..range.end().to_usize()]),
+                        Some("where T: Copy")
+                    );
                     assert!(source_map.syntax_for_node(sig.params[0].hir_id).is_some());
                     let body = hir_owner.body.expect("function body exists");
                     assert_eq!(body.contracts.len(), 2);

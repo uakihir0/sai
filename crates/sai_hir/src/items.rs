@@ -200,6 +200,10 @@ pub struct ImplItem<'hir> {
     pub vis: Visibility,
     pub kind: ImplItemKind<'hir>,
     pub span: Span,
+    /// Exact syntax range of this item's generic parameter list, when present.
+    pub generic_params_span: Option<Span>,
+    /// Exact syntax range of this item's `where` clause, when present.
+    pub where_clause_span: Option<Span>,
 }
 
 impl PartialEq for ImplItem<'_> {
@@ -762,6 +766,8 @@ mod tests {
             vis: Visibility::Pub,
             kind: ImplItemKind::AssocType { ty: &ty_a },
             span: span(3),
+            generic_params_span: None,
+            where_clause_span: None,
         };
         let impl_item_right = ImplItem {
             name: name(&ids, 40),
@@ -1184,6 +1190,8 @@ mod tests {
             vis: Visibility::Pub,
             kind: ImplItemKind::AssocType { ty },
             span: span(3),
+            generic_params_span: None,
+            where_clause_span: None,
         });
         let trait_assoc_type = arena.alloc_trait_item(TraitItem {
             owner_id: ids.owner,
@@ -1203,6 +1211,8 @@ mod tests {
                 has_body: true,
             },
             span: span(5),
+            generic_params_span: None,
+            where_clause_span: None,
         });
         let world_kinds = [
             WorldItemKind::Import(WorldRef::Pkg {

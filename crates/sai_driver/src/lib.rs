@@ -13397,6 +13397,11 @@ impl RootDatabase {
                     .resolve(item.name.sym)
                     .map_err(OwnerControlFlowResolutionError::SymbolLookup)?
                     .to_string();
+                let generic_locations = [item.generic_params_span, item.where_clause_span]
+                    .into_iter()
+                    .flatten()
+                    .map(|span| interface_impl_source_location(item.owner_id, span, &inputs))
+                    .collect::<Result<Vec<_>, _>>()?;
                 let kind = match item.kind {
                     ImplItemKind::Fn { .. } => InterfaceImplItemKind::Function,
                     ImplItemKind::AssocType { ty } => {
@@ -13510,6 +13515,7 @@ impl RootDatabase {
                         &inputs,
                     )?,
                     item_span: sai_vfs::Span::new(item.span.file, item.span.range),
+                    generic_locations,
                 });
             }
             impls.push(InterfaceImplInput {
@@ -13535,6 +13541,7 @@ impl RootDatabase {
                 for item in &implementation.items {
                     locations.push(item.name_location.clone());
                     locations.push(item.item_location.clone());
+                    locations.extend(item.generic_locations.iter().cloned());
                 }
                 (implementation.impl_def, locations)
             })
@@ -21611,6 +21618,112 @@ mod tests {
             ),
             Err(OwnerControlFlowResolutionError::SnapshotMismatch)
         ));
+    }
+
+    #[test]
+    fn interface_impl_collection_rejects_generic_function_restrictions_at_exact_spans() {
+        let source = concat!(
+            "interface api {\n",
+            "  fn run()\n",
+            "}\n",
+            "impl api {\n",
+            "  fn run<T>() where T: Copy {}\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("local interface impl source collects");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty source member closure validates");
+        let header_resolutions = database
+            .resolve_trait_impl_header_test_only_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("local impl targets resolve");
+        let member_resolutions = database
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("impl associated items resolve");
+
+        let collected = database
+            .collect_interface_impls_with_header_resolutions(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                None,
+                &header_resolutions,
+                &member_resolutions,
+            )
+            .expect("interface impl items collect");
+
+        assert_eq!(
+            collected
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::GenericInterfaceItem,
+                sai_diagnostics::Code::GenericInterfaceItem,
+            ]
+        );
+        let generic_start = source.find("<T>").expect("generic parameters exist");
+        let where_start = source.find("where T: Copy").expect("where clause exists");
+        assert_eq!(
+            collected.diagnostics[0]
+                .primary()
+                .map(|location| location.span.range),
+            Some(
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(generic_start as u32),
+                    sai_diagnostics::TextSize::new((generic_start + "<T>".len()) as u32),
+                )
+                .expect("generic span is ordered")
+            )
+        );
+        assert_eq!(
+            collected.diagnostics[1]
+                .primary()
+                .map(|location| location.span.range),
+            Some(
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(where_start as u32),
+                    sai_diagnostics::TextSize::new((where_start + "where T: Copy".len()) as u32),
+                )
+                .expect("where span is ordered")
+            )
+        );
+        assert!(
+            !collected.impls[0].fns[0].compare_signature,
+            "the collected function pair carries the conformance skip state"
+        );
+        assert!(
+            collected
+                .diagnostics
+                .iter()
+                .all(Diagnostic::has_workspace_snapshot),
+            "generic conformance diagnostics use the active snapshot"
+        );
     }
 
     #[test]

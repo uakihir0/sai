@@ -72,6 +72,11 @@ pub struct InterfaceImplItem {
     pub item_span: Span,
     /// Snapshot-bound location of the complete `type R = C` binding.
     pub item_location: Location,
+    /// Generic parameter and `where` clause locations on function items.
+    ///
+    /// A matched interface function with either restriction is diagnosed by
+    /// §16.7.2 and its signature comparison is skipped.
+    pub generic_locations: Vec<Location>,
 }
 
 /// Source item kinds that can match an interface function or resource.
@@ -126,6 +131,8 @@ pub struct InterfaceImplsInput {
 pub struct InterfaceImplFunction {
     pub interface_fn: DefId,
     pub impl_fn: LocalDefId,
+    /// False when the implementation has forbidden generic restrictions.
+    pub compare_signature: bool,
 }
 
 /// A matched interface resource and its resolved implementation type.
@@ -242,6 +249,7 @@ pub fn collect_interface_impls(input: InterfaceImplsInput) -> InterfaceImpls {
         }
 
         let mut matched_interface_items = HashSet::new();
+        let mut conformance_diagnostics = Vec::new();
         for &index in &effective_interface_item_indexes {
             let item = &interface.items[index];
             if let InterfaceImplInterfaceItemKind::Function {
@@ -309,7 +317,12 @@ pub fn collect_interface_impls(input: InterfaceImplsInput) -> InterfaceImpls {
                     record.fns.push(InterfaceImplFunction {
                         interface_fn: interface_item.def,
                         impl_fn: item.def,
+                        compare_signature: item.generic_locations.is_empty(),
                     });
+                    for location in &item.generic_locations {
+                        conformance_diagnostics
+                            .push(generic_interface_item_diagnostic(&input.package, location));
+                    }
                 }
                 (
                     InterfaceImplInterfaceItemKind::Resource,
@@ -364,6 +377,7 @@ pub fn collect_interface_impls(input: InterfaceImplsInput) -> InterfaceImpls {
                 }
             }
         }
+        diagnostics.extend(conformance_diagnostics);
 
         impls.push(record);
     }
@@ -477,6 +491,18 @@ fn missing_interface_impl_item_diagnostic(
     diagnostic
 }
 
+fn generic_interface_item_diagnostic(package: &str, location: &Location) -> Diagnostic {
+    let mut diagnostic = Diagnostic::new(
+        Code::GenericInterfaceItem,
+        Severity::Error,
+        "interface implementation functions cannot have generic parameters or a `where` clause",
+        Some(location.clone()),
+    );
+    diagnostic.primary_label = "generic interface implementation function".to_owned();
+    diagnostic.package = Some(package.to_owned());
+    diagnostic
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,6 +602,7 @@ mod tests {
                 name_location: location("src/lib.sai", name_start, name_start + name.len() as u32),
                 item_span: span(item_start, item_end),
                 item_location: location("src/lib.sai", item_start, item_end),
+                generic_locations: Vec::new(),
             }
         }
 
@@ -661,10 +688,12 @@ mod tests {
                 InterfaceImplFunction {
                     interface_fn: run_def,
                     impl_fn: run_impl_def,
+                    compare_signature: true,
                 },
                 InterfaceImplFunction {
                     interface_fn: stop_def,
                     impl_fn: stop_impl_def,
+                    compare_signature: true,
                 },
             ]
         );
@@ -681,6 +710,105 @@ mod tests {
         assert!(
             result.impls[0].resources.is_empty(),
             "the data-only collector leaves resource validity to §16.7.3"
+        );
+    }
+
+    #[test]
+    fn generic_interface_impl_functions_are_reported_and_skip_signature_comparison() {
+        let mut fixture = Fixture::new();
+        let run = fixture.function("run", None);
+        let interface = fixture.interface("api", vec![run]);
+        let mut implementation_run =
+            fixture.implementation_item("run", InterfaceImplItemKind::Function, 20, 16, 40);
+        let generic_params = location("src/lib.sai", 24, 27);
+        let where_clause = location("src/lib.sai", 30, 40);
+        implementation_run.generic_locations = vec![generic_params.clone(), where_clause.clone()];
+        let implementation = fixture.implementation(
+            InterfaceImplTarget::Interface(interface),
+            "impl-api",
+            100,
+            vec![implementation_run],
+        );
+
+        let result = collect_interface_impls(input(vec![implementation]));
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [Code::GenericInterfaceItem, Code::GenericInterfaceItem]
+        );
+        assert_eq!(result.diagnostics[0].primary(), Some(&generic_params));
+        assert_eq!(result.diagnostics[1].primary(), Some(&where_clause));
+        assert!(
+            !result.impls[0].fns[0].compare_signature,
+            "a forbidden generic restriction suppresses later signature comparison"
+        );
+        assert!(result.impls[0].resource_bindings.is_empty());
+    }
+
+    #[test]
+    fn generic_findings_skip_repeated_unsupported_and_duplicate_impl_items() {
+        let mut fixture = Fixture::new();
+        let supported = fixture.function("supported", None);
+        let unsupported = fixture.function(
+            "unsupported",
+            Some(InterfaceImplUnsupportedFunction::Wit(Unsupported::Map)),
+        );
+        let interface = fixture.interface("api", vec![supported, unsupported]);
+
+        let first_supported =
+            fixture.implementation_item("supported", InterfaceImplItemKind::Function, 20, 16, 30);
+        let mut repeated_supported =
+            fixture.implementation_item("supported", InterfaceImplItemKind::Function, 40, 36, 55);
+        repeated_supported.generic_locations = vec![location("src/lib.sai", 48, 51)];
+        let mut unsupported_impl =
+            fixture.implementation_item("unsupported", InterfaceImplItemKind::Function, 60, 56, 78);
+        unsupported_impl.generic_locations = vec![location("src/lib.sai", 72, 75)];
+        let first = fixture.implementation(
+            InterfaceImplTarget::Interface(interface.clone()),
+            "first-impl",
+            100,
+            vec![first_supported, repeated_supported, unsupported_impl],
+        );
+        let mut duplicate_supported = fixture.implementation_item(
+            "supported",
+            InterfaceImplItemKind::Function,
+            120,
+            116,
+            140,
+        );
+        duplicate_supported.generic_locations = vec![location("src/lib.sai", 128, 131)];
+        let second = fixture.implementation(
+            InterfaceImplTarget::Interface(interface),
+            "second-impl",
+            200,
+            vec![duplicate_supported],
+        );
+
+        let result = collect_interface_impls(input(vec![first, second]));
+
+        assert_eq!(
+            result
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                Code::WitUnsupportedFeature,
+                Code::InterfaceImplExtraItem,
+                Code::DuplicateInterfaceImpl,
+            ]
+        );
+        assert!(
+            result.impls[0].fns[0].compare_signature,
+            "the first valid matched function remains eligible for signature comparison"
+        );
+        assert!(
+            result.impls[1].fns.is_empty(),
+            "items of a later duplicate impl are skipped"
         );
     }
 
@@ -854,6 +982,7 @@ mod tests {
             [InterfaceImplFunction {
                 interface_fn: supported_def,
                 impl_fn: unsupported_impl.def,
+                compare_signature: true,
             }]
         );
         assert_eq!(
@@ -908,6 +1037,7 @@ mod tests {
             [InterfaceImplFunction {
                 interface_fn: effective_run_def,
                 impl_fn: implementation_run_def,
+                compare_signature: true,
             }]
         );
         assert!(result.impls[0].resources.is_empty());
