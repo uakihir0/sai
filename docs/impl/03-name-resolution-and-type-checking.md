@@ -403,6 +403,13 @@ interface alias, function signature, and resource-method signature through a
 transitive-only re-export, exact foreign identity, private and missing-member
 errors, and requester mismatch rejection.
 
+**World function signature type paths over validated source closures (IR-571).**
+World import/export function signature types now accept the validated
+active-source closure and record its fingerprint on the aggregate result.
+Package-local resolution remains available. The regression checks transitive
+public, private, and missing type paths, while module/interface/import/export
+references and world includes remain outside the type-path result channel.
+
 When a foreign-interface re-export candidate precedes a known local candidate
 with the same name, this bridge uses the successful local candidate while
 retaining the foreign-interface item as deferred; a complete package resolver
