@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 
+mod interface_use_queries;
 pub mod package_graph;
 mod package_wit_name_queries;
 mod wit_package_queries;
 
+use interface_use_queries::InterfaceUsesQueries;
+pub use interface_use_queries::InterfaceUsesQueryError;
 pub use sai_wit::WitPackageDiagnosticTemplate;
 pub use wit_package_queries::{
     WitPackageFailure, WitPackageQueryError, WitPackageResult, WitPackageSourceFailure,
@@ -93,7 +96,7 @@ use sai_resolve::{InterfaceUseReference, InterfaceUses, InterfaceUsesInput, inte
 use sai_resolve::{ModuleId, ModuleTree, ModuleTreeQueries, ModuleTreeQueryError};
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher, fingerprint};
 use sai_syntax::ast::{self, AstNode, AstToken};
-use sai_syntax::{Parse, ParseQueryError, SyntaxQueries};
+use sai_syntax::{Parse, ParseQueryError, SyntaxNode, SyntaxQueries};
 use sai_vfs::{
     FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex, PackageFileKind,
     PackageFilesSnapshot, PackageKey, PackageKeyError, PackageRelativePath, PackageSourceDirectory,
@@ -161,6 +164,7 @@ pub struct RootDatabase {
     wit_source_def_path_generations: InputQuery<String, u64>,
     package_scopes: Phase1PackageScopesQueries,
     package_wit_names: PackageWitNamesQueries,
+    interface_uses: InterfaceUsesQueries,
     type_owner_paths: TypeOwnerPathQueries,
     declared_requirements: DeclaredRequirementsQueries,
     wit_contracts: WitContractQueries,
@@ -1834,6 +1838,7 @@ pub enum Phase1CollectionError {
     TargetFilter(TargetFilterError),
     PackageScopes(PackageScopesError),
     PackageWitNamesQuery(PackageWitNamesQueryError),
+    InterfaceUsesQuery(InterfaceUsesQueryError),
     UseTargetDiagnostics(UseTargetDiagnosticsError),
     DefPathInterner(DefPathInternerError),
     MissingSnapshotFile(FileId),
@@ -2226,6 +2231,8 @@ pub struct Phase1PackageScopesCollection {
     scopes: Phase1PackageScopes,
     package_wit_names: PackageWitNames,
     package_wit_names_fingerprint: Fingerprint,
+    interface_uses: InterfaceUses,
+    interface_uses_fingerprint: Fingerprint,
     input_fingerprint: Fingerprint,
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
@@ -2266,6 +2273,20 @@ impl Phase1PackageScopesCollection {
     /// than the session-local order of the returned definition-ID map.
     pub const fn package_wit_names_fingerprint(&self) -> Fingerprint {
         self.package_wit_names_fingerprint
+    }
+
+    /// Local interface-use edges and cycle diagnostics derived from this
+    /// target-filtered Phase 1 collection.
+    pub fn interface_uses(&self) -> &InterfaceUses {
+        &self.interface_uses
+    }
+
+    /// Stable result fingerprint for `interface_uses(P)`.
+    ///
+    /// The fingerprint follows interface generation order and canonical
+    /// definition paths, never the session-local order of the graph maps.
+    pub const fn interface_uses_fingerprint(&self) -> Fingerprint {
+        self.interface_uses_fingerprint
     }
 
     pub const fn build_context(&self) -> Phase1BuildContext {
@@ -3748,6 +3769,7 @@ pub enum OwnerControlFlowResolutionError {
         current: ItemTreeKind,
     },
     MissingModuleScope(FileId),
+    MissingInterfaceScope(OwnerId),
     MissingImportBinding {
         owner: OwnerId,
         import: ImportIndex,
@@ -3777,7 +3799,7 @@ pub type FunctionOwnerLabelResolutionError = FunctionOwnerResolutionError;
 
 struct CurrentOwnerInputs {
     source: Arc<SourceFile>,
-    parsed: Parse,
+    root: SyntaxNode,
     ast_ids: ast::AstIdMap,
     filtered_item_tree: ItemTree,
     retained_item_kinds: HashMap<ast::ErasedAstId, ItemTreeKind>,
@@ -3787,8 +3809,14 @@ struct CurrentOwnerInputs {
 fn index_top_level_owner_descriptors(
     collection: &Phase1PackageScopesCollection,
 ) -> HashMap<OwnerId, Option<TopLevelOwnerDescriptor>> {
-    let mut index = HashMap::with_capacity(collection.scopes.top_level_owners.len());
-    for descriptor in &collection.scopes.top_level_owners {
+    index_top_level_owner_descriptors_in_scopes(&collection.scopes)
+}
+
+fn index_top_level_owner_descriptors_in_scopes(
+    scopes: &Phase1PackageScopes,
+) -> HashMap<OwnerId, Option<TopLevelOwnerDescriptor>> {
+    let mut index = HashMap::with_capacity(scopes.top_level_owners.len());
+    for descriptor in &scopes.top_level_owners {
         if let Some(indexed) = index.get_mut(&descriptor.owner) {
             *indexed = None;
         } else {
@@ -4018,9 +4046,7 @@ fn collect_interface_owner_test_only_paths(
             let syntax = inputs
                 .ast_ids
                 .pointer(entry.ast_id)
-                .and_then(|pointer| {
-                    pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root)
-                })
+                .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.root))
                 .ok_or(OwnerControlFlowResolutionError::MissingRefinedTypeSyntax(
                     owner,
                 ))
@@ -4063,9 +4089,7 @@ fn collect_interface_owner_test_only_paths(
             let syntax = inputs
                 .ast_ids
                 .pointer(entry.ast_id)
-                .and_then(|pointer| {
-                    pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root)
-                })
+                .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.root))
                 .ok_or(OwnerControlFlowResolutionError::MissingInterfaceFunctionSyntax(owner))
                 .and_then(|syntax| {
                     ast::FnDecl::cast(syntax).ok_or(
@@ -4270,7 +4294,15 @@ fn module_scope_for_file<'a>(
     module_tree: &ModuleTree,
     file: FileId,
 ) -> Result<&'a Phase1ModuleScopes, OwnerControlFlowResolutionError> {
-    if collection.scopes.modules.len() != module_tree.modules.len() {
+    module_scope_for_scopes(&collection.scopes, module_tree, file)
+}
+
+fn module_scope_for_scopes<'a>(
+    scopes: &'a Phase1PackageScopes,
+    module_tree: &ModuleTree,
+    file: FileId,
+) -> Result<&'a Phase1ModuleScopes, OwnerControlFlowResolutionError> {
+    if scopes.modules.len() != module_tree.modules.len() {
         return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
     }
     let mut matching_modules = module_tree
@@ -4288,8 +4320,7 @@ fn module_scope_for_file<'a>(
         return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
     };
     let module_id = ModuleId::from_raw(raw_id);
-    let module_scope = collection
-        .scopes
+    let module_scope = scopes
         .module(module_id)
         .ok_or(OwnerControlFlowResolutionError::MissingModuleScope(file))?;
     Ok(module_scope)
@@ -5137,7 +5168,7 @@ fn world_item_syntax_generic_parameter_names(
     let syntax = inputs
         .ast_ids
         .pointer(entry.ast_id)
-        .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root))
+        .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.root))
         .ok_or(OwnerControlFlowResolutionError::MissingWorldItemSyntax {
             world: world_owner,
             item: item_owner,
@@ -5360,7 +5391,7 @@ fn world_item_syntax_test_only_path_candidates(
     let syntax = inputs
         .ast_ids
         .pointer(entry.ast_id)
-        .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root))
+        .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.root))
         .ok_or(OwnerControlFlowResolutionError::MissingWorldItemSyntax {
             world: world_owner,
             item: item_owner,
@@ -5681,7 +5712,7 @@ fn collect_refined_generic_syntax_test_only_diagnostics(
     let syntax = inputs
         .ast_ids
         .pointer(item_id)
-        .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root))
+        .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.root))
         .ok_or(OwnerControlFlowResolutionError::MissingRefinedTypeSyntax(
             owner,
         ))?;
@@ -5722,7 +5753,7 @@ fn local_expression_path_head_spans(
         .filter_map(|(hir_id, resolution)| {
             matches!(resolution.base, Res::Local(_)).then_some(())?;
             let pointer = source_map.syntax_for_node(*hir_id)?;
-            let syntax = pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root)?;
+            let syntax = pointer.resolve(inputs.filtered_item_tree.file, &inputs.root)?;
             let path = ast::PathExpr::cast(syntax)?;
             let name = path.name()?;
             Some(sai_diagnostics::Span::new(
@@ -5826,7 +5857,7 @@ fn test_only_reference_diagnostic_at(
     let syntax = inputs
         .ast_ids
         .pointer(use_ast_id)
-        .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root))
+        .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.root))
         .ok_or(OwnerControlFlowResolutionError::MissingTestOnlyUseSyntax {
             owner,
             import: import_index,
@@ -6941,6 +6972,12 @@ impl RootDatabase {
             Arc::clone(&packages),
             Arc::clone(&symbols),
         )?;
+        let interface_uses = InterfaceUsesQueries::new(
+            package_scopes.query.clone(),
+            Arc::clone(&packages),
+            Arc::clone(&symbols),
+            primitive_prelude.clone(),
+        )?;
         let type_owner_paths = TypeOwnerPathQueries::new()?;
         let declared_requirements = DeclaredRequirementsQueries::new()?;
         let wit_contracts = WitContractQueries::new(declared_requirements.input.clone())?;
@@ -6990,6 +7027,7 @@ impl RootDatabase {
             wit_source_def_path_generations,
             package_scopes,
             package_wit_names,
+            interface_uses,
             type_owner_paths,
             declared_requirements,
             wit_contracts,
@@ -8096,6 +8134,10 @@ impl RootDatabase {
             .package_wit_names
             .get(&mut self.query_database, package_key.clone(), snapshot)
             .map_err(Phase1CollectionError::PackageWitNamesQuery)?;
+        let (interface_uses, interface_uses_fingerprint) = self
+            .interface_uses
+            .get(&mut self.query_database, package_key.clone(), snapshot)
+            .map_err(Phase1CollectionError::InterfaceUsesQuery)?;
         let mut scopes = memo.scopes.clone();
         for input in &prepared.modules {
             scopes
@@ -8115,6 +8157,8 @@ impl RootDatabase {
             scopes,
             package_wit_names,
             package_wit_names_fingerprint,
+            interface_uses,
+            interface_uses_fingerprint,
             input_fingerprint: output.input_fingerprint,
             snapshot_id: snapshot.id(),
             target_cfg: target_cfg.clone(),
@@ -8176,7 +8220,7 @@ impl RootDatabase {
         };
         Ok(CurrentOwnerInputs {
             source,
-            parsed,
+            root: parsed.root,
             ast_ids,
             filtered_item_tree,
             retained_item_kinds,
@@ -8340,7 +8384,7 @@ impl RootDatabase {
                     let context = HirLoweringContext::new(
                         &inputs.ast_ids,
                         snapshot,
-                        &inputs.parsed.root,
+                        &inputs.root,
                         &arena,
                         &self.symbols,
                         def_paths,
@@ -8685,7 +8729,7 @@ impl RootDatabase {
                     let context = HirLoweringContext::new(
                         &inputs.ast_ids,
                         snapshot,
-                        &inputs.parsed.root,
+                        &inputs.root,
                         &arena,
                         &self.symbols,
                         def_paths,
@@ -8985,7 +9029,7 @@ impl RootDatabase {
                     let context = HirLoweringContext::new(
                         &inputs.ast_ids,
                         snapshot,
-                        &inputs.parsed.root,
+                        &inputs.root,
                         &arena,
                         &self.symbols,
                         def_paths,
@@ -9196,7 +9240,7 @@ impl RootDatabase {
                     let context = HirLoweringContext::new(
                         &inputs.ast_ids,
                         snapshot,
-                        &inputs.parsed.root,
+                        &inputs.root,
                         &arena,
                         &self.symbols,
                         def_paths,
@@ -9560,7 +9604,7 @@ impl RootDatabase {
                     let context = HirLoweringContext::new(
                         &inputs.ast_ids,
                         snapshot,
-                        &inputs.parsed.root,
+                        &inputs.root,
                         &arena,
                         &self.symbols,
                         def_paths,
@@ -9975,7 +10019,7 @@ impl RootDatabase {
                     let context = HirLoweringContext::new(
                         &inputs.ast_ids,
                         snapshot,
-                        &inputs.parsed.root,
+                        &inputs.root,
                         &arena,
                         &self.symbols,
                         def_paths,
@@ -10265,7 +10309,7 @@ impl RootDatabase {
                 let context = HirLoweringContext::new(
                     &inputs.ast_ids,
                     snapshot,
-                    &inputs.parsed.root,
+                    &inputs.root,
                     &arena,
                     &self.symbols,
                     def_paths,
@@ -10285,7 +10329,7 @@ impl RootDatabase {
                     .ast_ids
                     .pointer(descriptor.item_id)
                     .and_then(|pointer| {
-                        pointer.resolve(inputs.filtered_item_tree.file, &inputs.parsed.root)
+                        pointer.resolve(inputs.filtered_item_tree.file, &inputs.root)
                     })
                     .ok_or(
                         OwnerControlFlowResolutionError::MissingEffectDeclarationSyntax(
@@ -11138,7 +11182,7 @@ impl RootDatabase {
                 let context = HirLoweringContext::new(
                     &inputs.ast_ids,
                     snapshot,
-                    &inputs.parsed.root,
+                    &inputs.root,
                     &arena,
                     &self.symbols,
                     def_paths,
@@ -11740,7 +11784,7 @@ impl RootDatabase {
                 let context = HirLoweringContext::new(
                     &inputs.ast_ids,
                     snapshot,
-                    &inputs.parsed.root,
+                    &inputs.root,
                     &arena,
                     &self.symbols,
                     def_paths,
@@ -12157,7 +12201,7 @@ impl RootDatabase {
                 let context = HirLoweringContext::new(
                     &inputs.ast_ids,
                     snapshot,
-                    &inputs.parsed.root,
+                    &inputs.root,
                     &arena,
                     &self.symbols,
                     def_paths,
@@ -12451,7 +12495,7 @@ impl RootDatabase {
                 let context = HirLoweringContext::new(
                     &inputs.ast_ids,
                     snapshot,
-                    &inputs.parsed.root,
+                    &inputs.root,
                     &arena,
                     &self.symbols,
                     def_paths,
@@ -12798,9 +12842,13 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<InterfaceUses, OwnerControlFlowResolutionError> {
-        let resolutions =
-            self.resolve_interface_test_only_paths(collection, module_tree, snapshot)?;
-        resolutions.interface_uses().cloned().map_err(Clone::clone)
+        if collection.snapshot_id != snapshot.id() {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+        Ok(collection.interface_uses.clone())
     }
 
     /// Resolves interface declaration and resource-method type paths through
@@ -12957,7 +13005,7 @@ impl RootDatabase {
                 let context = HirLoweringContext::new(
                     &inputs.ast_ids,
                     snapshot,
-                    &inputs.parsed.root,
+                    &inputs.root,
                     &arena,
                     &self.symbols,
                     def_paths,
@@ -12999,6 +13047,12 @@ impl RootDatabase {
                 }
 
                 let module_scope = module_scope_for_file(collection, module_tree, descriptor.file)?;
+                let interface_module_scope =
+                    interface_use_queries::module_scope_with_interface_members(
+                        module_scope,
+                        collection.scopes(),
+                        descriptor.owner,
+                    )?;
                 let mut members = Vec::with_capacity(member_entries.len());
                 let mut owner_interface_use_references = Vec::new();
                 for (entry, member_owner) in member_entries
@@ -13053,7 +13107,7 @@ impl RootDatabase {
                             &candidates,
                             &generic_resolutions,
                             &self.primitive_prelude,
-                            module_scope,
+                            &interface_module_scope,
                             collection.module_tree.package,
                             Some(&module_members),
                             Some(&source_graph_packages),
@@ -13076,7 +13130,7 @@ impl RootDatabase {
                                 kind,
                                 entry,
                                 &member_hir,
-                                module_scope,
+                                &interface_module_scope,
                                 &self.symbols,
                                 &inputs,
                                 snapshot,
@@ -13165,7 +13219,7 @@ impl RootDatabase {
                                                 &candidates,
                                                 &generic_resolutions,
                                                 &self.primitive_prelude,
-                                                module_scope,
+                                                &interface_module_scope,
                                                 collection.module_tree.package,
                                                 Some(&module_members),
                                                 Some(&source_graph_packages),
@@ -13189,7 +13243,7 @@ impl RootDatabase {
                                             InterfaceMemberKind::ResourceMethod,
                                             method_entry,
                                             &method_hir,
-                                            module_scope,
+                                            &interface_module_scope,
                                             &self.symbols,
                                             &inputs,
                                             snapshot,
@@ -13988,7 +14042,7 @@ mod tests {
         let context = HirLoweringContext::new(
             &inputs.ast_ids,
             &snapshot,
-            &inputs.parsed.root,
+            &inputs.root,
             &arena,
             &database.symbols,
             &def_paths,
@@ -19600,7 +19654,7 @@ mod tests {
         let api_context = HirLoweringContext::new(
             &api_inputs.ast_ids,
             &snapshot,
-            &api_inputs.parsed.root,
+            &api_inputs.root,
             &api_arena,
             &database.symbols,
             api_def_paths,
@@ -22423,7 +22477,7 @@ mod tests {
         let context = HirLoweringContext::new(
             &inputs.ast_ids,
             &snapshot,
-            &inputs.parsed.root,
+            &inputs.root,
             &arena,
             &database.symbols,
             def_paths,
@@ -27239,6 +27293,225 @@ mod tests {
                 .start(),
             sai_diagnostics::TextSize::new(second_reference as u32)
         );
+        assert_eq!(collection.interface_uses().uses, result.uses);
+        assert_eq!(collection.interface_uses().cyclic, result.cyclic);
+        assert_eq!(
+            collection.interface_uses().diagnostics[0]
+                .primary()
+                .expect("tracked cycle diagnostic has a primary location")
+                .file
+                .snapshot,
+            Some(17)
+        );
+        assert_ne!(
+            collection.interface_uses_fingerprint(),
+            Fingerprint::default(),
+            "tracked interface uses have a stable result fingerprint"
+        );
+    }
+
+    #[test]
+    fn interface_use_resolution_prefers_interface_members_over_module_imports() {
+        let root = concat!(
+            "use b::Request\n",
+            "interface a {\n",
+            "  type Request = Bool\n",
+            "  type UsesRequest = Request\n",
+            "}\n",
+            "interface b {\n",
+            "  type Request = Bool\n",
+            "  type UsesA = a.Request\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let interfaces = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == TopLevelOwnerKind::Interface)
+            .map(|owner| owner.owner.def_id)
+            .collect::<Vec<_>>();
+        assert_eq!(interfaces.len(), 2);
+        let [a, b] = interfaces.as_slice() else {
+            unreachable!("the fixture declares interfaces a and b in source order");
+        };
+        let (a, b) = (*a, *b);
+        let uses = collection.interface_uses();
+
+        assert!(
+            uses.uses[&a].is_empty(),
+            "the interface-local Request shadows the imported b.Request"
+        );
+        assert_eq!(uses.uses[&b].len(), 1);
+        assert_eq!(uses.uses[&b][0].0, a);
+        assert!(
+            uses.cyclic.is_empty(),
+            "the module import must not create a false a → b → a cycle"
+        );
+
+        let adapter = database
+            .resolve_interface_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("the direct interface path adapter succeeds");
+        assert_eq!(
+            adapter
+                .interface_uses()
+                .expect("adapter graph succeeds")
+                .uses,
+            uses.uses
+        );
+        assert_eq!(
+            adapter
+                .interface_uses()
+                .expect("adapter graph succeeds")
+                .cyclic,
+            uses.cyclic
+        );
+        let request = database
+            .symbols
+            .intern("Request")
+            .expect("Request symbol interns");
+        let local_request = collection.scopes().interfaces[&a.to_def_id()].members[&request].res;
+        let a_owner = adapter
+            .owners()
+            .iter()
+            .find(|owner| owner.owner().def_id == a)
+            .expect("interface a's adapter result exists");
+        let uses_request = a_owner
+            .members()
+            .iter()
+            .find(|member| {
+                member.type_path_resolution().is_ok_and(|resolution| {
+                    resolution
+                        .paths()
+                        .values()
+                        .any(|path| path.base == local_request)
+                })
+            })
+            .expect("UsesRequest resolves through a's interface-member rib");
+        assert!(
+            uses_request
+                .type_path_resolution()
+                .expect("interface member path resolution succeeds")
+                .paths()
+                .values()
+                .any(|path| path.base == local_request)
+        );
+    }
+
+    #[test]
+    fn interface_uses_query_cuts_off_body_edits_and_rebinds_diagnostics() {
+        let root = concat!(
+            "interface first { type Request = second.Response }\n",
+            "interface second { type Response = first.Request }\n",
+            "fn body() { 1; }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let first = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("initial interface-use query succeeds");
+        let package_key = first.package_key().clone();
+        let first_memo = database
+            .interface_uses
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("interface-use query has a memo");
+        let first_fingerprint = first.interface_uses_fingerprint();
+
+        database
+            .set_file_contents(
+                FileKey::new("acme:phase1#1", "src/lib.sai").expect("root file key is valid"),
+                Arc::from(
+                    &b"interface first { type Request = second.Response }\n\
+                      interface second { type Response = first.Request }\n\
+                      fn body() { 2; }\n"[..],
+                ),
+                Durability::Low,
+            )
+            .expect("body edit is tracked");
+        let changed_snapshot = phase1_snapshot_from_vfs(&mut database, &module_tree, 18);
+        let second = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &changed_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("interface-use query recomputes after the body edit");
+        let second_memo = database
+            .interface_uses
+            .query
+            .get(&mut database.query_database, package_key)
+            .expect("recomputed interface-use query has a memo");
+
+        assert_eq!(first_fingerprint, second.interface_uses_fingerprint());
+        assert!(
+            Arc::ptr_eq(&first_memo, &second_memo),
+            "the derived query should cut off when the ordered interface graph is unchanged"
+        );
+        assert_eq!(
+            second.interface_uses().diagnostics[0]
+                .primary()
+                .expect("memoized cycle diagnostic has a primary location")
+                .file
+                .snapshot,
+            Some(18),
+            "cycle diagnostic is rebound to the current source snapshot"
+        );
+    }
+
+    #[test]
+    fn interface_uses_fingerprint_changes_when_generation_order_changes() {
+        let initial = b"interface a {}\ninterface b {}\n";
+        let changed = b"interface b {}\ninterface a {}\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(initial, b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let first = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("initial interface-use query succeeds");
+        let first_fingerprint = first.interface_uses_fingerprint();
+
+        database
+            .set_file_contents(
+                FileKey::new("acme:phase1#1", "src/lib.sai").expect("root file key is valid"),
+                Arc::from(&changed[..]),
+                Durability::Low,
+            )
+            .expect("source order edit is tracked");
+        let changed_snapshot = phase1_snapshot_from_vfs(&mut database, &module_tree, 18);
+        let second = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &changed_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("interface-use query recomputes after the order edit");
+
+        assert_ne!(
+            first_fingerprint,
+            second.interface_uses_fingerprint(),
+            "interface generation order contributes to the public fingerprint"
+        );
     }
 
     #[test]
@@ -27390,7 +27663,7 @@ mod tests {
     }
 
     #[test]
-    fn interface_use_collection_propagates_incomplete_type_path_resolution() {
+    fn interface_test_only_adapter_propagates_incomplete_type_path_resolution() {
         let (mut database, module_tree, snapshot, _) =
             phase1_fixture(b"interface api { type Request = Bool }\n", b"");
         let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -27406,9 +27679,12 @@ mod tests {
             "injected test failure",
         ));
 
+        let resolutions = database
+            .resolve_interface_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("interface path adapter returns a result");
         assert_eq!(
-            database.resolve_interface_uses(&collection, &module_tree, &snapshot),
-            Err(OwnerControlFlowResolutionError::PrimitivePrelude(
+            resolutions.interface_uses(),
+            Err(&OwnerControlFlowResolutionError::PrimitivePrelude(
                 PrimitivePreludeBuildError::DuplicateName("injected test failure"),
             ))
         );
