@@ -80,6 +80,12 @@ pub struct GeneratedText {
 }
 ```
 
+`RootDatabase` keeps this snapshot as a tracked input keyed by the package's
+stable `PackageKey`. The `sai_ty` producer will populate that input from
+`generated_wit_text(P)` once the type-query crate is available. Until then,
+the driver exposes set, remove, and read operations so the loader can be
+implemented and tested without coupling `sai_wit` to `sai_ty`.
+
 ### 16.1.3 Queries
 
 | Query | Crate | Key | Value | Section |
@@ -143,7 +149,7 @@ Values carry their diagnostics, and the driver collects them as impl/01 §1.9 st
    - the identity and the version.
 
    An edit to another field of `sai.package` leaves every query of this chapter green when it preserves these projected values. In particular, an edit before `export world` that moves its byte span changes `wit_contract`, even when the world spelling is unchanged, so the updated span remains available for diagnostics.
-6. **Early cutoff.** `generated_wit_text` is compared by value. Editing a function body of a source dependency recomputes its `generated_wit_text`, but leaves the text equal, so the views and checks of its dependents stay green.
+6. **Early cutoff.** The tracked generated snapshot is compared by value, including completeness and origin mappings. Editing a function body of a source dependency recomputes its generated snapshot, but leaves the text and origins equal, so the views and checks of its dependents stay green. The stable fingerprint omits session-local origin `DefId`s and includes their WIT interface names; query equality still detects an origin-only change and invalidates its readers.
 7. **Selected version.** A `WitUnit`'s persistent view key is compatibility-line scoped, but its canonical package name contains the exact selected version. `wit_unit_of` therefore tracks that exact version separately in its query value, so a patch or prerelease selection change within one compatibility line invalidates dependent WIT queries without changing the persistent view identity.
 
 ### 16.1.5 Stages
