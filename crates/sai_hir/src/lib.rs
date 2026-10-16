@@ -55,7 +55,7 @@ impl std::fmt::Debug for DefId {
 
 static NEXT_DEF_PATH_INTERNER_ID: AtomicU32 = AtomicU32::new(1);
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct DefPathInternerId(u32);
 
 fn next_def_path_interner_id() -> Option<DefPathInternerId> {
@@ -74,7 +74,7 @@ fn next_def_path_interner_id() -> Option<DefPathInternerId> {
     }
 }
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LocalDefId {
     package: PackageId,
     index: DefIndex,

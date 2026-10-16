@@ -13,6 +13,7 @@ sai_stable_hash = { path = "../sai_stable_hash" }
 sai_syntax = { path = "../sai_syntax" }
 sai_vfs = { path = "../sai_vfs" }
 sai_wit = { path = "../sai_wit" }
+smol_str.workspace = true
 
 [dev-dependencies]
 sai_package = { path = "../sai_package" }

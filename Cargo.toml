@@ -43,6 +43,7 @@ unicode-ident = "=1.0.18"
 unicode-normalization = "=0.1.24"
 unicode-width = "0.2.1"
 getrandom = "=0.4.3"
+smol_str = "=0.3.2"
 
 [patch.crates-io]
 gix-protocol = { path = "vendor/gix-protocol-0.65.1" }

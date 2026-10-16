@@ -5,12 +5,15 @@ pub mod module_path;
 pub mod module_target;
 pub mod owner;
 pub mod package_scopes;
+pub mod package_wit_names;
 pub mod prelude;
 pub mod use_binding;
 pub mod use_item_binding;
 pub mod use_path;
 pub mod use_target;
 pub mod use_target_diagnostics;
+
+pub use package_wit_names::{PackageWitNames, PackageWitNamesError, package_wit_names};
 
 use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Value};
 use sai_intern::{InternError, Interner, PackageId, PackageIdError, PackageInterner, Symbol};

@@ -10,7 +10,7 @@ const SHARD_COUNT: usize = 16;
 const RADIX: usize = 256;
 static NEXT_INTERNER_SESSION_ID: AtomicU32 = AtomicU32::new(1);
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct InternerSessionId(u32);
 
 impl std::fmt::Debug for InternerSessionId {
@@ -86,7 +86,7 @@ impl std::fmt::Debug for Symbol {
 /// The numeric value is an implementation detail and must not be persisted;
 /// stable package identity is the canonical package key string.
 #[repr(C)]
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PackageId {
     index: u32,
     session_id: InternerSessionId,
