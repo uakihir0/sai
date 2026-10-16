@@ -839,6 +839,15 @@ local/expression results. Package-local callers retain typed path errors
 without snapshot-bound diagnostics. `sai check` collects each child result and
 reports parent-owner analysis failures once. The command remains incomplete.
 
+**Interface/resource member type-path diagnostics (IR-578).** The
+closure-aware interface adapter maps typed private and missing member failures
+independently for each direct interface declaration and nested resource-method
+owner. Each child exposes a separate optional diagnostic channel; parent
+interface errors, resource-method structure errors, test-only results, and
+typed path results remain distinct. Package-local calls leave mapped
+diagnostics absent. `sai check` collects member and resource-method diagnostics
+independently and reports structural failures at their owning level.
+
 **Qualified missing-member diagnostics (IR-545).** The module path walker
 retains the exact `ModuleTarget` when a member is missing. The driver emits a
 snapshot-bound `UNRESOLVED_NAME` at that segment with the canonical package
