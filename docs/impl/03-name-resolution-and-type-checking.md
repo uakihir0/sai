@@ -879,6 +879,16 @@ Rejected test-only heads remain `Res::Err` without suffix lookup. Generic and
 effect path candidates keep their existing classifications; foreign scopes
 and WIT members stay deferred.
 
+**Qualified local trait/impl associated-member prefixes (IR-561).** Associated
+type bounds and definitions, method signatures, and retained method-body type
+paths continue through current-package module and interface members. Each
+child owner keeps its own result and generic scope. Stop at the first
+non-module member, retain the full path length and type-relative suffix, and
+keep missing local members as typed path errors. Rejected test-only heads
+remain `Res::Err` without suffix lookup, even if diagnostic collection fails.
+Expression lookup remains separate; foreign scopes and WIT members stay
+deferred.
+
 ### 3.4.3 Ribs
 
 Local scopes are implemented with a stack of **ribs**, one per scope of spec/04 §4.7.1 below the module scope:
