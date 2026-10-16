@@ -9505,6 +9505,8 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
+        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
+        let source_graph_packages = HashSet::from([collection.module_tree.package]);
         let descriptors = collection
             .scopes
             .top_level_owners
@@ -9727,9 +9729,9 @@ impl RootDatabase {
                                         primitive_prelude,
                                         &rejected_type_paths,
                                         module_scope,
-                                        None,
+                                        Some(&module_members),
                                         member_owner.def_id.package(),
-                                        None,
+                                        Some(&source_graph_packages),
                                     ))
                                 }
                                 (Err(error), _) => {
@@ -17421,7 +17423,7 @@ mod tests {
             "  fn impl_method<N: fixture.ImplMethodBound>(value: fixture.ImplParam, parent: T) -> fixture.ImplReturned where N: fixture.ImplWhereBound effects { fixture.impl_effect } { fixture.impl_body }\n",
             "}\n",
         );
-        let child = "type ChildWidget = U32\n";
+        let child = "type Widget = Bool\ntype ChildWidget = U32\n";
         let (mut database, module_tree, snapshot, _) =
             phase1_fixture(root.as_bytes(), child.as_bytes());
         let parsed_root = database
@@ -17602,10 +17604,18 @@ mod tests {
             .get(&member_symbol("Array"))
             .expect("root Array alias exists")
             .res;
-        let child_module = member_root_scope
-            .scope
-            .get(&member_symbol("child_alias"))
-            .expect("root child module alias exists")
+        let child_widget = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists")
+            .members
+            .get(
+                &database
+                    .symbols
+                    .intern("Widget")
+                    .expect("Widget is interned"),
+            )
+            .expect("child Widget alias exists")
             .res;
         let method_types = trait_members[1]
             .type_path_resolution()
@@ -17638,9 +17648,9 @@ mod tests {
         );
         assert!(
             method_types.paths().values().any(|path| {
-                path.base == child_module && path.resolved_segments == 1 && path.segment_count == 2
+                path.base == child_widget && path.resolved_segments == 2 && path.segment_count == 2
             }),
-            "qualified member type heads resolve only their module prefix"
+            "qualified member type heads resolve their same-package type member"
         );
         assert!(
             method_types.deferred_paths().iter().any(|path| {
@@ -18494,6 +18504,10 @@ mod tests {
             "later test-only type heads remain rejected after diagnostic extraction fails"
         );
         assert!(
+            broken_types.module_path_errors().is_empty(),
+            "rejected test-only method heads do not trigger member lookup"
+        );
+        assert!(
             members[1]
                 .type_path_resolution()
                 .expect("sibling type result remains independent")
@@ -18501,6 +18515,162 @@ mod tests {
                 .values()
                 .all(|path| path.base == Res::Err),
             "a diagnostic failure in one child does not stop sibling type resolution"
+        );
+    }
+
+    #[test]
+    fn trait_impl_member_resolves_local_qualified_type_prefixes() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "trait Api {\n",
+            "  type Qualified: child_alias.api.Request.Associated\n",
+            "  fn method(value: child_alias.Widget, missing: child_alias.MissingType) -> Bool\n",
+            "}\n",
+            "impl Api for child_alias.Widget {\n",
+            "  type Qualified = child_alias.api.Request.Associated\n",
+            "}\n",
+        );
+        let child = concat!(
+            "type Widget = Bool\n",
+            "interface api {\n",
+            "  type Request = Bool\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("trait and impl members collect");
+
+        let child_module_scope = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists");
+        let widget_name = database
+            .symbols
+            .intern("Widget")
+            .expect("Widget name is interned");
+        let widget_binding = child_module_scope
+            .members
+            .get(&widget_name)
+            .expect("child Widget alias is declared");
+        let api_name = database
+            .symbols
+            .intern("api")
+            .expect("api name is interned");
+        let request_name = database
+            .symbols
+            .intern("Request")
+            .expect("Request name is interned");
+        let request_binding = collection
+            .scopes()
+            .interfaces
+            .iter()
+            .find_map(|(def_id, interface)| {
+                (child_module_scope
+                    .members
+                    .get(&api_name)
+                    .is_some_and(|binding| binding.res == Res::Def(DefKind::Interface, *def_id)))
+                .then(|| interface.members.get(&request_name))
+                .flatten()
+            })
+            .expect("interface api declares Request");
+
+        let resolved = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("trait and impl member prefixes resolve");
+        assert_eq!(resolved.owners().len(), 2);
+        let trait_members = resolved.owners()[0].members();
+        assert_eq!(trait_members.len(), 2);
+        let associated = trait_members
+            .iter()
+            .find(|member| member.kind() == TraitImplMemberKind::TraitAssociatedType)
+            .expect("trait associated type member exists");
+        let associated_types = associated
+            .type_path_resolution()
+            .expect("trait associated type lookup succeeds");
+        assert!(
+            associated_types.paths().values().any(|path| {
+                path.base == request_binding.res
+                    && path.resolved_segments == 3
+                    && path.segment_count == 4
+            }),
+            "trait associated type bounds stop at the interface type and retain the suffix"
+        );
+
+        let method = trait_members
+            .iter()
+            .find(|member| member.kind() == TraitImplMemberKind::TraitMethod)
+            .expect("trait method member exists");
+        let method_types = method
+            .type_path_resolution()
+            .expect("trait method signature lookup succeeds");
+        assert!(
+            method_types.paths().values().any(|path| {
+                path.base == widget_binding.res
+                    && path.resolved_segments == 2
+                    && path.segment_count == 2
+            }),
+            "trait method signatures resolve same-package private module members"
+        );
+        assert_eq!(method_types.module_path_errors().len(), 1);
+        let missing_offset = root
+            .find("child_alias.MissingType")
+            .expect("missing member path exists");
+        let missing_error = &method_types.module_path_errors()[0];
+        let (missing_name, missing_segment, missing_span) = match missing_error.error() {
+            ModulePathError::MissingMember {
+                name,
+                segment_index,
+                span,
+                ..
+            } => (name, segment_index, span),
+            error => panic!("expected a missing-member error, got {error:?}"),
+        };
+        assert!(
+            database
+                .resolve_symbol(missing_name)
+                .is_ok_and(|name| name.as_ref() == "MissingType")
+        );
+        assert_eq!(missing_segment, 0);
+        let missing_start = missing_offset + "child_alias.".len();
+        assert_eq!(missing_span.file, module_tree.modules[0].file);
+        assert_eq!(missing_span.range.start().to_usize(), missing_start);
+        assert_eq!(
+            missing_span.range.end().to_usize(),
+            missing_start + "MissingType".len()
+        );
+        assert_eq!(
+            method_types.paths().get(&missing_error.hir_id()),
+            Some(&PathRes {
+                base: Res::Err,
+                resolved_segments: 2,
+                segment_count: 2,
+            }),
+            "a missing member retains its exact type-path error"
+        );
+
+        let impl_members = resolved.owners()[1].members();
+        let impl_associated = impl_members
+            .iter()
+            .find(|member| member.kind() == TraitImplMemberKind::ImplAssociatedType)
+            .expect("impl associated type member exists");
+        let impl_types = impl_associated
+            .type_path_resolution()
+            .expect("impl associated type lookup succeeds");
+        assert!(
+            impl_types.paths().values().any(|path| {
+                path.base == request_binding.res
+                    && path.resolved_segments == 3
+                    && path.segment_count == 4
+            }),
+            "impl associated type definitions resolve through the same local interface"
         );
     }
 
