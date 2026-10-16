@@ -520,7 +520,7 @@ This table applies to local interfaces and worlds, and to the impls of external 
 | `own<r>` / `r` | `R` | `R` |
 | `borrow<r>` | `borrow R` | (WIT allows it only in parameters) |
 | `future<T>` / `stream<T>` | `FutureReader<T>` / `StreamReader<T>` of `sai:async` (Stage 5, [11](11-async-and-concurrency.md) §11.10.3 item 3) | same |
-| `error-context`, fixed-length `list<T, N>`, multiple named results | not supported: `WIT_UNSUPPORTED_FEATURE` | |
+| `error-context`, fixed-length `list<T, N>`, `map<K, V>`, multiple named results | not supported: `WIT_UNSUPPORTED_FEATURE` | |
 
 - A function without a result has the SAI return type `()`.
 - The view of the parameters uses borrowed `Str` and `Slice` so that calling an import never forces a copy into an owned value (N-D-37). The view is used both for calling imports and for implementing external interfaces (§13.3.2).

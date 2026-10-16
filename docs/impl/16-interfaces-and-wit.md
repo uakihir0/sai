@@ -165,12 +165,19 @@ The following are Stage 5:
 A **WIT unit** is one WIT package as the compiler sees it:
 
 ```rust
-pub enum WitUnit {
-    Wasi { package: Symbol },   // an embedded WASI package (`cli`, `io`, …) at the version of §16.2.3
-    Dir(PackageId),             // the `wit` directory of a package
-    Generated(PackageId),       // the WIT generated from a source package (§16.10)
+pub enum WitUnitKind {
+    Wasi { package: Symbol },         // an embedded WASI package (`cli`, `io`, …)
+    Dir { package: PackageId },       // the `wit` directory of a package
+    Generated { package: PackageId }, // WIT generated from a source package (§16.10)
+}
+pub struct WitUnit {
+    kind: WitUnitKind,
+    stable_key: Arc<str>,
+    canonical_name: Arc<str>,
 }
 ```
+
+The constructor resolves `Symbol` or `PackageId` through its matching interner. A WASI unit accepts only one of the seven embedded packages at version `0.2.3`. A package unit also checks that the `PackageId` key equals the identity and compatibility line of the selected `MvsPackageVersion`. The session-local IDs are retained for runtime lookup; `Eq`, `Hash` and `StableHash` use the unit kind and canonical view key only. The expected WIT package name is derived from the package identity and full selected version, so callers cannot forge either identity string.
 
 `wit_unit_of(P)` gives the unit through which **dependents** of `P` see it:
 
@@ -200,6 +207,8 @@ The VFS currently stores this listing as sorted package-relative paths under a v
 4. **Name and version.** The package name `namespace:name` MUST equal the identity of `P`, and its version MUST equal the version of `P`. A difference, including a missing version, is `WIT_PACKAGE_MISMATCH` (package/01 §1.6.3 item 3), at the package declaration. The unit still loads, under the name and version of `P`.
 5. **Resolution.** Foreign references are resolved by §16.2.3. The package is then pushed into a `wit_parser::Resolve` that already contains the units of its closure (§16.2.4). A validation error of `wit-parser`, such as an unknown type, a duplicate name or an invalid `use`, is `WIT_PARSE_ERROR` at the reported location.
 6. **Features.** The `Resolve` is created with no features enabled, so `wit-parser` removes every item gated by `@unstable` (spec/13 §13.7.3, N-D-34). `@since` is ignored, and `@deprecated` is recorded in the model.
+
+The pinned `wit-parser` release does not parse named function results. Before parsing, a WIT-aware lexical pass skips comments and strings, rewrites `-> (name: type)` to the single result type, and rewrites `-> (name: type, name: type, …)` to an equivalent `tuple<type, type, …>`. Only the latter is recorded as `NamedResults` and modeled with `result: None`, matching spec/13 §13.9.2. Duplicate labels, invalid identifiers, unexpected characters and non-ASCII whitespace are left intact for `wit-parser` to reject. The pass retains a byte-boundary map from rewritten parser text to original text; parser errors and model spans therefore still point to original files and byte ranges. Result type syntax and references remain visible to `wit-parser` validation.
 
 `wit_package(Wasi{..})` and `wit_package(Generated(P))` run steps 2, 5 and 6 on the embedded text or on `generated_wit_text(P).text`. A failure there is an internal compiler error ([11](11-diagnostics.md) §11.4.6), not a diagnostic of the program.
 
@@ -260,19 +269,19 @@ The model is a `wit-parser`-independent copy of one resolved package. It is a qu
 pub struct WitPackage {
     pub unit: WitUnit,
     pub name: WitPackageName,
-    pub interfaces: IndexVec<WitIfaceIdx, WitInterface>,
-    pub worlds: IndexVec<WitWorldIdx, WitWorld>,
+    pub interfaces: WitIndexVec<WitIfaceIdx, WitInterface>,
+    pub worlds: WitIndexVec<WitWorldIdx, WitWorld>,
 }
-pub struct WitPackageName { pub namespace: SmolStr, pub name: SmolStr, pub version: Option<Version> }
+pub struct WitPackageName { pub namespace: String, pub name: String, pub version: Option<Version> }
 pub struct WitInterface {
-    pub name: SmolStr,                       // the WIT name (kebab case)
+    pub name: String,                        // the WIT name (kebab case)
     pub docs: Option<Arc<str>>,
     pub deprecated: Option<Version>,
-    pub items: IndexVec<WitItemIdx, WitItem>,
+    pub items: WitIndexVec<WitItemIdx, WitItem>,
     pub span: Option<WitSpan>,               // None in embedded and generated units
 }
 pub struct WitItem {
-    pub name: SmolStr,
+    pub name: String,
     pub docs: Option<Arc<str>>,
     pub deprecated: Option<Version>,
     pub kind: WitItemKind,
@@ -282,16 +291,16 @@ pub struct WitItem {
 pub enum WitItemKind {
     Record(Vec<WitField>),                   // WitField { name, docs, ty }
     Variant(Vec<WitCase>),                   // WitCase { name, docs, payload: Option<WitType> }
-    Enum(Vec<SmolStr>),
-    Flags(Vec<SmolStr>),
+    Enum(Vec<String>),
+    Flags(Vec<String>),
     Resource(Vec<WitMember>),
     Alias(WitType),                          // `type t = …`
     Used(WitTypeRef),                        // `use other.{t}` or `use other.{t as u}`
     Func(WitFunc),
 }
-pub struct WitMember { pub name: SmolStr, pub kind: WitMemberKind, pub func: WitFunc, pub docs: Option<Arc<str>>, pub deprecated: Option<Version> }
+pub struct WitMember { pub name: String, pub kind: WitMemberKind, pub func: WitFunc, pub docs: Option<Arc<str>>, pub deprecated: Option<Version>, pub unsupported: Option<Unsupported> }
 pub enum WitMemberKind { Constructor, Method, Static }
-pub struct WitFunc { pub params: Vec<(SmolStr, WitType)>, pub result: Option<WitType>, pub is_async: bool }
+pub struct WitFunc { pub params: Vec<(String, WitType)>, pub result: Option<WitType>, pub is_async: bool }
 pub enum WitType {
     Bool, S8, S16, S32, S64, U8, U16, U32, U64, F32, F64, Char, String,
     List(Box<WitType>),
@@ -301,23 +310,25 @@ pub enum WitType {
     Named(WitTypeRef),                        // a record, variant, enum, flags or alias
     Own(WitTypeRef), Borrow(WitTypeRef),      // resource handles
     Future(Option<Box<WitType>>), Stream(Option<Box<WitType>>),
-    Unsupported(Unsupported),                 // error-context, fixed-length list
+    Unsupported(Unsupported),                 // error-context, fixed list, map
 }
 pub struct WitTypeRef { pub interface: WitIfaceRef, pub item: WitItemIdx }
 pub struct WitIfaceRef { pub unit: WitUnit, pub interface: WitIfaceIdx }
 pub struct WitWorld {
-    pub name: SmolStr,
+    pub name: String,
     pub docs: Option<Arc<str>>,
     pub imports: Vec<WitWorldItem>,           // as elaborated by `wit-parser`, in its order
     pub exports: Vec<WitWorldItem>,
     pub unsupported: Option<Unsupported>,
     pub span: Option<WitSpan>,
 }
-pub enum WitWorldItem { Interface(WitIfaceRef), Func { name: SmolStr, func: WitFunc } }
-pub enum Unsupported { ErrorContext, FixedList, NamedResults, Async, Future, Stream, WorldType, InlineInterface }
+pub enum WitWorldItem { Interface(WitIfaceRef), Func { name: String, func: WitFunc, unsupported: Option<Unsupported> } }
+pub enum Unsupported { ErrorContext, FixedList, Map, NamedResults, Async, Future, Stream, WorldType, InlineInterface }
 ```
 
-A function with several named results gets `result: None` and `unsupported: Some(NamedResults)`. A type of another unit is referenced by `WitTypeRef`. The model of a unit therefore never copies a definition of another unit, and nominal identity follows the referenced unit (§16.4.1).
+A `WitIndexVec<I, T>` keeps its backing vector private, creates an `I` only when appending, and uses checked 32-bit indices. Its local sealed index trait prevents interface, world and item indices from being mixed; the `sai_intern::Idx` trait cannot be implemented outside its owning crate. Model strings are owned `String`s so query values do not retain parser storage or add a small-string dependency. Every model type has a manual stable-hash encoding with explicit type and variant tags; vector encodings include their index-domain tag, span endpoints use fixed-width integers, and package `Version`s use their canonical display form.
+
+A function with several named results gets `result: None` and `unsupported: Some(NamedResults)`, including resource members and world functions. A function with one named result keeps that result type and is supported. A type of another unit is referenced by `WitTypeRef`. The model of a unit therefore never copies a definition of another unit, and nominal identity follows the referenced unit (§16.4.1).
 
 ### 16.3.2 Order
 
@@ -336,11 +347,13 @@ Unsupported constructs are recorded in the model and reported where the program 
 
 | Construct | Recorded on | Diagnostic at a use |
 |---|---|---|
-| `error-context`, a fixed-length list, multiple named results | the type or function whose definition or signature contains it, and transitively every type and function that contains such a type | `WIT_UNSUPPORTED_FEATURE` |
+| `error-context`, a fixed-length list, `map<K, V>`, multiple named results | the type or function whose definition or signature contains it, and transitively every type and function that contains such a type | `WIT_UNSUPPORTED_FEATURE` |
 | an `async` function, `future<T>`, `stream<T>` | the same | before Stage 5, `FEATURE_NOT_IMPLEMENTED`; from Stage 5 on, the rule of spec/13 §13.9.2 |
 | a type or `use` declared in a world, or an inline `interface { … }` in a world | the world (`WorldType`, `InlineInterface`) | `WIT_UNSUPPORTED_FEATURE` |
 
 The last row is a decision of this chapter. A SAI world has no types, and an inline interface has no `ns:pkg/name` by which SAI could name it. Such a world therefore has no SAI form.
+
+The unsupported-feature pass follows the complete resolved type dependency graph, including references to another WIT unit. When a definition contains more than one unsupported construct, the first one in deterministic WIT traversal order is retained. Within a function signature, the function modifier precedes parameters, parameters are visited in declaration order, and the result follows the parameters. Parser-valid WIT type graphs are acyclic; defensive callers with a cyclic resolved graph use the same ordered traversal with cycle detection.
 
 A **use** is one of:
 
@@ -1237,4 +1250,10 @@ The codes below are defined in [spec/13](../spec/13-components-and-wit.md) or in
 
 ### IR-580: Deterministic in-memory WIT source loading
 
-`sai_wit` now owns the WIT unit identity and an in-memory loader for VFS-provided direct-child `.wit` files. It sorts filenames by bytes, rejects duplicate and nested paths, reports invalid UTF-8 at the first byte, and maps `wit-parser` syntax spans back to the originating relative filename and byte range without reading the filesystem. The loader's parsed package group remains an intermediate value; package-graph closure resolution, package identity validation, the parser-independent model, and view definitions remain future steps. The selected `wit-parser` 0.246.0 uses Unicode 16.0.0 identifier tables and supports the workspace Rust 1.85 minimum.
+`sai_wit` owns the WIT unit identity and the in-memory loader for VFS-provided direct-child `.wit` files. It sorts filenames by bytes, rejects duplicate and nested paths, reports invalid UTF-8 at the first byte, and maps `wit-parser` syntax spans back to the originating relative filename and byte range without reading the filesystem. The parsed package group remains an intermediate loader value; IR-581 adds package validation and the parser-independent model. Package-graph closure resolution and view definitions remain future steps. The selected `wit-parser` 0.246.0 uses Unicode 16.0.0 identifier tables and supports the workspace Rust 1.85 minimum.
+
+### IR-581: Validate WIT units and build the stable package model
+
+`WitUnit` now validates package IDs and symbols through their matching interners, limits WASI units to the embedded catalog at `0.2.3`, and derives persistent view keys from the canonical package identity, compatibility line and unit kind. `sai_wit` converts resolved packages into an owned, parser-independent model with locally typed index vectors and explicit stable hashes. It reports package mismatch and nested-package declaration locations, records unsupported constructs on items, resource members and world functions, and propagates unsupported types in deterministic WIT traversal order through named references. A lexical normalization pass unwraps one named result and converts multiple named results for `wit-parser`, preserving source offsets and recording only the unsupported multiple-result function spans. Invalid and duplicate labels remain visible for parser rejection. Definitions and diagnostic details are recorded in `docs/design/implementation-review.md`.
+- **Human review:** **Review required:** Confirm the use of owned `String`s and local typed vectors instead of `SmolStr` and `sai_intern::IndexVec`; that the stable `Dir`/`Generated` view key uses package compatibility identity while declaration validation uses the full selected version; the seven-package WASI catalog/version restriction; and that parsed `map<K, V>` is recorded as unsupported. Review single and multiple named-result normalization, malformed-input preservation, and the fixed-point propagation of unsupported constructs through cycles.
+- **Remaining scope:** Resolve foreign package references from the package graph, establish WIT closures and generated-text hooks, then assign stable view `DefId`s and connect the model to direct interface-member scopes and name resolution.
