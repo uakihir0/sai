@@ -344,6 +344,18 @@ analysis.
 The complete canonical prelude and general tracked `package_scopes(PackageId)`
 query also remain deferred.
 
+**Function type paths over validated source closures (IR-564).** The driver
+now exposes `resolve_function_owner_analyses_with_member_scopes` for free
+function signatures and body type paths. It accepts only a
+`Phase1ActiveSourceMemberScopes` value validated against the same package
+collection, indexes the complete transitive active source closure, applies
+foreign visibility through canonical module/interface definitions, and
+records the closure fingerprint on the result. The existing
+`resolve_function_owner_analyses` entry point remains package-local. The
+closure-aware function bridge retains private and missing member failures as
+typed path errors; final diagnostic mapping and CLI consumption remain later
+work.
+
 When a foreign-interface re-export candidate precedes a known local candidate
 with the same name, this bridge uses the successful local candidate while
 retaining the foreign-interface item as deferred; a complete package resolver
