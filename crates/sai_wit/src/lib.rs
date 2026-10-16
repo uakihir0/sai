@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod closure;
+mod contract;
 mod convert;
 mod dependency;
 mod generated;
@@ -13,6 +14,7 @@ mod wasi;
 mod wasi_loader;
 
 pub use closure::*;
+pub use contract::*;
 pub use convert::*;
 pub use dependency::*;
 pub use generated::*;

@@ -88,8 +88,9 @@ use sai_vfs::{
     WorkspaceSnapshotId,
 };
 use sai_wit::{
-    EMBEDDED_WASI_VERSION, LoadedWasiPackage, WitUnit, WitUnitIdentityError, WitUnitKind, WitView,
-    WitViewError, WitWasiLoadError, load_embedded_wasi_package,
+    EMBEDDED_WASI_VERSION, LoadedWasiPackage, WitContract, WitContractError, WitContractField,
+    WitUnit, WitUnitIdentityError, WitUnitKind, WitView, WitViewError, WitWasiLoadError,
+    load_embedded_wasi_package,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -121,6 +122,7 @@ pub struct RootDatabase {
     package_scopes: Phase1PackageScopesQueries,
     type_owner_paths: TypeOwnerPathQueries,
     declared_requirements: DeclaredRequirementsQueries,
+    wit_contracts: WitContractQueries,
     package_graph: InputQuery<u8, Option<PackageGraph>>,
     wasi_packages: WasiPackageQueries,
     wasi_views: WasiViewQueries,
@@ -332,6 +334,194 @@ impl DeclaredRequirementsQueries {
             },
         )?;
         Ok(Self { input, query })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WitContractQueryFailure {
+    Projection(WitContractError),
+    PackageMismatch {
+        found_identity: String,
+        found_compatibility_line: String,
+    },
+}
+
+impl StableHash for WitContractQueryFailure {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        match self {
+            Self::Projection(error) => {
+                hasher.write_tag(0xD8);
+                match error {
+                    WitContractError::MissingHeader => hasher.write_tag(0x01),
+                    WitContractError::MalformedHeader { span } => {
+                        hasher.write_tag(0x02);
+                        stable_hash_byte_range(span, hasher);
+                    }
+                    WitContractError::MissingContentKind => hasher.write_tag(0x03),
+                    WitContractError::InvalidContentPath { field, span, error } => {
+                        hasher.write_tag(0x04);
+                        stable_hash_wit_contract_field(*field, hasher);
+                        stable_hash_byte_range(span, hasher);
+                        hasher.write_tag(match error {
+                            sai_package::package_path::PackagePathError::InvalidPackagePath => 0x01,
+                            sai_package::package_path::PackagePathError::PathEscapesRepository => {
+                                0x02
+                            }
+                        });
+                    }
+                    WitContractError::DuplicateDeclaration {
+                        field,
+                        first_span,
+                        duplicate_span,
+                    } => {
+                        hasher.write_tag(0x05);
+                        stable_hash_wit_contract_field(*field, hasher);
+                        stable_hash_byte_range(first_span, hasher);
+                        stable_hash_byte_range(duplicate_span, hasher);
+                    }
+                    WitContractError::MalformedDeclaration { span } => {
+                        hasher.write_tag(0x06);
+                        stable_hash_byte_range(span, hasher);
+                    }
+                    WitContractError::MalformedManifest {
+                        lexical_error_count,
+                        parser_error_count,
+                    } => {
+                        hasher.write_tag(0x07);
+                        stable_hash_usize(*lexical_error_count, hasher);
+                        stable_hash_usize(*parser_error_count, hasher);
+                    }
+                }
+            }
+            Self::PackageMismatch {
+                found_identity,
+                found_compatibility_line,
+            } => {
+                hasher.write_tag(0xD9);
+                found_identity.stable_hash(hasher);
+                found_compatibility_line.stable_hash(hasher);
+            }
+        }
+    }
+}
+
+fn stable_hash_wit_contract_field(field: WitContractField, hasher: &mut StableHasher) {
+    hasher.write_tag(match field {
+        WitContractField::PackageHeader => 0x01,
+        WitContractField::Source => 0x02,
+        WitContractField::Artifact => 0x03,
+        WitContractField::Wit => 0x04,
+        WitContractField::ExportWorld => 0x05,
+    });
+}
+
+fn stable_hash_byte_range(range: &std::ops::Range<usize>, hasher: &mut StableHasher) {
+    stable_hash_usize(range.start, hasher);
+    stable_hash_usize(range.end, hasher);
+}
+
+fn stable_hash_usize(value: usize, hasher: &mut StableHasher) {
+    hasher.write_tag(0xDA);
+    hasher.write_u64(u64::try_from(value).unwrap_or(u64::MAX));
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WitContractQueryOutput {
+    result: Result<Arc<WitContract>, WitContractQueryFailure>,
+}
+
+impl StableHash for WitContractQueryOutput {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        match &self.result {
+            Ok(contract) => {
+                hasher.write_tag(0xDB);
+                contract.stable_hash(hasher);
+            }
+            Err(error) => {
+                hasher.write_tag(0xDC);
+                error.stable_hash(hasher);
+            }
+        }
+    }
+}
+
+/// Errors returned by the tracked WIT projection of a package manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WitContractQueryError {
+    Package(PackageIdError),
+    PackageKey(PackageKeyError),
+    Query(QueryError),
+    Projection {
+        package_key: String,
+        error: WitContractError,
+    },
+    ManifestPackageMismatch {
+        expected_package_key: String,
+        found_identity: String,
+        found_compatibility_line: String,
+    },
+}
+
+impl From<PackageIdError> for WitContractQueryError {
+    fn from(error: PackageIdError) -> Self {
+        Self::Package(error)
+    }
+}
+
+impl From<PackageKeyError> for WitContractQueryError {
+    fn from(error: PackageKeyError) -> Self {
+        Self::PackageKey(error)
+    }
+}
+
+impl From<QueryError> for WitContractQueryError {
+    fn from(error: QueryError) -> Self {
+        Self::Query(error)
+    }
+}
+
+struct WitContractQueries {
+    query: DerivedQuery<PackageKey, WitContractQueryOutput>,
+}
+
+impl WitContractQueries {
+    fn new(input: InputQuery<PackageKey, DeclaredRequirementsInput>) -> Result<Self, QueryError> {
+        let query = DerivedQuery::new(
+            "wit_contract",
+            move |database: &mut QueryDatabase, key: &PackageKey| {
+                let input = input.get(database, key.clone())?;
+                let role = if input.dependency {
+                    PackageRole::Dependency
+                } else {
+                    PackageRole::Root
+                };
+                let parsed = sai_package::manifest::parse_for_role_with_error_limit(
+                    &input.source_bytes,
+                    role,
+                    0,
+                );
+                let contract = WitContract::from_package_parse_output(&parsed)
+                    .map_err(|error| WitContractQueryFailure::Projection(error));
+                let result = contract.and_then(|contract| {
+                    let found_identity = contract.identity().to_string();
+                    let found_compatibility_line =
+                        contract.version().compatibility_line().to_string();
+                    if !manifest_matches_package_key(
+                        key,
+                        &found_identity,
+                        &found_compatibility_line,
+                    ) {
+                        return Err(WitContractQueryFailure::PackageMismatch {
+                            found_identity,
+                            found_compatibility_line,
+                        });
+                    }
+                    Ok(Arc::new(contract))
+                });
+                Ok(WitContractQueryOutput { result })
+            },
+        )?;
+        Ok(Self { query })
     }
 }
 
@@ -5956,6 +6146,7 @@ impl RootDatabase {
             Phase1PackageScopesQueries::new(Arc::clone(&packages), Arc::clone(&symbols))?;
         let type_owner_paths = TypeOwnerPathQueries::new()?;
         let declared_requirements = DeclaredRequirementsQueries::new()?;
+        let wit_contracts = WitContractQueries::new(declared_requirements.input.clone())?;
         let package_graph =
             InputQuery::<u8, Option<PackageGraph>>::new("package_graph", Durability::Medium)?;
         package_graph.set(&mut query_database, 0, None)?;
@@ -5981,6 +6172,7 @@ impl RootDatabase {
             package_scopes,
             type_owner_paths,
             declared_requirements,
+            wit_contracts,
             package_graph,
             wasi_packages,
             wasi_views,
@@ -6088,7 +6280,8 @@ impl RootDatabase {
     }
 
     /// Sets the exact `sai.package` bytes used by
-    /// [`RootDatabase::declared_requirements`].
+    /// [`RootDatabase::declared_requirements`] and
+    /// [`RootDatabase::wit_contract`].
     ///
     /// The role is part of the tracked input because root and dependency
     /// manifest parsing has different validation rules. Durability follows
@@ -6159,6 +6352,46 @@ impl RootDatabase {
                 found_compatibility_line: found_compatibility_line.clone(),
             }),
         }
+    }
+
+    /// Returns the tracked WIT-relevant projection of this package's manifest.
+    ///
+    /// The projection is a firewall over package identity, exact version,
+    /// content kind, the optional WIT directory, and optional export-world
+    /// spelling and span. Both this query and [`RootDatabase::declared_requirements`]
+    /// read the same tracked manifest input. Projection failures and package
+    /// identity mismatches are values, so malformed manifests do not poison
+    /// the query runtime.
+    pub fn wit_contract(
+        &mut self,
+        package: PackageId,
+    ) -> Result<Arc<WitContract>, WitContractQueryError> {
+        let package_key = self
+            .packages
+            .resolve(package)
+            .map_err(WitContractQueryError::from)?;
+        let package_key =
+            PackageKey::new(package_key.as_ref()).map_err(WitContractQueryError::from)?;
+        let expected_package_key = package_key.as_str().to_owned();
+        let output = self
+            .wit_contracts
+            .query
+            .get(&mut self.query_database, package_key)
+            .map_err(WitContractQueryError::from)?;
+        output.result.clone().map_err(|failure| match failure {
+            WitContractQueryFailure::Projection(error) => WitContractQueryError::Projection {
+                package_key: expected_package_key,
+                error,
+            },
+            WitContractQueryFailure::PackageMismatch {
+                found_identity,
+                found_compatibility_line,
+            } => WitContractQueryError::ManifestPackageMismatch {
+                expected_package_key,
+                found_identity,
+                found_compatibility_line,
+            },
+        })
     }
 
     /// Interns a stable file key and returns its session-local file ID.
@@ -26254,6 +26487,172 @@ mod tests {
             diagnostic.code != sai_diagnostics::Code::TestDependencyOutsideTest
                 && diagnostic.code != sai_diagnostics::Code::InactiveDependency
         }));
+    }
+
+    #[test]
+    fn wit_contract_query_projects_manifest_fields_and_backdates_unrelated_edits() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let package = database
+            .intern_package("acme:wit-contract#1")
+            .expect("package key interns");
+        let first_source: Arc<[u8]> = Arc::from(
+            &b"package acme:wit-contract @ 1.0.0\n\
+              source \"src\"\n\
+              wit \"wit\"\n\
+              export world server\n\
+              description \"one\"\n"[..],
+        );
+        database
+            .set_package_manifest(package, first_source, PackageRole::Root, Durability::Low)
+            .expect("manifest input is set");
+
+        let first = database
+            .wit_contract(package)
+            .expect("WIT contract projection succeeds");
+        assert_eq!(first.identity().to_string(), "acme:wit-contract");
+        assert_eq!(first.version().to_string(), "1.0.0");
+        assert_eq!(first.kind(), sai_wit::WitPackageKind::Source);
+        assert_eq!(first.wit_directory(), Some("wit"));
+        let export_world = first
+            .export_world()
+            .expect("the manifest declares an export world");
+        assert_eq!(export_world.value(), "server");
+        let export_span = export_world.span().clone();
+
+        let package_key = PackageKey::new("acme:wit-contract#1").expect("package key is valid");
+        let first_output = database
+            .wit_contracts
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("first WIT contract memo exists");
+
+        // Replacing an unrelated, same-width field preserves the exported
+        // span as well as every projected contract field.
+        let unrelated_edit: Arc<[u8]> = Arc::from(
+            &b"package acme:wit-contract @ 1.0.0\n\
+              source \"src\"\n\
+              wit \"wit\"\n\
+              export world server\n\
+              description \"two\"\n"[..],
+        );
+        database
+            .set_package_manifest(package, unrelated_edit, PackageRole::Root, Durability::Low)
+            .expect("unrelated manifest edit is set");
+        let second = database
+            .wit_contract(package)
+            .expect("WIT projection remains valid");
+        let second_output = database
+            .wit_contracts
+            .query
+            .get(&mut database.query_database, package_key.clone())
+            .expect("second WIT contract memo exists");
+        assert!(
+            Arc::ptr_eq(&first_output, &second_output),
+            "editing an unrelated field with stable offsets keeps the WIT query green"
+        );
+        assert_eq!(
+            second
+                .export_world()
+                .expect("world remains declared")
+                .span(),
+            &export_span
+        );
+
+        let changed_contract: Arc<[u8]> = Arc::from(
+            &b"package acme:wit-contract @ 1.0.0\n\
+              source \"src\"\n\
+              wit \"api\"\n\
+              export world server\n\
+              description \"two\"\n"[..],
+        );
+        database
+            .set_package_manifest(
+                package,
+                changed_contract,
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("WIT directory edit is set");
+        let third = database
+            .wit_contract(package)
+            .expect("edited WIT contract projection succeeds");
+        assert_eq!(third.wit_directory(), Some("api"));
+        assert!(
+            !Arc::ptr_eq(&second, &third),
+            "changing a WIT contract field changes the projected query value"
+        );
+    }
+
+    #[test]
+    fn wit_contract_query_returns_projection_errors_as_values_and_recovers() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let package = database
+            .intern_package("acme:wit-contract#1")
+            .expect("package key interns");
+        let invalid_source: Arc<[u8]> = Arc::from(
+            &b"package acme:wit-contract @ 1.0.0\n\
+              source \"src\"\n\
+              wit \"../outside\"\n"[..],
+        );
+        database
+            .set_package_manifest(package, invalid_source, PackageRole::Root, Durability::Low)
+            .expect("invalid manifest input is still trackable");
+
+        assert!(matches!(
+            database.wit_contract(package),
+            Err(WitContractQueryError::Projection { .. })
+        ));
+
+        let valid_source: Arc<[u8]> = Arc::from(
+            &b"package acme:wit-contract @ 1.0.0\n\
+              source \"src\"\n\
+              wit \"wit\"\n"[..],
+        );
+        database
+            .set_package_manifest(package, valid_source, PackageRole::Root, Durability::Low)
+            .expect("corrected manifest input is set");
+        let recovered = database
+            .wit_contract(package)
+            .expect("a corrected manifest recovers the query");
+        assert_eq!(recovered.wit_directory(), Some("wit"));
+
+        let mismatched_source: Arc<[u8]> = Arc::from(
+            &b"package acme:other @ 1.0.0\n\
+              source \"src\"\n"[..],
+        );
+        database
+            .set_package_manifest(
+                package,
+                mismatched_source,
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("mismatched manifest input is set");
+        assert!(matches!(
+            database.wit_contract(package),
+            Err(WitContractQueryError::ManifestPackageMismatch { .. })
+        ));
+
+        let wrong_version_source: Arc<[u8]> = Arc::from(
+            &b"package acme:wit-contract @ 2.0.0\n\
+              source \"src\"\n"[..],
+        );
+        database
+            .set_package_manifest(
+                package,
+                wrong_version_source,
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("wrong compatibility-line manifest input is set");
+        assert!(matches!(
+            database.wit_contract(package),
+            Err(WitContractQueryError::ManifestPackageMismatch {
+                found_identity,
+                found_compatibility_line,
+                ..
+            }) if found_identity == "acme:wit-contract" && found_compatibility_line == "2"
+        ));
     }
 
     #[test]
