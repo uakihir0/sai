@@ -4006,11 +4006,22 @@ fn check_locked_active_wit_directory_inputs(
 ) -> Result<CheckLockedWitDirectoryInputs, ()> {
     let directories = packages
         .iter()
-        .filter(|package| package.form == sai_driver::package_graph::PackageForm::Artifact)
         .filter_map(|package| {
             let manifest = package
                 .directory
                 .parse_manifest(sai_package::manifest::PackageRole::Dependency);
+            let has_artifact_declaration = manifest.file().declarations.iter().any(|declaration| {
+                matches!(
+                    &declaration.value,
+                    sai_package::manifest::PackageDeclaration::ArtifactComponents(artifacts)
+                        if !artifacts.is_empty()
+                )
+            });
+            if package.form == sai_driver::package_graph::PackageForm::Source
+                && !has_artifact_declaration
+            {
+                return None;
+            }
             let wit_directory = check_manifest_wit_directory(&manifest)?;
             Some(CheckLockedWitDirectory {
                 package_key: package.package_key.clone(),
@@ -4599,6 +4610,100 @@ fn check_module_tree_workspace_exceeds_limits(
         || tree_path_bytes > limits.path_bytes
 }
 
+fn wit_package_load_check_diagnostics(
+    database: &mut RootDatabase,
+    package_graph: &sai_driver::package_graph::PackageGraph,
+    wit_packages: &[CheckWitDirectoryPackageInput],
+    include_source_lines: bool,
+) -> Result<(Vec<CheckDiagnostic>, usize), String> {
+    let mut diagnostics = Vec::new();
+    for wit_package in wit_packages {
+        let Some(directory) = wit_package.files.directory() else {
+            continue;
+        };
+        let graph_node = package_graph
+            .node(&wit_package.package_key)
+            .ok_or_else(|| {
+                format!(
+                    "captured WIT inventory belongs to inactive package {}",
+                    wit_package.package_key.as_str()
+                )
+            })?;
+        let package_identity = format!("{}@{}", graph_node.identity(), graph_node.version());
+        let package_id = database
+            .intern_package(graph_node.key().as_str())
+            .map_err(|error| format!("could not intern WIT package: {error:?}"))?;
+        let selected_version = sai_package::mvs::MvsPackageVersion::new(
+            graph_node.identity().to_owned(),
+            graph_node.version().clone(),
+        )
+        .map_err(|error| format!("invalid WIT package version: {error:?}"))?;
+        let Some(template) = database
+            .wit_directory_load_diagnostic_template(package_id, &selected_version)
+            .map_err(|error| {
+                format!("WIT package query failed for {package_identity}: {error:?}")
+            })?
+        else {
+            continue;
+        };
+
+        let code = template.code().as_str();
+        let diagnostic = if let Some(location) = template.location() {
+            let package_relative_path = if directory == "." {
+                location.path.clone()
+            } else {
+                format!("{directory}/{}", location.path)
+            };
+            let display_path =
+                if graph_node.role() == sai_driver::package_graph::PackageGraphRole::Root {
+                    package_relative_path.clone()
+                } else {
+                    dependency_source_ref(&package_identity, &package_relative_path)
+                };
+            let source = wit_package
+                .file_inputs
+                .iter()
+                .find(|(path, _)| path.as_str() == package_relative_path.as_str())
+                .map(|(_, source)| Arc::clone(source))
+                .ok_or_else(|| {
+                    format!(
+                        "WIT diagnostic for {package_identity} references uncaptured source `{package_relative_path}`"
+                    )
+                })?;
+            let mut source_index = CliSourceIndex::new(source);
+            cli_source_diagnostic(
+                &mut source_index,
+                FmtDiagnosticSource {
+                    path: &display_path,
+                    include_source_line: include_source_lines,
+                },
+                code,
+                template.message().to_owned(),
+                location.range.clone(),
+                None,
+                None,
+            )
+        } else {
+            CliDiagnostic {
+                code,
+                message: template.message().to_owned(),
+                primary: None,
+                primary_label: String::new(),
+                argument_index: None,
+                argument: String::new(),
+                help: None,
+                data: None,
+            }
+        };
+        diagnostics.push(check_diagnostic_with_package(
+            check_cli_diagnostic(diagnostic),
+            Some(&package_identity),
+        ));
+    }
+    let errors = diagnostics.len();
+    Ok((diagnostics, errors))
+}
+
 fn module_tree_workspace_check_diagnostics(
     inputs: &[CheckModuleTreePackageInput],
     package_manifests: &[CheckPackageManifestInput],
@@ -4829,6 +4934,16 @@ fn module_tree_workspace_check_diagnostics(
     let mut errors = 0usize;
     let mut warnings = 0usize;
     let mut infos = 0usize;
+    if let Some(package_graph) = package_graph_for_scopes.as_ref() {
+        let (wit_diagnostics, wit_errors) = wit_package_load_check_diagnostics(
+            &mut database,
+            package_graph,
+            wit_packages,
+            include_source_lines,
+        )?;
+        diagnostics.extend(wit_diagnostics);
+        errors = errors.saturating_add(wit_errors);
+    }
     for (index, _, module_tree, source_by_key) in &package_trees {
         let input = &inputs[*index];
         for diagnostic in module_tree.diagnostics.iter() {

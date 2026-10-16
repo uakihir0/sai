@@ -1056,3 +1056,347 @@ fn locked_check_checks_active_dependency_sources_for_an_artifact_only_root() {
         "{syntax_diagnostic}"
     );
 }
+
+#[test]
+fn locked_check_reports_one_root_wit_loader_parse_diagnostic_with_source_range() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    fs::create_dir_all(root.join("wit")).expect("create root WIT directory");
+    fs::create_dir_all(root.join("dist")).expect("create root artifact directory");
+
+    fs::write(
+        root.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "wit \"wit\"\n",
+            "export world check\n",
+            "targets { wasm32-wasi }\n",
+            "artifact component { wasm32-wasi \"dist/check.wasm\" }\n"
+        ),
+    )
+    .expect("write artifact-only root manifest");
+    fs::write(root.join("dist/check.wasm"), b"component").expect("write root component artifact");
+    let malformed_wit = "package acme:check@0.1.0;\nworld check { # }\n";
+    fs::write(root.join("wit/bad.wit"), malformed_wit).expect("write malformed root WIT source");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:check @ 0.1.0\n",
+            "    targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write root-only format-2 lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let wit_diagnostics = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"WIT_PARSE_ERROR\""))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wit_diagnostics.len(),
+        1,
+        "the root WIT loader error should be emitted once: {stdout}"
+    );
+    let diagnostic = wit_diagnostics[0];
+    let error_byte = malformed_wit
+        .find('#')
+        .expect("the malformed WIT token exists");
+    assert!(
+        diagnostic.contains("\"package\":\"acme:check@0.1.0\"")
+            && diagnostic.contains("\"path\":\"wit/bad.wit\"")
+            && diagnostic.contains(&format!("\"start\":{{\"byte\":{error_byte},"))
+            && diagnostic.contains(&format!("\"end\":{{\"byte\":{},", error_byte + 1)),
+        "{diagnostic}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "successful check remains unavailable: {stdout}"
+    );
+}
+
+#[test]
+fn locked_check_reports_locationless_root_wit_resolve_failure_once() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    fs::create_dir_all(root.join("wit")).expect("create root WIT directory");
+    fs::create_dir_all(root.join("dist")).expect("create root artifact directory");
+
+    fs::write(
+        root.join("sai.package"),
+        concat!(
+            "package acme:check @ 1.0.0\n",
+            "compiler ^0.1\n",
+            "wit \"wit\"\n",
+            "export world check\n",
+            "targets { wasm32-wasi }\n",
+            "artifact component { wasm32-wasi \"dist/check.wasm\" }\n"
+        ),
+    )
+    .expect("write artifact-only root manifest");
+    fs::write(root.join("dist/check.wasm"), b"component").expect("write root component artifact");
+    fs::write(
+        root.join("wit/semantic.wit"),
+        "package acme:check@1.0.0;\n@since(version = 2.0.0) interface api {}\n",
+    )
+    .expect("write WIT with a locationless Resolve::push failure");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:check @ 1.0.0\n",
+            "    targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write root-only format-2 lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let wit_diagnostics = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"WIT_PARSE_ERROR\""))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wit_diagnostics.len(),
+        1,
+        "the root Resolve::push failure should be emitted once: {stdout}"
+    );
+    assert!(
+        wit_diagnostics[0].contains("\"package\":\"acme:check@1.0.0\"")
+            && wit_diagnostics[0].contains("\"primary\":null"),
+        "the locationless semantic failure keeps root ownership without a fabricated span: {}",
+        wit_diagnostics[0]
+    );
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "semantic diagnostics do not imply full check success: {stdout}"
+    );
+}
+
+#[test]
+fn locked_check_reports_referenced_artifact_wit_failure_once_for_its_owner() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    let dependency = root.join("dep");
+    fs::create_dir_all(root.join("wit")).expect("create root WIT directory");
+    fs::create_dir_all(root.join("dist")).expect("create root artifact directory");
+    fs::create_dir_all(dependency.join("wit")).expect("create dependency WIT directory");
+    fs::create_dir_all(dependency.join("dist")).expect("create dependency artifact directory");
+
+    fs::write(
+        root.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "wit \"wit\"\n",
+            "export world app\n",
+            "targets { wasm32-wasi }\n",
+            "artifact component { wasm32-wasi \"dist/check.wasm\" }\n",
+            "requires { acme:dep @ ^1 from path \"dep\" }\n"
+        ),
+    )
+    .expect("write artifact-only root manifest");
+    fs::write(
+        root.join("wit/root.wit"),
+        "package acme:check@0.1.0;\nworld app { import acme:dep/api; }\n",
+    )
+    .expect("write root WIT reference");
+    fs::write(root.join("dist/check.wasm"), b"component").expect("write root component artifact");
+    fs::write(
+        dependency.join("sai.package"),
+        concat!(
+            "package acme:dep @ 1.0.0\n",
+            "wit \"wit\"\n",
+            "export world api\n",
+            "targets { wasm32-wasi }\n",
+            "artifact component { wasm32-wasi \"dist/dep.wasm\" }\n"
+        ),
+    )
+    .expect("write artifact dependency manifest");
+    let malformed_wit = "package acme:dep@1.0.0;\ninterface api { # }\n";
+    fs::write(dependency.join("wit/bad.wit"), malformed_wit)
+        .expect("write malformed dependency WIT");
+    fs::write(dependency.join("dist/dep.wasm"), b"component")
+        .expect("write dependency component artifact");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:check @ 0.1.0\n",
+            "    targets { wasm32-wasi }\n",
+            "    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n",
+            "\n",
+            "package acme:dep @ 1.0.0\n",
+            "    source path \"dep\"\n"
+        ),
+    )
+    .expect("write complete format-2 path lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let wit_diagnostics = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"WIT_PARSE_ERROR\""))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wit_diagnostics.len(),
+        1,
+        "the dependency failure propagated through root loading must be emitted once: {stdout}"
+    );
+    let diagnostic = wit_diagnostics[0];
+    let error_byte = malformed_wit
+        .find('#')
+        .expect("the malformed WIT token exists");
+    assert!(
+        diagnostic.contains("\"package\":\"acme:dep@1.0.0\"")
+            && diagnostic.contains("\"path\":\"dep:acme:dep@1.0.0/wit/bad.wit\"")
+            && diagnostic.contains(&format!("\"start\":{{\"byte\":{error_byte},"))
+            && diagnostic.contains(&format!("\"end\":{{\"byte\":{},", error_byte + 1))
+            && !diagnostic.contains("\"package\":\"acme:check@0.1.0\""),
+        "{diagnostic}"
+    );
+}
+
+#[test]
+fn locked_check_reports_wit_failure_from_source_selected_hybrid_dependency() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    let dependency = root.join("dep");
+    fs::create_dir_all(root.join("src")).expect("create root source directory");
+    fs::create_dir_all(dependency.join("src")).expect("create hybrid source directory");
+    fs::create_dir_all(dependency.join("wit")).expect("create hybrid WIT directory");
+    fs::create_dir_all(dependency.join("dist")).expect("create hybrid artifact directory");
+
+    fs::write(
+        root.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n",
+            "targets { wasm32-wasi }\n",
+            "requires { acme:dep @ ^1 from path \"dep\" }\n"
+        ),
+    )
+    .expect("write root source manifest");
+    fs::write(root.join("src/lib.sai"), "pub fn root() {}\n").expect("write root source");
+    fs::write(
+        dependency.join("sai.package"),
+        concat!(
+            "package acme:dep @ 1.0.0\n",
+            "source \"src\"\n",
+            "wit \"wit\"\n",
+            "export world api\n",
+            "targets { wasm32-wasi }\n",
+            "artifact component { wasm32-wasi \"dist/dep.wasm\" }\n"
+        ),
+    )
+    .expect("write source-form hybrid manifest");
+    fs::write(dependency.join("src/lib.sai"), "pub fn dep() {}\n").expect("write hybrid source");
+    let malformed_wit = "package acme:dep@1.0.0;\ninterface api { # }\n";
+    fs::write(dependency.join("wit/bad.wit"), malformed_wit).expect("write malformed hybrid WIT");
+    fs::write(dependency.join("dist/dep.wasm"), b"component").expect("write hybrid artifact");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:check @ 0.1.0\n",
+            "    targets { wasm32-wasi }\n",
+            "    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n",
+            "\n",
+            "package acme:dep @ 1.0.0\n",
+            "    source path \"dep\"\n"
+        ),
+    )
+    .expect("write complete format-2 path lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let wit_diagnostics = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"WIT_PARSE_ERROR\""))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wit_diagnostics.len(),
+        1,
+        "the source-selected hybrid WIT failure should be emitted once: {stdout}"
+    );
+    let diagnostic = wit_diagnostics[0];
+    let error_byte = malformed_wit
+        .find('#')
+        .expect("the malformed WIT token exists");
+    assert!(
+        diagnostic.contains("\"package\":\"acme:dep@1.0.0\"")
+            && diagnostic.contains("\"path\":\"dep:acme:dep@1.0.0/wit/bad.wit\"")
+            && diagnostic.contains(&format!("\"start\":{{\"byte\":{error_byte},"))
+            && diagnostic.contains(&format!("\"end\":{{\"byte\":{},", error_byte + 1)),
+        "{diagnostic}"
+    );
+    assert!(
+        !stdout.contains("\"type\":\"result\""),
+        "incomplete check does not produce a success record: {stdout}"
+    );
+}
