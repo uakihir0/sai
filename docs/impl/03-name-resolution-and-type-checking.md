@@ -889,6 +889,14 @@ remain `Res::Err` without suffix lookup, even if diagnostic collection fails.
 Expression lookup remains separate; foreign scopes and WIT members stay
 deferred.
 
+**Qualified local interface/resource prefixes (IR-562).** Direct interface
+declarations and resource-method type paths continue through current-package
+module and interface members. Stop at the first non-module member, retain the
+full path length and type-relative suffix, and keep missing local members as
+typed path errors. The shared resolver's world-item call still has no member
+index, so world module, interface, and include paths keep their separate
+namespace behavior. Foreign scopes and WIT members stay deferred.
+
 ### 3.4.3 Ribs
 
 Local scopes are implemented with a stack of **ribs**, one per scope of spec/04 §4.7.1 below the module scope:
