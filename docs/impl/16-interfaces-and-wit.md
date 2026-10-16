@@ -694,7 +694,7 @@ Interface items and world items have no bodies. The parser reports a `{` after a
 | a record without fields, an enum without variants, a flags type without flags | `WIT_EMPTY_TYPE` | `interface_check`, at the item name |
 | a case with a tuple payload of two or more types, or a record payload | `WIT_INCOMPATIBLE_TYPE` | `interface_check`, at the payload |
 | `@repr` on an interface type | `WIT_INCOMPATIBLE_TYPE` | attribute target validation ([02](02-frontend-ast-hir.md) §2.10.2), at the attribute |
-| a resource member with an invalid receiver or constructor (§16.6.2) | `WIT_INCOMPATIBLE_TYPE` | `interface_check` |
+| a resource method with an invalid receiver (§16.6.2) | `WIT_INCOMPATIBLE_TYPE` | `interface_check` |
 | a type without a WIT mapping (§16.6.3) | `WIT_INCOMPATIBLE_TYPE` | `interface_check` |
 | a name without a WIT name (§16.6.3) | `WIT_NAME_NOT_REPRESENTABLE` | `interface_check`, at the name |
 | two names with the same WIT name (§16.6.4) | `WIT_NAME_COLLISION` | `interface_check`, at the later name |

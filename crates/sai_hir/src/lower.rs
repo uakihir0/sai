@@ -2992,6 +2992,7 @@ pub fn lower_interface_resource_member_owner<'hir>(
     let role = if sig.params.first().is_some_and(|param| param.is_self) {
         MemberRole::Method
     } else if name.sym == context.symbols.intern("new")?
+        && !sig.params.iter().any(|param| param.is_self)
         && sig
             .ret
             .is_some_and(|ty| is_interface_resource_type(ty, resource_entry.name))
@@ -25541,6 +25542,7 @@ mod tests {
             "        fn info() -> Str\n",
             "        fn info<T>(value: T) -> T where T: Copy requires true ensures true { value }\n",
             "        fn new() -> Result<Self, E>\n",
+            "        fn new(value: U32, self: borrow Self) -> Image\n",
             "    }\n",
             "}\n",
         );
@@ -25573,7 +25575,7 @@ mod tests {
             .iter()
             .find(|entry| entry.kind == ItemTreeKind::Resource)
             .expect("interface resource entry");
-        assert_eq!(resource_entry.children.len(), 6);
+        assert_eq!(resource_entry.children.len(), 7);
         let name = symbols.intern("images").expect("interface name interns");
         let (_packages, paths, interface_owner_id) =
             owner_context_with_data(&symbols, DefPathData::Interface(name));
@@ -25624,6 +25626,7 @@ mod tests {
             MemberRole::Method,
             MemberRole::Constructor,
             MemberRole::Constructor,
+            MemberRole::Static,
             MemberRole::Static,
             MemberRole::Static,
             MemberRole::Static,
@@ -25726,6 +25729,12 @@ mod tests {
                 assert!(
                     !is_interface_resource_type(result_ty, resource_entry.name),
                     "Result<Self, E> does not classify a new function as a constructor"
+                );
+            }
+            if index == 6 {
+                assert!(
+                    sig.params.iter().any(|param| param.is_self),
+                    "a later self parameter prevents constructor classification"
                 );
             }
         }

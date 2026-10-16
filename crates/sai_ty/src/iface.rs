@@ -1,5 +1,5 @@
 use sai_diagnostics::Code;
-use sai_hir::items::{HirOwner, InterfaceItemKind, OwnerNode, Variant, VariantShape};
+use sai_hir::items::{HirOwner, InterfaceItemKind, MemberRole, OwnerNode, Variant, VariantShape};
 use sai_hir::{OwnerId, Span};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -10,6 +10,7 @@ pub enum InterfaceCheckIssueKind {
     EmptyType,
     UnsupportedVariantPayload,
     InvalidFlagsEnum,
+    InvalidResourceReceiver,
 }
 
 impl InterfaceCheckIssueKind {
@@ -20,6 +21,7 @@ impl InterfaceCheckIssueKind {
             Self::ExplicitDiscriminant => Code::WitExplicitDiscriminant,
             Self::EmptyType => Code::WitEmptyType,
             Self::InvalidFlagsEnum => Code::InvalidFlagsEnum,
+            Self::InvalidResourceReceiver => Code::WitIncompatibleType,
         }
     }
 
@@ -37,6 +39,7 @@ impl InterfaceCheckIssueKind {
             Self::InvalidFlagsEnum => {
                 "flags enums require unit variants without explicit discriminants and at most 32 flags"
             }
+            Self::InvalidResourceReceiver => "resource methods must borrow their resource receiver",
         }
     }
 
@@ -48,6 +51,7 @@ impl InterfaceCheckIssueKind {
             Self::EmptyType => "empty WIT interface type",
             Self::UnsupportedVariantPayload => "unsupported WIT variant payload",
             Self::InvalidFlagsEnum => "invalid flags enum",
+            Self::InvalidResourceReceiver => "invalid resource receiver",
         }
     }
 }
@@ -85,6 +89,25 @@ pub fn interface_item_check(
             kind: InterfaceCheckIssueKind::GenericItem,
             span,
         });
+    }
+    if let InterfaceItemKind::ResourceMember {
+        role: MemberRole::Method,
+        sig,
+        ..
+    } = item.kind
+    {
+        if let Some(receiver) = sig.params.first().filter(|param| param.is_self) {
+            if !matches!(
+                receiver.ty.kind,
+                sai_hir::types::TyKind::Borrow(_, _) | sai_hir::types::TyKind::Err
+            ) {
+                issues.push(InterfaceCheckIssue {
+                    owner: item.owner_id,
+                    kind: InterfaceCheckIssueKind::InvalidResourceReceiver,
+                    span: receiver.ty.span,
+                });
+            }
+        }
     }
     if let InterfaceItemKind::Refined { clause, .. } = item.kind {
         issues.push(InterfaceCheckIssue {
@@ -177,13 +200,14 @@ fn is_empty_wit_type(kind: &InterfaceItemKind<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{InterfaceCheckIssueKind, interface_item_check, is_empty_wit_type};
+    use sai_hir::body::{FnParam, FnSig};
     use sai_hir::items::{
-        HirOwner, InterfaceItem, InterfaceItemKind, OwnerNode, Variant, VariantShape,
+        HirOwner, InterfaceItem, InterfaceItemKind, MemberRole, OwnerNode, Variant, VariantShape,
     };
-    use sai_hir::types::{Generics, Name};
+    use sai_hir::types::{Generics, Name, Path, PathRoot, Ty, TyKind};
     use sai_hir::{
-        DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, OwnerId, Span,
-        SpanCtxt,
+        DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, Mutability,
+        OwnerId, Safety, Span, SpanCtxt,
     };
     use sai_intern::{Interner, ItemLocalId, PackageInterner};
     use sai_vfs::{FileId, TextRange, TextSize};
@@ -293,6 +317,81 @@ mod tests {
         interface_item_check(&owner, flags_marker_accepted)
     }
 
+    fn check_resource_member(
+        role: MemberRole,
+        outer_borrow: Option<Mutability>,
+        error_type: bool,
+    ) -> Vec<super::InterfaceCheckIssue> {
+        let (ids, _symbols) = test_ids();
+        let inner_ty = Ty {
+            hir_id: ids.hir,
+            kind: TyKind::Path(Path {
+                hir_id: ids.hir,
+                root: PathRoot::SelfType,
+                segments: &[],
+                span: span(35, 39),
+            }),
+            span: span(35, 39),
+        };
+        let receiver_ty = Ty {
+            hir_id: ids.hir,
+            kind: if error_type {
+                TyKind::Err
+            } else if let Some(mutability) = outer_borrow {
+                TyKind::Borrow(mutability, &inner_ty)
+            } else {
+                TyKind::Tuple(&[])
+            },
+            span: span(30, 34),
+        };
+        let receiver = FnParam {
+            hir_id: ids.hir,
+            name: Some(Name {
+                sym: ids.symbol,
+                span: span(20, 24),
+            }),
+            is_self: true,
+            mutable: false,
+            ty: &receiver_ty,
+        };
+        let params = [receiver];
+        let sig = FnSig {
+            safety: Safety::Safe,
+            is_async: false,
+            params: &params,
+            ret: None,
+            borrows: None,
+            effects: None,
+            requires: &[],
+            ensures: &[],
+        };
+        let item = InterfaceItem {
+            owner_id: ids.owner,
+            interface: ids.owner.def_id,
+            name: Name {
+                sym: ids.symbol,
+                span: span(0, 5),
+            },
+            kind: InterfaceItemKind::ResourceMember {
+                resource: ids.owner.def_id,
+                role,
+                sig,
+                generics: EMPTY_GENERICS,
+            },
+            span: span(0, 100),
+            generic_params_span: None,
+            where_clause_span: None,
+        };
+        let owner = HirOwner {
+            id: ids.owner,
+            node: OwnerNode::InterfaceItem(&item),
+            body: None,
+            raw_attrs: &[],
+            diagnostics: Vec::new(),
+        };
+        interface_item_check(&owner, false)
+    }
+
     #[test]
     fn empty_interface_records_and_enums_are_incompatible_with_wit() {
         assert!(is_empty_wit_type(&InterfaceItemKind::Struct {
@@ -377,5 +476,32 @@ mod tests {
             InterfaceCheckIssueKind::ExplicitDiscriminant
         );
         assert_eq!(issues[0].span, explicit[0].span);
+    }
+
+    #[test]
+    fn resource_methods_require_an_outer_borrow_and_suppress_error_types() {
+        for mutability in [Mutability::Not, Mutability::Mut] {
+            let issues = check_resource_member(MemberRole::Method, Some(mutability), false);
+            assert!(issues.is_empty(), "borrowed self receivers are accepted");
+        }
+
+        let issues = check_resource_member(MemberRole::Method, None, false);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(
+            issues[0].kind,
+            InterfaceCheckIssueKind::InvalidResourceReceiver
+        );
+        assert_eq!(issues[0].span, span(30, 34));
+
+        let issues = check_resource_member(MemberRole::Method, None, true);
+        assert!(issues.is_empty(), "an existing type error is not cascaded");
+
+        for role in [MemberRole::Constructor, MemberRole::Static] {
+            let issues = check_resource_member(role, None, false);
+            assert!(
+                issues.is_empty(),
+                "only methods have a resource receiver rule"
+            );
+        }
     }
 }
