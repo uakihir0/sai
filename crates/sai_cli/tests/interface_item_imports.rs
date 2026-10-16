@@ -416,3 +416,94 @@ fn check_reports_generic_interface_types_functions_and_resource_members_once() {
         "{stdout}"
     );
 }
+
+#[test]
+fn check_reports_wit_discriminants_and_payload_shapes_at_full_spans() {
+    let directory = TestDirectory::new();
+    let package = directory.path().join("package");
+    let source_directory = package.join("src");
+    fs::create_dir_all(&source_directory).expect("create package source directory");
+    fs::write(
+        package.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n\n",
+            "targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write package manifest");
+    let source = concat!(
+        "pub interface api {\n",
+        "  enum Mixed {\n",
+        "    Pair(U32, Bool)\n",
+        "    Record(code: U32)\n",
+        "    Plain = 7\n",
+        "    Huge = 340282366920938463463374607431768211456\n",
+        "    Single(U32)\n",
+        "    Nested((U32, Bool))\n",
+        "  }\n",
+        "  @flags\n",
+        "  enum Flags {\n",
+        "    First = 1\n",
+        "    Second = 2\n",
+        "  }\n",
+        "}\n",
+    );
+    fs::write(source_directory.join("lib.sai"), source).expect("write interface enum restrictions");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(package)
+        .args(["--format=json", "check"])
+        .output()
+        .expect("run sai check");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
+    let diagnostics_for = |code: &str| {
+        stdout
+            .lines()
+            .filter(|line| line.contains(&format!("\"code\":\"{code}\"")))
+            .collect::<Vec<_>>()
+    };
+    let explicit_discriminants = diagnostics_for("WIT_EXPLICIT_DISCRIMINANT");
+    assert_eq!(explicit_discriminants.len(), 4, "{stdout}");
+    let incompatible_payloads = diagnostics_for("WIT_INCOMPATIBLE_TYPE");
+    assert_eq!(incompatible_payloads.len(), 2, "{stdout}");
+    assert_eq!(
+        diagnostics_for("EXPLICIT_DISCRIMINANT_ON_DATA_ENUM").len(),
+        1,
+        "{stdout}"
+    );
+
+    let span_texts = [
+        (incompatible_payloads[0], "(U32, Bool)"),
+        (incompatible_payloads[1], "(code: U32)"),
+        (explicit_discriminants[0], "Plain = 7"),
+        (
+            explicit_discriminants[1],
+            "Huge = 340282366920938463463374607431768211456",
+        ),
+        (explicit_discriminants[2], "First = 1"),
+        (explicit_discriminants[3], "Second = 2"),
+    ];
+    for (diagnostic, text) in span_texts {
+        let start = source
+            .find(text)
+            .expect("expected enum restriction occurs in source");
+        let end = start + text.len();
+        assert!(
+            diagnostic.contains(&format!("\"start\":{{\"byte\":{start},")),
+            "diagnostic should start at {text:?} ({start}): {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&format!("\"end\":{{\"byte\":{end},")),
+            "diagnostic should end at {text:?} ({end}): {diagnostic}"
+        );
+    }
+    assert!(
+        stdout.contains("\"type\":\"summary\",\"errors\":9,"),
+        "{stdout}"
+    );
+}

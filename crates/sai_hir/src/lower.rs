@@ -987,6 +987,19 @@ pub fn lower_enum_owner<'hir>(
                 def_id,
             } = pending;
             let hir_id = source_map.add_node(variant.syntax())?;
+            let span = source_map.span_for(variant.syntax(), SpanCtxt::Root)?;
+            let payload_syntax = variant
+                .tuple_shape()
+                .map(|shape| shape.syntax().clone())
+                .or_else(|| variant.record_shape().map(|shape| shape.syntax().clone()));
+            let payload_span = payload_syntax
+                .as_ref()
+                .map(|syntax| source_map.span_for(syntax, SpanCtxt::Root))
+                .transpose()?;
+            let discriminant = variant.discriminant();
+            let has_explicit_discriminant = discriminant
+                .as_ref()
+                .is_some_and(|discriminant| discriminant.integer().is_some());
             let shape = if let Some(tuple_shape) = variant.tuple_shape() {
                 let types = lower_fn_type_params(
                     tuple_shape.syntax(),
@@ -1037,7 +1050,10 @@ pub fn lower_enum_owner<'hir>(
                 def_id,
                 name,
                 shape,
-                discriminant: variant.discriminant().and_then(signed_discriminant),
+                discriminant: discriminant.and_then(signed_discriminant),
+                has_explicit_discriminant,
+                span,
+                payload_span,
             })
         })
         .collect::<Result<Vec<_>, HirLoweringError>>()?;
@@ -2546,6 +2562,19 @@ pub fn lower_interface_item_owner<'hir>(
                         def_id,
                     } = pending;
                     let hir_id = source_map.add_node(variant.syntax())?;
+                    let span = source_map.span_for(variant.syntax(), SpanCtxt::Root)?;
+                    let payload_syntax = variant
+                        .tuple_shape()
+                        .map(|shape| shape.syntax().clone())
+                        .or_else(|| variant.record_shape().map(|shape| shape.syntax().clone()));
+                    let payload_span = payload_syntax
+                        .as_ref()
+                        .map(|syntax| source_map.span_for(syntax, SpanCtxt::Root))
+                        .transpose()?;
+                    let discriminant = variant.discriminant();
+                    let has_explicit_discriminant = discriminant
+                        .as_ref()
+                        .is_some_and(|discriminant| discriminant.integer().is_some());
                     let shape = if let Some(tuple_shape) = variant.tuple_shape() {
                         let types = lower_fn_type_params(
                             tuple_shape.syntax(),
@@ -2600,7 +2629,10 @@ pub fn lower_interface_item_owner<'hir>(
                         def_id,
                         name,
                         shape,
-                        discriminant: variant.discriminant().and_then(signed_discriminant),
+                        discriminant: discriminant.and_then(signed_discriminant),
+                        has_explicit_discriminant,
+                        span,
+                        payload_span,
                     })
                 })
                 .collect::<Result<Vec<_>, HirLoweringError>>()?;
@@ -21762,6 +21794,7 @@ mod tests {
             "    Hex = 0xff\n",
             "    Minimum = -170141183460469231731687303715884105728\n",
             "    TooLarge = 170141183460469231731687303715884105728\n",
+            "    BeyondU128 = 340282366920938463463374607431768211456\n",
             "    Next\n",
             "}\n",
         );
@@ -21793,7 +21826,20 @@ mod tests {
         assert_eq!(variants[2].discriminant, Some(i128::MIN));
         assert_eq!(variants[3].discriminant, None);
         assert_eq!(variants[4].discriminant, None);
-        assert!(source_map.syntax_for_node(variants[3].hir_id).is_some());
+        assert_eq!(variants[5].discriminant, None);
+        assert!(
+            variants[..5]
+                .iter()
+                .all(|variant| variant.has_explicit_discriminant)
+        );
+        assert!(!variants[5].has_explicit_discriminant);
+        assert_eq!(
+            source.get(
+                variants[4].span.range.start().to_usize()..variants[4].span.range.end().to_usize()
+            ),
+            Some("BeyondU128 = 340282366920938463463374607431768211456")
+        );
+        assert!(source_map.syntax_for_node(variants[4].hir_id).is_some());
     }
 
     #[test]
@@ -24921,11 +24967,30 @@ mod tests {
                     assert_eq!(variants.len(), 3);
                     assert!(matches!(variants[0].shape, HirVariantShape::Unit));
                     assert!(matches!(variants[1].shape, HirVariantShape::Tuple([_])));
+                    assert!(
+                        !variants
+                            .iter()
+                            .any(|variant| { variant.has_explicit_discriminant })
+                    );
+                    assert_eq!(
+                        source.get(
+                            variants[1].payload_span.unwrap().range.start().to_usize()
+                                ..variants[1].payload_span.unwrap().range.end().to_usize()
+                        ),
+                        Some("(U32)")
+                    );
                     let HirVariantShape::Record(fields) = variants[2].shape else {
                         panic!("record enum variants retain their fields");
                     };
                     assert_eq!(fields.len(), 1);
                     assert_eq!(fields[0].vis, crate::Visibility::Pub);
+                    assert_eq!(
+                        source.get(
+                            variants[2].payload_span.unwrap().range.start().to_usize()
+                                ..variants[2].payload_span.unwrap().range.end().to_usize()
+                        ),
+                        Some("(code: U32)")
+                    );
                     observed.insert("enum");
                 }
                 (ItemTreeKind::Resource, InterfaceItemKind::Resource { members }) => {

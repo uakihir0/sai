@@ -685,6 +685,7 @@ pub struct ValidatedAttrs {
     pub deprecated: Option<Deprecation>,
     pub lint_levels: Vec<LintAttr>,
     pub repr: Option<(ReprAttr, Span)>,
+    pub flags: Option<Span>,
     pub target: Option<(TargetPredicate, Span)>,
     pub doc_hidden: Option<Span>,
     pub diagnostics: Vec<Diagnostic>,
@@ -941,6 +942,7 @@ enum PreparedAttribute {
     Deprecated(Option<String>, Option<(String, Span)>),
     Lints(Vec<LintAttr>),
     Repr(ReprAttr),
+    Flags,
     Target(PendingTarget),
     ValidatedTarget(TargetPredicate),
     DocHidden,
@@ -1874,11 +1876,19 @@ fn prepare_attribute(
             }
             Some(PreparedAttribute::Derives(derives))
         }
-        AttrName::ImportName
-        | AttrName::Flags
-        | AttrName::Cases
-        | AttrName::Seed
-        | AttrName::PanicHook => {
+        AttrName::Flags => {
+            if attribute.args.is_none() {
+                Some(PreparedAttribute::Flags)
+            } else {
+                invalid(
+                    invalid_argument_span(attribute),
+                    "no arguments",
+                    diagnostics,
+                )?;
+                None
+            }
+        }
+        AttrName::ImportName | AttrName::Cases | AttrName::Seed | AttrName::PanicHook => {
             unreachable!("attributes above the implemented stage are gated earlier")
         }
     };
@@ -2079,6 +2089,7 @@ fn apply_prepared(
         }
         PreparedAttribute::Lints(lints) => validated.lint_levels.extend(lints),
         PreparedAttribute::Repr(repr) => validated.repr = Some((repr, attribute.span)),
+        PreparedAttribute::Flags => validated.flags = Some(attribute.span),
         PreparedAttribute::ValidatedTarget(predicate) => {
             validated.target = Some((predicate, attribute.span));
         }
@@ -2888,6 +2899,58 @@ mod tests {
                 .with_workspace_snapshot(&snapshot)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn flags_marker_is_retained_only_when_stage_validation_accepts_it() {
+        let mut target = AttributeTarget::new(TargetKind::Enum);
+        target.inside_interface = true;
+
+        let (derive_then_flags, _) =
+            validate_source_at_stage("@derive(Clone)\n@flags\nenum Bits { One }\n", target, 4);
+        assert_eq!(derive_then_flags.flags, None);
+        assert_eq!(derive_then_flags.derives.len(), 1);
+        assert!(
+            derive_then_flags
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ConflictingAttributes)
+        );
+
+        let (flags_then_derive, _) =
+            validate_source_at_stage("@flags\n@derive(Clone)\nenum Bits { One }\n", target, 4);
+        assert!(flags_then_derive.flags.is_some());
+        assert!(flags_then_derive.derives.is_empty());
+        assert!(
+            flags_then_derive
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::ConflictingAttributes)
+        );
+
+        let (stage_zero, _) = validate_source_at_stage("@flags\nenum Bits { One }\n", target, 0);
+        assert_eq!(stage_zero.flags, None);
+        assert!(
+            stage_zero
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::FeatureNotImplemented)
+        );
+
+        for source in [
+            "@flags()\nenum Bits { One }\n",
+            "@flags(foo)\nenum Bits { One }\n",
+        ] {
+            let (malformed_flags, _) = validate_source_at_stage(source, target, 4);
+            assert_eq!(malformed_flags.flags, None, "{source}");
+            assert!(
+                malformed_flags
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == Code::InvalidAttributeArgument),
+                "{source}"
+            );
+        }
     }
 
     #[test]

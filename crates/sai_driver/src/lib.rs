@@ -3810,6 +3810,7 @@ struct CurrentOwnerInputs {
     ast_ids: ast::AstIdMap,
     filtered_item_tree: ItemTree,
     retained_item_kinds: HashMap<ast::ErasedAstId, ItemTreeKind>,
+    accepted_flags_attributes: HashSet<ast::ErasedAstId>,
     source_ref: SourceRef,
 }
 
@@ -8198,7 +8199,7 @@ impl RootDatabase {
         let item_tree = self
             .def_collector(snapshot, file)
             .map_err(OwnerControlFlowResolutionError::ItemTree)?;
-        let filtered_item_tree = item_tree
+        let filtered = item_tree
             .filter_for_target(
                 source.text(),
                 &parsed.root,
@@ -8207,8 +8208,13 @@ impl RootDatabase {
                 snapshot,
                 target_cfg,
             )
-            .map_err(OwnerControlFlowResolutionError::TargetFilter)?
-            .item_tree;
+            .map_err(OwnerControlFlowResolutionError::TargetFilter)?;
+        let accepted_flags_attributes = filtered
+            .validated_attrs
+            .iter()
+            .filter_map(|(ast_id, attrs)| attrs.flags.map(|_| *ast_id))
+            .collect();
+        let filtered_item_tree = filtered.item_tree;
         let retained_item_kinds = filtered_item_tree
             .items
             .iter()
@@ -8232,6 +8238,7 @@ impl RootDatabase {
             ast_ids,
             filtered_item_tree,
             retained_item_kinds,
+            accepted_flags_attributes,
             source_ref,
         })
     }
@@ -27515,6 +27522,89 @@ mod tests {
                 "where T: Copy",
             ],
             "generic diagnostics cover their complete syntax nodes and include refined aliases"
+        );
+    }
+
+    #[test]
+    fn interface_check_reports_explicit_discriminants_and_unsupported_variant_payloads() {
+        let root = concat!(
+            "pub interface api {\n",
+            "  enum Mixed {\n",
+            "    Pair(U32, Bool)\n",
+            "    Record(code: U32)\n",
+            "    Plain = 7\n",
+            "    Huge = 340282366920938463463374607431768211456\n",
+            "    Single(U32)\n",
+            "    Nested((U32, Bool))\n",
+            "  }\n",
+            "  @flags\n",
+            "  enum Flags {\n",
+            "    First = 1\n",
+            "    Second = 2\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let diagnostics = collection.interface_check_diagnostics();
+        assert_eq!(diagnostics.len(), 6, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::WitExplicitDiscriminant,
+                sai_diagnostics::Code::WitExplicitDiscriminant,
+                sai_diagnostics::Code::WitIncompatibleType,
+                sai_diagnostics::Code::WitIncompatibleType,
+                sai_diagnostics::Code::WitExplicitDiscriminant,
+                sai_diagnostics::Code::WitExplicitDiscriminant,
+            ],
+            "each enum follows interface-check table order even when payloads appear first"
+        );
+
+        let mut spans_by_code = diagnostics
+            .iter()
+            .map(|diagnostic| {
+                let primary = diagnostic
+                    .primary()
+                    .expect("interface item finding has a primary location");
+                let start = primary.span.range.start().to_usize();
+                let end = primary.span.range.end().to_usize();
+                (
+                    diagnostic.code,
+                    start,
+                    root.get(start..end).expect("diagnostic span is in source"),
+                )
+            })
+            .collect::<Vec<_>>();
+        spans_by_code.sort_by_key(|(_, start, _)| *start);
+        assert_eq!(
+            spans_by_code
+                .iter()
+                .map(|(code, _, text)| (*code, *text))
+                .collect::<Vec<_>>(),
+            [
+                (sai_diagnostics::Code::WitIncompatibleType, "(U32, Bool)"),
+                (sai_diagnostics::Code::WitIncompatibleType, "(code: U32)"),
+                (sai_diagnostics::Code::WitExplicitDiscriminant, "Plain = 7"),
+                (
+                    sai_diagnostics::Code::WitExplicitDiscriminant,
+                    "Huge = 340282366920938463463374607431768211456"
+                ),
+                (sai_diagnostics::Code::WitExplicitDiscriminant, "First = 1"),
+                (sai_diagnostics::Code::WitExplicitDiscriminant, "Second = 2"),
+            ],
+            "explicit variants and unsupported payload shapes use their complete spans"
         );
     }
 

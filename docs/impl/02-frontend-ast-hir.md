@@ -1388,7 +1388,12 @@ pub struct Provenance<'hir> { pub root: Name /* `self` or a parameter */, pub fi
 pub struct EffectRef<'hir> { pub hir_id: HirId, pub segments: &'hir [Name] }
 
 pub struct FieldDef<'hir> { pub hir_id: HirId, pub def_id: LocalDefId, pub vis: Visibility, pub name: Name, pub ty: &'hir Ty<'hir> }
-pub struct Variant<'hir> { pub hir_id: HirId, pub def_id: LocalDefId, pub name: Name, pub shape: VariantShape<'hir>, pub discriminant: Option<i128> }
+pub struct Variant<'hir> {
+    pub hir_id: HirId, pub def_id: LocalDefId, pub name: Name,
+    pub shape: VariantShape<'hir>, pub discriminant: Option<i128>,
+    pub has_explicit_discriminant: bool,  // also true when the integer exceeds i128
+    pub span: Span, pub payload_span: Option<Span>,
+}
 pub enum VariantShape<'hir> { Unit, Tuple(&'hir [Ty<'hir>]), Record(&'hir [FieldDef<'hir>]) }
 
 pub struct Body<'hir> {

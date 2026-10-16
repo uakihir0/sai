@@ -223,6 +223,7 @@ fn append_interface_item_diagnostics(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<(), InterfaceUsesQueryError> {
     for issue in issues {
+        let code = issue.kind.code();
         let snapshot_file = snapshot.file(issue.span.file).ok_or_else(|| {
             InterfaceUsesQueryError::Collection(
                 OwnerControlFlowResolutionError::MissingSnapshotFile(issue.span.file),
@@ -238,27 +239,9 @@ fn append_interface_item_diagnostics(
                 OwnerControlFlowResolutionError::InvalidSourceLocation(issue.owner),
             )
         })?;
-        let (message, primary_label) = match issue.code {
-            sai_diagnostics::Code::GenericInterfaceItem => (
-                "WIT interface items cannot have generic parameters or a `where` clause",
-                "generic interface item",
-            ),
-            sai_diagnostics::Code::WitEmptyType => (
-                "WIT interface types must not be empty",
-                "empty WIT interface type",
-            ),
-            sai_diagnostics::Code::WitIncompatibleType => (
-                "WIT aliases cannot have refinement clauses",
-                "unsupported refinement clause",
-            ),
-            _ => {
-                return Err(InterfaceUsesQueryError::Collection(
-                    OwnerControlFlowResolutionError::InvalidSourceLocation(issue.owner),
-                ));
-            }
-        };
-        let mut diagnostic = Diagnostic::new(issue.code, Severity::Error, message, Some(location));
-        diagnostic.primary_label = primary_label.to_owned();
+        let mut diagnostic =
+            Diagnostic::new(code, Severity::Error, issue.kind.message(), Some(location));
+        diagnostic.primary_label = issue.kind.primary_label().to_owned();
         diagnostic.package = snapshot_file.package().map(str::to_owned);
         diagnostics.push(diagnostic);
     }
@@ -443,8 +426,9 @@ fn collect_interface_uses_input(
             )
             .map_err(OwnerControlFlowResolutionError::Lowering)
             .map_err(InterfaceUsesQueryError::Collection)?;
+            let flags_marker_accepted = inputs.accepted_flags_attributes.contains(&entry.ast_id);
             append_interface_item_diagnostics(
-                interface_item_check(&member_hir),
+                interface_item_check(&member_hir, flags_marker_accepted),
                 &inputs.source_ref,
                 &inputs.source,
                 &prepared.snapshot,
@@ -534,7 +518,7 @@ fn collect_interface_uses_input(
                 .map_err(OwnerControlFlowResolutionError::Lowering)
                 .map_err(InterfaceUsesQueryError::Collection)?;
                 append_interface_item_diagnostics(
-                    interface_item_check(&method_hir),
+                    interface_item_check(&method_hir, false),
                     &inputs.source_ref,
                     &inputs.source,
                     &prepared.snapshot,
@@ -622,6 +606,12 @@ fn collect_owner_references(
 
 fn current_owner_inputs_from_prepared(input: &OwnedPhase1ModuleInput) -> CurrentOwnerInputs {
     let filtered_item_tree = input.filtered.item_tree.clone();
+    let accepted_flags_attributes = input
+        .filtered
+        .validated_attrs
+        .iter()
+        .filter_map(|(ast_id, attrs)| attrs.flags.map(|_| *ast_id))
+        .collect();
     let retained_item_kinds = filtered_item_tree
         .items
         .iter()
@@ -640,6 +630,7 @@ fn current_owner_inputs_from_prepared(input: &OwnedPhase1ModuleInput) -> Current
         ast_ids: input.ast_ids.clone(),
         filtered_item_tree,
         retained_item_kinds,
+        accepted_flags_attributes,
         source_ref: input.source_ref.clone(),
     }
 }

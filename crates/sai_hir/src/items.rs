@@ -284,6 +284,13 @@ pub struct Variant<'hir> {
     pub name: Name,
     pub shape: VariantShape<'hir>,
     pub discriminant: Option<i128>,
+    /// Whether an `= INT` discriminant was written, including values too large
+    /// to fit in the semantic `i128` field above.
+    pub has_explicit_discriminant: bool,
+    /// Complete source range of the variant declaration.
+    pub span: Span,
+    /// Complete source range of a tuple or record payload, when present.
+    pub payload_span: Option<Span>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -974,6 +981,9 @@ mod tests {
             name: name(&ids, 5),
             shape: VariantShape::Record(fields),
             discriminant: Some(7),
+            has_explicit_discriminant: true,
+            span: span(7),
+            payload_span: Some(span(8)),
         };
         let variants = arena.alloc_variants(&[variant]);
         let world_ref = WorldRef::Pkg {
