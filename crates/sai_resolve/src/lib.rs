@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod interface_uses;
 pub mod module_member_lookup;
 pub mod module_path;
 pub mod module_target;
@@ -13,6 +14,9 @@ pub mod use_path;
 pub mod use_target;
 pub mod use_target_diagnostics;
 
+pub use interface_uses::{
+    InterfaceUseReference, InterfaceUses, InterfaceUsesInput, interface_uses,
+};
 pub use package_wit_names::{PackageWitNames, PackageWitNamesError, package_wit_names};
 
 use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Value};
