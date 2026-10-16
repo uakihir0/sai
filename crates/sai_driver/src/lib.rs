@@ -27648,12 +27648,20 @@ mod tests {
             .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::GenericInterfaceItem)
             .collect::<Vec<_>>();
         assert_eq!(generic_diagnostics.len(), 9, "{diagnostics:?}");
-        let refinement_diagnostics = diagnostics
+        let incompatible_diagnostics = diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitIncompatibleType)
             .collect::<Vec<_>>();
-        assert_eq!(refinement_diagnostics.len(), 1, "{diagnostics:?}");
-        let refinement = refinement_diagnostics[0]
+        assert_eq!(incompatible_diagnostics.len(), 3, "{diagnostics:?}");
+        for diagnostic in &incompatible_diagnostics[..2] {
+            assert_eq!(
+                diagnostic.data.get("wit_incompatibility"),
+                Some(&sai_diagnostics::Value::String("type_parameter".to_owned())),
+                "a type parameter used at a boundary has its own WIT incompatibility"
+            );
+        }
+        let refinement_diagnostic = incompatible_diagnostics[2];
+        let refinement = refinement_diagnostic
             .primary()
             .expect("refinement finding has a primary location");
         let alias_generic_start = root
@@ -27671,8 +27679,16 @@ mod tests {
             .expect("refined alias generic finding is present");
         let refinement_index = diagnostics
             .iter()
-            .position(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitIncompatibleType)
-            .expect("refinement finding is present");
+            .position(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::WitIncompatibleType
+                    && diagnostic.primary().is_some_and(|primary| {
+                        root.get(
+                            primary.span.range.start().to_usize()
+                                ..primary.span.range.end().to_usize(),
+                        ) == Some("where true")
+                    })
+            })
+            .expect("refinement finding is present after the type-parameter findings");
         assert!(
             generic_refined_index < refinement_index,
             "interface item restrictions are reported in §16.6.1 row order"
@@ -27894,6 +27910,244 @@ mod tests {
                 .paths()
                 .values()
                 .any(|path| path.base == local_request)
+        );
+    }
+
+    #[test]
+    fn interface_use_resolution_includes_local_module_alias_expansions() {
+        let root = concat!(
+            "type AliasA = b.Record\n",
+            "type AliasB = a.Record\n",
+            "interface a {\n",
+            "  type Record = U32\n",
+            "  type ThroughAlias = AliasA\n",
+            "}\n",
+            "interface b {\n",
+            "  type Record = U32\n",
+            "  type ThroughAlias = AliasB\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let interfaces = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == TopLevelOwnerKind::Interface)
+            .map(|owner| owner.owner.def_id)
+            .collect::<Vec<_>>();
+        let [a, b] = interfaces.as_slice() else {
+            panic!("the fixture declares interfaces a and b");
+        };
+        let uses = collection.interface_uses();
+
+        assert!(
+            uses.cyclic.contains(a),
+            "alias expansion records a → b: {uses:?}; diagnostics: {:?}",
+            collection.interface_check_diagnostics()
+        );
+        assert!(
+            uses.cyclic.contains(b),
+            "alias expansion records b → a: {uses:?}"
+        );
+        assert_eq!(uses.uses[a].len(), 1);
+        assert_eq!(uses.uses[a][0].0, *b);
+        assert_eq!(uses.uses[b].len(), 1);
+        assert_eq!(uses.uses[b][0].0, *a);
+        for reference in uses.uses.values().flatten() {
+            let start = reference.1.range.start().to_usize();
+            let end = reference.1.range.end().to_usize();
+            assert!(
+                matches!(root.get(start..end), Some("AliasA" | "AliasB")),
+                "the hidden edge is anchored at the module alias use: {reference:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_use_resolution_keeps_first_direct_or_alias_hidden_reference() {
+        let root = concat!(
+            "type AliasB = b.Record\n",
+            "interface a {\n",
+            "  type Record = U32\n",
+            "  fn invoke(first: AliasB, second: b.Record)\n",
+            "}\n",
+            "interface b {\n",
+            "  type Record = U32\n",
+            "  type Back = a.Record\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let interfaces = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == TopLevelOwnerKind::Interface)
+            .map(|owner| owner.owner.def_id)
+            .collect::<Vec<_>>();
+        let [a, b] = interfaces.as_slice() else {
+            panic!("the fixture declares interfaces a and b");
+        };
+
+        let uses = collection.interface_uses();
+        let a_to_b = &uses.uses[a];
+        assert_eq!(a_to_b.len(), 1);
+        assert_eq!(a_to_b[0].0, *b);
+        let first_reference = root
+            .find("first: AliasB")
+            .expect("the first parameter uses the local alias")
+            + "first: ".len();
+        assert_eq!(
+            a_to_b[0].1.range.start(),
+            sai_vfs::TextSize::new(first_reference as u32),
+            "deduplication retains the earliest source reference even when alias expansion is collected later"
+        );
+        assert_eq!(uses.cyclic.len(), 2);
+        let cycle = uses
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::InterfaceUseCycle)
+            .expect("the two emitted dependencies form a cycle");
+        assert_eq!(
+            cycle
+                .primary()
+                .expect("the cycle diagnostic has a primary location")
+                .span
+                .range
+                .start(),
+            sai_vfs::TextSize::new(first_reference as u32)
+        );
+    }
+
+    #[test]
+    fn interface_use_resolution_expands_references_from_incompatible_boundaries() {
+        let alias_root = concat!(
+            "type AliasWithInvalidPart = (USize, b.Record)\n",
+            "interface a {\n",
+            "  type Record = U32\n",
+            "  fn invalid(value: AliasWithInvalidPart)\n",
+            "}\n",
+            "interface b {\n",
+            "  type Record = U32\n",
+            "  type Back = a.Record\n",
+            "}\n",
+        );
+        let direct_root = concat!(
+            "interface a {\n",
+            "  type Record = U32\n",
+            "  fn invalid(value: (USize, b.Record))\n",
+            "}\n",
+            "interface b {\n",
+            "  type Record = U32\n",
+            "  type Back = a.Record\n",
+            "}\n",
+        );
+        for (description, root) in [
+            ("module alias", alias_root),
+            ("direct type path", direct_root),
+        ] {
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target,
+                    Phase1BuildContext::default(),
+                )
+                .expect("Phase 1 interface scopes collect");
+            let interfaces = collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .filter(|owner| owner.kind == TopLevelOwnerKind::Interface)
+                .map(|owner| owner.owner.def_id)
+                .collect::<Vec<_>>();
+            let [a, b] = interfaces.as_slice() else {
+                panic!("the fixture declares interfaces a and b");
+            };
+
+            assert!(
+                collection
+                    .interface_check_diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitIncompatibleType),
+                "{description} fixture must report its incompatible boundary"
+            );
+            let uses = collection.interface_uses();
+            assert_eq!(uses.uses[a].len(), 1, "{description}");
+            assert_eq!(uses.uses[a][0].0, *b, "{description}");
+            assert_eq!(uses.uses[b].len(), 1, "{description}");
+            assert_eq!(uses.uses[b][0].0, *a, "{description}");
+            assert!(
+                uses.cyclic.contains(a) && uses.cyclic.contains(b),
+                "{description} references remain part of the source-level interface-use graph"
+            );
+        }
+    }
+
+    #[test]
+    fn interface_use_resolution_ignores_generic_constraints_and_alias_bounds() {
+        let root = concat!(
+            "type GenericAlias<T: b.Record> = U32\n",
+            "interface a {\n",
+            "  type Record = U32\n",
+            "  type ThroughAlias = GenericAlias<U32>\n",
+            "  fn constrained<T: b.Record>()\n",
+            "}\n",
+            "interface b {\n",
+            "  type Record = U32\n",
+            "  type Back = a.Record\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+        let interfaces = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == TopLevelOwnerKind::Interface)
+            .map(|owner| owner.owner.def_id)
+            .collect::<Vec<_>>();
+        let [a, b] = interfaces.as_slice() else {
+            panic!("the fixture declares interfaces a and b");
+        };
+
+        let uses = collection.interface_uses();
+        assert!(
+            uses.uses[a].is_empty(),
+            "generic function constraints and module-alias bounds do not form boundary type paths"
+        );
+        assert_eq!(uses.uses[b].len(), 1);
+        assert_eq!(uses.uses[b][0].0, *a);
+        assert!(
+            uses.cyclic.is_empty(),
+            "non-boundary constraints cannot create interface-use cycles"
         );
     }
 
@@ -29902,6 +30156,9 @@ mod tests {
             "use wasi:io/streams.{InputStream as Stream}\n",
             "use wasi:cli/command as command\n",
             "type Client = streams.InputStream\n",
+            "pub interface local {\n",
+            "  fn send(value: borrow streams.StreamError)\n",
+            "}\n",
         )
         .as_bytes();
         let (mut database, module_tree, snapshot, root_package) = phase1_fixture(root, b"");
@@ -29945,6 +30202,34 @@ mod tests {
                 &wit_scopes,
             )
             .expect("WASI imports are resolved during phase 1");
+        let incompatible_borrow = collection
+            .interface_check_diagnostics()
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::WitIncompatibleType
+                    && diagnostic.data.get("wit_incompatibility")
+                        == Some(&sai_diagnostics::Value::String(
+                            "borrow_of_non_resource".to_owned(),
+                        ))
+            })
+            .expect("a borrowed WIT enum is rejected as a non-resource");
+        let borrow_span = incompatible_borrow
+            .primary()
+            .expect("the boundary finding has a source location");
+        let borrow_start = root
+            .windows(b"borrow streams.StreamError".len())
+            .position(|window| window == b"borrow streams.StreamError")
+            .expect("the borrowed WIT enum occurs in the source");
+        assert_eq!(
+            borrow_span.span.range.start().to_usize(),
+            borrow_start,
+            "the diagnostic points to the complete borrowed WIT type"
+        );
+        assert_eq!(
+            borrow_span.span.range.end().to_usize(),
+            borrow_start + b"borrow streams.StreamError".len(),
+            "the diagnostic spans the complete borrowed WIT type"
+        );
         let module_scope = collection.scopes().module(ModuleId::ROOT).unwrap();
         let streams = database.symbols.intern("streams").unwrap();
         assert!(matches!(

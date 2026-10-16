@@ -617,7 +617,7 @@ fn check_reports_empty_interface_records_and_enums() {
 }
 
 #[test]
-fn check_reports_generic_interface_types_functions_and_resource_members_once() {
+fn check_reports_generic_interface_restrictions_and_type_parameter_boundaries() {
     let directory = TestDirectory::new();
     let package = directory.path().join("package");
     let source_directory = package.join("src");
@@ -700,21 +700,35 @@ fn check_reports_generic_interface_types_functions_and_resource_members_once() {
         .lines()
         .filter(|line| line.contains("\"code\":\"WIT_INCOMPATIBLE_TYPE\""))
         .collect::<Vec<_>>();
-    assert_eq!(incompatible_diagnostics.len(), 1, "{stdout}");
-    let refinement_start = source
-        .find("where true")
-        .expect("alias refinement is present");
-    let refinement_end = refinement_start + "where true".len();
+    assert_eq!(incompatible_diagnostics.len(), 3, "{stdout}");
+    let expected_incompatible_spans = [
+        ("value: T", 7, 1),
+        ("Ready(T)", 6, 1),
+        ("where true", 0, "where true".len()),
+    ];
+    let mut source_search_from = 0;
+    for (diagnostic, (anchor, span_offset, span_length)) in incompatible_diagnostics
+        .iter()
+        .zip(expected_incompatible_spans)
+    {
+        let anchor_start = source[source_search_from..]
+            .find(anchor)
+            .map(|relative| source_search_from + relative)
+            .expect("expected incompatible type occurs after the previous span");
+        let start = anchor_start + span_offset;
+        let end = start + span_length;
+        assert!(
+            diagnostic.contains(&format!("\"start\":{{\"byte\":{start},")),
+            "diagnostic should start at {anchor:?} ({start}): {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&format!("\"end\":{{\"byte\":{end},")),
+            "diagnostic should end at {anchor:?} ({end}): {diagnostic}"
+        );
+        source_search_from = anchor_start + anchor.len();
+    }
     assert!(
-        incompatible_diagnostics[0].contains(&format!("\"start\":{{\"byte\":{refinement_start},")),
-        "{incompatible_diagnostics:?}"
-    );
-    assert!(
-        incompatible_diagnostics[0].contains(&format!("\"end\":{{\"byte\":{refinement_end},")),
-        "{incompatible_diagnostics:?}"
-    );
-    assert!(
-        stdout.contains("\"type\":\"summary\",\"errors\":11,"),
+        stdout.contains("\"type\":\"summary\",\"errors\":13,"),
         "{stdout}"
     );
     assert!(
@@ -811,6 +825,169 @@ fn check_reports_wit_discriminants_and_payload_shapes_at_full_spans() {
     assert!(
         stdout.contains("\"type\":\"summary\",\"errors\":9,"),
         "{stdout}"
+    );
+}
+
+#[test]
+fn check_reports_incompatible_interface_boundary_types_without_payload_cascades() {
+    let directory = TestDirectory::new();
+    let package = directory.path().join("package");
+    let source_directory = package.join("src");
+    fs::create_dir_all(&source_directory).expect("create package source directory");
+    fs::write(
+        package.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n\n",
+            "targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write package manifest");
+    let source = concat!(
+        "pub interface api {\n",
+        "  type Option { value: U32 }\n",
+        "  fn use_option(value: Option) -> Option\n",
+        "  type Record { field: USize }\n",
+        "  type Alias = USize\n",
+        "  enum Payload {\n",
+        "    Single(USize)\n",
+        "    Pair(USize, USize)\n",
+        "    Fields(value: USize)\n",
+        "  }\n",
+        "  fn submit(input: USize) -> USize\n",
+        "  resource Handle {\n",
+        "    fn adjust(self: borrow Self, amount: USize) -> USize\n",
+        "  }\n",
+        "  fn generic<T: USize>(input: U32)\n",
+        "}\n",
+    );
+    fs::write(source_directory.join("lib.sai"), source)
+        .expect("write interface with incompatible boundary types");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(package)
+        .args(["--format=json", "check"])
+        .output()
+        .expect("run sai check");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
+    let incompatible = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"WIT_INCOMPATIBLE_TYPE\""))
+        .collect::<Vec<_>>();
+    assert_eq!(incompatible.len(), 9, "{stdout}");
+    let expected_spans = [
+        "USize",
+        "USize",
+        "USize",
+        "(USize, USize)",
+        "(value: USize)",
+        "USize",
+        "USize",
+        "USize",
+        "USize",
+    ];
+    let mut source_search_from = 0;
+    for (diagnostic, text) in incompatible.iter().zip(expected_spans) {
+        let relative_start = source[source_search_from..]
+            .find(text)
+            .unwrap_or_else(|| panic!("expected boundary span {text:?} in source"));
+        let start = source_search_from + relative_start;
+        let end = start + text.len();
+        assert!(
+            diagnostic.contains(&format!("\"start\":{{\"byte\":{start},")),
+            "diagnostic should start at {text:?} ({start}): {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains(&format!("\"end\":{{\"byte\":{end},")),
+            "diagnostic should end at {text:?} ({end}): {diagnostic}"
+        );
+        source_search_from = end;
+    }
+    assert!(
+        stdout.contains("\"wit_incompatibility\":\"pointer_sized_integer\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\"wit_position\":\"nested type\""),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\"wit_position\":\"parameter\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\"wit_position\":\"result\""), "{stdout}");
+    assert!(
+        stdout.contains("\"stage\":0,\"feature\":\"sai check\""),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn check_expands_local_module_aliases_at_the_interface_use_span() {
+    let directory = TestDirectory::new();
+    let package = directory.path().join("package");
+    let source_directory = package.join("src");
+    fs::create_dir_all(&source_directory).expect("create package source directory");
+    fs::write(
+        package.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n\n",
+            "targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write package manifest");
+    fs::write(
+        source_directory.join("types.sai"),
+        "pub type ModuleSize = USize\n",
+    )
+    .expect("write external module alias");
+    let source = concat!(
+        "use acme:check/types.{ModuleSize}\n",
+        "pub interface api {\n",
+        "  fn send(value: ModuleSize)\n",
+        "}\n"
+    );
+    fs::write(source_directory.join("lib.sai"), source)
+        .expect("write interface using module alias");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(package)
+        .args(["--format=json", "check"])
+        .output()
+        .expect("run sai check");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI output is UTF-8");
+    let incompatible = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"WIT_INCOMPATIBLE_TYPE\""))
+        .collect::<Vec<_>>();
+    assert_eq!(incompatible.len(), 1, "{stdout}");
+    let diagnostic = incompatible[0];
+    let start = source
+        .rfind("ModuleSize")
+        .expect("the interface parameter uses the alias");
+    let end = start + "ModuleSize".len();
+    assert!(
+        diagnostic.contains("\"path\":\"src/lib.sai\"")
+            && diagnostic.contains(&format!("\"start\":{{\"byte\":{start},")),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains(&format!("\"end\":{{\"byte\":{end},")),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("\"wit_incompatibility\":\"pointer_sized_integer\"")
+            && diagnostic.contains("\"wit_position\":\"parameter\""),
+        "{diagnostic}"
     );
 }
 

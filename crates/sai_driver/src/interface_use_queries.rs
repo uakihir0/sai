@@ -2,11 +2,11 @@ use super::{
     CurrentOwnerInputs, DetachedWorkspaceDiagnostic, InterfaceResourceMemberIds,
     OwnedPhase1ModuleInput, OwnerControlFlowResolutionError, Phase1ModuleScopes,
     Phase1PackageScopesQueryOutput, Prelude, PreparedPhase1PackageScopes,
-    PrimitivePreludeBuildError, STAGED_PHASE1_PACKAGE_SCOPES, append_interface_use_references,
-    index_top_level_owner_descriptors_in_scopes, interface_generation_order, interface_member_kind,
-    local_interface_type_member_owners, lower_interface_item_owner,
-    lower_interface_resource_member_owner, lower_top_level_owner, module_scope_for_scopes,
-    owner_test_only_path_candidates, owner_type_generic_resolutions,
+    PrimitivePreludeBuildError, STAGED_PHASE1_PACKAGE_SCOPES, TypeOwnerPathResolution,
+    append_interface_use_references, index_top_level_owner_descriptors_in_scopes,
+    interface_generation_order, interface_member_kind, local_interface_type_member_owners,
+    lower_interface_item_owner, lower_interface_resource_member_owner, lower_top_level_owner,
+    module_scope_for_scopes, owner_test_only_path_candidates, owner_type_generic_resolutions,
     resolve_partial_type_owner_paths,
 };
 use sai_diagnostics::{
@@ -14,24 +14,44 @@ use sai_diagnostics::{
 };
 use sai_hir::arena::HirArena;
 use sai_hir::item_tree::ItemTreeKind;
-use sai_hir::items::{HirOwner, InterfaceItemKind, ItemKind, MemberRole, OwnerNode};
-use sai_hir::types::Name;
-use sai_hir::{DefPathError, DefPathHash, DefPathInternerError, LocalDefId, OwnerId, Symbol};
+use sai_hir::items::{HirOwner, InterfaceItemKind, ItemKind, MemberRole, OwnerNode, VariantShape};
+use sai_hir::lower::HirLoweringContext;
+use sai_hir::types::{GenericArg, Name, Ty, TyKind};
+use sai_hir::{
+    DefId, DefPathError, DefPathHash, DefPathInternerError, HirId, LocalDefId, OwnerId, Symbol,
+};
 use sai_intern::{Interner, PackageInterner};
 use sai_query::{DerivedQuery, QueryDatabase, QueryError};
 use sai_resolve::module_member_lookup::ModuleMemberIndex;
 use sai_resolve::package_scopes::{
-    PackageScopesError, Phase1PackageScopes, Res, TopLevelOwnerKind,
+    DefKind, PackageScopesError, PathRes, Phase1PackageScopes, Res, TopLevelOwnerKind,
 };
 use sai_resolve::{
     InterfaceUseReference, InterfaceUses, InterfaceUsesInput, WitNameDefinition, interface_uses,
     wit_name_collisions,
 };
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher};
+use sai_ty::boundary::{
+    BoundaryAlias, BoundaryDefinition, BoundaryTypeContext, BoundaryTypeOutcome,
+    IncompatibleReason, Position, boundary_type_with_references,
+};
 use sai_ty::iface::{InterfaceCheckError, InterfaceCheckIssue, interface_item_check};
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
+use sai_wit::WitViewDefKind;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+struct LocalBoundaryAliases<'hir> {
+    definitions: HashMap<DefId, BoundaryAlias<'hir>>,
+    path_resolutions: HashMap<sai_hir::HirId, PathRes>,
+    interface_references: HashMap<DefId, Vec<DefId>>,
+}
+
+#[derive(Clone, Copy)]
+enum LocalAliasReference {
+    InterfaceType(DefId),
+    ModuleAlias(DefId),
+}
 
 /// A failure while deriving or rebinding `interface_uses(P)`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -391,9 +411,30 @@ fn collect_interface_uses_input(
     )
     .map_err(InterfaceUsesQueryError::Collection)?;
     let interface_type_members = local_interface_type_member_owners(scopes, &descriptors);
-    let indexed_scopes = [scopes];
-    let module_members = ModuleMemberIndex::new(indexed_scopes);
-    let source_graph_packages = HashSet::from([prepared.module_tree.package]);
+    let indexed_scopes = std::iter::once(scopes).chain(
+        prepared
+            .foreign_packages
+            .iter()
+            .map(|package| package.scopes.as_ref()),
+    );
+    let module_members = ModuleMemberIndex::new_with_wit_views(
+        indexed_scopes,
+        prepared
+            .foreign_wit_views
+            .iter()
+            .map(|foreign| foreign.view.as_ref()),
+        symbols,
+    );
+    let source_graph_packages = std::iter::once(prepared.module_tree.package)
+        .chain(
+            prepared
+                .foreign_packages
+                .iter()
+                .map(|package| package.module_tree.package),
+        )
+        .collect::<HashSet<_>>();
+    let interface_boundary_types =
+        interface_boundary_type_definitions(&interface_type_members, scopes, prepared);
     let mut module_inputs =
         HashMap::<FileId, CurrentOwnerInputs>::with_capacity(prepared.modules.len());
     for input in &prepared.modules {
@@ -412,6 +453,18 @@ fn collect_interface_uses_input(
             OwnerControlFlowResolutionError::ModuleTreeMismatch,
         ));
     }
+    let alias_arena = HirArena::new();
+    let local_boundary_aliases = collect_local_boundary_aliases(
+        prepared,
+        scopes,
+        &module_inputs,
+        &module_members,
+        &source_graph_packages,
+        primitive_prelude,
+        symbols,
+        &alias_arena,
+        &interface_type_members,
+    )?;
 
     let mut package_identity = None;
     let mut references = Vec::<InterfaceUseReference>::new();
@@ -574,7 +627,7 @@ fn collect_interface_uses_input(
             if let Some(definition) = wit_name_definition(item.name, member_owner, symbols)? {
                 interface_item_names.push(definition);
             }
-            collect_owner_references(
+            let resolution = collect_owner_references(
                 &mut owner_references,
                 descriptor.owner.def_id,
                 member_owner,
@@ -589,6 +642,20 @@ fn collect_interface_uses_input(
                 primitive_prelude,
                 &interface_type_members,
                 inputs,
+            )?;
+            append_interface_boundary_diagnostics(
+                &member_hir,
+                &resolution,
+                &interface_boundary_types,
+                &local_boundary_aliases,
+                descriptor.owner.def_id,
+                &interface_type_members,
+                &mut owner_references,
+                &module_inputs,
+                &inputs.source_ref,
+                &inputs.source,
+                &prepared.snapshot,
+                &mut interface_check_diagnostics,
             )?;
             if kind != super::InterfaceMemberKind::Resource {
                 continue;
@@ -667,7 +734,7 @@ fn collect_interface_uses_input(
                 {
                     resource_member_names.push(definition);
                 }
-                collect_owner_references(
+                let resolution = collect_owner_references(
                     &mut owner_references,
                     descriptor.owner.def_id,
                     method_owner,
@@ -680,6 +747,20 @@ fn collect_interface_uses_input(
                     primitive_prelude,
                     &interface_type_members,
                     inputs,
+                )?;
+                append_interface_boundary_diagnostics(
+                    &method_hir,
+                    &resolution,
+                    &interface_boundary_types,
+                    &local_boundary_aliases,
+                    descriptor.owner.def_id,
+                    &interface_type_members,
+                    &mut owner_references,
+                    &module_inputs,
+                    &inputs.source_ref,
+                    &inputs.source,
+                    &prepared.snapshot,
+                    &mut interface_check_diagnostics,
                 )?;
             }
             append_wit_name_collision_diagnostics(
@@ -697,6 +778,11 @@ fn collect_interface_uses_input(
             &prepared.snapshot,
             &mut interface_check_diagnostics,
         )?;
+        // Direct path resolution and alias expansion are collected in
+        // separate passes for each owner. Re-establish source order before
+        // graph deduplication so the retained edge (and its diagnostic span)
+        // points to the first WIT reference written by the user.
+        owner_references.sort_by_key(|reference| reference.location.span.range.start());
         references.extend(owner_references);
     }
 
@@ -733,8 +819,9 @@ fn collect_owner_references(
     primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
     interface_type_members: &HashMap<sai_hir::DefId, LocalDefId>,
     inputs: &CurrentOwnerInputs,
-) -> Result<(), InterfaceUsesQueryError> {
+) -> Result<TypeOwnerPathResolution, InterfaceUsesQueryError> {
     let candidates = owner_test_only_path_candidates(hir_owner);
+    let interface_use_candidates = interface_use_path_candidates(hir_owner, &candidates);
     let mut generic_resolutions = owner_type_generic_resolutions(hir_owner);
     for parameter in additional_generic_parameters {
         generic_resolutions.entry(parameter).or_insert(Res::Err);
@@ -753,12 +840,610 @@ fn collect_owner_references(
     append_interface_use_references(
         references,
         interface,
-        &candidates,
+        &interface_use_candidates,
         &resolution,
         interface_type_members,
         inputs,
     )
-    .map_err(InterfaceUsesQueryError::Collection)
+    .map_err(InterfaceUsesQueryError::Collection)?;
+    Ok(resolution)
+}
+
+fn interface_use_path_candidates<'hir>(
+    owner: &HirOwner<'hir>,
+    candidates: &[super::OwnerPathHead<'hir>],
+) -> Vec<super::OwnerPathHead<'hir>> {
+    let roots = interface_use_type_roots(owner);
+    type_path_candidates_in_roots(candidates, &roots)
+}
+
+fn type_path_candidates_in_roots<'hir>(
+    candidates: &[super::OwnerPathHead<'hir>],
+    roots: &[&'hir Ty<'hir>],
+) -> Vec<super::OwnerPathHead<'hir>> {
+    let mut path_ids = HashSet::<HirId>::new();
+    for root in roots {
+        collect_type_path_ids(root, &mut path_ids);
+    }
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            candidate.kind == super::OwnerPathKind::Type && path_ids.contains(&candidate.hir_id)
+        })
+        .collect()
+}
+
+fn collect_type_path_ids(ty: &Ty<'_>, path_ids: &mut HashSet<HirId>) {
+    match ty.kind {
+        TyKind::Path(path) => {
+            path_ids.insert(path.hir_id);
+            for segment in path.segments {
+                let Some(arguments) = segment.args else {
+                    continue;
+                };
+                for argument in arguments.args {
+                    match *argument {
+                        GenericArg::Type(ty) | GenericArg::Binding { ty, .. } => {
+                            collect_type_path_ids(ty, path_ids);
+                        }
+                        GenericArg::Const(_) => {}
+                    }
+                }
+            }
+        }
+        TyKind::Borrow(_, inner) => collect_type_path_ids(inner, path_ids),
+        TyKind::Tuple(elements) => {
+            for element in elements {
+                collect_type_path_ids(element, path_ids);
+            }
+        }
+        TyKind::FnPtr { params, ret, .. } => {
+            for parameter in params {
+                collect_type_path_ids(parameter, path_ids);
+            }
+            if let Some(ret) = ret {
+                collect_type_path_ids(ret, path_ids);
+            }
+        }
+        TyKind::Infer | TyKind::Err => {}
+    }
+}
+
+fn interface_use_type_roots<'hir>(owner: &HirOwner<'hir>) -> Vec<&'hir Ty<'hir>> {
+    let OwnerNode::InterfaceItem(item) = owner.node else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    match item.kind {
+        InterfaceItemKind::Struct { fields, .. } => {
+            roots.extend(fields.iter().map(|field| field.ty));
+        }
+        InterfaceItemKind::Alias { ty, .. } | InterfaceItemKind::Refined { base: ty, .. } => {
+            roots.push(ty);
+        }
+        InterfaceItemKind::Enum { variants, .. } => {
+            for variant in variants {
+                match variant.shape {
+                    VariantShape::Unit => {}
+                    VariantShape::Tuple(types) => roots.extend(types.iter()),
+                    VariantShape::Record(fields) => {
+                        roots.extend(fields.iter().map(|field| field.ty));
+                    }
+                }
+            }
+        }
+        InterfaceItemKind::Fn { sig, .. } | InterfaceItemKind::ResourceMember { sig, .. } => {
+            roots.extend(
+                sig.params
+                    .iter()
+                    .filter(|param| !param.is_self)
+                    .map(|param| param.ty),
+            );
+            roots.extend(sig.ret);
+        }
+        InterfaceItemKind::Resource { .. } => {}
+    }
+    roots
+}
+
+fn collect_local_boundary_aliases<'hir>(
+    prepared: &PreparedPhase1PackageScopes,
+    scopes: &Phase1PackageScopes,
+    module_inputs: &'hir HashMap<FileId, CurrentOwnerInputs>,
+    module_members: &ModuleMemberIndex<'_>,
+    source_graph_packages: &HashSet<sai_hir::PackageId>,
+    primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
+    symbols: &Interner,
+    arena: &'hir HirArena<'hir>,
+    interface_type_members: &HashMap<DefId, LocalDefId>,
+) -> Result<LocalBoundaryAliases<'hir>, InterfaceUsesQueryError> {
+    let mut aliases = HashMap::new();
+    let mut path_resolutions = HashMap::new();
+    let mut alias_references = HashMap::new();
+    for descriptor in scopes
+        .top_level_owners
+        .iter()
+        .copied()
+        .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Alias)
+    {
+        let Some(inputs) = module_inputs.get(&descriptor.file) else {
+            continue;
+        };
+        let expected_path = prepared
+            .def_paths
+            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+            .map_err(OwnerControlFlowResolutionError::DefPathInterner)
+            .map_err(InterfaceUsesQueryError::Collection)?
+            .ok_or_else(|| OwnerControlFlowResolutionError::MissingDefPath(descriptor.owner))
+            .map_err(InterfaceUsesQueryError::Collection)?;
+        let context = HirLoweringContext::new(
+            &inputs.ast_ids,
+            &prepared.snapshot,
+            &inputs.root,
+            arena,
+            symbols,
+            &prepared.def_paths,
+        );
+        let Ok((hir_owner, _)) = lower_top_level_owner(
+            descriptor,
+            &expected_path,
+            &inputs.filtered_item_tree,
+            &inputs.retained_item_kinds,
+            &context,
+        ) else {
+            // Existing lowering diagnostics own malformed or unsupported alias
+            // declarations. They cannot provide a sound expansion target.
+            continue;
+        };
+        let OwnerNode::Item(item) = hir_owner.node else {
+            continue;
+        };
+        let ItemKind::Alias { generics, ty } = item.kind else {
+            continue;
+        };
+        let candidates = owner_test_only_path_candidates(&hir_owner);
+        let candidates = type_path_candidates_in_roots(&candidates, &[ty]);
+        let mut candidates = candidates;
+        candidates.sort_by_key(|candidate| candidate.span.range.start());
+        let generic_resolutions = owner_type_generic_resolutions(&hir_owner);
+        let module_scope = module_scope_for_scopes(scopes, &prepared.module_tree, descriptor.file)
+            .map_err(InterfaceUsesQueryError::Collection)?;
+        let resolution = resolve_partial_type_owner_paths(
+            descriptor.owner,
+            &candidates,
+            &generic_resolutions,
+            primitive_prelude,
+            module_scope,
+            prepared.module_tree.package,
+            Some(module_members),
+            Some(source_graph_packages),
+        )
+        .map_err(InterfaceUsesQueryError::Collection)?;
+        let has_generic_params = !generics.params.is_empty();
+        let references = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let PathRes {
+                    base: Res::Def(kind, target),
+                    ..
+                } = resolution.paths().get(&candidate.hir_id).copied()?
+                else {
+                    return None;
+                };
+                if interface_type_members.contains_key(&target) {
+                    Some(LocalAliasReference::InterfaceType(target))
+                } else if kind == DefKind::Alias {
+                    Some(LocalAliasReference::ModuleAlias(target))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        aliases.insert(
+            descriptor.owner.def_id.to_def_id(),
+            BoundaryAlias {
+                owner: descriptor.owner,
+                ty,
+                has_generic_params,
+            },
+        );
+        alias_references.insert(descriptor.owner.def_id.to_def_id(), references);
+        path_resolutions.extend(
+            resolution
+                .paths()
+                .iter()
+                .map(|(hir_id, resolution)| (*hir_id, *resolution)),
+        );
+    }
+    let mut expanded_references = HashMap::with_capacity(aliases.len());
+    for alias in aliases.keys().copied() {
+        let mut references = Vec::new();
+        expand_local_alias_interface_references(
+            alias,
+            &alias_references,
+            &aliases,
+            &mut HashSet::new(),
+            &mut references,
+        );
+        expanded_references.insert(alias, references);
+    }
+    Ok(LocalBoundaryAliases {
+        definitions: aliases,
+        path_resolutions,
+        interface_references: expanded_references,
+    })
+}
+
+fn expand_local_alias_interface_references(
+    alias: DefId,
+    alias_references: &HashMap<DefId, Vec<LocalAliasReference>>,
+    aliases: &HashMap<DefId, BoundaryAlias<'_>>,
+    visiting: &mut HashSet<DefId>,
+    output: &mut Vec<DefId>,
+) {
+    if !aliases.contains_key(&alias) || !visiting.insert(alias) {
+        return;
+    }
+    for reference in alias_references.get(&alias).into_iter().flatten() {
+        match reference {
+            LocalAliasReference::InterfaceType(definition) => output.push(*definition),
+            LocalAliasReference::ModuleAlias(nested) => expand_local_alias_interface_references(
+                *nested,
+                alias_references,
+                aliases,
+                visiting,
+                output,
+            ),
+        }
+    }
+    visiting.remove(&alias);
+}
+
+fn append_local_alias_interface_use_references(
+    owner: &HirOwner<'_>,
+    resolution: &TypeOwnerPathResolution,
+    local_boundary_aliases: &LocalBoundaryAliases<'_>,
+    interface: LocalDefId,
+    interface_type_members: &HashMap<DefId, LocalDefId>,
+    references: &mut Vec<InterfaceUseReference>,
+    module_inputs: &HashMap<FileId, CurrentOwnerInputs>,
+    source_ref: &SourceRef,
+    source: &sai_vfs::SourceFile,
+) -> Result<(), InterfaceUsesQueryError> {
+    let owner_id = owner.id;
+    let candidates = owner_test_only_path_candidates(owner);
+    let mut candidates = interface_use_path_candidates(owner, &candidates);
+    candidates.sort_by_key(|candidate| candidate.span.range.start());
+    for candidate in candidates {
+        let Some(PathRes {
+            base: Res::Def(DefKind::Alias, alias),
+            ..
+        }) = resolution.paths().get(&candidate.hir_id)
+        else {
+            continue;
+        };
+        if interface_type_members.contains_key(alias) {
+            continue;
+        }
+        let Some(hidden_references) = local_boundary_aliases.interface_references.get(alias) else {
+            continue;
+        };
+        let (reference_source_ref, reference_source) = module_inputs
+            .get(&candidate.span.file)
+            .map(|inputs| (inputs.source_ref.clone(), inputs.source.as_ref()))
+            .unwrap_or_else(|| (source_ref.clone(), source));
+        let location = Location::from_decoded_source(
+            reference_source_ref,
+            sai_diagnostics::Span::new(candidate.span.file, candidate.span.range),
+            reference_source,
+        )
+        .ok_or_else(|| {
+            InterfaceUsesQueryError::Collection(
+                OwnerControlFlowResolutionError::InvalidSourceLocation(owner_id),
+            )
+        })?;
+        for hidden_reference in hidden_references {
+            let Some(&to) = interface_type_members.get(hidden_reference) else {
+                continue;
+            };
+            references.push(InterfaceUseReference {
+                from: interface,
+                to,
+                location: location.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn append_interface_boundary_diagnostics(
+    owner: &HirOwner<'_>,
+    resolution: &TypeOwnerPathResolution,
+    interface_boundary_types: &HashMap<DefId, BoundaryDefinition>,
+    local_boundary_aliases: &LocalBoundaryAliases<'_>,
+    interface: LocalDefId,
+    interface_type_members: &HashMap<DefId, LocalDefId>,
+    references: &mut Vec<InterfaceUseReference>,
+    module_inputs: &HashMap<FileId, CurrentOwnerInputs>,
+    source_ref: &SourceRef,
+    source: &sai_vfs::SourceFile,
+    snapshot: &WorkspaceSnapshot,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<(), InterfaceUsesQueryError> {
+    let owner_id = owner.id;
+    let self_resource = match owner.node {
+        OwnerNode::InterfaceItem(item) => match item.kind {
+            InterfaceItemKind::ResourceMember { resource, .. } => Some(resource.to_def_id()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut path_resolutions = resolution.paths().clone();
+    path_resolutions.extend(
+        local_boundary_aliases
+            .path_resolutions
+            .iter()
+            .map(|(hir_id, resolution)| (*hir_id, *resolution)),
+    );
+    append_local_alias_interface_use_references(
+        owner,
+        resolution,
+        local_boundary_aliases,
+        interface,
+        interface_type_members,
+        references,
+        module_inputs,
+        source_ref,
+        source,
+    )?;
+    let mut definitions = HashMap::new();
+    for path_resolution in path_resolutions.values() {
+        let Res::Def(kind, def_id) = path_resolution.base else {
+            continue;
+        };
+        let definition = if let Some(&definition) = interface_boundary_types.get(&def_id) {
+            Some(definition)
+        } else {
+            match kind {
+                DefKind::Alias => Some(BoundaryDefinition::ModuleAlias),
+                DefKind::Struct
+                | DefKind::Enum
+                | DefKind::Distinct
+                | DefKind::Refined
+                | DefKind::Resource => Some(BoundaryDefinition::OutsideInterfaceNominal),
+                _ => None,
+            }
+        };
+        if let Some(definition) = definition {
+            definitions.insert(def_id, definition);
+        }
+    }
+    let canonical_types = HashMap::new();
+    let boundary_context = BoundaryTypeContext {
+        path_resolutions: &path_resolutions,
+        canonical_types: &canonical_types,
+        definitions: &definitions,
+        resource_containment: None,
+        aliases: &local_boundary_aliases.definitions,
+        self_resource,
+    };
+
+    for (ty, position) in interface_boundary_roots(owner) {
+        let conversion = boundary_type_with_references(&boundary_context, owner_id, ty, position);
+        if let BoundaryTypeOutcome::Mapped(_) = &conversion.outcome {
+            continue;
+        }
+        let BoundaryTypeOutcome::Incompatible(incompatible) = conversion.outcome else {
+            continue;
+        };
+        let snapshot_file = snapshot.file(incompatible.span.file).ok_or_else(|| {
+            InterfaceUsesQueryError::Collection(
+                OwnerControlFlowResolutionError::MissingSnapshotFile(incompatible.span.file),
+            )
+        })?;
+        let (diagnostic_source_ref, diagnostic_source) = module_inputs
+            .get(&incompatible.span.file)
+            .map(|inputs| (inputs.source_ref.clone(), inputs.source.as_ref()))
+            .unwrap_or_else(|| (source_ref.clone(), source));
+        let location = Location::from_decoded_source(
+            diagnostic_source_ref,
+            sai_diagnostics::Span::new(incompatible.span.file, incompatible.span.range),
+            diagnostic_source,
+        )
+        .ok_or_else(|| {
+            InterfaceUsesQueryError::Collection(
+                OwnerControlFlowResolutionError::InvalidSourceLocation(owner_id),
+            )
+        })?;
+        let position_name = boundary_position_name(position);
+        let (reason_name, reason_message) = boundary_incompatibility_message(incompatible.reason);
+        let mut diagnostic = Diagnostic::new(
+            sai_diagnostics::Code::WitIncompatibleType,
+            Severity::Error,
+            format!("{reason_message} in {position_name} position"),
+            Some(location),
+        );
+        diagnostic.primary_label = "incompatible WIT boundary type".to_owned();
+        diagnostic.package = snapshot_file.package().map(str::to_owned);
+        diagnostic.data.insert(
+            "wit_position".to_owned(),
+            Value::String(position_name.to_owned()),
+        );
+        diagnostic.data.insert(
+            "wit_incompatibility".to_owned(),
+            Value::String(reason_name.to_owned()),
+        );
+        if let Some(help) = boundary_incompatibility_help(incompatible.reason) {
+            diagnostic
+                .push_child(Child {
+                    kind: ChildKind::Help,
+                    message: help.to_owned(),
+                    location: None,
+                })
+                .expect("unbound diagnostics accept help children");
+        }
+        diagnostics.push(diagnostic);
+    }
+    Ok(())
+}
+
+fn interface_boundary_type_definitions(
+    local_interface_type_members: &HashMap<DefId, LocalDefId>,
+    scopes: &Phase1PackageScopes,
+    prepared: &PreparedPhase1PackageScopes,
+) -> HashMap<DefId, BoundaryDefinition> {
+    let mut definitions = HashMap::new();
+    for scope in scopes.interfaces.values() {
+        for binding in scope.members.values() {
+            let Res::Def(kind, def_id) = binding.res else {
+                continue;
+            };
+            if !local_interface_type_members.contains_key(&def_id) {
+                continue;
+            }
+            let definition = match kind {
+                DefKind::Resource => Some(BoundaryDefinition::Resource),
+                DefKind::Struct
+                | DefKind::Enum
+                | DefKind::Alias
+                | DefKind::Distinct
+                | DefKind::Refined => Some(BoundaryDefinition::InterfaceType),
+                _ => None,
+            };
+            if let Some(definition) = definition {
+                definitions.insert(def_id, definition);
+            }
+        }
+    }
+    for foreign in &prepared.foreign_wit_views {
+        for interface in foreign.view.interfaces.values() {
+            for member in interface.members.values() {
+                let definition = match member.kind {
+                    WitViewDefKind::Resource => Some(BoundaryDefinition::Resource),
+                    WitViewDefKind::Struct | WitViewDefKind::Enum | WitViewDefKind::Alias => {
+                        Some(BoundaryDefinition::InterfaceType)
+                    }
+                    WitViewDefKind::Interface
+                    | WitViewDefKind::World
+                    | WitViewDefKind::Fn
+                    | WitViewDefKind::Field
+                    | WitViewDefKind::Variant
+                    | WitViewDefKind::AssocFn
+                    | WitViewDefKind::WorldFn => None,
+                };
+                if let Some(definition) = definition {
+                    definitions.insert(member.def, definition);
+                }
+            }
+        }
+    }
+    definitions
+}
+
+fn interface_boundary_roots<'hir>(owner: &HirOwner<'hir>) -> Vec<(&'hir Ty<'hir>, Position)> {
+    let OwnerNode::InterfaceItem(item) = owner.node else {
+        return Vec::new();
+    };
+    let mut roots = Vec::new();
+    match item.kind {
+        InterfaceItemKind::Struct { fields, .. } => {
+            roots.extend(fields.iter().map(|field| (field.ty, Position::Nested)));
+        }
+        InterfaceItemKind::Alias { ty, .. } => roots.push((ty, Position::Nested)),
+        InterfaceItemKind::Enum { variants, .. } => {
+            for variant in variants {
+                if let VariantShape::Tuple([ty]) = variant.shape {
+                    roots.push((ty, Position::Nested));
+                }
+            }
+        }
+        InterfaceItemKind::Fn { sig, .. } | InterfaceItemKind::ResourceMember { sig, .. } => {
+            roots.extend(
+                sig.params
+                    .iter()
+                    .filter(|param| !param.is_self)
+                    .map(|param| (param.ty, Position::Param)),
+            );
+            roots.extend(sig.ret.map(|ty| (ty, Position::Result)));
+        }
+        InterfaceItemKind::Refined { .. } | InterfaceItemKind::Resource { .. } => {}
+    }
+    roots
+}
+
+fn boundary_position_name(position: Position) -> &'static str {
+    match position {
+        Position::Param => "parameter",
+        Position::Result => "result",
+        Position::Nested => "nested type",
+    }
+}
+
+fn boundary_incompatibility_message(reason: IncompatibleReason) -> (&'static str, &'static str) {
+    match reason {
+        IncompatibleReason::PointerSizedInteger => (
+            "pointer_sized_integer",
+            "pointer-sized integers have no WIT mapping",
+        ),
+        IncompatibleReason::Never => ("never", "`Never` has no WIT mapping"),
+        IncompatibleReason::FixedLengthArray => (
+            "fixed_length_array",
+            "fixed-length arrays have no WIT mapping",
+        ),
+        IncompatibleReason::FunctionPointer => (
+            "function_pointer",
+            "function pointer types have no WIT mapping",
+        ),
+        IncompatibleReason::TypeParameter => {
+            ("type_parameter", "type parameters have no WIT mapping")
+        }
+        IncompatibleReason::Box => ("box", "`Box<T>` has no WIT mapping"),
+        IncompatibleReason::BorrowOfNonResource => (
+            "borrow_of_non_resource",
+            "only resource types may be borrowed across the WIT boundary",
+        ),
+        IncompatibleReason::BorrowOutsideParameter => (
+            "borrow_outside_parameter",
+            "resource borrows are valid only in parameter position",
+        ),
+        IncompatibleReason::StrOutsideParameter => (
+            "str_outside_parameter",
+            "`Str` is valid only in parameter position",
+        ),
+        IncompatibleReason::SliceOutsideParameter => (
+            "slice_outside_parameter",
+            "`Slice<T>` is valid only in parameter position",
+        ),
+        IncompatibleReason::SliceContainsResource => (
+            "slice_contains_resource",
+            "`Slice<T>` cannot contain a resource type",
+        ),
+        IncompatibleReason::UnitOutsideResult => (
+            "unit_outside_result",
+            "`()` is valid only as a result or a `Result` arm",
+        ),
+        IncompatibleReason::OptionUnit => ("option_unit", "`Option<()>` has no WIT mapping"),
+        IncompatibleReason::OutsideInterfaceNominal => (
+            "outside_interface_nominal",
+            "nominal types crossing the boundary must be declared in an interface",
+        ),
+        IncompatibleReason::DistinctType => ("distinct_type", "distinct types have no WIT mapping"),
+        IncompatibleReason::RefinedType => ("refined_type", "refined types have no WIT mapping"),
+    }
+}
+
+fn boundary_incompatibility_help(reason: IncompatibleReason) -> Option<&'static str> {
+    match reason {
+        IncompatibleReason::PointerSizedInteger => {
+            Some("use a fixed-width integer such as `I32`, `I64`, `U32` or `U64`")
+        }
+        IncompatibleReason::OutsideInterfaceNominal => Some("declare the type in an interface"),
+        IncompatibleReason::SliceContainsResource => {
+            Some("use `Vec<T>` for a list whose elements contain resource handles")
+        }
+        _ => None,
+    }
 }
 
 fn current_owner_inputs_from_prepared(input: &OwnedPhase1ModuleInput) -> CurrentOwnerInputs {
