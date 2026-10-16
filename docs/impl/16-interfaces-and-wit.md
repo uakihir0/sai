@@ -891,14 +891,14 @@ A failed binding is not entered in `bindings`, and the `R` stays unbound. Incomp
 Spec/13 §13.3.4 makes a reference to an implemented interface item mean the implementation. The resolver realizes this as a redirect of resolutions. `ResolvedOwner` (impl/03 §3.4.1) gains
 
 ```rust
-pub redirected: HashMap<HirId, DefId>,     // path → its original resolution, where the redirect changed it
+pub redirected: HashMap<HirId, Res>,        // path → original resolution, where changed
 ```
 
 In every owner of a package `P`, except the interface impl items and their `type R = C` owners, `resolve_owner` applies `interface_impls(P).redirect` after a path resolves:
 
 1. An interface function `F` that `P` implements becomes `Res::Def(DefKind::AssocFn, G)`, because `G` is an associated function declared inside an impl.
 2. A resource `R` (abstract or view) that `P` binds becomes `Res::Def(DefKind::Resource, C)`. `Self` in the members of a local resource `R` denotes `C`.
-3. In each case the original `DefId` is stored in `redirected` under the path's `HirId`.
+3. In each case the original `Res` is stored in `redirected` under the path's `HirId`.
 
 An interface function that `P` does not implement is not redirected.
 
@@ -923,7 +923,9 @@ pub struct WitFnRef {
 
 The `WitIfaceRef` of a local interface of the root refers to `Generated(root)`, which is the package that the component's WIT contains ([07](07-component-lowering.md) §7.1.1).
 
-**Implementation progress (IR-625).** `sai_resolve::InterfaceRedirects` builds lookup tables for selected interface-function matches and accepted resource bindings. It ignores later duplicate impls, unsupported functions, and unvalidated or unresolved resource candidates. Applying these redirects to resolved owners and preserving each original resolution remains.
+**Implementation progress (IR-625).** `sai_resolve::InterfaceRedirects` builds lookup tables for selected interface-function matches and accepted resource bindings. It ignores later duplicate impls, unsupported functions, and unvalidated or unresolved resource candidates.
+
+**Implementation progress (IR-625B).** `InterfaceRedirects::apply_to_paths` takes an unredirected owner path map and returns a rewritten copy plus `redirected: HashMap<HirId, Res>`. It uses the original resolution for each lookup and retains `PathRes` segment metadata. This helper does not select eligible owners or resolve local-resource `Self`; those integrations remain.
 
 ### 16.7.5 Opaque resources
 

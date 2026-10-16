@@ -4764,10 +4764,19 @@
 
 - **Decision:** Rewrite an implemented interface function as `Res::Def(DefKind::AssocFn, G)`. Keep the original interface function `DefId` separately for WIT identity recovery.
 - **Reason:** Impl functions are associated owners (`ItemTreeKind::AssocFn` / `DefPathData::AssocFn`), not module-level `Fn` definitions. Reusing `DefKind::Fn` would send later type and call resolution through the wrong definition kind.
-- **Verification:** Inspected `DefKind`, `ImplItemKind::Fn`, and the impl-item path construction; the redirect helper regression verifies that it stores a target `DefId`, and the path-application step will assert the `AssocFn` kind directly.
-- **Review:** A hostile redirect-architecture review identified the mismatch in the original plan. The plan now names `AssocFn`; follow-up implementation review will verify the rewritten `Res` and retained source identity.
+- **Verification:** Inspected `DefKind`, `ImplItemKind::Fn`, and the impl-item path construction. `apply_to_paths` tests assert that the rewritten path carries `DefKind::AssocFn` and retains the original resolution.
+- **Review:** A hostile redirect-architecture review identified the mismatch in the original plan. The path-application regression and its hostile implementation review confirm that the rewritten `Res` uses `AssocFn` and retains the original source identity.
 - **Human review:** **Review required:** Confirm that an interface function redirect must carry the implementation item's associated-function kind while retaining the original interface function identity for WIT calls and generation.
-- **Remaining scope:** Apply the redirect to one original `PathRes` and retain its original `Res` before integrating it into eligible owners.
+- **Remaining scope:** Integrate path rewriting into eligible owners and handle local-resource `Self`.
+
+### IR-625B: Apply each interface redirect once to original paths
+
+- **Decision:** Add a resolver helper that takes an unredirected `HashMap<HirId, PathRes>` and returns a rewritten copy plus `HashMap<HirId, Res>` for paths whose base changed. Each lookup uses the original `Res`; function targets become `DefKind::AssocFn`, resource targets remain `DefKind::Resource`, and `resolved_segments` and `segment_count` are preserved. Do not chase a redirect target through another mapping.
+- **Reason:** The resolver must keep the interface identity available to WIT boundary conversion and generation while type and call resolution use the implementation target. A one-step rewrite prevents map contents or application order from changing the result. Keeping owner selection outside this helper avoids applying redirects to impl targets and resource-binding RHS owners, which would create a query cycle.
+- **Verification:** `cargo test -p sai_resolve --locked` passes 201 tests. New regressions cover function and resource rewrites, associated-function kind, original `Res` retention, segment metadata, unmatched and nonmatching paths, and a resource chain that resolves only one step. `cargo fmt --all -- --check` and `git diff --check` pass.
+- **Review:** Hostile review found no actionable issue. It confirmed that lookups use only the original path base, only supported `Fn` and `Resource` kinds are considered, and the helper changes no other path metadata.
+- **Human review:** **Review required:** Confirm that redirect recovery should store the complete original `Res`, including its kind; that each path must follow at most one mapping; and that the caller will exclude interface impl targets and associated-type RHS owners before wiring this helper into `ResolvedOwner`.
+- **Remaining scope:** Wire redirects into eligible resolved owners, preserve local-resource `Self` identity, and connect `ResolvedOwner::redirected` to boundary type conversion, WIT generation, and imported-call analysis.
 
 ### IR-619: Diagnose resolved interface impl targets of the wrong kind
 
