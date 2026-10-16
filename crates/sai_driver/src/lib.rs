@@ -4282,6 +4282,8 @@ fn resolve_partial_type_owner_paths(
     primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
     module_scope: &Phase1ModuleScopes,
     requesting_package: PackageId,
+    members: Option<&ModuleMemberIndex<'_>>,
+    source_graph_packages: Option<&HashSet<PackageId>>,
 ) -> Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError> {
     let generic_parameters = generic_resolutions.keys().copied().collect();
     let rejected_test_only_paths =
@@ -4294,9 +4296,9 @@ fn resolve_partial_type_owner_paths(
             primitive_prelude,
             &rejected_test_only_paths,
             module_scope,
-            None,
+            members,
             requesting_package,
-            None,
+            source_graph_packages,
         )),
         Err(error) => Err(OwnerControlFlowResolutionError::PrimitivePrelude(
             error.clone(),
@@ -9151,6 +9153,8 @@ impl RootDatabase {
                                             &self.primitive_prelude,
                                             &module_scope,
                                             collection.module_tree.package,
+                                            None,
+                                            None,
                                         )
                                         .map(Some)
                                     }
@@ -9933,6 +9937,8 @@ impl RootDatabase {
             .copied()
             .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Interface)
             .collect::<Vec<_>>();
+        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
+        let source_graph_packages = HashSet::from([collection.module_tree.package]);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let mut owners = Vec::with_capacity(descriptors.len());
 
@@ -10107,6 +10113,8 @@ impl RootDatabase {
                             &self.primitive_prelude,
                             module_scope,
                             collection.module_tree.package,
+                            Some(&module_members),
+                            Some(&source_graph_packages),
                         ));
                         let (path_resolution, diagnostics) =
                             collect_interface_owner_test_only_paths(
@@ -10205,6 +10213,8 @@ impl RootDatabase {
                                                 &self.primitive_prelude,
                                                 module_scope,
                                                 collection.module_tree.package,
+                                                Some(&module_members),
+                                                Some(&source_graph_packages),
                                             ));
                                         Ok(collect_interface_owner_test_only_paths(
                                             method_owner,
@@ -21598,6 +21608,176 @@ mod tests {
                 .values()
                 .any(|path| { path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32) }),
             "resource method signature types resolve through the primitive Prelude"
+        );
+    }
+
+    #[test]
+    fn interface_and_resource_type_paths_resolve_local_qualified_prefixes() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "interface contract {\n",
+            "  type Qualified = child_alias.api.Request.Associated\n",
+            "  fn call(value: child_alias.Widget) -> child_alias.api.Request.Associated\n",
+            "  resource File {\n",
+            "    fn read(value: child_alias.Widget, missing: child_alias.MissingType) -> child_alias.api.Request.Associated\n",
+            "  }\n",
+            "}\n",
+        );
+        let child = concat!(
+            "type Widget = Bool\n",
+            "interface api { type Request = Bool }\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("interface signatures collect");
+        let child_module_scope = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .expect("child module scope exists");
+        let widget_name = database
+            .symbols
+            .intern("Widget")
+            .expect("Widget name is interned");
+        let widget = child_module_scope
+            .members
+            .get(&widget_name)
+            .expect("child Widget alias exists")
+            .res;
+        let api_name = database
+            .symbols
+            .intern("api")
+            .expect("api name is interned");
+        let api = child_module_scope
+            .members
+            .get(&api_name)
+            .expect("child api interface exists")
+            .res;
+        let request_name = database
+            .symbols
+            .intern("Request")
+            .expect("Request name is interned");
+        let request = collection
+            .scopes()
+            .interfaces
+            .iter()
+            .find_map(|(def_id, interface)| {
+                (api == Res::Def(DefKind::Interface, *def_id))
+                    .then(|| interface.members.get(&request_name))
+                    .flatten()
+            })
+            .expect("child api declares Request")
+            .res;
+
+        let results = database
+            .resolve_interface_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("interface member prefixes resolve");
+        assert_eq!(results.owners().len(), 2);
+        let members = results.owners()[0].members();
+        let alias = members
+            .iter()
+            .find(|member| member.kind() == InterfaceMemberKind::Alias)
+            .expect("qualified interface alias exists");
+        let alias_types = alias
+            .type_path_resolution()
+            .expect("interface alias type lookup succeeds");
+        assert!(
+            alias_types.paths().values().any(|path| {
+                path.base == request && path.resolved_segments == 3 && path.segment_count == 4
+            }),
+            "interface aliases stop at the associated type and retain its suffix"
+        );
+
+        let function = members
+            .iter()
+            .find(|member| member.kind() == InterfaceMemberKind::Function)
+            .expect("qualified interface function exists");
+        let function_types = function
+            .type_path_resolution()
+            .expect("interface function type lookup succeeds");
+        assert!(
+            function_types.paths().values().any(|path| {
+                path.base == widget && path.resolved_segments == 2 && path.segment_count == 2
+            }),
+            "interface function signatures resolve same-package private module members"
+        );
+        assert!(
+            function_types.paths().values().any(|path| {
+                path.base == request && path.resolved_segments == 3 && path.segment_count == 4
+            }),
+            "interface function signatures traverse a local interface and retain the suffix"
+        );
+
+        let resource = members
+            .iter()
+            .find(|member| member.kind() == InterfaceMemberKind::Resource)
+            .expect("resource declaration exists");
+        let method = resource
+            .resource_methods()
+            .first()
+            .expect("resource method exists");
+        let method_types = method
+            .type_path_resolution()
+            .expect("resource method type lookup succeeds");
+        assert!(
+            method_types.paths().values().any(|path| {
+                path.base == widget && path.resolved_segments == 2 && path.segment_count == 2
+            }),
+            "resource method signatures resolve same-package private module members"
+        );
+        assert!(
+            method_types.paths().values().any(|path| {
+                path.base == request && path.resolved_segments == 3 && path.segment_count == 4
+            }),
+            "resource method signatures retain suffixes after local interface traversal"
+        );
+        assert_eq!(
+            method_types.module_path_errors().len(),
+            1,
+            "{:?}",
+            method_types.module_path_errors()
+        );
+        let missing_offset = root
+            .find("child_alias.MissingType")
+            .expect("missing member path exists");
+        let missing_error = &method_types.module_path_errors()[0];
+        let (missing_name, missing_segment, missing_span) = match missing_error.error() {
+            ModulePathError::MissingMember {
+                name,
+                segment_index,
+                span,
+                ..
+            } => (name, segment_index, span),
+            error => panic!("expected a missing-member error, got {error:?}"),
+        };
+        assert!(
+            database
+                .resolve_symbol(missing_name)
+                .is_ok_and(|name| name.as_ref() == "MissingType")
+        );
+        assert_eq!(missing_segment, 0);
+        let missing_start = missing_offset + "child_alias.".len();
+        assert_eq!(missing_span.file, module_tree.modules[0].file);
+        assert_eq!(missing_span.range.start().to_usize(), missing_start);
+        assert_eq!(
+            missing_span.range.end().to_usize(),
+            missing_start + "MissingType".len()
+        );
+        assert_eq!(
+            method_types.paths().get(&missing_error.hir_id()),
+            Some(&PathRes {
+                base: Res::Err,
+                resolved_segments: 2,
+                segment_count: 2,
+            }),
+            "a missing resource-method member keeps its exact type-path error"
         );
     }
 
