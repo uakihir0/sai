@@ -802,6 +802,15 @@ diagnostics alongside the top-level type-owner diagnostics and passes both
 through the existing package-aware source renderer. The command continues to
 report `FEATURE_NOT_IMPLEMENTED`.
 
+**Const type-path member diagnostics (IR-574).** The closure-aware const
+adapter maps typed private and missing source-member errors from both declared
+types and initializer annotations through the same snapshot-aware mapper.
+`ConstOwnerResolution` exposes this optional channel independently of
+initializer expression, local, module, and test-only results. Package-local
+calls continue to expose typed errors without constructing diagnostics.
+`sai check` renders const diagnostics alongside function and top-level
+type-owner results; the command remains incomplete.
+
 **Qualified missing-member diagnostics (IR-545).** The module path walker
 retains the exact `ModuleTarget` when a member is missing. The driver emits a
 snapshot-bound `UNRESOLVED_NAME` at that segment with the canonical package
