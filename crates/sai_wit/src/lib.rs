@@ -7,6 +7,7 @@ mod generated;
 mod model;
 mod source_scan;
 mod stable_hash;
+mod stable_view_hash;
 mod view;
 mod wasi;
 mod wasi_loader;

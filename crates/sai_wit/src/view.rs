@@ -130,6 +130,18 @@ pub struct ViewInterface {
     /// Generated-text provenance is attached by the caller that owns the
     /// generated-WIT hook. A plain `WitPackage` does not carry that metadata.
     pub origin: Option<DefId>,
+    /// Stable identity for `origin`, independent of session-local IDs.
+    pub origin_identity: Option<WitViewOriginIdentity>,
+}
+
+/// Persistent identity for the source interface represented by generated WIT.
+///
+/// `path_hash` includes the source package's canonical key. The canonical path
+/// is retained as a readable collision tie-breaker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WitViewOriginIdentity {
+    pub path_hash: DefPathHash,
+    pub canonical_path: String,
 }
 
 /// A world in the SAI view.
@@ -208,18 +220,41 @@ impl WitView {
         symbols: &Interner,
         def_paths: Arc<DefPathInterner>,
     ) -> Result<Self, WitViewError> {
-        Self::build_with_origins(model, packages, symbols, def_paths, &[])
+        Self::build_inner(model, packages, symbols, def_paths, None, &[])
     }
 
     /// Builds a view and attaches generated-interface provenance.
     ///
     /// `origins` maps WIT interface names to the source interface definitions
     /// that generated them. It is read only for `Generated` units.
+    ///
+    /// `source_def_paths` must be the retained path interner for the source
+    /// package, not the generated view package. It validates origin scope and
+    /// kind and provides the stable identity for each source definition.
     pub fn build_with_origins(
         model: WitPackage,
         packages: &PackageInterner,
         symbols: &Interner,
         def_paths: Arc<DefPathInterner>,
+        source_def_paths: &DefPathInterner,
+        origins: &[(String, DefId)],
+    ) -> Result<Self, WitViewError> {
+        Self::build_inner(
+            model,
+            packages,
+            symbols,
+            def_paths,
+            Some(source_def_paths),
+            origins,
+        )
+    }
+
+    fn build_inner(
+        model: WitPackage,
+        packages: &PackageInterner,
+        symbols: &Interner,
+        def_paths: Arc<DefPathInterner>,
+        source_def_paths: Option<&DefPathInterner>,
         origins: &[(String, DefId)],
     ) -> Result<Self, WitViewError> {
         let unit = model.unit.clone();
@@ -244,7 +279,14 @@ impl WitView {
                 actual: def_paths.package(),
             });
         }
-        let generated_origins = validate_generated_origins(&unit, &model, origins)?;
+        let generated_origins = validate_generated_origins(
+            &unit,
+            &model,
+            packages,
+            symbols,
+            source_def_paths,
+            origins,
+        )?;
 
         let mut interface_plans = make_interface_plans(&model, symbols)?;
         let mut candidates = Vec::new();
@@ -360,7 +402,7 @@ impl WitView {
                 .collect::<Result<Vec<_>, WitViewError>>()?;
             shadowed.sort_by_key(|(order, _)| *order);
             let shadowed = shadowed.into_iter().map(|(_, shadow)| shadow).collect();
-            let origin = generated_origins.get(&plan.wit_name).copied();
+            let origin = generated_origins.get(&plan.wit_name);
             insert_unique(
                 &mut interfaces,
                 plan.wit_name,
@@ -370,7 +412,8 @@ impl WitView {
                     sai_name: plan.sai_name,
                     members,
                     shadowed,
-                    origin,
+                    origin: origin.map(|origin| origin.def),
+                    origin_identity: origin.map(|origin| origin.identity.clone()),
                 },
             )?;
         }
@@ -388,7 +431,12 @@ impl WitView {
                         item,
                     },
                 )?;
-                import_fns.insert(name, def);
+                if import_fns.insert(name.clone(), def).is_some() {
+                    return Err(WitViewError::DuplicateWorldImportFunction {
+                        world: plan.wit_name.clone(),
+                        name,
+                    });
+                }
             }
             insert_unique(
                 &mut worlds,
@@ -444,16 +492,30 @@ impl WitView {
 fn validate_generated_origins(
     unit: &WitUnit,
     model: &WitPackage,
+    packages: &PackageInterner,
+    symbols: &Interner,
+    source_def_paths: Option<&DefPathInterner>,
     origins: &[(String, DefId)],
-) -> Result<HashMap<String, DefId>, WitViewError> {
+) -> Result<HashMap<String, ValidatedGeneratedOrigin>, WitViewError> {
     let WitUnitKind::Generated { package } = unit.kind() else {
         return Ok(HashMap::new());
     };
 
+    if let Some(source_def_paths) = source_def_paths {
+        if source_def_paths.package() != package {
+            return Err(WitViewError::GeneratedOriginInternerPackageMismatch {
+                expected: package,
+                actual: source_def_paths.package(),
+            });
+        }
+    } else if !origins.is_empty() {
+        return Err(WitViewError::GeneratedOriginInternerRequired);
+    }
+
     let mut generated_origins = HashMap::with_capacity(origins.len());
     let mut source_definitions = HashSet::with_capacity(origins.len());
     for (name, def) in origins {
-        if generated_origins.insert(name.clone(), *def).is_some() {
+        if generated_origins.contains_key(name) {
             return Err(WitViewError::DuplicateGeneratedOrigin(name.clone()));
         }
         if def.package != package {
@@ -463,9 +525,42 @@ fn validate_generated_origins(
                 actual: def.package,
             });
         }
+        let source_def_paths =
+            source_def_paths.ok_or(WitViewError::GeneratedOriginInternerRequired)?;
+        let path = source_def_paths
+            .resolve_def_id(*def)
+            .map_err(|error| WitViewError::GeneratedOriginPath {
+                interface: name.clone(),
+                error,
+            })?
+            .ok_or_else(|| WitViewError::GeneratedOriginDefinitionNotFound {
+                interface: name.clone(),
+                def: *def,
+            })?;
+        if !matches!(
+            path.data().last().map(|component| &component.data),
+            Some(DefPathData::Interface(_))
+        ) {
+            return Err(WitViewError::GeneratedOriginNotInterface {
+                interface: name.clone(),
+                def: *def,
+            });
+        }
+        let identity = WitViewOriginIdentity {
+            path_hash: DefPathHash::compute(&path, packages, symbols)
+                .map_err(WitViewError::DefPath)?,
+            canonical_path: canonical_path(path.data(), symbols)?,
+        };
         if !source_definitions.insert(*def) {
             return Err(WitViewError::DuplicateGeneratedOriginDefinition(*def));
         }
+        generated_origins.insert(
+            name.clone(),
+            ValidatedGeneratedOrigin {
+                def: *def,
+                identity,
+            },
+        );
     }
     let interface_names = model
         .interfaces
@@ -484,6 +579,12 @@ fn validate_generated_origins(
         }
     }
     Ok(generated_origins)
+}
+
+#[derive(Clone)]
+struct ValidatedGeneratedOrigin {
+    def: DefId,
+    identity: WitViewOriginIdentity,
 }
 
 /// Returns the SAI source spelling for a WIT identifier.
@@ -627,6 +728,23 @@ pub enum WitViewError {
         expected: PackageId,
         actual: PackageId,
     },
+    GeneratedOriginInternerRequired,
+    GeneratedOriginInternerPackageMismatch {
+        expected: PackageId,
+        actual: PackageId,
+    },
+    GeneratedOriginPath {
+        interface: String,
+        error: DefPathInternerError,
+    },
+    GeneratedOriginDefinitionNotFound {
+        interface: String,
+        def: DefId,
+    },
+    GeneratedOriginNotInterface {
+        interface: String,
+        def: DefId,
+    },
     DuplicateGeneratedOrigin(String),
     DuplicateGeneratedOriginDefinition(DefId),
     MissingGeneratedOrigin(String),
@@ -634,6 +752,10 @@ pub enum WitViewError {
     InvalidName(String),
     DuplicateViewName {
         kind: &'static str,
+        name: String,
+    },
+    DuplicateWorldImportFunction {
+        world: String,
         name: String,
     },
     MissingDefinition(WitViewEntity),
@@ -676,6 +798,25 @@ impl fmt::Display for WitViewError {
                 formatter,
                 "generated WIT interface `{interface}` belongs to package {expected:?}, but its origin belongs to {actual:?}"
             ),
+            Self::GeneratedOriginInternerRequired => formatter.write_str(
+                "generated WIT origins require the source package's definition-path interner",
+            ),
+            Self::GeneratedOriginInternerPackageMismatch { expected, actual } => write!(
+                formatter,
+                "generated WIT origin interner belongs to package {actual:?}, expected source package {expected:?}"
+            ),
+            Self::GeneratedOriginPath { interface, error } => write!(
+                formatter,
+                "could not resolve generated WIT origin for interface `{interface}`: {error:?}"
+            ),
+            Self::GeneratedOriginDefinitionNotFound { interface, def } => write!(
+                formatter,
+                "generated WIT origin for interface `{interface}` does not exist: {def:?}"
+            ),
+            Self::GeneratedOriginNotInterface { interface, def } => write!(
+                formatter,
+                "generated WIT origin for interface `{interface}` is not an interface definition: {def:?}"
+            ),
             Self::DuplicateGeneratedOrigin(name) => {
                 write!(
                     formatter,
@@ -702,6 +843,10 @@ impl fmt::Display for WitViewError {
             Self::DuplicateViewName { kind, name } => {
                 write!(formatter, "duplicate WIT {kind} name `{name}` in view")
             }
+            Self::DuplicateWorldImportFunction { world, name } => write!(
+                formatter,
+                "duplicate WIT world import function `{name}` in world `{world}`"
+            ),
             Self::MissingDefinition(entity) => {
                 write!(formatter, "missing WIT view definition for {entity:?}")
             }
@@ -1161,28 +1306,34 @@ fn collect_world_candidates(
         )?;
 
         let mut function_components = HashMap::new();
+        let mut import_function_names = HashSet::new();
         let mut import_functions = Vec::new();
         collect_world_function_candidates(
             &world.imports,
             true,
             wit,
+            &world.name,
             &root,
             package,
             packages,
             symbols,
             &mut function_components,
+            &mut import_function_names,
             &mut import_functions,
             candidates,
         )?;
+        let mut export_function_names = HashSet::new();
         collect_world_function_candidates(
             &world.exports,
             false,
             wit,
+            &world.name,
             &root,
             package,
             packages,
             symbols,
             &mut function_components,
+            &mut export_function_names,
             &mut Vec::new(),
             candidates,
         )?;
@@ -1201,11 +1352,13 @@ fn collect_world_function_candidates(
     items: &[WitWorldItem],
     import: bool,
     world: WitWorldIdx,
+    world_name: &str,
     root: &[DisambiguatedDefPathData],
     package: PackageId,
     packages: &PackageInterner,
     symbols: &Interner,
     components: &mut HashMap<DefPathData, u32>,
+    seen_names: &mut HashSet<String>,
     import_functions: &mut Vec<(String, u32)>,
     candidates: &mut Vec<Candidate>,
 ) -> Result<(), WitViewError> {
@@ -1214,6 +1367,12 @@ fn collect_world_function_candidates(
             continue;
         };
         let sai_name = wit_name_to_sai_name(name, false)?;
+        if import && !seen_names.insert(sai_name.clone()) {
+            return Err(WitViewError::DuplicateWorldImportFunction {
+                world: world_name.to_owned(),
+                name: sai_name,
+            });
+        }
         let symbol = symbols.intern(&sai_name).map_err(WitViewError::Symbol)?;
         let data = DefPathData::WorldItem {
             import,
@@ -1286,35 +1445,140 @@ fn canonical_path(
 ) -> Result<String, WitViewError> {
     let mut output = String::new();
     for component in data {
-        let (tag, name, extra) = match &component.data {
-            DefPathData::Interface(name) => ("interface", Some(*name), None),
-            DefPathData::World(name) => ("world", Some(*name), None),
-            DefPathData::TypeNs(name) => ("type", Some(*name), None),
-            DefPathData::ValueNs(name) => ("value", Some(*name), None),
-            DefPathData::Field(name) => ("field", Some(*name), None),
-            DefPathData::Variant(name) => ("variant", Some(*name), None),
-            DefPathData::AssocFn(name) => ("assoc-fn", Some(*name), None),
-            DefPathData::WorldItem { import, name } => (
-                "world-import",
-                Some(*name),
-                Some(if *import { "import" } else { "export" }),
-            ),
-            other => return Err(WitViewError::InvalidName(format!("{other:?}"))),
-        };
-        output.push_str(tag);
-        output.push('[');
-        if let Some(extra) = extra {
-            write_length_prefixed(&mut output, extra);
+        output.push_str(&canonical_path_component(component, symbols)?);
+    }
+    Ok(output)
+}
+
+fn canonical_path_component(
+    component: &DisambiguatedDefPathData,
+    symbols: &Interner,
+) -> Result<String, WitViewError> {
+    let mut output = String::new();
+    let mut named_symbol = None;
+    let mut named_string: Option<&str> = None;
+    let mut extra: Option<&str> = None;
+    let mut numeric: Option<String> = None;
+    let tag = match &component.data {
+        DefPathData::Module(name) => {
+            named_symbol = Some(*name);
+            "module"
+        }
+        DefPathData::TypeNs(name) => {
+            named_symbol = Some(*name);
+            "type"
+        }
+        DefPathData::ValueNs(name) => {
+            named_symbol = Some(*name);
+            "value"
+        }
+        DefPathData::Interface(name) => {
+            named_symbol = Some(*name);
+            "interface"
+        }
+        DefPathData::World(name) => {
+            named_symbol = Some(*name);
+            "world"
+        }
+        DefPathData::Effect(name) => {
+            named_symbol = Some(*name);
+            "effect"
+        }
+        DefPathData::Field(name) => {
+            named_symbol = Some(*name);
+            "field"
+        }
+        DefPathData::Variant(name) => {
+            named_symbol = Some(*name);
+            "variant"
+        }
+        DefPathData::AssocType(name) => {
+            named_symbol = Some(*name);
+            "assoc-type"
+        }
+        DefPathData::AssocFn(name) => {
+            named_symbol = Some(*name);
+            "assoc-fn"
+        }
+        DefPathData::TypeParam(name) => {
+            named_symbol = Some(*name);
+            "type-param"
+        }
+        DefPathData::ConstParam(name) => {
+            named_symbol = Some(*name);
+            "const-param"
+        }
+        DefPathData::Impl { header_hash } => {
+            numeric = Some(format!("{header_hash:016x}"));
+            "impl"
+        }
+        DefPathData::DerivedImpl { trait_name } => {
+            named_symbol = Some(*trait_name);
+            "derived-impl"
+        }
+        DefPathData::Invariant(name) => {
+            named_symbol = Some(*name);
+            "invariant"
+        }
+        DefPathData::ExternBlock { abi, module } => {
+            named_symbol = Some(*abi);
+            numeric = Some(if let Some(module) = module {
+                let module = symbols.resolve(*module).map_err(WitViewError::Lookup)?;
+                format!("module:{}:{}", module.len(), module)
+            } else {
+                "module:none".to_owned()
+            });
+            "extern-block"
+        }
+        DefPathData::Test(name) => {
+            named_string = Some(name);
+            "test"
+        }
+        DefPathData::Property(name) => {
+            named_string = Some(name);
+            "property"
+        }
+        DefPathData::Closure => "closure",
+        DefPathData::AsyncBlock => "async-block",
+        DefPathData::WorldItem { import, name } => {
+            named_symbol = Some(*name);
+            extra = Some(if *import { "import" } else { "export" });
+            "world-import"
+        }
+        DefPathData::WorldInclude(name) => {
+            named_symbol = Some(*name);
+            "world-include"
+        }
+    };
+
+    output.push_str(tag);
+    output.push('[');
+    if let Some(extra) = extra {
+        write_length_prefixed(&mut output, extra);
+        output.push(';');
+    }
+    let mut wrote_value = false;
+    if let Some(name) = named_symbol {
+        let name = symbols.resolve(name).map_err(WitViewError::Lookup)?;
+        write_length_prefixed(&mut output, &name);
+        wrote_value = true;
+    }
+    if let Some(name) = named_string {
+        if wrote_value {
             output.push(';');
         }
-        if let Some(name) = name {
-            let name = symbols.resolve(name).map_err(WitViewError::Lookup)?;
-            write_length_prefixed(&mut output, &name);
-        }
-        output.push(';');
-        output.push_str(&component.disambiguator.to_string());
-        output.push_str("]/");
+        write_length_prefixed(&mut output, name);
+        wrote_value = true;
     }
+    if let Some(value) = numeric {
+        if wrote_value {
+            output.push(';');
+        }
+        write_length_prefixed(&mut output, &value);
+    }
+    output.push(';');
+    output.push_str(&component.disambiguator.to_string());
+    output.push_str("]/");
     Ok(output)
 }
 
@@ -1363,14 +1627,14 @@ fn insert_unique<V>(
 
 #[cfg(test)]
 mod tests {
-    use super::{WitView, WitViewDefKind, WitViewEntity, wit_name_to_sai};
+    use super::{WitView, WitViewDefKind, WitViewEntity, WitViewOriginIdentity, wit_name_to_sai};
     use crate::{
         WitCase, WitField, WitIfaceIdx, WitIndexVec, WitInterface, WitItem, WitItemIdx,
         WitItemKind, WitMember, WitMemberKind, WitPackage, WitPackageName, WitType, WitUnit,
         WitWorld, WitWorldItem,
     };
-    use sai_hir::DefPathInterner;
-    use sai_intern::{Interner, PackageInterner};
+    use sai_hir::{DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, IndexVec};
+    use sai_intern::{DefIndex, Interner, PackageInterner};
     use sai_package::mvs::MvsPackageVersion;
     use sai_package::version::Version;
     use std::sync::Arc;
@@ -1591,6 +1855,33 @@ mod tests {
         let package = packages.intern(unit.stable_key()).unwrap();
         let def_paths = Arc::new(DefPathInterner::new(package, &packages, &symbols).unwrap());
         WitView::build(model(unit, reverse), &packages, &symbols, def_paths).unwrap()
+    }
+
+    fn source_def(
+        package: sai_intern::PackageId,
+        symbols: &Interner,
+        packages: &PackageInterner,
+        source_def_paths: &DefPathInterner,
+        name: &str,
+        interface: bool,
+    ) -> sai_hir::DefId {
+        let name = symbols.intern(name).unwrap();
+        let data = if interface {
+            DefPathData::Interface(name)
+        } else {
+            DefPathData::TypeNs(name)
+        };
+        let path = DefPath::new(
+            package,
+            vec![DisambiguatedDefPathData {
+                data,
+                disambiguator: 0,
+            }],
+            packages,
+            symbols,
+        )
+        .unwrap();
+        source_def_paths.intern(path).unwrap().to_def_id()
     }
 
     fn stable_defs(view: &WitView) -> Vec<(String, u128, u32, WitViewDefKind)> {
@@ -1845,12 +2136,39 @@ mod tests {
             version: Some(Version::parse("1.2.3").unwrap()),
         };
         let source = package;
-        let mut source_defs = sai_hir::IndexVec::<sai_intern::DefIndex, ()>::new();
-        let files_origin = sai_hir::DefId::from_foreign(source, source_defs.push(()).unwrap());
-        let metadata_origin = sai_hir::DefId::from_foreign(source, source_defs.push(()).unwrap());
-        let unknown_origin = sai_hir::DefId::from_foreign(source, source_defs.push(()).unwrap());
-        let second_unknown_origin =
-            sai_hir::DefId::from_foreign(source, source_defs.push(()).unwrap());
+        let source_def_paths = DefPathInterner::new(source, &packages, &symbols).unwrap();
+        let files_origin = source_def(
+            source,
+            &symbols,
+            &packages,
+            &source_def_paths,
+            "SaiFiles",
+            true,
+        );
+        let metadata_origin = source_def(
+            source,
+            &symbols,
+            &packages,
+            &source_def_paths,
+            "SaiMetadata",
+            true,
+        );
+        let unknown_origin = source_def(
+            source,
+            &symbols,
+            &packages,
+            &source_def_paths,
+            "SaiUnknown",
+            true,
+        );
+        let second_unknown_origin = source_def(
+            source,
+            &symbols,
+            &packages,
+            &source_def_paths,
+            "SaiSecondUnknown",
+            true,
+        );
         let origins = vec![
             ("files".to_owned(), files_origin),
             ("metadata".to_owned(), metadata_origin),
@@ -1863,11 +2181,20 @@ mod tests {
             &packages,
             &symbols,
             Arc::clone(&def_paths),
+            &source_def_paths,
             &origins,
         )
         .unwrap();
         assert_eq!(view.interfaces["files"].origin, Some(files_origin));
         assert_eq!(view.interfaces["metadata"].origin, Some(metadata_origin));
+        assert_eq!(
+            view.interfaces["files"]
+                .origin_identity
+                .as_ref()
+                .unwrap()
+                .canonical_path,
+            "interface[8:SaiFiles;0]/"
+        );
 
         assert!(matches!(
             WitView::build_with_origins(
@@ -1875,6 +2202,7 @@ mod tests {
                 &packages,
                 &symbols,
                 Arc::clone(&def_paths),
+                &source_def_paths,
                 &[origins[0].clone()]
             ),
             Err(super::WitViewError::MissingGeneratedOrigin(name)) if name == "metadata"
@@ -1885,6 +2213,7 @@ mod tests {
                 &packages,
                 &symbols,
                 Arc::clone(&def_paths),
+                &source_def_paths,
                 &[origins[0].clone(), origins[0].clone(), origins[1].clone()]
             ),
             Err(super::WitViewError::DuplicateGeneratedOrigin(name)) if name == "files"
@@ -1895,6 +2224,7 @@ mod tests {
                 &packages,
                 &symbols,
                 Arc::clone(&def_paths),
+                &source_def_paths,
                 &[
                     ("files".to_owned(), files_origin),
                     ("metadata".to_owned(), files_origin),
@@ -1909,6 +2239,7 @@ mod tests {
                 &packages,
                 &symbols,
                 Arc::clone(&def_paths),
+                &source_def_paths,
                 &[
                     origins[0].clone(),
                     origins[1].clone(),
@@ -1923,6 +2254,7 @@ mod tests {
                 &packages,
                 &symbols,
                 Arc::clone(&def_paths),
+                &source_def_paths,
                 &[
                     origins[0].clone(),
                     origins[1].clone(),
@@ -1934,14 +2266,25 @@ mod tests {
         ));
 
         let other_package = packages.intern("acme:other#1").unwrap();
-        let wrong_origin =
-            sai_hir::DefId::from_foreign(other_package, source_defs.push(()).unwrap());
+        let other_source_def_paths =
+            DefPathInterner::new(other_package, &packages, &symbols).unwrap();
+        let wrong_origin = source_def(
+            other_package,
+            &symbols,
+            &packages,
+            &other_source_def_paths,
+            "Foreign",
+            true,
+        );
+        let invalid_def_paths =
+            Arc::new(DefPathInterner::new(view_package, &packages, &symbols).unwrap());
         assert!(matches!(
             WitView::build_with_origins(
                 view.model.clone(),
                 &packages,
                 &symbols,
-                def_paths,
+                Arc::clone(&invalid_def_paths),
+                &source_def_paths,
                 &[("files".to_owned(), wrong_origin), origins[1].clone()]
             ),
             Err(super::WitViewError::GeneratedOriginPackageMismatch {
@@ -1951,18 +2294,181 @@ mod tests {
             }) if interface == "files" && expected == source && actual == other_package
         ));
 
-        let invalid_def_paths =
-            Arc::new(DefPathInterner::new(view_package, &packages, &symbols).unwrap());
+        let wrong_interner = DefPathInterner::new(other_package, &packages, &symbols).unwrap();
         assert!(matches!(
             WitView::build_with_origins(
                 view.model.clone(),
                 &packages,
                 &symbols,
                 Arc::clone(&invalid_def_paths),
-                &[("files".to_owned(), wrong_origin), origins[1].clone()]
+                &wrong_interner,
+                &origins
             ),
-            Err(super::WitViewError::GeneratedOriginPackageMismatch { .. })
+            Err(super::WitViewError::GeneratedOriginInternerPackageMismatch {
+                expected,
+                actual,
+            }) if expected == source && actual == other_package
+        ));
+
+        let foreign_scope_interner = DefPathInterner::new(source, &packages, &symbols).unwrap();
+        let foreign_scope_origin = source_def(
+            source,
+            &symbols,
+            &packages,
+            &foreign_scope_interner,
+            "ForeignScope",
+            true,
+        );
+        assert!(matches!(
+            WitView::build_with_origins(
+                view.model.clone(),
+                &packages,
+                &symbols,
+                Arc::clone(&invalid_def_paths),
+                &source_def_paths,
+                &[
+                    ("files".to_owned(), foreign_scope_origin),
+                    origins[1].clone()
+                ]
+            ),
+            Err(super::WitViewError::GeneratedOriginPath {
+                error: sai_hir::DefPathInternerError::ForeignDefinitionId,
+                ..
+            })
+        ));
+
+        let non_interface = source_def(
+            source,
+            &symbols,
+            &packages,
+            &source_def_paths,
+            "NotAnInterface",
+            false,
+        );
+        assert!(matches!(
+            WitView::build_with_origins(
+                view.model.clone(),
+                &packages,
+                &symbols,
+                Arc::clone(&invalid_def_paths),
+                &source_def_paths,
+                &[("files".to_owned(), non_interface), origins[1].clone()]
+            ),
+            Err(super::WitViewError::GeneratedOriginNotInterface { interface, def })
+                if interface == "files" && def == non_interface
+        ));
+
+        let mut indices = IndexVec::<DefIndex, ()>::new();
+        for _ in 0..source_def_paths.len().unwrap() {
+            indices.push(()).unwrap();
+        }
+        let mut unknown_index = files_origin;
+        unknown_index.index = indices.push(()).unwrap();
+        assert!(matches!(
+            WitView::build_with_origins(
+                view.model.clone(),
+                &packages,
+                &symbols,
+                Arc::clone(&invalid_def_paths),
+                &source_def_paths,
+                &[("files".to_owned(), unknown_index), origins[1].clone()]
+            ),
+            Err(super::WitViewError::GeneratedOriginDefinitionNotFound { interface, def })
+                if interface == "files" && def == unknown_index
         ));
         assert_eq!(invalid_def_paths.len().unwrap(), 0);
+    }
+
+    #[test]
+    fn generated_origin_identity_ignores_runtime_package_and_symbol_ids() {
+        fn build_origin(padded: bool) -> (sai_intern::PackageId, WitViewOriginIdentity) {
+            let packages = PackageInterner::new();
+            let symbols = Interner::new();
+            if padded {
+                packages.intern("padding#1").unwrap();
+                symbols.intern("padding").unwrap();
+            }
+            let selected =
+                MvsPackageVersion::new("acme:graphics", Version::parse("1.2.3").unwrap()).unwrap();
+            let source = packages.intern("acme:graphics#1").unwrap();
+            let unit = WitUnit::generated(source, &packages, &selected).unwrap();
+            let source_def_paths = DefPathInterner::new(source, &packages, &symbols).unwrap();
+            let files_origin = source_def(
+                source,
+                &symbols,
+                &packages,
+                &source_def_paths,
+                "SaiFiles",
+                true,
+            );
+            let metadata_origin = source_def(
+                source,
+                &symbols,
+                &packages,
+                &source_def_paths,
+                "SaiMetadata",
+                true,
+            );
+            let mut model = model(unit, false);
+            model.name = WitPackageName {
+                namespace: "acme".to_owned(),
+                name: "graphics".to_owned(),
+                version: Some(Version::parse("1.2.3").unwrap()),
+            };
+            let view_package = packages.intern(model.unit.stable_key()).unwrap();
+            let view_def_paths =
+                Arc::new(DefPathInterner::new(view_package, &packages, &symbols).unwrap());
+            let view = WitView::build_with_origins(
+                model,
+                &packages,
+                &symbols,
+                view_def_paths,
+                &source_def_paths,
+                &[
+                    ("files".to_owned(), files_origin),
+                    ("metadata".to_owned(), metadata_origin),
+                ],
+            )
+            .unwrap();
+            (
+                source,
+                view.interfaces["files"].origin_identity.clone().unwrap(),
+            )
+        }
+
+        let (first_package, first_identity) = build_origin(false);
+        let (second_package, second_identity) = build_origin(true);
+        assert_ne!(first_package, second_package);
+        assert_eq!(first_identity, second_identity);
+    }
+
+    #[test]
+    fn duplicate_normalized_world_import_names_are_rejected_before_interning() {
+        let packages = PackageInterner::new();
+        let symbols = Interner::new();
+        let unit_name = symbols.intern("cli").unwrap();
+        let unit = WitUnit::wasi(unit_name, &symbols, &Version::parse("0.2.3").unwrap()).unwrap();
+        let mut model = model(unit, false);
+        let duplicate = |name: &str| WitWorldItem::Func {
+            name: name.to_owned(),
+            func: crate::WitFunc {
+                params: Vec::new(),
+                result: None,
+                is_async: false,
+            },
+            unsupported: None,
+        };
+        model.worlds[crate::WitWorldIdx::from_raw(0)]
+            .imports
+            .extend([duplicate("HTTP"), duplicate("http")]);
+        let package = packages.intern(model.unit.stable_key()).unwrap();
+        let def_paths = Arc::new(DefPathInterner::new(package, &packages, &symbols).unwrap());
+
+        assert!(matches!(
+            WitView::build(model, &packages, &symbols, Arc::clone(&def_paths)),
+            Err(super::WitViewError::DuplicateWorldImportFunction { world, name })
+                if world == "client" && name == "http"
+        ));
+        assert_eq!(def_paths.len().unwrap(), 0);
     }
 }
