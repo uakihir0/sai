@@ -8974,6 +8974,8 @@ impl RootDatabase {
             .copied()
             .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
             .collect::<Vec<_>>();
+        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
+        let source_graph_packages = HashSet::from([collection.module_tree.package]);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let mut owners = Vec::with_capacity(descriptors.len());
 
@@ -9153,8 +9155,8 @@ impl RootDatabase {
                                             &self.primitive_prelude,
                                             &module_scope,
                                             collection.module_tree.package,
-                                            None,
-                                            None,
+                                            Some(&module_members),
+                                            Some(&source_graph_packages),
                                         )
                                         .map(Some)
                                     }
@@ -19522,12 +19524,15 @@ mod tests {
     #[test]
     fn world_signature_type_heads_use_each_files_module_scope() {
         let root = concat!(
+            "use acme:phase1/child as child_alias\n",
             "type Shared = U32\n",
             "type RootOnly = Bool\n",
-            "world root_api { export fn read(value: Shared, root: RootOnly) -> U32 }\n",
+            "world root_api { export fn read(value: Shared, local: child_alias.Widget) -> child_alias.api.Request.Associated }\n",
         );
         let child = concat!(
             "type Shared = I32\n",
+            "type Widget = Bool\n",
+            "interface api { type Request = Bool }\n",
             "world child_api { export fn read(value: Shared, root: RootOnly) -> I32 }\n",
         );
         let (mut database, module_tree, snapshot, _) =
@@ -19575,6 +19580,39 @@ mod tests {
             .expect("child Shared alias exists")
             .res;
         assert_ne!(root_shared, child_shared);
+        let widget_symbol = database
+            .symbols
+            .intern("Widget")
+            .expect("Widget name is interned");
+        let child_widget = child_scope
+            .members
+            .get(&widget_symbol)
+            .expect("child Widget alias exists")
+            .res;
+        let api_symbol = database
+            .symbols
+            .intern("api")
+            .expect("api name is interned");
+        let child_api = child_scope
+            .members
+            .get(&api_symbol)
+            .expect("child api interface exists")
+            .res;
+        let request_symbol = database
+            .symbols
+            .intern("Request")
+            .expect("Request name is interned");
+        let child_request = collection
+            .scopes()
+            .interfaces
+            .iter()
+            .find_map(|(def_id, interface)| {
+                (child_api == Res::Def(DefKind::Interface, *def_id))
+                    .then(|| interface.members.get(&request_symbol))
+                    .flatten()
+            })
+            .expect("child api declares Request")
+            .res;
 
         let root_types = results.owners()[0].items()[0]
             .type_path_resolution()
@@ -19590,6 +19628,18 @@ mod tests {
                 .values()
                 .any(|path| path.base == root_shared),
             "root signatures resolve the root file's Shared alias"
+        );
+        assert!(
+            root_types.paths().values().any(|path| {
+                path.base == child_widget && path.resolved_segments == 2 && path.segment_count == 2
+            }),
+            "world function signatures resolve same-package private module members"
+        );
+        assert!(
+            root_types.paths().values().any(|path| {
+                path.base == child_request && path.resolved_segments == 3 && path.segment_count == 4
+            }),
+            "world function signatures traverse local interfaces and retain type suffixes"
         );
         assert!(
             child_types
