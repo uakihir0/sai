@@ -1422,6 +1422,7 @@ pub struct TraitImplHeaderResolutions {
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
+    member_scope_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<TraitImplHeaderResolution>,
 }
 
@@ -1438,6 +1439,20 @@ impl TraitImplHeaderResolutions {
         self.snapshot_id == collection.snapshot_id
             && self.target_cfg == collection.target_cfg
             && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn matches_member_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && member_scopes.matches_collection(collection)
+            && self.member_scope_closure_fingerprint == Some(member_scopes.closure_fingerprint)
+    }
+
+    pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
+        self.member_scope_closure_fingerprint
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -9574,6 +9589,43 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<TraitImplHeaderResolutions, OwnerControlFlowResolutionError> {
+        self.resolve_trait_impl_header_test_only_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            None,
+        )
+    }
+
+    /// Resolves trait and impl header type prefixes through a validated
+    /// active-source member-scope closure.
+    pub fn resolve_trait_impl_header_test_only_paths_with_member_scopes(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> Result<TraitImplHeaderResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.resolve_trait_impl_header_test_only_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+        )
+    }
+
+    fn resolve_trait_impl_header_test_only_paths_inner(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+    ) -> Result<TraitImplHeaderResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
         }
@@ -9581,8 +9633,22 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
         }
 
-        let module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
-        let source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let mut indexed_scopes =
+            Vec::with_capacity(1 + member_scopes.map_or(0, |scopes| scopes.source_packages.len()));
+        indexed_scopes.push(collection.scopes());
+        if let Some(member_scopes) = member_scopes {
+            indexed_scopes.extend(
+                member_scopes
+                    .source_packages
+                    .iter()
+                    .map(Phase1ModuleMemberScopePackage::scopes),
+            );
+        }
+        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let source_graph_packages = member_scopes
+            .map(|scopes| &scopes.source_graph_packages)
+            .unwrap_or(&local_source_graph_packages);
         let descriptors = collection
             .scopes
             .top_level_owners
@@ -9767,6 +9833,8 @@ impl RootDatabase {
             snapshot_id: snapshot.id(),
             target_cfg: collection.target_cfg.clone(),
             collection_input_fingerprint: collection.input_fingerprint,
+            member_scope_closure_fingerprint: member_scopes
+                .map(|scopes| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -20677,6 +20745,9 @@ mod tests {
                       invariant U32 { { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true } }\n\
                       type ForeignRefined = U32 where { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true }\n\
                       distinct ForeignDistinct = U32 where { let public: middle.api.PublicType = 0; let private: leaf_model.PrivateType = 0; let missing: middle.api.PublicTypo = 0; true }\n\
+                      trait ForeignHeader<Public: middle.api.PublicType, Private: leaf_model.PrivateType, Missing: middle.api.PublicTypo> {}\n\
+                      impl middle.api.PublicType for leaf_model.PrivateType where Self: middle.api.PublicTypo {}\n\
+                      impl middle.api {}\n\
                       unsafe extern \"wasm\" module \"env\" { fn transitive_extern(public: middle.api.PublicType, private: leaf_model.PrivateType, missing: middle.api.PublicTypo); }\n\
                       fn qualified_signature(value: middle.api.PublicType, hidden: leaf_model.PrivateType, missing: middle.api.PublicTypo) -> middle.api.PublicType.Associated {}\n\
                       const QUALIFIED_FOREIGN: middle.api.PublicType = { let nested: middle.api.PublicType = 0; 0 }\n\
@@ -21187,6 +21258,97 @@ mod tests {
                     })
                 ));
             };
+
+        let header_results = database
+            .resolve_trait_impl_header_test_only_paths_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("trait and impl header paths resolve through transitive member scopes");
+        assert!(header_results.matches_member_scopes(&root_collection, &member_scopes));
+        assert_eq!(
+            header_results.member_scope_closure_fingerprint(),
+            Some(member_scopes.closure_fingerprint())
+        );
+        assert!(matches!(
+            database.resolve_trait_impl_header_test_only_paths_with_member_scopes(
+                &middle_collection,
+                &middle_tree,
+                &snapshot,
+                &member_scopes,
+            ),
+            Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(key)
+            )) if key.as_str() == "acme:middle#1"
+        ));
+        assert_eq!(header_results.owners().len(), 3);
+        assert_eq!(
+            header_results
+                .owners()
+                .iter()
+                .map(|owner| owner.kind())
+                .collect::<Vec<_>>(),
+            [
+                TopLevelOwnerKind::Trait,
+                TopLevelOwnerKind::Impl,
+                TopLevelOwnerKind::Impl
+            ],
+            "trait and impl headers both use the validated source closure"
+        );
+        let header_paths = header_results.owners()[0]
+            .type_path_resolution()
+            .expect("trait header type path result succeeds");
+        let header_start = source_text
+            .find("trait ForeignHeader")
+            .expect("transitive trait header appears in the root source");
+        let header_end = source_text[header_start..]
+            .find('\n')
+            .map_or(source_text.len(), |index| header_start + index);
+        assert_foreign_predicate_paths(
+            header_paths,
+            &source_text[header_start..header_end],
+            header_start,
+        );
+        let impl_header_start = source_text
+            .find("impl middle.api.PublicType")
+            .expect("transitive impl header appears in the root source");
+        let impl_header_end = source_text[impl_header_start..]
+            .find('\n')
+            .map_or(source_text.len(), |index| impl_header_start + index);
+        let impl_header_paths = header_results.owners()[1]
+            .type_path_resolution()
+            .expect("impl header type path result succeeds");
+        assert_foreign_predicate_paths(
+            impl_header_paths,
+            &source_text[impl_header_start..impl_header_end],
+            impl_header_start,
+        );
+        let interface_impl_index = header_results
+            .owners()
+            .iter()
+            .position(|owner| {
+                owner.kind() == TopLevelOwnerKind::Impl && {
+                    let paths = owner
+                        .type_path_resolution()
+                        .expect("interface impl header result succeeds");
+                    paths.paths().values().any(|path| {
+                        matches!(path.base, Res::Def(DefKind::Interface, _))
+                            && path.resolved_segments == 2
+                            && path.segment_count == 2
+                    })
+                }
+            })
+            .expect("interface impl target resolves through transitive member scopes");
+        assert!(
+            header_results.owners()[interface_impl_index]
+                .type_path_resolution()
+                .expect("interface impl header result succeeds")
+                .module_path_errors()
+                .is_empty(),
+            "a transitive public interface target has no lookup errors"
+        );
 
         let extern_results = database
             .resolve_extern_function_predicates_with_member_scopes(
