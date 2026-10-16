@@ -5087,6 +5087,25 @@ fn module_tree_workspace_check_diagnostics(
             warnings = warnings.saturating_add(phase1_warnings);
             infos = infos.saturating_add(phase1_infos);
 
+            let package_analysis_diagnostics = collection
+                .package_wit_names()
+                .diagnostics
+                .iter()
+                .chain(collection.interface_uses().diagnostics.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            let (package_analysis_diagnostics, package_errors, package_warnings, package_infos) =
+                phase1_check_diagnostics(
+                    &package_analysis_diagnostics,
+                    &workspace_source_by_key,
+                    &input.package_identity,
+                    include_source_lines,
+                );
+            diagnostics.extend(package_analysis_diagnostics);
+            errors = errors.saturating_add(package_errors);
+            warnings = warnings.saturating_add(package_warnings);
+            infos = infos.saturating_add(package_infos);
+
             if let Some(graph) = package_graph_for_scopes.as_ref()
                 && graph.node(&package_key).is_some()
             {

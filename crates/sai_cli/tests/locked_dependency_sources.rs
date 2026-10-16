@@ -61,6 +61,10 @@ fn locked_check_reports_syntax_errors_from_active_path_dependencies() {
         "fn repeated() {}\nfn repeated() {}\n",
     )
     .expect("write dependency with duplicate declarations");
+    fs::write(dependency.join("src/a.sai"), "pub interface codec {}\n")
+        .expect("write earlier dependency interface");
+    fs::write(dependency.join("src/b.sai"), "pub interface codec {}\n")
+        .expect("write colliding dependency interface");
     fs::write(
         root.join("sai.lock"),
         concat!(
@@ -115,6 +119,22 @@ fn locked_check_reports_syntax_errors_from_active_path_dependencies() {
     assert!(
         phase1_diagnostic.contains("\"path\":\"dep:acme:dep@1.0.0/src/other.sai\""),
         "{phase1_diagnostic}"
+    );
+    let wit_collision = stdout
+        .lines()
+        .find(|line| line.contains("\"code\":\"WIT_NAME_COLLISION\""))
+        .expect("dependency WIT-name collision should appear in JSON output");
+    assert!(
+        wit_collision.contains("\"package\":\"acme:dep@1.0.0\""),
+        "{wit_collision}"
+    );
+    assert!(
+        wit_collision.contains("\"path\":\"dep:acme:dep@1.0.0/src/b.sai\""),
+        "{wit_collision}"
+    );
+    assert!(
+        wit_collision.contains("\"path\":\"dep:acme:dep@1.0.0/src/a.sai\""),
+        "{wit_collision}"
     );
 }
 
