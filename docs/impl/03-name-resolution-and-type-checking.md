@@ -1293,21 +1293,28 @@ have a test-only `use` binding to point back to. Until spec/14 defines this
 case, IR-540 leaves it outside the binding-based test-only pass. Ordinary
 world/WIT name resolution and package availability validation remain pending.
 
-**Top-level type-path resolution (IR-541).** `resolve_type_owner_paths`
-returns type-path results and the existing test-only diagnostics from one
-lowering pass over current-target top-level structs, aliases, enums, and
-resources. It resolves each plain type path's first segment by generic
-parameter, then exact-file module scope; generic type and const parameters
-retain their `DefKind` and `DefId`, and the first source declaration wins
-duplicate-name recovery. Ordinary bindings preserve their known
-`Res`, including known wrong-kind entities, while test-only imports are
-diagnosed by import origin regardless of `Res` and receive `Res::Err`.
-Qualified paths resolve one head and retain the full segment count so a later
-module-prefix or type-relative pass can continue. Misses, including
-Prelude-provided names, remain source-ordered deferred candidates; this slice
-does not emit unresolved-name diagnostics or resolve qualified tails.
-`resolve_type_owner_test_only_paths` remains a compatibility wrapper over the
-combined pass.
+**Top-level type-path resolution (IR-541, extended through IR-572).**
+`resolve_type_owner_paths` returns type-path results and the existing
+test-only diagnostics from one lowering pass over current-target top-level
+structs, aliases, enums, distinct types, and resources. Distinct declarations
+without a refinement clause use this pass; their base and generic-bound type
+paths share the same lowering and lookup behavior. Refinement-bearing distinct
+types remain in the predicate-owner adapter, which also resolves their type
+paths.
+Plain type-path heads resolve by generic parameter, then exact-file module
+scope; generic type and const parameters retain their `DefKind` and `DefId`,
+and the first source declaration wins duplicate-name recovery. Ordinary
+bindings preserve their known `Res`, including known wrong-kind entities,
+while test-only imports are diagnosed by import origin regardless of `Res`
+and receive `Res::Err`. With a validated active-source closure, the additive
+`resolve_type_owner_paths_with_member_scopes` entry point also walks available
+module/interface prefixes across the requester and transitive source packages
+and records closure provenance. Typed missing/private member failures remain
+available to the matching diagnostic mapper. Misses without a resolved
+member prefix, including Prelude-provided names, remain source-ordered
+deferred candidates; this adapter does not emit final unresolved-name
+diagnostics. `resolve_type_owner_test_only_paths` remains a compatibility
+wrapper over the combined pass.
 
 **Extern-function contracts (IR-516; implemented; hostile reviews complete).** The
 adapter reuses Phase 1's extern-function descriptors and their canonical
