@@ -289,6 +289,7 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
             "  missing: leaf_model.PublicTypo\n",
             "  hidden_missing: leaf_model.PrivatType\n",
             "}\n",
+            "const MIDDLE_CONST: leaf_model.PrivateType = { let nested: leaf_model.PublicTypo = 0; 0 }\n",
             "fn middle_signature(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) { let body_private: leaf_model.PrivateType = 0; let body_missing: leaf_model.PublicTypo = 0; }\n",
         ),
     )
@@ -357,7 +358,7 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         .lines()
         .filter(|line| line.contains("\"code\":\"PRIVATE_ITEM\""))
         .collect::<Vec<_>>();
-    assert_eq!(private_diagnostics.len(), 3, "{stdout}");
+    assert_eq!(private_diagnostics.len(), 4, "{stdout}");
     let middle_source = concat!(
         "use acme:leaf/model as leaf_model\n",
         "pub use acme:leaf.{api}\n",
@@ -366,6 +367,7 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         "  missing: leaf_model.PublicTypo\n",
         "  hidden_missing: leaf_model.PrivatType\n",
         "}\n",
+        "const MIDDLE_CONST: leaf_model.PrivateType = { let nested: leaf_model.PublicTypo = 0; 0 }\n",
         "fn middle_signature(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) { let body_private: leaf_model.PrivateType = 0; let body_missing: leaf_model.PublicTypo = 0; }\n",
     );
     let reference_start = middle_source
@@ -375,6 +377,22 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
     let declaration_start = leaf_model_source
         .find("PrivateType")
         .expect("private declaration exists");
+    let const_start = middle_source
+        .find("const MIDDLE_CONST")
+        .expect("const declaration exists");
+    let const_end = middle_source[const_start..]
+        .find('\n')
+        .expect("const declaration has a line ending")
+        + const_start;
+    let const_source = &middle_source[const_start..const_end];
+    let const_private_start = const_start
+        + const_source
+            .find("PrivateType")
+            .expect("const declared private type exists");
+    let const_missing_start = const_start
+        + const_source
+            .rfind("PublicTypo")
+            .expect("const initializer missing type exists");
     let private = private_diagnostics
         .iter()
         .find(|line| {
@@ -472,11 +490,34 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
             ),
         "{function_body_private}"
     );
+    assert_eq!(
+        private_diagnostics
+            .iter()
+            .filter(|line| line.contains(&format!("\"start\":{{\"byte\":{const_private_start},")))
+            .count(),
+        1,
+        "the const declared private type is reported exactly once: {stdout}"
+    );
+    let const_private = private_diagnostics
+        .iter()
+        .find(|line| {
+            line.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
+                && line.contains(&format!("\"start\":{{\"byte\":{const_private_start},"))
+        })
+        .expect("the const declared private type diagnostic is present");
+    assert!(
+        const_private.contains("\"package\":\"acme:middle@1.0.0\"")
+            && const_private.contains("\"what\":\"private member declared here\"")
+            && const_private.contains(
+                "\"path\":\"dep:acme:leaf@1.0.0/src/model.sai\",\"package\":\"acme:leaf@1.0.0\""
+            ),
+        "{const_private}"
+    );
     let unresolved_diagnostics = stdout
         .lines()
         .filter(|line| line.contains("\"code\":\"UNRESOLVED_NAME\""))
         .collect::<Vec<_>>();
-    assert_eq!(unresolved_diagnostics.len(), 5, "{stdout}");
+    assert_eq!(unresolved_diagnostics.len(), 6, "{stdout}");
     let missing_start = middle_source
         .find("PublicTypo")
         .expect("missing reference exists");
@@ -579,6 +620,27 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
                 .contains("no item `PublicTypo` in module `acme:leaf@1.0.0/model`")
             && function_body_missing.contains("\"candidates\":[\"PublicType\"]"),
         "{function_body_missing}"
+    );
+    assert_eq!(
+        unresolved_diagnostics
+            .iter()
+            .filter(|line| line.contains(&format!("\"start\":{{\"byte\":{const_missing_start},")))
+            .count(),
+        1,
+        "the const initializer missing type is reported exactly once: {stdout}"
+    );
+    let const_missing = unresolved_diagnostics
+        .iter()
+        .find(|line| {
+            line.contains("\"path\":\"dep:acme:middle@1.0.0/src/lib.sai\"")
+                && line.contains(&format!("\"start\":{{\"byte\":{const_missing_start},"))
+        })
+        .expect("the const initializer missing type diagnostic is present");
+    assert!(
+        const_missing.contains("\"package\":\"acme:middle@1.0.0\"")
+            && const_missing.contains("no item `PublicTypo` in module `acme:leaf@1.0.0/model`")
+            && const_missing.contains("\"candidates\":[\"PublicType\"]"),
+        "{const_missing}"
     );
     assert!(
         !stdout.contains("\"stage\":3,\"feature\":\"dependencies\""),

@@ -2475,6 +2475,7 @@ pub struct ConstOwnerResolution {
     local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
+    module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution:
         Result<Option<OwnerTestOnlyPathResolution>, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
@@ -2511,6 +2512,17 @@ impl ConstOwnerResolution {
         self.type_path_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
+    }
+
+    /// Returns snapshot-bound diagnostics for typed member failures when this
+    /// owner was resolved with a validated active-source closure. Package-local
+    /// calls leave diagnostic mapping to their caller.
+    pub fn module_path_diagnostics(
+        &self,
+    ) -> Result<Option<&[Diagnostic]>, &OwnerControlFlowResolutionError> {
+        self.module_path_diagnostics
+            .as_ref()
+            .map(|diagnostics| diagnostics.as_deref())
     }
 
     pub fn test_only_path_resolution(
@@ -6799,8 +6811,9 @@ impl RootDatabase {
     }
 
     /// Resolves const-owner type prefixes through a validated active-source
-    /// member-scope closure. Other owner results remain identical to the
-    /// package-local analysis bridge.
+    /// member-scope closure and maps typed member failures to snapshot-bound
+    /// diagnostics. Other owner results remain identical to the package-local
+    /// analysis bridge.
     pub fn resolve_const_owner_paths_with_member_scopes(
         &mut self,
         collection: &Phase1PackageScopesCollection,
@@ -6872,6 +6885,7 @@ impl RootDatabase {
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
+                                module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
                                 lowering_diagnostics: Vec::new(),
@@ -6889,6 +6903,7 @@ impl RootDatabase {
 
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
+                let mut module_path_diagnostics = None;
                 let analysis: Result<
                     (
                         Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
@@ -6989,6 +7004,23 @@ impl RootDatabase {
                             ),
                             (_, _, Err(error)) => Err(error),
                         };
+                    module_path_diagnostics = match (member_scopes, type_path_resolution.as_ref()) {
+                        (Some(member_scopes), Ok(Some(path_resolution))) => Some(
+                            self.type_owner_module_path_diagnostics(
+                                descriptor.owner,
+                                path_resolution,
+                                &inputs,
+                                Some(&module_members),
+                                snapshot,
+                                &collection.target_cfg,
+                                Some(member_scopes),
+                            )
+                            .map(Some),
+                        ),
+                        (Some(_), Err(error)) => Some(Err(error.clone())),
+                        (Some(_), Ok(None)) => Some(Ok(Some(Vec::new()))),
+                        (None, _) => None,
+                    };
                     let path_resolution = match &module_scope {
                         Ok(_) => Ok(Some(resolved_paths)),
                         Err(error) => Err(error.clone()),
@@ -7081,11 +7113,17 @@ impl RootDatabase {
                         Err(error),
                     )
                 });
+                let module_path_diagnostics =
+                    module_path_diagnostics.unwrap_or_else(|| match &type_path_resolution {
+                        Err(error) => Err(error.clone()),
+                        Ok(_) => Ok(None),
+                    });
                 owners.push(ConstOwnerResolution {
                     owner: descriptor.owner,
                     local_resolution,
                     module_resolution,
                     type_path_resolution,
+                    module_path_diagnostics,
                     test_only_path_resolution,
                     test_only_diagnostics,
                     lowering_diagnostics,
@@ -13034,6 +13072,13 @@ mod tests {
             .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
             .expect("const owners resolve type path heads");
         assert_eq!(resolved.owners().len(), 8);
+        assert!(
+            resolved.owners().iter().all(|owner| owner
+                .module_path_diagnostics()
+                .expect("package-local const calls keep their typed path channel")
+                .is_none()),
+            "package-local const calls do not construct snapshot-bound member diagnostics"
+        );
 
         let module_type = resolved.owners()[1]
             .type_path_resolution()
@@ -21025,6 +21070,7 @@ mod tests {
                       const QUALIFIED_FOREIGN: middle.api.PublicType = { let nested: middle.api.PublicType = 0; 0 }\n\
                       const PRIVATE_FOREIGN: leaf_model.PrivateType = 0\n\
                       const MISSING_FOREIGN: middle.api.PublicTypo = 0\n\
+                      const BODY_FOREIGN: middle.api.PublicType = { let body_private: leaf_model.PrivateType = 0; let body_missing: middle.api.PublicTypo = 0; 0 }\n\
                       ",
                 ),
                 (
@@ -21592,7 +21638,7 @@ mod tests {
                 Phase1ModuleMemberScopeError::PackageGraphMismatch(key)
             )) if key.as_str() == "acme:middle#1"
         ));
-        assert_eq!(const_results.owners().len(), 3);
+        assert_eq!(const_results.owners().len(), 4);
         let qualified_const = const_results.owners()[0]
             .type_path_resolution()
             .expect("qualified const path result succeeds")
@@ -21621,17 +21667,39 @@ mod tests {
             .iter()
             .find(|entry| matches!(entry.error(), ModulePathError::InaccessibleMember { .. }))
             .expect("foreign private const member is rejected");
-        assert!(matches!(
-            private_const_error.error(),
-            ModulePathError::InaccessibleMember { name, span, .. }
-                if database.resolve_symbol(name).is_ok_and(|name| name.as_ref() == "PrivateType")
-                    && span.range == member_range(
-                        source_text,
-                        0,
-                        "leaf_model.PrivateType",
-                        "PrivateType"
-                    )
-        ));
+        let private_const_start = source_text
+            .find("const PRIVATE_FOREIGN")
+            .expect("private const declaration exists");
+        let private_const_end = source_text[private_const_start..]
+            .find('\n')
+            .expect("private const declaration has a line ending")
+            + private_const_start;
+        let private_const_source = &source_text[private_const_start..private_const_end];
+        let ModulePathError::InaccessibleMember {
+            name,
+            span: private_const_span,
+            declaration_span: private_const_declaration_span,
+            ..
+        } = private_const_error.error()
+        else {
+            panic!("foreign private const member is inaccessible");
+        };
+        assert_eq!(
+            database
+                .resolve_symbol(name)
+                .expect("private name is interned")
+                .as_ref(),
+            "PrivateType"
+        );
+        assert_eq!(
+            private_const_span.range,
+            member_range(
+                private_const_source,
+                private_const_start,
+                "leaf_model.PrivateType",
+                "PrivateType"
+            )
+        );
         assert!(matches!(
             private_const.paths().get(&private_const_error.hir_id()),
             Some(PathRes {
@@ -21640,6 +21708,40 @@ mod tests {
                 segment_count: 2,
             })
         ));
+        let private_const_diagnostics = const_results.owners()[1]
+            .module_path_diagnostics()
+            .expect("private const member diagnostics resolve")
+            .expect("the closure-aware const adapter maps member failures");
+        assert_eq!(private_const_diagnostics.len(), 1);
+        let private_const_diagnostic = &private_const_diagnostics[0];
+        assert_eq!(
+            private_const_diagnostic.code,
+            sai_diagnostics::Code::PrivateItem
+        );
+        assert_eq!(
+            private_const_diagnostic
+                .primary()
+                .map(|location| &location.span),
+            Some(&sai_diagnostics::Span::new(
+                private_const_span.file,
+                private_const_span.range
+            ))
+        );
+        assert!(
+            private_const_diagnostic
+                .related()
+                .iter()
+                .any(|related| matches!(
+                    related,
+                    Related::DeclaredHere { location, .. }
+                        if location.span
+                            == sai_diagnostics::Span::new(
+                                private_const_declaration_span.file,
+                                private_const_declaration_span.range
+                            )
+                )),
+            "private const diagnostics retain the foreign declaration location"
+        );
 
         let missing_const = const_results.owners()[2]
             .type_path_resolution()
@@ -21650,17 +21752,38 @@ mod tests {
             .iter()
             .find(|entry| matches!(entry.error(), ModulePathError::MissingMember { .. }))
             .expect("missing transitive const member is retained");
-        assert!(matches!(
-            missing_const_error.error(),
-            ModulePathError::MissingMember { name, span, .. }
-                if database.resolve_symbol(name).is_ok_and(|name| name.as_ref() == "PublicTypo")
-                    && span.range == member_range(
-                        source_text,
-                        0,
-                        "middle.api.PublicTypo",
-                        "PublicTypo"
-                    )
-        ));
+        let missing_const_start = source_text
+            .find("const MISSING_FOREIGN")
+            .expect("missing const declaration exists");
+        let missing_const_end = source_text[missing_const_start..]
+            .find('\n')
+            .expect("missing const declaration has a line ending")
+            + missing_const_start;
+        let missing_const_source = &source_text[missing_const_start..missing_const_end];
+        let ModulePathError::MissingMember {
+            name,
+            span: missing_const_span,
+            ..
+        } = missing_const_error.error()
+        else {
+            panic!("missing transitive const member reports a missing-member error");
+        };
+        assert_eq!(
+            database
+                .resolve_symbol(name)
+                .expect("missing name is interned")
+                .as_ref(),
+            "PublicTypo"
+        );
+        assert_eq!(
+            missing_const_span.range,
+            member_range(
+                missing_const_source,
+                missing_const_start,
+                "middle.api.PublicTypo",
+                "PublicTypo"
+            )
+        );
         assert!(matches!(
             missing_const.paths().get(&missing_const_error.hir_id()),
             Some(PathRes {
@@ -21669,6 +21792,126 @@ mod tests {
                 segment_count: 3,
             })
         ));
+        let missing_const_diagnostics = const_results.owners()[2]
+            .module_path_diagnostics()
+            .expect("missing const member diagnostics resolve")
+            .expect("the closure-aware const adapter maps missing members");
+        assert_eq!(missing_const_diagnostics.len(), 1);
+        let missing_const_diagnostic = &missing_const_diagnostics[0];
+        assert_eq!(
+            missing_const_diagnostic.code,
+            sai_diagnostics::Code::UnresolvedName
+        );
+        assert_eq!(
+            missing_const_diagnostic
+                .primary()
+                .map(|location| &location.span),
+            Some(&sai_diagnostics::Span::new(
+                missing_const_span.file,
+                missing_const_span.range
+            ))
+        );
+        assert_eq!(
+            missing_const_diagnostic.data.get("candidates"),
+            Some(&sai_diagnostics::Value::Array(vec![
+                sai_diagnostics::Value::String("PublicType".to_owned())
+            ])),
+            "const suggestions use the visible transitive target members"
+        );
+        let body_const = const_results.owners()[3]
+            .type_path_resolution()
+            .expect("body const type paths resolve")
+            .expect("body const has type paths");
+        assert_eq!(body_const.module_path_errors().len(), 2);
+        let body_const_start = source_text
+            .find("const BODY_FOREIGN")
+            .expect("body const source is present");
+        let body_const_end = source_text[body_const_start..]
+            .find('\n')
+            .expect("body const source has a line ending")
+            + body_const_start;
+        let body_const_source = &source_text[body_const_start..body_const_end];
+        let body_const_private_span = member_range(
+            body_const_source,
+            body_const_start,
+            "leaf_model.PrivateType",
+            "PrivateType",
+        );
+        let body_const_missing_span = member_range(
+            body_const_source,
+            body_const_start,
+            "middle.api.PublicTypo",
+            "PublicTypo",
+        );
+        assert!(
+            body_const.module_path_errors().iter().any(|entry| matches!(
+                entry.error(),
+                ModulePathError::InaccessibleMember { span, .. }
+                    if span.range == body_const_private_span
+            )),
+            "const initializer annotations retain private member path errors"
+        );
+        assert!(
+            body_const.module_path_errors().iter().any(|entry| matches!(
+                entry.error(),
+                ModulePathError::MissingMember { span, .. }
+                    if span.range == body_const_missing_span
+            )),
+            "const initializer annotations retain missing member path errors"
+        );
+        let body_const_diagnostics = const_results.owners()[3]
+            .module_path_diagnostics()
+            .expect("body const member diagnostics resolve")
+            .expect("the closure-aware const adapter maps initializer errors");
+        assert_eq!(body_const_diagnostics.len(), 2);
+        let body_const_private_diagnostic = body_const_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::PrivateItem)
+            .expect("initializer private type becomes PRIVATE_ITEM");
+        assert_eq!(
+            body_const_private_diagnostic
+                .primary()
+                .map(|location| &location.span),
+            Some(&sai_diagnostics::Span::new(
+                private_const_span.file,
+                body_const_private_span
+            ))
+        );
+        assert!(
+            body_const_private_diagnostic
+                .related()
+                .iter()
+                .any(|related| matches!(
+                    related,
+                    Related::DeclaredHere { location, .. }
+                        if location.span
+                            == sai_diagnostics::Span::new(
+                                private_const_declaration_span.file,
+                                private_const_declaration_span.range
+                            )
+                )),
+            "initializer private diagnostics retain the foreign declaration location"
+        );
+        let body_const_missing_diagnostic = body_const_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::UnresolvedName)
+            .expect("initializer missing type becomes UNRESOLVED_NAME");
+        assert_eq!(
+            body_const_missing_diagnostic
+                .primary()
+                .map(|location| &location.span),
+            Some(&sai_diagnostics::Span::new(
+                missing_const_span.file,
+                body_const_missing_span
+            ))
+        );
+        assert_eq!(
+            body_const_missing_diagnostic.data.get("candidates"),
+            Some(&sai_diagnostics::Value::Array(vec![
+                sai_diagnostics::Value::String("PublicType".to_owned())
+            ])),
+            "initializer suggestions use the visible transitive target members"
+        );
 
         let assert_foreign_predicate_paths =
             |paths: &TypeOwnerPathResolution, source: &str, source_offset: usize| {

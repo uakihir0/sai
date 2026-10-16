@@ -4409,6 +4409,14 @@ fn module_tree_workspace_check_diagnostics(
                         &member_scopes,
                     )
                     .map_err(|error| format!("function owner analysis failed: {error:?}"))?;
+                let const_resolutions = database
+                    .resolve_const_owner_paths_with_member_scopes(
+                        collection,
+                        module_tree,
+                        &workspace_snapshot,
+                        &member_scopes,
+                    )
+                    .map_err(|error| format!("const owner analysis failed: {error:?}"))?;
                 let mut owner_diagnostics = Vec::new();
                 for owner in resolutions.owners() {
                     match owner.module_path_diagnostics() {
@@ -4435,6 +4443,24 @@ fn module_tree_workspace_check_diagnostics(
                             diagnostics.push(check_diagnostic_with_package(
                                 check_internal_diagnostic(
                                     &format!("function type path processing failed: {error:?}"),
+                                    None,
+                                ),
+                                Some(&input.package_identity),
+                            ));
+                            errors = errors.saturating_add(1);
+                        }
+                    }
+                }
+                for owner in const_resolutions.owners() {
+                    match owner.module_path_diagnostics() {
+                        Ok(Some(diagnostics_for_owner)) => {
+                            owner_diagnostics.extend(diagnostics_for_owner.iter().cloned())
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            diagnostics.push(check_diagnostic_with_package(
+                                check_internal_diagnostic(
+                                    &format!("const type path processing failed: {error:?}"),
                                     None,
                                 ),
                                 Some(&input.package_identity),
