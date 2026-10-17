@@ -13614,7 +13614,7 @@ impl RootDatabase {
     /// Returns the elaborated world with direct world-function name and
     /// boundary-type checks, plus collisions in its elaborated WIT namespace.
     ///
-    /// Export implementation checks are added by a later world-check stage.
+    /// Checks for missing implementations of directly exported interfaces.
     pub fn world_check(
         &mut self,
         world: DefId,
@@ -13634,6 +13634,13 @@ impl RootDatabase {
             wit_view_scopes,
         )?;
         let is_local = input.local_worlds.iter().any(|local| local.world == world);
+        let local_source_items = input
+            .local_worlds
+            .iter()
+            .find(|local| local.world == world)
+            .map(|local| local.items.clone())
+            .unwrap_or_default();
+        let package = input.package.clone();
         let mut elaborated = sai_resolve::elaborated_world(world, input)
             .map_err(OwnerControlFlowResolutionError::WorldElaboration)?;
         if !is_local {
@@ -13698,6 +13705,85 @@ impl RootDatabase {
             snapshot,
             &mut elaborated.diagnostics,
         )?;
+        let mut seen_direct_export_interfaces = HashSet::new();
+        let direct_export_interfaces = elaborated
+            .exports
+            .iter()
+            .filter_map(|item| {
+                let (
+                    sai_resolve::ElabKind::Interface(interface),
+                    sai_resolve::ElabOrigin::Written(owner),
+                ) = (item.kind, item.origin)
+                else {
+                    return None;
+                };
+                if !seen_direct_export_interfaces.insert(interface) {
+                    return None;
+                }
+                local_source_items.iter().find_map(|source| match source {
+                    sai_resolve::WorldElaborationSourceItem::ExportInterface {
+                        interface: source_interface,
+                        source_name,
+                        owner: source_owner,
+                        location,
+                        ..
+                    } if *source_interface == interface && *source_owner == owner => {
+                        let name = if item.key.is_empty() {
+                            source_name.clone().unwrap_or_else(|| item.key.clone())
+                        } else {
+                            item.key.clone()
+                        };
+                        Some((interface, name, owner, location.clone()))
+                    }
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !direct_export_interfaces.is_empty() {
+            let header_resolutions = self
+                .resolve_trait_impl_header_test_only_paths_with_member_scopes_and_wit_views(
+                    collection,
+                    module_tree,
+                    snapshot,
+                    member_scopes,
+                    wit_view_scopes,
+                )?;
+            let member_resolutions = self
+                .resolve_trait_impl_member_test_only_paths_with_member_scopes_and_wit_views(
+                    collection,
+                    module_tree,
+                    snapshot,
+                    member_scopes,
+                    wit_view_scopes,
+                )?;
+            let interface_impls = self.collect_interface_impls_with_header_resolutions(
+                collection,
+                module_tree,
+                snapshot,
+                member_scopes,
+                Some(wit_view_scopes),
+                &header_resolutions,
+                &member_resolutions,
+            )?;
+            for (interface, name, owner, location) in direct_export_interfaces {
+                if interface_impls.by_interface.contains_key(&interface) {
+                    continue;
+                }
+                let mut diagnostic = Diagnostic::new(
+                    sai_diagnostics::Code::WorldExportUnimplemented,
+                    sai_diagnostics::Severity::Error,
+                    format!("exported interface `{name}` has no implementation"),
+                    Some(location),
+                );
+                diagnostic.primary_label = "missing implementation".to_owned();
+                diagnostic.package = Some(package.clone());
+                elaborated
+                    .diagnostics
+                    .push(diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
+                        OwnerControlFlowResolutionError::InvalidSourceLocation(owner.owner)
+                    })?);
+            }
+        }
         Ok(elaborated)
     }
 
@@ -30331,9 +30417,33 @@ mod tests {
             "}\n",
             "type Pointer = USize\n",
             "interface foo_bar {}\n",
+            "interface missing_api {}\n",
+            "interface userID {}\n",
+            "interface implemented_api {}\n",
+            "impl implemented_api {}\n",
             "world namespace_checks {\n",
             "  import foo_bar\n",
             "  import fn foo_bar()\n",
+            "}\n",
+            "world missing_impl_checks {\n",
+            "  export missing_api\n",
+            "  export missing_api\n",
+            "}\n",
+            "world partial_missing_impl_checks {\n",
+            "  export missing_api\n",
+            "  export missing_api\n",
+            "  include missing_world\n",
+            "}\n",
+            "world invalid_name_missing_impl_checks { export userID }\n",
+            "world implemented_impl_checks { export implemented_api }\n",
+            "world include_export_source { export missing_api }\n",
+            "world direct_export_before_include {\n",
+            "  export missing_api\n",
+            "  include include_export_source\n",
+            "}\n",
+            "world include_export_before_direct {\n",
+            "  include include_export_source\n",
+            "  export missing_api\n",
             "}\n",
             "world boundary_checks {\n",
             "  import fn bad_param(size: USize)\n",
@@ -31025,6 +31135,305 @@ world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
             }),
             Some("foo_bar"),
             "world duplicate points to both source declarations"
+        );
+        let missing_impl_world = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::World
+                    && database
+                        .resolve_def_path(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| {
+                            path.data()
+                                .last()
+                                .and_then(|component| match &component.data {
+                                    DefPathData::World(symbol) => database
+                                        .resolve_symbol(*symbol)
+                                        .ok()
+                                        .map(|name| name.as_ref() == "missing_impl_checks"),
+                                    _ => None,
+                                })
+                        })
+                        .unwrap_or(false)
+            })
+            .expect("the package has a world exporting an unimplemented interface")
+            .owner
+            .def_id
+            .to_def_id();
+        let missing_impls = database
+            .world_check(
+                missing_impl_world,
+                &collection,
+                &module_tree,
+                &snapshot,
+                &resolutions,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("world check collects interface implementations");
+        let missing_impl = missing_impls
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented)
+            .expect("the exported interface without an impl is diagnosed");
+        assert_eq!(
+            missing_impls
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+                })
+                .count(),
+            1,
+            "a duplicate export dropped by elaboration does not duplicate the missing-impl finding"
+        );
+        assert_eq!(
+            missing_impls
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WorldDuplicateItem)
+                .count(),
+            1,
+            "the duplicate export retains its elaboration diagnostic"
+        );
+        assert_eq!(
+            missing_impl.message,
+            "exported interface `missing-api` has no implementation"
+        );
+        assert!(
+            missing_impl.has_workspace_snapshot(),
+            "the missing implementation diagnostic is bound to the current snapshot"
+        );
+        let missing_impl_primary = missing_impl
+            .primary()
+            .expect("the missing implementation diagnostic has a source location");
+        assert_eq!(
+            &root[missing_impl_primary.span.range.start().to_usize()
+                ..missing_impl_primary.span.range.end().to_usize()],
+            "missing_api",
+            "the missing implementation diagnostic points at the exported interface"
+        );
+
+        let partial_missing_impl_world = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::World
+                    && database
+                        .resolve_def_path(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| {
+                            path.data()
+                                .last()
+                                .and_then(|component| match &component.data {
+                                    DefPathData::World(symbol) => database
+                                        .resolve_symbol(*symbol)
+                                        .ok()
+                                        .map(|name| name.as_ref() == "partial_missing_impl_checks"),
+                                    _ => None,
+                                })
+                        })
+                        .unwrap_or(false)
+            })
+            .expect("the package has a partially resolved world with a direct export")
+            .owner
+            .def_id
+            .to_def_id();
+        let partial_missing_impls = database
+            .world_check(
+                partial_missing_impl_world,
+                &collection,
+                &module_tree,
+                &snapshot,
+                &resolutions,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("world checking retains findings for resolved direct exports");
+        assert!(!partial_missing_impls.complete);
+        assert_eq!(
+            partial_missing_impls
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+                })
+                .count(),
+            1,
+            "an unrelated unresolved include does not suppress a resolved export's missing impl"
+        );
+
+        let invalid_name_world = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::World
+                    && database
+                        .resolve_def_path(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| {
+                            path.data()
+                                .last()
+                                .and_then(|component| match &component.data {
+                                    DefPathData::World(symbol) => {
+                                        database.resolve_symbol(*symbol).ok().map(|name| {
+                                            name.as_ref() == "invalid_name_missing_impl_checks"
+                                        })
+                                    }
+                                    _ => None,
+                                })
+                        })
+                        .unwrap_or(false)
+            })
+            .expect("the package has a world exporting an interface with an invalid WIT name")
+            .owner
+            .def_id
+            .to_def_id();
+        let invalid_name_missing_impls = database
+            .world_check(
+                invalid_name_world,
+                &collection,
+                &module_tree,
+                &snapshot,
+                &resolutions,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("world checking retains the source name for invalid WIT interface names");
+        let invalid_name_missing_impl = invalid_name_missing_impls
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented)
+            .expect("the invalidly named exported interface without an impl is diagnosed");
+        assert_eq!(
+            invalid_name_missing_impl.message, "exported interface `userID` has no implementation",
+            "an unrepresentable WIT name falls back to its local source spelling"
+        );
+
+        let check_world_by_name = |database: &mut RootDatabase, expected_name: &str| {
+            let world = collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::World
+                        && database
+                            .resolve_def_path(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .and_then(|path| {
+                                path.data()
+                                    .last()
+                                    .and_then(|component| match &component.data {
+                                        DefPathData::World(symbol) => database
+                                            .resolve_symbol(*symbol)
+                                            .ok()
+                                            .map(|name| name.as_ref() == expected_name),
+                                        _ => None,
+                                    })
+                            })
+                            .unwrap_or(false)
+                })
+                .expect("the package contains the requested world")
+                .owner
+                .def_id
+                .to_def_id();
+            database
+                .world_check(
+                    world,
+                    &collection,
+                    &module_tree,
+                    &snapshot,
+                    &resolutions,
+                    &member_scopes,
+                    &wit_view_scopes,
+                )
+                .expect("world check resolves the requested local world")
+        };
+        let direct_before_include =
+            check_world_by_name(&mut database, "direct_export_before_include");
+        assert_eq!(
+            direct_before_include
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+                })
+                .count(),
+            1,
+            "a direct export before the matching include is checked once"
+        );
+        let include_before_direct =
+            check_world_by_name(&mut database, "include_export_before_direct");
+        assert!(
+            !include_before_direct.diagnostics.iter().any(
+                |diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+            ),
+            "an include-retained export is checked through its local source world, not again here"
+        );
+        let include_export_source = check_world_by_name(&mut database, "include_export_source");
+        assert_eq!(
+            include_export_source
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+                })
+                .count(),
+            1,
+            "the included local world checks its own directly written export"
+        );
+
+        let implemented_world = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::World
+                    && database
+                        .resolve_def_path(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| {
+                            path.data()
+                                .last()
+                                .and_then(|component| match &component.data {
+                                    DefPathData::World(symbol) => database
+                                        .resolve_symbol(*symbol)
+                                        .ok()
+                                        .map(|name| name.as_ref() == "implemented_impl_checks"),
+                                    _ => None,
+                                })
+                        })
+                        .unwrap_or(false)
+            })
+            .expect("the package has a world exporting an implemented interface")
+            .owner
+            .def_id
+            .to_def_id();
+        let implemented = database
+            .world_check(
+                implemented_world,
+                &collection,
+                &module_tree,
+                &snapshot,
+                &resolutions,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("world check recognizes the package's interface impl");
+        assert!(
+            !implemented.diagnostics.iter().any(
+                |diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+            ),
+            "an implemented interface satisfies its direct world export"
         );
         let server_include = owner
             .references()
