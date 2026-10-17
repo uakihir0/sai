@@ -121,11 +121,11 @@ use sai_vfs::{
 };
 use sai_wit::{
     EMBEDDED_WASI_CATALOG, EMBEDDED_WASI_VERSION, GeneratedText, LoadedWasiPackage,
-    LoadedWitPackage, Unsupported, WitContract, WitContractError, WitContractField, WitPackageEdge,
-    WitPackageGraph, WitPackageGraphError, WitPackageLoadError, WitPackageLoadFailure,
-    WitPackageNode, WitSourceFile, WitUnit, WitUnitIdentityError, WitUnitKind, WitView,
-    WitViewDefKind, WitViewEntity, WitViewError, WitWasiLoadError, embedded_wasi_package,
-    load_embedded_wasi_package, load_wit_package_closure,
+    LoadedWitPackage, Unsupported, WitContract, WitContractError, WitContractField,
+    WitPackageDeclaration, WitPackageEdge, WitPackageGraph, WitPackageGraphError,
+    WitPackageLoadError, WitPackageLoadFailure, WitPackageNode, WitSourceFile, WitUnit,
+    WitUnitIdentityError, WitUnitKind, WitView, WitViewDefKind, WitViewEntity, WitViewError,
+    WitWasiLoadError, embedded_wasi_package, load_embedded_wasi_package, load_wit_package_closure,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2281,6 +2281,7 @@ pub struct Phase1PackageScopesCollection {
     target_cfg: TargetCfg,
     build_context: Phase1BuildContext,
     module_tree: ModuleTree,
+    declared_requirements: Option<Arc<[DeclaredRequirement]>>,
     package_graph_fingerprint: Option<Fingerprint>,
     wit_view_closure_fingerprint: Option<Fingerprint>,
     foreign_scope_provenance: Vec<Phase1ForeignPackageIdentity>,
@@ -3007,6 +3008,9 @@ pub enum WorldReferencePathResult {
     DeferredMod(PathRes),
     /// A package reference retained for later package/WIT lookup.
     Pkg(String),
+    /// A package path resolved (or diagnosed) through validated package
+    /// scopes.
+    ResolvedPkg(PathRes),
 }
 
 /// Path result and diagnostics for one import, export, or include reference.
@@ -3962,6 +3966,7 @@ pub enum OwnerControlFlowResolutionError {
     SessionMismatch,
     SnapshotMismatch,
     ModuleTreeMismatch,
+    WorldReferenceCollectionMismatch,
     ModuleMemberScopes(Phase1ModuleMemberScopeError),
     TestAnalysisDisabled,
     MissingSnapshotFile(FileId),
@@ -4623,6 +4628,423 @@ fn world_reference_found_kind(resolution: Res) -> Option<&'static str> {
         Res::Local(_) => "local value",
         Res::Err | Res::TestOnly(_) => return None,
     })
+}
+
+fn canonical_source_interface_path(
+    path: &DefPath,
+    symbols: &Interner,
+) -> Result<Option<String>, OwnerControlFlowResolutionError> {
+    if !matches!(
+        path.data().last().map(|component| &component.data),
+        Some(DefPathData::Interface(_))
+    ) {
+        return Ok(None);
+    }
+    let mut output = String::new();
+    for component in path.data() {
+        let (tag, symbol) = match &component.data {
+            DefPathData::Module(name) => ("module", *name),
+            DefPathData::Interface(name) => ("interface", *name),
+            _ => return Ok(None),
+        };
+        let spelling = symbols
+            .resolve(symbol)
+            .map_err(OwnerControlFlowResolutionError::SymbolLookup)?;
+        output.push_str(tag);
+        output.push('[');
+        output.push_str(&spelling.len().to_string());
+        output.push(':');
+        output.push_str(&spelling);
+        output.push(';');
+        output.push_str(&component.disambiguator.to_string());
+        output.push_str("]/");
+    }
+    Ok(Some(output))
+}
+
+fn canonical_wit_path_name(name: &str) -> String {
+    name.split('-')
+        .map(|word| {
+            if word.bytes().any(|byte| byte.is_ascii_alphabetic())
+                && word
+                    .bytes()
+                    .filter(u8::is_ascii_alphabetic)
+                    .all(|byte| byte.is_ascii_uppercase())
+            {
+                word.to_ascii_lowercase()
+            } else {
+                word.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn world_package_path_diagnostic(
+    owner: OwnerId,
+    span: sai_hir::Span,
+    code: sai_diagnostics::Code,
+    message: String,
+    primary_label: &str,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    let location = sai_diagnostics::Location::from_decoded_source(
+        inputs.source_ref.clone(),
+        sai_diagnostics::Span::new(span.file, span.range),
+        &inputs.source,
+    )
+    .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        owner,
+    ))?;
+    let mut diagnostic = Diagnostic::new(
+        code,
+        sai_diagnostics::Severity::Error,
+        message,
+        Some(location),
+    );
+    diagnostic.primary_label = primary_label.to_owned();
+    diagnostic.package = inputs.source_ref.package.clone();
+    diagnostic
+        .with_workspace_snapshot(snapshot)
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))
+}
+
+fn world_dependency_path_diagnostic(
+    owner: OwnerId,
+    span: sai_hir::Span,
+    code: sai_diagnostics::Code,
+    identity: &str,
+    allowed_targets: Option<&[String]>,
+    target: &str,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    let (message, label) = match code {
+        sai_diagnostics::Code::InactiveDependency => (
+            format!("dependency `{identity}` is inactive for target `{target}`"),
+            "inactive dependency",
+        ),
+        sai_diagnostics::Code::TestDependencyUnavailable => (
+            format!(
+                "test dependency `{identity}` is unavailable because this package is not the root"
+            ),
+            "test dependency use",
+        ),
+        sai_diagnostics::Code::TestDependencyOutsideTest => (
+            format!("test dependency `{identity}` cannot be referenced from a world declaration"),
+            "test dependency reference outside a test or property",
+        ),
+        _ => unreachable!("only dependency-selection diagnostics are constructed here"),
+    };
+    let mut diagnostic =
+        world_package_path_diagnostic(owner, span, code, message, label, inputs, snapshot)?;
+    diagnostic.data.insert(
+        "dependency".to_owned(),
+        sai_diagnostics::Value::String(identity.to_owned()),
+    );
+    if code == sai_diagnostics::Code::InactiveDependency {
+        diagnostic.data.insert(
+            "target".to_owned(),
+            sai_diagnostics::Value::String(target.to_owned()),
+        );
+        let allowed_targets = allowed_targets.unwrap_or_default();
+        diagnostic.data.insert(
+            "only".to_owned(),
+            sai_diagnostics::Value::Array(
+                allowed_targets
+                    .iter()
+                    .cloned()
+                    .map(sai_diagnostics::Value::String)
+                    .collect(),
+            ),
+        );
+        let rendered_targets = allowed_targets
+            .iter()
+            .map(|target| format!("`{target}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Help,
+                message: format!("this dependency is available only for {rendered_targets}"),
+                location: None,
+            })
+            .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    } else if code == sai_diagnostics::Code::TestDependencyUnavailable {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Help,
+                message:
+                    "test dependencies are available only for the root package; run `sai test` in this package's directory"
+                        .to_owned(),
+                location: None,
+            })
+            .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    }
+    Ok(diagnostic)
+}
+
+fn unknown_world_module_diagnostic(
+    owner: OwnerId,
+    original_path: &str,
+    span: sai_hir::Span,
+    matched_prefix: Vec<String>,
+    module_candidates: Vec<String>,
+    segments: &[Symbol],
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    let mut diagnostic = world_package_path_diagnostic(
+        owner,
+        span,
+        sai_diagnostics::Code::UnknownModule,
+        format!("no module or interface has the path `{original_path}`"),
+        "unknown module path",
+        inputs,
+        snapshot,
+    )?;
+    diagnostic.data.insert(
+        "matched_prefix".to_owned(),
+        sai_diagnostics::Value::Array(
+            matched_prefix
+                .iter()
+                .cloned()
+                .map(sai_diagnostics::Value::String)
+                .collect(),
+        ),
+    );
+    diagnostic.data.insert(
+        "module_candidates".to_owned(),
+        sai_diagnostics::Value::Array(
+            module_candidates
+                .iter()
+                .cloned()
+                .map(sai_diagnostics::Value::String)
+                .collect(),
+        ),
+    );
+    let prefix = if matched_prefix.is_empty() {
+        "the package root".to_owned()
+    } else {
+        format!("`{}`", matched_prefix.join("/"))
+    };
+    let child_message = if module_candidates.is_empty() {
+        format!("no modules directly under {prefix}")
+    } else {
+        format!(
+            "modules directly under {prefix}: {}",
+            module_candidates
+                .iter()
+                .map(|candidate| format!("`{candidate}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    diagnostic
+        .push_child(Child {
+            kind: ChildKind::Note,
+            message: child_message,
+            location: None,
+        })
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+
+    let spellings = segments
+        .iter()
+        .map(|segment| {
+            symbols
+                .resolve(*segment)
+                .map(|spelling| spelling.to_string())
+                .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if spellings.iter().any(|segment| segment == "lib") {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Help,
+                message: "the root module is named by the package identity alone".to_owned(),
+                location: None,
+            })
+            .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    }
+    if spellings.iter().any(|segment| segment.contains('-')) {
+        let package_identity = original_path
+            .split_once('/')
+            .map_or(original_path, |(package, _)| package);
+        let suggested_segments = spellings
+            .iter()
+            .map(|segment| segment.replace('-', "_"))
+            .collect::<Vec<_>>();
+        let suggested_path = if suggested_segments.is_empty() {
+            package_identity.to_owned()
+        } else {
+            format!("{package_identity}/{}", suggested_segments.join("/"))
+        };
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Help,
+                message: format!(
+                    "try `{suggested_path}`; hyphens do not normalize in SAI module paths"
+                ),
+                location: None,
+            })
+            .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    }
+    Ok(diagnostic)
+}
+
+fn unknown_world_package_diagnostic(
+    owner: OwnerId,
+    span: sai_hir::Span,
+    identity: &str,
+    requirements: &[DeclaredRequirement],
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    let candidate_names = suggest_world_packages(identity, requirements);
+    let mut diagnostic = world_package_path_diagnostic(
+        owner,
+        span,
+        sai_diagnostics::Code::UnknownPackage,
+        format!("unknown package `{identity}`"),
+        "unknown package",
+        inputs,
+        snapshot,
+    )?;
+    diagnostic.data.insert(
+        "name".to_owned(),
+        sai_diagnostics::Value::String(identity.to_owned()),
+    );
+    diagnostic.data.insert(
+        "candidates".to_owned(),
+        sai_diagnostics::Value::Array(
+            candidate_names
+                .iter()
+                .cloned()
+                .map(sai_diagnostics::Value::String)
+                .collect(),
+        ),
+    );
+    if !candidate_names.is_empty() {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Help,
+                message: format!(
+                    "similar packages: {}",
+                    candidate_names
+                        .iter()
+                        .map(|candidate| format!("`{candidate}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                location: None,
+            })
+            .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    }
+    Ok(diagnostic)
+}
+
+fn suggest_world_packages(identity: &str, requirements: &[DeclaredRequirement]) -> Vec<String> {
+    let mut candidates = requirements
+        .iter()
+        .filter_map(|requirement| {
+            edit_distance_at_most_two(identity, &requirement.identity).map(|distance| {
+                (
+                    distance,
+                    requirement.declaration_order,
+                    requirement.identity.as_str(),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.as_bytes().cmp(right.2.as_bytes()))
+    });
+    candidates
+        .into_iter()
+        .take(10)
+        .map(|(_, _, identity)| identity.to_owned())
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GeneratedSourceInterfaceView {
+    Unavailable,
+    Omitted,
+    Resolved(DefId),
+}
+
+fn suggest_wit_items(requested_name: &str, candidates: &[(usize, String)]) -> Vec<String> {
+    let include_all = candidates.len() <= 5;
+    let threshold = (requested_name.chars().count() / 3).max(1);
+    let mut ranked = candidates
+        .iter()
+        .filter_map(|(declaration_order, name)| {
+            let distance = unicode_damerau_levenshtein(requested_name, name);
+            (include_all || distance <= threshold).then_some((distance, *declaration_order, name))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(distance, declaration_order, _)| (*distance, *declaration_order));
+    ranked
+        .into_iter()
+        .take(10)
+        .map(|(_, _, name)| name.clone())
+        .collect()
+}
+
+/// Unrestricted Damerau–Levenshtein distance over Unicode scalar values.
+fn unicode_damerau_levenshtein(left: &str, right: &str) -> usize {
+    let left = left.chars().collect::<Vec<_>>();
+    let right = right.chars().collect::<Vec<_>>();
+    let left_len = left.len();
+    let right_len = right.len();
+    let max_distance = left_len + right_len;
+    let mut distances = vec![vec![0_usize; right_len + 2]; left_len + 2];
+    distances[0][0] = max_distance;
+    for index in 0..=left_len {
+        distances[index + 1][0] = max_distance;
+        distances[index + 1][1] = index;
+    }
+    for index in 0..=right_len {
+        distances[0][index + 1] = max_distance;
+        distances[1][index + 1] = index;
+    }
+
+    let mut last_seen_row = HashMap::new();
+    for left_index in 1..=left_len {
+        let mut last_matching_column = 0;
+        for right_index in 1..=right_len {
+            let previous_left = last_seen_row
+                .get(&right[right_index - 1])
+                .copied()
+                .unwrap_or(0);
+            let previous_right = last_matching_column;
+            let substitution_cost = if left[left_index - 1] == right[right_index - 1] {
+                last_matching_column = right_index;
+                0
+            } else {
+                1
+            };
+            distances[left_index + 1][right_index + 1] = [
+                distances[left_index][right_index] + substitution_cost,
+                distances[left_index + 1][right_index] + 1,
+                distances[left_index][right_index + 1] + 1,
+                distances[previous_left][previous_right]
+                    + (left_index - previous_left - 1)
+                    + 1
+                    + (right_index - previous_right - 1),
+            ]
+            .into_iter()
+            .min()
+            .expect("edit operations always include candidates");
+        }
+        last_seen_row.insert(left[left_index - 1], left_index);
+    }
+    distances[left_len + 1][right_len + 1]
 }
 
 fn module_scope_for_scopes<'a>(
@@ -9255,6 +9677,7 @@ impl RootDatabase {
             target_cfg: target_cfg.clone(),
             build_context,
             module_tree: module_tree.clone(),
+            declared_requirements: prepared.declared_requirements.clone(),
             package_graph_fingerprint,
             wit_view_closure_fingerprint: foreign_wit_view_closure_fingerprint,
             foreign_scope_provenance,
@@ -12757,7 +13180,14 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<WorldTestOnlyResolutions, OwnerControlFlowResolutionError> {
-        self.resolve_world_test_only_paths_inner(collection, module_tree, snapshot, None, None)
+        self.resolve_world_test_only_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Resolves direct world references from current-package world owners
@@ -12780,6 +13210,7 @@ impl RootDatabase {
             snapshot,
             None,
             Some(&mut owners),
+            None,
         )?;
         Ok(WorldReferenceResolutions {
             snapshot_id: test_only.snapshot_id,
@@ -12788,6 +13219,193 @@ impl RootDatabase {
             session_token: collection.session_token.clone(),
             owners,
         })
+    }
+
+    /// Resolves package-qualified world references through validated active
+    /// source and WIT-view closures. The local-only API intentionally keeps
+    /// package paths deferred when this evidence is not supplied.
+    pub fn resolve_world_references_with_scopes(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<WorldReferenceResolutions, OwnerControlFlowResolutionError> {
+        if collection.session_token != self.session_token {
+            return Err(OwnerControlFlowResolutionError::SessionMismatch);
+        }
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        if !wit_view_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::WitViewScopeMismatch(collection.package_key.clone()),
+            ));
+        }
+        let mut owners = Vec::new();
+        let test_only = self.resolve_world_test_only_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+            Some(&mut owners),
+            Some((member_scopes, wit_view_scopes)),
+        )?;
+        Ok(WorldReferenceResolutions {
+            snapshot_id: test_only.snapshot_id,
+            target_cfg: test_only.target_cfg,
+            collection_input_fingerprint: test_only.collection_input_fingerprint,
+            session_token: collection.session_token.clone(),
+            owners,
+        })
+    }
+
+    /// Builds the package-local include graph from matching world-reference
+    /// results. Only complete references to local worlds become graph edges;
+    /// foreign, deferred, failed, and wrong-kind paths remain outside it.
+    pub fn resolve_world_includes(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        references: &WorldReferenceResolutions,
+    ) -> Result<sai_resolve::WorldIncludes, OwnerControlFlowResolutionError> {
+        if collection.session_token != self.session_token {
+            return Err(OwnerControlFlowResolutionError::SessionMismatch);
+        }
+        if collection.snapshot_id != snapshot.id() || !references.matches_snapshot(snapshot) {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+        if !references.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+        }
+
+        let descriptors = interface_generation_order(
+            module_tree,
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
+                .collect(),
+            &self.symbols,
+        )?;
+        let mut owner_resolutions = HashMap::with_capacity(references.owners.len());
+        for owner in &references.owners {
+            if owner_resolutions.insert(owner.owner, owner).is_some() {
+                return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+            }
+        }
+        if owner_resolutions.len() != descriptors.len()
+            || descriptors
+                .iter()
+                .any(|descriptor| !owner_resolutions.contains_key(&descriptor.owner))
+        {
+            return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+        }
+
+        let mut worlds = Vec::with_capacity(descriptors.len());
+        let mut includes = Vec::new();
+        let mut include_owners = Vec::new();
+        for descriptor in &descriptors {
+            let world = owner_resolutions
+                .get(&descriptor.owner)
+                .copied()
+                .ok_or(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch)?;
+            if let Some(error) = &world.error {
+                return Err(error.clone());
+            }
+            if let Some((_, error)) = world.item_errors.first() {
+                return Err(error.clone());
+            }
+            let inputs =
+                self.current_owner_inputs(snapshot, descriptor.file, &collection.target_cfg)?;
+            let world_def = descriptor.owner.def_id.to_def_id();
+            worlds.push(world_def);
+            for reference in &world.references {
+                if reference.world_owner != descriptor.owner {
+                    return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+                }
+                if reference.position != WorldReferencePosition::Include {
+                    continue;
+                }
+                let path = match &reference.path_result {
+                    WorldReferencePathResult::Mod(path)
+                    | WorldReferencePathResult::ResolvedPkg(path)
+                        if path.resolved_segments == path.segment_count =>
+                    {
+                        path
+                    }
+                    WorldReferencePathResult::Mod(_)
+                    | WorldReferencePathResult::DeferredMod(_)
+                    | WorldReferencePathResult::Pkg(_)
+                    | WorldReferencePathResult::ResolvedPkg(_) => continue,
+                };
+                let Res::Def(DefKind::World, target) = path.base else {
+                    continue;
+                };
+                if reference.span.file != descriptor.file {
+                    return Err(OwnerControlFlowResolutionError::InvalidSourceLocation(
+                        reference.owner,
+                    ));
+                }
+                let location = sai_diagnostics::Location::from_decoded_source(
+                    inputs.source_ref.clone(),
+                    sai_diagnostics::Span::new(reference.span.file, reference.span.range),
+                    &inputs.source,
+                )
+                .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+                    reference.owner,
+                ))?;
+                includes.push(sai_resolve::WorldIncludeReference {
+                    from: world_def,
+                    to: target,
+                    owner: reference.owner,
+                    location,
+                });
+                include_owners.push(reference.owner);
+            }
+        }
+
+        let package = collection
+            .package_key
+            .as_str()
+            .split_once('#')
+            .map_or(collection.package_key.as_str(), |(identity, _)| identity)
+            .to_owned();
+        let mut result = sai_resolve::world_includes(sai_resolve::WorldIncludesInput {
+            package,
+            worlds,
+            includes,
+        });
+        let mut diagnostics = Vec::with_capacity(result.diagnostics.len());
+        for diagnostic in std::mem::take(&mut result.diagnostics) {
+            let owner = diagnostic
+                .primary()
+                .and_then(|primary| {
+                    result
+                        .includes
+                        .iter()
+                        .find(|include| &include.location == primary)
+                })
+                .map(|include| include.owner)
+                .or_else(|| include_owners.first().copied())
+                .ok_or(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch)?;
+            diagnostics.push(
+                diagnostic
+                    .with_workspace_snapshot(snapshot)
+                    .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?,
+            );
+        }
+        result.diagnostics = diagnostics;
+        Ok(result)
     }
 
     /// Resolves world function signature type paths through a validated
@@ -12810,6 +13428,7 @@ impl RootDatabase {
             snapshot,
             Some(member_scopes),
             None,
+            None,
         )
     }
 
@@ -12822,17 +13441,47 @@ impl RootDatabase {
         module_scope: &Phase1ModuleScopes,
         module_members: &ModuleMemberIndex<'_>,
         requesting_package: PackageId,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        package_scopes: Option<(&Phase1ActiveSourceMemberScopes, &Phase1ActiveWitViewScopes)>,
         inputs: &CurrentOwnerInputs,
         snapshot: &WorkspaceSnapshot,
         target_cfg: &TargetCfg,
     ) -> Result<WorldReferencePathResolution, OwnerControlFlowResolutionError> {
         let (hir_id, span, path_result, diagnostics) = match reference {
-            WorldRef::Pkg { hir_id, path, span } => (
-                hir_id,
-                span,
-                WorldReferencePathResult::Pkg(path.to_owned()),
-                Vec::new(),
-            ),
+            WorldRef::Pkg { hir_id, path, span } => {
+                let (path_result, mut diagnostics) = match package_scopes {
+                    Some((member_scopes, wit_view_scopes)) => self.resolve_world_package_path(
+                        owner,
+                        position,
+                        path,
+                        span,
+                        collection,
+                        module_tree,
+                        member_scopes,
+                        wit_view_scopes,
+                        inputs,
+                        snapshot,
+                    )?,
+                    None => (WorldReferencePathResult::Pkg(path.to_owned()), Vec::new()),
+                };
+                if let WorldReferencePathResult::ResolvedPkg(path_resolution) = &path_result
+                    && path_resolution.base != Res::Err
+                    && !matches!(path_resolution.base, Res::TestOnly(_))
+                    && let Some(diagnostic) = world_reference_kind_diagnostic(
+                        owner,
+                        position,
+                        span,
+                        *path_resolution,
+                        inputs,
+                        snapshot,
+                    )?
+                {
+                    diagnostics.push(diagnostic);
+                }
+                sort_phase1_diagnostics(&mut diagnostics);
+                (hir_id, span, path_result, diagnostics)
+            }
             WorldRef::Mod(path) => {
                 let segment_count = u32::try_from(path.segments.len())
                     .expect("a HIR path fits its stored segment count");
@@ -13080,6 +13729,577 @@ impl RootDatabase {
         })
     }
 
+    fn resolve_world_package_path(
+        &mut self,
+        owner: OwnerId,
+        position: WorldReferencePosition,
+        path: &str,
+        span: sai_hir::Span,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+        inputs: &CurrentOwnerInputs,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<(WorldReferencePathResult, Vec<Diagnostic>), OwnerControlFlowResolutionError> {
+        let entry = sai_hir::item_tree::UseEntry {
+            ast_id: ast::ErasedAstId::new(0),
+            is_pub: false,
+            pkg_path: path.to_owned(),
+            alias: None,
+            has_items: false,
+            items: Vec::new(),
+            raw_attrs: Vec::new(),
+        };
+        let Ok(parsed) = sai_resolve::use_path::parse_use_path(&entry, &self.symbols) else {
+            // HIR does not retain the token's recovery bit. A malformed
+            // recovered package path therefore stays unresolved here.
+            return Ok((WorldReferencePathResult::Pkg(path.to_owned()), Vec::new()));
+        };
+        let segment_count = u32::try_from(parsed.segments.len())
+            .expect("a package path fits its stored segment count");
+        let unresolved = || {
+            WorldReferencePathResult::ResolvedPkg(PathRes {
+                base: Res::Err,
+                resolved_segments: segment_count,
+                segment_count,
+            })
+        };
+
+        let current_identity = collection
+            .package_key
+            .as_str()
+            .split_once('#')
+            .map_or(collection.package_key.as_str(), |(identity, _)| identity);
+        let requirements = collection.declared_requirements.as_deref();
+        let requirement = requirements.and_then(|requirements| {
+            requirements
+                .iter()
+                .find(|requirement| requirement.identity == parsed.package_identity)
+        });
+        let inactive_targets = requirement
+            .filter(|requirement| !requirement.test || collection.build_context().analyzes_tests)
+            .and_then(|requirement| requirement.only.as_ref())
+            .filter(|targets| {
+                !targets
+                    .iter()
+                    .any(|target| target == collection.target_cfg.target_name())
+            });
+        let non_root_test_dependency_unavailable = requirement.is_some_and(|requirement| {
+            requirement.test
+                && collection.build_context().analyzes_tests
+                && !collection.build_context().is_root_package
+        });
+        if non_root_test_dependency_unavailable {
+            let diagnostic = world_dependency_path_diagnostic(
+                owner,
+                span,
+                sai_diagnostics::Code::TestDependencyUnavailable,
+                &parsed.package_identity,
+                None,
+                collection.target_cfg.target_name(),
+                inputs,
+                snapshot,
+            )?;
+            return Ok((unresolved(), vec![diagnostic]));
+        }
+        if let Some(allowed_targets) = inactive_targets {
+            let diagnostic = world_dependency_path_diagnostic(
+                owner,
+                span,
+                sai_diagnostics::Code::InactiveDependency,
+                &parsed.package_identity,
+                Some(allowed_targets),
+                collection.target_cfg.target_name(),
+                inputs,
+                snapshot,
+            )?;
+            return Ok((unresolved(), vec![diagnostic]));
+        }
+        if requirement.is_some_and(|requirement| requirement.test) {
+            let diagnostic = world_dependency_path_diagnostic(
+                owner,
+                span,
+                sai_diagnostics::Code::TestDependencyOutsideTest,
+                &parsed.package_identity,
+                None,
+                collection.target_cfg.target_name(),
+                inputs,
+                snapshot,
+            )?;
+            return Ok((unresolved(), vec![diagnostic]));
+        }
+
+        let local_source_target = (parsed.package_identity == current_identity).then_some((
+            module_tree,
+            &collection.scopes,
+            false,
+        ));
+        let foreign_source_target = if local_source_target.is_none() {
+            collection
+                .foreign_scope_provenance
+                .iter()
+                .find(|provenance| provenance.visible_identity == parsed.package_identity)
+                .and_then(|provenance| {
+                    member_scopes
+                        .source_packages
+                        .iter()
+                        .find(|package| package.package_key() == &provenance.package_key)
+                })
+                .map(|package| (package.module_tree(), package.scopes(), true))
+        } else {
+            None
+        };
+        if let Some((source_tree, source_scopes, is_foreign)) =
+            local_source_target.or(foreign_source_target)
+        {
+            return self.resolve_world_source_package_path(
+                owner,
+                path,
+                span,
+                position,
+                &parsed.segments,
+                source_tree,
+                source_scopes,
+                is_foreign,
+                wit_view_scopes,
+                inputs,
+                snapshot,
+            );
+        }
+
+        if let Some(foreign_view) = wit_view_scopes
+            .views()
+            .find(|view| view.directly_visible && view.visible_identity == parsed.package_identity)
+        {
+            return self.resolve_world_wit_package_path(
+                owner,
+                position,
+                path,
+                span,
+                &parsed.segments,
+                &foreign_view.view,
+                inputs,
+                snapshot,
+            );
+        }
+
+        let selected_but_unavailable = wit_view_scopes.entries.iter().any(|entry| {
+            entry.direct_order.is_some()
+                && entry.identity.package_identity == parsed.package_identity
+                && entry.available.is_none()
+        });
+        if selected_but_unavailable
+            || matches!(parsed.package_identity.as_str(), "sai:core" | "sai:alloc")
+        {
+            return Ok((WorldReferencePathResult::Pkg(path.to_owned()), Vec::new()));
+        }
+
+        let Some(requirements) = requirements else {
+            // An invalid manifest or unavailable requirements query leaves
+            // direct-package selection incomplete. Do not turn that missing
+            // evidence into an unknown-package error.
+            return Ok((WorldReferencePathResult::Pkg(path.to_owned()), Vec::new()));
+        };
+        if requirements
+            .iter()
+            .any(|requirement| requirement.identity == parsed.package_identity)
+        {
+            // The package is declared, but this validated closure has no
+            // usable source or WIT target for it. Keep the path deferred so
+            // package selection or dependency loading can report its owner
+            // diagnostic without a misleading UNKNOWN_PACKAGE cascade.
+            return Ok((WorldReferencePathResult::Pkg(path.to_owned()), Vec::new()));
+        }
+        let diagnostic = unknown_world_package_diagnostic(
+            owner,
+            span,
+            &parsed.package_identity,
+            &requirements,
+            inputs,
+            snapshot,
+        )?;
+        Ok((unresolved(), vec![diagnostic]))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_world_source_package_path(
+        &mut self,
+        owner: OwnerId,
+        original_path: &str,
+        span: sai_hir::Span,
+        position: WorldReferencePosition,
+        segments: &[Symbol],
+        source_tree: &ModuleTree,
+        source_scopes: &Phase1PackageScopes,
+        is_foreign: bool,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+        inputs: &CurrentOwnerInputs,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<(WorldReferencePathResult, Vec<Diagnostic>), OwnerControlFlowResolutionError> {
+        use sai_resolve::module_target::{ModuleTargetError, resolve_foreign_module_target};
+
+        let to_path_result = |base| {
+            WorldReferencePathResult::ResolvedPkg(PathRes {
+                base,
+                resolved_segments: u32::try_from(segments.len())
+                    .expect("a package path fits its stored segment count"),
+                segment_count: u32::try_from(segments.len())
+                    .expect("a package path fits its stored segment count"),
+            })
+        };
+        if segments.is_empty() {
+            if position != WorldReferencePosition::Include {
+                // The parser owns WORLD_IMPORT_NEEDS_INTERFACE for this
+                // syntactic form. Do not feed the package-root module to the
+                // common kind checker and produce a WRONG_NAME_KIND cascade.
+                return Ok((to_path_result(Res::Err), Vec::new()));
+            }
+            let diagnostic = world_package_path_diagnostic(
+                owner,
+                span,
+                sai_diagnostics::Code::InvalidWorldItem,
+                format!("`{original_path}` names a package, not a world"),
+                "invalid world item",
+                inputs,
+                snapshot,
+            )?;
+            return Ok((to_path_result(Res::Err), vec![diagnostic]));
+        }
+        let module_miss = match resolve_foreign_module_target(source_tree, segments, &self.symbols)
+        {
+            Ok(module) => {
+                let module_scope = source_scopes
+                    .modules
+                    .get(module.raw() as usize)
+                    .ok_or(OwnerControlFlowResolutionError::ModuleTreeMismatch)?;
+                return Ok((
+                    to_path_result(Res::Def(
+                        DefKind::Module,
+                        module_scope.module_def_id.to_def_id(),
+                    )),
+                    Vec::new(),
+                ));
+            }
+            Err(ModuleTargetError::UnknownModule {
+                matched_prefix,
+                module_candidates,
+            }) => Some((matched_prefix, module_candidates)),
+            Err(ModuleTargetError::Symbol(error)) => {
+                return Err(OwnerControlFlowResolutionError::SymbolLookup(error));
+            }
+            Err(
+                ModuleTargetError::MissingRootModule
+                | ModuleTargetError::InvalidCurrentModule
+                | ModuleTargetError::InvalidModuleTree
+                | ModuleTargetError::UseOfCurrentModule(_),
+            ) => return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch),
+        };
+
+        let Some(name) = segments.last().copied() else {
+            // The source package root resolved as a module above.
+            return Ok((to_path_result(Res::Err), Vec::new()));
+        };
+        let parent_segments = &segments[..segments.len() - 1];
+        let parent_module =
+            match resolve_foreign_module_target(source_tree, parent_segments, &self.symbols) {
+                Ok(module) => module,
+                Err(ModuleTargetError::UnknownModule {
+                    matched_prefix,
+                    module_candidates,
+                }) => {
+                    let diagnostic = unknown_world_module_diagnostic(
+                        owner,
+                        original_path,
+                        span,
+                        matched_prefix,
+                        module_candidates,
+                        segments,
+                        &self.symbols,
+                        inputs,
+                        snapshot,
+                    )?;
+                    return Ok((to_path_result(Res::Err), vec![diagnostic]));
+                }
+                Err(ModuleTargetError::Symbol(error)) => {
+                    return Err(OwnerControlFlowResolutionError::SymbolLookup(error));
+                }
+                Err(
+                    ModuleTargetError::MissingRootModule
+                    | ModuleTargetError::InvalidCurrentModule
+                    | ModuleTargetError::InvalidModuleTree
+                    | ModuleTargetError::UseOfCurrentModule(_),
+                ) => return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch),
+            };
+        let module_scope = source_scopes
+            .modules
+            .get(parent_module.raw() as usize)
+            .ok_or(OwnerControlFlowResolutionError::ModuleTreeMismatch)?;
+        let binding = module_scope
+            .members
+            .get(&name)
+            .or_else(|| module_scope.declared.get(&name));
+        let Some(binding) = binding else {
+            let (matched_prefix, module_candidates) =
+                module_miss.expect("a missing package member also misses the exact module path");
+            let diagnostic = unknown_world_module_diagnostic(
+                owner,
+                original_path,
+                span,
+                matched_prefix,
+                module_candidates,
+                segments,
+                &self.symbols,
+                inputs,
+                snapshot,
+            )?;
+            return Ok((to_path_result(Res::Err), vec![diagnostic]));
+        };
+        if is_foreign
+            && !matches!(
+                binding.visibility,
+                sai_hir::Visibility::Pub | sai_hir::Visibility::Export
+            )
+        {
+            let diagnostic = world_package_path_diagnostic(
+                owner,
+                span,
+                sai_diagnostics::Code::PrivateItem,
+                format!("the package member in `{original_path}` is not visible from this package"),
+                "private package member",
+                inputs,
+                snapshot,
+            )?;
+            return Ok((to_path_result(Res::Err), vec![diagnostic]));
+        }
+
+        let mut resolution = binding.res;
+        if is_foreign && let Res::Def(DefKind::Interface, source_interface) = resolution {
+            match self
+                .generated_view_interface_for_source_interface(source_interface, wit_view_scopes)?
+            {
+                GeneratedSourceInterfaceView::Unavailable => {
+                    return Ok((
+                        WorldReferencePathResult::Pkg(original_path.to_owned()),
+                        Vec::new(),
+                    ));
+                }
+                GeneratedSourceInterfaceView::Omitted => {
+                    resolution = Res::Err;
+                }
+                GeneratedSourceInterfaceView::Resolved(view_interface) => {
+                    resolution = Res::Def(DefKind::Interface, view_interface);
+                }
+            };
+        }
+        Ok((to_path_result(resolution), Vec::new()))
+    }
+
+    fn generated_view_interface_for_source_interface(
+        &self,
+        source_interface: DefId,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<GeneratedSourceInterfaceView, OwnerControlFlowResolutionError> {
+        let Some(view_scope) = wit_view_scopes.views().find(|scope| {
+            matches!(
+                scope.view.unit.kind(),
+                WitUnitKind::Generated { package } if package == source_interface.package
+            )
+        }) else {
+            // An unavailable generated output has no view scope from which
+            // source-origin completeness can be established.
+            return Ok(GeneratedSourceInterfaceView::Unavailable);
+        };
+        let paths = self
+            .def_paths
+            .get(&source_interface.package)
+            .map(Arc::as_ref)
+            .or(view_scope.source_def_paths.as_deref());
+        let Some(paths) = paths else {
+            return Ok(GeneratedSourceInterfaceView::Unavailable);
+        };
+        let source_path = match paths.resolve_def_id(source_interface) {
+            Ok(Some(path)) => path,
+            Ok(None) => return Ok(GeneratedSourceInterfaceView::Unavailable),
+            Err(
+                sai_hir::DefPathInternerError::ForeignDefinitionId
+                | sai_hir::DefPathInternerError::WrongPackage,
+            ) => return Ok(GeneratedSourceInterfaceView::Unavailable),
+            Err(error) => {
+                return Err(OwnerControlFlowResolutionError::DefPathInterner(error));
+            }
+        };
+        let Some(canonical_source_path) =
+            canonical_source_interface_path(&source_path, &self.symbols)?
+        else {
+            return Ok(GeneratedSourceInterfaceView::Unavailable);
+        };
+        let matching_interface = view_scope
+            .view
+            .interfaces
+            .values()
+            .find(|interface| {
+                interface
+                    .origin_identity
+                    .as_ref()
+                    .is_some_and(|origin| origin.canonical_path == canonical_source_path)
+            })
+            .map(|interface| interface.def);
+        Ok(match matching_interface {
+            Some(interface) => GeneratedSourceInterfaceView::Resolved(interface),
+            // A successfully loaded Generated view is complete. Missing
+            // source-origin metadata means the interface is not in that view.
+            None => GeneratedSourceInterfaceView::Omitted,
+        })
+    }
+
+    fn resolve_world_wit_package_path(
+        &self,
+        owner: OwnerId,
+        position: WorldReferencePosition,
+        original_path: &str,
+        span: sai_hir::Span,
+        segments: &[Symbol],
+        view: &WitView,
+        inputs: &CurrentOwnerInputs,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<(WorldReferencePathResult, Vec<Diagnostic>), OwnerControlFlowResolutionError> {
+        let segment_count = u32::try_from(segments.len())
+            .expect("a WIT package path fits its stored segment count");
+        let resolved = |base| {
+            WorldReferencePathResult::ResolvedPkg(PathRes {
+                base,
+                resolved_segments: segment_count,
+                segment_count,
+            })
+        };
+        if segments.is_empty() {
+            if position != WorldReferencePosition::Include {
+                // The parser owns WORLD_IMPORT_NEEDS_INTERFACE for this
+                // syntactic form. Re-emitting it here would duplicate the
+                // diagnostic during semantic resolution.
+                return Ok((resolved(Res::Err), Vec::new()));
+            }
+            let diagnostic = world_package_path_diagnostic(
+                owner,
+                span,
+                sai_diagnostics::Code::InvalidWorldItem,
+                format!("`{original_path}` names a package, not a world"),
+                "invalid world item",
+                inputs,
+                snapshot,
+            )?;
+            return Ok((resolved(Res::Err), vec![diagnostic]));
+        }
+        if segments.len() != 1 {
+            let diagnostic = world_package_path_diagnostic(
+                owner,
+                span,
+                sai_diagnostics::Code::UnknownModule,
+                format!("WIT package path `{original_path}` has more than one item segment"),
+                "unknown WIT package member",
+                inputs,
+                snapshot,
+            )?;
+            return Ok((resolved(Res::Err), vec![diagnostic]));
+        }
+        let requested_name = self
+            .symbols
+            .resolve(segments[0])
+            .map_err(OwnerControlFlowResolutionError::SymbolLookup)?;
+        let requested_name = canonical_wit_path_name(&requested_name);
+        let found_interface = view.interfaces.values().find(|interface| {
+            canonical_wit_path_name(&view.model.interfaces[interface.wit].name) == requested_name
+        });
+        if let Some(interface) = found_interface {
+            return Ok((
+                resolved(Res::Def(DefKind::Interface, interface.def)),
+                Vec::new(),
+            ));
+        }
+        let found_world = view.worlds.values().find(|world| {
+            canonical_wit_path_name(&view.model.worlds[world.wit].name) == requested_name
+        });
+        if let Some(world) = found_world {
+            return Ok((resolved(Res::Def(DefKind::World, world.def)), Vec::new()));
+        }
+        let mut available_interfaces = HashMap::new();
+        for interface in view.interfaces.values() {
+            available_interfaces
+                .entry(interface.wit)
+                .or_insert_with(|| {
+                    canonical_wit_path_name(&view.model.interfaces[interface.wit].name)
+                });
+        }
+        let mut available_worlds = HashMap::new();
+        for world in view.worlds.values() {
+            available_worlds
+                .entry(world.wit)
+                .or_insert_with(|| canonical_wit_path_name(&view.model.worlds[world.wit].name));
+        }
+        let candidates = view
+            .model
+            .declarations_in_order()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(declaration_order, declaration)| {
+                let name = match declaration {
+                    WitPackageDeclaration::Interface(wit) => available_interfaces.get(&wit),
+                    WitPackageDeclaration::World(wit) => available_worlds.get(&wit),
+                }?
+                .clone();
+                Some((declaration_order, name))
+            })
+            .collect::<Vec<_>>();
+        let mut seen_names = HashSet::new();
+        let mut candidates = candidates;
+        candidates.retain(|(_, name)| seen_names.insert(name.clone()));
+        let candidate_names = suggest_wit_items(&requested_name, &candidates);
+        let mut diagnostic = world_package_path_diagnostic(
+            owner,
+            span,
+            sai_diagnostics::Code::UnknownWitItem,
+            format!(
+                "WIT package `{}` has no interface or world named `{requested_name}`",
+                view.unit.canonical_name()
+            ),
+            "unknown WIT item",
+            inputs,
+            snapshot,
+        )?;
+        diagnostic.data.insert(
+            "name".to_owned(),
+            sai_diagnostics::Value::String(requested_name),
+        );
+        diagnostic.data.insert(
+            "candidates".to_owned(),
+            sai_diagnostics::Value::Array(
+                candidate_names
+                    .iter()
+                    .cloned()
+                    .map(sai_diagnostics::Value::String)
+                    .collect(),
+            ),
+        );
+        if !candidate_names.is_empty() {
+            diagnostic
+                .push_child(Child {
+                    kind: ChildKind::Help,
+                    message: format!(
+                        "similar WIT items: {}",
+                        candidate_names
+                            .iter()
+                            .map(|candidate| format!("`{candidate}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    location: None,
+                })
+                .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+        }
+        Ok((resolved(Res::Err), vec![diagnostic]))
+    }
+
     fn resolve_world_test_only_paths_inner(
         &mut self,
         collection: &Phase1PackageScopesCollection,
@@ -13087,6 +14307,10 @@ impl RootDatabase {
         snapshot: &WorkspaceSnapshot,
         member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
         mut world_reference_owners: Option<&mut Vec<WorldOwnerReferenceResolution>>,
+        world_reference_scopes: Option<(
+            &Phase1ActiveSourceMemberScopes,
+            &Phase1ActiveWitViewScopes,
+        )>,
     ) -> Result<WorldTestOnlyResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
@@ -13418,6 +14642,9 @@ impl RootDatabase {
                                     &module_scope,
                                     &local_module_members,
                                     collection.module_tree.package,
+                                    collection,
+                                    module_tree,
+                                    world_reference_scopes,
                                     &inputs,
                                     snapshot,
                                     &collection.target_cfg,
@@ -26704,6 +27931,7 @@ mod tests {
             .iter()
             .filter_map(|reference| match reference.path_result() {
                 WorldReferencePathResult::Mod(path) => Some(path.base),
+                WorldReferencePathResult::ResolvedPkg(path) => Some(path.base),
                 WorldReferencePathResult::DeferredMod(_) | WorldReferencePathResult::Pkg(_) => None,
             })
             .collect::<Vec<_>>();
@@ -26961,6 +28189,1099 @@ mod tests {
             deferred_reference.diagnostics().is_empty(),
             "a foreign member suffix does not become a local missing-name error"
         );
+    }
+
+    #[test]
+    fn world_include_adapter_keeps_only_complete_local_edges_and_binds_cycle_diagnostics() {
+        let root = concat!(
+            "world first {\n",
+            "  include second\n",
+            "  include api\n",
+            "  include acme:external/remote\n",
+            "}\n",
+            "interface api {}\n",
+            "world second {\n",
+            "  include first\n",
+            "}\n",
+            "world independent {}\n",
+        );
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), b"world nested {}\n");
+        let target_range = |line: &str, name: &str| {
+            let start = root.find(line).expect("world item line exists");
+            let name_start = line.find(name).expect("world item has a target name");
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new((start + name_start) as u32),
+                sai_diagnostics::TextSize::new((start + name_start + name.len()) as u32),
+            )
+            .expect("target range is ordered")
+        };
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("world owners are collected");
+        let references = database
+            .resolve_world_references(&collection, &module_tree, &snapshot)
+            .expect("local world references are resolved");
+        let includes = database
+            .resolve_world_includes(&collection, &module_tree, &snapshot, &references)
+            .expect("matching world references form the package graph");
+
+        let local_worlds = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
+            .map(|descriptor| descriptor.owner.def_id.to_def_id())
+            .collect::<Vec<_>>();
+        assert_eq!(includes.cyclic, local_worlds[..2]);
+        assert_eq!(
+            includes.includes.len(),
+            2,
+            "wrong-kind and deferred foreign references do not become local graph edges"
+        );
+        assert_eq!(includes.includes[0].from, local_worlds[0]);
+        assert_eq!(includes.includes[1].from, local_worlds[1]);
+        assert_eq!(includes.diagnostics.len(), 1);
+        let cycle = &includes.diagnostics[0];
+        assert!(cycle.has_workspace_snapshot());
+        assert_eq!(cycle.code, sai_diagnostics::Code::WorldIncludeCycle);
+        assert_eq!(
+            cycle
+                .primary()
+                .expect("cycle has a primary span")
+                .span
+                .range,
+            target_range("  include second\n", "second"),
+        );
+        assert_eq!(cycle.children().len(), 1);
+        assert_eq!(
+            cycle.children()[0]
+                .location
+                .as_ref()
+                .expect("cycle witness edge has a note location")
+                .span
+                .range,
+            target_range("  include first\n", "first"),
+        );
+
+        let mut mismatched_collection = collection.clone();
+        mismatched_collection.target_cfg =
+            target_cfg_for_check("wasm64-core").expect("second target config is valid");
+        assert_eq!(
+            database.resolve_world_includes(
+                &mismatched_collection,
+                &module_tree,
+                &snapshot,
+                &references,
+            ),
+            Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch),
+            "reference results from a different target are rejected"
+        );
+
+        let mut failed_owner = references.clone();
+        failed_owner.owners[0].error = Some(OwnerControlFlowResolutionError::TestAnalysisDisabled);
+        assert_eq!(
+            database.resolve_world_includes(&collection, &module_tree, &snapshot, &failed_owner),
+            Err(OwnerControlFlowResolutionError::TestAnalysisDisabled),
+            "owner lowering failures cannot produce a partial include graph"
+        );
+
+        let mut invalid_span = references;
+        let include = invalid_span
+            .owners
+            .iter_mut()
+            .flat_map(|owner| owner.references.iter_mut())
+            .find(|reference| reference.position == WorldReferencePosition::Include)
+            .expect("there is a local include");
+        let invalid_owner = include.owner;
+        include.span.file = FileId::new(u32::MAX);
+        assert_eq!(
+            database.resolve_world_includes(&collection, &module_tree, &snapshot, &invalid_span),
+            Err(OwnerControlFlowResolutionError::InvalidSourceLocation(
+                invalid_owner
+            )),
+            "an unbindable include span is an adapter error rather than a dropped edge"
+        );
+    }
+
+    #[test]
+    fn world_package_references_resolve_wit_interfaces_and_worlds() {
+        let root = concat!(
+            "world references {\n",
+            "  import acme:codec\n",
+            "  export acme:codec\n",
+            "  include acme:codec\n",
+            "  import acme:codec/api\n",
+            "  export acme:codec/api\n",
+            "  include acme:codec/server\n",
+            "  import acme:codec/server\n",
+            "  include acme:codec/api\n",
+            "  import acme:codec/can\n",
+            "  import acme:codex/api\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, root_package) =
+            phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("world source parses");
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::WorldImportNeedsInterface
+                })
+                .count(),
+            2,
+            "the parser owns whole-package import and export diagnostics"
+        );
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let root_key = PackageKey::new("acme:phase1#1").expect("root key is valid");
+        let codec_key = PackageKey::new("acme:codec#1").expect("WIT package key is valid");
+        let codec = database
+            .intern_package(codec_key.as_str())
+            .expect("WIT package interns");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                PackageGraphNode::new(
+                    root_key,
+                    "acme:phase1",
+                    Version::parse("1.0.0").expect("root version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:codec#1", "acme:codec")],
+                )
+                .expect("root graph node is valid"),
+                PackageGraphNode::new(
+                    codec_key.clone(),
+                    "acme:codec",
+                    Version::parse("1.0.0").expect("WIT package version is valid"),
+                    PackageForm::Artifact,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                )
+                .expect("WIT package graph node is valid"),
+            ],
+        )
+        .expect("package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        database
+            .set_package_manifest(
+                codec,
+                Arc::from(
+                    &b"package acme:codec @ 1.0.0\n\
+                      artifact component {}\n\
+                      wit \"wit\"\n"[..],
+                ),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("WIT package manifest is recorded");
+        database
+            .set_wit_files(
+                codec_key.clone(),
+                WitFilesSnapshot::listed(
+                    "wit",
+                    [PackageRelativePath::new("wit/api.wit").expect("WIT path is valid")],
+                )
+                .expect("WIT inventory is valid"),
+                Durability::Low,
+            )
+            .expect("WIT inventory is recorded");
+        database
+            .set_file_contents(
+                FileKey::new(codec_key.as_str(), "wit/api.wit").expect("WIT file key is valid"),
+                Arc::from(
+                    &b"package acme:codec@1.0.0; world cat {} interface car {} interface api { run: func(); } world server {} interface distant {} world another {}"[..],
+                ),
+                Durability::Low,
+            )
+            .expect("WIT source is recorded");
+        let wit_view_scopes = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target_cfg, &graph)
+            .expect("active WIT view loads");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_view_scopes,
+            )
+            .expect("Phase 1 scopes include the active WIT view");
+        database
+            .set_package_manifest(
+                root_package,
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("the live manifest changes after the validated collection is frozen");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty source member closure validates");
+        let resolutions = database
+            .resolve_world_references_with_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("package-qualified world paths resolve");
+        assert!(resolutions.matches_collection(&collection));
+        let owner = resolutions
+            .owners()
+            .iter()
+            .find(|owner| owner.references().len() == 10)
+            .expect("the source world has all package paths");
+        let codec_view = wit_view_scopes
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("codec view is directly visible");
+        let expected_interface = codec_view
+            .view
+            .interfaces
+            .values()
+            .find(|interface| codec_view.view.model.interfaces[interface.wit].name == "api")
+            .expect("codec interface exists")
+            .def;
+        let expected_world = codec_view
+            .view
+            .worlds
+            .values()
+            .find(|world| codec_view.view.model.worlds[world.wit].name == "server")
+            .expect("codec world exists")
+            .def;
+        let reference_for = |line: &str, path: &str, position: WorldReferencePosition| {
+            let line_start = root.find(line).expect("world item line exists");
+            let start = line_start + line.find(path).expect("world item line contains the path");
+            let range = sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(start as u32),
+                sai_diagnostics::TextSize::new((start + path.len()) as u32),
+            )
+            .expect("path span is ordered");
+            owner
+                .references()
+                .iter()
+                .find(|reference| {
+                    reference.span().range == range && reference.position() == position
+                })
+                .expect("reference uses its exact source span")
+        };
+        for (line, path, position, expected) in [
+            (
+                "  import acme:codec/api\n",
+                "acme:codec/api",
+                WorldReferencePosition::Import,
+                Res::Def(DefKind::Interface, expected_interface),
+            ),
+            (
+                "  export acme:codec/api\n",
+                "acme:codec/api",
+                WorldReferencePosition::Export,
+                Res::Def(DefKind::Interface, expected_interface),
+            ),
+            (
+                "  include acme:codec/server\n",
+                "acme:codec/server",
+                WorldReferencePosition::Include,
+                Res::Def(DefKind::World, expected_world),
+            ),
+        ] {
+            let reference = reference_for(line, path, position);
+            assert_eq!(
+                reference.path_result(),
+                &WorldReferencePathResult::ResolvedPkg(PathRes {
+                    base: expected,
+                    resolved_segments: 1,
+                    segment_count: 1,
+                })
+            );
+            assert!(reference.diagnostics().is_empty());
+        }
+        for (line, path, position) in [
+            (
+                "  import acme:codec/server\n",
+                "acme:codec/server",
+                WorldReferencePosition::Import,
+            ),
+            (
+                "  include acme:codec/api\n",
+                "acme:codec/api",
+                WorldReferencePosition::Include,
+            ),
+        ] {
+            let reference = reference_for(line, path, position);
+            assert_eq!(
+                reference
+                    .diagnostics()
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                [sai_diagnostics::Code::InvalidWorldItem],
+                "world/interface kind errors stay asymmetric and single-owned"
+            );
+        }
+        for (line, position) in [
+            ("  import acme:codec\n", WorldReferencePosition::Import),
+            ("  export acme:codec\n", WorldReferencePosition::Export),
+        ] {
+            let whole_package = reference_for(line, "acme:codec", position);
+            assert_eq!(
+                whole_package.path_result(),
+                &WorldReferencePathResult::ResolvedPkg(PathRes {
+                    base: Res::Err,
+                    resolved_segments: 0,
+                    segment_count: 0,
+                })
+            );
+            assert!(
+                whole_package.diagnostics().is_empty(),
+                "the parser-owned import/export diagnostic is not duplicated or recast"
+            );
+        }
+        let whole_package_include = reference_for(
+            "  include acme:codec\n",
+            "acme:codec",
+            WorldReferencePosition::Include,
+        );
+        assert_eq!(
+            whole_package_include
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::InvalidWorldItem]
+        );
+        let combined_whole_package_diagnostics = parsed
+            .errors
+            .iter()
+            .chain(
+                owner
+                    .references()
+                    .iter()
+                    .flat_map(|reference| reference.diagnostics()),
+            )
+            .filter(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::WorldImportNeedsInterface
+            })
+            .count();
+        assert_eq!(
+            combined_whole_package_diagnostics, 2,
+            "only parser-owned whole-package import and export diagnostics are exposed"
+        );
+
+        let unknown_item = reference_for(
+            "  import acme:codec/can\n",
+            "acme:codec/can",
+            WorldReferencePosition::Import,
+        );
+        assert_eq!(
+            unknown_item
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::UnknownWitItem]
+        );
+        assert_eq!(
+            unknown_item.diagnostics()[0].data.get("candidates"),
+            Some(&sai_diagnostics::Value::Array(vec![
+                sai_diagnostics::Value::String("cat".to_owned()),
+                sai_diagnostics::Value::String("car".to_owned())
+            ])),
+            "large WIT candidate sets use distance then total cross-kind WIT declaration order"
+        );
+        assert!(
+            unknown_item.diagnostics()[0]
+                .children()
+                .iter()
+                .any(|child| child.message == "similar WIT items: `cat`, `car`")
+        );
+        let unknown_package = reference_for(
+            "  import acme:codex/api\n",
+            "acme:codex/api",
+            WorldReferencePosition::Import,
+        );
+        assert_eq!(
+            unknown_package
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::UnknownPackage]
+        );
+        assert_eq!(
+            unknown_package.diagnostics()[0].data.get("candidates"),
+            Some(&sai_diagnostics::Value::Array(vec![
+                sai_diagnostics::Value::String("acme:codec".to_owned())
+            ])),
+            "unknown package suggestions use requirements frozen into the validated collection even after the live manifest changes"
+        );
+        assert!(
+            unknown_package.diagnostics()[0]
+                .children()
+                .iter()
+                .any(|child| child.message == "similar packages: `acme:codec`")
+        );
+        assert_eq!(
+            parsed
+                .errors
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::WorldImportNeedsInterface
+                })
+                .count(),
+            2,
+            "resolving the world does not duplicate parser-owned diagnostics"
+        );
+    }
+
+    #[test]
+    fn small_world_item_candidate_sets_are_sorted_by_distance() {
+        let candidates = vec![(0, "zzz".to_owned()), (1, "ab".to_owned())];
+        assert_eq!(
+            suggest_wit_items("a", &candidates),
+            ["ab", "zzz"],
+            "small candidate sets include all names but retain distance ordering"
+        );
+    }
+
+    #[test]
+    fn world_reference_suggestions_follow_diagnostic_limits_and_order() {
+        let many = (0_u8..12)
+            .map(|index| (usize::from(index), char::from(b'b' + index).to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            suggest_wit_items("a", &many),
+            ["b", "c", "d", "e", "f", "g", "h", "i", "j", "k"],
+            "distance ties preserve total WIT declaration order and results cap at ten"
+        );
+        let threshold_candidates = vec![
+            (0, "abcXYZghij".to_owned()),
+            (1, "xbcdefghij".to_owned()),
+            (2, "abXXefghij".to_owned()),
+            (3, "WXYdefghij".to_owned()),
+            (4, "abcdWXYZij".to_owned()),
+            (5, "qqqqqqqqqq".to_owned()),
+        ];
+        assert_eq!(
+            suggest_wit_items("abcdefghij", &threshold_candidates),
+            ["xbcdefghij", "abXXefghij", "abcXYZghij", "WXYdefghij"],
+            "a ten-scalar name uses the floor one-third distance threshold"
+        );
+        assert_eq!(
+            unicode_damerau_levenshtein("ab", "ba"),
+            1,
+            "adjacent transpositions count as one edit"
+        );
+        assert_eq!(
+            unicode_damerau_levenshtein("🦀", "🦊"),
+            1,
+            "distance operates on Unicode scalar values rather than UTF-8 bytes"
+        );
+
+        let requirements = (b'b'..=b'm')
+            .enumerate()
+            .map(|(declaration_order, suffix)| DeclaredRequirement {
+                identity: format!("acme:dep-{}", char::from(suffix)),
+                declaration_order: u32::try_from(declaration_order)
+                    .expect("test declaration order fits u32"),
+                only: None,
+                test: false,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            suggest_world_packages("acme:dep-a", &requirements),
+            (b'b'..=b'k')
+                .map(|suffix| format!("acme:dep-{}", char::from(suffix)))
+                .collect::<Vec<_>>(),
+            "UNKNOWN_PACKAGE keeps the fixed distance-two rule and returns up to ten candidates"
+        );
+    }
+
+    #[test]
+    fn world_package_references_preserve_source_visibility_and_module_miss_evidence() {
+        let root_source = concat!(
+            "world references {\n",
+            "  import acme:dep\n",
+            "  export acme:dep\n",
+            "  include acme:dep\n",
+            "  import acme:dep/api\n",
+            "  import acme:dep/hidden\n",
+            "  import acme:dep/missing\n",
+            "  import acme:dep/lib\n",
+            "}\n",
+        );
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (_, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", root_source.as_bytes())],
+        );
+        let (dependency_package, dependency_tree, dependency_files) = multi_package_fixture(
+            &mut database,
+            "acme:dep#1",
+            "acme:dep@1.0.0",
+            &[
+                (
+                    "lib.sai",
+                    b"pub interface api {}\ninterface hidden {}\npub interface renamed {}\n",
+                ),
+                ("alpha.sai", b"pub fn alpha() {}\n"),
+                ("zeta.sai", b"pub fn zeta() {}\n"),
+            ],
+        );
+        snapshot_files.extend(dependency_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let dependency_manifest: Arc<[u8]> =
+            Arc::from(&b"package acme:dep @ 1.0.0\nsource \"src\"\n"[..]);
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:dep#1", "acme:dep")],
+                ),
+                graph_node(
+                    "acme:dep#1",
+                    "acme:dep",
+                    "1.0.0",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("source dependency graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let dependency_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &dependency_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                dependency_manifest,
+                PackageRole::Dependency,
+                &[],
+            )
+            .expect("source dependency scopes collect");
+        let renamed_symbol = database
+            .symbols
+            .intern("renamed")
+            .expect("renamed interface symbol interns");
+        let renamed_interface = match dependency_collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("dependency root scope exists")
+            .scope
+            .get(&renamed_symbol)
+            .expect("renamed source interface is bound")
+            .res
+        {
+            Res::Def(DefKind::Interface, interface) => interface,
+            other => panic!("renamed member resolves to an interface, got {other:?}"),
+        };
+        let dependency_member_package = dependency_collection.module_member_scope_package();
+        let root_manifest_with_wit: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              requires { acme:dep @ ^1 }\n"[..],
+        );
+        let generated = GeneratedText {
+            text: Arc::from("package acme:dep@1.0.0; interface api {}"),
+            complete: true,
+            origins: Arc::from([("api".to_owned(), renamed_interface)]),
+        };
+        database
+            .set_generated_wit_text(dependency_package, generated, Durability::Low)
+            .expect("generated WIT maps the api spelling to another source interface");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target_cfg, &graph)
+            .expect("generated WIT view loads");
+        assert!(
+            wit_views.views().any(|scope| {
+                matches!(scope.view.unit.kind(), WitUnitKind::Generated { .. })
+                    && scope.visible_identity == "acme:dep"
+            }),
+            "the generated source view is available for the package"
+        );
+        let root_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                root_manifest_with_wit,
+                PackageRole::Root,
+                &[dependency_member_package.as_foreign_package_scopes("acme:dep")],
+                &wit_views,
+            )
+            .expect("root source and generated WIT scopes collect");
+        let member_scopes = database
+            .collect_active_source_member_scopes(
+                &root_collection,
+                &graph,
+                &[dependency_member_package],
+            )
+            .expect("source dependency closure validates");
+        let resolutions = database
+            .resolve_world_references_with_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_views,
+            )
+            .expect("source package world paths resolve or defer");
+        let owner = resolutions
+            .owners()
+            .iter()
+            .find(|owner| owner.references().len() == 7)
+            .expect("source world has seven package references");
+        let reference_for = |line: &str, path: &str| {
+            let line_start = root_source.find(line).expect("world item line exists");
+            let start = line_start + line.find(path).expect("world item line contains path");
+            let range = sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(start as u32),
+                sai_diagnostics::TextSize::new((start + path.len()) as u32),
+            )
+            .expect("path span is ordered");
+            owner
+                .references()
+                .iter()
+                .find(|reference| reference.span().range == range)
+                .expect("reference uses its exact source span")
+        };
+        for (line, position) in [
+            ("  import acme:dep\n", WorldReferencePosition::Import),
+            ("  export acme:dep\n", WorldReferencePosition::Export),
+        ] {
+            let reference = reference_for(line, "acme:dep");
+            assert_eq!(reference.position(), position);
+            assert_eq!(
+                reference.path_result(),
+                &WorldReferencePathResult::ResolvedPkg(PathRes {
+                    base: Res::Err,
+                    resolved_segments: 0,
+                    segment_count: 0,
+                })
+            );
+            assert!(
+                reference.diagnostics().is_empty(),
+                "source package roots preserve parser ownership for {line:?}"
+            );
+        }
+        assert_eq!(
+            reference_for("  include acme:dep\n", "acme:dep")
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::InvalidWorldItem],
+            "including a source package root is an invalid world item"
+        );
+        let no_origin_interface = reference_for("  import acme:dep/api\n", "acme:dep/api");
+        assert_eq!(
+            no_origin_interface.path_result(),
+            &WorldReferencePathResult::ResolvedPkg(PathRes {
+                base: Res::Err,
+                resolved_segments: 1,
+                segment_count: 1,
+            }),
+            "the WIT spelling match does not replace the source interface's missing origin"
+        );
+        assert!(no_origin_interface.diagnostics().is_empty());
+        let private_interface = reference_for("  import acme:dep/hidden\n", "acme:dep/hidden");
+        assert_eq!(
+            private_interface
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::PrivateItem],
+            "private source interfaces are rejected without a kind cascade"
+        );
+        let unknown_module = reference_for("  import acme:dep/missing\n", "acme:dep/missing");
+        assert_eq!(
+            unknown_module
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::UnknownModule]
+        );
+        assert_eq!(
+            unknown_module.diagnostics()[0].data.get("matched_prefix"),
+            Some(&sai_diagnostics::Value::Array(Vec::new())),
+            "foreign module misses preserve the longest matched prefix"
+        );
+        assert_eq!(
+            unknown_module.diagnostics()[0]
+                .data
+                .get("module_candidates"),
+            Some(&sai_diagnostics::Value::Array(vec![
+                sai_diagnostics::Value::String("alpha".to_owned()),
+                sai_diagnostics::Value::String("zeta".to_owned())
+            ])),
+            "foreign module suggestions contain sorted direct child modules"
+        );
+        assert!(
+            unknown_module.diagnostics()[0]
+                .children()
+                .iter()
+                .any(|child| {
+                    child.kind == ChildKind::Note
+                        && child.message
+                            == "modules directly under the package root: `alpha`, `zeta`"
+                })
+        );
+        let lib_module = reference_for("  import acme:dep/lib\n", "acme:dep/lib");
+        assert_eq!(
+            lib_module
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::UnknownModule]
+        );
+        assert!(lib_module.diagnostics()[0].children().iter().any(|child| {
+            child.message == "the root module is named by the package identity alone"
+        }));
+    }
+
+    #[test]
+    fn world_package_reference_defers_when_generated_source_view_is_unavailable() {
+        let root_source = b"world references { import acme:wit-source/streams }\n";
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (_, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", root_source)],
+        );
+        let (source_package, source_tree, source_files) = multi_package_fixture(
+            &mut database,
+            "acme:wit-source#1",
+            "acme:wit-source@1.0.0",
+            &[("lib.sai", b"pub interface streams {}\n")],
+        );
+        snapshot_files.extend(source_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let root_key = PackageKey::new("acme:root#1").expect("root package key is valid");
+        let source_key = PackageKey::new("acme:wit-source#1").expect("source package key is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                PackageGraphNode::new(
+                    root_key,
+                    "acme:root",
+                    Version::parse("1.0.0").expect("root package version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:wit-source#1", "acme:wit-source")],
+                )
+                .expect("root package graph node is valid"),
+                PackageGraphNode::new(
+                    source_key,
+                    "acme:wit-source",
+                    Version::parse("1.0.0").expect("source package version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                )
+                .expect("source package graph node is valid"),
+            ],
+        )
+        .expect("package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        database
+            .set_package_manifest(
+                source_package,
+                Arc::from(&b"package acme:wit-source @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("source package contract is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-wasi").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target_cfg, &graph)
+            .expect("missing generated output remains in the WIT closure");
+        assert_eq!(
+            wit_views.unavailable_unit_names().collect::<Vec<_>>(),
+            ["acme:wit-source@1.0.0"]
+        );
+        let source_manifest: Arc<[u8]> =
+            Arc::from(&b"package acme:wit-source @ 1.0.0\nsource \"src\"\n"[..]);
+        let source_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &source_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                source_manifest,
+                PackageRole::Dependency,
+                &[],
+            )
+            .expect("source dependency scopes collect");
+        let source_member_package = source_collection.module_member_scope_package();
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              requires { acme:wit-source @ ^1 }\n"[..],
+        );
+        let root_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &[source_member_package.as_foreign_package_scopes("acme:wit-source")],
+                &wit_views,
+            )
+            .expect("root scopes capture the source package and unavailable WIT view");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&root_collection, &graph, &[source_member_package])
+            .expect("source package closure validates");
+        let resolutions = database
+            .resolve_world_references_with_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_views,
+            )
+            .expect("unavailable generated view leaves the world path deferred");
+        let reference = resolutions
+            .owners()
+            .iter()
+            .flat_map(|owner| owner.references())
+            .next()
+            .expect("one package reference is retained");
+        assert_eq!(
+            reference.path_result(),
+            &WorldReferencePathResult::Pkg("acme:wit-source/streams".to_owned())
+        );
+        assert!(reference.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn world_package_references_defer_known_packages_without_wit_views() {
+        let root = b"world references { import acme:empty/api }\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root, b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let root_key = PackageKey::new("acme:phase1#1").expect("root key is valid");
+        let empty_key = PackageKey::new("acme:empty#1").expect("empty package key is valid");
+        let empty_package = database
+            .intern_package(empty_key.as_str())
+            .expect("empty package interns");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                PackageGraphNode::new(
+                    root_key,
+                    "acme:phase1",
+                    Version::parse("1.0.0").expect("root version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:empty#1", "acme:empty")],
+                )
+                .expect("root graph node is valid"),
+                PackageGraphNode::new(
+                    empty_key,
+                    "acme:empty",
+                    Version::parse("1.0.0").expect("dependency version is valid"),
+                    PackageForm::Artifact,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                )
+                .expect("dependency graph node is valid"),
+            ],
+        )
+        .expect("package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        database
+            .set_package_manifest(
+                empty_package,
+                Arc::from(&b"package acme:empty @ 1.0.0\nartifact component {}\n"[..]),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("artifact package without a WIT directory is recorded");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target_cfg, &graph)
+            .expect("a missing WIT unit is retained in the closure");
+        let empty_wit_entry = wit_views
+            .entries
+            .iter()
+            .find(|entry| {
+                entry.direct_order.is_some()
+                    && entry.identity.package_identity == "acme:empty"
+                    && entry.available.is_none()
+            })
+            .expect("the active direct artifact has a retained WIT-view entry");
+        assert!(
+            empty_wit_entry.identity.failure.is_some(),
+            "an artifact without a WIT inventory is retained as a failed WIT view"
+        );
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:empty @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root package scopes retain the known direct requirement");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty source member closure validates");
+        let resolutions = database
+            .resolve_world_references_with_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_views,
+            )
+            .expect("world references retain unavailable package evidence");
+        let reference = resolutions
+            .owners()
+            .iter()
+            .flat_map(|owner| owner.references())
+            .next()
+            .expect("one package reference is retained");
+        assert_eq!(
+            reference.path_result(),
+            &WorldReferencePathResult::Pkg("acme:empty/api".to_owned())
+        );
+        assert!(
+            reference.diagnostics().is_empty(),
+            "a known package without WIT output does not cascade into UNKNOWN_PACKAGE"
+        );
+    }
+
+    #[test]
+    fn world_package_references_classify_inactive_and_test_dependencies() {
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        for (manifest_text, context, expected) in [
+            (
+                "package acme:phase1 @ 1.0.0\nrequires { acme:dep @ ^1 only { wasm64-core } }\n",
+                Phase1BuildContext::default(),
+                sai_diagnostics::Code::InactiveDependency,
+            ),
+            (
+                "package acme:phase1 @ 1.0.0\nrequires test { acme:dep @ ^1 }\n",
+                Phase1BuildContext {
+                    is_root_package: false,
+                    analyzes_tests: true,
+                    ..Phase1BuildContext::default()
+                },
+                sai_diagnostics::Code::TestDependencyUnavailable,
+            ),
+            (
+                "package acme:phase1 @ 1.0.0\nrequires test { acme:dep @ ^1 }\n",
+                Phase1BuildContext::default(),
+                sai_diagnostics::Code::TestDependencyOutsideTest,
+            ),
+        ] {
+            let root = b"world references { import acme:dep/api }\n";
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root, b"");
+            let graph = phase1_root_only_graph();
+            database
+                .set_package_graph(Some(graph.clone()))
+                .expect("root-only package graph is recorded");
+            let wit_views = database
+                .collect_active_wit_view_scopes(&module_tree, &snapshot, &target_cfg, &graph)
+                .expect("empty WIT closure validates");
+            let collection = database
+                .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    context,
+                    Arc::from(manifest_text.as_bytes()),
+                    PackageRole::Root,
+                    &wit_views,
+                )
+                .expect("direct dependency declarations are retained");
+            let member_scopes = database
+                .collect_active_source_member_scopes(&collection, &graph, &[])
+                .expect("empty source member closure validates");
+            let resolutions = database
+                .resolve_world_references_with_scopes(
+                    &collection,
+                    &module_tree,
+                    &snapshot,
+                    &member_scopes,
+                    &wit_views,
+                )
+                .expect("dependency selection diagnostics are world-local");
+            let diagnostic = resolutions
+                .owners()
+                .iter()
+                .flat_map(|owner| owner.references())
+                .flat_map(|reference| reference.diagnostics())
+                .find(|diagnostic| diagnostic.code == expected)
+                .unwrap_or_else(|| panic!("expected {expected:?} for manifest {manifest_text}"));
+            assert_eq!(
+                diagnostic.data.get("dependency"),
+                Some(&sai_diagnostics::Value::String("acme:dep".to_owned()))
+            );
+            assert!(diagnostic.has_workspace_snapshot());
+            assert!(
+                resolutions
+                    .owners()
+                    .iter()
+                    .flat_map(|owner| owner.references())
+                    .flat_map(|reference| reference.diagnostics())
+                    .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::UnknownPackage),
+                "known requirements are not reclassified as unknown packages"
+            );
+        }
     }
 
     #[test]

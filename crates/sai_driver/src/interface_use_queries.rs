@@ -2437,6 +2437,7 @@ fn owner_resolution_error_tag(error: &OwnerControlFlowResolutionError) -> u8 {
         OwnerControlFlowResolutionError::Query(_) => 0,
         OwnerControlFlowResolutionError::PrimitivePrelude(_) => 1,
         OwnerControlFlowResolutionError::SessionMismatch => 33,
+        OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch => 34,
         OwnerControlFlowResolutionError::SnapshotMismatch => 2,
         OwnerControlFlowResolutionError::ModuleTreeMismatch => 3,
         OwnerControlFlowResolutionError::ModuleMemberScopes(_) => 4,

@@ -306,7 +306,9 @@ pub struct WitPackage {
     pub name: WitPackageName,
     pub interfaces: WitIndexVec<WitIfaceIdx, WitInterface>,
     pub worlds: WitIndexVec<WitWorldIdx, WitWorld>,
+    pub declaration_order: Vec<WitPackageDeclaration>, // interfaces and worlds in total WIT order
 }
+pub enum WitPackageDeclaration { Interface(WitIfaceIdx), World(WitWorldIdx) }
 pub struct WitPackageName { pub namespace: String, pub name: String, pub version: Option<Version> }
 pub struct WitStabilityVersion;              // complete SemVer text, including unbounded prerelease and build metadata
 pub struct WitInterface {
@@ -389,12 +391,12 @@ A function with several named results gets `result: None` and `unsupported: Some
 
 The **WIT order** of a unit is the order that `wit-parser` assigns when it is fed the files of §16.2.2 in path order:
 
-- interfaces and worlds in the order of their declarations;
+- interfaces and worlds in the order of their declarations. `WitPackage::declaration_order` retains this combined order while `interfaces` and `worlds` remain separately indexed;
 - the items of an interface in the order of `Interface::types`, followed by `Interface::functions`;
 - the members of a resource in declaration order;
 - the imports and exports of a world in the order of the elaborated `World::imports` and `World::exports` of `wit-parser`.
 
-The `imports` and `exports` vectors retain that elaborated order. `source_order` points to the directly written items and includes in source order, excluding items inherited through include expansion. Includes and interface world items are captured before `Resolve::push`, because the pinned parser consumes include entries and can clear an interface reference's resolved span. Generated units have the generation order of §16.10.1, because the printer writes them in that order.
+The `imports` and `exports` vectors retain that elaborated order. `source_order` points to the directly written items and includes in source order, excluding items inherited through include expansion. Includes and interface world items are captured before `Resolve::push`, because the pinned parser consumes include entries and can clear an interface reference's resolved span. Generated units have the generation order of §16.10.1, because the printer writes them in that order; their package declaration order is interfaces followed by worlds. Hand-built models without source-order metadata use that same interfaces-then-worlds order as a deterministic fallback.
 
 ### 16.3.3 Unsupported constructs
 
@@ -952,6 +954,8 @@ The `WitIfaceRef` of a local interface of the root refers to `Generated(root)`, 
 
 **Implementation progress (IR-626).** The snapshot-bound `resolve_world_references` adapter reuses the existing world-item lowering traversal without adding reference data to the test-only result. It resolves direct local `ModPath` references through their containing module scope and the package-local `ModuleMemberIndex`, records one per-reference `PathRes` and `WorldRef` span, and emits `INVALID_WORLD_ITEM`, `WRONG_NAME_KIND`, or `UNRESOLVED_NAME` with the specified world-reference or missing-segment span. Missing first segments include up to three deterministic suggestions from non-error, non-test-only current-module bindings. A `ModPath` suffix whose member scope is absent remains deferred with its resolved prefix, and `Pkg` references are retained as deferred package paths. Worlds cannot carry `@target` under spec/15 §15.11; owners are taken from the validated Phase 1 collection. Exact-name `use` fixes requiring dependency metadata are deferred by this local-only slice; adding those fixes also needs the syntax-aware fix planner, which the repository does not yet provide. The Stage 0 gate and `sai check` integration are unchanged.
 
+**Implementation progress (IR-628).** Package-qualified world references now resolve through the validated active source-package scopes and WIT views. Whole source or WIT packages in `include` receive `INVALID_WORLD_ITEM`; parser-owned whole-package import/export diagnostics are not duplicated. Unknown WIT item diagnostics carry deterministic candidates, and generated interfaces distinguish a known omission from an unavailable view so an omitted item does not gain a false missing-name diagnostic. The adapter consumes the `declared_requirements` frozen into the current collection rather than re-querying them. Hostile review found two candidate-order issues: small sets were not distance-sorted and interface/world ties did not preserve interleaved WIT declaration order. IR-632 fixes both and adds coverage. Exact-name `use` fixes and the Stage 0 gate remain unchanged.
+
 ### 16.8.2 World functions
 
 The function items of a world are function heads with `DefKind::WorldFn`. `fn_sig` converts them like interface functions, and `world_check` checks their boundary types and names (§16.8.4).
@@ -1009,7 +1013,7 @@ The **identity** of an item is its `DefId`: the view `DefId` for external interf
 
 Diagnostics are produced only for local worlds and only for occurrences whose reporting location is in `w`. Duplicates inside an included local world are reported by that world's own check, and its elaborated items are already free of them.
 
-**Include cycles.** `world_includes(P)` builds the graph of local worlds with an edge for each `include` of a local world. A strongly connected component with more than one world, or a world that includes itself, is one `WORLD_INCLUDE_CYCLE` (spec/13 §13.4.2). It is reported at the first include item, in source order, of the first world of the component in generation order, with notes at the other includes of the cycle. `WorldIncludes::cyclic` lists the worlds of these components.
+**Include cycles.** `world_includes(P)` builds the graph of local worlds with an edge for each `include` of a local world. A strongly connected component with more than one world, or a world that includes itself, is one `WORLD_INCLUDE_CYCLE` (spec/13 §13.4.2). It is reported at the first in-component include item, in source order, of the first world of the component in generation order. That edge starts one deterministic cycle witness; the witness continues by depth-first search through in-component edges in source order until it returns to the start world. The diagnostic has notes at the other include items on that witness cycle. `WorldIncludes::cyclic` lists the worlds of these components.
 
 ### 16.8.4 Exports of a world
 
@@ -1487,3 +1491,33 @@ See [implementation-review.md](../design/implementation-review.md) for the decis
 The `sai_resolve` collector now handles ordered duplicate-target selection, unsupported interface functions, and name/kind matching of impl functions and resource bindings. It reports duplicate, extra, repeated, and missing items at the specified target/item locations. Wrong-kind target diagnostics remain owned by IR-619, and unresolved resource binding types are matched by name without creating a duplicate missing-item finding. The collector is data-only and is not yet connected to Phase 1 or `sai check`.
 
 See [implementation-review.md](../design/implementation-review.md) for the decision record, verification, review status, human review items, and remaining scope.
+
+### IR-629: Collect local world-include cycles
+
+The data-only `sai_resolve::world_includes` collector builds local-world SCCs from generation-ordered worlds and source-ordered resolved include edges. It preserves repeated edges, excludes foreign targets, and reports one cycle per cyclic SCC using the first in-component edge of the first world and one deterministic depth-first witness. SCC and witness traversals are iterative. The clarified location and note contract is recorded in §16.8.3.
+
+See [implementation-review.md](../design/implementation-review.md) for the decision record, verification, hostile review, human review items, and driver integration scope.
+
+### IR-630: Build one world's imported-function lookup
+
+The data-only `sai_resolve::world_import_fns(root, input)` collector builds only the requested local world's import map. It expands included worlds depth-first at each include's source position, uses a visited set, accepts external WIT-world import maps, and preserves the first item for each canonical SAI name. The ordered key is an owned canonical `String`, since `Symbol` is session-local and does not implement `Ord`.
+
+See [implementation-review.md](../design/implementation-review.md) for the decision record, verification, hostile review, human review items, and driver integration scope.
+
+### IR-631: Preserve total declaration order across WIT interfaces and worlds
+
+`WitPackage::declaration_order` now records a typed sequence containing both interfaces and worlds. Directory and WASI models retain source order across files and declarations; generated models retain interface-then-world generation order. The sequence participates in stable hashing. Hand-built models with no order metadata use the deterministic interface-then-world fallback.
+
+See [implementation-review.md](../design/implementation-review.md) for the decision record, verification, hostile review, and human review items.
+
+### IR-632: Rank world WIT-item suggestions by distance and total order
+
+Unknown WIT items in package-qualified world references now use the §11.4.5 candidate rule: candidate sets of at most five list every item, larger sets use the relative Damerau–Levenshtein cutoff, and all candidates sort by distance then total WIT declaration order before the ten-item limit. Interface and world candidates share the package declaration order.
+
+See [implementation-review.md](../design/implementation-review.md) for the decision record, verification, hostile review, and human review items.
+
+### IR-633: Adapt resolved local world includes to cycle analysis
+
+The snapshot-bound driver adapter now translates only complete local world-include resolutions into `sai_resolve::world_includes` edges. It orders worlds and includes by package generation and source order, rebinds decoded spans to the active workspace snapshot, and ignores deferred, foreign, wrong-kind, and error results without manufacturing local graph edges.
+
+See [implementation-review.md](../design/implementation-review.md) for the decision record, verification, hostile review, and human review items.
