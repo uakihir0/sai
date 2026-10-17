@@ -45018,6 +45018,473 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
+    fn generated_wit_references_types_reexported_by_a_direct_wit_dependency() {
+        let source = concat!(
+            "use acme:codec/api as api\n",
+            "interface local {\n",
+            "  type LocalAlias = api.Wrapped\n",
+            "  fn local_member(value: api.Wrapped)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, root_package) =
+            phase1_fixture(source.as_bytes(), b"");
+        let root_key = PackageKey::new("acme:phase1#1").expect("root package key is valid");
+        let codec_key = PackageKey::new("acme:codec#1").expect("codec package key is valid");
+        let codec = database
+            .intern_package(codec_key.as_str())
+            .expect("codec package interns");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                PackageGraphNode::new(
+                    root_key,
+                    "acme:phase1",
+                    Version::parse("1.0.0").expect("root version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:codec#1", "acme:codec")],
+                )
+                .expect("root graph node is valid"),
+                PackageGraphNode::new(
+                    codec_key.clone(),
+                    "acme:codec",
+                    Version::parse("1.2.3").expect("codec version is valid"),
+                    PackageForm::Artifact,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                )
+                .expect("codec graph node is valid"),
+            ],
+        )
+        .expect("package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        database
+            .set_package_manifest(
+                codec,
+                Arc::from(
+                    &b"package acme:codec @ 1.2.3\n\
+                      artifact component {}\n\
+                      wit \"wit\"\n"[..],
+                ),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("codec WIT manifest is recorded");
+        database
+            .set_wit_files(
+                codec_key.clone(),
+                WitFilesSnapshot::listed(
+                    "wit",
+                    [PackageRelativePath::new("wit/codec.wit").expect("codec WIT path is valid")],
+                )
+                .expect("codec WIT inventory is valid"),
+                Durability::Low,
+            )
+            .expect("codec WIT inventory is recorded");
+        database
+            .set_file_contents(
+                FileKey::new(codec_key.as_str(), "wit/codec.wit")
+                    .expect("codec WIT file key is valid"),
+                Arc::from(
+                    &b"package acme:codec@1.2.3; \
+                      interface types { record payload { value: u32, } } \
+                      interface api { use acme:codec/types@1.2.3.{payload as wrapped}; }"[..],
+                ),
+                Durability::Low,
+            )
+            .expect("codec WIT source is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target, &graph)
+            .expect("active codec WIT view loads");
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the direct codec dependency is in the WIT closure");
+        let api = codec_view
+            .view
+            .interfaces
+            .get("api")
+            .expect("codec view contains the api interface");
+        let wrapped = api
+            .members
+            .get("Wrapped")
+            .expect("the api interface retains its imported type alias");
+        let api_item = &codec_view.view.model.interfaces[api.wit].items[wrapped.item];
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(reexport_reference)) =
+            &api_item.kind
+        else {
+            panic!(
+                "the facade's imported type remains a named alias: {:?}",
+                api_item.kind
+            );
+        };
+        assert_eq!(reexport_reference.interface.unit, codec_view.view.unit);
+        let types = codec_view
+            .view
+            .interfaces
+            .get("types")
+            .expect("the re-export target interface is in the same direct package");
+        let payload = types
+            .members
+            .get("Payload")
+            .expect("the re-export points at the payload record");
+        assert_eq!(reexport_reference.interface.interface, types.wit);
+        assert_eq!(reexport_reference.item, payload.item);
+
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("Phase 1 scopes use the selected codec WIT view");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT package loads through the direct re-export");
+        assert!(
+            result.failure.is_none(),
+            "the direct WIT re-export resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(unit, _)| unit == &generated_unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("root generated text is retained");
+        assert!(
+            generated.complete,
+            "a named type re-exported within the direct dependency remains representable: {}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{wrapped};")
+        );
+        assert!(generated.text.contains("type local-alias = wrapped;"));
+        assert!(
+            generated
+                .text
+                .contains("local-member: func(value: wrapped);")
+        );
+
+        let root_model = result
+            .package
+            .as_ref()
+            .expect("root generated WIT model is available");
+        let (root_interface_index, root_interface) = root_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("root source interface is generated");
+        let items = root_interface.items.iter().collect::<Vec<_>>();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["wrapped", "local-alias", "local-member"]
+        );
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(foreign_reference)) =
+            &items[0].kind
+        else {
+            panic!("the imported type retains its exact re-export target");
+        };
+        assert_eq!(foreign_reference.interface.unit, codec_view.view.unit);
+        assert_eq!(foreign_reference.interface.interface, api.wit);
+        assert_eq!(foreign_reference.item, wrapped.item);
+        assert_eq!(foreign_reference.item_name, "wrapped");
+        let generated_import_index = root_interface.items.iter_enumerated().next().unwrap().0;
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(local_reference)) = &items[1].kind
+        else {
+            panic!("the source alias targets the local generated import alias");
+        };
+        assert_eq!(local_reference.interface.unit, generated_unit);
+        assert_eq!(local_reference.interface.interface, root_interface_index);
+        assert_eq!(local_reference.item, generated_import_index);
+        assert_eq!(local_reference.item_name, "wrapped");
+        let sai_wit::WitItemKind::Func(local_member) = &items[2].kind else {
+            panic!("the source function targets the local generated import alias");
+        };
+        assert!(matches!(
+            local_member.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == root_interface_index
+                    && reference.item == generated_import_index
+                    && reference.item_name == "wrapped"
+        ));
+    }
+
+    #[test]
+    fn generated_wit_references_wit_reexport_aliases_from_direct_dependencies() {
+        let source = concat!(
+            "use acme:codec/api as api\n",
+            "interface local {\n",
+            "  type LocalAlias = api.Payload\n",
+            "  fn local_member(value: api.Payload)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, root_package) =
+            phase1_fixture(source.as_bytes(), b"");
+        let root_key = PackageKey::new("acme:phase1#1").expect("root package key is valid");
+        let codec_key = PackageKey::new("acme:codec#1").expect("codec package key is valid");
+        let base_key = PackageKey::new("acme:base#1").expect("base package key is valid");
+        let (_base, base_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:base",
+            "1.0.0",
+            b"package acme:base@1.0.0; interface types { record payload { value: u32, } }",
+        );
+        let codec = database
+            .intern_package(codec_key.as_str())
+            .expect("codec package interns");
+        database
+            .set_package_manifest(
+                codec,
+                Arc::from(
+                    &b"package acme:codec @ 1.2.3\n\
+                      artifact component {}\n\
+                      wit \"wit\"\n\
+                      requires { acme:base @ ^1 }\n"[..],
+                ),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("codec WIT manifest is recorded");
+        database
+            .set_wit_files(
+                codec_key.clone(),
+                WitFilesSnapshot::listed(
+                    "wit",
+                    [PackageRelativePath::new("wit/api.wit").expect("codec WIT path is valid")],
+                )
+                .expect("codec WIT inventory is valid"),
+                Durability::Low,
+            )
+            .expect("codec WIT inventory is recorded");
+        database
+            .set_file_contents(
+                FileKey::new(codec_key.as_str(), "wit/api.wit")
+                    .expect("codec WIT file key is valid"),
+                Arc::from(
+                    &b"package acme:codec@1.2.3; \
+                      interface api { use acme:base/types@1.0.0.{payload}; }"[..],
+                ),
+                Durability::Low,
+            )
+            .expect("codec WIT source is recorded");
+        let codec_node = PackageGraphNode::new(
+            codec_key.clone(),
+            "acme:codec",
+            Version::parse("1.2.3").expect("codec version is valid"),
+            PackageForm::Artifact,
+            PackageGraphRole::Dependency,
+            vec![graph_edge(base_key.as_str(), "acme:base")],
+        )
+        .expect("codec graph node is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                PackageGraphNode::new(
+                    root_key.clone(),
+                    "acme:phase1",
+                    Version::parse("1.0.0").expect("root version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Root,
+                    vec![graph_edge(codec_key.as_str(), "acme:codec")],
+                )
+                .expect("root graph node is valid"),
+                codec_node.clone(),
+                base_node.clone(),
+            ],
+        )
+        .expect("transitive re-export graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target, &graph)
+            .expect("the direct codec and transitive base WIT views load");
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the direct codec package is in the active WIT closure");
+        let base_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:base")
+            .expect("the transitive base package is in the active WIT closure");
+        assert_eq!(base_view.view.unit.canonical_name(), "acme:base@1.0.0");
+        let api = codec_view
+            .view
+            .interfaces
+            .get("api")
+            .expect("codec view contains the api interface");
+        let payload_alias = api
+            .members
+            .get("Payload")
+            .expect("api exposes the imported Payload type");
+        let api_item = &codec_view.view.model.interfaces[api.wit].items[payload_alias.item];
+        assert_eq!(
+            codec_view.view.model.interfaces[api.wit].name, "api",
+            "the selected model item belongs to the facade interface"
+        );
+        assert_eq!(api_item.name, "payload");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(reexport_reference)) =
+            &api_item.kind
+        else {
+            panic!(
+                "cross-package re-exports retain their facade alias: {:?}",
+                api_item.kind
+            );
+        };
+        assert_eq!(reexport_reference.interface.unit, base_view.view.unit);
+        let base_types = base_view
+            .view
+            .interfaces
+            .get("types")
+            .expect("base view contains the types interface");
+        let payload = base_types
+            .members
+            .get("Payload")
+            .expect("base view contains the payload record");
+        assert_eq!(reexport_reference.interface.interface, base_types.wit);
+        assert_eq!(reexport_reference.item, payload.item);
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::clone(&root_manifest),
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("Phase 1 uses the validated active WIT closure");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root WIT package loads with the transitive re-export");
+        assert!(
+            result.failure.is_none(),
+            "the direct facade WIT package resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(unit, _)| unit == &generated_unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("root generated text is retained");
+        assert!(
+            generated.complete,
+            "the public alias from the direct dependency remains representable: {}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{payload};")
+        );
+        assert!(
+            !generated
+                .text
+                .contains("use acme:base/types@1.0.0.{payload};"),
+            "the root imports through the selected direct facade"
+        );
+        assert!(generated.text.contains("type local-alias = payload;"));
+        assert!(
+            generated
+                .text
+                .contains("local-member: func(value: payload);")
+        );
+
+        let root_model = result
+            .package
+            .as_ref()
+            .expect("the root generated WIT model is available");
+        let (root_interface_index, local_interface) = root_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the root local interface is generated");
+        let local_items = local_interface.items.iter().collect::<Vec<_>>();
+        assert_eq!(
+            local_items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["payload", "local-alias", "local-member"]
+        );
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(foreign_reference)) =
+            &local_items[0].kind
+        else {
+            panic!("the facade alias is retained as a named type");
+        };
+        assert_eq!(foreign_reference.interface.unit, codec_view.view.unit);
+        assert_eq!(foreign_reference.interface.interface, api.wit);
+        assert_eq!(foreign_reference.item, payload_alias.item);
+        assert_eq!(foreign_reference.item_name, "payload");
+        let generated_import_index = local_interface.items.iter_enumerated().next().unwrap().0;
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(local_reference)) =
+            &local_items[1].kind
+        else {
+            panic!("the root alias targets its generated facade import");
+        };
+        assert_eq!(local_reference.interface.unit, generated_unit);
+        assert_eq!(local_reference.interface.interface, root_interface_index);
+        assert_eq!(local_reference.item, generated_import_index);
+        let sai_wit::WitItemKind::Func(local_member) = &local_items[2].kind else {
+            panic!("the root function targets its generated facade import");
+        };
+        assert!(matches!(
+            local_member.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == root_interface_index
+                    && reference.item == generated_import_index
+                    && reference.item_name == "payload"
+        ));
+    }
+
+    #[test]
     fn generated_wit_emits_self_contained_aliases_and_records_in_source_order() {
         let source = concat!(
             "interface api {\n",
