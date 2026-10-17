@@ -37,7 +37,8 @@ pub use wit_name::{sai_identifier_to_wit_name, suggested_representable_name};
 pub use wit_name_collisions::{WitNameCollision, WitNameDefinition, wit_name_collisions};
 pub use world_import_fns::{
     MissingLocalWorld, WorldImportFnItem, WorldImportFnWorld, WorldImportFnsInput,
-    WorldImportFunction, world_import_fns,
+    WorldImportFnsInputWithCycles, WorldImportFunction, world_import_fns,
+    world_import_fns_with_cycles,
 };
 pub use world_includes::{
     WorldIncludeReference, WorldIncludes, WorldIncludesInput, world_includes,

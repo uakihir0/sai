@@ -3,8 +3,8 @@
 //! The caller supplies each local world's items in source order, replacing
 //! includes with their already-resolved target `DefId`s. This module does not
 //! inspect HIR or resolve paths. It expands the requested world's includes
-//! depth-first, skips worlds already visited for this lookup, and keeps the
-//! first import function for each SAI name.
+//! depth-first, skips cyclic include targets and worlds already visited for
+//! this lookup, and keeps the first import function for each SAI name.
 //!
 //! Names are owned, canonical SAI spellings instead of [`sai_hir::Symbol`]:
 //! symbols are session-local and do not implement `Ord`, while this query
@@ -53,19 +53,61 @@ pub struct WorldImportFnsInput {
     pub external_worlds: Vec<(DefId, BTreeMap<String, DefId>)>,
 }
 
+impl WorldImportFnsInput {
+    /// Adds the package's local worlds that belong to cyclic include
+    /// components. Includes targeting any such world contribute nothing.
+    ///
+    /// Keeping cycle metadata in this wrapper preserves source compatibility
+    /// for callers that construct `WorldImportFnsInput` directly.
+    pub fn with_cyclic_worlds(
+        self,
+        cyclic_worlds: HashSet<DefId>,
+    ) -> WorldImportFnsInputWithCycles {
+        WorldImportFnsInputWithCycles {
+            input: self,
+            cyclic_worlds,
+        }
+    }
+}
+
+/// Cycle-aware query input for [`world_import_fns_with_cycles`].
+///
+/// The set contains local world IDs in cyclic SCCs. An include targeting one
+/// of these worlds is skipped, while direct items in the requested root are
+/// still collected. Use [`WorldImportFnsInput::with_cyclic_worlds`] to build
+/// this input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorldImportFnsInputWithCycles {
+    pub input: WorldImportFnsInput,
+    pub cyclic_worlds: HashSet<DefId>,
+}
+
+impl From<WorldImportFnsInput> for WorldImportFnsInputWithCycles {
+    /// Legacy callers without SCC data use an empty cyclic-world set.
+    fn from(input: WorldImportFnsInput) -> Self {
+        Self {
+            input,
+            cyclic_worlds: HashSet::new(),
+        }
+    }
+}
+
 /// The requested root is absent from the supplied local-world data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MissingLocalWorld {
     pub world: DefId,
 }
 
-/// Builds the ordered import-function lookup for one local world.
+/// Builds the ordered import-function lookup for one local world, without
+/// cycle metadata.
 ///
 /// Items are visited in source order. An include is expanded immediately and
 /// depth-first before the containing world's next item is visited. A visited
-/// set prevents cycles and repeated expansion of the same local or external
-/// world. External worlds contribute the supplied map at the point where the
-/// include is encountered.
+/// set prevents repeated expansion of the same local or external world.
+/// External worlds contribute the supplied map at the point where the include
+/// is encountered. This legacy entry point supplies an empty cyclic-world
+/// set; callers with cycle analysis results should use
+/// [`world_import_fns_with_cycles`].
 ///
 /// The lookup is computed only for `root`. This keeps work proportional to the
 /// supplied package index plus the part of the include graph reachable from
@@ -74,6 +116,26 @@ pub fn world_import_fns(
     root: DefId,
     input: WorldImportFnsInput,
 ) -> Result<BTreeMap<String, DefId>, MissingLocalWorld> {
+    world_import_fns_with_cycles(root, input.into())
+}
+
+/// Builds the ordered import-function lookup for one local world using cycle
+/// analysis results.
+///
+/// Includes targeting a world in the supplied cyclic SCC set are skipped,
+/// while direct items in the requested root are still collected. A visited
+/// set also prevents repeated expansion of the same local or external world.
+/// External worlds contribute the supplied map at the point where the include
+/// is encountered.
+pub fn world_import_fns_with_cycles(
+    root: DefId,
+    input: WorldImportFnsInputWithCycles,
+) -> Result<BTreeMap<String, DefId>, MissingLocalWorld> {
+    let WorldImportFnsInputWithCycles {
+        input,
+        cyclic_worlds,
+    } = input;
+
     let mut local_indices = HashMap::with_capacity(input.worlds.len());
     for (index, world) in input.worlds.iter().enumerate() {
         // `DefId` identifies one definition. If malformed input repeats it,
@@ -112,6 +174,9 @@ pub fn world_import_fns(
                         .or_insert(function.def_id);
                 }
                 WorldImportFnItem::Include(target) => {
+                    if cyclic_worlds.contains(target) {
+                        continue;
+                    }
                     if visited.insert(*target) {
                         stack.push((*target, 0));
                     }
@@ -285,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn cycles_terminate_and_each_world_is_expanded_once_for_the_root() {
+    fn legacy_input_without_cycle_data_terminates_and_expands_each_world_once() {
         let fixture = Fixture::new();
         let imports = world_import_fns(
             fixture.def(1),
@@ -314,6 +379,132 @@ mod tests {
         assert_eq!(imports.get("root"), Some(&fixture.def(101)));
         assert_eq!(imports.get("child"), Some(&fixture.def(201)));
         assert_eq!(imports.get("leaf"), Some(&fixture.def(301)));
+    }
+
+    #[test]
+    fn includes_of_cyclic_worlds_contribute_nothing_to_an_acyclic_root() {
+        let fixture = Fixture::new();
+        let input = fixture
+            .input(vec![
+                fixture.world(
+                    1,
+                    vec![
+                        fixture.import("root", 101),
+                        WorldImportFnItem::Include(fixture.def(2)),
+                    ],
+                ),
+                fixture.world(
+                    2,
+                    vec![
+                        fixture.import("cycle_b", 201),
+                        WorldImportFnItem::Include(fixture.def(3)),
+                    ],
+                ),
+                fixture.world(
+                    3,
+                    vec![
+                        fixture.import("cycle_c", 301),
+                        WorldImportFnItem::Include(fixture.def(2)),
+                    ],
+                ),
+            ])
+            .with_cyclic_worlds(HashSet::from([fixture.def(2), fixture.def(3)]));
+
+        let imports = world_import_fns_with_cycles(fixture.def(1), input).expect("root exists");
+
+        assert_eq!(
+            imports,
+            BTreeMap::from([("root".to_owned(), fixture.def(101))])
+        );
+    }
+
+    #[test]
+    fn cyclic_root_keeps_direct_imports_but_skips_internal_cycle_edges() {
+        let fixture = Fixture::new();
+        let input = fixture
+            .input(vec![
+                fixture.world(
+                    1,
+                    vec![
+                        fixture.import("root", 101),
+                        WorldImportFnItem::Include(fixture.def(2)),
+                    ],
+                ),
+                fixture.world(2, vec![fixture.import("child", 201)]),
+            ])
+            .with_cyclic_worlds(HashSet::from([fixture.def(1), fixture.def(2)]));
+
+        let imports = world_import_fns_with_cycles(fixture.def(1), input).expect("root exists");
+
+        assert_eq!(
+            imports,
+            BTreeMap::from([("root".to_owned(), fixture.def(101))])
+        );
+    }
+
+    #[test]
+    fn cyclic_root_still_expands_outgoing_includes_to_acyclic_worlds() {
+        let fixture = Fixture::new();
+        let input = fixture
+            .input(vec![
+                fixture.world(
+                    1,
+                    vec![
+                        fixture.import("root", 101),
+                        WorldImportFnItem::Include(fixture.def(2)),
+                        WorldImportFnItem::Include(fixture.def(3)),
+                    ],
+                ),
+                fixture.world(2, vec![fixture.import("cycle_child", 201)]),
+                fixture.world(3, vec![fixture.import("acyclic_child", 301)]),
+            ])
+            .with_cyclic_worlds(HashSet::from([fixture.def(1), fixture.def(2)]));
+
+        let imports = world_import_fns_with_cycles(fixture.def(1), input).expect("root exists");
+
+        assert_eq!(
+            imports,
+            BTreeMap::from([
+                ("acyclic_child".to_owned(), fixture.def(301)),
+                ("root".to_owned(), fixture.def(101)),
+            ])
+        );
+    }
+
+    #[test]
+    fn cyclic_include_cannot_win_before_an_acyclic_duplicate() {
+        let fixture = Fixture::new();
+        let input = fixture
+            .input(vec![
+                fixture.world(
+                    1,
+                    vec![
+                        WorldImportFnItem::Include(fixture.def(2)),
+                        WorldImportFnItem::Include(fixture.def(4)),
+                    ],
+                ),
+                fixture.world(
+                    2,
+                    vec![
+                        fixture.import("collision", 202),
+                        WorldImportFnItem::Include(fixture.def(3)),
+                    ],
+                ),
+                fixture.world(
+                    3,
+                    vec![
+                        fixture.import("cycle_peer", 303),
+                        WorldImportFnItem::Include(fixture.def(2)),
+                    ],
+                ),
+                fixture.world(4, vec![fixture.import("collision", 404)]),
+            ])
+            .with_cyclic_worlds(HashSet::from([fixture.def(2), fixture.def(3)]));
+
+        let imports = world_import_fns_with_cycles(fixture.def(1), input).expect("root exists");
+
+        assert_eq!(imports.get("collision"), Some(&fixture.def(404)));
+        assert!(!imports.contains_key("cycle_peer"));
     }
 
     #[test]
