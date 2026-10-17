@@ -13614,7 +13614,8 @@ impl RootDatabase {
     /// Returns the elaborated world with direct world-function name and
     /// boundary-type checks, plus collisions in its elaborated WIT namespace.
     ///
-    /// Checks for missing implementations of directly exported interfaces.
+    /// Checks for missing implementations of directly exported interfaces
+    /// and functions.
     pub fn world_check(
         &mut self,
         world: DefId,
@@ -13773,6 +13774,71 @@ impl RootDatabase {
                     sai_diagnostics::Code::WorldExportUnimplemented,
                     sai_diagnostics::Severity::Error,
                     format!("exported interface `{name}` has no implementation"),
+                    Some(location),
+                );
+                diagnostic.primary_label = "missing implementation".to_owned();
+                diagnostic.package = Some(package.clone());
+                elaborated
+                    .diagnostics
+                    .push(diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
+                        OwnerControlFlowResolutionError::InvalidSourceLocation(owner.owner)
+                    })?);
+            }
+        }
+        let mut seen_direct_export_function_names = HashSet::new();
+        let direct_export_functions = elaborated
+            .exports
+            .iter()
+            .filter_map(|item| {
+                let (
+                    sai_resolve::ElabKind::Func(function),
+                    sai_resolve::ElabOrigin::Written(owner),
+                ) = (item.kind, item.origin)
+                else {
+                    return None;
+                };
+                let direct_source = local_source_items.iter().find_map(|source| match source {
+                    sai_resolve::WorldElaborationSourceItem::ExportFunction {
+                        function: source_function,
+                        source_name,
+                        owner: source_owner,
+                        location,
+                        ..
+                    } if *source_function == function && *source_owner == owner => Some((
+                        item.key.clone(),
+                        source_name.clone(),
+                        owner,
+                        location.clone(),
+                    )),
+                    _ => None,
+                })?;
+                seen_direct_export_function_names
+                    .insert(direct_source.1.to_string())
+                    .then_some(direct_source)
+            })
+            .collect::<Vec<_>>();
+        if !direct_export_functions.is_empty() {
+            let mut root_function_names = HashSet::new();
+            if let Some(root_module) = collection.scopes().modules.first() {
+                for (symbol, binding) in &root_module.members {
+                    if !matches!(binding.res, Res::Def(DefKind::Fn, _)) {
+                        continue;
+                    }
+                    let name = self
+                        .symbols
+                        .resolve(*symbol)
+                        .map_err(OwnerControlFlowResolutionError::SymbolLookup)?;
+                    root_function_names.insert(name.to_string());
+                }
+            }
+            for (name, source_name, owner, location) in direct_export_functions {
+                if root_function_names.contains(source_name.as_str()) {
+                    continue;
+                }
+                let mut diagnostic = Diagnostic::new(
+                    sai_diagnostics::Code::WorldExportUnimplemented,
+                    sai_diagnostics::Severity::Error,
+                    format!("exported function `{name}` has no implementation"),
                     Some(location),
                 );
                 diagnostic.primary_label = "missing implementation".to_owned();
@@ -30416,7 +30482,9 @@ mod tests {
             "  import fn userID(fetch_user: U32, _: U32)\n",
             "}\n",
             "type Pointer = USize\n",
+            "type TypeOnlyWorldFunction = U32\n",
             "interface foo_bar {}\n",
+            "interface same_named_non_function {}\n",
             "interface missing_api {}\n",
             "interface userID {}\n",
             "interface implemented_api {}\n",
@@ -30436,6 +30504,18 @@ mod tests {
             "}\n",
             "world invalid_name_missing_impl_checks { export userID }\n",
             "world implemented_impl_checks { export implemented_api }\n",
+            "world missing_function_impl_checks {\n",
+            "  export fn missing_world_function(value: U32)\n",
+            "}\n",
+            "world implemented_function_impl_checks {\n",
+            "  export fn implemented_world_function(value: U32)\n",
+            "}\n",
+            "world type_only_function_impl_checks {\n",
+            "  export fn type_only_world_function()\n",
+            "}\n",
+            "world non_function_impl_checks {\n",
+            "  export fn same_named_non_function()\n",
+            "}\n",
             "world include_export_source { export missing_api }\n",
             "world direct_export_before_include {\n",
             "  export missing_api\n",
@@ -30452,6 +30532,7 @@ mod tests {
             "}\n",
             "world implicit_child { include acme:codec/implicit-child }\n",
             "fn external_world_field() { server.remote }\n",
+            "fn implemented_world_function(input: U32) {}\n",
         );
         let (mut database, module_tree, snapshot, root_package) =
             phase1_fixture(root.as_bytes(), b"");
@@ -31357,6 +31438,53 @@ world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
                 )
                 .expect("world check resolves the requested local world")
         };
+        let missing_function_export =
+            check_world_by_name(&mut database, "missing_function_impl_checks");
+        let missing_function_impl = missing_function_export
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented)
+            .expect("an exported world function without a root function is diagnosed");
+        assert_eq!(
+            missing_function_impl.message,
+            "exported function `missing-world-function` has no implementation"
+        );
+        let missing_function_primary = missing_function_impl
+            .primary()
+            .expect("the missing function implementation diagnostic has a source location");
+        assert_eq!(
+            &root[missing_function_primary.span.range.start().to_usize()
+                ..missing_function_primary.span.range.end().to_usize()],
+            "missing_world_function",
+            "the missing function diagnostic points at the direct world export"
+        );
+
+        let implemented_function_export =
+            check_world_by_name(&mut database, "implemented_function_impl_checks");
+        assert!(
+            !implemented_function_export.diagnostics.iter().any(
+                |diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+            ),
+            "a matching root-module function implements the direct world export"
+        );
+
+        let type_only_function_export =
+            check_world_by_name(&mut database, "type_only_function_impl_checks");
+        assert!(
+            type_only_function_export.diagnostics.iter().any(
+                |diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+            ),
+            "a type with the same WIT name does not implement the exported function"
+        );
+
+        let non_function_export = check_world_by_name(&mut database, "non_function_impl_checks");
+        assert!(
+            non_function_export.diagnostics.iter().any(
+                |diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+            ),
+            "a same-named interface does not implement the exported function"
+        );
+
         let direct_before_include =
             check_world_by_name(&mut database, "direct_export_before_include");
         assert_eq!(
