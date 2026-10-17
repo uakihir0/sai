@@ -97,8 +97,14 @@ struct SourceWorldInclude {
 
 #[derive(Clone, Debug, Default)]
 struct SourceWorldItems {
-    imports: HashMap<String, u32>,
-    exports: HashMap<String, u32>,
+    imports: HashMap<SourceWorldItemKey, u32>,
+    exports: HashMap<SourceWorldItemKey, u32>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum SourceWorldItemKey {
+    Function(String),
+    Interface { unit: String, name: String },
 }
 
 /// A short-lived loader context for constructing one package model at a time.
@@ -144,7 +150,7 @@ impl WitResolveContext {
         }
 
         let source_world_includes = capture_source_world_includes(&parsed, &self.package_units)?;
-        let source_world_items = capture_source_world_items(&parsed);
+        let source_world_items = capture_source_world_items(&parsed, &self.package_units);
         let group = parsed.group;
         let source_map = group.source_map;
         let source_offset = resolve.push_source_map(source_map);
@@ -216,7 +222,10 @@ impl WitResolveContext {
     }
 }
 
-fn capture_source_world_items(parsed: &ParsedWitPackageGroup) -> HashMap<String, SourceWorldItems> {
+fn capture_source_world_items(
+    parsed: &ParsedWitPackageGroup,
+    package_units: &HashMap<ParserPackageId, WitUnit>,
+) -> HashMap<String, SourceWorldItems> {
     parsed
         .group
         .main
@@ -226,7 +235,7 @@ fn capture_source_world_items(parsed: &ParsedWitPackageGroup) -> HashMap<String,
             let mut items = SourceWorldItems::default();
             for (key, item) in &world.imports {
                 if let (Some(name), Some(start)) = (
-                    source_world_item_name(&parsed.group.main, key, item),
+                    source_world_item_key(parsed, package_units, key, item),
                     span_start(item.span()),
                 ) {
                     items.imports.insert(name, start);
@@ -234,7 +243,7 @@ fn capture_source_world_items(parsed: &ParsedWitPackageGroup) -> HashMap<String,
             }
             for (key, item) in &world.exports {
                 if let (Some(name), Some(start)) = (
-                    source_world_item_name(&parsed.group.main, key, item),
+                    source_world_item_key(parsed, package_units, key, item),
                     span_start(item.span()),
                 ) {
                     items.exports.insert(name, start);
@@ -245,22 +254,55 @@ fn capture_source_world_items(parsed: &ParsedWitPackageGroup) -> HashMap<String,
         .collect()
 }
 
-fn source_world_item_name(
-    package: &wit_parser::UnresolvedPackage,
+fn source_world_item_key(
+    parsed: &ParsedWitPackageGroup,
+    package_units: &HashMap<ParserPackageId, WitUnit>,
     key: &WorldKey,
     item: &WorldItem,
-) -> Option<String> {
+) -> Option<SourceWorldItemKey> {
     match item {
-        WorldItem::Interface { id, .. } => package
-            .interfaces
-            .get(*id)
-            .and_then(|interface| interface.name.clone())
-            .or_else(|| match key {
-                WorldKey::Name(name) => Some(name.clone()),
+        WorldItem::Interface { id, span, .. } => {
+            let package = &parsed.group.main;
+            let name = package
+                .interfaces
+                .get(*id)
+                .and_then(|interface| interface.name.clone());
+            if let Some(name) = name {
+                return Some(SourceWorldItemKey::Interface {
+                    unit: parsed.unit().canonical_name().to_owned(),
+                    name,
+                });
+            }
+            if let Some(reference) = parsed.foreign_reference_for_parser_span(*span) {
+                let unit = reference
+                    .resolved_unit
+                    .as_ref()
+                    .or_else(|| package_unit_for_foreign_reference(reference, package_units))?;
+                return Some(SourceWorldItemKey::Interface {
+                    unit: unit.canonical_name().to_owned(),
+                    name: reference.item.clone(),
+                });
+            }
+            match key {
+                WorldKey::Name(name) => Some(SourceWorldItemKey::Interface {
+                    unit: parsed.unit().canonical_name().to_owned(),
+                    name: name.clone(),
+                }),
                 WorldKey::Interface(_) => None,
-            }),
-        WorldItem::Function(function) => Some(function.name.clone()),
+            }
+        }
+        WorldItem::Function(function) => Some(SourceWorldItemKey::Function(function.name.clone())),
         WorldItem::Type { .. } => None,
+    }
+}
+
+fn model_world_item_key(item: &WitWorldItem) -> SourceWorldItemKey {
+    match item {
+        WitWorldItem::Interface { reference, .. } => SourceWorldItemKey::Interface {
+            unit: reference.unit.canonical_name().to_owned(),
+            name: reference.name.clone(),
+        },
+        WitWorldItem::Func { name, .. } => SourceWorldItemKey::Function(name.clone()),
     }
 }
 
@@ -554,7 +596,7 @@ fn model_package(
         let direct_items = source_world_items.get(name);
         for (index, (item, _)) in imports.iter().enumerate() {
             if let Some(start) =
-                direct_items.and_then(|items| items.imports.get(world_item_name(item)))
+                direct_items.and_then(|items| items.imports.get(&model_world_item_key(item)))
             {
                 source_order.push((
                     Some(*start),
@@ -566,7 +608,7 @@ fn model_package(
         }
         for (index, (item, _)) in exports.iter().enumerate() {
             if let Some(start) =
-                direct_items.and_then(|items| items.exports.get(world_item_name(item)))
+                direct_items.and_then(|items| items.exports.get(&model_world_item_key(item)))
             {
                 source_order.push((
                     Some(*start),
@@ -1441,13 +1483,6 @@ fn resource_member_name(function: &Function) -> Result<(WitMemberKind, String), 
     Ok((kind, name.to_owned()))
 }
 
-fn world_item_name(item: &WitWorldItem) -> &str {
-    match item {
-        WitWorldItem::Interface { reference, .. } => &reference.name,
-        WitWorldItem::Func { name, .. } => name,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn world_items(
     items: &wit_parser::IndexMap<WorldKey, WorldItem>,
@@ -1968,6 +2003,62 @@ mod tests {
                 WitWorldItemDirection::Import,
             ]
         );
+    }
+
+    #[test]
+    fn preserves_interleaved_order_for_package_qualified_interface_items() {
+        let dependency = dir_unit_for("acme:dep", "acme:dep#1", "1.0.0");
+        let consumer = dir_unit_for("acme:consumer", "acme:consumer#1", "1.0.0");
+        let mut context = WitResolveContext::default();
+        let mut resolve = Resolve::default();
+        let dependency = parse_source_files(
+            dependency,
+            [WitSourceFile::new(
+                "dependency.wit",
+                "package acme:dep@1.0.0;\ninterface api { call: func(); }",
+            )],
+        )
+        .expect("dependency WIT parses");
+        context
+            .push_package(&mut resolve, dependency)
+            .expect("dependency WIT resolves");
+
+        let consumer = parse_source_files(
+            consumer,
+            [WitSourceFile::new(
+                "consumer.wit",
+                "package acme:consumer@1.0.0;\nworld app { export before: func(); import acme:dep/api@1.0.0; export after: func(); }",
+            )],
+        )
+        .expect("consumer WIT parses");
+        let package = context
+            .push_package(&mut resolve, consumer)
+            .expect("consumer WIT resolves against its dependency");
+        let world = package
+            .worlds
+            .iter()
+            .find(|world| world.name == "app")
+            .expect("app world is retained");
+
+        assert_eq!(
+            world
+                .source_order
+                .iter()
+                .map(|entry| (entry.direction, entry.index))
+                .collect::<Vec<_>>(),
+            [
+                (WitWorldItemDirection::Export, 0),
+                (WitWorldItemDirection::Import, 0),
+                (WitWorldItemDirection::Export, 1),
+            ],
+            "the resolved interface identity must not hide its direct source position"
+        );
+        assert!(matches!(
+            &world.imports[0],
+            WitWorldItem::Interface { reference, .. }
+                if reference.name == "api"
+                    && reference.unit.canonical_name() == "acme:dep@1.0.0"
+        ));
     }
 
     #[test]

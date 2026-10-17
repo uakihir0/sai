@@ -6,6 +6,7 @@ mod interface_use_queries;
 pub mod package_graph;
 mod package_wit_name_queries;
 mod wit_package_queries;
+mod world_elaboration_adapter;
 
 use interface_impl_resource_wit::{
     WitResourceIdentity, WitResourceOccurrenceIncomplete, WitResourceOccurrenceSearch,
@@ -13530,6 +13531,33 @@ impl RootDatabase {
             session_token: collection.session_token.clone(),
             owners,
         })
+    }
+
+    /// Builds the snapshot-bound, ordered input consumed by
+    /// `sai_resolve::elaborated_world`.
+    ///
+    /// The reference results, active source-member scopes, and active WIT-view
+    /// scopes must all belong to the same collection and workspace snapshot.
+    /// Semantic failures remain local to the affected world through its
+    /// `complete` flag.
+    pub fn resolve_world_elaboration_input(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        references: &WorldReferenceResolutions,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<sai_resolve::WorldElaborationInput, OwnerControlFlowResolutionError> {
+        world_elaboration_adapter::build(
+            self,
+            collection,
+            module_tree,
+            snapshot,
+            references,
+            member_scopes,
+            wit_view_scopes,
+        )
     }
 
     /// Builds the package-local include graph from matching world-reference
@@ -29916,6 +29944,8 @@ mod tests {
             "  import acme:codec/can\n",
             "  import acme:codex/api\n",
             "}\n",
+            "world independent {}\n",
+            "world implicit_child { include acme:codec/implicit-child }\n",
             "fn external_world_field() { server.remote }\n",
         );
         let (mut database, module_tree, snapshot, root_package) =
@@ -29994,7 +30024,21 @@ mod tests {
             .set_file_contents(
                 FileKey::new(codec_key.as_str(), "wit/api.wit").expect("WIT file key is valid"),
                 Arc::from(
-                    &b"package acme:codec@1.0.0; world cat {} interface car {} interface api { run: func(); } world server { import remote: func(); } interface distant {} world another {} world unsupported { type hidden = u32; import rejected: func(); }"[..],
+                    &br#"package acme:codec@1.0.0;
+interface types { type value = u32; }
+interface api { use types.{value}; run: func(value: value); }
+world cat {}
+interface car {}
+world leaf { import origin: func(); export old-out: func(); }
+world base { import api; include leaf with { origin as inherited, old-out as old-base } import base-own: func(); }
+world server { import api; import remote: func(); include base with { inherited as renamed, old-base as renamed-out } export after: func(); }
+world include-first { include base with { inherited as renamed, old-base as renamed-out } import api; }
+world implicit-base { export api; }
+world implicit-child { include implicit-base; }
+interface distant {}
+world another {}
+world unsupported { type hidden = u32; import rejected: func(); }
+world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
                 ),
                 Durability::Low,
             )
@@ -30041,6 +30085,16 @@ mod tests {
         assert!(resolutions.matches_collection(&collection));
         assert!(resolutions.matches_member_scopes(&collection, &member_scopes));
         assert!(resolutions.matches_wit_view_scopes(&collection, &wit_view_scopes));
+        let elaboration_input = database
+            .resolve_world_elaboration_input(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &resolutions,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("matching Phase 1 and active scope results build world input");
         let owner = resolutions
             .owners()
             .iter()
@@ -30050,20 +30104,28 @@ mod tests {
             .views()
             .find(|scope| scope.visible_identity == "acme:codec")
             .expect("codec view is directly visible");
-        let expected_interface = codec_view
+        let expected_interface_view = codec_view
             .view
             .interfaces
             .values()
             .find(|interface| codec_view.view.model.interfaces[interface.wit].name == "api")
-            .expect("codec interface exists")
+            .expect("codec interface exists");
+        let expected_interface = expected_interface_view.def;
+        let imported_api = expected_interface_view.def;
+        let implicit_types = codec_view
+            .view
+            .interfaces
+            .values()
+            .find(|interface| codec_view.view.model.interfaces[interface.wit].name == "types")
+            .expect("the WIT type dependency interface is retained")
             .def;
-        let expected_world = codec_view
+        let expected_world_view = codec_view
             .view
             .worlds
             .values()
             .find(|world| codec_view.view.model.worlds[world.wit].name == "server")
-            .expect("codec world exists")
-            .def;
+            .expect("codec world exists");
+        let expected_world = expected_world_view.def;
         let expected_remote = codec_view
             .view
             .worlds
@@ -30072,6 +30134,297 @@ mod tests {
             .and_then(|world| world.import_fns.get("remote"))
             .copied()
             .expect("codec server imports remote");
+        let local_world = owner.owner().def_id.to_def_id();
+        let local_world_input = elaboration_input
+            .local_worlds
+            .iter()
+            .find(|world| world.world == local_world)
+            .expect("the source world is projected");
+        assert!(
+            !local_world_input.complete,
+            "unresolved, wrong-kind, and unsupported references make only their owner incomplete"
+        );
+        let independent = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::World && descriptor.owner != owner.owner()
+            })
+            .expect("independent world is collected")
+            .owner
+            .def_id
+            .to_def_id();
+        assert!(
+            elaboration_input
+                .local_worlds
+                .iter()
+                .find(|world| world.world == independent)
+                .is_some_and(|world| world.complete),
+            "a damaged world does not make a disconnected local world incomplete"
+        );
+        let external_server = elaboration_input
+            .external_worlds
+            .iter()
+            .find(|world| world.world == expected_world)
+            .expect("the exact selected WIT server is projected");
+        assert!(external_server.complete);
+        assert_eq!(
+            external_server
+                .items
+                .iter()
+                .filter(|item| {
+                    item.direction == sai_resolve::WorldDirection::Import
+                        && item.item.kind == sai_resolve::ElabKind::Interface(imported_api)
+                })
+                .count(),
+            1,
+            "an interface present through both an include and a direct import is emitted once"
+        );
+        let include_first_view = codec_view
+            .view
+            .worlds
+            .values()
+            .find(|world| codec_view.view.model.worlds[world.wit].name == "include-first")
+            .expect("the include-first WIT world is retained");
+        let include_first_external = elaboration_input
+            .external_worlds
+            .iter()
+            .find(|world| world.world == include_first_view.def)
+            .expect("the include-first WIT world is projected");
+        assert!(include_first_external.complete);
+        assert_eq!(
+            include_first_external
+                .items
+                .iter()
+                .filter(|item| {
+                    item.direction == sai_resolve::WorldDirection::Import
+                        && item.item.kind == sai_resolve::ElabKind::Interface(imported_api)
+                })
+                .count(),
+            1,
+            "include-first interface merges remain complete and deduplicated"
+        );
+        let implicit_base_view = codec_view
+            .view
+            .worlds
+            .values()
+            .find(|world| codec_view.view.model.worlds[world.wit].name == "implicit-base")
+            .expect("the WIT world with a synthesized import is retained");
+        let implicit_base_model = &codec_view.view.model.worlds[implicit_base_view.wit];
+        assert_eq!(
+            implicit_base_model.source_order,
+            [sai_wit::WitWorldItemOrder::export(0)],
+            "the parser-synthesized import has no direct source-order slot"
+        );
+        assert!(
+            implicit_base_model.imports.iter().any(
+                |item| matches!(item, sai_wit::WitWorldItem::Interface { reference, .. } if reference.name == "types")
+            ),
+            "the resolved model retains the parser-synthesized interface import"
+        );
+        let implicit_base_external = elaboration_input
+            .external_worlds
+            .iter()
+            .find(|world| world.world == implicit_base_view.def)
+            .expect("the WIT world with a synthesized import is projected");
+        assert!(implicit_base_external.complete);
+        assert_eq!(
+            implicit_base_external
+                .items
+                .iter()
+                .map(|item| (item.direction, item.item.key.as_str(), item.item.kind))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    sai_resolve::WorldDirection::Import,
+                    "acme:codec/types",
+                    sai_resolve::ElabKind::Interface(implicit_types),
+                ),
+                (
+                    sai_resolve::WorldDirection::Export,
+                    "acme:codec/api",
+                    sai_resolve::ElabKind::Interface(imported_api),
+                ),
+            ],
+            "parser-synthesized imports are placed before the first direct export"
+        );
+        let implicit_child_view = codec_view
+            .view
+            .worlds
+            .values()
+            .find(|world| codec_view.view.model.worlds[world.wit].name == "implicit-child")
+            .expect("the WIT world that includes the implicit import is retained");
+        let implicit_external = elaboration_input
+            .external_worlds
+            .iter()
+            .find(|world| world.world == implicit_child_view.def)
+            .expect("the WIT world that includes the implicit import is projected");
+        assert!(implicit_external.complete);
+        assert!(
+            implicit_external.items.iter().any(|item| {
+                item.direction == sai_resolve::WorldDirection::Import
+                    && item.item.kind == sai_resolve::ElabKind::Interface(implicit_types)
+            }),
+            "parser-synthesized imports from exported interface dependencies are retained"
+        );
+        let local_implicit_world = elaboration_input
+            .local_worlds
+            .iter()
+            .find(|world| {
+                world.items.iter().any(|item| {
+                    matches!(
+                        item,
+                        sai_resolve::WorldElaborationSourceItem::Include { target, .. }
+                            if *target == implicit_child_view.def
+                    )
+                })
+            })
+            .expect("the source world that includes the WIT dependency is projected");
+        assert!(
+            local_implicit_world.complete,
+            "an external world's parser-synthesized interface imports preserve local include completeness"
+        );
+        let retained_world = codec_view
+            .view
+            .worlds
+            .values()
+            .find(|world| codec_view.view.model.worlds[world.wit].name == "retained")
+            .expect("the WIT view retains the world with an unsupported function");
+        let retained_external = elaboration_input
+            .external_worlds
+            .iter()
+            .find(|world| world.world == retained_world.def)
+            .expect("the retained external world is projected");
+        assert!(retained_external.complete);
+        let retained_index = codec_view.view.model.worlds[retained_world.wit]
+            .imports
+            .iter()
+            .position(
+                |item| matches!(item, sai_wit::WitWorldItem::Func { name, .. } if name == "preserved"),
+            )
+            .expect("the unsupported function remains in the semantic model");
+        let retained_def = codec_view
+            .view
+            .definition_for_entity(WitViewEntity::WorldFunction {
+                world: retained_world.wit,
+                import: true,
+                item: retained_index as u32,
+            })
+            .expect("the unsupported function retains its exact view identity");
+        assert!(matches!(
+            &codec_view.view.model.worlds[retained_world.wit].imports[retained_index],
+            sai_wit::WitWorldItem::Func {
+                unsupported: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            retained_external.items.iter().any(|item| {
+                item.item.kind == sai_resolve::ElabKind::Func(retained_def)
+                    && item.item.key == "preserved"
+            }),
+            "unsupported retained signatures remain available to downstream checks"
+        );
+        let server_model = &codec_view.view.model.worlds[expected_world_view.wit];
+        let function_def = |items: &[sai_wit::WitWorldItem], imported: bool, name: &str| {
+            let index = items
+                .iter()
+                .position(|item| matches!(item, sai_wit::WitWorldItem::Func { name: found, .. } if found == name))
+                .expect("the named WIT function is present");
+            codec_view
+                .view
+                .definition_for_entity(WitViewEntity::WorldFunction {
+                    world: expected_world_view.wit,
+                    import: imported,
+                    item: index as u32,
+                })
+                .expect("the world function has a scoped view identity")
+        };
+        let expected_renamed = function_def(&server_model.imports, true, "renamed");
+        let expected_base_own = function_def(&server_model.imports, true, "base-own");
+        let expected_renamed_out = function_def(&server_model.exports, false, "renamed-out");
+        let expected_after = function_def(&server_model.exports, false, "after");
+        assert_eq!(
+            external_server
+                .items
+                .iter()
+                .map(|item| (item.direction, item.item.key.as_str(), item.item.kind))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    sai_resolve::WorldDirection::Import,
+                    "acme:codec/api",
+                    sai_resolve::ElabKind::Interface(imported_api),
+                ),
+                (
+                    sai_resolve::WorldDirection::Import,
+                    "remote",
+                    sai_resolve::ElabKind::Func(expected_remote),
+                ),
+                (
+                    sai_resolve::WorldDirection::Import,
+                    "renamed",
+                    sai_resolve::ElabKind::Func(expected_renamed),
+                ),
+                (
+                    sai_resolve::WorldDirection::Export,
+                    "renamed-out",
+                    sai_resolve::ElabKind::Func(expected_renamed_out),
+                ),
+                (
+                    sai_resolve::WorldDirection::Import,
+                    "base-own",
+                    sai_resolve::ElabKind::Func(expected_base_own),
+                ),
+                (
+                    sai_resolve::WorldDirection::Import,
+                    "acme:codec/types",
+                    sai_resolve::ElabKind::Interface(implicit_types),
+                ),
+                (
+                    sai_resolve::WorldDirection::Export,
+                    "after",
+                    sai_resolve::ElabKind::Func(expected_after),
+                ),
+            ],
+            "source_order expands WIT includes in place, applies aliases, and resolves parent-view function identities"
+        );
+        assert!(
+            external_server
+                .items
+                .iter()
+                .all(|item| { item.item.origin == sai_resolve::ElabOrigin::External }),
+            "the external WIT world's direct and included items retain external origin"
+        );
+        let root_elaboration = sai_resolve::elaborated_world(local_world, elaboration_input)
+            .expect("the local world has a partial recovery result");
+        assert!(!root_elaboration.complete);
+        let server_include = owner
+            .references()
+            .iter()
+            .find(|reference| {
+                reference.position() == WorldReferencePosition::Include
+                    && matches!(
+                        reference.path_result(),
+                        WorldReferencePathResult::ResolvedPkg(PathRes {
+                            base: Res::Def(DefKind::World, target),
+                            ..
+                        }) if *target == expected_world
+                    )
+            })
+            .expect("the source world includes the resolved WIT server")
+            .hir_id();
+        assert!(
+            root_elaboration.imports.iter().any(|item| {
+                item.key == "renamed"
+                    && item.origin
+                        == sai_resolve::ElabOrigin::Included {
+                            include: server_include,
+                        }
+            }),
+            "external WIT include items are recoverable at the local include position"
+        );
         // The module-use path resolver has not yet added external worlds to
         // ordinary value scopes. Inject the validated view identity here to
         // exercise the downstream owner-field rule for an external `World`.
