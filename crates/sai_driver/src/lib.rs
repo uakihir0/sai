@@ -5111,6 +5111,7 @@ pub struct InterfaceTestOnlyResolutions {
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
     member_scope_closure_fingerprint: Option<Fingerprint>,
+    wit_view_closure_fingerprint: Option<Fingerprint>,
     interface_uses: Result<InterfaceUses, OwnerControlFlowResolutionError>,
     owners: Vec<InterfaceOwnerTestOnlyResolution>,
 }
@@ -5142,6 +5143,20 @@ impl InterfaceTestOnlyResolutions {
 
     pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
         self.member_scope_closure_fingerprint
+    }
+
+    pub fn matches_wit_view_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && wit_view_scopes.matches_collection(collection)
+            && self.wit_view_closure_fingerprint == Some(wit_view_scopes.closure_fingerprint)
+    }
+
+    pub const fn wit_view_closure_fingerprint(&self) -> Option<Fingerprint> {
+        self.wit_view_closure_fingerprint
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -5343,6 +5358,7 @@ pub struct PredicateOwnerResolutions {
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
     member_scope_closure_fingerprint: Option<Fingerprint>,
+    wit_view_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<PredicateOwnerResolution>,
 }
 
@@ -5375,6 +5391,20 @@ impl PredicateOwnerResolutions {
 
     pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
         self.member_scope_closure_fingerprint
+    }
+
+    pub fn matches_wit_view_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && wit_view_scopes.matches_collection(collection)
+            && self.wit_view_closure_fingerprint == Some(wit_view_scopes.closure_fingerprint)
+    }
+
+    pub const fn wit_view_closure_fingerprint(&self) -> Option<Fingerprint> {
+        self.wit_view_closure_fingerprint
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -5548,7 +5578,9 @@ pub struct ConstOwnerResolutions {
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
     member_scope_closure_fingerprint: Option<Fingerprint>,
+    wit_view_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<ConstOwnerResolution>,
+    session_token: SessionToken,
 }
 
 impl ConstOwnerResolutions {
@@ -5561,7 +5593,8 @@ impl ConstOwnerResolutions {
     }
 
     pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
-        self.snapshot_id == collection.snapshot_id
+        self.session_token == collection.session_token
+            && self.snapshot_id == collection.snapshot_id
             && self.target_cfg == collection.target_cfg
             && self.collection_input_fingerprint == collection.input_fingerprint
     }
@@ -5578,6 +5611,20 @@ impl ConstOwnerResolutions {
 
     pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
         self.member_scope_closure_fingerprint
+    }
+
+    pub fn matches_wit_view_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && wit_view_scopes.matches_collection(collection)
+            && self.wit_view_closure_fingerprint == Some(wit_view_scopes.closure_fingerprint)
+    }
+
+    pub const fn wit_view_closure_fingerprint(&self) -> Option<Fingerprint> {
+        self.wit_view_closure_fingerprint
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -11565,7 +11612,14 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<FunctionOwnerResolutions, FunctionOwnerResolutionError> {
-        self.resolve_function_owner_analyses_inner(collection, module_tree, snapshot, None, None)
+        self.resolve_function_owner_analyses_inner(
+            collection,
+            module_tree,
+            snapshot,
+            None,
+            None,
+            None,
+        )
     }
 
     /// Resolves function-owner type prefixes through a validated active-source
@@ -11589,6 +11643,36 @@ impl RootDatabase {
             module_tree,
             snapshot,
             Some(member_scopes),
+            None,
+            None,
+        )
+    }
+
+    /// Resolves function signatures and body type paths through validated
+    /// active-source member scopes and WIT views from the same package graph.
+    pub fn resolve_function_owner_analyses_with_member_scopes_and_wit_views(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<FunctionOwnerResolutions, FunctionOwnerResolutionError> {
+        if collection.session_token != self.session_token {
+            return Err(OwnerControlFlowResolutionError::SessionMismatch);
+        }
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.validate_active_wit_view_scopes(collection, snapshot, wit_view_scopes)?;
+        self.resolve_function_owner_analyses_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+            Some(wit_view_scopes),
             None,
         )
     }
@@ -11665,6 +11749,7 @@ impl RootDatabase {
             module_tree,
             snapshot,
             member_scopes,
+            wit_view_scopes,
             Some(&world_fields),
         )
     }
@@ -11675,6 +11760,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
         member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
         world_fields: Option<&FunctionOwnerWorldFieldInputs>,
     ) -> Result<FunctionOwnerResolutions, FunctionOwnerResolutionError> {
         if collection.snapshot_id != snapshot.id() {
@@ -11695,7 +11781,16 @@ impl RootDatabase {
                     .map(Phase1ModuleMemberScopePackage::scopes),
             );
         }
-        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let symbols = Arc::clone(&self.symbols);
+        let module_members = if let Some(wit_view_scopes) = wit_view_scopes {
+            let wit_views = wit_view_scopes
+                .views()
+                .map(|view| view.view.as_ref())
+                .collect::<Vec<_>>();
+            ModuleMemberIndex::new_with_wit_views(indexed_scopes, wit_views, &symbols)
+        } else {
+            ModuleMemberIndex::new(indexed_scopes)
+        };
         let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
         let source_graph_packages = member_scopes
             .map(|scopes| &scopes.source_graph_packages)
@@ -12000,8 +12095,11 @@ impl RootDatabase {
             collection_input_fingerprint: collection.input_fingerprint,
             member_scope_closure_fingerprint: member_scopes
                 .map(|scopes| scopes.closure_fingerprint),
-            wit_view_closure_fingerprint: world_fields
-                .and_then(|world_fields| world_fields.wit_view_closure_fingerprint),
+            wit_view_closure_fingerprint: wit_view_scopes
+                .map(|scopes| scopes.closure_fingerprint)
+                .or_else(|| {
+                    world_fields.and_then(|world_fields| world_fields.wit_view_closure_fingerprint)
+                }),
             owners,
             session_token: collection.session_token.clone(),
         })
@@ -12020,7 +12118,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<ConstOwnerResolutions, OwnerControlFlowResolutionError> {
-        self.resolve_const_owner_paths_inner(collection, module_tree, snapshot, None)
+        self.resolve_const_owner_paths_inner(collection, module_tree, snapshot, None, None)
     }
 
     /// Resolves const-owner type prefixes through a validated active-source
@@ -12039,7 +12137,41 @@ impl RootDatabase {
                 Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
             ));
         }
-        self.resolve_const_owner_paths_inner(collection, module_tree, snapshot, Some(member_scopes))
+        self.resolve_const_owner_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+            None,
+        )
+    }
+
+    /// Resolves constant annotations and initializer type paths through
+    /// validated source-member scopes and WIT views from the same graph.
+    pub fn resolve_const_owner_paths_with_member_scopes_and_wit_views(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<ConstOwnerResolutions, OwnerControlFlowResolutionError> {
+        if collection.session_token != self.session_token {
+            return Err(OwnerControlFlowResolutionError::SessionMismatch);
+        }
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.validate_active_wit_view_scopes(collection, snapshot, wit_view_scopes)?;
+        self.resolve_const_owner_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+            Some(wit_view_scopes),
+        )
     }
 
     fn resolve_const_owner_paths_inner(
@@ -12048,6 +12180,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
         member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
     ) -> Result<ConstOwnerResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
@@ -12067,7 +12200,16 @@ impl RootDatabase {
                     .map(Phase1ModuleMemberScopePackage::scopes),
             );
         }
-        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let symbols = Arc::clone(&self.symbols);
+        let module_members = if let Some(wit_view_scopes) = wit_view_scopes {
+            let wit_views = wit_view_scopes
+                .views()
+                .map(|view| view.view.as_ref())
+                .collect::<Vec<_>>();
+            ModuleMemberIndex::new_with_wit_views(indexed_scopes, wit_views, &symbols)
+        } else {
+            ModuleMemberIndex::new(indexed_scopes)
+        };
         let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
         let source_graph_packages = member_scopes
             .map(|scopes| &scopes.source_graph_packages)
@@ -12350,7 +12492,9 @@ impl RootDatabase {
             collection_input_fingerprint: collection.input_fingerprint,
             member_scope_closure_fingerprint: member_scopes
                 .map(|scopes| scopes.closure_fingerprint),
+            wit_view_closure_fingerprint: wit_view_scopes.map(|scopes| scopes.closure_fingerprint),
             owners,
+            session_token: collection.session_token.clone(),
         })
     }
 
@@ -12532,7 +12676,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
-        self.resolve_invariant_owner_predicates_inner(collection, module_tree, snapshot, None)
+        self.resolve_invariant_owner_predicates_inner(collection, module_tree, snapshot, None, None)
     }
 
     /// Resolves invariant type prefixes through a validated active-source
@@ -12554,6 +12698,32 @@ impl RootDatabase {
             module_tree,
             snapshot,
             Some(member_scopes),
+            None,
+        )
+    }
+
+    /// Resolves invariant type prefixes through validated active-source
+    /// member scopes and WIT views from the same package graph.
+    pub fn resolve_invariant_owner_predicates_with_member_scopes_and_wit_views(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.validate_active_wit_view_scopes(collection, snapshot, wit_view_scopes)?;
+        self.resolve_invariant_owner_predicates_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+            Some(wit_view_scopes),
         )
     }
 
@@ -12563,6 +12733,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
         member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
     ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
@@ -12582,7 +12753,16 @@ impl RootDatabase {
                     .map(Phase1ModuleMemberScopePackage::scopes),
             );
         }
-        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let symbols = Arc::clone(&self.symbols);
+        let module_members = if let Some(wit_view_scopes) = wit_view_scopes {
+            let wit_views = wit_view_scopes
+                .views()
+                .map(|view| view.view.as_ref())
+                .collect::<Vec<_>>();
+            ModuleMemberIndex::new_with_wit_views(indexed_scopes, wit_views, &symbols)
+        } else {
+            ModuleMemberIndex::new(indexed_scopes)
+        };
         let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
         let source_graph_packages = member_scopes
             .map(|scopes| &scopes.source_graph_packages)
@@ -12873,6 +13053,7 @@ impl RootDatabase {
             collection_input_fingerprint: collection.input_fingerprint,
             member_scope_closure_fingerprint: member_scopes
                 .map(|scopes| scopes.closure_fingerprint),
+            wit_view_closure_fingerprint: wit_view_scopes.map(|scopes| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -12892,7 +13073,13 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
-        self.resolve_refinement_owner_predicates_inner(collection, module_tree, snapshot, None)
+        self.resolve_refinement_owner_predicates_inner(
+            collection,
+            module_tree,
+            snapshot,
+            None,
+            None,
+        )
     }
 
     /// Resolves refined and refinement-bearing distinct type prefixes through
@@ -12914,6 +13101,32 @@ impl RootDatabase {
             module_tree,
             snapshot,
             Some(member_scopes),
+            None,
+        )
+    }
+
+    /// Resolves refined and refinement-bearing distinct type prefixes through
+    /// validated active-source member scopes and WIT views from the same graph.
+    pub fn resolve_refinement_owner_predicates_with_member_scopes_and_wit_views(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.validate_active_wit_view_scopes(collection, snapshot, wit_view_scopes)?;
+        self.resolve_refinement_owner_predicates_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+            Some(wit_view_scopes),
         )
     }
 
@@ -12923,6 +13136,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
         member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
     ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
@@ -12942,7 +13156,16 @@ impl RootDatabase {
                     .map(Phase1ModuleMemberScopePackage::scopes),
             );
         }
-        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let symbols = Arc::clone(&self.symbols);
+        let module_members = if let Some(wit_view_scopes) = wit_view_scopes {
+            let wit_views = wit_view_scopes
+                .views()
+                .map(|view| view.view.as_ref())
+                .collect::<Vec<_>>();
+            ModuleMemberIndex::new_with_wit_views(indexed_scopes, wit_views, &symbols)
+        } else {
+            ModuleMemberIndex::new(indexed_scopes)
+        };
         let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
         let source_graph_packages = member_scopes
             .map(|scopes| &scopes.source_graph_packages)
@@ -13284,6 +13507,7 @@ impl RootDatabase {
             collection_input_fingerprint: collection.input_fingerprint,
             member_scope_closure_fingerprint: member_scopes
                 .map(|scopes| scopes.closure_fingerprint),
+            wit_view_closure_fingerprint: wit_view_scopes.map(|scopes| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -13301,7 +13525,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
-        self.resolve_extern_function_predicates_inner(collection, module_tree, snapshot, None)
+        self.resolve_extern_function_predicates_inner(collection, module_tree, snapshot, None, None)
     }
 
     /// Resolves extern function type prefixes through a validated active-source
@@ -13323,6 +13547,32 @@ impl RootDatabase {
             module_tree,
             snapshot,
             Some(member_scopes),
+            None,
+        )
+    }
+
+    /// Resolves extern function type prefixes through validated active-source
+    /// member scopes and WIT views from the same package graph.
+    pub fn resolve_extern_function_predicates_with_member_scopes_and_wit_views(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.validate_active_wit_view_scopes(collection, snapshot, wit_view_scopes)?;
+        self.resolve_extern_function_predicates_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+            Some(wit_view_scopes),
         )
     }
 
@@ -13332,6 +13582,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
         member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
     ) -> Result<PredicateOwnerResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
@@ -13351,7 +13602,16 @@ impl RootDatabase {
                     .map(Phase1ModuleMemberScopePackage::scopes),
             );
         }
-        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let symbols = Arc::clone(&self.symbols);
+        let module_members = if let Some(wit_view_scopes) = wit_view_scopes {
+            let wit_views = wit_view_scopes
+                .views()
+                .map(|view| view.view.as_ref())
+                .collect::<Vec<_>>();
+            ModuleMemberIndex::new_with_wit_views(indexed_scopes, wit_views, &symbols)
+        } else {
+            ModuleMemberIndex::new(indexed_scopes)
+        };
         let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
         let source_graph_packages = member_scopes
             .map(|scopes| &scopes.source_graph_packages)
@@ -13645,6 +13905,7 @@ impl RootDatabase {
             collection_input_fingerprint: collection.input_fingerprint,
             member_scope_closure_fingerprint: member_scopes
                 .map(|scopes| scopes.closure_fingerprint),
+            wit_view_closure_fingerprint: wit_view_scopes.map(|scopes| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -14910,13 +15171,17 @@ impl RootDatabase {
                     .ok_or(
                         OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
                     )?;
+                    let diagnostic_target = members
+                        .and_then(|index| index.source_origin_target_for_diagnostics(target))
+                        .unwrap_or(target);
                     let module_path = self.module_target_diagnostic_path(
                         owner,
-                        target,
+                        diagnostic_target,
                         requesting_inputs.source.id(),
                         member_scopes,
                     )?;
                     let mut candidates = Vec::new();
+                    let mut candidate_spellings = HashSet::new();
                     if let Some(visible_members) = members.and_then(|index| {
                         index.visible_diagnostic_members(target, owner.def_id.package())
                     }) {
@@ -14928,11 +15193,30 @@ impl RootDatabase {
                                 .symbols
                                 .resolve(symbol)
                                 .map_err(OwnerControlFlowResolutionError::SymbolLookup)?;
+                            if !candidate_spellings.insert(spelling.to_string()) {
+                                continue;
+                            }
                             if let Some(distance) = edit_distance_at_most_two(&name, &spelling) {
                                 candidates.push((
                                     distance,
                                     name_span.range.start().raw(),
                                     spelling.to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    if let Some(visible_wit_members) =
+                        members.and_then(|index| index.visible_wit_diagnostic_members(target))
+                    {
+                        for (declaration_order, spelling) in visible_wit_members.enumerate() {
+                            if !candidate_spellings.insert(spelling.to_owned()) {
+                                continue;
+                            }
+                            if let Some(distance) = edit_distance_at_most_two(&name, spelling) {
+                                candidates.push((
+                                    distance,
+                                    u32::try_from(declaration_order).unwrap_or(u32::MAX),
+                                    spelling.to_owned(),
                                 ));
                             }
                         }
@@ -15147,11 +15431,7 @@ impl RootDatabase {
                 Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
             ));
         }
-        if !wit_view_scopes.matches_collection(collection) {
-            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
-                Phase1ModuleMemberScopeError::WitViewScopeMismatch(collection.package_key.clone()),
-            ));
-        }
+        self.validate_active_wit_view_scopes(collection, snapshot, wit_view_scopes)?;
         let mut owners = Vec::new();
         let test_only = self.resolve_world_test_only_paths_inner(
             collection,
@@ -17183,11 +17463,7 @@ impl RootDatabase {
                 Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
             ));
         }
-        if !wit_view_scopes.matches_collection(collection) {
-            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
-                Phase1ModuleMemberScopeError::WitViewScopeMismatch(collection.package_key.clone()),
-            ));
-        }
+        self.validate_active_wit_view_scopes(collection, snapshot, wit_view_scopes)?;
         self.resolve_world_test_only_paths_inner(
             collection,
             module_tree,
@@ -17930,7 +18206,12 @@ impl RootDatabase {
         else {
             // A source world with an invalid or colliding package WIT name
             // cannot have a corresponding item in a complete generated view.
-            return Ok(GeneratedSourceWorldView::Omitted);
+            // A partial generated view cannot establish that omission.
+            return Ok(if view_scope.view.complete {
+                GeneratedSourceWorldView::Omitted
+            } else {
+                GeneratedSourceWorldView::Unavailable
+            });
         };
         let requested_name = canonical_wit_path_name(world_name);
         let matching_world = view_scope.view.worlds.values().find(|world| {
@@ -17941,8 +18222,10 @@ impl RootDatabase {
                 world.def,
                 view_scope.view.model.worlds[world.wit].unsupported,
             ),
-            // A successfully loaded Generated view is complete. A missing
-            // source world is therefore an intentional omission.
+            // A successfully loaded Generated view may still be partial. A
+            // missing world is authoritative only when its producer marked
+            // the generated snapshot complete.
+            None if !view_scope.view.complete => GeneratedSourceWorldView::Unavailable,
             None => GeneratedSourceWorldView::Omitted,
         })
     }
@@ -17999,8 +18282,9 @@ impl RootDatabase {
             .map(|interface| interface.def);
         Ok(match matching_interface {
             Some(interface) => GeneratedSourceInterfaceView::Resolved(interface),
-            // A successfully loaded Generated view is complete. Missing
-            // source-origin metadata means the interface is not in that view.
+            // Missing source-origin metadata proves omission only when the
+            // producer says the generated package is complete.
+            None if !view_scope.view.complete => GeneratedSourceInterfaceView::Unavailable,
             None => GeneratedSourceInterfaceView::Omitted,
         })
     }
@@ -20623,7 +20907,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<InterfaceTestOnlyResolutions, OwnerControlFlowResolutionError> {
-        self.resolve_interface_test_only_paths_inner(collection, module_tree, snapshot, None)
+        self.resolve_interface_test_only_paths_inner(collection, module_tree, snapshot, None, None)
     }
 
     /// Collects local interface-use edges and cycle diagnostics from the
@@ -20662,6 +20946,32 @@ impl RootDatabase {
             module_tree,
             snapshot,
             Some(member_scopes),
+            None,
+        )
+    }
+
+    /// Resolves interface and resource-method type paths through validated
+    /// active-source member scopes and WIT views from the same package graph.
+    pub fn resolve_interface_test_only_paths_with_member_scopes_and_wit_views(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<InterfaceTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.validate_active_wit_view_scopes(collection, snapshot, wit_view_scopes)?;
+        self.resolve_interface_test_only_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+            Some(wit_view_scopes),
         )
     }
 
@@ -20671,6 +20981,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
         member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
     ) -> Result<InterfaceTestOnlyResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
@@ -20701,7 +21012,16 @@ impl RootDatabase {
                     .map(Phase1ModuleMemberScopePackage::scopes),
             );
         }
-        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let symbols = Arc::clone(&self.symbols);
+        let module_members = if let Some(wit_view_scopes) = wit_view_scopes {
+            let wit_views = wit_view_scopes
+                .views()
+                .map(|view| view.view.as_ref())
+                .collect::<Vec<_>>();
+            ModuleMemberIndex::new_with_wit_views(indexed_scopes, wit_views, &symbols)
+        } else {
+            ModuleMemberIndex::new(indexed_scopes)
+        };
         let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
         let source_graph_packages = member_scopes
             .map(|scopes| &scopes.source_graph_packages)
@@ -21217,6 +21537,7 @@ impl RootDatabase {
             collection_input_fingerprint: collection.input_fingerprint,
             member_scope_closure_fingerprint: member_scopes
                 .map(|scopes| scopes.closure_fingerprint),
+            wit_view_closure_fingerprint: wit_view_scopes.map(|scopes| scopes.closure_fingerprint),
             interface_uses,
             owners,
         })
@@ -29222,7 +29543,18 @@ mod tests {
 
     #[test]
     fn interface_impl_target_kind_resolves_members_from_active_wit_views() {
-        let source = "use acme:codec/api as api\nimpl api.run {}\nimpl api { fn run() {} }\n";
+        let source = concat!(
+            "use acme:codec/api as api\n",
+            "invariant Account { { let value: api.Data = 0; true } }\n",
+            "type Refined = api.Data where { true }\n",
+            "unsafe extern \"wasm\" module \"env\" { fn extern_member(value: api.Data); }\n",
+            "interface local {\n",
+            "  type LocalAlias = api.Data\n",
+            "  fn local_member(value: api.Data)\n",
+            "}\n",
+            "impl api.run {}\n",
+            "impl api { fn run() {} }\n",
+        );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
         let root_key = PackageKey::new("acme:phase1#1").expect("root key is valid");
@@ -29283,7 +29615,9 @@ mod tests {
         database
             .set_file_contents(
                 FileKey::new(codec_key.as_str(), "wit/api.wit").expect("WIT file key is valid"),
-                Arc::from(&b"package acme:codec@1.0.0; interface api { run: func(); }"[..]),
+                Arc::from(
+                    &b"package acme:codec@1.0.0; interface api { type data = u32; run: func(value: data); }"[..],
+                ),
                 Durability::Low,
             )
             .expect("WIT source is recorded");
@@ -29309,6 +29643,111 @@ mod tests {
         let member_scopes = database
             .collect_active_source_member_scopes(&collection, &graph, &[])
             .expect("empty source member closure validates");
+        let assert_wit_data_path = |paths: &TypeOwnerPathResolution| {
+            assert!(
+                paths.paths().values().any(|path| {
+                    path.base != Res::Err && path.resolved_segments == 2 && path.segment_count == 2
+                }),
+                "the qualified WIT type path resolves through the active view: {paths:#?}"
+            );
+            assert!(
+                paths.module_path_errors().is_empty(),
+                "resolved WIT type paths have no module member errors: {:?}",
+                paths.module_path_errors()
+            );
+        };
+
+        let invariant_resolutions = database
+            .resolve_invariant_owner_predicates_with_member_scopes_and_wit_views(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("invariant type paths resolve through active WIT views");
+        assert!(invariant_resolutions.matches_wit_view_scopes(&collection, &wit_view_scopes));
+        assert_eq!(
+            invariant_resolutions.wit_view_closure_fingerprint(),
+            Some(wit_view_scopes.closure_fingerprint())
+        );
+        assert_wit_data_path(
+            invariant_resolutions.owners()[0]
+                .type_path_resolution()
+                .expect("invariant type paths resolve")
+                .as_ref()
+                .expect("invariant type paths are present"),
+        );
+
+        let refinement_resolutions = database
+            .resolve_refinement_owner_predicates_with_member_scopes_and_wit_views(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("refinement type paths resolve through active WIT views");
+        assert!(refinement_resolutions.matches_wit_view_scopes(&collection, &wit_view_scopes));
+        assert_eq!(
+            refinement_resolutions.wit_view_closure_fingerprint(),
+            Some(wit_view_scopes.closure_fingerprint())
+        );
+        assert_wit_data_path(
+            refinement_resolutions.owners()[0]
+                .type_path_resolution()
+                .expect("refinement type paths resolve")
+                .as_ref()
+                .expect("refined owner has type paths"),
+        );
+
+        let extern_resolutions = database
+            .resolve_extern_function_predicates_with_member_scopes_and_wit_views(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("extern function type paths resolve through active WIT views");
+        assert!(extern_resolutions.matches_wit_view_scopes(&collection, &wit_view_scopes));
+        assert_eq!(
+            extern_resolutions.wit_view_closure_fingerprint(),
+            Some(wit_view_scopes.closure_fingerprint())
+        );
+        assert_wit_data_path(
+            extern_resolutions.owners()[0]
+                .type_path_resolution()
+                .expect("extern function type paths resolve")
+                .as_ref()
+                .expect("extern function has type paths"),
+        );
+
+        let interface_resolutions = database
+            .resolve_interface_test_only_paths_with_member_scopes_and_wit_views(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("interface member type paths resolve through active WIT views");
+        assert!(interface_resolutions.matches_member_scopes(&collection, &member_scopes));
+        assert!(interface_resolutions.matches_wit_view_scopes(&collection, &wit_view_scopes));
+        assert_eq!(
+            interface_resolutions.wit_view_closure_fingerprint(),
+            Some(wit_view_scopes.closure_fingerprint())
+        );
+        let interface_members = interface_resolutions.owners()[0].members();
+        assert_eq!(interface_members.len(), 2);
+        for member in interface_members {
+            assert_wit_data_path(
+                member
+                    .type_path_resolution()
+                    .expect("interface member type paths resolve"),
+            );
+        }
+
         let resolutions = database
             .resolve_trait_impl_header_test_only_paths_with_member_scopes_and_wit_views(
                 &collection,
@@ -38649,7 +39088,11 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             )
             .expect("root scopes capture the source package and unavailable WIT view");
         let member_scopes = database
-            .collect_active_source_member_scopes(&root_collection, &graph, &[source_member_package])
+            .collect_active_source_member_scopes(
+                &root_collection,
+                &graph,
+                &[source_member_package.clone()],
+            )
             .expect("source package closure validates");
         let resolutions = database
             .resolve_world_references_with_scopes(
@@ -38671,6 +39114,218 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             &WorldReferencePathResult::Pkg("acme:wit-source/streams".to_owned())
         );
         assert!(reference.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn world_package_reference_defers_when_generated_source_view_is_incomplete() {
+        let root_source = b"world references { import acme:wit-source/server }\n";
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (_, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", root_source)],
+        );
+        let (source_package, source_tree, source_files) = multi_package_fixture(
+            &mut database,
+            "acme:wit-source#1",
+            "acme:wit-source@1.0.0",
+            &[("lib.sai", b"pub world server {}\n")],
+        );
+        snapshot_files.extend(source_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let root_key = PackageKey::new("acme:root#1").expect("root package key is valid");
+        let source_key = PackageKey::new("acme:wit-source#1").expect("source package key is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                PackageGraphNode::new(
+                    root_key,
+                    "acme:root",
+                    Version::parse("1.0.0").expect("root package version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:wit-source#1", "acme:wit-source")],
+                )
+                .expect("root package graph node is valid"),
+                PackageGraphNode::new(
+                    source_key,
+                    "acme:wit-source",
+                    Version::parse("1.0.0").expect("source package version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                )
+                .expect("source package graph node is valid"),
+            ],
+        )
+        .expect("package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let source_manifest: Arc<[u8]> =
+            Arc::from(&b"package acme:wit-source @ 1.0.0\nsource \"src\"\n"[..]);
+        database
+            .set_package_manifest(
+                source_package,
+                Arc::clone(&source_manifest),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("source package contract is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-wasi").expect("target config is valid");
+        let source_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &source_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                source_manifest,
+                PackageRole::Dependency,
+                &[],
+            )
+            .expect("source dependency scopes collect");
+        let source_member_package = source_collection.module_member_scope_package();
+        let partial_generated = database
+            .generated_wit_text(source_package)
+            .expect("generated WIT query succeeds")
+            .expect("source package publishes a generated snapshot");
+        assert!(!partial_generated.complete);
+        let partial_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target_cfg, &graph)
+            .expect("partial generated view remains available");
+        let generated_view = partial_views
+            .views()
+            .find(|scope| scope.view.unit.canonical_name() == "acme:wit-source@1.0.0")
+            .expect("the generated WIT view is present");
+        assert!(!generated_view.view.complete);
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              requires { acme:wit-source @ ^1 }\n"[..],
+        );
+        let root_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                Arc::clone(&root_manifest),
+                PackageRole::Root,
+                &[source_member_package.as_foreign_package_scopes("acme:wit-source")],
+                &partial_views,
+            )
+            .expect("root scopes capture the source package and partial WIT view");
+        let member_scopes = database
+            .collect_active_source_member_scopes(
+                &root_collection,
+                &graph,
+                &[source_member_package.clone()],
+            )
+            .expect("source package closure validates");
+        let partial_resolutions = database
+            .resolve_world_references_with_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+                &partial_views,
+            )
+            .expect("partial generated view leaves an absent source world deferred");
+        let partial_reference = partial_resolutions
+            .owners()
+            .iter()
+            .flat_map(|owner| owner.references())
+            .next()
+            .expect("one package reference is retained");
+        assert_eq!(
+            partial_reference.path_result(),
+            &WorldReferencePathResult::Pkg("acme:wit-source/server".to_owned())
+        );
+        assert!(partial_reference.diagnostics().is_empty());
+
+        let complete_generated = sai_wit::GeneratedText {
+            complete: true,
+            ..partial_generated.as_ref().clone()
+        };
+        database
+            .set_generated_wit_text(source_package, complete_generated, Durability::Low)
+            .expect("the test flips only the generated completeness metadata");
+        assert!(matches!(
+            database.resolve_world_references_with_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+                &partial_views,
+            ),
+            Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::WitViewScopeMismatch(_)
+            ))
+        ));
+        assert!(matches!(
+            database.resolve_world_test_only_paths_with_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+                &partial_views,
+            ),
+            Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::WitViewScopeMismatch(_)
+            ))
+        ));
+        let complete_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target_cfg, &graph)
+            .expect("complete generated view reloads");
+        assert_ne!(
+            partial_views.closure_fingerprint(),
+            complete_views.closure_fingerprint(),
+            "completeness-only changes participate in the active-view identity"
+        );
+        let complete_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &[source_member_package.as_foreign_package_scopes("acme:wit-source")],
+                &complete_views,
+            )
+            .expect("root scopes refresh against the complete generated view");
+        let complete_member_scopes = database
+            .collect_active_source_member_scopes(
+                &complete_collection,
+                &graph,
+                &[source_member_package],
+            )
+            .expect("source package closure remains valid");
+        let complete_resolutions = database
+            .resolve_world_references_with_scopes(
+                &complete_collection,
+                &root_tree,
+                &snapshot,
+                &complete_member_scopes,
+                &complete_views,
+            )
+            .expect("a complete generated view authoritatively omits the world");
+        let complete_reference = complete_resolutions
+            .owners()
+            .iter()
+            .flat_map(|owner| owner.references())
+            .next()
+            .expect("one package reference is retained");
+        assert!(matches!(
+            complete_reference.path_result(),
+            WorldReferencePathResult::ResolvedPkg(PathRes { base: Res::Err, .. })
+        ));
+        assert!(complete_reference.diagnostics().is_empty());
     }
 
     #[test]
@@ -43927,6 +44582,105 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .expect("the documentation-updated text is retained");
         assert_ne!(docs_changed_text, first_text);
         assert!(docs_changed_text.contains("Updated API docs."));
+    }
+
+    #[test]
+    fn generated_wit_emits_self_contained_aliases_and_records_in_source_order() {
+        let source = concat!(
+            "interface api {\n",
+            "  /// Stable identifier.\n",
+            "  type Id = U32\n",
+            "  /// A request payload.\n",
+            "  type Payload {\n",
+            "    /// Request identifier.\n",
+            "    request_id: U32\n",
+            "    label: U64\n",
+            "  }\n",
+            "  type Wrapped = Id\n",
+            "  fn read(value: Wrapped) -> U32\n",
+            "  fn ping(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated aliases and records load");
+        assert!(
+            result.failure.is_none(),
+            "generated declaration text parses and resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        let package_model = result.package.expect("generated WIT model loads");
+        let interface = package_model
+            .root()
+            .interfaces
+            .iter()
+            .next()
+            .expect("the local interface is generated");
+        let items = interface.items.iter().collect::<Vec<_>>();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "payload", "ping"],
+            "named references stay omitted while self-contained declarations and functions survive in source order"
+        );
+        assert_eq!(items[0].docs.as_deref(), Some("Stable identifier."));
+        assert_eq!(
+            items[0].kind,
+            sai_wit::WitItemKind::Alias(sai_wit::WitType::U32)
+        );
+        assert_eq!(items[1].docs.as_deref(), Some("A request payload."));
+        let sai_wit::WitItemKind::Record(fields) = &items[1].kind else {
+            panic!("the payload declaration is emitted as a WIT record");
+        };
+        assert_eq!(
+            fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["request-id", "label"]
+        );
+        assert_eq!(
+            fields[0].docs.as_deref(),
+            Some("Request identifier."),
+            "record field documentation is retained"
+        );
+        assert_eq!(fields[0].ty, sai_wit::WitType::U32);
+        assert_eq!(fields[1].ty, sai_wit::WitType::U64);
+        assert!(!generated.text.contains("type Wrapped"));
+        assert!(!generated.text.contains("read: func"));
     }
 
     #[test]

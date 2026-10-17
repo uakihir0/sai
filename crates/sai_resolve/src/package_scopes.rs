@@ -1694,6 +1694,15 @@ pub fn collect_module_alias_bindings_with_foreign_wit_views_unavailable_and_sour
                                                         source_interface: Some(interface_def),
                                                     },
                                                 ));
+                                            } else if !view_scope.view.complete {
+                                                // A partial view may have
+                                                // omitted this source
+                                                // interface from its
+                                                // projection. Keep the
+                                                // re-export deferred until
+                                                // the producer is complete.
+                                                resolved_foreign_target =
+                                                    Some((None, PendingItemTarget::Deferred));
                                             } else {
                                                 // The source interface was
                                                 // omitted from the generated
@@ -2776,6 +2785,9 @@ impl LocalModuleMemberResolver<'_> {
             .values()
             .any(|interface| interface.origin_identity.is_some());
         if !has_origins {
+            if !view_scope.view.complete {
+                return Ok(LocalMemberLookup::DeferredSource(binding));
+            }
             // A Generated view without origins has no source interface
             // replacement. The source package owns the interface diagnostics.
             binding.res = Res::Err;
@@ -2789,6 +2801,9 @@ impl LocalModuleMemberResolver<'_> {
             .values()
             .find(|interface| interface.origin_identity.as_ref() == Some(&origin))
         else {
+            if !view_scope.view.complete {
+                return Ok(LocalMemberLookup::DeferredSource(binding));
+            }
             binding.res = Res::Err;
             return Ok(LocalMemberLookup::FoundSuppressed(binding));
         };
@@ -2828,6 +2843,13 @@ impl LocalModuleMemberResolver<'_> {
                 origin: BindingOrigin::Decl,
                 visibility: Visibility::Pub,
             })),
+            ModuleMemberLookup::DeferredWit => {
+                if let Some(source_interface) = source_interface {
+                    self.lookup_omitted_generated_member(scope, source_interface, name, import_span)
+                } else {
+                    Ok(LocalMemberLookup::Deferred)
+                }
+            }
             ModuleMemberLookup::Missing => {
                 if let Some(source_interface) = source_interface {
                     self.lookup_omitted_generated_member(scope, source_interface, name, import_span)
@@ -6612,6 +6634,119 @@ mod tests {
     }
 
     #[test]
+    fn partial_transitive_view_without_requested_interface_defers_reexport() {
+        let fixture = Fixture::new(
+            "use acme:foreign/api/remote_codec as deferred\n",
+            "wasm32-core",
+        );
+        let mut foreign = ForeignScopeFixture::new(&fixture);
+        let origin_package = fixture
+            .packages
+            .intern("acme:origin#1")
+            .expect("transitive source package interns");
+        let origin_def_paths =
+            DefPathInterner::new(origin_package, &fixture.packages, &fixture.symbols)
+                .expect("transitive definition path interner");
+        let api = fixture.symbols.intern("api").unwrap();
+        let shared = fixture.symbols.intern("shared").unwrap();
+        let unrelated = fixture.symbols.intern("unrelated").unwrap();
+        let source_interface = intern_path(
+            origin_package,
+            &[DisambiguatedDefPathData {
+                data: DefPathData::Module(api),
+                disambiguator: 0,
+            }],
+            DefPathData::Interface(shared),
+            0,
+            &fixture.packages,
+            &fixture.symbols,
+            &origin_def_paths,
+        )
+        .expect("transitive source interface path")
+        .to_def_id();
+        let unrelated_interface = intern_path(
+            origin_package,
+            &[],
+            DefPathData::Interface(unrelated),
+            0,
+            &fixture.packages,
+            &fixture.symbols,
+            &origin_def_paths,
+        )
+        .expect("unrelated source interface path")
+        .to_def_id();
+        let remote_codec = fixture.symbols.intern("remote_codec").unwrap();
+        let mut reexported_binding =
+            foreign.scopes.modules[1].members[&fixture.symbols.intern("codec").unwrap()].clone();
+        reexported_binding.res = Res::Def(DefKind::Interface, source_interface);
+        foreign.scopes.modules[1]
+            .members
+            .insert(remote_codec, reexported_binding);
+
+        let direct_view =
+            generated_test_view(&fixture, &foreign.def_paths, "codec", foreign.codec_def_id);
+        let mut partial_view = generated_test_view_for_package(
+            &fixture,
+            &origin_def_paths,
+            "acme:origin",
+            "unrelated",
+            unrelated_interface,
+            &[],
+        );
+        partial_view.complete = false;
+        assert!(
+            partial_view.interfaces["unrelated"].origin.is_some(),
+            "the partial view contains an unrelated source origin"
+        );
+        let wit_scopes = [
+            ForeignWitViewScope {
+                visible_identity: "acme:foreign",
+                view: &direct_view,
+                source_def_paths: Some(&foreign.def_paths),
+                directly_visible: true,
+            },
+            ForeignWitViewScope {
+                visible_identity: "acme:origin",
+                view: &partial_view,
+                source_def_paths: Some(&origin_def_paths),
+                directly_visible: false,
+            },
+        ];
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &wit_scopes,
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let deferred = fixture.symbols.intern("deferred").unwrap();
+        assert!(
+            !root.scope.contains_key(&deferred),
+            "a partial view cannot prove that the requested source interface was omitted"
+        );
+        assert!(
+            scopes.diagnostics.iter().all(|diagnostic| {
+                !matches!(
+                    diagnostic.code,
+                    Code::UnresolvedImport | Code::UnknownModule | Code::FeatureNotImplemented
+                )
+            }),
+            "the missing generated interface stays deferred without a secondary diagnostic"
+        );
+    }
+
+    #[test]
     fn transitive_omitted_member_uses_its_owner_source_scope() {
         let fixture = Fixture::new(
             concat!(
@@ -6786,6 +6921,49 @@ mod tests {
                 .count(),
             1,
             "an absent member still reports an unresolved import"
+        );
+
+        let mut partial_view = transitive_view.clone();
+        partial_view.complete = false;
+        let partial_wit_scopes = [
+            ForeignWitViewScope {
+                visible_identity: "acme:foreign",
+                view: &direct_view,
+                source_def_paths: Some(&foreign.def_paths),
+                directly_visible: true,
+            },
+            ForeignWitViewScope {
+                visible_identity: "acme:origin",
+                view: &partial_view,
+                source_def_paths: Some(&origin_def_paths),
+                directly_visible: false,
+            },
+        ];
+        let (partial_scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views_unavailable_and_source_scopes(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &partial_wit_scopes,
+                &[],
+                &source_member_scopes,
+            );
+        let partial_root = &partial_scopes.modules[ModuleId::ROOT.raw() as usize];
+        assert_eq!(
+            partial_root.scope[&known_omitted].res,
+            Res::Err,
+            "a partial WIT omission falls back to the owning source interface"
+        );
+        assert_eq!(
+            partial_scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::UnresolvedImport)
+                .count(),
+            1,
+            "source scopes prove that the absent member is truly unknown"
         );
     }
 

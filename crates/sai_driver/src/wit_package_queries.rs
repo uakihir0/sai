@@ -463,26 +463,29 @@ fn build_wit_view(
             let view_def_paths =
                 super::persistent_wit_view_def_paths(unit, packages, symbols, view_def_paths)
                     .map_err(WitViewQueryError::View)?;
-            if generated.origins.is_empty() {
-                WitView::build(model.clone(), packages, symbols, view_def_paths)
+            let source_def_paths = if generated.origins.is_empty() {
+                None
             } else {
-                let source_def_paths = source_def_paths
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&source_package)
-                    .cloned()
-                    .ok_or(WitViewQueryError::View(
-                        WitViewError::GeneratedOriginInternerRequired,
-                    ))?;
-                WitView::build_with_origins(
-                    model.clone(),
-                    packages,
-                    symbols,
-                    view_def_paths,
-                    &source_def_paths,
-                    &generated.origins,
+                Some(
+                    source_def_paths
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&source_package)
+                        .cloned()
+                        .ok_or(WitViewQueryError::View(
+                            WitViewError::GeneratedOriginInternerRequired,
+                        ))?,
                 )
-            }
+            };
+            WitView::build_with_generated_metadata(
+                model.clone(),
+                packages,
+                symbols,
+                view_def_paths,
+                source_def_paths.as_deref(),
+                &generated.origins,
+                generated.complete,
+            )
         }
         WitUnitKind::Dir { .. } | WitUnitKind::Wasi { .. } => {
             let view_def_paths =

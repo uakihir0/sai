@@ -173,6 +173,13 @@ pub struct Shadowed {
 pub struct WitView {
     pub unit: WitUnit,
     pub package: PackageId,
+    /// Whether this view represents the complete contents of its unit.
+    ///
+    /// Authored WIT views are complete after successful loading. Generated
+    /// source-package views retain the producer's completeness bit so
+    /// consumers do not treat names omitted by a partial projection as
+    /// authoritative misses.
+    pub complete: bool,
     pub interfaces: BTreeMap<String, ViewInterface>,
     pub worlds: BTreeMap<String, ViewWorld>,
     /// The current definitions indexed by the persistent path interner.
@@ -193,6 +200,7 @@ impl fmt::Debug for WitView {
             .debug_struct("WitView")
             .field("unit", &self.unit)
             .field("package", &self.package)
+            .field("complete", &self.complete)
             .field("interfaces", &self.interfaces)
             .field("worlds", &self.worlds)
             .field("defs", &self.defs)
@@ -205,6 +213,7 @@ impl PartialEq for WitView {
     fn eq(&self, other: &Self) -> bool {
         self.unit == other.unit
             && self.package == other.package
+            && self.complete == other.complete
             && self.interfaces == other.interfaces
             && self.worlds == other.worlds
             && self.defs == other.defs
@@ -227,7 +236,7 @@ impl WitView {
         symbols: &Interner,
         def_paths: Arc<DefPathInterner>,
     ) -> Result<Self, WitViewError> {
-        Self::build_inner(model, packages, symbols, def_paths, None, &[])
+        Self::build_inner(model, packages, symbols, def_paths, None, &[], true)
     }
 
     /// Builds a view and attaches generated-interface provenance.
@@ -253,6 +262,30 @@ impl WitView {
             def_paths,
             Some(source_def_paths),
             origins,
+            true,
+        )
+    }
+
+    /// Builds a generated view with its producer completeness and origins.
+    ///
+    /// `source_def_paths` may be absent only when `origins` is empty.
+    pub fn build_with_generated_metadata(
+        model: WitPackage,
+        packages: &PackageInterner,
+        symbols: &Interner,
+        def_paths: Arc<DefPathInterner>,
+        source_def_paths: Option<&DefPathInterner>,
+        origins: &[(String, DefId)],
+        complete: bool,
+    ) -> Result<Self, WitViewError> {
+        Self::build_inner(
+            model,
+            packages,
+            symbols,
+            def_paths,
+            source_def_paths,
+            origins,
+            complete,
         )
     }
 
@@ -263,6 +296,7 @@ impl WitView {
         def_paths: Arc<DefPathInterner>,
         source_def_paths: Option<&DefPathInterner>,
         origins: &[(String, DefId)],
+        complete: bool,
     ) -> Result<Self, WitViewError> {
         let unit = model.unit.clone();
         let actual_name = model
@@ -461,6 +495,7 @@ impl WitView {
         Ok(Self {
             unit,
             package,
+            complete,
             interfaces,
             worlds,
             defs,

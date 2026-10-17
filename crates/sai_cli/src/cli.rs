@@ -4798,6 +4798,12 @@ fn export_world_selection_for_check<T>(
             // into an internal error or a false unknown-world diagnostic.
             Ok(None)
         }
+        Err(sai_driver::ExportWorldQueryError::IncompleteGeneratedWit { .. }) => {
+            // A partial generated source-package view cannot prove that an
+            // absent world is invalid. Keep selection unavailable while the
+            // existing incomplete-feature diagnostic owns the missing stage.
+            Ok(None)
+        }
         Err(error) => Err(format!("{failure_context}: {error:?}")),
     }
 }
@@ -5421,54 +5427,117 @@ fn module_tree_workspace_check_diagnostics(
                     .map_err(|error| {
                         format!("active source member-scope closure failed: {error:?}")
                     })?;
-                let resolutions = database
-                    .resolve_type_owner_paths_with_member_scopes(
-                        collection,
-                        module_tree,
-                        &workspace_snapshot,
-                        &member_scopes,
-                    )
+                let resolutions =
+                    if let Some(wit_view_scopes) = finalized_wit_view_scopes.get(&package_key) {
+                        database.resolve_type_owner_paths_with_member_scopes_and_wit_views(
+                            collection,
+                            module_tree,
+                            &workspace_snapshot,
+                            &member_scopes,
+                            wit_view_scopes,
+                        )
+                    } else {
+                        database.resolve_type_owner_paths_with_member_scopes(
+                            collection,
+                            module_tree,
+                            &workspace_snapshot,
+                            &member_scopes,
+                        )
+                    }
                     .map_err(|error| format!("type-owner path query failed: {error:?}"))?;
-                let function_resolutions = database
-                    .resolve_function_owner_analyses_with_member_scopes(
-                        collection,
-                        module_tree,
-                        &workspace_snapshot,
-                        &member_scopes,
-                    )
+                let function_resolutions =
+                    if let Some(wit_view_scopes) = finalized_wit_view_scopes.get(&package_key) {
+                        database.resolve_function_owner_analyses_with_member_scopes_and_wit_views(
+                            collection,
+                            module_tree,
+                            &workspace_snapshot,
+                            &member_scopes,
+                            wit_view_scopes,
+                        )
+                    } else {
+                        database.resolve_function_owner_analyses_with_member_scopes(
+                            collection,
+                            module_tree,
+                            &workspace_snapshot,
+                            &member_scopes,
+                        )
+                    }
                     .map_err(|error| format!("function owner analysis failed: {error:?}"))?;
-                let const_resolutions = database
-                    .resolve_const_owner_paths_with_member_scopes(
-                        collection,
-                        module_tree,
-                        &workspace_snapshot,
-                        &member_scopes,
-                    )
+                let const_resolutions =
+                    if let Some(wit_view_scopes) = finalized_wit_view_scopes.get(&package_key) {
+                        database.resolve_const_owner_paths_with_member_scopes_and_wit_views(
+                            collection,
+                            module_tree,
+                            &workspace_snapshot,
+                            &member_scopes,
+                            wit_view_scopes,
+                        )
+                    } else {
+                        database.resolve_const_owner_paths_with_member_scopes(
+                            collection,
+                            module_tree,
+                            &workspace_snapshot,
+                            &member_scopes,
+                        )
+                    }
                     .map_err(|error| format!("const owner analysis failed: {error:?}"))?;
-                let invariant_resolutions = database
-                    .resolve_invariant_owner_predicates_with_member_scopes(
+                let invariant_resolutions = if let Some(wit_view_scopes) =
+                    finalized_wit_view_scopes.get(&package_key)
+                {
+                    database.resolve_invariant_owner_predicates_with_member_scopes_and_wit_views(
+                        collection,
+                        module_tree,
+                        &workspace_snapshot,
+                        &member_scopes,
+                        wit_view_scopes,
+                    )
+                } else {
+                    database.resolve_invariant_owner_predicates_with_member_scopes(
                         collection,
                         module_tree,
                         &workspace_snapshot,
                         &member_scopes,
                     )
-                    .map_err(|error| format!("invariant owner analysis failed: {error:?}"))?;
-                let refinement_resolutions = database
-                    .resolve_refinement_owner_predicates_with_member_scopes(
+                }
+                .map_err(|error| format!("invariant owner analysis failed: {error:?}"))?;
+                let refinement_resolutions = if let Some(wit_view_scopes) =
+                    finalized_wit_view_scopes.get(&package_key)
+                {
+                    database.resolve_refinement_owner_predicates_with_member_scopes_and_wit_views(
+                        collection,
+                        module_tree,
+                        &workspace_snapshot,
+                        &member_scopes,
+                        wit_view_scopes,
+                    )
+                } else {
+                    database.resolve_refinement_owner_predicates_with_member_scopes(
                         collection,
                         module_tree,
                         &workspace_snapshot,
                         &member_scopes,
                     )
-                    .map_err(|error| format!("refinement owner analysis failed: {error:?}"))?;
-                let extern_resolutions = database
-                    .resolve_extern_function_predicates_with_member_scopes(
+                }
+                .map_err(|error| format!("refinement owner analysis failed: {error:?}"))?;
+                let extern_resolutions = if let Some(wit_view_scopes) =
+                    finalized_wit_view_scopes.get(&package_key)
+                {
+                    database.resolve_extern_function_predicates_with_member_scopes_and_wit_views(
+                        collection,
+                        module_tree,
+                        &workspace_snapshot,
+                        &member_scopes,
+                        wit_view_scopes,
+                    )
+                } else {
+                    database.resolve_extern_function_predicates_with_member_scopes(
                         collection,
                         module_tree,
                         &workspace_snapshot,
                         &member_scopes,
                     )
-                    .map_err(|error| format!("extern function owner analysis failed: {error:?}"))?;
+                }
+                .map_err(|error| format!("extern function owner analysis failed: {error:?}"))?;
                 let trait_impl_header_resolutions =
                     if let Some(wit_view_scopes) = finalized_wit_view_scopes.get(&package_key) {
                         database
@@ -5518,21 +5587,41 @@ fn module_tree_workspace_check_diagnostics(
                         &trait_impl_member_resolutions,
                     )
                     .map_err(|error| format!("interface impl collection failed: {error:?}"))?;
-                let interface_resolutions = database
-                    .resolve_interface_test_only_paths_with_member_scopes(
-                        collection,
-                        module_tree,
-                        &workspace_snapshot,
-                        &member_scopes,
-                    )
+                let interface_resolutions =
+                    if let Some(wit_view_scopes) = finalized_wit_view_scopes.get(&package_key) {
+                        database.resolve_interface_test_only_paths_with_member_scopes_and_wit_views(
+                            collection,
+                            module_tree,
+                            &workspace_snapshot,
+                            &member_scopes,
+                            wit_view_scopes,
+                        )
+                    } else {
+                        database.resolve_interface_test_only_paths_with_member_scopes(
+                            collection,
+                            module_tree,
+                            &workspace_snapshot,
+                            &member_scopes,
+                        )
+                    }
                     .map_err(|error| format!("interface member analysis failed: {error:?}"))?;
-                let world_resolutions = database
-                    .resolve_world_test_only_paths_with_member_scopes(
-                        collection,
-                        module_tree,
-                        &workspace_snapshot,
-                        &member_scopes,
-                    )
+                let world_resolutions =
+                    if let Some(wit_view_scopes) = finalized_wit_view_scopes.get(&package_key) {
+                        database.resolve_world_test_only_paths_with_scopes(
+                            collection,
+                            module_tree,
+                            &workspace_snapshot,
+                            &member_scopes,
+                            wit_view_scopes,
+                        )
+                    } else {
+                        database.resolve_world_test_only_paths_with_member_scopes(
+                            collection,
+                            module_tree,
+                            &workspace_snapshot,
+                            &member_scopes,
+                        )
+                    }
                     .map_err(|error| format!("world item analysis failed: {error:?}"))?;
                 let mut owner_diagnostics = Vec::new();
                 owner_diagnostics.extend(interface_impls.diagnostics.iter().cloned());

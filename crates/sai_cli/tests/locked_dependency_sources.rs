@@ -753,9 +753,9 @@ fn locked_check_does_not_report_missing_source_wit_generation_as_internal_error(
     .expect("write source dependency manifest");
     fs::write(
         dependency.join("src/lib.sai"),
-        "pub interface api {}\npub world api {}\n",
+        "pub interface types {}\npub world api {}\n",
     )
-    .expect("write valid source dependency");
+    .expect("write source dependency with a world the generator cannot emit yet");
     fs::write(
         root.join("sai.lock"),
         concat!(
@@ -1047,6 +1047,109 @@ fn locked_check_resolves_foreign_imports_after_dependency_reexports() {
 }
 
 #[test]
+fn locked_check_reports_generated_wit_typos_in_function_and_const_owners() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    let dependency = root.join("dependency");
+    fs::create_dir_all(root.join("src")).expect("create root source directory");
+    fs::create_dir_all(dependency.join("src")).expect("create dependency source directory");
+    fs::write(
+        root.join("sai.package"),
+        concat!(
+            "package acme:check @ 0.1.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n",
+            "targets { wasm32-wasi }\n",
+            "requires { acme:dependency @ ^1 from path \"dependency\" }\n",
+        ),
+    )
+    .expect("write root manifest");
+    fs::write(
+        dependency.join("sai.package"),
+        "package acme:dependency @ 1.0.0\nsource \"src\"\ntargets { wasm32-wasi }\n",
+    )
+    .expect("write dependency manifest");
+    fs::write(
+        dependency.join("src/lib.sai"),
+        "pub interface api {\n  type PublicType = U32\n  type Wrapped = PublicType\n}\n",
+    )
+    .expect("write partial generated interface");
+    let source = concat!(
+        "use acme:dependency/api as api\n",
+        "fn valid(value: api.PublicType) {}\n",
+        "const GOOD: api.PublicType = 0\n",
+        "fn omitted(value: api.Wrapped) {}\n",
+        "const OMITTED: api.Wrapped = 0\n",
+        "fn bad(value: api.PublicTypo) {\n",
+        "  let body_missing: api.PublicTypo = 0\n",
+        "}\n",
+        "const BAD: api.PublicTypo = {\n",
+        "  let inner_missing: api.PublicTypo = 0\n",
+        "  0\n",
+        "}\n",
+    );
+    fs::write(root.join("src/lib.sai"), source).expect("write root owners");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:check @ 0.1.0\n",
+            "    targets { wasm32-wasi }\n",
+            "    requires acme:dependency @ ^1 -> 1.0.0 from path \"dependency\"\n",
+            "\n",
+            "package acme:dependency @ 1.0.0\n",
+            "    source path \"dependency\"\n",
+        ),
+    )
+    .expect("write complete dependency lock");
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run locked check");
+    let stdout = String::from_utf8(output.stdout).expect("diagnostics are UTF-8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}\n{stderr}");
+    let unresolved = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"UNRESOLVED_NAME\""))
+        .collect::<Vec<_>>();
+    assert_eq!(unresolved.len(), 4, "{stdout}\n{stderr}");
+    for (start, _) in source.match_indices("PublicTypo") {
+        let diagnostic = unresolved
+            .iter()
+            .find(|line| line.contains(&format!("\"start\":{{\"byte\":{start},")))
+            .unwrap_or_else(|| panic!("missing owner diagnostic at byte {start}: {stdout}"));
+        assert!(
+            diagnostic.contains("\"candidates\":[\"PublicType\"]"),
+            "{diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("\"module\":\"acme:dependency@1.0.0/api\""),
+            "{diagnostic}"
+        );
+    }
+    assert!(
+        !unresolved
+            .iter()
+            .any(|line| line.contains("\"name\":\"Wrapped\"")),
+        "source-present omitted declarations stay suppressed: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""),
+        "{stdout}\n{stderr}"
+    );
+}
+
+#[test]
 fn locked_check_reports_private_type_members_through_transitive_source_scopes() {
     let temporary = TestDirectory::new();
     let root = temporary.0.join("project");
@@ -1117,42 +1220,46 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         ),
     )
     .expect("write middle package manifest");
-    fs::write(
-        middle.join("src/lib.sai"),
-        concat!(
-            "use acme:leaf/model as leaf_model\n",
-            "pub use acme:leaf.{api}\n",
-            "interface middle_api {\n",
-            "  fn middle_interface_member(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) -> leaf_model.PublicType\n",
-            "  resource MiddleRemote {\n",
-            "    fn middle_resource_member(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) -> leaf_model.PublicType\n",
-            "  }\n",
-            "}\n",
-            "type MiddleRecord {\n",
-            "  value: leaf_model.PrivateType\n",
-            "  missing: leaf_model.PublicTypo\n",
-            "  hidden_missing: leaf_model.PrivatType\n",
-            "}\n",
-            "const MIDDLE_CONST: leaf_model.PrivateType = { let nested: leaf_model.PublicTypo = 0; 0 }\n",
-            "fn middle_signature(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) { let body_private: leaf_model.PrivateType = 0; let body_missing: leaf_model.PublicTypo = 0; }\n",
-            "invariant U32 { {\n",
-            "  let private: leaf_model.PrivateType = 0\n",
-            "  let missing: leaf_model.PublicTypo = 0\n",
-            "  true\n",
-            "} }\n",
-            "type MiddleRefined = U32 where {\n",
-            "  let private: leaf_model.PrivateType = 0\n",
-            "  let missing: leaf_model.PublicTypo = 0\n",
-            "  true\n",
-            "}\n",
-            "distinct MiddleDistinct = U32 where {\n",
-            "  let private: leaf_model.PrivateType = 0\n",
-            "  let missing: leaf_model.PublicTypo = 0\n",
-            "  true\n",
-            "}\n",
-        ),
-    )
-    .expect("write middle package scopes and type owner");
+    let middle_source = concat!(
+        "use acme:leaf/model as leaf_model\n",
+        "pub use acme:leaf.{api}\n",
+        "interface middle_api {\n",
+        "  fn middle_interface_member(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) -> leaf_model.PublicType\n",
+        "  resource MiddleRemote {\n",
+        "    fn middle_resource_member(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) -> leaf_model.PublicType\n",
+        "  }\n",
+        "}\n",
+        "type MiddleRecord {\n",
+        "  value: leaf_model.PrivateType\n",
+        "  missing: leaf_model.PublicTypo\n",
+        "  hidden_missing: leaf_model.PrivatType\n",
+        "}\n",
+        "const MIDDLE_CONST: leaf_model.PrivateType = {\n",
+        "  let nested: leaf_model.PublicTypo = 0\n",
+        "  0\n",
+        "}\n",
+        "fn middle_signature(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) {\n",
+        "  let body_private: leaf_model.PrivateType = 0\n",
+        "  let body_missing: leaf_model.PublicTypo = 0\n",
+        "}\n",
+        "invariant U32 { {\n",
+        "  let private: leaf_model.PrivateType = 0\n",
+        "  let missing: leaf_model.PublicTypo = 0\n",
+        "  true\n",
+        "} }\n",
+        "type MiddleRefined = U32 where {\n",
+        "  let private: leaf_model.PrivateType = 0\n",
+        "  let missing: leaf_model.PublicTypo = 0\n",
+        "  true\n",
+        "}\n",
+        "distinct MiddleDistinct = U32 where {\n",
+        "  let private: leaf_model.PrivateType = 0\n",
+        "  let missing: leaf_model.PublicTypo = 0\n",
+        "  true\n",
+        "}\n",
+    );
+    fs::write(middle.join("src/lib.sai"), middle_source)
+        .expect("write middle package scopes and type owner");
     fs::write(
         leaf.join("sai.package"),
         "package acme:leaf @ 1.0.0\nsource \"src\"\ntargets { wasm32-wasi }\n",
@@ -1218,38 +1325,6 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         .filter(|line| line.contains("\"code\":\"PRIVATE_ITEM\""))
         .collect::<Vec<_>>();
     assert_eq!(private_diagnostics.len(), 9, "{stdout}");
-    let middle_source = concat!(
-        "use acme:leaf/model as leaf_model\n",
-        "pub use acme:leaf.{api}\n",
-        "interface middle_api {\n",
-        "  fn middle_interface_member(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) -> leaf_model.PublicType\n",
-        "  resource MiddleRemote {\n",
-        "    fn middle_resource_member(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) -> leaf_model.PublicType\n",
-        "  }\n",
-        "}\n",
-        "type MiddleRecord {\n",
-        "  value: leaf_model.PrivateType\n",
-        "  missing: leaf_model.PublicTypo\n",
-        "  hidden_missing: leaf_model.PrivatType\n",
-        "}\n",
-        "const MIDDLE_CONST: leaf_model.PrivateType = { let nested: leaf_model.PublicTypo = 0; 0 }\n",
-        "fn middle_signature(private: leaf_model.PrivateType, missing: leaf_model.PublicTypo) { let body_private: leaf_model.PrivateType = 0; let body_missing: leaf_model.PublicTypo = 0; }\n",
-        "invariant U32 { {\n",
-        "  let private: leaf_model.PrivateType = 0\n",
-        "  let missing: leaf_model.PublicTypo = 0\n",
-        "  true\n",
-        "} }\n",
-        "type MiddleRefined = U32 where {\n",
-        "  let private: leaf_model.PrivateType = 0\n",
-        "  let missing: leaf_model.PublicTypo = 0\n",
-        "  true\n",
-        "}\n",
-        "distinct MiddleDistinct = U32 where {\n",
-        "  let private: leaf_model.PrivateType = 0\n",
-        "  let missing: leaf_model.PublicTypo = 0\n",
-        "  true\n",
-        "}\n",
-    );
     let reference_start = middle_source
         .find("PrivateType")
         .expect("private reference exists");
@@ -1261,9 +1336,10 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         .find("const MIDDLE_CONST")
         .expect("const declaration exists");
     let const_end = middle_source[const_start..]
-        .find('\n')
-        .expect("const declaration has a line ending")
-        + const_start;
+        .find("\n}\n")
+        .expect("const declaration block has a closing brace")
+        + const_start
+        + 2;
     let const_source = &middle_source[const_start..const_end];
     let const_private_start = const_start
         + const_source
@@ -1299,32 +1375,23 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
     let function_start = middle_source
         .find("fn middle_signature")
         .expect("function signature exists");
-    let function_end = middle_source[function_start..]
-        .find('\n')
-        .expect("function line has a line ending")
-        + function_start;
-    let function_line = &middle_source[function_start..function_end];
-    let body_start_in_function = function_line
-        .find('{')
-        .expect("function body starts on the same line");
-    let function_signature = &function_line[..body_start_in_function];
-    let function_body = &function_line[body_start_in_function..];
     let function_private_start = function_start
-        + function_signature
-            .rfind("PrivateType")
-            .expect("function signature private reference exists");
+        + middle_source[function_start..]
+            .find("private: leaf_model.PrivateType")
+            .expect("function signature private reference exists")
+        + "private: leaf_model.".len();
     let function_body_private_start = function_start
-        + body_start_in_function
-        + function_body
-            .rfind("PrivateType")
-            .expect("function body private reference exists");
+        + middle_source[function_start..]
+            .find("body_private: leaf_model.PrivateType")
+            .expect("function body private reference exists")
+        + "body_private: leaf_model.".len();
     assert_eq!(
         private_diagnostics
             .iter()
             .filter(|line| line.contains(&format!("\"start\":{{\"byte\":{function_private_start},")))
             .count(),
         1,
-        "the function private member is reported exactly once: {stdout}"
+        "the function private member at byte {function_private_start} is reported exactly once: {stdout}"
     );
     let function_private = private_diagnostics
         .iter()
@@ -1611,9 +1678,10 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         );
     }
     let function_missing_start = function_start
-        + function_signature
-            .rfind("PublicTypo")
-            .expect("function signature missing reference exists");
+        + middle_source[function_start..]
+            .find("missing: leaf_model.PublicTypo")
+            .expect("function signature missing reference exists")
+        + "missing: leaf_model.".len();
     assert_eq!(
         unresolved_diagnostics
             .iter()
@@ -1636,10 +1704,10 @@ fn locked_check_reports_private_type_members_through_transitive_source_scopes() 
         "{function_missing}"
     );
     let function_body_missing_start = function_start
-        + body_start_in_function
-        + function_body
-            .rfind("PublicTypo")
-            .expect("function body missing reference exists");
+        + middle_source[function_start..]
+            .find("body_missing: leaf_model.PublicTypo")
+            .expect("function body missing reference exists")
+        + "body_missing: leaf_model.".len();
     assert_eq!(
         unresolved_diagnostics
             .iter()

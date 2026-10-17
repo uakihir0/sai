@@ -34,6 +34,7 @@ impl StableHash for WitView {
     fn stable_hash(&self, hasher: &mut StableHasher) {
         hasher.write_tag(0xE0);
         self.unit.stable_hash(hasher);
+        self.complete.stable_hash(hasher);
         self.model.stable_hash(hasher);
 
         let mut definitions = self

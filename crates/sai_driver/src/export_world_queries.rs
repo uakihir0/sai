@@ -16,7 +16,7 @@ use sai_vfs::{
     FileId, FileInternerError, PackageKey, PackageRelativePath, SnapshotFile, TextRange, TextSize,
     WorkspaceSnapshot,
 };
-use sai_wit::{WitUnit, WitUnitIdentityError};
+use sai_wit::{WitUnit, WitUnitIdentityError, WitUnitKind};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -56,6 +56,9 @@ pub enum ExportWorldQueryError {
     InvalidExternalWorldReference(String),
     PackageVersion(MvsInputError),
     ArtifactWitUnit(WitUnitIdentityError),
+    IncompleteGeneratedWit {
+        canonical_unit: String,
+    },
     WasiWitUnit(WasiWitUnitError),
     WasiWitView(WasiWitQueryError),
     WitView(WitViewQueryError),
@@ -453,6 +456,7 @@ impl RootDatabase {
             ));
         }
 
+        let mut incomplete_generated_unit = None;
         let view = if let Some((namespace, package_name)) = identity.split_once(':')
             && namespace == "wasi"
         {
@@ -493,10 +497,15 @@ impl RootDatabase {
                         )),
                     );
                 }
-                ExternalWorldUnitSelection::Selected(unit) => Some(
-                    self.wit_view(&unit)
-                        .map_err(ExportWorldQueryError::WitView)?,
-                ),
+                ExternalWorldUnitSelection::Selected(unit) => {
+                    let view = self
+                        .wit_view(&unit)
+                        .map_err(ExportWorldQueryError::WitView)?;
+                    if matches!(unit.kind(), WitUnitKind::Generated { .. }) && !view.complete {
+                        incomplete_generated_unit = Some(unit.canonical_name().to_owned());
+                    }
+                    Some(view)
+                }
             }
         };
 
@@ -511,6 +520,9 @@ impl RootDatabase {
             );
         };
         let Some(world) = view.worlds.get(world_name) else {
+            if let Some(canonical_unit) = incomplete_generated_unit {
+                return Err(ExportWorldQueryError::IncompleteGeneratedWit { canonical_unit });
+            }
             return export_world_diagnostic_result(
                 Code::UnknownExportWorld,
                 format!("export world `{value}` names no WIT world"),

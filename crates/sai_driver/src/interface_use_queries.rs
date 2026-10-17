@@ -44,11 +44,11 @@ use sai_ty::iface::{
 };
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
 use sai_wit::{
-    GeneratedText, WitFunc, WitIfaceIdx, WitIndexVec, WitInterface, WitItem, WitItemIdx,
+    GeneratedText, WitField, WitFunc, WitIfaceIdx, WitIndexVec, WitInterface, WitItem, WitItemIdx,
     WitItemKind, WitPackage, WitPackageDeclaration, WitPackageName, WitStabilityVersion, WitType,
     WitTypeRef, WitUnit, WitViewDefKind, WitViewEntity, print_wit, wit_name_to_sai,
 };
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 struct LocalBoundaryAliases<'hir> {
@@ -1628,19 +1628,31 @@ fn collect_interface_uses_input(
                 poisoned_owners.insert(member_owner);
             }
             if generated_interface_eligible {
-                let item = if kind == super::InterfaceMemberKind::Function
-                    && member_hir.diagnostics.is_empty()
+                let item = if member_hir.diagnostics.is_empty()
                     && !member_has_issues
                     && !has_incompatible_boundary
                 {
-                    generated_function_item(
-                        entry,
-                        &member_hir,
-                        &boundary_conversions,
-                        inputs.validated_attrs.get(&entry.ast_id),
-                        prepared.generated_package_version.as_ref(),
-                        symbols,
-                    )?
+                    match kind {
+                        super::InterfaceMemberKind::Alias | super::InterfaceMemberKind::Struct => {
+                            generated_interface_type_item(
+                                entry,
+                                &member_hir,
+                                &boundary_conversions,
+                                &inputs.validated_attrs,
+                                prepared.generated_package_version.as_ref(),
+                                symbols,
+                            )?
+                        }
+                        super::InterfaceMemberKind::Function => generated_function_item(
+                            entry,
+                            &member_hir,
+                            &boundary_conversions,
+                            inputs.validated_attrs.get(&entry.ast_id),
+                            prepared.generated_package_version.as_ref(),
+                            symbols,
+                        )?,
+                        _ => None,
+                    }
                 } else {
                     None
                 };
@@ -3219,6 +3231,126 @@ fn generated_function_item(
             result,
             is_async: sig.is_async,
         }),
+        unsupported: None,
+        span: None,
+    }))
+}
+
+fn generated_interface_type_item(
+    entry: &ItemTreeEntry,
+    owner: &HirOwner<'_>,
+    conversions: &[sai_ty::boundary::BoundaryTypeConversion],
+    validated_attrs: &BTreeMap<sai_hir::item_tree::ErasedAstId, sai_hir::attrs::ValidatedAttrs>,
+    selected: Option<&sai_package::mvs::MvsPackageVersion>,
+    symbols: &Interner,
+) -> Result<Option<WitItem>, InterfaceUsesQueryError> {
+    let OwnerNode::InterfaceItem(item) = owner.node else {
+        return Ok(None);
+    };
+    if item.name.is_error() {
+        return Ok(None);
+    }
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let attrs = validated_attrs.get(&entry.ast_id);
+    if attrs.is_some_and(|attrs| !attrs.diagnostics.is_empty()) {
+        return Ok(None);
+    }
+    let Some((since, deprecated)) = generated_stability(attrs, Some(selected)) else {
+        return Ok(None);
+    };
+    let Some(name_definition) = wit_name_definition(item.name, owner.id, symbols)? else {
+        return Ok(None);
+    };
+    let Some(name) = sai_identifier_to_wit_name(&name_definition.source_name) else {
+        return Ok(None);
+    };
+
+    let references = HashMap::new();
+    let kind = match item.kind {
+        InterfaceItemKind::Alias { generics, .. } => {
+            if !generics.params.is_empty() || !generics.where_preds.is_empty() {
+                return Ok(None);
+            }
+            let [conversion] = conversions else {
+                return Ok(None);
+            };
+            let BoundaryTypeOutcome::Mapped(boundary_type) = &conversion.outcome else {
+                return Ok(None);
+            };
+            let Ok(Some(ty)) = sai_ty::boundary::materialize_boundary_type(
+                boundary_type,
+                &references,
+                Position::Nested,
+            ) else {
+                return Ok(None);
+            };
+            WitItemKind::Alias(ty)
+        }
+        InterfaceItemKind::Struct { generics, fields } => {
+            if !generics.params.is_empty() || !generics.where_preds.is_empty() {
+                return Ok(None);
+            }
+            let field_entries = entry
+                .children
+                .iter()
+                .filter(|child| child.kind == ItemTreeKind::Field)
+                .collect::<Vec<_>>();
+            if fields.len() != field_entries.len() || fields.len() != conversions.len() {
+                return Ok(None);
+            }
+            let mut wit_fields = Vec::with_capacity(fields.len());
+            let mut field_names = HashSet::with_capacity(fields.len());
+            for ((field, field_entry), conversion) in
+                fields.iter().zip(field_entries).zip(conversions)
+            {
+                let field_attrs = validated_attrs.get(&field_entry.ast_id);
+                if field_attrs.is_some_and(|attrs| {
+                    !attrs.diagnostics.is_empty()
+                        || attrs.deprecated.is_some()
+                        || attrs.doc_hidden.is_some()
+                }) || field.name.is_error()
+                {
+                    return Ok(None);
+                }
+                let field_source_name = symbols
+                    .resolve(field.name.sym)
+                    .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+                    .map_err(InterfaceUsesQueryError::Collection)?;
+                let Some(field_name) = sai_identifier_to_wit_name(&field_source_name) else {
+                    return Ok(None);
+                };
+                if !field_names.insert(field_name.clone()) {
+                    return Ok(None);
+                }
+                let BoundaryTypeOutcome::Mapped(boundary_type) = &conversion.outcome else {
+                    return Ok(None);
+                };
+                let Ok(Some(ty)) = sai_ty::boundary::materialize_boundary_type(
+                    boundary_type,
+                    &references,
+                    Position::Nested,
+                ) else {
+                    return Ok(None);
+                };
+                wit_fields.push(WitField {
+                    name: field_name,
+                    docs: field_entry.docs.clone().map(Arc::from),
+                    ty,
+                });
+            }
+            WitItemKind::Record(wit_fields)
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(WitItem {
+        name,
+        docs: entry.docs.clone().map(Arc::from),
+        since,
+        deprecated,
+        kind,
         unsupported: None,
         span: None,
     }))

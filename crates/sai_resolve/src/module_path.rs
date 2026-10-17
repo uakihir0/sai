@@ -25,6 +25,10 @@ pub enum ModulePathStop {
     /// generated WIT replacement is unavailable. The returned base is always
     /// `Res::Err`, so callers cannot consume the source definition.
     DeferredSource,
+    /// A missing member belongs to a partial generated WIT interface. The
+    /// returned base is `Res::Err` because the partial view cannot prove the
+    /// member is absent.
+    DeferredWit,
 }
 
 /// The resolved prefix and the first segment the caller still needs to handle.
@@ -165,6 +169,13 @@ pub fn resolve_module_prefix(
                         stop: ModulePathStop::DeferredSource,
                     });
                 }
+            }
+            ModuleMemberLookup::DeferredWit => {
+                return Ok(ModulePathPrefix {
+                    base: Res::Err,
+                    consumed_segments,
+                    stop: ModulePathStop::DeferredWit,
+                });
             }
             ModuleMemberLookup::Missing => {
                 return Err(ModulePathError::MissingMember {

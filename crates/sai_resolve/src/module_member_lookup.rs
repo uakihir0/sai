@@ -51,19 +51,24 @@ impl ModuleTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModuleMemberLookup<'a> {
     Found(&'a Binding),
-    /// A source-only member whose generated WIT view is unavailable.
+    /// A source-only member whose generated WIT representation is unavailable
+    /// or omitted from a partial view.
     ///
     /// The binding is available only to qualified-path analysis for
     /// diagnostics. `resolve_module_prefix` never returns it as the path's
     /// resolved base.
     DeferredSource,
-    /// A private member in an unavailable source scope. Carry only its
+    /// A private source member without a WIT representation. Carry only its
     /// declaration span so diagnostic callers cannot observe its `Res`.
     InaccessibleDeferred(sai_vfs::Span),
     /// A WIT member definition, which has no SAI source span.
     ///
     /// WIT view members are public and intentionally do not use `Binding`.
     WitMember(Res),
+    /// A missing member in a partial generated WIT interface.
+    ///
+    /// The generated snapshot cannot prove that the member is absent.
+    DeferredWit,
     Missing,
     Inaccessible(&'a Binding),
     NotModule,
@@ -156,6 +161,7 @@ struct IndexedTarget<'a> {
 pub struct ModuleMemberIndex<'a> {
     targets: HashMap<DefId, IndexedTarget<'a>>,
     unavailable_source_interfaces: std::collections::HashSet<DefId>,
+    incomplete_wit_interfaces: std::collections::HashSet<DefId>,
     wit_symbols: Option<&'a Interner>,
 }
 
@@ -199,9 +205,14 @@ impl<'a> ModuleMemberIndex<'a> {
         let mut targets = HashMap::new();
         let mut source_interfaces = std::collections::HashSet::new();
         let mut represented_source_interfaces = std::collections::HashSet::new();
+        let mut incomplete_wit_interfaces = std::collections::HashSet::new();
         let wit_views = wit_views.into_iter().collect::<Vec<_>>();
 
         for view in &wit_views {
+            if !view.complete {
+                incomplete_wit_interfaces
+                    .extend(view.interfaces.values().map(|interface| interface.def));
+            }
             represented_source_interfaces.extend(
                 view.interfaces
                     .values()
@@ -254,6 +265,7 @@ impl<'a> ModuleMemberIndex<'a> {
         Self {
             targets,
             unavailable_source_interfaces,
+            incomplete_wit_interfaces,
             wit_symbols,
         }
     }
@@ -269,6 +281,17 @@ impl<'a> ModuleMemberIndex<'a> {
                 .is_some_and(|target| target.package != requesting_package)
                 && self.unavailable_source_interfaces.contains(&def_id)
         })
+    }
+
+    fn partial_wit_source_scope(&self, target: ModuleTarget) -> Option<IndexedTarget<'a>> {
+        if !self.incomplete_wit_interfaces.contains(&target.def_id) {
+            return None;
+        }
+        let MemberScope::WitInterface(interface) = self.targets.get(&target.def_id)?.scope else {
+            return None;
+        };
+        let source = *self.targets.get(&interface.origin?)?;
+        matches!(source.scope, MemberScope::Source { .. }).then_some(source)
     }
 
     /// Look up a member of a module or interface `Res`.
@@ -302,6 +325,23 @@ impl<'a> ModuleMemberIndex<'a> {
         let target_is_unavailable_source_interface = indexed.package != requesting_package
             && self.unavailable_source_interfaces.contains(&target.def_id);
         let Some(member) = indexed.scope.get(name, self.wit_symbols) else {
+            if self.incomplete_wit_interfaces.contains(&target.def_id) {
+                if let Some(source) = self.partial_wit_source_scope(target) {
+                    let Some(MemberLookupValue::Source(binding)) =
+                        source.scope.get(name, self.wit_symbols)
+                    else {
+                        return ModuleMemberLookup::Missing;
+                    };
+                    return if source.package != requesting_package
+                        && !matches!(binding.visibility, Visibility::Pub | Visibility::Export)
+                    {
+                        ModuleMemberLookup::InaccessibleDeferred(binding.name_span)
+                    } else {
+                        ModuleMemberLookup::DeferredSource
+                    };
+                }
+                return ModuleMemberLookup::DeferredWit;
+            }
             return ModuleMemberLookup::Missing;
         };
         match member {
@@ -357,6 +397,16 @@ impl<'a> ModuleMemberIndex<'a> {
         requesting_package: PackageId,
     ) -> Option<&'a Binding> {
         let indexed = self.targets.get(&target.def_id)?;
+        if indexed.scope.get(name, self.wit_symbols).is_none() {
+            let source = self.partial_wit_source_scope(target)?;
+            let MemberLookupValue::Source(binding) = source.scope.get(name, self.wit_symbols)?
+            else {
+                return None;
+            };
+            return (source.package == requesting_package
+                || matches!(binding.visibility, Visibility::Pub | Visibility::Export))
+            .then_some(binding);
+        }
         let binding = match indexed.scope.get(name, self.wit_symbols)? {
             MemberLookupValue::DeferredSource(binding) => binding,
             MemberLookupValue::Source(binding)
@@ -421,7 +471,9 @@ impl<'a> ModuleMemberIndex<'a> {
         target: ModuleTarget,
         requesting_package: PackageId,
     ) -> Option<impl Iterator<Item = (Symbol, sai_vfs::Span)> + '_> {
-        let indexed = *self.targets.get(&target.def_id)?;
+        let indexed = self
+            .partial_wit_source_scope(target)
+            .or_else(|| self.targets.get(&target.def_id).copied())?;
         let include_private = indexed.package == requesting_package;
         Some(
             indexed
@@ -433,6 +485,48 @@ impl<'a> ModuleMemberIndex<'a> {
                     .then_some((name, binding.name_span))
                 }),
         )
+    }
+
+    /// Enumerate public WIT member spellings for diagnostic suggestions in
+    /// declaration order. WIT members have no source declaration spans, so this
+    /// API returns only names and never exposes their resolutions.
+    ///
+    /// A source target or an unavailable target returns `None`.
+    pub fn visible_wit_diagnostic_members(
+        &self,
+        target: ModuleTarget,
+    ) -> Option<impl Iterator<Item = &'a str>> {
+        let MemberScope::WitInterface(interface) = self.targets.get(&target.def_id)?.scope else {
+            return None;
+        };
+        let mut members = interface
+            .members
+            .iter()
+            .filter(|(_, member)| wit_member_res(member).is_some())
+            .collect::<Vec<_>>();
+        members.sort_by_key(|(_, member)| member.item.index());
+        Some(members.into_iter().map(|(name, _)| name.as_str()))
+    }
+
+    /// Return the source interface represented by a generated target when its
+    /// indexed source scope is available.
+    ///
+    /// This lets diagnostics keep the selected source package identity and
+    /// path after source scopes have confirmed that an omitted member is
+    /// actually absent. Directory WIT targets and generated targets without
+    /// an indexed source origin return `None`.
+    pub fn source_origin_target_for_diagnostics(
+        &self,
+        target: ModuleTarget,
+    ) -> Option<ModuleTarget> {
+        let MemberScope::WitInterface(interface) = self.targets.get(&target.def_id)?.scope else {
+            return None;
+        };
+        let origin = interface.origin?;
+        self.targets
+            .get(&origin)
+            .is_some_and(|source| matches!(source.scope, MemberScope::Source { .. }))
+            .then_some(ModuleTarget { def_id: origin })
     }
 }
 
@@ -467,7 +561,7 @@ mod tests {
         BindingOrigin, InterfaceScope, Phase1ModuleScopes, Phase1PackageScopes,
     };
     use sai_hir::{DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, LocalDefId};
-    use sai_intern::{Interner, PackageInterner};
+    use sai_intern::{Idx, Interner, PackageInterner};
     use sai_vfs::{FileId, Span, TextRange, TextSize};
     use std::collections::{BTreeMap, HashMap};
 
@@ -796,6 +890,347 @@ mod tests {
                 package
             ),
             ModuleMemberLookup::NotModule
+        );
+    }
+
+    #[test]
+    fn partial_generated_interface_defers_missing_members() {
+        use sai_package::{mvs::MvsPackageVersion, version::Version};
+        use sai_wit::{
+            WitIndexVec, WitInterface, WitItem, WitItemKind, WitPackage, WitPackageName, WitUnit,
+            WitView,
+        };
+        use std::sync::Arc;
+
+        let packages = PackageInterner::new();
+        let symbols = Interner::new();
+        let dependency = package_id(&packages, "acme:dependency#1");
+        let selected = MvsPackageVersion::new(
+            "acme:dependency",
+            Version::parse("1.0.0").expect("dependency version is valid"),
+        )
+        .expect("selected dependency version is valid");
+        let unit = WitUnit::generated(dependency, &packages, &selected)
+            .expect("generated unit uses the selected dependency");
+        let source_api_path = DefPath::new(
+            dependency,
+            vec![DisambiguatedDefPathData {
+                data: DefPathData::Interface(symbol(&symbols, "api")),
+                disambiguator: 0,
+            }],
+            &packages,
+            &symbols,
+        )
+        .expect("source interface path is valid");
+        let source_def_paths = DefPathInterner::new(dependency, &packages, &symbols)
+            .expect("source path interner initializes");
+        let source_api_local = source_def_paths
+            .intern(source_api_path)
+            .expect("source interface path interns");
+        let source_api = source_api_local.to_def_id();
+        let origins = [("api".to_owned(), source_api)];
+        let mut items = WitIndexVec::new();
+        items
+            .push(WitItem {
+                name: "visible".to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                kind: WitItemKind::Alias(sai_wit::WitType::U32),
+                unsupported: None,
+                span: None,
+            })
+            .expect("the retained alias appends");
+        items
+            .push(WitItem {
+                name: "alpha".to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                kind: WitItemKind::Alias(sai_wit::WitType::U64),
+                unsupported: None,
+                span: None,
+            })
+            .expect("the later retained alias appends");
+        let mut interfaces = WitIndexVec::new();
+        interfaces
+            .push(WitInterface {
+                name: "api".to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                items,
+                span: None,
+            })
+            .expect("the generated interface appends");
+        let model = WitPackage {
+            unit: unit.clone(),
+            name: WitPackageName {
+                namespace: "acme".to_owned(),
+                name: "dependency".to_owned(),
+                version: Some(Version::parse("1.0.0").expect("package version is valid")),
+            },
+            interfaces,
+            worlds: WitIndexVec::new(),
+            declaration_order: Vec::new(),
+        };
+        let view_package = packages
+            .intern(unit.stable_key())
+            .expect("view package interns");
+        let view_paths = Arc::new(
+            DefPathInterner::new(view_package, &packages, &symbols)
+                .expect("view path interner initializes"),
+        );
+        let partial_view = WitView::build_with_generated_metadata(
+            model.clone(),
+            &packages,
+            &symbols,
+            view_paths,
+            Some(&source_def_paths),
+            &origins,
+            false,
+        )
+        .expect("partial generated view builds");
+        let partial_interface = partial_view
+            .interfaces
+            .get("api")
+            .expect("generated interface is present")
+            .def;
+        assert!(
+            partial_view.interfaces["api"]
+                .members
+                .contains_key("Visible"),
+            "the retained interface member is present: {:?}",
+            partial_view.interfaces["api"]
+                .members
+                .keys()
+                .collect::<Vec<_>>()
+        );
+        let api_target = ModuleTarget::from_res(Res::Def(DefKind::Interface, partial_interface))
+            .expect("interface is a module-like target");
+        let missing = symbol(&symbols, "Missing");
+        let visible = symbol(&symbols, "Visible");
+        let partial_index = ModuleMemberIndex::new_with_wit_views([], [&partial_view], &symbols);
+        assert_eq!(
+            partial_index
+                .visible_wit_diagnostic_members(api_target)
+                .expect("WIT diagnostic candidates are available without source scopes")
+                .collect::<Vec<_>>(),
+            ["Visible", "Alpha"],
+            "candidate order follows item declarations rather than alphabetical map order"
+        );
+        assert_eq!(
+            partial_index.lookup_target(api_target, missing, dependency),
+            ModuleMemberLookup::DeferredWit
+        );
+        let retained_lookup = partial_index.lookup_target(api_target, visible, dependency);
+        assert!(
+            matches!(retained_lookup, ModuleMemberLookup::WitMember(_)),
+            "known members remain usable in a partial view: {retained_lookup:?}"
+        );
+
+        let requester = package_id(&packages, "acme:requester#1");
+        let private = symbol(&symbols, "Private");
+        let exported = symbol(&symbols, "Exported");
+        let absent = symbol(&symbols, "Absent");
+        let public_binding = binding(Res::Def(DefKind::Alias, source_api), Visibility::Pub);
+        let private_binding = binding(Res::Err, Visibility::Private);
+        let source_scopes = package_scopes(
+            Vec::new(),
+            HashMap::from([(
+                source_api,
+                InterfaceScope {
+                    members: HashMap::from([
+                        (missing, public_binding.clone()),
+                        (private, private_binding.clone()),
+                        (exported, binding(Res::Err, Visibility::Export)),
+                    ]),
+                },
+            )]),
+        );
+        let source_index =
+            ModuleMemberIndex::new_with_wit_views([&source_scopes], [&partial_view], &symbols);
+        assert!(
+            source_index
+                .visible_wit_diagnostic_members(
+                    ModuleTarget::from_res(Res::Def(DefKind::Interface, source_api))
+                        .expect("source interface is a module-like target"),
+                )
+                .is_none(),
+            "the span-free enumeration API only exposes WIT candidates"
+        );
+        assert_eq!(
+            source_index.lookup_target(api_target, missing, requester),
+            ModuleMemberLookup::DeferredSource
+        );
+        assert_eq!(
+            source_index.deferred_source_binding(api_target, missing, requester),
+            Some(&public_binding)
+        );
+        assert_eq!(
+            source_index.lookup_target(api_target, exported, requester),
+            ModuleMemberLookup::DeferredSource
+        );
+        assert_eq!(
+            source_index.lookup_target(api_target, private, requester),
+            ModuleMemberLookup::InaccessibleDeferred(private_binding.name_span)
+        );
+        assert_eq!(
+            source_index.deferred_source_binding(api_target, private, requester),
+            None
+        );
+        assert_eq!(
+            source_index.lookup_target(api_target, private, dependency),
+            ModuleMemberLookup::DeferredSource,
+            "privacy uses the source package identity"
+        );
+        assert_eq!(
+            source_index.lookup_target(api_target, absent, requester),
+            ModuleMemberLookup::Missing
+        );
+        assert_eq!(
+            source_index.source_origin_target_for_diagnostics(api_target),
+            Some(
+                ModuleTarget::from_res(Res::Def(DefKind::Interface, source_api))
+                    .expect("source interface is a module-like target")
+            ),
+            "source-confirmed misses retain the source interface for diagnostics"
+        );
+        assert!(matches!(
+            source_index.lookup_target(api_target, visible, requester),
+            ModuleMemberLookup::WitMember(_)
+        ));
+        let diagnostic_members = source_index
+            .visible_diagnostic_members(api_target, requester)
+            .expect("source origin supplies diagnostic candidates")
+            .map(|(name, _)| name)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(
+            diagnostic_members,
+            std::collections::HashSet::from([missing, exported])
+        );
+        let path_segment = |name| sai_hir::types::PathSegment {
+            hir_id: sai_hir::HirId {
+                owner: sai_hir::OwnerId {
+                    def_id: source_api_local,
+                },
+                local_id: sai_intern::ItemLocalId::from_raw(0),
+            },
+            name: sai_hir::types::Name {
+                sym: name,
+                span: sai_hir::Span {
+                    file: FileId::new(1),
+                    range: TextRange::empty(TextSize::new(0)),
+                    ctxt: sai_hir::SpanCtxt::Root,
+                },
+            },
+            args: None,
+        };
+        assert_eq!(
+            crate::module_path::resolve_module_prefix(
+                Res::Def(DefKind::Interface, partial_interface),
+                &[path_segment(missing), path_segment(absent)],
+                requester,
+                &source_index,
+            ),
+            Ok(crate::module_path::ModulePathPrefix {
+                base: Res::Err,
+                consumed_segments: 1,
+                stop: crate::module_path::ModulePathStop::DeferredSource,
+            }),
+            "a deferred source type is never exposed as the resolved base"
+        );
+        assert_eq!(
+            crate::module_path::resolve_module_prefix(
+                Res::Def(DefKind::Interface, partial_interface),
+                &[path_segment(exported), path_segment(absent)],
+                requester,
+                &source_index,
+            ),
+            Ok(crate::module_path::ModulePathPrefix {
+                base: Res::Err,
+                consumed_segments: 1,
+                stop: crate::module_path::ModulePathStop::DeferredSource,
+            }),
+            "an omitted member with an existing error suppresses its suffix"
+        );
+        assert!(matches!(
+            crate::module_path::resolve_module_prefix(
+                Res::Def(DefKind::Interface, partial_interface),
+                &[path_segment(absent)],
+                requester,
+                &source_index,
+            ),
+            Err(crate::module_path::ModulePathError::MissingMember {
+                segment_index: 0,
+                ..
+            })
+        ));
+        assert!(matches!(
+            crate::module_path::resolve_module_prefix(
+                Res::Def(DefKind::Interface, partial_interface),
+                &[path_segment(private)],
+                requester,
+                &source_index,
+            ),
+            Err(crate::module_path::ModulePathError::InaccessibleMember {
+                segment_index: 0,
+                ..
+            })
+        ));
+
+        let mut no_origin_view = partial_view.clone();
+        no_origin_view
+            .interfaces
+            .get_mut("api")
+            .expect("generated interface is present")
+            .origin = None;
+        let no_origin_index =
+            ModuleMemberIndex::new_with_wit_views([&source_scopes], [&no_origin_view], &symbols);
+        assert_eq!(
+            no_origin_index.lookup_target(api_target, absent, requester),
+            ModuleMemberLookup::DeferredWit
+        );
+        assert_eq!(
+            crate::module_path::resolve_module_prefix(
+                Res::Def(DefKind::Interface, partial_interface),
+                &[path_segment(absent)],
+                requester,
+                &no_origin_index,
+            ),
+            Ok(crate::module_path::ModulePathPrefix {
+                base: Res::Err,
+                consumed_segments: 0,
+                stop: crate::module_path::ModulePathStop::DeferredWit,
+            })
+        );
+
+        let view_paths = Arc::new(
+            DefPathInterner::new(view_package, &packages, &symbols)
+                .expect("complete view path interner initializes"),
+        );
+        let complete_view = WitView::build_with_generated_metadata(
+            model,
+            &packages,
+            &symbols,
+            view_paths,
+            Some(&source_def_paths),
+            &origins,
+            true,
+        )
+        .expect("complete generated view builds");
+        let complete_interface = complete_view
+            .interfaces
+            .get("api")
+            .expect("generated interface is present")
+            .def;
+        let complete_target =
+            ModuleTarget::from_res(Res::Def(DefKind::Interface, complete_interface))
+                .expect("interface is a module-like target");
+        let complete_index = ModuleMemberIndex::new_with_wit_views([], [&complete_view], &symbols);
+        assert_eq!(
+            complete_index.lookup_target(complete_target, missing, dependency),
+            ModuleMemberLookup::Missing
         );
     }
 
