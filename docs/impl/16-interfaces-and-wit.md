@@ -1033,7 +1033,7 @@ The exports of an external `export world` are checked by `export_world` (§16.8.
 
 `export_world(P)` resolves the `export world` of `wit_contract(P)` by package/01 §1.9 item 3:
 
-**Implemented foundation (IR-647A; not the complete query):** `RootDatabase::resolve_local_export_world` resolves source/hybrid local `WORD` paths through the root module tree and the selected module's member namespace. Declared worlds and `pub use` re-exports resolve; plain `use` bindings, unknown modules/worlds, and non-world members return `Missing`. The query still needs to consume `WitContract::export_world`, bind diagnostics to the manifest span, and select artifact and external WIT worlds.
+**Implemented foundation (IR-647A–B; not the complete query):** `RootDatabase::resolve_local_export_world` resolves source/hybrid local `WORD` paths through the root module tree and the selected module's member namespace. Declared worlds and `pub use` re-exports resolve; plain `use` bindings, unknown modules/worlds, and non-world members return `Missing`. `WitContract::export_world` preserves the value's original byte range for diagnostics; a local slash path range may include whitespace or comments between segments. The query still needs to bind this range to the current workspace manifest snapshot and select artifact and external WIT worlds.
 
 ```rust
 pub struct ExportWorld { pub world: Option<DefId>, pub diagnostics: Vec<Diagnostic> }
