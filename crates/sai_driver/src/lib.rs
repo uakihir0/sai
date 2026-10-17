@@ -3062,6 +3062,13 @@ pub struct WorldOwnerReferenceResolution {
     error: Option<OwnerControlFlowResolutionError>,
     references: Vec<WorldReferencePathResolution>,
     item_errors: Vec<(OwnerId, OwnerControlFlowResolutionError)>,
+    source_import_items: Vec<WorldImportFnSourceItem>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorldImportFnSourceItem {
+    ImportFunction(sai_resolve::WorldImportFunction),
+    Include(OwnerId),
 }
 
 impl WorldOwnerReferenceResolution {
@@ -4976,6 +4983,13 @@ enum GeneratedSourceInterfaceView {
     Unavailable,
     Omitted,
     Resolved(DefId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GeneratedSourceWorldView {
+    Unavailable,
+    Omitted,
+    Resolved(DefId, Option<Unsupported>),
 }
 
 fn suggest_wit_items(requested_name: &str, candidates: &[(usize, String)]) -> Vec<String> {
@@ -13408,6 +13422,186 @@ impl RootDatabase {
         Ok(result)
     }
 
+    /// Builds the imported-function lookup for one local world from the
+    /// matching source-ordered world-reference results.
+    ///
+    /// The active WIT-view closure supplies import maps for external worlds.
+    /// Incomplete and wrong-kind include references are left out of the
+    /// resolver input; their own path diagnostics remain owned by world
+    /// reference resolution.
+    pub fn resolve_world_import_fns(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        references: &WorldReferenceResolutions,
+        root: DefId,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+    ) -> Result<BTreeMap<String, DefId>, OwnerControlFlowResolutionError> {
+        if collection.session_token != self.session_token {
+            return Err(OwnerControlFlowResolutionError::SessionMismatch);
+        }
+        if collection.snapshot_id != snapshot.id() || !references.matches_snapshot(snapshot) {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+        if !references.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+        }
+        if let Some(scopes) = wit_view_scopes
+            && !scopes.matches_collection(collection)
+        {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::WitViewScopeMismatch(collection.package_key.clone()),
+            ));
+        }
+
+        let descriptors = interface_generation_order(
+            module_tree,
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
+                .collect(),
+            &self.symbols,
+        )?;
+        let mut owner_resolutions = HashMap::with_capacity(references.owners.len());
+        for owner in &references.owners {
+            if owner_resolutions.insert(owner.owner, owner).is_some() {
+                return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+            }
+        }
+        if owner_resolutions.len() != descriptors.len()
+            || descriptors
+                .iter()
+                .any(|descriptor| !owner_resolutions.contains_key(&descriptor.owner))
+        {
+            return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+        }
+
+        let mut external_worlds = Vec::new();
+        let mut external_world_ids = HashSet::new();
+        if let Some(scopes) = wit_view_scopes {
+            for view in scopes.views() {
+                for world in view.view.worlds.values() {
+                    if !external_world_ids.insert(world.def) {
+                        return Err(
+                            OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch,
+                        );
+                    }
+                    external_worlds.push((world.def, world.import_fns.clone()));
+                }
+            }
+        }
+        let local_world_ids = descriptors
+            .iter()
+            .map(|descriptor| descriptor.owner.def_id.to_def_id())
+            .collect::<HashSet<_>>();
+        let mut worlds = Vec::with_capacity(descriptors.len());
+        for descriptor in &descriptors {
+            let world = owner_resolutions
+                .get(&descriptor.owner)
+                .copied()
+                .ok_or(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch)?;
+            if let Some(error) = &world.error {
+                return Err(error.clone());
+            }
+            if let Some((_, error)) = world.item_errors.first() {
+                return Err(error.clone());
+            }
+            if world
+                .references
+                .iter()
+                .any(|reference| reference.world_owner != descriptor.owner)
+            {
+                return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+            }
+
+            let mut include_references = HashMap::new();
+            for reference in world
+                .references
+                .iter()
+                .filter(|reference| reference.position == WorldReferencePosition::Include)
+            {
+                if include_references
+                    .insert(reference.owner, reference)
+                    .is_some()
+                {
+                    return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+                }
+            }
+            let source_include_count = world
+                .source_import_items
+                .iter()
+                .filter(|item| matches!(item, WorldImportFnSourceItem::Include(_)))
+                .count();
+            if source_include_count != include_references.len() {
+                return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+            }
+            let mut items = Vec::with_capacity(world.source_import_items.len());
+            for source_item in &world.source_import_items {
+                match source_item {
+                    WorldImportFnSourceItem::ImportFunction(function) => {
+                        items.push(sai_resolve::WorldImportFnItem::ImportFunction(
+                            function.clone(),
+                        ));
+                    }
+                    WorldImportFnSourceItem::Include(owner) => {
+                        let reference = include_references.get(owner).ok_or(
+                            OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch,
+                        )?;
+                        let target = match &reference.path_result {
+                            WorldReferencePathResult::Mod(path)
+                            | WorldReferencePathResult::ResolvedPkg(path)
+                                if path.resolved_segments == path.segment_count =>
+                            {
+                                match path.base {
+                                    Res::Def(DefKind::World, target) => target,
+                                    _ => continue,
+                                }
+                            }
+                            WorldReferencePathResult::Mod(_)
+                            | WorldReferencePathResult::DeferredMod(_)
+                            | WorldReferencePathResult::Pkg(_)
+                            | WorldReferencePathResult::ResolvedPkg(_) => continue,
+                        };
+                        if !local_world_ids.contains(&target)
+                            && !external_world_ids.contains(&target)
+                        {
+                            return Err(if wit_view_scopes.is_some() {
+                                OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch
+                            } else {
+                                OwnerControlFlowResolutionError::ModuleMemberScopes(
+                                    Phase1ModuleMemberScopeError::WitViewScopeMismatch(
+                                        collection.package_key.clone(),
+                                    ),
+                                )
+                            });
+                        }
+                        items.push(sai_resolve::WorldImportFnItem::Include(target));
+                    }
+                }
+            }
+            worlds.push(sai_resolve::WorldImportFnWorld {
+                world: descriptor.owner.def_id.to_def_id(),
+                items,
+            });
+        }
+
+        sai_resolve::world_import_fns(
+            root,
+            sai_resolve::WorldImportFnsInput {
+                worlds,
+                external_worlds,
+            },
+        )
+        .map_err(|_| OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch)
+    }
+
     /// Resolves world function signature type paths through a validated
     /// active-source member-scope closure.
     pub fn resolve_world_test_only_paths_with_member_scopes(
@@ -13833,6 +14027,7 @@ impl RootDatabase {
         let local_source_target = (parsed.package_identity == current_identity).then_some((
             module_tree,
             &collection.scopes,
+            collection.package_wit_names(),
             false,
         ));
         let foreign_source_target = if local_source_target.is_none() {
@@ -13846,11 +14041,18 @@ impl RootDatabase {
                         .iter()
                         .find(|package| package.package_key() == &provenance.package_key)
                 })
-                .map(|package| (package.module_tree(), package.scopes(), true))
+                .map(|package| {
+                    (
+                        package.module_tree(),
+                        package.scopes(),
+                        package.collection.package_wit_names(),
+                        true,
+                    )
+                })
         } else {
             None
         };
-        if let Some((source_tree, source_scopes, is_foreign)) =
+        if let Some((source_tree, source_scopes, source_wit_names, is_foreign)) =
             local_source_target.or(foreign_source_target)
         {
             return self.resolve_world_source_package_path(
@@ -13861,6 +14063,7 @@ impl RootDatabase {
                 &parsed.segments,
                 source_tree,
                 source_scopes,
+                source_wit_names,
                 is_foreign,
                 wit_view_scopes,
                 inputs,
@@ -13932,6 +14135,7 @@ impl RootDatabase {
         segments: &[Symbol],
         source_tree: &ModuleTree,
         source_scopes: &Phase1PackageScopes,
+        source_wit_names: &PackageWitNames,
         is_foreign: bool,
         wit_view_scopes: &Phase1ActiveWitViewScopes,
         inputs: &CurrentOwnerInputs,
@@ -14092,7 +14296,83 @@ impl RootDatabase {
                 }
             };
         }
+        if is_foreign && let Res::Def(DefKind::World, source_world) = resolution {
+            match self.generated_view_world_for_source_world(
+                source_world,
+                source_wit_names,
+                wit_view_scopes,
+            )? {
+                GeneratedSourceWorldView::Unavailable => {
+                    return Ok((
+                        WorldReferencePathResult::Pkg(original_path.to_owned()),
+                        Vec::new(),
+                    ));
+                }
+                GeneratedSourceWorldView::Omitted => {
+                    resolution = Res::Err;
+                }
+                GeneratedSourceWorldView::Resolved(view_world, unsupported) => {
+                    if position == WorldReferencePosition::Include
+                        && let Some(unsupported) = unsupported
+                    {
+                        let diagnostic = world_package_path_diagnostic(
+                            owner,
+                            span,
+                            sai_diagnostics::Code::WitUnsupportedFeature,
+                            format!(
+                                "included WIT world `{original_path}` uses unsupported feature `{unsupported:?}`"
+                            ),
+                            "unsupported WIT world",
+                            inputs,
+                            snapshot,
+                        )?;
+                        return Ok((to_path_result(Res::Err), vec![diagnostic]));
+                    }
+                    resolution = Res::Def(DefKind::World, view_world);
+                }
+            }
+        }
         Ok((to_path_result(resolution), Vec::new()))
+    }
+
+    fn generated_view_world_for_source_world(
+        &self,
+        source_world: DefId,
+        source_wit_names: &PackageWitNames,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<GeneratedSourceWorldView, OwnerControlFlowResolutionError> {
+        let Some(view_scope) = wit_view_scopes.views().find(|scope| {
+            matches!(
+                scope.view.unit.kind(),
+                WitUnitKind::Generated { package } if package == source_world.package
+            )
+        }) else {
+            // Without a complete generated view, source names cannot be used
+            // as identities for dependency world imports.
+            return Ok(GeneratedSourceWorldView::Unavailable);
+        };
+        let Some(world_name) = source_wit_names
+            .names
+            .iter()
+            .find_map(|(local, name)| (local.to_def_id() == source_world).then_some(name))
+        else {
+            // A source world with an invalid or colliding package WIT name
+            // cannot have a corresponding item in a complete generated view.
+            return Ok(GeneratedSourceWorldView::Omitted);
+        };
+        let requested_name = canonical_wit_path_name(world_name);
+        let matching_world = view_scope.view.worlds.values().find(|world| {
+            canonical_wit_path_name(&view_scope.view.model.worlds[world.wit].name) == requested_name
+        });
+        Ok(match matching_world {
+            Some(world) => GeneratedSourceWorldView::Resolved(
+                world.def,
+                view_scope.view.model.worlds[world.wit].unsupported,
+            ),
+            // A successfully loaded Generated view is complete. A missing
+            // source world is therefore an intentional omission.
+            None => GeneratedSourceWorldView::Omitted,
+        })
     }
 
     fn generated_view_interface_for_source_interface(
@@ -14221,6 +14501,22 @@ impl RootDatabase {
             canonical_wit_path_name(&view.model.worlds[world.wit].name) == requested_name
         });
         if let Some(world) = found_world {
+            if position == WorldReferencePosition::Include
+                && let Some(unsupported) = view.model.worlds[world.wit].unsupported
+            {
+                let diagnostic = world_package_path_diagnostic(
+                    owner,
+                    span,
+                    sai_diagnostics::Code::WitUnsupportedFeature,
+                    format!(
+                        "included WIT world `{original_path}` uses unsupported feature `{unsupported:?}`"
+                    ),
+                    "unsupported WIT world",
+                    inputs,
+                    snapshot,
+                )?;
+                return Ok((resolved(Res::Err), vec![diagnostic]));
+            }
             return Ok((resolved(Res::Def(DefKind::World, world.def)), Vec::new()));
         }
         let mut available_interfaces = HashMap::new();
@@ -14349,6 +14645,7 @@ impl RootDatabase {
         for descriptor in descriptors {
             let mut world_references = Vec::new();
             let mut world_reference_item_errors = Vec::new();
+            let mut source_import_items = Vec::new();
             let inputs = match self.current_owner_inputs(
                 snapshot,
                 descriptor.file,
@@ -14362,6 +14659,7 @@ impl RootDatabase {
                             error: Some(error.clone()),
                             references: Vec::new(),
                             item_errors: Vec::new(),
+                            source_import_items: Vec::new(),
                         });
                     }
                     owners.push(WorldOwnerTestOnlyResolution {
@@ -14515,16 +14813,39 @@ impl RootDatabase {
                         )
                         .map_err(OwnerControlFlowResolutionError::Lowering)?;
                         item_lowering_diagnostics.extend(item_hir.diagnostics.iter().cloned());
-                        world_reference_input = match item_hir.node {
+                        let source_import_item = match item_hir.node {
                             OwnerNode::WorldItem(item) => match item.kind {
                                 WorldItemKind::Import(reference) => {
-                                    Some((WorldReferencePosition::Import, reference))
+                                    world_reference_input =
+                                        Some((WorldReferencePosition::Import, reference));
+                                    None
                                 }
                                 WorldItemKind::Export(reference) => {
-                                    Some((WorldReferencePosition::Export, reference))
+                                    world_reference_input =
+                                        Some((WorldReferencePosition::Export, reference));
+                                    None
                                 }
                                 WorldItemKind::Include(reference) => {
-                                    Some((WorldReferencePosition::Include, reference))
+                                    world_reference_input =
+                                        Some((WorldReferencePosition::Include, reference));
+                                    world_reference_owners
+                                        .is_some()
+                                        .then_some(WorldImportFnSourceItem::Include(item_owner))
+                                }
+                                WorldItemKind::ImportFn { name, .. }
+                                    if !name.is_error() && world_reference_owners.is_some() =>
+                                {
+                                    let name = self
+                                        .symbols
+                                        .resolve(name.sym)
+                                        .map_err(OwnerControlFlowResolutionError::SymbolLookup)?
+                                        .to_string();
+                                    Some(WorldImportFnSourceItem::ImportFunction(
+                                        sai_resolve::WorldImportFunction {
+                                            name,
+                                            def_id: item_owner.def_id.to_def_id(),
+                                        },
+                                    ))
                                 }
                                 WorldItemKind::ImportFn { .. } | WorldItemKind::ExportFn { .. } => {
                                     None
@@ -14536,6 +14857,9 @@ impl RootDatabase {
                                 ));
                             }
                         };
+                        if let Some(source_import_item) = source_import_item {
+                            source_import_items.push(source_import_item);
+                        }
                         let signature_type_candidates =
                             world_item_signature_type_path_candidates(&item_hir);
                         let type_resolution = match signature_type_candidates {
@@ -14736,6 +15060,7 @@ impl RootDatabase {
                             error: None,
                             references: world_references,
                             item_errors: world_reference_item_errors,
+                            source_import_items,
                         });
                     }
                 }
@@ -14746,6 +15071,7 @@ impl RootDatabase {
                             error: Some(error.clone()),
                             references: Vec::new(),
                             item_errors: Vec::new(),
+                            source_import_items: Vec::new(),
                         });
                     }
                     owners.push(WorldOwnerTestOnlyResolution {
@@ -28311,6 +28637,175 @@ mod tests {
     }
 
     #[test]
+    fn world_import_fn_adapter_preserves_source_order_and_handles_local_include_cycles() {
+        let source = concat!(
+            "interface api {}\n",
+            "world root {\n",
+            "  import fn root_before()\n",
+            "  import fn direct_wins()\n",
+            "  include child_world\n",
+            "  import fn after()\n",
+            "  export fn ignored()\n",
+            "  include child_world\n",
+            "  include api\n",
+            "  include missing.world\n",
+            "}\n",
+            "world child_world {\n",
+            "  include leaf_world\n",
+            "  import fn direct_wins()\n",
+            "  import fn collision()\n",
+            "  import fn child_only()\n",
+            "}\n",
+            "world leaf_world {\n",
+            "  import fn direct_wins()\n",
+            "  import fn collision()\n",
+            "  import fn leaf_only()\n",
+            "  include root\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("world owners are collected");
+        let references = database
+            .resolve_world_references(&collection, &module_tree, &snapshot)
+            .expect("local world references resolve");
+
+        let owner_named = |expected_name: &str| {
+            references
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| {
+                            path.data()
+                                .last()
+                                .and_then(|component| match &component.data {
+                                    DefPathData::World(symbol) => database
+                                        .resolve_symbol(*symbol)
+                                        .ok()
+                                        .map(|name| name.as_ref() == expected_name),
+                                    _ => None,
+                                })
+                        })
+                        .unwrap_or(false)
+                })
+                .expect("world reference result exists")
+        };
+        let function_def = |owner: &WorldOwnerReferenceResolution, expected_name: &str| {
+            owner
+                .source_import_items
+                .iter()
+                .find_map(|item| match item {
+                    WorldImportFnSourceItem::ImportFunction(function)
+                        if function.name == expected_name =>
+                    {
+                        Some(function.def_id)
+                    }
+                    WorldImportFnSourceItem::ImportFunction(_)
+                    | WorldImportFnSourceItem::Include(_) => None,
+                })
+                .expect("world declares the expected import function")
+        };
+        let root = owner_named("root");
+        let child = owner_named("child_world");
+        let leaf = owner_named("leaf_world");
+        let imports = database
+            .resolve_world_import_fns(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &references,
+                root.owner().def_id.to_def_id(),
+                None,
+            )
+            .expect("local import functions are collected");
+
+        assert_eq!(
+            imports.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "after",
+                "child_only",
+                "collision",
+                "direct_wins",
+                "leaf_only",
+                "root_before",
+            ],
+            "exports, wrong-kind includes, and incomplete includes do not enter the map"
+        );
+        assert_eq!(
+            imports["root_before"],
+            function_def(root, "root_before"),
+            "an import before an include wins over all included declarations"
+        );
+        assert_eq!(
+            imports["direct_wins"],
+            function_def(root, "direct_wins"),
+            "a direct import wins over the same name in included worlds"
+        );
+        assert_eq!(
+            imports["collision"],
+            function_def(leaf, "collision"),
+            "nested includes expand depth-first before the including world's later items"
+        );
+        assert_eq!(
+            imports["child_only"],
+            function_def(child, "child_only"),
+            "the child world contributes its non-duplicate import"
+        );
+        assert_eq!(imports["leaf_only"], function_def(leaf, "leaf_only"));
+        assert_eq!(
+            imports["after"],
+            function_def(root, "after"),
+            "items following includes remain in the containing source order"
+        );
+        assert_eq!(
+            imports.get("collision"),
+            Some(&function_def(leaf, "collision")),
+            "repeated includes do not replace the first depth-first declaration"
+        );
+
+        let mut mismatched_collection = collection.clone();
+        mismatched_collection.target_cfg =
+            target_cfg_for_check("wasm64-core").expect("second target is valid");
+        assert_eq!(
+            database.resolve_world_import_fns(
+                &mismatched_collection,
+                &module_tree,
+                &snapshot,
+                &references,
+                root.owner().def_id.to_def_id(),
+                None,
+            ),
+            Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch),
+            "world references from a different collection are rejected"
+        );
+
+        let stale_snapshot = phase1_snapshot_from_vfs(&mut database, &module_tree, 27);
+        assert_eq!(
+            database.resolve_world_import_fns(
+                &collection,
+                &module_tree,
+                &stale_snapshot,
+                &references,
+                root.owner().def_id.to_def_id(),
+                None,
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch),
+            "world references cannot be reused with a different workspace snapshot"
+        );
+    }
+
+    #[test]
     fn world_package_references_resolve_wit_interfaces_and_worlds() {
         let root = concat!(
             "world references {\n",
@@ -28320,6 +28815,8 @@ mod tests {
             "  import acme:codec/api\n",
             "  export acme:codec/api\n",
             "  include acme:codec/server\n",
+            "  include acme:codec/unsupported\n",
+            "  import fn remote()\n",
             "  import acme:codec/server\n",
             "  include acme:codec/api\n",
             "  import acme:codec/can\n",
@@ -28402,7 +28899,7 @@ mod tests {
             .set_file_contents(
                 FileKey::new(codec_key.as_str(), "wit/api.wit").expect("WIT file key is valid"),
                 Arc::from(
-                    &b"package acme:codec@1.0.0; world cat {} interface car {} interface api { run: func(); } world server {} interface distant {} world another {}"[..],
+                    &b"package acme:codec@1.0.0; world cat {} interface car {} interface api { run: func(); } world server { import remote: func(); } interface distant {} world another {} world unsupported { type hidden = u32; import rejected: func(); }"[..],
                 ),
                 Durability::Low,
             )
@@ -28450,7 +28947,7 @@ mod tests {
         let owner = resolutions
             .owners()
             .iter()
-            .find(|owner| owner.references().len() == 10)
+            .find(|owner| owner.references().len() == 11)
             .expect("the source world has all package paths");
         let codec_view = wit_view_scopes
             .views()
@@ -28470,6 +28967,33 @@ mod tests {
             .find(|world| codec_view.view.model.worlds[world.wit].name == "server")
             .expect("codec world exists")
             .def;
+        let expected_remote = codec_view
+            .view
+            .worlds
+            .values()
+            .find(|world| world.def == expected_world)
+            .and_then(|world| world.import_fns.get("remote"))
+            .copied()
+            .expect("codec server imports remote");
+        let imported_functions = database
+            .resolve_world_import_fns(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &resolutions,
+                owner.owner().def_id.to_def_id(),
+                Some(&wit_view_scopes),
+            )
+            .expect("external world imports are available from the validated WIT view");
+        assert_eq!(
+            imported_functions.get("remote"),
+            Some(&expected_remote),
+            "an external world's import wins over a later direct import"
+        );
+        assert!(
+            !imported_functions.contains_key("rejected"),
+            "an unsupported external world does not contribute imported functions"
+        );
         let reference_for = |line: &str, path: &str, position: WorldReferencePosition| {
             let line_start = root.find(line).expect("world item line exists");
             let start = line_start + line.find(path).expect("world item line contains the path");
@@ -28517,6 +29041,28 @@ mod tests {
             );
             assert!(reference.diagnostics().is_empty());
         }
+        let unsupported_world = reference_for(
+            "  include acme:codec/unsupported\n",
+            "acme:codec/unsupported",
+            WorldReferencePosition::Include,
+        );
+        assert_eq!(
+            unsupported_world.path_result(),
+            &WorldReferencePathResult::ResolvedPkg(PathRes {
+                base: Res::Err,
+                resolved_segments: 1,
+                segment_count: 1,
+            })
+        );
+        assert_eq!(
+            unsupported_world
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::WitUnsupportedFeature],
+            "unsupported external worlds are diagnosed at their include reference"
+        );
         for (line, path, position) in [
             (
                 "  import acme:codec/server\n",
@@ -28725,6 +29271,9 @@ mod tests {
             "  import acme:dep\n",
             "  export acme:dep\n",
             "  include acme:dep\n",
+            "  include acme:dep/server\n",
+            "  include acme:dep/bad\n",
+            "  import fn external()\n",
             "  import acme:dep/api\n",
             "  import acme:dep/hidden\n",
             "  import acme:dep/missing\n",
@@ -28745,7 +29294,7 @@ mod tests {
             &[
                 (
                     "lib.sai",
-                    b"pub interface api {}\ninterface hidden {}\npub interface renamed {}\n",
+                    b"pub interface api {}\ninterface hidden {}\npub interface renamed {}\npub world server { import fn source_fn() }\npub world bad {}\n",
                 ),
                 ("alpha.sai", b"pub fn alpha() {}\n"),
                 ("zeta.sai", b"pub fn zeta() {}\n"),
@@ -28816,7 +29365,9 @@ mod tests {
               requires { acme:dep @ ^1 }\n"[..],
         );
         let generated = GeneratedText {
-            text: Arc::from("package acme:dep@1.0.0; interface api {}"),
+            text: Arc::from(
+                "package acme:dep@1.0.0; world server { import external: func(); } world bad { type hidden = u32; import rejected: func(); } interface api {}",
+            ),
             complete: true,
             origins: Arc::from([("api".to_owned(), renamed_interface)]),
         };
@@ -28864,8 +29415,8 @@ mod tests {
         let owner = resolutions
             .owners()
             .iter()
-            .find(|owner| owner.references().len() == 7)
-            .expect("source world has seven package references");
+            .find(|owner| owner.references().len() == 9)
+            .expect("source world has nine package references");
         let reference_for = |line: &str, path: &str| {
             let line_start = root_source.find(line).expect("world item line exists");
             let start = line_start + line.find(path).expect("world item line contains path");
@@ -28907,6 +29458,72 @@ mod tests {
                 .collect::<Vec<_>>(),
             [sai_diagnostics::Code::InvalidWorldItem],
             "including a source package root is an invalid world item"
+        );
+        let source_world_reference =
+            reference_for("  include acme:dep/server\n", "acme:dep/server");
+        let generated_world_scope = wit_views
+            .views()
+            .find(|scope| {
+                matches!(scope.view.unit.kind(), WitUnitKind::Generated { .. })
+                    && scope.visible_identity == "acme:dep"
+            })
+            .expect("source package has a generated WIT view");
+        let generated_world = generated_world_scope
+            .view
+            .worlds
+            .get("server")
+            .expect("generated source view has the server world");
+        assert_eq!(
+            source_world_reference.path_result(),
+            &WorldReferencePathResult::ResolvedPkg(PathRes {
+                base: Res::Def(DefKind::World, generated_world.def),
+                resolved_segments: 1,
+                segment_count: 1,
+            }),
+            "a foreign source world resolves to its validated generated WIT view definition"
+        );
+        assert!(source_world_reference.diagnostics().is_empty());
+        let expected_external = generated_world
+            .import_fns
+            .get("external")
+            .copied()
+            .expect("generated world has its external import function");
+        let imported = database
+            .resolve_world_import_fns(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &resolutions,
+                owner.owner().def_id.to_def_id(),
+                Some(&wit_views),
+            )
+            .expect("source world include expands through the active generated WIT view");
+        assert_eq!(
+            imported.get("external"),
+            Some(&expected_external),
+            "the external source world contributes its generated-view imports before direct imports"
+        );
+        assert!(
+            !imported.contains_key("rejected"),
+            "an unsupported generated source world does not contribute imported functions"
+        );
+        let unsupported_generated_world = reference_for("  include acme:dep/bad\n", "acme:dep/bad");
+        assert_eq!(
+            unsupported_generated_world.path_result(),
+            &WorldReferencePathResult::ResolvedPkg(PathRes {
+                base: Res::Err,
+                resolved_segments: 1,
+                segment_count: 1,
+            })
+        );
+        assert_eq!(
+            unsupported_generated_world
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::WitUnsupportedFeature],
+            "unsupported worlds in the Generated source view are diagnosed at the include"
         );
         let no_origin_interface = reference_for("  import acme:dep/api\n", "acme:dep/api");
         assert_eq!(

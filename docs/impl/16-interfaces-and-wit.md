@@ -1521,3 +1521,9 @@ See [implementation-review.md](../design/implementation-review.md) for the decis
 The snapshot-bound driver adapter now translates only complete local world-include resolutions into `sai_resolve::world_includes` edges. It orders worlds and includes by package generation and source order, rebinds decoded spans to the active workspace snapshot, and ignores deferred, foreign, wrong-kind, and error results without manufacturing local graph edges.
 
 See [implementation-review.md](../design/implementation-review.md) for the decision record, verification, hostile review, and human review items.
+
+### IR-634: Adapt world imports and includes to imported-function lookup
+
+The snapshot- and collection-bound `resolve_world_import_fns` adapter now captures direct local `import fn` declarations and include references in one source-ordered sequence, builds external import maps from the validated active WIT-view closure, and calls `sai_resolve::world_import_fns`. Foreign source-package worlds resolve to their matching Generated WIT world by the source collection's `package_wit_names` entry. An unavailable generated view leaves the package path deferred. An include of a WIT world marked unsupported receives `WIT_UNSUPPORTED_FEATURE` at its `WorldRef` and does not contribute functions.
+
+See [implementation-review.md](../design/implementation-review.md) for the decision record, verification, hostile review, human review items, and remaining `w.f` expression-resolution scope.
