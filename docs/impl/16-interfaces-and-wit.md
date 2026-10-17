@@ -1214,6 +1214,8 @@ pub struct GeneratedWit {
 
 `generated_wit_text(P)` prints the model with `print_wit` (§16.3.4) and returns a `GeneratedText` with the text, `complete` and `origins`. The model and the text depend only on the declarations of `P` and on the views it refers to. A body edit therefore changes neither (§16.1.4 item 6).
 
+**Declaration-documentation input foundation (IR-650; generated-WIT model construction remains unimplemented):** The stable HIR item-tree projection now retains each declaration's outer documentation payload without SAI `///` delimiters, including interfaces, nested type members, resource members, worlds, and world items. These payloads participate in the stable item-tree fingerprint and are checked when rebinding the shape to a new AST snapshot. The generator can pass them directly to the WIT model; its printer adds the WIT comment delimiters. Executable bodies remain outside this projection.
+
 ### 16.10.2 Clients
 
 1. **Bindgen.** `sai bindgen wit` ([13](13-cli.md) §13.6.19 item 1) checks the root, and writes `generated_wit_text(root).text` only when the root has no errors and the text is `complete`.
