@@ -5,7 +5,9 @@
 //! conversion result that WIT generation later materializes against its
 //! generated-unit and view-item index maps.
 
-use sai_hir::types::{GenericArg, LangItem, Path, PathRoot, Ty, TyKind};
+use sai_hir::types::{
+    GenericArg, GenericParam, GenericParamKind, LangItem, Path, PathRoot, Ty, TyKind,
+};
 use sai_hir::{DefId, HirId, OwnerId, Span};
 use sai_resolve::package_scopes::{DefKind, PathRes, Res};
 use sai_resolve::prelude::PrimTy;
@@ -93,16 +95,16 @@ pub enum BoundaryDefinition {
 
 /// Caller-supplied target for a module alias.
 ///
-/// The target must be lowered HIR from `owner`; callers are responsible for
-/// supplying its original path resolutions in
-/// [`BoundaryTypeContext::path_resolutions`]. Generic aliases are retained in
-/// the map so they can be explicitly deferred rather than mistaken for
-/// nongeneric aliases.
+/// The target and generic parameters must be lowered HIR from `owner`;
+/// callers are responsible for supplying their original path resolutions in
+/// [`BoundaryTypeContext::path_resolutions`].
 #[derive(Clone, Copy, Debug)]
 pub struct BoundaryAlias<'hir> {
     pub owner: OwnerId,
     pub ty: &'hir Ty<'hir>,
-    pub has_generic_params: bool,
+    /// Parameters in declaration order, including both type and const
+    /// parameters. Their HIR identities are used for type substitution.
+    pub generic_params: &'hir [GenericParam<'hir>],
 }
 
 /// Whether a named interface type contains a resource handle.
@@ -192,10 +194,10 @@ pub struct BoundaryTypeContext<'a> {
 /// Convert one HIR type into an index-free WIT type representation.
 ///
 /// No database access or spelling-based prelude recognition occurs here.
-pub fn boundary_type(
-    context: &BoundaryTypeContext<'_>,
+pub fn boundary_type<'hir>(
+    context: &BoundaryTypeContext<'hir>,
     owner: OwnerId,
-    ty: &Ty<'_>,
+    ty: &Ty<'hir>,
     position: Position,
 ) -> BoundaryTypeOutcome {
     boundary_type_with_references(context, owner, ty, position).outcome
@@ -203,10 +205,10 @@ pub fn boundary_type(
 
 /// Convert one HIR type and expose local interface references that become
 /// visible only after expanding a module alias.
-pub fn boundary_type_with_references(
-    context: &BoundaryTypeContext<'_>,
+pub fn boundary_type_with_references<'hir>(
+    context: &BoundaryTypeContext<'hir>,
     owner: OwnerId,
-    ty: &Ty<'_>,
+    ty: &Ty<'hir>,
     position: Position,
 ) -> BoundaryTypeConversion {
     if ty.hir_id.owner != owner {
@@ -222,6 +224,7 @@ pub fn boundary_type_with_references(
         ty,
         position,
         position == Position::Result,
+        &HashMap::new(),
         &mut HashSet::new(),
         None,
         &mut references,
@@ -232,13 +235,20 @@ pub fn boundary_type_with_references(
     }
 }
 
-fn convert_type(
-    context: &BoundaryTypeContext<'_>,
+#[derive(Clone, Copy)]
+struct TypeSubstitution<'hir> {
+    ty: &'hir Ty<'hir>,
+    self_resource: Option<DefId>,
+}
+
+fn convert_type<'hir>(
+    context: &BoundaryTypeContext<'hir>,
     owner: OwnerId,
-    ty: &Ty<'_>,
+    ty: &Ty<'hir>,
     position: Position,
     allow_unit: bool,
-    alias_stack: &mut HashSet<DefId>,
+    substitutions: &HashMap<DefId, TypeSubstitution<'hir>>,
+    alias_stack: &mut HashSet<(DefId, HirId)>,
     alias_use_span: Option<Span>,
     references: &mut Vec<BoundaryTypeReference>,
 ) -> BoundaryTypeOutcome {
@@ -263,6 +273,7 @@ fn convert_type(
                     element,
                     Position::Nested,
                     false,
+                    substitutions,
                     alias_stack,
                     alias_use_span,
                     references,
@@ -281,6 +292,7 @@ fn convert_type(
                 inner,
                 Position::Nested,
                 false,
+                substitutions,
                 alias_stack,
                 alias_use_span,
                 references,
@@ -306,6 +318,7 @@ fn convert_type(
             path,
             position,
             allow_unit,
+            substitutions,
             alias_stack,
             alias_use_span,
             references,
@@ -313,14 +326,15 @@ fn convert_type(
     }
 }
 
-fn convert_path(
-    context: &BoundaryTypeContext<'_>,
+fn convert_path<'hir>(
+    context: &BoundaryTypeContext<'hir>,
     owner: OwnerId,
-    ty: &Ty<'_>,
-    path: Path<'_>,
+    ty: &Ty<'hir>,
+    path: Path<'hir>,
     position: Position,
     allow_unit: bool,
-    alias_stack: &mut HashSet<DefId>,
+    substitutions: &HashMap<DefId, TypeSubstitution<'hir>>,
+    alias_stack: &mut HashSet<(DefId, HirId)>,
     alias_use_span: Option<Span>,
     references: &mut Vec<BoundaryTypeReference>,
 ) -> BoundaryTypeOutcome {
@@ -383,6 +397,7 @@ fn convert_path(
             path,
             canonical,
             position,
+            substitutions,
             alias_stack,
             alias_use_span,
             references,
@@ -391,6 +406,29 @@ fn convert_path(
 
     match resolution.or_else(|| path_res_for(context, &path).map(|path_res| path_res.base)) {
         Some(Res::PrimTy(primitive)) => convert_primitive(primitive, ty.span),
+        Some(Res::Def(DefKind::TyParam, def_id)) => {
+            let Some(substitution) = substitutions.get(&def_id).copied() else {
+                return incompatible(ty.span, IncompatibleReason::TypeParameter);
+            };
+            // A type argument belongs to the owner where the alias was used.
+            // Preserve active alias applications while expanding it. Distinct
+            // nested HIR applications such as `A<A<u32>>` remain finite.
+            let substitution_context = BoundaryTypeContext {
+                self_resource: substitution.self_resource,
+                ..*context
+            };
+            convert_type(
+                &substitution_context,
+                substitution.ty.hir_id.owner,
+                substitution.ty,
+                position,
+                allow_unit,
+                substitutions,
+                alias_stack,
+                alias_use_span,
+                references,
+            )
+        }
         Some(Res::Def(kind, def_id)) => convert_definition(
             context,
             kind,
@@ -399,6 +437,7 @@ fn convert_path(
             path,
             position,
             allow_unit,
+            substitutions,
             alias_stack,
             alias_use_span,
             references,
@@ -437,15 +476,16 @@ fn convert_primitive(primitive: PrimTy, span: Span) -> BoundaryTypeOutcome {
     BoundaryTypeOutcome::Mapped(mapped)
 }
 
-fn convert_definition(
-    context: &BoundaryTypeContext<'_>,
+fn convert_definition<'hir>(
+    context: &BoundaryTypeContext<'hir>,
     kind: DefKind,
     def_id: DefId,
     span: Span,
-    path: Path<'_>,
+    path: Path<'hir>,
     position: Position,
     allow_unit: bool,
-    alias_stack: &mut HashSet<DefId>,
+    substitutions: &HashMap<DefId, TypeSubstitution<'hir>>,
+    alias_stack: &mut HashSet<(DefId, HirId)>,
     alias_use_span: Option<Span>,
     references: &mut Vec<BoundaryTypeReference>,
 ) -> BoundaryTypeOutcome {
@@ -487,13 +527,18 @@ fn convert_definition(
                 let Some(alias) = context.aliases.get(&def_id) else {
                     return BoundaryTypeOutcome::Deferred;
                 };
-                if alias.has_generic_params
-                    || has_generic_arguments(path)
-                    || alias.ty.hir_id.owner != alias.owner
-                    || !alias_stack.insert(def_id)
-                {
+                let application = (def_id, path.hir_id);
+                if alias.ty.hir_id.owner != alias.owner || !alias_stack.insert(application) {
                     return BoundaryTypeOutcome::Deferred;
                 }
+                let alias_substitutions =
+                    match alias_type_substitutions(context, alias, path, substitutions) {
+                        Ok(substitutions) => substitutions,
+                        Err(outcome) => {
+                            alias_stack.remove(&application);
+                            return outcome;
+                        }
+                    };
                 // An alias target is evaluated in its declaring context.
                 // In particular, a `Self` from the using resource member
                 // must not be captured while expanding a module alias.
@@ -507,11 +552,12 @@ fn convert_definition(
                     alias.ty,
                     position,
                     allow_unit,
+                    &alias_substitutions,
                     alias_stack,
                     Some(alias_use_span.unwrap_or(span)),
                     references,
                 );
-                alias_stack.remove(&def_id);
+                alias_stack.remove(&application);
                 match outcome {
                     BoundaryTypeOutcome::Incompatible(finding) => {
                         incompatible(span, finding.reason)
@@ -524,14 +570,196 @@ fn convert_definition(
     }
 }
 
-fn convert_canonical(
-    context: &BoundaryTypeContext<'_>,
+fn alias_type_substitutions<'hir>(
+    context: &BoundaryTypeContext<'hir>,
+    alias: &BoundaryAlias<'hir>,
+    path: Path<'hir>,
+    substitutions: &HashMap<DefId, TypeSubstitution<'hir>>,
+) -> Result<HashMap<DefId, TypeSubstitution<'hir>>, BoundaryTypeOutcome> {
+    let arguments = alias_generic_arguments(path).ok_or(BoundaryTypeOutcome::Deferred)?;
+    if alias.generic_params.is_empty() {
+        if arguments.is_some() {
+            return Err(BoundaryTypeOutcome::Deferred);
+        }
+        return Ok(substitutions.clone());
+    }
+    let Some(arguments) = arguments else {
+        return Err(BoundaryTypeOutcome::Deferred);
+    };
+    if arguments.len() != alias.generic_params.len() {
+        return Err(BoundaryTypeOutcome::Deferred);
+    }
+
+    let mut expanded = substitutions.clone();
+    for (parameter, argument) in alias.generic_params.iter().zip(arguments) {
+        match (parameter.kind, argument) {
+            (GenericParamKind::Type { .. }, GenericArg::Type(ty)) => {
+                validate_type_argument(context, ty, substitutions)?;
+                let def_id = parameter.def_id.to_def_id();
+                // A nested application of the same generic alias reuses
+                // the declaration's parameter identities. The nested
+                // environment must shadow the outer application; the caller
+                // keeps its own map because this map is cloned per alias.
+                expanded.insert(
+                    def_id,
+                    TypeSubstitution {
+                        ty: *ty,
+                        self_resource: context.self_resource,
+                    },
+                );
+            }
+            (GenericParamKind::Const { .. }, GenericArg::Const(_)) => {}
+            (GenericParamKind::Type { .. }, _) | (GenericParamKind::Const { .. }, _) => {
+                return Err(BoundaryTypeOutcome::Deferred);
+            }
+        }
+    }
+    Ok(expanded)
+}
+
+fn alias_generic_arguments<'hir>(path: Path<'hir>) -> Option<Option<&'hir [GenericArg<'hir>]>> {
+    if path.segments.is_empty() {
+        return None;
+    }
+    let mut arguments = None;
+    for (index, segment) in path.segments.iter().enumerate() {
+        let Some(generic_args) = segment.args else {
+            continue;
+        };
+        if index + 1 != path.segments.len() || arguments.is_some() {
+            return None;
+        }
+        arguments = Some(generic_args.args);
+    }
+    Some(arguments)
+}
+
+fn validate_type_argument<'hir>(
+    context: &BoundaryTypeContext<'hir>,
+    ty: &'hir Ty<'hir>,
+    substitutions: &HashMap<DefId, TypeSubstitution<'hir>>,
+) -> Result<(), BoundaryTypeOutcome> {
+    validate_type_paths(context, ty, substitutions, &mut HashSet::new())?;
+    Ok(())
+}
+
+fn validate_type_paths<'hir>(
+    context: &BoundaryTypeContext<'hir>,
+    ty: &'hir Ty<'hir>,
+    substitutions: &HashMap<DefId, TypeSubstitution<'hir>>,
+    substitution_stack: &mut HashSet<DefId>,
+) -> Result<(), BoundaryTypeOutcome> {
+    match ty.kind {
+        TyKind::Err | TyKind::Infer => Err(BoundaryTypeOutcome::Suppressed),
+        TyKind::Path(path) => {
+            if ty.hir_id.owner != path.hir_id.owner
+                || path.segments.iter().any(|segment| segment.name.is_error())
+            {
+                return Err(BoundaryTypeOutcome::Suppressed);
+            }
+            match path.root {
+                PathRoot::Plain => {
+                    let Some(path_res) = context.path_resolutions.get(&path.hir_id) else {
+                        return Err(BoundaryTypeOutcome::Deferred);
+                    };
+                    let Ok(segment_count) = u32::try_from(path.segments.len()) else {
+                        return Err(BoundaryTypeOutcome::Deferred);
+                    };
+                    if path_res.segment_count != segment_count
+                        || path_res.resolved_segments != segment_count
+                    {
+                        return Err(BoundaryTypeOutcome::Deferred);
+                    }
+                    match path_res.base {
+                        Res::Err | Res::Local(_) | Res::TestOnly(_) => {
+                            return Err(BoundaryTypeOutcome::Suppressed);
+                        }
+                        Res::Def(DefKind::TyParam, def_id) => {
+                            if let Some(substitution) = substitutions.get(&def_id) {
+                                if !substitution_stack.insert(def_id) {
+                                    return Err(BoundaryTypeOutcome::Deferred);
+                                }
+                                let result = validate_type_paths(
+                                    context,
+                                    substitution.ty,
+                                    substitutions,
+                                    substitution_stack,
+                                );
+                                substitution_stack.remove(&def_id);
+                                result?;
+                            }
+                        }
+                        Res::Def(DefKind::Alias, def_id)
+                            if context.definitions.get(&def_id).is_some_and(|definition| {
+                                *definition == BoundaryDefinition::ModuleAlias
+                            }) =>
+                        {
+                            let Some(alias) = context.aliases.get(&def_id) else {
+                                return Err(BoundaryTypeOutcome::Deferred);
+                            };
+                            // Even an unused type argument must not hide a
+                            // malformed nested application.
+                            alias_type_substitutions(context, alias, path, substitutions)?;
+                        }
+                        _ => {}
+                    }
+                }
+                PathRoot::SelfType if path.segments.is_empty() => {
+                    if context.self_resource.is_none() {
+                        return Err(BoundaryTypeOutcome::Deferred);
+                    }
+                }
+                PathRoot::Lang(LangItem::Option | LangItem::Result) if path.segments.len() == 1 => {
+                }
+                PathRoot::SelfType | PathRoot::SelfValue | PathRoot::Lang(_) => {
+                    return Err(BoundaryTypeOutcome::Deferred);
+                }
+            }
+            for segment in path.segments {
+                let Some(arguments) = segment.args else {
+                    continue;
+                };
+                for argument in arguments.args {
+                    match argument {
+                        GenericArg::Type(ty) | GenericArg::Binding { ty, .. } => {
+                            validate_type_paths(context, ty, substitutions, substitution_stack)?;
+                        }
+                        GenericArg::Const(_) => {}
+                    }
+                }
+            }
+            Ok(())
+        }
+        TyKind::Borrow(_, inner) => {
+            validate_type_paths(context, inner, substitutions, substitution_stack)
+        }
+        TyKind::Tuple(elements) => {
+            for element in elements.iter() {
+                validate_type_paths(context, element, substitutions, substitution_stack)?;
+            }
+            Ok(())
+        }
+        TyKind::FnPtr { params, ret, .. } => {
+            for parameter in params.iter() {
+                validate_type_paths(context, parameter, substitutions, substitution_stack)?;
+            }
+            if let Some(ret) = ret {
+                validate_type_paths(context, ret, substitutions, substitution_stack)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn convert_canonical<'hir>(
+    context: &BoundaryTypeContext<'hir>,
     owner: OwnerId,
-    ty: &Ty<'_>,
-    path: Path<'_>,
+    ty: &Ty<'hir>,
+    path: Path<'hir>,
     canonical: CanonicalBoundaryType,
     position: Position,
-    alias_stack: &mut HashSet<DefId>,
+    substitutions: &HashMap<DefId, TypeSubstitution<'hir>>,
+    alias_stack: &mut HashSet<(DefId, HirId)>,
     alias_use_span: Option<Span>,
     references: &mut Vec<BoundaryTypeReference>,
 ) -> BoundaryTypeOutcome {
@@ -580,6 +808,7 @@ fn convert_canonical(
                 element,
                 Position::Nested,
                 false,
+                substitutions,
                 alias_stack,
                 alias_use_span,
                 references,
@@ -611,6 +840,7 @@ fn convert_canonical(
                 element,
                 Position::Nested,
                 false,
+                substitutions,
                 alias_stack,
                 alias_use_span,
                 references,
@@ -638,6 +868,7 @@ fn convert_canonical(
                 ok,
                 Position::Nested,
                 true,
+                substitutions,
                 alias_stack,
                 alias_use_span,
                 references,
@@ -652,6 +883,7 @@ fn convert_canonical(
                 err,
                 Position::Nested,
                 true,
+                substitutions,
                 alias_stack,
                 alias_use_span,
                 references,
@@ -769,11 +1001,12 @@ mod tests {
         ResourceContainment, boundary_type, boundary_type_with_references,
     };
     use sai_hir::types::{
-        ConstArg, GenericArg, GenericArgs, LangItem, Name, Path, PathRoot, PathSegment, Ty, TyKind,
+        ConstArg, GenericArg, GenericArgs, GenericParam, GenericParamKind, LangItem, Name, Path,
+        PathRoot, PathSegment, Ty, TyKind,
     };
     use sai_hir::{
         DefId, DefIndex, DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId,
-        ItemLocalId, Mutability, OwnerId, Span, SpanCtxt,
+        ItemLocalId, LocalDefId, Mutability, OwnerId, Span, SpanCtxt,
     };
     use sai_intern::{Idx, Interner, PackageInterner};
     use sai_resolve::package_scopes::{DefKind, PathRes, Res};
@@ -786,6 +1019,8 @@ mod tests {
         owner: OwnerId,
         alias_owner: OwnerId,
         second_alias_owner: OwnerId,
+        alias_type_param: LocalDefId,
+        second_alias_type_param: LocalDefId,
         package: sai_hir::PackageId,
         symbol: sai_hir::Symbol,
     }
@@ -810,17 +1045,26 @@ mod tests {
                 &symbols,
             )
             .expect("owner path builds");
-            OwnerId {
-                def_id: paths.intern(path).expect("owner definition interns"),
-            }
+            let def_id = paths.intern(path).expect("owner definition interns");
+            (OwnerId { def_id }, def_id)
         };
-        let owner = intern_owner(symbol, 0);
+        let (owner, _) = intern_owner(symbol, 0);
         let alias_name = symbols.intern("Alias").expect("alias name interns");
         let second_alias_name = symbols.intern("NextAlias").expect("alias name interns");
+        let (alias_owner, alias_local_def) = intern_owner(alias_name, 0);
+        let (second_alias_owner, second_alias_local_def) = intern_owner(second_alias_name, 0);
+        let alias_type_param = paths
+            .intern_generic_param(alias_local_def, symbol, false, 0)
+            .expect("alias type parameter interns");
+        let second_alias_type_param = paths
+            .intern_generic_param(second_alias_local_def, symbol, false, 0)
+            .expect("second alias type parameter interns");
         TestIds {
             owner,
-            alias_owner: intern_owner(alias_name, 0),
-            second_alias_owner: intern_owner(second_alias_name, 0),
+            alias_owner,
+            second_alias_owner,
+            alias_type_param,
+            second_alias_type_param,
             package,
             symbol,
         }
@@ -872,6 +1116,51 @@ mod tests {
                 span: span(start, end),
             }),
             span: span(start, end),
+        }
+    }
+
+    fn path_type_with_args<'hir>(
+        owner: OwnerId,
+        symbol: sai_hir::Symbol,
+        id: u32,
+        start: u32,
+        end: u32,
+        args: &'hir [GenericArg<'hir>],
+    ) -> Ty<'hir> {
+        let hir_id = hir_id(owner, id);
+        let name = Name {
+            sym: symbol,
+            span: span(start, end),
+        };
+        let generic_args = Box::leak(Box::new(GenericArgs {
+            args,
+            span: span(start, end),
+        }));
+        let segment = Box::leak(Box::new(PathSegment {
+            hir_id,
+            name,
+            args: Some(generic_args),
+        }));
+        Ty {
+            hir_id,
+            kind: TyKind::Path(Path {
+                hir_id,
+                root: PathRoot::Plain,
+                segments: std::slice::from_ref(segment),
+                span: span(start, end),
+            }),
+            span: span(start, end),
+        }
+    }
+
+    fn type_generic_param<'hir>(def_id: LocalDefId, symbol: sai_hir::Symbol) -> GenericParam<'hir> {
+        GenericParam {
+            def_id,
+            name: Name {
+                sym: symbol,
+                span: span(0, 1),
+            },
+            kind: GenericParamKind::Type { bounds: &[] },
         }
     }
 
@@ -1112,7 +1401,7 @@ mod tests {
             BoundaryAlias {
                 owner: ids.alias_owner,
                 ty: &target_ty,
-                has_generic_params: false,
+                generic_params: &[],
             },
         )]);
         let context =
@@ -1151,7 +1440,7 @@ mod tests {
             BoundaryAlias {
                 owner: ids.alias_owner,
                 ty: &target_ty,
-                has_generic_params: false,
+                generic_params: &[],
             },
         )]);
         let context =
@@ -1196,7 +1485,7 @@ mod tests {
                 BoundaryAlias {
                     owner: ids.alias_owner,
                     ty: &next_alias_ty,
-                    has_generic_params: false,
+                    generic_params: &[],
                 },
             ),
             (
@@ -1204,7 +1493,7 @@ mod tests {
                 BoundaryAlias {
                     owner: ids.second_alias_owner,
                     ty: &target_ty,
-                    has_generic_params: false,
+                    generic_params: &[],
                 },
             ),
         ]);
@@ -1214,6 +1503,330 @@ mod tests {
         assert_eq!(
             boundary_type(&context, ids.owner, &use_ty, Position::Nested),
             BoundaryTypeOutcome::Mapped(BoundaryType::U32)
+        );
+    }
+
+    #[test]
+    fn substitutes_type_parameters_in_generic_aliases() {
+        let ids = test_ids();
+        let alias_def = ids.alias_owner.def_id.to_def_id();
+        let param_def = ids.alias_type_param.to_def_id();
+        let u64_argument = path_type(ids.owner, ids.symbol, 2, 10, 13);
+        let direct_arguments = [GenericArg::Type(&u64_argument)];
+        let direct_use = path_type_with_args(ids.owner, ids.symbol, 1, 5, 15, &direct_arguments);
+        let nested_arguments = [GenericArg::Type(&u64_argument)];
+        let nested_application =
+            path_type_with_args(ids.owner, ids.symbol, 3, 20, 30, &nested_arguments);
+        let nested_use_arguments = [GenericArg::Type(&nested_application)];
+        let nested_use =
+            path_type_with_args(ids.owner, ids.symbol, 4, 18, 32, &nested_use_arguments);
+        let target_ty = path_type(ids.alias_owner, ids.symbol, 5, 40, 41);
+        let generic_param = type_generic_param(ids.alias_type_param, ids.symbol);
+        let generic_params = [generic_param];
+
+        let mut paths = HashMap::new();
+        insert_path(&mut paths, &direct_use, Res::Def(DefKind::Alias, alias_def));
+        insert_path(
+            &mut paths,
+            &nested_application,
+            Res::Def(DefKind::Alias, alias_def),
+        );
+        insert_path(&mut paths, &nested_use, Res::Def(DefKind::Alias, alias_def));
+        insert_path(&mut paths, &u64_argument, Res::PrimTy(PrimTy::U64));
+        insert_path(
+            &mut paths,
+            &target_ty,
+            Res::Def(DefKind::TyParam, param_def),
+        );
+        let canonical = HashMap::new();
+        let definitions = HashMap::from([(alias_def, BoundaryDefinition::ModuleAlias)]);
+        let aliases = HashMap::from([(
+            alias_def,
+            BoundaryAlias {
+                owner: ids.alias_owner,
+                ty: &target_ty,
+                generic_params: &generic_params,
+            },
+        )]);
+        let context =
+            make_context_with_aliases(&paths, &canonical, &definitions, &aliases, None, None);
+
+        assert_eq!(
+            boundary_type(&context, ids.owner, &direct_use, Position::Param),
+            BoundaryTypeOutcome::Mapped(BoundaryType::U64)
+        );
+        assert_eq!(
+            boundary_type(&context, ids.owner, &nested_use, Position::Param),
+            BoundaryTypeOutcome::Mapped(BoundaryType::U64),
+            "a nested use of the same generic alias is finite, not a definition cycle"
+        );
+    }
+
+    #[test]
+    fn substitutes_outer_generic_argument_through_inner_generic_alias() {
+        let ids = test_ids();
+        let wrap_def = ids.alias_owner.def_id.to_def_id();
+        let outer_def = ids.second_alias_owner.def_id.to_def_id();
+        let wrap_param_def = ids.alias_type_param.to_def_id();
+        let outer_param_def = ids.second_alias_type_param.to_def_id();
+
+        let u32_argument = path_type(ids.owner, ids.symbol, 2, 10, 13);
+        let use_arguments = [GenericArg::Type(&u32_argument)];
+        let use_ty = path_type_with_args(ids.owner, ids.symbol, 1, 5, 15, &use_arguments);
+        let outer_target_argument = path_type(ids.second_alias_owner, ids.symbol, 4, 25, 26);
+        let wrap_arguments = [GenericArg::Type(&outer_target_argument)];
+        let outer_target = path_type_with_args(
+            ids.second_alias_owner,
+            ids.symbol,
+            3,
+            20,
+            30,
+            &wrap_arguments,
+        );
+        let wrap_target = path_type(ids.alias_owner, ids.symbol, 5, 40, 41);
+        let wrap_generic_param = type_generic_param(ids.alias_type_param, ids.symbol);
+        let wrap_generic_params = [wrap_generic_param];
+        let outer_generic_param = type_generic_param(ids.second_alias_type_param, ids.symbol);
+        let outer_generic_params = [outer_generic_param];
+
+        let mut paths = HashMap::new();
+        insert_path(&mut paths, &use_ty, Res::Def(DefKind::Alias, outer_def));
+        insert_path(&mut paths, &u32_argument, Res::PrimTy(PrimTy::U32));
+        insert_path(
+            &mut paths,
+            &outer_target,
+            Res::Def(DefKind::Alias, wrap_def),
+        );
+        insert_path(
+            &mut paths,
+            &outer_target_argument,
+            Res::Def(DefKind::TyParam, outer_param_def),
+        );
+        insert_path(
+            &mut paths,
+            &wrap_target,
+            Res::Def(DefKind::TyParam, wrap_param_def),
+        );
+        let canonical = HashMap::new();
+        let definitions = HashMap::from([
+            (wrap_def, BoundaryDefinition::ModuleAlias),
+            (outer_def, BoundaryDefinition::ModuleAlias),
+        ]);
+        let aliases = HashMap::from([
+            (
+                wrap_def,
+                BoundaryAlias {
+                    owner: ids.alias_owner,
+                    ty: &wrap_target,
+                    generic_params: &wrap_generic_params,
+                },
+            ),
+            (
+                outer_def,
+                BoundaryAlias {
+                    owner: ids.second_alias_owner,
+                    ty: &outer_target,
+                    generic_params: &outer_generic_params,
+                },
+            ),
+        ]);
+        let context =
+            make_context_with_aliases(&paths, &canonical, &definitions, &aliases, None, None);
+
+        assert_eq!(
+            boundary_type(&context, ids.owner, &use_ty, Position::Param),
+            BoundaryTypeOutcome::Mapped(BoundaryType::U32)
+        );
+    }
+
+    #[test]
+    fn substitutes_nested_type_structure_through_generic_alias_chain() {
+        let ids = test_ids();
+        let inner_def = ids.alias_owner.def_id.to_def_id();
+        let outer_def = ids.second_alias_owner.def_id.to_def_id();
+        let inner_param_def = ids.alias_type_param.to_def_id();
+        let outer_param_def = ids.second_alias_type_param.to_def_id();
+
+        let u32_argument = path_type(ids.owner, ids.symbol, 2, 10, 13);
+        let use_arguments = [GenericArg::Type(&u32_argument)];
+        let use_ty = path_type_with_args(ids.owner, ids.symbol, 1, 5, 15, &use_arguments);
+
+        let outer_parameter_ty = path_type(ids.second_alias_owner, ids.symbol, 4, 25, 26);
+        let bool_ty = path_type(ids.second_alias_owner, ids.symbol, 5, 27, 31);
+        let tuple_elements = [outer_parameter_ty, bool_ty];
+        let tuple_argument = Ty {
+            hir_id: hir_id(ids.second_alias_owner, 6),
+            kind: TyKind::Tuple(&tuple_elements),
+            span: span(24, 32),
+        };
+        let inner_arguments = [GenericArg::Type(&tuple_argument)];
+        let outer_target = path_type_with_args(
+            ids.second_alias_owner,
+            ids.symbol,
+            3,
+            20,
+            34,
+            &inner_arguments,
+        );
+        let inner_target = path_type(ids.alias_owner, ids.symbol, 7, 40, 41);
+
+        let inner_generic_param = type_generic_param(ids.alias_type_param, ids.symbol);
+        let inner_generic_params = [inner_generic_param];
+        let outer_generic_param = type_generic_param(ids.second_alias_type_param, ids.symbol);
+        let outer_generic_params = [outer_generic_param];
+
+        let mut paths = HashMap::new();
+        insert_path(&mut paths, &use_ty, Res::Def(DefKind::Alias, outer_def));
+        insert_path(&mut paths, &u32_argument, Res::PrimTy(PrimTy::U32));
+        insert_path(
+            &mut paths,
+            &outer_target,
+            Res::Def(DefKind::Alias, inner_def),
+        );
+        insert_path(
+            &mut paths,
+            &outer_parameter_ty,
+            Res::Def(DefKind::TyParam, outer_param_def),
+        );
+        insert_path(&mut paths, &bool_ty, Res::PrimTy(PrimTy::Bool));
+        insert_path(
+            &mut paths,
+            &inner_target,
+            Res::Def(DefKind::TyParam, inner_param_def),
+        );
+
+        let canonical = HashMap::new();
+        let definitions = HashMap::from([
+            (inner_def, BoundaryDefinition::ModuleAlias),
+            (outer_def, BoundaryDefinition::ModuleAlias),
+        ]);
+        let aliases = HashMap::from([
+            (
+                inner_def,
+                BoundaryAlias {
+                    owner: ids.alias_owner,
+                    ty: &inner_target,
+                    generic_params: &inner_generic_params,
+                },
+            ),
+            (
+                outer_def,
+                BoundaryAlias {
+                    owner: ids.second_alias_owner,
+                    ty: &outer_target,
+                    generic_params: &outer_generic_params,
+                },
+            ),
+        ]);
+        let context =
+            make_context_with_aliases(&paths, &canonical, &definitions, &aliases, None, None);
+
+        assert_eq!(
+            boundary_type(&context, ids.owner, &use_ty, Position::Param),
+            BoundaryTypeOutcome::Mapped(BoundaryType::Tuple(vec![
+                BoundaryType::U32,
+                BoundaryType::Bool,
+            ]))
+        );
+    }
+
+    #[test]
+    fn malformed_and_unresolved_generic_alias_arguments_defer() {
+        let ids = test_ids();
+        let alias_def = ids.alias_owner.def_id.to_def_id();
+        let param_def = ids.alias_type_param.to_def_id();
+        let target_ty = path_type(ids.alias_owner, ids.symbol, 20, 40, 41);
+        let generic_param = type_generic_param(ids.alias_type_param, ids.symbol);
+        let generic_params = [generic_param];
+
+        let no_arguments = path_type(ids.owner, ids.symbol, 1, 5, 10);
+        let u64_argument = path_type(ids.owner, ids.symbol, 3, 20, 23);
+        let unresolved_argument = path_type(ids.owner, ids.symbol, 4, 30, 37);
+        let one_type_argument = [GenericArg::Type(&u64_argument)];
+        let wrong_kind_argument = [GenericArg::Const(ConstArg::Bool(true))];
+        let too_many_arguments = [
+            GenericArg::Type(&u64_argument),
+            GenericArg::Type(&u64_argument),
+        ];
+        let wrong_kind =
+            path_type_with_args(ids.owner, ids.symbol, 2, 12, 18, &wrong_kind_argument);
+        let too_many = path_type_with_args(ids.owner, ids.symbol, 5, 25, 39, &too_many_arguments);
+        let unresolved_argument = [GenericArg::Type(&unresolved_argument)];
+        let unresolved =
+            path_type_with_args(ids.owner, ids.symbol, 6, 42, 51, &unresolved_argument);
+        let valid = path_type_with_args(ids.owner, ids.symbol, 7, 52, 60, &one_type_argument);
+
+        let mut paths = HashMap::new();
+        for ty in [&no_arguments, &wrong_kind, &too_many, &unresolved, &valid] {
+            insert_path(&mut paths, ty, Res::Def(DefKind::Alias, alias_def));
+        }
+        insert_path(&mut paths, &u64_argument, Res::PrimTy(PrimTy::U64));
+        insert_path(
+            &mut paths,
+            &target_ty,
+            Res::Def(DefKind::TyParam, param_def),
+        );
+        let canonical = HashMap::new();
+        let definitions = HashMap::from([(alias_def, BoundaryDefinition::ModuleAlias)]);
+        let aliases = HashMap::from([(
+            alias_def,
+            BoundaryAlias {
+                owner: ids.alias_owner,
+                ty: &target_ty,
+                generic_params: &generic_params,
+            },
+        )]);
+        let context =
+            make_context_with_aliases(&paths, &canonical, &definitions, &aliases, None, None);
+
+        for ty in [&no_arguments, &wrong_kind, &too_many, &unresolved] {
+            assert_eq!(
+                boundary_type(&context, ids.owner, ty, Position::Param),
+                BoundaryTypeOutcome::Deferred
+            );
+        }
+    }
+
+    #[test]
+    fn recursive_generic_alias_application_defers() {
+        let ids = test_ids();
+        let alias_def = ids.alias_owner.def_id.to_def_id();
+        let param_def = ids.alias_type_param.to_def_id();
+        let u64_argument = path_type(ids.owner, ids.symbol, 2, 10, 13);
+        let use_arguments = [GenericArg::Type(&u64_argument)];
+        let use_ty = path_type_with_args(ids.owner, ids.symbol, 1, 5, 15, &use_arguments);
+        let target_argument = path_type(ids.alias_owner, ids.symbol, 4, 25, 26);
+        let target_arguments = [GenericArg::Type(&target_argument)];
+        let target_ty =
+            path_type_with_args(ids.alias_owner, ids.symbol, 3, 20, 30, &target_arguments);
+        let generic_param = type_generic_param(ids.alias_type_param, ids.symbol);
+        let generic_params = [generic_param];
+
+        let mut paths = HashMap::new();
+        insert_path(&mut paths, &use_ty, Res::Def(DefKind::Alias, alias_def));
+        insert_path(&mut paths, &u64_argument, Res::PrimTy(PrimTy::U64));
+        insert_path(&mut paths, &target_ty, Res::Def(DefKind::Alias, alias_def));
+        insert_path(
+            &mut paths,
+            &target_argument,
+            Res::Def(DefKind::TyParam, param_def),
+        );
+        let canonical = HashMap::new();
+        let definitions = HashMap::from([(alias_def, BoundaryDefinition::ModuleAlias)]);
+        let aliases = HashMap::from([(
+            alias_def,
+            BoundaryAlias {
+                owner: ids.alias_owner,
+                ty: &target_ty,
+                generic_params: &generic_params,
+            },
+        )]);
+        let context =
+            make_context_with_aliases(&paths, &canonical, &definitions, &aliases, None, None);
+
+        assert_eq!(
+            boundary_type(&context, ids.owner, &use_ty, Position::Param),
+            BoundaryTypeOutcome::Deferred
         );
     }
 
@@ -1250,7 +1863,7 @@ mod tests {
                 BoundaryAlias {
                     owner: ids.alias_owner,
                     ty: &cycle_to_next,
-                    has_generic_params: false,
+                    generic_params: &[],
                 },
             ),
             (
@@ -1258,7 +1871,7 @@ mod tests {
                 BoundaryAlias {
                     owner: ids.second_alias_owner,
                     ty: &cycle_to_first,
-                    has_generic_params: false,
+                    generic_params: &[],
                 },
             ),
         ]);
@@ -1275,12 +1888,14 @@ mod tests {
             BoundaryTypeOutcome::Deferred
         );
 
+        let generic_param = type_generic_param(ids.alias_type_param, ids.symbol);
+        let generic_params = [generic_param];
         let generic_aliases = HashMap::from([(
             alias_def,
             BoundaryAlias {
                 owner: ids.alias_owner,
                 ty: &generic_target,
-                has_generic_params: true,
+                generic_params: &generic_params,
             },
         )]);
         let generic_context = make_context_with_aliases(
@@ -1294,6 +1909,106 @@ mod tests {
         assert_eq!(
             boundary_type(&generic_context, ids.owner, &use_ty, Position::Param),
             BoundaryTypeOutcome::Deferred
+        );
+
+        let loop_def = next_alias_def;
+        let loop_param_def = ids.second_alias_type_param.to_def_id();
+        let u32_ty = path_type(ids.owner, ids.symbol, 100, 100, 103);
+        let loop_param_ty = path_type(ids.second_alias_owner, ids.symbol, 101, 104, 105);
+        let recursive_loop_args = [GenericArg::Type(&loop_param_ty)];
+        let recursive_loop_ty = path_type_with_args(
+            ids.second_alias_owner,
+            ids.symbol,
+            102,
+            106,
+            113,
+            &recursive_loop_args,
+        );
+        let identity_target_ty = path_type(ids.alias_owner, ids.symbol, 103, 114, 115);
+        let identity_args = [GenericArg::Type(&recursive_loop_ty)];
+        let identity_application_ty = path_type_with_args(
+            ids.second_alias_owner,
+            ids.symbol,
+            104,
+            116,
+            126,
+            &identity_args,
+        );
+        let recursive_loop_use_args = [GenericArg::Type(&u32_ty)];
+        let recursive_loop_use = path_type_with_args(
+            ids.owner,
+            ids.symbol,
+            105,
+            127,
+            137,
+            &recursive_loop_use_args,
+        );
+        let identity_param = type_generic_param(ids.alias_type_param, ids.symbol);
+        let loop_param = type_generic_param(ids.second_alias_type_param, ids.symbol);
+        let identity_params = [identity_param];
+        let loop_params = [loop_param];
+        let mut recursive_paths = HashMap::new();
+        insert_path(&mut recursive_paths, &u32_ty, Res::PrimTy(PrimTy::U32));
+        insert_path(
+            &mut recursive_paths,
+            &loop_param_ty,
+            Res::Def(DefKind::TyParam, loop_param_def),
+        );
+        insert_path(
+            &mut recursive_paths,
+            &recursive_loop_ty,
+            Res::Def(DefKind::Alias, loop_def),
+        );
+        insert_path(
+            &mut recursive_paths,
+            &identity_target_ty,
+            Res::Def(DefKind::TyParam, ids.alias_type_param.to_def_id()),
+        );
+        insert_path(
+            &mut recursive_paths,
+            &identity_application_ty,
+            Res::Def(DefKind::Alias, alias_def),
+        );
+        insert_path(
+            &mut recursive_paths,
+            &recursive_loop_use,
+            Res::Def(DefKind::Alias, loop_def),
+        );
+        let recursive_aliases = HashMap::from([
+            (
+                alias_def,
+                BoundaryAlias {
+                    owner: ids.alias_owner,
+                    ty: &identity_target_ty,
+                    generic_params: &identity_params,
+                },
+            ),
+            (
+                loop_def,
+                BoundaryAlias {
+                    owner: ids.second_alias_owner,
+                    ty: &identity_application_ty,
+                    generic_params: &loop_params,
+                },
+            ),
+        ]);
+        let recursive_context = make_context_with_aliases(
+            &recursive_paths,
+            &canonical,
+            &definitions,
+            &recursive_aliases,
+            None,
+            None,
+        );
+        assert_eq!(
+            boundary_type(
+                &recursive_context,
+                ids.owner,
+                &recursive_loop_use,
+                Position::Param,
+            ),
+            BoundaryTypeOutcome::Deferred,
+            "a generic alias cycle mediated through a substituted type parameter defers"
         );
 
         let unknown_def = def_id(&ids, 500);
@@ -1338,7 +2053,7 @@ mod tests {
             BoundaryAlias {
                 owner: ids.alias_owner,
                 ty: &target_ty,
-                has_generic_params: false,
+                generic_params: &[],
             },
         )]);
         let context =
@@ -1383,7 +2098,7 @@ mod tests {
             BoundaryAlias {
                 owner: ids.alias_owner,
                 ty: &target_ty,
-                has_generic_params: false,
+                generic_params: &[],
             },
         )]);
         let context = make_context_with_aliases(

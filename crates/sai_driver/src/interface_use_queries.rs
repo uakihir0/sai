@@ -2238,7 +2238,6 @@ fn collect_local_boundary_aliases<'hir>(
             Some(source_graph_packages),
         )
         .map_err(InterfaceUsesQueryError::Collection)?;
-        let has_generic_params = !generics.params.is_empty();
         let mut alias_is_complete =
             hir_owner.diagnostics.is_empty() && !type_has_incomplete_world_interface_reference(ty);
         let references = candidates
@@ -2284,7 +2283,7 @@ fn collect_local_boundary_aliases<'hir>(
             BoundaryAlias {
                 owner: descriptor.owner,
                 ty,
-                has_generic_params,
+                generic_params: generics.params,
             },
         );
         alias_references.insert(descriptor.owner.def_id.to_def_id(), references);

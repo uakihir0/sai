@@ -7,6 +7,7 @@ pub mod package_graph;
 mod package_wit_name_queries;
 mod wit_package_queries;
 mod world_elaboration_adapter;
+mod world_resource_containment;
 
 use interface_impl_resource_wit::{
     WitResourceIdentity, WitResourceOccurrenceIncomplete, WitResourceOccurrenceSearch,
@@ -97,7 +98,8 @@ pub use sai_resolve::package_scopes::{
     TopLevelOwnerKind,
 };
 use sai_resolve::prelude::{
-    Prelude, PreludeBinding, PrimitivePreludeBuildError, build_primitive_prelude,
+    CANONICAL_PRELUDE_ITEMS, CanonicalPreludeKind, CanonicalPreludeSegment, Prelude,
+    PreludeBinding, PrimitivePreludeBuildError, build_primitive_prelude,
     primitive_prelude_fingerprint,
 };
 use sai_resolve::use_target_diagnostics::{
@@ -2883,6 +2885,427 @@ pub enum WorldItemTestOnlyKind {
 struct WorldBoundaryAliases<'hir> {
     definitions: HashMap<DefId, sai_ty::boundary::BoundaryAlias<'hir>>,
     path_resolutions: HashMap<HirId, PathRes>,
+    resource_type_roots: HashMap<DefId, world_resource_containment::TypeRoots<'hir>>,
+    resource_containment: HashMap<DefId, sai_ty::boundary::ResourceContainment>,
+}
+
+struct WorldBoundaryAliasPackageInputs<'a> {
+    collection: &'a Phase1PackageScopesCollection,
+    module_tree: &'a ModuleTree,
+    source_graph_packages: HashSet<PackageId>,
+    alias_descriptors: Vec<TopLevelOwnerDescriptor>,
+    alias_inputs: Vec<CurrentOwnerInputs>,
+    interface_descriptors: Vec<TopLevelOwnerDescriptor>,
+    interface_inputs: Vec<CurrentOwnerInputs>,
+}
+
+fn source_graph_packages_for_world_boundary_aliases(
+    requester: &Phase1PackageScopesCollection,
+    source_packages: &[Phase1ModuleMemberScopePackage],
+) -> HashSet<PackageId> {
+    let source_collections = source_packages
+        .iter()
+        .map(|package| (package.package_key().as_str(), &package.collection))
+        .collect::<HashMap<_, _>>();
+    let mut reachable = HashSet::new();
+    let mut visited = HashSet::new();
+    let mut pending = vec![requester.package_key().as_str().to_owned()];
+
+    while let Some(package_key) = pending.pop() {
+        if !visited.insert(package_key.clone()) {
+            continue;
+        }
+        let collection = if package_key == requester.package_key().as_str() {
+            requester
+        } else if let Some(collection) = source_collections.get(package_key.as_str()) {
+            collection
+        } else {
+            continue;
+        };
+        reachable.insert(collection.module_tree.package);
+        pending.extend(
+            collection
+                .foreign_scope_provenance
+                .iter()
+                .map(|foreign| foreign.package_key.as_str().to_owned()),
+        );
+    }
+    reachable
+}
+
+fn generated_wit_origin_type_definitions(
+    scopes: &[&Phase1PackageScopes],
+    wit_view_scopes: &Phase1ActiveWitViewScopes,
+    symbols: &Interner,
+) -> HashMap<DefId, DefId> {
+    let mut origins = HashMap::new();
+    for foreign in wit_view_scopes.views() {
+        for view_interface in foreign.view.interfaces.values() {
+            let Some(source_interface) = view_interface.origin else {
+                continue;
+            };
+            let Some(source_members) = scopes
+                .iter()
+                .find_map(|scopes| scopes.interfaces.get(&source_interface))
+            else {
+                continue;
+            };
+            let source_types = source_members
+                .members
+                .iter()
+                .filter_map(|(name, binding)| {
+                    let Res::Def(kind, def) = binding.res else {
+                        return None;
+                    };
+                    let view_kind = match kind {
+                        DefKind::Struct => WitViewDefKind::Struct,
+                        DefKind::Enum => WitViewDefKind::Enum,
+                        DefKind::Resource => WitViewDefKind::Resource,
+                        // Source and WIT aliases are expanded before conformance
+                        // identity comparison; mapping aliases here could
+                        // incorrectly make an incomplete alias look nominal.
+                        DefKind::Alias => return None,
+                        _ => return None,
+                    };
+                    let name = symbols.resolve(*name).ok()?;
+                    let wit_name = sai_resolve::sai_identifier_to_wit_name(name.as_ref())?;
+                    Some((wit_name, view_kind, def))
+                })
+                .collect::<Vec<_>>();
+            let mut source_name_counts = HashMap::<&str, usize>::new();
+            for (name, _, _) in &source_types {
+                *source_name_counts.entry(name).or_default() += 1;
+            }
+            for (wit_name, view_kind, source_def) in &source_types {
+                if source_name_counts.get(wit_name.as_str()) != Some(&1) {
+                    continue;
+                }
+                let matches = view_interface
+                    .members
+                    .values()
+                    .filter(|member| {
+                        member.kind == *view_kind
+                            && foreign.view.model.interfaces[view_interface.wit].items[member.item]
+                                .name
+                                == *wit_name
+                    })
+                    .collect::<Vec<_>>();
+                if let [member] = matches.as_slice() {
+                    origins.insert(member.def, *source_def);
+                }
+            }
+        }
+    }
+    origins
+}
+
+fn collect_world_interface_aliases<'hir>(
+    aliases: &mut WorldBoundaryAliases<'hir>,
+    interface_descriptors: &[TopLevelOwnerDescriptor],
+    interface_inputs: &'hir [CurrentOwnerInputs],
+    collection: &Phase1PackageScopesCollection,
+    module_tree: &ModuleTree,
+    snapshot: &WorkspaceSnapshot,
+    symbols: &Interner,
+    primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
+    module_members: &ModuleMemberIndex<'_>,
+    source_graph_packages: &HashSet<PackageId>,
+    arena: &'hir HirArena<'hir>,
+    def_paths: &HashMap<PackageId, Arc<DefPathInterner>>,
+) -> Result<(), OwnerControlFlowResolutionError> {
+    for (descriptor, inputs) in interface_descriptors.iter().zip(interface_inputs) {
+        let Some(interface_path) = def_paths
+            .get(&descriptor.owner.def_id.package())
+            .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                descriptor.owner,
+            ))?
+            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+            .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+        else {
+            continue;
+        };
+        let Some(interface_entry) = inputs.filtered_item_tree.items.iter().find(|entry| {
+            entry.ast_id == descriptor.item_id && entry.kind == ItemTreeKind::Interface
+        }) else {
+            continue;
+        };
+        let context = HirLoweringContext::new(
+            &inputs.ast_ids,
+            snapshot,
+            &inputs.root,
+            arena,
+            symbols,
+            def_paths.get(&descriptor.owner.def_id.package()).ok_or(
+                OwnerControlFlowResolutionError::MissingDefPath(descriptor.owner),
+            )?,
+        );
+        let Ok((interface_owner, _)) = lower_top_level_owner(
+            *descriptor,
+            &interface_path,
+            &inputs.filtered_item_tree,
+            &inputs.retained_item_kinds,
+            &context,
+        ) else {
+            continue;
+        };
+        let OwnerNode::Item(interface_item) = interface_owner.node else {
+            continue;
+        };
+        let ItemKind::Interface {
+            items: interface_item_owners,
+        } = interface_item.kind
+        else {
+            continue;
+        };
+        let interface_members = interface_entry
+            .children
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.kind,
+                    ItemTreeKind::Struct
+                        | ItemTreeKind::Alias
+                        | ItemTreeKind::Refined
+                        | ItemTreeKind::Enum
+                        | ItemTreeKind::Resource
+                        | ItemTreeKind::InterfaceFn
+                )
+            })
+            .collect::<Vec<_>>();
+        if interface_members.len() != interface_item_owners.len() {
+            continue;
+        }
+        let module_scope = module_scope_for_file(collection, module_tree, descriptor.file)?;
+        let interface_module_scope = interface_use_queries::module_scope_with_interface_members(
+            module_scope,
+            collection.scopes(),
+            descriptor.owner,
+        )?;
+        for (entry, member_owner) in interface_members.into_iter().zip(interface_item_owners) {
+            let Some(member_path) = def_paths
+                .get(&member_owner.def_id.package())
+                .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                    *member_owner,
+                ))?
+                .resolve_def_id(member_owner.def_id.to_def_id())
+                .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+            else {
+                continue;
+            };
+            let Ok((member_hir, _)) = lower_interface_item_owner(
+                *member_owner,
+                &member_path,
+                &interface_owner,
+                descriptor.item_id,
+                entry.ast_id,
+                &inputs.filtered_item_tree,
+                &context,
+            ) else {
+                continue;
+            };
+            let OwnerNode::InterfaceItem(member) = member_hir.node else {
+                continue;
+            };
+            let (roots, alias) = match member.kind {
+                HirInterfaceItemKind::Struct { fields, .. } => (
+                    fields.iter().map(|field| field.ty).collect::<Vec<_>>(),
+                    None,
+                ),
+                HirInterfaceItemKind::Alias { generics, ty } => (vec![ty], Some((generics, ty))),
+                HirInterfaceItemKind::Refined { base, .. } => (vec![base], None),
+                HirInterfaceItemKind::Enum { variants, .. } => {
+                    let mut roots = Vec::new();
+                    for variant in variants {
+                        match variant.shape {
+                            VariantShape::Unit => {}
+                            VariantShape::Tuple(types) => roots.extend(types),
+                            VariantShape::Record(fields) => {
+                                roots.extend(fields.iter().map(|field| field.ty));
+                            }
+                        }
+                    }
+                    (roots, None)
+                }
+                HirInterfaceItemKind::Resource { .. }
+                | HirInterfaceItemKind::Fn { .. }
+                | HirInterfaceItemKind::ResourceMember { .. } => continue,
+            };
+            if roots.is_empty() && alias.is_none() {
+                aliases.resource_type_roots.insert(
+                    member_owner.def_id.to_def_id(),
+                    world_resource_containment::TypeRoots {
+                        owner: member_hir.id,
+                        types: roots,
+                    },
+                );
+                continue;
+            }
+            let type_candidates = owner_test_only_path_candidates(&member_hir)
+                .into_iter()
+                .filter(|candidate| candidate.kind == OwnerPathKind::Type)
+                .collect::<Vec<_>>();
+            let Ok(resolution) = resolve_partial_type_owner_paths(
+                *member_owner,
+                &type_candidates,
+                &owner_type_generic_resolutions(&member_hir),
+                primitive_prelude,
+                &interface_module_scope,
+                descriptor.owner.def_id.package(),
+                Some(module_members),
+                Some(source_graph_packages),
+            ) else {
+                continue;
+            };
+            aliases.path_resolutions.extend(
+                resolution
+                    .paths()
+                    .iter()
+                    .map(|(hir_id, resolution)| (*hir_id, *resolution)),
+            );
+            if let Some((generics, ty)) = alias {
+                aliases.definitions.insert(
+                    member_owner.def_id.to_def_id(),
+                    sai_ty::boundary::BoundaryAlias {
+                        owner: member_hir.id,
+                        ty,
+                        generic_params: generics.params,
+                    },
+                );
+            }
+            aliases.resource_type_roots.insert(
+                member_owner.def_id.to_def_id(),
+                world_resource_containment::TypeRoots {
+                    owner: member_hir.id,
+                    types: roots,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn collect_world_top_level_aliases<'hir>(
+    aliases: &mut WorldBoundaryAliases<'hir>,
+    package: &'hir WorldBoundaryAliasPackageInputs<'_>,
+    snapshot: &WorkspaceSnapshot,
+    symbols: &Interner,
+    primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
+    module_members: &ModuleMemberIndex<'_>,
+    arena: &'hir HirArena<'hir>,
+    def_paths: &HashMap<PackageId, Arc<DefPathInterner>>,
+) -> Result<(), OwnerControlFlowResolutionError> {
+    for (descriptor, inputs) in package.alias_descriptors.iter().zip(&package.alias_inputs) {
+        let module_scope =
+            module_scope_for_file(package.collection, package.module_tree, descriptor.file)?;
+        let alias_def_paths = def_paths.get(&descriptor.owner.def_id.package()).ok_or(
+            OwnerControlFlowResolutionError::MissingDefPath(descriptor.owner),
+        )?;
+        let Some(alias_path) = alias_def_paths
+            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+            .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+        else {
+            continue;
+        };
+        let alias_context = HirLoweringContext::new(
+            &inputs.ast_ids,
+            snapshot,
+            &inputs.root,
+            arena,
+            symbols,
+            alias_def_paths,
+        );
+        let Ok((alias_owner, _)) = lower_top_level_owner(
+            *descriptor,
+            &alias_path,
+            &inputs.filtered_item_tree,
+            &inputs.retained_item_kinds,
+            &alias_context,
+        ) else {
+            continue;
+        };
+        let OwnerNode::Item(alias_item) = alias_owner.node else {
+            continue;
+        };
+        let ItemKind::Alias { generics, ty } = alias_item.kind else {
+            continue;
+        };
+        let alias_candidates = owner_test_only_path_candidates(&alias_owner)
+            .into_iter()
+            .filter(|candidate| candidate.kind == OwnerPathKind::Type)
+            .collect::<Vec<_>>();
+        if let Ok(resolution) = resolve_partial_type_owner_paths(
+            descriptor.owner,
+            &alias_candidates,
+            &owner_type_generic_resolutions(&alias_owner),
+            primitive_prelude,
+            &module_scope,
+            descriptor.owner.def_id.package(),
+            Some(module_members),
+            Some(&package.source_graph_packages),
+        ) {
+            aliases.path_resolutions.extend(
+                resolution
+                    .paths()
+                    .iter()
+                    .map(|(hir_id, resolution)| (*hir_id, *resolution)),
+            );
+        }
+        aliases.definitions.insert(
+            descriptor.owner.def_id.to_def_id(),
+            sai_ty::boundary::BoundaryAlias {
+                owner: alias_owner.id,
+                ty,
+                generic_params: generics.params,
+            },
+        );
+        aliases.resource_type_roots.insert(
+            descriptor.owner.def_id.to_def_id(),
+            world_resource_containment::TypeRoots {
+                owner: alias_owner.id,
+                types: vec![ty],
+            },
+        );
+    }
+    Ok(())
+}
+
+fn collect_world_boundary_aliases<'hir>(
+    aliases: &mut WorldBoundaryAliases<'hir>,
+    packages: &'hir [WorldBoundaryAliasPackageInputs<'_>],
+    snapshot: &WorkspaceSnapshot,
+    symbols: &Interner,
+    primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
+    module_members: &ModuleMemberIndex<'_>,
+    arena: &'hir HirArena<'hir>,
+    def_paths: &HashMap<PackageId, Arc<DefPathInterner>>,
+) -> Result<(), OwnerControlFlowResolutionError> {
+    for package in packages {
+        collect_world_top_level_aliases(
+            aliases,
+            package,
+            snapshot,
+            symbols,
+            primitive_prelude,
+            module_members,
+            arena,
+            def_paths,
+        )?;
+        collect_world_interface_aliases(
+            aliases,
+            &package.interface_descriptors,
+            &package.interface_inputs,
+            package.collection,
+            package.module_tree,
+            snapshot,
+            symbols,
+            primitive_prelude,
+            module_members,
+            &package.source_graph_packages,
+            arena,
+            def_paths,
+        )?;
+    }
+    Ok(())
 }
 
 /// Test-only references found in one direct world item.
@@ -2893,6 +3316,7 @@ pub struct WorldItemTestOnlyResolution {
     kind: WorldItemTestOnlyKind,
     world_function_name_issues: Vec<sai_ty::iface::InterfaceCheckIssue>,
     world_function_boundary_issues: Vec<sai_ty::world::WorldFunctionBoundaryIssue>,
+    world_export_signature: Option<NormalizedWorldFunctionSignature>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
@@ -2919,6 +3343,10 @@ impl WorldItemTestOnlyResolution {
 
     pub fn world_function_boundary_issues(&self) -> &[sai_ty::world::WorldFunctionBoundaryIssue] {
         &self.world_function_boundary_issues
+    }
+
+    fn world_export_signature(&self) -> Option<&NormalizedWorldFunctionSignature> {
+        self.world_export_signature.as_ref()
     }
 
     pub fn type_path_resolution(
@@ -2955,6 +3383,1042 @@ impl WorldItemTestOnlyResolution {
 
     pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
         &self.lowering_diagnostics
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NormalizedWorldFunctionSignature {
+    owner: OwnerId,
+    signature: sai_ty::world::NormalizedSignature<WorldFunctionConformanceType>,
+    parameter_type_spans: Vec<sai_hir::Span>,
+    result_type_span: Option<sai_hir::Span>,
+    name_span: sai_hir::Span,
+    is_unsafe: bool,
+    syntax: String,
+    location: sai_diagnostics::Location,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorldFunctionConformanceType {
+    Boundary(sai_ty::boundary::BoundaryType),
+    /// `Str` is ABI-equivalent to `String`, but remains a distinct SAI type.
+    Str,
+    /// A borrowed top-level slice remains distinct from an owned `Vec`.
+    Slice(Box<sai_ty::boundary::BoundaryType>),
+    Vec(Box<sai_ty::boundary::BoundaryType>),
+    /// Mutability is erased by WIT, but signature conformance retains it.
+    BorrowMut(DefId),
+    Incompatible,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorldFunctionParameterKind {
+    Ordinary,
+    Str,
+    Slice,
+    Vec,
+    BorrowMut,
+}
+
+fn canonical_boundary_type_for_path(
+    path: &DefPath,
+    package_identity: &str,
+    symbols: &Interner,
+) -> Option<sai_ty::boundary::CanonicalBoundaryType> {
+    let package_identity = package_identity
+        .split_once('#')
+        .map_or(package_identity, |(identity, _)| identity);
+    let mut path_segments = Vec::with_capacity(path.data().len());
+    for component in path.data() {
+        let (kind, symbol) = match &component.data {
+            DefPathData::Module(symbol) => (0_u8, *symbol),
+            DefPathData::TypeNs(symbol) => (1_u8, *symbol),
+            _ => return None,
+        };
+        path_segments.push((kind, symbols.resolve(symbol).ok()?.to_string()));
+    }
+    CANONICAL_PRELUDE_ITEMS.iter().find_map(|item| {
+        if item.path.kind != CanonicalPreludeKind::Type || item.path.package != package_identity {
+            return None;
+        }
+        let expected = item
+            .path
+            .segments
+            .iter()
+            .map(|segment| match segment {
+                CanonicalPreludeSegment::Module(name) => Some((0, *name)),
+                CanonicalPreludeSegment::Type(name) => Some((1, *name)),
+                CanonicalPreludeSegment::Value(_) | CanonicalPreludeSegment::Variant(_) => None,
+            })
+            .collect::<Option<Vec<_>>>()?;
+        if expected.len() != path_segments.len()
+            || !expected.iter().zip(&path_segments).all(
+                |((expected_kind, expected_name), (actual_kind, actual_name))| {
+                    *expected_kind == *actual_kind && *expected_name == actual_name
+                },
+            )
+        {
+            return None;
+        }
+        match item.name {
+            "String" => Some(sai_ty::boundary::CanonicalBoundaryType::String),
+            "Str" => Some(sai_ty::boundary::CanonicalBoundaryType::Str),
+            "Slice" => Some(sai_ty::boundary::CanonicalBoundaryType::Slice),
+            "Vec" => Some(sai_ty::boundary::CanonicalBoundaryType::Vec),
+            "Bytes" => Some(sai_ty::boundary::CanonicalBoundaryType::Bytes),
+            "Option" => Some(sai_ty::boundary::CanonicalBoundaryType::Option),
+            "Result" => Some(sai_ty::boundary::CanonicalBoundaryType::Result),
+            "Box" => Some(sai_ty::boundary::CanonicalBoundaryType::Box),
+            _ => None,
+        }
+    })
+}
+
+enum WorldWitAliasTarget<'a> {
+    Type(&'a sai_wit::WitType),
+    Used(&'a sai_wit::WitTypeRef),
+}
+
+fn world_wit_alias_target<'a>(
+    def_id: DefId,
+    wit_view_scopes: &'a Phase1ActiveWitViewScopes,
+) -> Option<WorldWitAliasTarget<'a>> {
+    for foreign in wit_view_scopes.views() {
+        let Some(definition) = foreign.view.definition(def_id) else {
+            continue;
+        };
+        let sai_wit::WitViewEntity::Item { interface, item } = definition.entity else {
+            return None;
+        };
+        return match &foreign.view.model.interfaces[interface].items[item].kind {
+            sai_wit::WitItemKind::Alias(ty) => Some(WorldWitAliasTarget::Type(ty)),
+            sai_wit::WitItemKind::Used(reference) => Some(WorldWitAliasTarget::Used(reference)),
+            _ => None,
+        };
+    }
+    None
+}
+
+fn world_wit_type_def_id(
+    reference: &sai_wit::WitTypeRef,
+    wit_view_scopes: &Phase1ActiveWitViewScopes,
+) -> Option<DefId> {
+    let foreign = wit_view_scopes
+        .views()
+        .find(|foreign| foreign.view.unit == reference.interface.unit)?;
+    foreign
+        .view
+        .definition_for_entity(sai_wit::WitViewEntity::Item {
+            interface: reference.interface.interface,
+            item: reference.item,
+        })
+}
+
+fn world_boundary_type_from_wit_type(
+    ty: &sai_wit::WitType,
+    wit_view_scopes: &Phase1ActiveWitViewScopes,
+    alias_stack: &mut HashSet<DefId>,
+) -> Option<sai_ty::boundary::BoundaryType> {
+    use sai_ty::boundary::BoundaryType as Boundary;
+    use sai_wit::WitType as Wit;
+
+    Some(match ty {
+        Wit::Bool => Boundary::Bool,
+        Wit::S8 => Boundary::S8,
+        Wit::S16 => Boundary::S16,
+        Wit::S32 => Boundary::S32,
+        Wit::S64 => Boundary::S64,
+        Wit::U8 => Boundary::U8,
+        Wit::U16 => Boundary::U16,
+        Wit::U32 => Boundary::U32,
+        Wit::U64 => Boundary::U64,
+        Wit::F32 => Boundary::F32,
+        Wit::F64 => Boundary::F64,
+        Wit::Char => Boundary::Char,
+        Wit::String => Boundary::String,
+        Wit::List(element) => Boundary::List(Box::new(world_boundary_type_from_wit_type(
+            element,
+            wit_view_scopes,
+            alias_stack,
+        )?)),
+        Wit::Option(element) => Boundary::Option(Box::new(world_boundary_type_from_wit_type(
+            element,
+            wit_view_scopes,
+            alias_stack,
+        )?)),
+        Wit::Result { ok, err } => Boundary::Result {
+            ok: match ok.as_deref() {
+                Some(ty) => Some(Box::new(world_boundary_type_from_wit_type(
+                    ty,
+                    wit_view_scopes,
+                    alias_stack,
+                )?)),
+                None => None,
+            },
+            err: match err.as_deref() {
+                Some(ty) => Some(Box::new(world_boundary_type_from_wit_type(
+                    ty,
+                    wit_view_scopes,
+                    alias_stack,
+                )?)),
+                None => None,
+            },
+        },
+        Wit::Tuple(elements) if elements.is_empty() => Boundary::Unit,
+        Wit::Tuple(elements) => Boundary::Tuple(
+            elements
+                .iter()
+                .map(|ty| world_boundary_type_from_wit_type(ty, wit_view_scopes, alias_stack))
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        Wit::Named(reference) => {
+            let def_id = world_wit_type_def_id(reference, wit_view_scopes)?;
+            expand_world_wit_alias(def_id, wit_view_scopes, alias_stack)?
+                .unwrap_or(Boundary::Named(def_id))
+        }
+        Wit::Own(reference) => Boundary::Own(world_wit_type_def_id(reference, wit_view_scopes)?),
+        Wit::Borrow(reference) => {
+            Boundary::Borrow(world_wit_type_def_id(reference, wit_view_scopes)?)
+        }
+        Wit::Future(_) | Wit::Stream(_) | Wit::Unsupported(_) => return None,
+    })
+}
+
+fn world_wit_type_contains_resource(
+    ty: &sai_wit::WitType,
+    wit_view_scopes: &Phase1ActiveWitViewScopes,
+    visiting: &mut HashSet<DefId>,
+) -> Option<bool> {
+    use sai_wit::{WitItemKind, WitType as Wit};
+
+    fn any_type_contains_resource<'a>(
+        types: impl IntoIterator<Item = &'a Wit>,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+        visiting: &mut HashSet<DefId>,
+    ) -> Option<bool> {
+        for ty in types {
+            if world_wit_type_contains_resource(ty, wit_view_scopes, visiting)? {
+                return Some(true);
+            }
+        }
+        Some(false)
+    }
+
+    Some(match ty {
+        Wit::Own(_) | Wit::Borrow(_) => true,
+        Wit::List(element) | Wit::Option(element) => {
+            world_wit_type_contains_resource(element, wit_view_scopes, visiting)?
+        }
+        Wit::Result { ok, err } => any_type_contains_resource(
+            ok.iter().chain(err.iter()).map(Box::as_ref),
+            wit_view_scopes,
+            visiting,
+        )?,
+        Wit::Tuple(elements) => any_type_contains_resource(elements, wit_view_scopes, visiting)?,
+        Wit::Named(reference) => {
+            let def_id = world_wit_type_def_id(reference, wit_view_scopes)?;
+            if !visiting.insert(def_id) {
+                // A recursive type with no handle found on the current path
+                // adds no new handle; other fields continue to be inspected.
+                false
+            } else {
+                let foreign = wit_view_scopes
+                    .views()
+                    .find(|foreign| foreign.view.unit == reference.interface.unit)?;
+                let item = &foreign.view.model.interfaces[reference.interface.interface].items
+                    [reference.item];
+                let contains = match &item.kind {
+                    WitItemKind::Resource(_) => true,
+                    WitItemKind::Record(fields) => any_type_contains_resource(
+                        fields.iter().map(|field| &field.ty),
+                        wit_view_scopes,
+                        visiting,
+                    )?,
+                    WitItemKind::Variant(cases) => any_type_contains_resource(
+                        cases.iter().filter_map(|case| case.payload.as_ref()),
+                        wit_view_scopes,
+                        visiting,
+                    )?,
+                    WitItemKind::Alias(target) => {
+                        world_wit_type_contains_resource(target, wit_view_scopes, visiting)?
+                    }
+                    WitItemKind::Used(target) => world_wit_type_contains_resource(
+                        &Wit::Named(target.clone()),
+                        wit_view_scopes,
+                        visiting,
+                    )?,
+                    WitItemKind::Enum(_) | WitItemKind::Flags(_) | WitItemKind::Func(_) => false,
+                };
+                visiting.remove(&def_id);
+                contains
+            }
+        }
+        Wit::Bool
+        | Wit::S8
+        | Wit::S16
+        | Wit::S32
+        | Wit::S64
+        | Wit::U8
+        | Wit::U16
+        | Wit::U32
+        | Wit::U64
+        | Wit::F32
+        | Wit::F64
+        | Wit::Char
+        | Wit::String => false,
+        Wit::Future(_) | Wit::Stream(_) | Wit::Unsupported(_) => return None,
+    })
+}
+
+fn world_function_conformance_type_from_wit(
+    ty: &sai_wit::WitType,
+    parameter_position: bool,
+    wit_view_scopes: &Phase1ActiveWitViewScopes,
+    wit_origin_types: &HashMap<DefId, DefId>,
+) -> Option<WorldFunctionConformanceType> {
+    use sai_ty::boundary::BoundaryType as Boundary;
+    use sai_wit::WitType as Wit;
+
+    let mut boundary_type =
+        world_boundary_type_from_wit_type(ty, wit_view_scopes, &mut HashSet::new())?;
+    canonicalize_world_boundary_type(&mut boundary_type, wit_origin_types);
+    match ty {
+        Wit::String if parameter_position => Some(WorldFunctionConformanceType::Str),
+        Wit::List(_) | Wit::Named(_) => match boundary_type {
+            Boundary::List(element) => {
+                let slice = matches!(ty, Wit::List(_))
+                    && parameter_position
+                    && !world_wit_type_contains_resource(ty, wit_view_scopes, &mut HashSet::new())?;
+                if slice {
+                    Some(WorldFunctionConformanceType::Slice(element))
+                } else {
+                    Some(WorldFunctionConformanceType::Vec(element))
+                }
+            }
+            boundary_type => Some(WorldFunctionConformanceType::Boundary(boundary_type)),
+        },
+        _ => Some(WorldFunctionConformanceType::Boundary(boundary_type)),
+    }
+}
+
+fn expand_world_wit_alias(
+    def_id: DefId,
+    wit_view_scopes: &Phase1ActiveWitViewScopes,
+    alias_stack: &mut HashSet<DefId>,
+) -> Option<Option<sai_ty::boundary::BoundaryType>> {
+    let Some(target) = world_wit_alias_target(def_id, wit_view_scopes) else {
+        return Some(None);
+    };
+    if !alias_stack.insert(def_id) {
+        return None;
+    }
+    let expanded = match target {
+        WorldWitAliasTarget::Type(ty) => {
+            world_boundary_type_from_wit_type(ty, wit_view_scopes, alias_stack)
+        }
+        WorldWitAliasTarget::Used(reference) => {
+            let def_id = world_wit_type_def_id(reference, wit_view_scopes)?;
+            expand_world_wit_alias(def_id, wit_view_scopes, alias_stack)?
+                .or(Some(sai_ty::boundary::BoundaryType::Named(def_id)))
+        }
+    };
+    alias_stack.remove(&def_id);
+    expanded.map(Some)
+}
+
+fn expand_world_conformance_type(
+    context: &sai_ty::boundary::BoundaryTypeContext<'_>,
+    owner: OwnerId,
+    ty: sai_ty::boundary::BoundaryType,
+    wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+    alias_stack: &mut HashSet<DefId>,
+) -> Option<sai_ty::boundary::BoundaryType> {
+    use sai_ty::boundary::BoundaryType as Boundary;
+
+    Some(match ty {
+        Boundary::Named(def_id) => {
+            if let Some(alias) = context.aliases.get(&def_id) {
+                if !alias.generic_params.is_empty() || !alias_stack.insert(def_id) {
+                    return None;
+                }
+                let target = match sai_ty::boundary::boundary_type(
+                    context,
+                    alias.owner,
+                    alias.ty,
+                    sai_ty::boundary::Position::Nested,
+                ) {
+                    sai_ty::boundary::BoundaryTypeOutcome::Mapped(target) => {
+                        expand_world_conformance_type(
+                            context,
+                            alias.owner,
+                            target,
+                            wit_view_scopes,
+                            alias_stack,
+                        )
+                    }
+                    sai_ty::boundary::BoundaryTypeOutcome::Suppressed
+                    | sai_ty::boundary::BoundaryTypeOutcome::Deferred
+                    | sai_ty::boundary::BoundaryTypeOutcome::Incompatible(_) => None,
+                };
+                alias_stack.remove(&def_id);
+                target?
+            } else if let Some(wit_view_scopes) = wit_view_scopes {
+                expand_world_wit_alias(def_id, wit_view_scopes, alias_stack)?
+                    .unwrap_or(Boundary::Named(def_id))
+            } else {
+                Boundary::Named(def_id)
+            }
+        }
+        Boundary::List(element) => Boundary::List(Box::new(expand_world_conformance_type(
+            context,
+            owner,
+            *element,
+            wit_view_scopes,
+            alias_stack,
+        )?)),
+        Boundary::Option(element) => Boundary::Option(Box::new(expand_world_conformance_type(
+            context,
+            owner,
+            *element,
+            wit_view_scopes,
+            alias_stack,
+        )?)),
+        Boundary::Result { ok, err } => Boundary::Result {
+            ok: match ok {
+                Some(ty) => Some(Box::new(expand_world_conformance_type(
+                    context,
+                    owner,
+                    *ty,
+                    wit_view_scopes,
+                    alias_stack,
+                )?)),
+                None => None,
+            },
+            err: match err {
+                Some(ty) => Some(Box::new(expand_world_conformance_type(
+                    context,
+                    owner,
+                    *ty,
+                    wit_view_scopes,
+                    alias_stack,
+                )?)),
+                None => None,
+            },
+        },
+        Boundary::Tuple(elements) => Boundary::Tuple(
+            elements
+                .into_iter()
+                .map(|ty| {
+                    expand_world_conformance_type(context, owner, ty, wit_view_scopes, alias_stack)
+                })
+                .collect::<Option<Vec<_>>>()?,
+        ),
+        other => other,
+    })
+}
+
+fn world_function_parameter_kind(
+    context: &sai_ty::boundary::BoundaryTypeContext<'_>,
+    ty: &sai_hir::types::Ty<'_>,
+    alias_stack: &mut HashSet<(DefId, HirId)>,
+    wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+) -> Option<WorldFunctionParameterKind> {
+    fn with_substitutions<'hir>(
+        context: &sai_ty::boundary::BoundaryTypeContext<'hir>,
+        ty: &'hir sai_hir::types::Ty<'hir>,
+        alias_stack: &mut HashSet<(DefId, HirId)>,
+        substitutions: &mut HashMap<DefId, &'hir sai_hir::types::Ty<'hir>>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+    ) -> Option<WorldFunctionParameterKind> {
+        use sai_hir::types::{GenericArg, GenericParamKind, TyKind};
+
+        match ty.kind {
+            TyKind::Borrow(sai_hir::Mutability::Mut, _) => {
+                Some(WorldFunctionParameterKind::BorrowMut)
+            }
+            TyKind::Borrow(sai_hir::Mutability::Not, _) => {
+                Some(WorldFunctionParameterKind::Ordinary)
+            }
+            TyKind::Path(path) if path.root == sai_hir::types::PathRoot::Plain => {
+                let Some(path_resolution) = context.path_resolutions.get(&path.hir_id) else {
+                    return Some(WorldFunctionParameterKind::Ordinary);
+                };
+                let Res::Def(kind, def_id) = path_resolution.base else {
+                    return Some(WorldFunctionParameterKind::Ordinary);
+                };
+                if kind == DefKind::TyParam {
+                    if let Some(argument) = substitutions.get(&def_id) {
+                        return with_substitutions(
+                            context,
+                            argument,
+                            alias_stack,
+                            substitutions,
+                            wit_view_scopes,
+                        );
+                    }
+                }
+                if kind == DefKind::Alias {
+                    if let Some(alias) = context.aliases.get(&def_id) {
+                        let application = (def_id, path.hir_id);
+                        if !alias_stack.insert(application) {
+                            return None;
+                        }
+                        let mut alias_substitutions = substitutions.clone();
+                        let mut generic_arguments = None;
+                        for (index, segment) in path.segments.iter().enumerate() {
+                            let Some(arguments) = segment.args else {
+                                continue;
+                            };
+                            if index + 1 != path.segments.len() || generic_arguments.is_some() {
+                                alias_stack.remove(&application);
+                                return None;
+                            }
+                            generic_arguments = Some(arguments.args);
+                        }
+                        let generic_arguments = generic_arguments.unwrap_or(&[]);
+                        if generic_arguments.len() != alias.generic_params.len() {
+                            alias_stack.remove(&application);
+                            return None;
+                        }
+                        for (parameter, argument) in
+                            alias.generic_params.iter().zip(generic_arguments)
+                        {
+                            match (parameter.kind, argument) {
+                                (GenericParamKind::Type { .. }, GenericArg::Type(argument)) => {
+                                    alias_substitutions
+                                        .insert(parameter.def_id.to_def_id(), *argument);
+                                }
+                                (GenericParamKind::Const { .. }, GenericArg::Const(_)) => {}
+                                _ => {
+                                    alias_stack.remove(&application);
+                                    return None;
+                                }
+                            }
+                        }
+                        let kind = with_substitutions(
+                            context,
+                            alias.ty,
+                            alias_stack,
+                            &mut alias_substitutions,
+                            wit_view_scopes,
+                        );
+                        alias_stack.remove(&application);
+                        return kind;
+                    }
+                    if let Some(wit_view_scopes) = wit_view_scopes {
+                        if world_wit_alias_target(def_id, wit_view_scopes).is_some()
+                            && matches!(
+                                expand_world_wit_alias(
+                                    def_id,
+                                    wit_view_scopes,
+                                    &mut HashSet::new(),
+                                )?,
+                                Some(sai_ty::boundary::BoundaryType::List(_))
+                            )
+                        {
+                            return Some(WorldFunctionParameterKind::Vec);
+                        }
+                    }
+                }
+                Some(match context.canonical_types.get(&def_id) {
+                    Some(sai_ty::boundary::CanonicalBoundaryType::Str) => {
+                        WorldFunctionParameterKind::Str
+                    }
+                    Some(sai_ty::boundary::CanonicalBoundaryType::Slice) => {
+                        WorldFunctionParameterKind::Slice
+                    }
+                    Some(
+                        sai_ty::boundary::CanonicalBoundaryType::Vec
+                        | sai_ty::boundary::CanonicalBoundaryType::Bytes,
+                    ) => WorldFunctionParameterKind::Vec,
+                    _ => WorldFunctionParameterKind::Ordinary,
+                })
+            }
+            _ => Some(WorldFunctionParameterKind::Ordinary),
+        }
+    }
+
+    with_substitutions(
+        context,
+        ty,
+        alias_stack,
+        &mut HashMap::new(),
+        wit_view_scopes,
+    )
+}
+
+#[cfg(test)]
+fn world_function_conformance_type_from_hir(
+    context: &sai_ty::boundary::BoundaryTypeContext<'_>,
+    hir_type: &sai_hir::types::Ty<'_>,
+    boundary_type: sai_ty::boundary::BoundaryType,
+    parameter_position: bool,
+) -> Option<WorldFunctionConformanceType> {
+    world_function_conformance_type_from_hir_with_views(
+        context,
+        hir_type,
+        boundary_type,
+        parameter_position,
+        None,
+    )
+}
+
+fn world_function_conformance_type_from_hir_with_views(
+    context: &sai_ty::boundary::BoundaryTypeContext<'_>,
+    hir_type: &sai_hir::types::Ty<'_>,
+    boundary_type: sai_ty::boundary::BoundaryType,
+    parameter_position: bool,
+    wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+) -> Option<WorldFunctionConformanceType> {
+    use sai_ty::boundary::BoundaryType as Boundary;
+
+    let parameter_kind =
+        world_function_parameter_kind(context, hir_type, &mut HashSet::new(), wit_view_scopes)?;
+    Some(match parameter_kind {
+        WorldFunctionParameterKind::Str
+            if parameter_position && matches!(boundary_type, Boundary::String) =>
+        {
+            WorldFunctionConformanceType::Str
+        }
+        WorldFunctionParameterKind::Slice
+            if parameter_position && matches!(boundary_type, Boundary::List(_)) =>
+        {
+            let Boundary::List(element) = boundary_type else {
+                unreachable!("the boundary shape was checked above");
+            };
+            WorldFunctionConformanceType::Slice(element)
+        }
+        WorldFunctionParameterKind::Vec if matches!(boundary_type, Boundary::List(_)) => {
+            let Boundary::List(element) = boundary_type else {
+                unreachable!("the boundary shape was checked above");
+            };
+            WorldFunctionConformanceType::Vec(element)
+        }
+        WorldFunctionParameterKind::BorrowMut
+            if parameter_position && matches!(boundary_type, Boundary::Borrow(_)) =>
+        {
+            let Boundary::Borrow(resource) = boundary_type else {
+                unreachable!("the boundary shape was checked above");
+            };
+            WorldFunctionConformanceType::BorrowMut(resource)
+        }
+        _ => WorldFunctionConformanceType::Boundary(boundary_type),
+    })
+}
+
+fn normalize_world_function_signature(
+    owner: OwnerId,
+    signature: sai_hir::body::FnSig<'_>,
+    name_span: sai_hir::Span,
+    item_span: sai_hir::Span,
+    source: &SourceFile,
+    source_ref: &SourceRef,
+    boundary_context: &sai_ty::boundary::BoundaryTypeContext<'_>,
+    wit_origin_types: &HashMap<DefId, DefId>,
+    wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+    allow_incompatible: bool,
+) -> Option<NormalizedWorldFunctionSignature> {
+    let mut params = Vec::with_capacity(signature.params.len());
+    let mut parameter_type_spans = Vec::with_capacity(signature.params.len());
+    for parameter in signature.params {
+        let ty = match sai_ty::boundary::boundary_type(
+            boundary_context,
+            owner,
+            parameter.ty,
+            sai_ty::boundary::Position::Param,
+        ) {
+            sai_ty::boundary::BoundaryTypeOutcome::Mapped(ty) => {
+                let ty = expand_world_conformance_type(
+                    boundary_context,
+                    owner,
+                    ty,
+                    wit_view_scopes,
+                    &mut HashSet::new(),
+                )?;
+                let mut ty = ty;
+                canonicalize_world_boundary_type(&mut ty, wit_origin_types);
+                world_function_conformance_type_from_hir_with_views(
+                    boundary_context,
+                    parameter.ty,
+                    ty,
+                    true,
+                    wit_view_scopes,
+                )?
+            }
+            sai_ty::boundary::BoundaryTypeOutcome::Incompatible(_) if allow_incompatible => {
+                WorldFunctionConformanceType::Incompatible
+            }
+            sai_ty::boundary::BoundaryTypeOutcome::Suppressed
+            | sai_ty::boundary::BoundaryTypeOutcome::Deferred
+            | sai_ty::boundary::BoundaryTypeOutcome::Incompatible(_) => return None,
+        };
+        params.push(ty);
+        parameter_type_spans.push(parameter.ty.span);
+    }
+    let (result, result_type_span) = match signature.ret {
+        Some(source_ty) => {
+            let ty = match sai_ty::boundary::boundary_type(
+                boundary_context,
+                owner,
+                source_ty,
+                sai_ty::boundary::Position::Result,
+            ) {
+                sai_ty::boundary::BoundaryTypeOutcome::Mapped(ty) => {
+                    let ty = expand_world_conformance_type(
+                        boundary_context,
+                        owner,
+                        ty,
+                        wit_view_scopes,
+                        &mut HashSet::new(),
+                    )?;
+                    let mut ty = ty;
+                    canonicalize_world_boundary_type(&mut ty, wit_origin_types);
+                    world_function_conformance_type_from_hir_with_views(
+                        boundary_context,
+                        source_ty,
+                        ty,
+                        false,
+                        wit_view_scopes,
+                    )?
+                }
+                sai_ty::boundary::BoundaryTypeOutcome::Incompatible(_) if allow_incompatible => {
+                    WorldFunctionConformanceType::Incompatible
+                }
+                sai_ty::boundary::BoundaryTypeOutcome::Suppressed
+                | sai_ty::boundary::BoundaryTypeOutcome::Deferred
+                | sai_ty::boundary::BoundaryTypeOutcome::Incompatible(_) => return None,
+            };
+            (Some(ty), Some(source_ty.span))
+        }
+        None => (
+            Some(WorldFunctionConformanceType::Boundary(
+                sai_ty::boundary::BoundaryType::Unit,
+            )),
+            None,
+        ),
+    };
+    let syntax_range = item_span.range.start().to_usize()..item_span.range.end().to_usize();
+    let syntax = source.text().get(syntax_range)?.trim().to_owned();
+    let location = sai_diagnostics::Location::from_decoded_source(
+        source_ref.clone(),
+        sai_diagnostics::Span::new(item_span.file, item_span.range),
+        source,
+    )?;
+    Some(NormalizedWorldFunctionSignature {
+        owner,
+        signature: sai_ty::world::NormalizedSignature {
+            params,
+            result,
+            is_async: signature.is_async,
+        },
+        parameter_type_spans,
+        result_type_span,
+        name_span,
+        is_unsafe: signature.safety == sai_hir::Safety::Unsafe,
+        syntax,
+        location,
+    })
+}
+
+fn canonicalize_world_boundary_type(
+    ty: &mut sai_ty::boundary::BoundaryType,
+    origins: &HashMap<DefId, DefId>,
+) {
+    use sai_ty::boundary::BoundaryType;
+
+    match ty {
+        BoundaryType::List(inner) | BoundaryType::Option(inner) => {
+            canonicalize_world_boundary_type(inner, origins)
+        }
+        BoundaryType::Result { ok, err } => {
+            for ty in ok.iter_mut().chain(err.iter_mut()) {
+                canonicalize_world_boundary_type(ty, origins);
+            }
+        }
+        BoundaryType::Tuple(elements) => {
+            for element in elements {
+                canonicalize_world_boundary_type(element, origins);
+            }
+        }
+        BoundaryType::Named(def) | BoundaryType::Own(def) | BoundaryType::Borrow(def) => {
+            if let Some(origin) = origins.get(def) {
+                *def = *origin;
+            }
+        }
+        BoundaryType::Unit
+        | BoundaryType::Bool
+        | BoundaryType::S8
+        | BoundaryType::S16
+        | BoundaryType::S32
+        | BoundaryType::S64
+        | BoundaryType::U8
+        | BoundaryType::U16
+        | BoundaryType::U32
+        | BoundaryType::U64
+        | BoundaryType::F32
+        | BoundaryType::F64
+        | BoundaryType::Char
+        | BoundaryType::String => {}
+    }
+}
+
+fn normalized_wit_view_function_signature(
+    function: DefId,
+    owner: OwnerId,
+    source_span: sai_diagnostics::Span,
+    snapshot: &WorkspaceSnapshot,
+    wit_view_scopes: &Phase1ActiveWitViewScopes,
+    wit_origin_types: &HashMap<DefId, DefId>,
+) -> Result<Option<NormalizedWorldFunctionSignature>, sai_wit::Unsupported> {
+    let Some(snapshot_file) = snapshot.file(source_span.file) else {
+        return Ok(None);
+    };
+    let source = Arc::clone(snapshot_file.source());
+    let source_ref = SourceRef {
+        path: snapshot_file.path().to_owned(),
+        package: snapshot_file.package().map(str::to_owned),
+        snapshot: snapshot_file.document_version(),
+    };
+    let Some(location) = sai_diagnostics::Location::from_decoded_source(
+        source_ref.clone(),
+        source_span,
+        source.as_ref(),
+    ) else {
+        return Ok(None);
+    };
+    let hir_span = sai_hir::Span {
+        file: source_span.file,
+        range: source_span.range,
+        ctxt: sai_hir::SpanCtxt::Root,
+    };
+
+    for foreign in wit_view_scopes.views() {
+        let Some(definition) = foreign.view.definition(function) else {
+            continue;
+        };
+        let (wit_name, wit_function) = match definition.entity {
+            sai_wit::WitViewEntity::Item { interface, item } => {
+                let wit_item = &foreign.view.model.interfaces[interface].items[item];
+                if let Some(unsupported) = wit_item.unsupported {
+                    return Err(unsupported);
+                }
+                let sai_wit::WitItemKind::Func(wit_function) = &wit_item.kind else {
+                    continue;
+                };
+                (wit_item.name.as_str(), wit_function)
+            }
+            sai_wit::WitViewEntity::WorldFunction {
+                world,
+                import: false,
+                item,
+            } => {
+                let Some(sai_wit::WitWorldItem::Func {
+                    name,
+                    func,
+                    unsupported,
+                    ..
+                }) = foreign.view.model.worlds[world].exports.get(item as usize)
+                else {
+                    continue;
+                };
+                if let Some(unsupported) = unsupported {
+                    return Err(*unsupported);
+                }
+                (name.as_str(), func)
+            }
+            sai_wit::WitViewEntity::WorldFunction { import: true, .. }
+            | sai_wit::WitViewEntity::Interface { .. }
+            | sai_wit::WitViewEntity::World { .. }
+            | sai_wit::WitViewEntity::Field { .. }
+            | sai_wit::WitViewEntity::Variant { .. }
+            | sai_wit::WitViewEntity::ResourceMember { .. }
+            | sai_wit::WitViewEntity::FlagsMethod { .. } => continue,
+        };
+        let mut params = Vec::with_capacity(wit_function.params.len());
+        for (_, ty) in &wit_function.params {
+            let Some(parameter) = world_function_conformance_type_from_wit(
+                ty,
+                true,
+                wit_view_scopes,
+                wit_origin_types,
+            ) else {
+                return Ok(None);
+            };
+            params.push(parameter);
+        }
+        let (result, result_type_span) = match &wit_function.result {
+            Some(ty) => {
+                let Some(result) = world_function_conformance_type_from_wit(
+                    ty,
+                    false,
+                    wit_view_scopes,
+                    wit_origin_types,
+                ) else {
+                    return Ok(None);
+                };
+                (Some(result), Some(hir_span))
+            }
+            None => (
+                Some(WorldFunctionConformanceType::Boundary(
+                    sai_ty::boundary::BoundaryType::Unit,
+                )),
+                None,
+            ),
+        };
+        return Ok(Some(NormalizedWorldFunctionSignature {
+            owner,
+            signature: sai_ty::world::NormalizedSignature {
+                params,
+                result,
+                is_async: wit_function.is_async,
+            },
+            parameter_type_spans: vec![hir_span; wit_function.params.len()],
+            result_type_span,
+            name_span: hir_span,
+            is_unsafe: false,
+            syntax: match format_wit_function_signature(wit_name, wit_function) {
+                Some(syntax) => syntax,
+                None => return Ok(None),
+            },
+            location,
+        }));
+    }
+    Ok(None)
+}
+
+fn format_wit_function_signature(name: &str, function: &sai_wit::WitFunc) -> Option<String> {
+    let parameters = function
+        .params
+        .iter()
+        .map(|(name, ty)| Some(format!("{name}: {}", format_wit_type(ty)?)))
+        .collect::<Option<Vec<_>>>()?
+        .join(", ");
+    let result = match function.result.as_ref() {
+        Some(ty) => format!(" -> {}", format_wit_type(ty)?),
+        None => String::new(),
+    };
+    Some(format!("export fn {name}({parameters}){result}"))
+}
+
+fn format_wit_type(ty: &sai_wit::WitType) -> Option<String> {
+    use sai_wit::WitType;
+
+    Some(match ty {
+        WitType::Bool => "bool".to_owned(),
+        WitType::S8 => "s8".to_owned(),
+        WitType::S16 => "s16".to_owned(),
+        WitType::S32 => "s32".to_owned(),
+        WitType::S64 => "s64".to_owned(),
+        WitType::U8 => "u8".to_owned(),
+        WitType::U16 => "u16".to_owned(),
+        WitType::U32 => "u32".to_owned(),
+        WitType::U64 => "u64".to_owned(),
+        WitType::F32 => "f32".to_owned(),
+        WitType::F64 => "f64".to_owned(),
+        WitType::Char => "char".to_owned(),
+        WitType::String => "string".to_owned(),
+        WitType::List(inner) => format!("list<{}>", format_wit_type(inner)?),
+        WitType::Option(inner) => format!("option<{}>", format_wit_type(inner)?),
+        WitType::Result { ok, err } => match (ok, err) {
+            (None, None) => "result".to_owned(),
+            (Some(ok), None) => format!("result<{}>", format_wit_type(ok)?),
+            (None, Some(err)) => format!("result<_, {}>", format_wit_type(err)?),
+            (Some(ok), Some(err)) => {
+                format!(
+                    "result<{}, {}>",
+                    format_wit_type(ok)?,
+                    format_wit_type(err)?
+                )
+            }
+        },
+        WitType::Tuple(elements) => format!(
+            "({})",
+            elements
+                .iter()
+                .map(format_wit_type)
+                .collect::<Option<Vec<_>>>()?
+                .join(", ")
+        ),
+        WitType::Named(reference) => reference.item_name.clone(),
+        WitType::Own(reference) => reference.item_name.clone(),
+        WitType::Borrow(reference) => format!("borrow {}", reference.item_name),
+        WitType::Future(_) | WitType::Stream(_) | WitType::Unsupported(_) => return None,
+    })
+}
+
+fn redirect_world_function_signature(
+    signature: &mut sai_ty::world::NormalizedSignature<WorldFunctionConformanceType>,
+    redirects: &sai_resolve::interface_redirect::InterfaceRedirects,
+) {
+    for parameter in &mut signature.params {
+        redirect_world_boundary_type(parameter, redirects);
+    }
+    if let Some(result) = &mut signature.result {
+        redirect_world_boundary_type(result, redirects);
+    }
+}
+
+fn redirect_world_boundary_type(
+    ty: &mut WorldFunctionConformanceType,
+    redirects: &sai_resolve::interface_redirect::InterfaceRedirects,
+) {
+    match ty {
+        WorldFunctionConformanceType::Boundary(ty) => redirect_boundary_type(ty, redirects),
+        WorldFunctionConformanceType::Slice(ty) | WorldFunctionConformanceType::Vec(ty) => {
+            redirect_boundary_type(ty, redirects);
+        }
+        WorldFunctionConformanceType::BorrowMut(resource) => {
+            if let Some(implementation) = redirects.resource_target(*resource) {
+                *resource = implementation;
+            }
+        }
+        WorldFunctionConformanceType::Str | WorldFunctionConformanceType::Incompatible => {}
+    }
+}
+
+fn redirect_boundary_type(
+    ty: &mut sai_ty::boundary::BoundaryType,
+    redirects: &sai_resolve::interface_redirect::InterfaceRedirects,
+) {
+    use sai_ty::boundary::BoundaryType;
+
+    match ty {
+        BoundaryType::Own(resource) | BoundaryType::Borrow(resource) => {
+            if let Some(implementation) = redirects.resource_target(*resource) {
+                *resource = implementation;
+            }
+        }
+        BoundaryType::List(inner) | BoundaryType::Option(inner) => {
+            redirect_boundary_type(inner, redirects);
+        }
+        BoundaryType::Result { ok, err } => {
+            if let Some(ok) = ok {
+                redirect_boundary_type(ok, redirects);
+            }
+            if let Some(err) = err {
+                redirect_boundary_type(err, redirects);
+            }
+        }
+        BoundaryType::Tuple(elements) => {
+            for element in elements {
+                redirect_boundary_type(element, redirects);
+            }
+        }
+        BoundaryType::Unit
+        | BoundaryType::Bool
+        | BoundaryType::S8
+        | BoundaryType::S16
+        | BoundaryType::S32
+        | BoundaryType::S64
+        | BoundaryType::U8
+        | BoundaryType::U16
+        | BoundaryType::U32
+        | BoundaryType::U64
+        | BoundaryType::F32
+        | BoundaryType::F64
+        | BoundaryType::Char
+        | BoundaryType::String
+        | BoundaryType::Named(_) => {}
     }
 }
 
@@ -9862,6 +11326,52 @@ impl RootDatabase {
         })
     }
 
+    fn world_boundary_alias_package_inputs<'a>(
+        &mut self,
+        snapshot: &WorkspaceSnapshot,
+        collection: &'a Phase1PackageScopesCollection,
+        source_packages: &[Phase1ModuleMemberScopePackage],
+    ) -> Result<WorldBoundaryAliasPackageInputs<'a>, OwnerControlFlowResolutionError> {
+        let alias_descriptors = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Alias)
+            .collect::<Vec<_>>();
+        let alias_inputs = alias_descriptors
+            .iter()
+            .map(|descriptor| {
+                self.current_owner_inputs(snapshot, descriptor.file, &collection.target_cfg)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let interface_descriptors = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Interface)
+            .collect::<Vec<_>>();
+        let interface_inputs = interface_descriptors
+            .iter()
+            .map(|descriptor| {
+                self.current_owner_inputs(snapshot, descriptor.file, &collection.target_cfg)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(WorldBoundaryAliasPackageInputs {
+            collection,
+            module_tree: &collection.module_tree,
+            source_graph_packages: source_graph_packages_for_world_boundary_aliases(
+                collection,
+                source_packages,
+            ),
+            alias_descriptors,
+            alias_inputs,
+            interface_descriptors,
+            interface_inputs,
+        })
+    }
+
     fn current_owner_inputs(
         &mut self,
         snapshot: &WorkspaceSnapshot,
@@ -13740,51 +15250,6 @@ impl RootDatabase {
                 })
             })
             .collect::<Vec<_>>();
-        if !direct_export_interfaces.is_empty() {
-            let header_resolutions = self
-                .resolve_trait_impl_header_test_only_paths_with_member_scopes_and_wit_views(
-                    collection,
-                    module_tree,
-                    snapshot,
-                    member_scopes,
-                    wit_view_scopes,
-                )?;
-            let member_resolutions = self
-                .resolve_trait_impl_member_test_only_paths_with_member_scopes_and_wit_views(
-                    collection,
-                    module_tree,
-                    snapshot,
-                    member_scopes,
-                    wit_view_scopes,
-                )?;
-            let interface_impls = self.collect_interface_impls_with_header_resolutions(
-                collection,
-                module_tree,
-                snapshot,
-                member_scopes,
-                Some(wit_view_scopes),
-                &header_resolutions,
-                &member_resolutions,
-            )?;
-            for (interface, name, owner, location) in direct_export_interfaces {
-                if interface_impls.by_interface.contains_key(&interface) {
-                    continue;
-                }
-                let mut diagnostic = Diagnostic::new(
-                    sai_diagnostics::Code::WorldExportUnimplemented,
-                    sai_diagnostics::Severity::Error,
-                    format!("exported interface `{name}` has no implementation"),
-                    Some(location),
-                );
-                diagnostic.primary_label = "missing implementation".to_owned();
-                diagnostic.package = Some(package.clone());
-                elaborated
-                    .diagnostics
-                    .push(diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
-                        OwnerControlFlowResolutionError::InvalidSourceLocation(owner.owner)
-                    })?);
-            }
-        }
         let mut seen_direct_export_function_names = HashSet::new();
         let direct_export_functions = elaborated
             .exports
@@ -13804,12 +15269,14 @@ impl RootDatabase {
                         owner: source_owner,
                         location,
                         ..
-                    } if *source_function == function && *source_owner == owner => Some((
-                        item.key.clone(),
-                        source_name.clone(),
-                        owner,
-                        location.clone(),
-                    )),
+                    } if *source_function == function && *source_owner == owner => {
+                        let name = if item.key.is_empty() {
+                            source_name.clone()
+                        } else {
+                            item.key.clone()
+                        };
+                        Some((name, source_name.clone(), owner, location.clone()))
+                    }
                     _ => None,
                 })?;
                 seen_direct_export_function_names
@@ -13817,22 +15284,280 @@ impl RootDatabase {
                     .then_some(direct_source)
             })
             .collect::<Vec<_>>();
-        if !direct_export_functions.is_empty() {
-            let mut root_function_names = HashSet::new();
+        let external_worlds = wit_view_scopes
+            .views()
+            .flat_map(|foreign| foreign.view.worlds.values().map(|view| view.def))
+            .collect::<HashSet<_>>();
+        let include_sources = local_source_items
+            .iter()
+            .filter_map(|source| match source {
+                sai_resolve::WorldElaborationSourceItem::Include {
+                    target,
+                    owner,
+                    location,
+                } => Some((*owner, (*target, location.clone()))),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        let included_external_exports = elaborated
+            .exports
+            .iter()
+            .filter_map(|item| {
+                let sai_resolve::ElabOrigin::Included { include } = item.origin else {
+                    return None;
+                };
+                let (target, location) = include_sources.get(&include)?;
+                external_worlds
+                    .contains(target)
+                    .then(|| (item.clone(), include, location.clone()))
+            })
+            .collect::<Vec<_>>();
+        let included_external_interfaces = included_external_exports
+            .iter()
+            .filter_map(|(item, include, location)| {
+                let sai_resolve::ElabKind::Interface(interface) = item.kind else {
+                    return None;
+                };
+                Some((interface, item.key.clone(), *include, location.clone()))
+            })
+            .collect::<Vec<_>>();
+        let included_external_functions = included_external_exports
+            .iter()
+            .filter_map(|(item, include, location)| {
+                let sai_resolve::ElabKind::Func(function) = item.kind else {
+                    return None;
+                };
+                Some((function, item.key.clone(), *include, location.clone()))
+            })
+            .collect::<Vec<_>>();
+        let interface_impls = if !direct_export_interfaces.is_empty()
+            || !direct_export_functions.is_empty()
+            || !included_external_interfaces.is_empty()
+            || !included_external_functions.is_empty()
+        {
+            let header_resolutions = self
+                .resolve_trait_impl_header_test_only_paths_with_member_scopes_and_wit_views(
+                    collection,
+                    module_tree,
+                    snapshot,
+                    member_scopes,
+                    wit_view_scopes,
+                )?;
+            let member_resolutions = self
+                .resolve_trait_impl_member_test_only_paths_with_member_scopes_and_wit_views(
+                    collection,
+                    module_tree,
+                    snapshot,
+                    member_scopes,
+                    wit_view_scopes,
+                )?;
+            Some(self.collect_interface_impls_with_header_resolutions(
+                collection,
+                module_tree,
+                snapshot,
+                member_scopes,
+                Some(wit_view_scopes),
+                &header_resolutions,
+                &member_resolutions,
+            )?)
+        } else {
+            None
+        };
+        let interface_redirects = interface_impls
+            .as_ref()
+            .map(sai_resolve::interface_redirect::InterfaceRedirects::from_impls);
+        let implementation_resources = interface_impls
+            .as_ref()
+            .into_iter()
+            .flat_map(|impls| impls.impls.iter())
+            .flat_map(|implementation| implementation.resources.iter())
+            .map(|resource| resource.implementation_type)
+            .collect::<HashSet<_>>();
+        if let Some(interface_impls) = &interface_impls {
+            for (interface, name, owner, location) in direct_export_interfaces {
+                if interface_impls.by_interface.contains_key(&interface) {
+                    continue;
+                }
+                let mut diagnostic = Diagnostic::new(
+                    sai_diagnostics::Code::WorldExportUnimplemented,
+                    sai_diagnostics::Severity::Error,
+                    format!("exported interface `{name}` has no implementation"),
+                    Some(location),
+                );
+                diagnostic.primary_label = "missing implementation".to_owned();
+                diagnostic.package = Some(package.clone());
+                elaborated
+                    .diagnostics
+                    .push(diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
+                        OwnerControlFlowResolutionError::InvalidSourceLocation(owner.owner)
+                    })?);
+            }
+            for (interface, name, include, location) in included_external_interfaces {
+                if interface_impls.by_interface.contains_key(&interface) {
+                    continue;
+                }
+                let mut diagnostic = Diagnostic::new(
+                    sai_diagnostics::Code::WorldExportUnimplemented,
+                    sai_diagnostics::Severity::Error,
+                    format!("exported interface `{name}` has no implementation"),
+                    Some(location),
+                );
+                diagnostic.primary_label = "missing implementation for included export".to_owned();
+                diagnostic.package = Some(package.clone());
+                elaborated
+                    .diagnostics
+                    .push(diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
+                        OwnerControlFlowResolutionError::InvalidSourceLocation(include.owner)
+                    })?);
+            }
+        }
+        if !direct_export_functions.is_empty() || !included_external_functions.is_empty() {
+            let mut root_function_definitions = HashMap::new();
+            let mut source_function_definitions = collection
+                .scopes()
+                .function_owners
+                .iter()
+                .map(|descriptor| descriptor.owner.def_id.to_def_id())
+                .collect::<HashSet<_>>();
+            source_function_definitions.extend(member_scopes.source_packages.iter().flat_map(
+                |source_package| {
+                    source_package
+                        .scopes()
+                        .function_owners
+                        .iter()
+                        .map(|descriptor| descriptor.owner.def_id.to_def_id())
+                },
+            ));
             if let Some(root_module) = collection.scopes().modules.first() {
                 for (symbol, binding) in &root_module.members {
-                    if !matches!(binding.res, Res::Def(DefKind::Fn, _)) {
+                    let Res::Def(DefKind::Fn, function) = binding.res else {
                         continue;
-                    }
+                    };
                     let name = self
                         .symbols
                         .resolve(*symbol)
                         .map_err(OwnerControlFlowResolutionError::SymbolLookup)?;
-                    root_function_names.insert(name.to_string());
+                    root_function_definitions
+                        .entry(name.to_string())
+                        .or_insert((function, binding.name_span));
                 }
             }
             for (name, source_name, owner, location) in direct_export_functions {
-                if root_function_names.contains(source_name.as_str()) {
+                if let Some(&(implementation, implementation_span)) =
+                    root_function_definitions.get(source_name.as_str())
+                    && source_function_definitions.contains(&implementation)
+                {
+                    let Some(interface_redirects) = &interface_redirects else {
+                        continue;
+                    };
+                    let Some(expected) = owner_result
+                        .items()
+                        .iter()
+                        .find(|item| item.owner() == owner.owner)
+                        .and_then(WorldItemTestOnlyResolution::world_export_signature)
+                    else {
+                        continue;
+                    };
+                    let Some(mut actual) = self.normalized_root_function_signature(
+                        implementation,
+                        owner.owner,
+                        implementation_span,
+                        collection,
+                        module_tree,
+                        snapshot,
+                        member_scopes,
+                        wit_view_scopes,
+                        &implementation_resources,
+                    )?
+                    else {
+                        continue;
+                    };
+                    let mut expected = expected.clone();
+                    redirect_world_function_signature(&mut expected.signature, interface_redirects);
+                    redirect_world_function_signature(&mut actual.signature, interface_redirects);
+                    let Some(mismatch) = sai_ty::world::compare_normalized_signatures(
+                        &expected.signature,
+                        &actual.signature,
+                        actual.is_unsafe,
+                    ) else {
+                        continue;
+                    };
+                    let span = match mismatch {
+                        sai_ty::world::NormalizedSignatureMismatch::ParameterType { index } => {
+                            actual.parameter_type_spans[index]
+                        }
+                        sai_ty::world::NormalizedSignatureMismatch::ResultType => {
+                            actual.result_type_span.unwrap_or(actual.name_span)
+                        }
+                        sai_ty::world::NormalizedSignatureMismatch::ParameterCount { .. }
+                        | sai_ty::world::NormalizedSignatureMismatch::Async
+                        | sai_ty::world::NormalizedSignatureMismatch::Unsafe => actual.name_span,
+                    };
+                    let snapshot_file = snapshot.file(span.file).ok_or(
+                        OwnerControlFlowResolutionError::MissingSnapshotFile(span.file),
+                    )?;
+                    let source_ref = SourceRef {
+                        path: snapshot_file.path().to_owned(),
+                        package: snapshot_file.package().map(str::to_owned),
+                        snapshot: snapshot_file.document_version(),
+                    };
+                    let source = Arc::clone(snapshot_file.source());
+                    let actual_location = sai_diagnostics::Location::from_decoded_source(
+                        source_ref,
+                        sai_diagnostics::Span::new(span.file, span.range),
+                        source.as_ref(),
+                    )
+                    .ok_or(
+                        OwnerControlFlowResolutionError::InvalidSourceLocation(actual.owner),
+                    )?;
+                    let mut diagnostic = Diagnostic::new(
+                        sai_diagnostics::Code::InterfaceImplSignatureMismatch,
+                        sai_diagnostics::Severity::Error,
+                        format!(
+                            "implementation of exported function `{name}` does not match its signature"
+                        ),
+                        Some(actual_location),
+                    );
+                    diagnostic.primary_label = match mismatch {
+                        sai_ty::world::NormalizedSignatureMismatch::ParameterType { .. } => {
+                            "parameter type differs".to_owned()
+                        }
+                        sai_ty::world::NormalizedSignatureMismatch::ResultType => {
+                            "result type differs".to_owned()
+                        }
+                        _ => "function signature differs".to_owned(),
+                    };
+                    let implementation_package = member_scopes
+                        .source_packages
+                        .iter()
+                        .find(|candidate| {
+                            candidate.module_tree().package == actual.owner.def_id.package()
+                        })
+                        .and_then(|candidate| {
+                            member_scopes.package_identity(candidate.package_key().as_str())
+                        })
+                        .or(actual.location.file.package.as_deref())
+                        .unwrap_or(&package);
+                    diagnostic.package = Some(implementation_package.to_owned());
+                    diagnostic
+                        .push_child(Child {
+                            kind: ChildKind::Note,
+                            message: format!("expected signature: {}", expected.syntax),
+                            location: Some(expected.location),
+                        })
+                        .expect("diagnostics accept an expected-signature note");
+                    diagnostic
+                        .push_child(Child {
+                            kind: ChildKind::Note,
+                            message: format!("actual implementation: {}", actual.syntax),
+                            location: Some(actual.location),
+                        })
+                        .expect("diagnostics accept an actual-signature note");
+                    elaborated.diagnostics.push(
+                        diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
+                            OwnerControlFlowResolutionError::InvalidSourceLocation(owner.owner)
+                        })?,
+                    );
                     continue;
                 }
                 let mut diagnostic = Diagnostic::new(
@@ -13849,8 +15574,475 @@ impl RootDatabase {
                         OwnerControlFlowResolutionError::InvalidSourceLocation(owner.owner)
                     })?);
             }
+            for (function, wit_name, include, location) in included_external_functions {
+                let include_span =
+                    sai_diagnostics::Span::new(location.span.file, location.span.range);
+                let expected = normalized_wit_view_function_signature(
+                    function,
+                    include.owner,
+                    include_span,
+                    snapshot,
+                    wit_view_scopes,
+                    &generated_wit_origin_type_definitions(
+                        &{
+                            let mut scopes = vec![collection.scopes()];
+                            scopes.extend(
+                                member_scopes
+                                    .source_packages
+                                    .iter()
+                                    .map(Phase1ModuleMemberScopePackage::scopes),
+                            );
+                            scopes
+                        },
+                        wit_view_scopes,
+                        &self.symbols,
+                    ),
+                );
+                let mut expected = match expected {
+                    Ok(expected) => expected,
+                    Err(unsupported) => {
+                        let mut diagnostic = Diagnostic::new(
+                            sai_diagnostics::Code::WitUnsupportedFeature,
+                            sai_diagnostics::Severity::Error,
+                            format!(
+                                "included WIT export function `{wit_name}` uses unsupported feature `{unsupported:?}`"
+                            ),
+                            Some(location.clone()),
+                        );
+                        diagnostic.primary_label = "unsupported WIT export function".to_owned();
+                        diagnostic.package = Some(package.clone());
+                        elaborated.diagnostics.push(
+                            diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
+                                OwnerControlFlowResolutionError::InvalidSourceLocation(
+                                    include.owner,
+                                )
+                            })?,
+                        );
+                        continue;
+                    }
+                };
+                let source_name = sai_wit::wit_name_to_sai(&wit_name, false)
+                    .ok()
+                    .map(|name| name.strip_prefix("r#").unwrap_or(&name).to_owned());
+                let implementation = source_name
+                    .as_deref()
+                    .and_then(|name| root_function_definitions.get(name))
+                    .copied()
+                    .filter(|(function, _)| source_function_definitions.contains(function));
+                let Some((implementation, implementation_span)) = implementation else {
+                    let mut diagnostic = Diagnostic::new(
+                        sai_diagnostics::Code::WorldExportUnimplemented,
+                        sai_diagnostics::Severity::Error,
+                        format!("exported function `{wit_name}` has no implementation"),
+                        Some(location),
+                    );
+                    diagnostic.primary_label =
+                        "missing implementation for included export".to_owned();
+                    diagnostic.package = Some(package.clone());
+                    elaborated.diagnostics.push(
+                        diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
+                            OwnerControlFlowResolutionError::InvalidSourceLocation(include.owner)
+                        })?,
+                    );
+                    continue;
+                };
+                let Some(interface_redirects) = &interface_redirects else {
+                    continue;
+                };
+                let Some(mut expected) = expected.take() else {
+                    continue;
+                };
+                let Some(mut actual) = self.normalized_root_function_signature(
+                    implementation,
+                    include.owner,
+                    implementation_span,
+                    collection,
+                    module_tree,
+                    snapshot,
+                    member_scopes,
+                    wit_view_scopes,
+                    &implementation_resources,
+                )?
+                else {
+                    // The root function exists, but one of its signature
+                    // types could not be normalized. Other type/resolution
+                    // diagnostics own that failure; it is not a missing
+                    // implementation.
+                    continue;
+                };
+                redirect_world_function_signature(&mut expected.signature, interface_redirects);
+                redirect_world_function_signature(&mut actual.signature, interface_redirects);
+                let Some(mismatch) = sai_ty::world::compare_normalized_signatures(
+                    &expected.signature,
+                    &actual.signature,
+                    actual.is_unsafe,
+                ) else {
+                    continue;
+                };
+                let mut diagnostic = Diagnostic::new(
+                    sai_diagnostics::Code::InterfaceImplSignatureMismatch,
+                    sai_diagnostics::Severity::Error,
+                    format!(
+                        "implementation of included exported function `{wit_name}` does not match its signature"
+                    ),
+                    Some(location),
+                );
+                diagnostic.primary_label = "included export signature differs".to_owned();
+                diagnostic.package = Some(package.clone());
+                diagnostic
+                    .push_child(Child {
+                        kind: ChildKind::Note,
+                        message: format!("expected signature: {}", expected.syntax),
+                        location: Some(expected.location),
+                    })
+                    .expect("diagnostics accept an expected-signature note");
+                diagnostic
+                    .push_child(Child {
+                        kind: ChildKind::Note,
+                        message: format!("actual implementation: {}", actual.syntax),
+                        location: Some(actual.location),
+                    })
+                    .expect("diagnostics accept an actual-signature note");
+                let mismatch_span = match mismatch {
+                    sai_ty::world::NormalizedSignatureMismatch::ParameterType { index } => {
+                        Some(actual.parameter_type_spans[index])
+                    }
+                    sai_ty::world::NormalizedSignatureMismatch::ResultType => {
+                        actual.result_type_span
+                    }
+                    sai_ty::world::NormalizedSignatureMismatch::ParameterCount { .. }
+                    | sai_ty::world::NormalizedSignatureMismatch::Async
+                    | sai_ty::world::NormalizedSignatureMismatch::Unsafe => Some(actual.name_span),
+                };
+                if let Some(span) = mismatch_span {
+                    let snapshot_file = snapshot.file(span.file).ok_or(
+                        OwnerControlFlowResolutionError::MissingSnapshotFile(span.file),
+                    )?;
+                    let source_ref = SourceRef {
+                        path: snapshot_file.path().to_owned(),
+                        package: snapshot_file.package().map(str::to_owned),
+                        snapshot: snapshot_file.document_version(),
+                    };
+                    let source = Arc::clone(snapshot_file.source());
+                    let related = sai_diagnostics::Location::from_decoded_source(
+                        source_ref,
+                        sai_diagnostics::Span::new(span.file, span.range),
+                        source.as_ref(),
+                    )
+                    .ok_or(
+                        OwnerControlFlowResolutionError::InvalidSourceLocation(actual.owner),
+                    )?;
+                    diagnostic
+                        .push_child(Child {
+                            kind: ChildKind::Note,
+                            message: "the implementing parameter or result differs here".to_owned(),
+                            location: Some(related),
+                        })
+                        .expect("diagnostics accept an implementation-location note");
+                }
+                elaborated
+                    .diagnostics
+                    .push(diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
+                        OwnerControlFlowResolutionError::InvalidSourceLocation(include.owner)
+                    })?);
+            }
         }
         Ok(elaborated)
+    }
+
+    fn normalized_root_function_signature(
+        &mut self,
+        function: DefId,
+        fallback_owner: OwnerId,
+        binding_span: sai_diagnostics::Span,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+        implementation_resources: &HashSet<DefId>,
+    ) -> Result<Option<NormalizedWorldFunctionSignature>, OwnerControlFlowResolutionError> {
+        let mut indexed_scopes = Vec::with_capacity(1 + member_scopes.source_packages.len());
+        indexed_scopes.push(collection.scopes());
+        indexed_scopes.extend(
+            member_scopes
+                .source_packages
+                .iter()
+                .map(Phase1ModuleMemberScopePackage::scopes),
+        );
+        let wit_origin_types =
+            generated_wit_origin_type_definitions(&indexed_scopes, wit_view_scopes, &self.symbols);
+        let root_owner = collection
+            .scopes()
+            .function_owners
+            .iter()
+            .find(|descriptor| descriptor.owner.def_id.to_def_id() == function)
+            .copied()
+            .map(|descriptor| (collection, module_tree, descriptor));
+        let source_owner = member_scopes.source_packages.iter().find_map(|package| {
+            package
+                .collection
+                .scopes()
+                .function_owners
+                .iter()
+                .find(|descriptor| descriptor.owner.def_id.to_def_id() == function)
+                .copied()
+                .map(|descriptor| {
+                    (
+                        &package.collection,
+                        &package.collection.module_tree,
+                        descriptor,
+                    )
+                })
+        });
+        let Some((owner_collection, owner_module_tree, descriptor)) = root_owner.or(source_owner)
+        else {
+            return Ok(normalized_wit_view_function_signature(
+                function,
+                fallback_owner,
+                binding_span,
+                snapshot,
+                wit_view_scopes,
+                &wit_origin_types,
+            )
+            .ok()
+            .flatten());
+        };
+        let inputs =
+            self.current_owner_inputs(snapshot, descriptor.file, &owner_collection.target_cfg)?;
+        let mut alias_collections = Vec::with_capacity(1 + member_scopes.source_packages.len());
+        alias_collections.push(collection);
+        alias_collections.extend(
+            member_scopes
+                .source_packages
+                .iter()
+                .map(|package| &package.collection),
+        );
+        let mut alias_package_inputs = Vec::with_capacity(alias_collections.len());
+        for alias_collection in alias_collections {
+            alias_package_inputs.push(self.world_boundary_alias_package_inputs(
+                snapshot,
+                alias_collection,
+                &member_scopes.source_packages,
+            )?);
+        }
+        let module_scope =
+            module_scope_for_file(owner_collection, owner_module_tree, descriptor.file)?;
+        let module_members = ModuleMemberIndex::new_with_wit_views(
+            indexed_scopes.clone(),
+            wit_view_scopes.views().map(|foreign| foreign.view.as_ref()),
+            &self.symbols,
+        );
+        let top_level_owner_index = index_top_level_owner_descriptors(owner_collection);
+        let owner_descriptor = find_top_level_owner_descriptor(
+            &top_level_owner_index,
+            descriptor.owner,
+            descriptor.file,
+            descriptor.item_id,
+            TopLevelOwnerKind::Function,
+        )?;
+        let def_paths = self
+            .def_paths
+            .get(&descriptor.owner.def_id.package())
+            .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                descriptor.owner,
+            ))?;
+        let expected_path = def_paths
+            .resolve_def_id(function)
+            .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+            .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
+                descriptor.owner,
+            ))?;
+        let arena = HirArena::new();
+        let context = HirLoweringContext::new(
+            &inputs.ast_ids,
+            snapshot,
+            &inputs.root,
+            &arena,
+            &self.symbols,
+            def_paths,
+        );
+        let (hir_owner, _) = lower_top_level_owner(
+            owner_descriptor,
+            &expected_path,
+            &inputs.filtered_item_tree,
+            &inputs.retained_item_kinds,
+            &context,
+        )?;
+        let (item, signature) = match hir_owner.node {
+            OwnerNode::Item(item) => match item.kind {
+                ItemKind::Fn { sig, .. } => (item, sig),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let signature_paths = owner_test_only_path_candidates(&hir_owner)
+            .into_iter()
+            .filter(|candidate| candidate.kind == OwnerPathKind::Type)
+            .collect::<Vec<_>>();
+        let signature_resolution = resolve_partial_type_owner_paths(
+            descriptor.owner,
+            &signature_paths,
+            &owner_type_generic_resolutions(&hir_owner),
+            &self.primitive_prelude,
+            &module_scope,
+            owner_collection.module_tree.package,
+            Some(&module_members),
+            Some(&member_scopes.source_graph_packages),
+        )?;
+
+        let mut boundary_aliases = WorldBoundaryAliases {
+            definitions: HashMap::new(),
+            path_resolutions: HashMap::new(),
+            resource_type_roots: HashMap::new(),
+            resource_containment: HashMap::new(),
+        };
+        collect_world_boundary_aliases(
+            &mut boundary_aliases,
+            &alias_package_inputs,
+            snapshot,
+            &self.symbols,
+            &self.primitive_prelude,
+            &module_members,
+            &arena,
+            &self.def_paths,
+        )?;
+        self.complete_world_boundary_resource_containment(
+            &mut boundary_aliases,
+            Some(wit_view_scopes),
+        );
+
+        let mut definitions = HashMap::new();
+        for scopes in &indexed_scopes {
+            for interface in scopes.interfaces.values() {
+                for binding in interface.members.values() {
+                    let Res::Def(kind, def_id) = binding.res else {
+                        continue;
+                    };
+                    let definition = match kind {
+                        DefKind::Resource => Some(sai_ty::boundary::BoundaryDefinition::Resource),
+                        DefKind::Struct | DefKind::Enum | DefKind::Alias => {
+                            Some(sai_ty::boundary::BoundaryDefinition::InterfaceType)
+                        }
+                        _ => None,
+                    };
+                    if let Some(definition) = definition {
+                        definitions.insert(def_id, definition);
+                    }
+                }
+            }
+        }
+        for foreign in wit_view_scopes.views() {
+            for interface in foreign.view.interfaces.values() {
+                for member in interface.members.values() {
+                    let definition = match member.kind {
+                        WitViewDefKind::Resource => {
+                            Some(sai_ty::boundary::BoundaryDefinition::Resource)
+                        }
+                        WitViewDefKind::Struct | WitViewDefKind::Enum | WitViewDefKind::Alias => {
+                            Some(sai_ty::boundary::BoundaryDefinition::InterfaceType)
+                        }
+                        _ => None,
+                    };
+                    if let Some(definition) = definition {
+                        definitions.insert(member.def, definition);
+                    }
+                }
+            }
+        }
+        let mut path_resolutions = signature_resolution.paths().clone();
+        path_resolutions.extend(
+            boundary_aliases
+                .path_resolutions
+                .iter()
+                .map(|(hir_id, resolution)| (*hir_id, *resolution)),
+        );
+        for path_resolution in path_resolutions.values() {
+            let Res::Def(kind, def_id) = path_resolution.base else {
+                continue;
+            };
+            let definition = match kind {
+                DefKind::Alias => Some(sai_ty::boundary::BoundaryDefinition::ModuleAlias),
+                DefKind::Struct | DefKind::Enum | DefKind::Resource => {
+                    Some(sai_ty::boundary::BoundaryDefinition::OutsideInterfaceNominal)
+                }
+                _ => None,
+            };
+            if let Some(definition) = definition {
+                definitions.entry(def_id).or_insert(definition);
+            }
+        }
+        for resource in implementation_resources {
+            definitions.insert(*resource, sai_ty::boundary::BoundaryDefinition::Resource);
+        }
+        let canonical_types = self.canonical_boundary_types_for_paths(&path_resolutions);
+        let boundary_context = sai_ty::boundary::BoundaryTypeContext {
+            path_resolutions: &path_resolutions,
+            canonical_types: &canonical_types,
+            definitions: &definitions,
+            aliases: &boundary_aliases.definitions,
+            resource_containment: Some(&boundary_aliases.resource_containment),
+            self_resource: None,
+        };
+        let normalized = normalize_world_function_signature(
+            descriptor.owner,
+            signature,
+            item.name.span,
+            item.span,
+            &inputs.source,
+            &inputs.source_ref,
+            &boundary_context,
+            &wit_origin_types,
+            Some(wit_view_scopes),
+            true,
+        );
+        Ok(normalized)
+    }
+
+    fn canonical_boundary_types_for_paths(
+        &self,
+        path_resolutions: &HashMap<HirId, PathRes>,
+    ) -> HashMap<DefId, sai_ty::boundary::CanonicalBoundaryType> {
+        let mut canonical_types = HashMap::new();
+        for path_resolution in path_resolutions.values() {
+            let Res::Def(_, def_id) = path_resolution.base else {
+                continue;
+            };
+            let Some(def_paths) = self.def_paths.get(&def_id.package) else {
+                continue;
+            };
+            let Ok(Some(path)) = def_paths.resolve_def_id(def_id) else {
+                continue;
+            };
+            let Ok(package_identity) = self.packages.resolve(def_id.package) else {
+                continue;
+            };
+            let Some(canonical) =
+                canonical_boundary_type_for_path(&path, package_identity.as_ref(), &self.symbols)
+            else {
+                continue;
+            };
+            canonical_types.insert(def_id, canonical);
+        }
+        canonical_types
+    }
+
+    fn complete_world_boundary_resource_containment(
+        &self,
+        aliases: &mut WorldBoundaryAliases<'_>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+    ) {
+        let canonical_types = self.canonical_boundary_types_for_paths(&aliases.path_resolutions);
+        let wit_containment = wit_view_scopes
+            .map(world_resource_containment::collect_wit_view_containment)
+            .unwrap_or_default();
+        aliases.resource_containment = world_resource_containment::compute_source_containment(
+            &aliases.resource_type_roots,
+            &aliases.definitions,
+            &aliases.path_resolutions,
+            &canonical_types,
+            wit_containment,
+        );
     }
 
     /// Builds the package-local include graph from matching world-reference
@@ -15530,6 +17722,23 @@ impl RootDatabase {
             .copied()
             .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
             .collect::<Vec<_>>();
+        let active_source_packages =
+            member_scopes.map_or(&[][..], |scopes| scopes.source_packages.as_slice());
+        let mut alias_collections = Vec::with_capacity(1 + active_source_packages.len());
+        alias_collections.push(collection);
+        alias_collections.extend(
+            active_source_packages
+                .iter()
+                .map(|package| &package.collection),
+        );
+        let mut alias_package_inputs = Vec::with_capacity(alias_collections.len());
+        for alias_collection in alias_collections {
+            alias_package_inputs.push(self.world_boundary_alias_package_inputs(
+                snapshot,
+                alias_collection,
+                active_source_packages,
+            )?);
+        }
         let mut indexed_scopes =
             Vec::with_capacity(1 + member_scopes.map_or(0, |scopes| scopes.source_packages.len()));
         indexed_scopes.push(collection.scopes());
@@ -15555,6 +17764,12 @@ impl RootDatabase {
         let source_graph_packages = member_scopes
             .map(|scopes| &scopes.source_graph_packages)
             .unwrap_or(&local_source_graph_packages);
+        let wit_origin_types = world_reference_scopes
+            .as_ref()
+            .map(|(_, wit_views)| {
+                generated_wit_origin_type_definitions(&indexed_scopes, wit_views, &self.symbols)
+            })
+            .unwrap_or_default();
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
         let mut world_boundary_definitions = HashMap::new();
         for scopes in &indexed_scopes {
@@ -15735,76 +17950,23 @@ impl RootDatabase {
                 let mut boundary_aliases = WorldBoundaryAliases {
                     definitions: HashMap::new(),
                     path_resolutions: HashMap::new(),
+                    resource_type_roots: HashMap::new(),
+                    resource_containment: HashMap::new(),
                 };
-                for alias_descriptor in
-                    collection
-                        .scopes
-                        .top_level_owners
-                        .iter()
-                        .copied()
-                        .filter(|alias| {
-                            alias.kind == TopLevelOwnerKind::Alias && alias.file == descriptor.file
-                        })
-                {
-                    let Some(expected_alias_path) = def_paths
-                        .resolve_def_id(alias_descriptor.owner.def_id.to_def_id())
-                        .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
-                    else {
-                        continue;
-                    };
-                    let alias_context = HirLoweringContext::new(
-                        &inputs.ast_ids,
-                        snapshot,
-                        &inputs.root,
-                        &arena,
-                        &self.symbols,
-                        &def_paths,
-                    );
-                    let Ok((alias_owner, _)) = lower_top_level_owner(
-                        alias_descriptor,
-                        &expected_alias_path,
-                        &inputs.filtered_item_tree,
-                        &inputs.retained_item_kinds,
-                        &alias_context,
-                    ) else {
-                        continue;
-                    };
-                    let OwnerNode::Item(alias_item) = alias_owner.node else {
-                        continue;
-                    };
-                    let ItemKind::Alias { generics, ty } = alias_item.kind else {
-                        continue;
-                    };
-                    let alias_candidates = owner_test_only_path_candidates(&alias_owner)
-                        .into_iter()
-                        .filter(|candidate| candidate.kind == OwnerPathKind::Type)
-                        .collect::<Vec<_>>();
-                    if let Ok(resolution) = resolve_partial_type_owner_paths(
-                        alias_descriptor.owner,
-                        &alias_candidates,
-                        &owner_type_generic_resolutions(&alias_owner),
-                        &self.primitive_prelude,
-                        &module_scope,
-                        collection.module_tree.package,
-                        Some(&module_members),
-                        Some(source_graph_packages),
-                    ) {
-                        boundary_aliases.path_resolutions.extend(
-                            resolution
-                                .paths()
-                                .iter()
-                                .map(|(hir_id, resolution)| (*hir_id, *resolution)),
-                        );
-                    }
-                    boundary_aliases.definitions.insert(
-                        alias_descriptor.owner.def_id.to_def_id(),
-                        sai_ty::boundary::BoundaryAlias {
-                            owner: alias_owner.id,
-                            ty,
-                            has_generic_params: !generics.params.is_empty(),
-                        },
-                    );
-                }
+                collect_world_boundary_aliases(
+                    &mut boundary_aliases,
+                    &alias_package_inputs,
+                    snapshot,
+                    &self.symbols,
+                    &self.primitive_prelude,
+                    &module_members,
+                    &arena,
+                    &self.def_paths,
+                )?;
+                self.complete_world_boundary_resource_containment(
+                    &mut boundary_aliases,
+                    world_reference_scopes.map(|(_, scopes)| scopes),
+                );
                 let mut items = Vec::with_capacity(child_entries.len());
                 for (entry, item_owner) in
                     child_entries.into_iter().zip(parent_items.iter().copied())
@@ -15819,6 +17981,7 @@ impl RootDatabase {
                     let mut item_lowering_diagnostics = Vec::new();
                     let mut world_function_name_issues = Vec::new();
                     let mut world_function_boundary_issues = Vec::new();
+                    let mut world_export_signature = None;
                     let item_result: Result<
                         (OwnerTestOnlyPathResolution, Vec<Diagnostic>),
                         OwnerControlFlowResolutionError,
@@ -16058,15 +18221,32 @@ impl RootDatabase {
                                     definitions.entry(def_id).or_insert(definition);
                                 }
                             }
-                            let canonical_types = HashMap::new();
+                            let canonical_types =
+                                self.canonical_boundary_types_for_paths(&boundary_path_resolutions);
                             let boundary_context = sai_ty::boundary::BoundaryTypeContext {
                                 path_resolutions: &boundary_path_resolutions,
                                 canonical_types: &canonical_types,
                                 definitions: &definitions,
                                 aliases: &boundary_aliases.definitions,
-                                resource_containment: None,
+                                resource_containment: Some(&boundary_aliases.resource_containment),
                                 self_resource: None,
                             };
+                            if let OwnerNode::WorldItem(world_item) = item_hir.node
+                                && let WorldItemKind::ExportFn { name, sig } = world_item.kind
+                            {
+                                world_export_signature = normalize_world_function_signature(
+                                    item_owner,
+                                    sig,
+                                    name.span,
+                                    world_item.span,
+                                    &inputs.source,
+                                    &inputs.source_ref,
+                                    &boundary_context,
+                                    &wit_origin_types,
+                                    world_reference_scopes.map(|(_, scopes)| scopes),
+                                    false,
+                                );
+                            }
                             world_function_boundary_issues =
                                 sai_ty::world::world_function_boundary_check(
                                     &item_hir,
@@ -16178,6 +18358,7 @@ impl RootDatabase {
                                 kind,
                                 world_function_name_issues,
                                 world_function_boundary_issues,
+                                world_export_signature,
                                 type_path_resolution,
                                 module_path_diagnostics: Ok(None),
                                 test_only_path_resolution: Ok(path_resolution),
@@ -16192,6 +18373,7 @@ impl RootDatabase {
                                 kind,
                                 world_function_name_issues,
                                 world_function_boundary_issues,
+                                world_export_signature,
                                 type_path_resolution,
                                 module_path_diagnostics: Ok(None),
                                 test_only_path_resolution: Err(error.clone()),
@@ -30461,8 +32643,1353 @@ mod tests {
     }
 
     #[test]
+    fn direct_world_function_export_checks_source_dependency_reexports() {
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let dependency_source = b"pub use acme:leaf.{Word as Number}\n\
+                                  pub interface api {\n\
+                                    type Request { field: U32 }\n\
+                                    fn remote(value: Request)\n\
+                                    fn wrong(value: U64)\n\
+                                  }\n\
+                                  pub fn implementation(value: U32) {}\n\
+                                  pub fn wrong(value: Number) {}\n";
+        let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[(
+                "lib.sai",
+                b"pub use acme:dep.{implementation as exported}\n\
+                  pub use acme:dep.{wrong as wrong_exported}\n\
+                  world exports {\n\
+                    export fn exported(value: U32)\n\
+                    export fn wrong_exported(value: U32)\n\
+                  }\n",
+            )],
+        );
+        let (dependency_package, dependency_tree, dependency_files) = multi_package_fixture(
+            &mut database,
+            "acme:dep#1",
+            "acme:dep@1.0.0",
+            &[("lib.sai", dependency_source)],
+        );
+        let (leaf_package, leaf_tree, leaf_files) = multi_package_fixture(
+            &mut database,
+            "acme:leaf#1",
+            "acme:leaf@1.0.0",
+            &[("lib.sai", b"pub type Word = U64\n")],
+        );
+        snapshot_files.extend(dependency_files);
+        snapshot_files.extend(leaf_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:dep#1", "acme:dep")],
+                ),
+                graph_node(
+                    "acme:dep#1",
+                    "acme:dep",
+                    "1.0.0",
+                    PackageGraphRole::Dependency,
+                    vec![graph_edge("acme:leaf#1", "acme:leaf")],
+                ),
+                graph_node(
+                    "acme:leaf#1",
+                    "acme:leaf",
+                    "1.0.0",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("source dependency graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let leaf_manifest: Arc<[u8]> =
+            Arc::from(&b"package acme:leaf @ 1.0.0\nsource \"src\"\n"[..]);
+        let leaf_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &leaf_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                leaf_manifest,
+                PackageRole::Dependency,
+                &[],
+            )
+            .expect("leaf source scopes collect");
+        database
+            .declared_requirements(leaf_package)
+            .expect("the leaf manifest requirements are tracked");
+        let leaf_member_package = leaf_collection.module_member_scope_package();
+        let dependency_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:dep @ 1.0.0\n\
+                  source \"src\"\n\
+                  requires { acme:leaf @ ^1 }\n"[..],
+        );
+        let dependency_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &dependency_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                dependency_manifest,
+                PackageRole::Dependency,
+                &[leaf_member_package.as_foreign_package_scopes("acme:leaf")],
+            )
+            .expect("source dependency scopes collect");
+        let dependency_member_package = dependency_collection.module_member_scope_package();
+        let number_symbol = database
+            .symbols
+            .intern("Number")
+            .expect("dependency alias symbol interns");
+        let number_binding = dependency_collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("dependency root module scope exists")
+            .scope
+            .get(&number_symbol)
+            .expect("the imported leaf alias binds as Number");
+        assert!(
+            matches!(number_binding.res, Res::Def(DefKind::Alias, _)),
+            "the imported leaf type alias is preserved: {:?}",
+            number_binding.res
+        );
+        let api_symbol = database
+            .symbols
+            .intern("api")
+            .expect("dependency interface symbol interns");
+        let api = match dependency_collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("dependency root module scope exists")
+            .scope
+            .get(&api_symbol)
+            .expect("dependency api interface is in scope")
+            .res
+        {
+            Res::Def(DefKind::Interface, api) => api,
+            other => panic!("dependency api resolves to an interface, got {other:?}"),
+        };
+        database
+            .set_generated_wit_text(
+                dependency_package,
+                GeneratedText {
+                    text: Arc::from(
+                        "package acme:dep@1.0.0; interface api { record request { field: u32 } remote: func(value: request); wrong: func(value: u64); }",
+                    ),
+                    complete: true,
+                    origins: Arc::from([("api".to_owned(), api)]),
+                },
+                Durability::Low,
+            )
+            .expect("generated WIT retains the source interface origin");
+        let root_wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target_cfg, &graph)
+            .expect("the root's active WIT view closure is available");
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:dep @ ^1 }\n"[..],
+        );
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &[dependency_member_package.as_foreign_package_scopes("acme:dep")],
+                &root_wit_views,
+            )
+            .expect("root and dependency scopes collect");
+        assert_eq!(
+            collection.module_tree.package, root_package,
+            "the root collection belongs to the requesting package"
+        );
+        let member_scopes = database
+            .collect_active_source_member_scopes(
+                &collection,
+                &graph,
+                &[dependency_member_package, leaf_member_package],
+            )
+            .expect("the source dependency closure validates");
+        let references = database
+            .resolve_world_references_with_scopes(
+                &collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+                &root_wit_views,
+            )
+            .expect("the exported function world resolves");
+        let world_owner = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::World
+                    && database
+                        .resolve_def_path(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| {
+                            path.data()
+                                .last()
+                                .and_then(|component| match &component.data {
+                                    DefPathData::World(name) => database
+                                        .resolve_symbol(*name)
+                                        .ok()
+                                        .map(|name| name.as_ref() == "exports"),
+                                    _ => None,
+                                })
+                        })
+                        .unwrap_or(false)
+            })
+            .expect("the direct-export world exists")
+            .owner;
+        let wrong_exported_symbol = database
+            .symbols
+            .intern("wrong_exported")
+            .expect("root re-export symbol interns");
+        let wrong_exported = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists")
+            .scope
+            .get(&wrong_exported_symbol)
+            .expect("the wrong-exported re-export is in scope");
+        let Res::Def(DefKind::Fn, wrong_function) = wrong_exported.res else {
+            panic!(
+                "wrong-exported resolves to a function, got {:?}",
+                wrong_exported.res
+            );
+        };
+        let normalized_wrong = database
+            .normalized_root_function_signature(
+                wrong_function,
+                world_owner,
+                sai_diagnostics::Span::new(
+                    wrong_exported.name_span.file,
+                    wrong_exported.name_span.range,
+                ),
+                &collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+                &root_wit_views,
+                &HashSet::new(),
+            )
+            .expect("the re-export signature lookup succeeds");
+        assert!(
+            normalized_wrong.is_some(),
+            "the re-exported source signature must normalize: {normalized_wrong:#?}"
+        );
+        let world = world_owner.def_id.to_def_id();
+        let checked = database
+            .world_check(
+                world,
+                &collection,
+                &root_tree,
+                &snapshot,
+                &references,
+                &member_scopes,
+                &root_wit_views,
+            )
+            .expect("the world checks dependency functions");
+        let unimplemented = checked
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented)
+            .collect::<Vec<_>>();
+        assert!(
+            unimplemented.is_empty(),
+            "root free function re-exports implement direct exports: {unimplemented:#?}"
+        );
+        let mismatches = checked
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mismatches.len(),
+            1,
+            "the source dependency function with a different parameter type mismatches: {mismatches:#?}"
+        );
+        let source_mismatch = mismatches
+            .iter()
+            .find(|diagnostic| diagnostic.package.as_deref() == Some("acme:dep@1.0.0"))
+            .expect("source function mismatch retains the dependency package");
+        let primary = source_mismatch
+            .primary()
+            .expect("dependency mismatch has its implementation source location");
+        assert_eq!(
+            primary.file.package.as_deref(),
+            Some("acme:dep@1.0.0"),
+            "the mismatch points into the defining source package"
+        );
+        assert_eq!(
+            &dependency_source
+                [primary.span.range.start().to_usize()..primary.span.range.end().to_usize()],
+            b"Number",
+            "the dependency mismatch points at its implementing parameter type"
+        );
+        assert_eq!(
+            source_mismatch.package.as_deref(),
+            Some("acme:dep@1.0.0"),
+            "the diagnostic is attributed to the defining package"
+        );
+    }
+
+    #[test]
+    fn world_function_conformance_preserves_sai_parameter_types() {
+        use sai_intern::Idx;
+
+        fn test_span(start: u32, end: u32) -> sai_hir::Span {
+            sai_hir::Span {
+                file: FileId::new(0),
+                range: sai_vfs::TextRange::new(
+                    sai_vfs::TextSize::new(start),
+                    sai_vfs::TextSize::new(end),
+                )
+                .expect("test span is ordered"),
+                ctxt: sai_hir::SpanCtxt::Root,
+            }
+        }
+
+        fn path_type<'hir>(
+            arena: &'hir HirArena<'hir>,
+            owner: OwnerId,
+            symbols: &Interner,
+            local_id: u32,
+            spelling: &str,
+        ) -> (&'hir Ty<'hir>, HirId) {
+            let span = test_span(local_id, local_id + 1);
+            let path_hir_id = HirId {
+                owner,
+                local_id: sai_hir::ItemLocalId::from_raw(local_id + 1),
+            };
+            let segments = arena.alloc_path_segments(&[PathSegment {
+                hir_id: HirId {
+                    owner,
+                    local_id: sai_hir::ItemLocalId::from_raw(local_id + 2),
+                },
+                name: Name {
+                    sym: symbols.intern(spelling).expect("test type name interns"),
+                    span,
+                },
+                args: None,
+            }]);
+            let path = arena.alloc_path(sai_hir::types::Path {
+                hir_id: path_hir_id,
+                root: sai_hir::types::PathRoot::Plain,
+                segments,
+                span,
+            });
+            (
+                arena.alloc_ty(Ty {
+                    hir_id: HirId {
+                        owner,
+                        local_id: sai_hir::ItemLocalId::from_raw(local_id),
+                    },
+                    kind: TyKind::Path(*path),
+                    span,
+                }),
+                path_hir_id,
+            )
+        }
+
+        fn generic_path_type<'hir>(
+            arena: &'hir HirArena<'hir>,
+            owner: OwnerId,
+            symbols: &Interner,
+            local_id: u32,
+            spelling: &str,
+            type_arguments: &[&'hir Ty<'hir>],
+        ) -> (&'hir Ty<'hir>, HirId) {
+            let span = test_span(local_id, local_id + 1);
+            let path_hir_id = HirId {
+                owner,
+                local_id: sai_hir::ItemLocalId::from_raw(local_id + 1),
+            };
+            let arguments = arena.alloc_generic_args(sai_hir::types::GenericArgs {
+                args: arena.alloc_generic_args_list(
+                    &type_arguments
+                        .iter()
+                        .copied()
+                        .map(sai_hir::types::GenericArg::Type)
+                        .collect::<Vec<_>>(),
+                ),
+                span,
+            });
+            let segments = arena.alloc_path_segments(&[PathSegment {
+                hir_id: HirId {
+                    owner,
+                    local_id: sai_hir::ItemLocalId::from_raw(local_id + 2),
+                },
+                name: Name {
+                    sym: symbols.intern(spelling).expect("generic type name interns"),
+                    span,
+                },
+                args: Some(arguments),
+            }]);
+            let path = arena.alloc_path(sai_hir::types::Path {
+                hir_id: path_hir_id,
+                root: sai_hir::types::PathRoot::Plain,
+                segments,
+                span,
+            });
+            (
+                arena.alloc_ty(Ty {
+                    hir_id: HirId {
+                        owner,
+                        local_id: sai_hir::ItemLocalId::from_raw(local_id),
+                    },
+                    kind: TyKind::Path(*path),
+                    span,
+                }),
+                path_hir_id,
+            )
+        }
+
+        fn array_path_type<'hir>(
+            arena: &'hir HirArena<'hir>,
+            owner: OwnerId,
+            symbols: &Interner,
+            local_id: u32,
+            element: &'hir Ty<'hir>,
+        ) -> (&'hir Ty<'hir>, HirId) {
+            let span = test_span(local_id, local_id + 1);
+            let path_hir_id = HirId {
+                owner,
+                local_id: sai_hir::ItemLocalId::from_raw(local_id + 1),
+            };
+            let arguments = arena.alloc_generic_args(sai_hir::types::GenericArgs {
+                args: arena.alloc_generic_args_list(&[
+                    GenericArg::Type(element),
+                    GenericArg::Const(sai_hir::types::ConstArg::Int {
+                        value: Some(3),
+                        negated: false,
+                    }),
+                ]),
+                span,
+            });
+            let segments = arena.alloc_path_segments(&[PathSegment {
+                hir_id: HirId {
+                    owner,
+                    local_id: sai_hir::ItemLocalId::from_raw(local_id + 2),
+                },
+                name: Name {
+                    sym: symbols.intern("Array").expect("array type name interns"),
+                    span,
+                },
+                args: Some(arguments),
+            }]);
+            let path = arena.alloc_path(sai_hir::types::Path {
+                hir_id: path_hir_id,
+                root: sai_hir::types::PathRoot::Plain,
+                segments,
+                span,
+            });
+            (
+                arena.alloc_ty(Ty {
+                    hir_id: HirId {
+                        owner,
+                        local_id: sai_hir::ItemLocalId::from_raw(local_id),
+                    },
+                    kind: TyKind::Path(*path),
+                    span,
+                }),
+                path_hir_id,
+            )
+        }
+
+        let (database, _, _, package) = phase1_fixture(b"", b"");
+        let owner_name = database
+            .symbols
+            .intern("world_signature_owner")
+            .expect("owner name interns");
+        let owner_path = DefPath::new(
+            package,
+            vec![sai_hir::DisambiguatedDefPathData {
+                data: DefPathData::ValueNs(owner_name),
+                disambiguator: 0,
+            }],
+            &database.packages,
+            &database.symbols,
+        )
+        .expect("owner definition path is valid");
+        let owner_def_paths = DefPathInterner::new(package, &database.packages, &database.symbols)
+            .expect("owner definition paths initialize");
+        let owner = OwnerId {
+            def_id: owner_def_paths
+                .intern(owner_path)
+                .expect("owner path interns"),
+        };
+        let arena = HirArena::new();
+        let (str_ty, str_path) = path_type(&arena, owner, &database.symbols, 1, "Str");
+        let (string_ty, string_path) = path_type(&arena, owner, &database.symbols, 5, "String");
+        let (slice_ty, slice_path) = path_type(&arena, owner, &database.symbols, 9, "Slice");
+        let (vec_ty, vec_path) = path_type(&arena, owner, &database.symbols, 13, "Vec");
+        let (bytes_ty, bytes_path) = path_type(&arena, owner, &database.symbols, 17, "Bytes");
+        let (alias_ty, alias_path) = path_type(&arena, owner, &database.symbols, 21, "Text");
+        let (resource_ty, resource_path) =
+            path_type(&arena, owner, &database.symbols, 25, "Resource");
+
+        let str_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(100));
+        let string_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(101));
+        let slice_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(102));
+        let vec_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(103));
+        let bytes_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(104));
+        let alias_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(105));
+        let resource_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(106));
+        let path_resolution = |def_id| PathRes {
+            base: Res::Def(DefKind::Alias, def_id),
+            resolved_segments: 1,
+            segment_count: 1,
+        };
+        let (contains_resource_ty, contains_resource_path) =
+            path_type(&arena, owner, &database.symbols, 33, "ContainsResource");
+        let (plain_record_ty, plain_record_path) =
+            path_type(&arena, owner, &database.symbols, 37, "PlainRecord");
+        let (unknown_record_ty, unknown_record_path) =
+            path_type(&arena, owner, &database.symbols, 39, "UnknownRecord");
+        let (primitive_field_ty, primitive_field_path) =
+            path_type(&arena, owner, &database.symbols, 41, "U32");
+        let (generic_alias_target_ty, generic_alias_target_path) =
+            path_type(&arena, owner, &database.symbols, 61, "T");
+        let (slice_of_resource_record_ty, slice_of_resource_record_path) = generic_path_type(
+            &arena,
+            owner,
+            &database.symbols,
+            45,
+            "Slice",
+            &[contains_resource_ty],
+        );
+        let (slice_of_plain_record_ty, slice_of_plain_record_path) = generic_path_type(
+            &arena,
+            owner,
+            &database.symbols,
+            49,
+            "Slice",
+            &[plain_record_ty],
+        );
+        let (slice_of_unknown_record_ty, slice_of_unknown_record_path) = generic_path_type(
+            &arena,
+            owner,
+            &database.symbols,
+            57,
+            "Slice",
+            &[unknown_record_ty],
+        );
+        let (wrapped_resource_record_ty, wrapped_resource_record_path) = generic_path_type(
+            &arena,
+            owner,
+            &database.symbols,
+            65,
+            "Wrap",
+            &[contains_resource_ty],
+        );
+        let (wrapped_plain_record_ty, wrapped_plain_record_path) = generic_path_type(
+            &arena,
+            owner,
+            &database.symbols,
+            69,
+            "Wrap",
+            &[plain_record_ty],
+        );
+        let (slice_of_wrapped_resource_record_ty, slice_of_wrapped_resource_record_path) =
+            generic_path_type(
+                &arena,
+                owner,
+                &database.symbols,
+                73,
+                "Slice",
+                &[wrapped_resource_record_ty],
+            );
+        let (slice_of_wrapped_plain_record_ty, slice_of_wrapped_plain_record_path) =
+            generic_path_type(
+                &arena,
+                owner,
+                &database.symbols,
+                77,
+                "Slice",
+                &[wrapped_plain_record_ty],
+            );
+        let (recursive_a_ty, recursive_a_path) =
+            path_type(&arena, owner, &database.symbols, 81, "RecursiveA");
+        let (recursive_b_ty, recursive_b_path) =
+            path_type(&arena, owner, &database.symbols, 85, "RecursiveB");
+        let (incomplete_recursive_a_ty, incomplete_recursive_a_path) =
+            path_type(&arena, owner, &database.symbols, 89, "IncompleteRecursiveA");
+        let (incomplete_recursive_b_ty, incomplete_recursive_b_path) =
+            path_type(&arena, owner, &database.symbols, 93, "IncompleteRecursiveB");
+        let incomplete_recursive_field_ty = arena.alloc_ty(Ty {
+            hir_id: HirId {
+                owner,
+                local_id: sai_hir::ItemLocalId::from_raw(97),
+            },
+            kind: TyKind::Infer,
+            span: test_span(97, 98),
+        });
+        let loop_param_symbol = database
+            .symbols
+            .intern("U")
+            .expect("recursive alias parameter name interns");
+        let loop_param_def = owner_def_paths
+            .intern_generic_param(owner.def_id, loop_param_symbol, false, 0)
+            .expect("recursive alias type parameter interns");
+        let (loop_param_ty, loop_param_path) =
+            path_type(&arena, owner, &database.symbols, 101, "U");
+        let (recursive_loop_ty, recursive_loop_path) = generic_path_type(
+            &arena,
+            owner,
+            &database.symbols,
+            105,
+            "Loop",
+            &[loop_param_ty],
+        );
+        let (loop_alias_target_ty, loop_alias_target_path) = generic_path_type(
+            &arena,
+            owner,
+            &database.symbols,
+            109,
+            "Wrap",
+            &[recursive_loop_ty],
+        );
+        let (recursive_loop_use_ty, recursive_loop_use_path) = generic_path_type(
+            &arena,
+            owner,
+            &database.symbols,
+            113,
+            "Loop",
+            &[primitive_field_ty],
+        );
+        let (nested_wrapped_plain_record_ty, nested_wrapped_plain_record_path) = generic_path_type(
+            &arena,
+            owner,
+            &database.symbols,
+            117,
+            "Wrap",
+            &[wrapped_plain_record_ty],
+        );
+        let (slice_of_nested_wrapped_plain_record_ty, slice_of_nested_wrapped_plain_record_path) =
+            generic_path_type(
+                &arena,
+                owner,
+                &database.symbols,
+                129,
+                "Slice",
+                &[nested_wrapped_plain_record_ty],
+            );
+        let (array_of_resource_record_ty, array_of_resource_record_path) =
+            array_path_type(&arena, owner, &database.symbols, 121, contains_resource_ty);
+        let (array_of_plain_record_ty, array_of_plain_record_path) =
+            array_path_type(&arena, owner, &database.symbols, 125, plain_record_ty);
+
+        let contains_resource_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(107));
+        let plain_record_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(108));
+        let unknown_record_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(109));
+        let nested_record_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(110));
+        let generic_alias_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(111));
+        let wrapped_resource_record_def =
+            DefId::from_foreign(package, sai_hir::DefIndex::from_raw(112));
+        let wrapped_plain_record_def =
+            DefId::from_foreign(package, sai_hir::DefIndex::from_raw(113));
+        let recursive_a_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(114));
+        let recursive_b_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(115));
+        let incomplete_recursive_a_def =
+            DefId::from_foreign(package, sai_hir::DefIndex::from_raw(116));
+        let incomplete_recursive_b_def =
+            DefId::from_foreign(package, sai_hir::DefIndex::from_raw(117));
+        let recursive_alias_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(118));
+        let recursive_loop_record_def =
+            DefId::from_foreign(package, sai_hir::DefIndex::from_raw(119));
+        let nested_wrapped_plain_record_def =
+            DefId::from_foreign(package, sai_hir::DefIndex::from_raw(120));
+        let array_resource_record_def =
+            DefId::from_foreign(package, sai_hir::DefIndex::from_raw(121));
+        let array_plain_record_def = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(122));
+        let path_resolutions = HashMap::from([
+            (str_path, path_resolution(str_def)),
+            (string_path, path_resolution(string_def)),
+            (slice_path, path_resolution(slice_def)),
+            (vec_path, path_resolution(vec_def)),
+            (bytes_path, path_resolution(bytes_def)),
+            (alias_path, path_resolution(alias_def)),
+            (
+                resource_path,
+                PathRes {
+                    base: Res::Def(DefKind::Resource, resource_def),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+            (
+                contains_resource_path,
+                PathRes {
+                    base: Res::Def(DefKind::Struct, contains_resource_def),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+            (
+                plain_record_path,
+                PathRes {
+                    base: Res::Def(DefKind::Struct, plain_record_def),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+            (
+                unknown_record_path,
+                PathRes {
+                    base: Res::Def(DefKind::Struct, unknown_record_def),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+            (
+                generic_alias_target_path,
+                PathRes {
+                    base: Res::Def(DefKind::TyParam, owner.def_id.to_def_id()),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+            (
+                primitive_field_path,
+                PathRes {
+                    base: Res::PrimTy(sai_resolve::prelude::PrimTy::U32),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+            (slice_of_resource_record_path, path_resolution(slice_def)),
+            (slice_of_plain_record_path, path_resolution(slice_def)),
+            (slice_of_unknown_record_path, path_resolution(slice_def)),
+            (
+                wrapped_resource_record_path,
+                path_resolution(generic_alias_def),
+            ),
+            (
+                wrapped_plain_record_path,
+                path_resolution(generic_alias_def),
+            ),
+            (
+                slice_of_wrapped_resource_record_path,
+                path_resolution(slice_def),
+            ),
+            (
+                slice_of_wrapped_plain_record_path,
+                path_resolution(slice_def),
+            ),
+            (recursive_a_path, path_resolution(recursive_a_def)),
+            (recursive_b_path, path_resolution(recursive_b_def)),
+            (
+                incomplete_recursive_a_path,
+                path_resolution(incomplete_recursive_a_def),
+            ),
+            (
+                incomplete_recursive_b_path,
+                path_resolution(incomplete_recursive_b_def),
+            ),
+            (
+                loop_param_path,
+                PathRes {
+                    base: Res::Def(DefKind::TyParam, loop_param_def.to_def_id()),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+            (recursive_loop_path, path_resolution(recursive_alias_def)),
+            (loop_alias_target_path, path_resolution(generic_alias_def)),
+            (
+                recursive_loop_use_path,
+                path_resolution(recursive_alias_def),
+            ),
+            (
+                nested_wrapped_plain_record_path,
+                path_resolution(generic_alias_def),
+            ),
+            (
+                slice_of_nested_wrapped_plain_record_path,
+                path_resolution(slice_def),
+            ),
+            (
+                array_of_resource_record_path,
+                PathRes {
+                    base: Res::PrimTy(sai_resolve::prelude::PrimTy::Array),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+            (
+                array_of_plain_record_path,
+                PathRes {
+                    base: Res::PrimTy(sai_resolve::prelude::PrimTy::Array),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+        ]);
+        let canonical_types = HashMap::from([
+            (str_def, sai_ty::boundary::CanonicalBoundaryType::Str),
+            (string_def, sai_ty::boundary::CanonicalBoundaryType::String),
+            (slice_def, sai_ty::boundary::CanonicalBoundaryType::Slice),
+            (vec_def, sai_ty::boundary::CanonicalBoundaryType::Vec),
+            (bytes_def, sai_ty::boundary::CanonicalBoundaryType::Bytes),
+        ]);
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            alias_def,
+            sai_ty::boundary::BoundaryAlias {
+                owner,
+                ty: str_ty,
+                generic_params: &[],
+            },
+        );
+        let generic_alias_param_name = Name {
+            sym: database
+                .symbols
+                .intern("T")
+                .expect("generic alias parameter name interns"),
+            span: test_span(60, 61),
+        };
+        let generic_alias_param = arena.alloc_generic_param(sai_hir::types::GenericParam {
+            def_id: owner.def_id,
+            name: generic_alias_param_name,
+            kind: GenericParamKind::Type { bounds: &[] },
+        });
+        aliases.insert(
+            generic_alias_def,
+            sai_ty::boundary::BoundaryAlias {
+                owner,
+                ty: generic_alias_target_ty,
+                generic_params: arena.alloc_generic_params(&[*generic_alias_param]),
+            },
+        );
+        let recursive_alias_param = arena.alloc_generic_param(sai_hir::types::GenericParam {
+            def_id: loop_param_def,
+            name: Name {
+                sym: loop_param_symbol,
+                span: test_span(100, 101),
+            },
+            kind: GenericParamKind::Type { bounds: &[] },
+        });
+        aliases.insert(
+            recursive_alias_def,
+            sai_ty::boundary::BoundaryAlias {
+                owner,
+                ty: loop_alias_target_ty,
+                generic_params: arena.alloc_generic_params(&[*recursive_alias_param]),
+            },
+        );
+        let definitions = HashMap::from([
+            (
+                contains_resource_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (
+                plain_record_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (
+                unknown_record_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (
+                nested_record_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (
+                generic_alias_def,
+                sai_ty::boundary::BoundaryDefinition::ModuleAlias,
+            ),
+            (
+                wrapped_resource_record_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (
+                wrapped_plain_record_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (
+                recursive_a_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (
+                recursive_b_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (
+                incomplete_recursive_a_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (
+                incomplete_recursive_b_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (
+                recursive_alias_def,
+                sai_ty::boundary::BoundaryDefinition::ModuleAlias,
+            ),
+            (
+                recursive_loop_record_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (
+                nested_wrapped_plain_record_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (
+                array_resource_record_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (
+                array_plain_record_def,
+                sai_ty::boundary::BoundaryDefinition::InterfaceType,
+            ),
+            (resource_def, sai_ty::boundary::BoundaryDefinition::Resource),
+        ]);
+        let context = sai_ty::boundary::BoundaryTypeContext {
+            path_resolutions: &path_resolutions,
+            canonical_types: &canonical_types,
+            definitions: &definitions,
+            aliases: &aliases,
+            resource_containment: None,
+            self_resource: None,
+        };
+
+        let string = world_function_conformance_type_from_hir(
+            &context,
+            string_ty,
+            sai_ty::boundary::BoundaryType::String,
+            true,
+        )
+        .expect("canonical String normalizes");
+        let borrowed_str = world_function_conformance_type_from_hir(
+            &context,
+            str_ty,
+            sai_ty::boundary::BoundaryType::String,
+            true,
+        )
+        .expect("canonical Str normalizes");
+        let alias_str = world_function_conformance_type_from_hir(
+            &context,
+            alias_ty,
+            sai_ty::boundary::BoundaryType::String,
+            true,
+        )
+        .expect("nongeneric aliases expand before conformance");
+        assert_eq!(borrowed_str, WorldFunctionConformanceType::Str);
+        assert_eq!(alias_str, borrowed_str);
+        assert_ne!(
+            string, borrowed_str,
+            "String and Str are distinct SAI types"
+        );
+
+        let slice = world_function_conformance_type_from_hir(
+            &context,
+            slice_ty,
+            sai_ty::boundary::BoundaryType::List(Box::new(sai_ty::boundary::BoundaryType::U32)),
+            true,
+        )
+        .expect("canonical Slice normalizes");
+        let vec = world_function_conformance_type_from_hir(
+            &context,
+            vec_ty,
+            sai_ty::boundary::BoundaryType::List(Box::new(sai_ty::boundary::BoundaryType::U32)),
+            true,
+        )
+        .expect("canonical Vec normalizes");
+        let bytes = world_function_conformance_type_from_hir(
+            &context,
+            bytes_ty,
+            sai_ty::boundary::BoundaryType::List(Box::new(sai_ty::boundary::BoundaryType::U8)),
+            true,
+        )
+        .expect("canonical Bytes normalizes");
+        assert_eq!(
+            slice,
+            WorldFunctionConformanceType::Slice(Box::new(sai_ty::boundary::BoundaryType::U32))
+        );
+        assert_ne!(slice, vec, "Slice and Vec are distinct SAI types");
+        assert_eq!(
+            bytes,
+            WorldFunctionConformanceType::Vec(Box::new(sai_ty::boundary::BoundaryType::U8)),
+            "Bytes and Vec<Byte> have the same expanded type"
+        );
+
+        let resource_roots = HashMap::from([
+            (
+                contains_resource_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![resource_ty],
+                },
+            ),
+            (
+                plain_record_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![primitive_field_ty],
+                },
+            ),
+            (
+                unknown_record_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![arena.alloc_ty(Ty {
+                        hir_id: HirId {
+                            owner,
+                            local_id: sai_hir::ItemLocalId::from_raw(53),
+                        },
+                        kind: TyKind::Infer,
+                        span: test_span(53, 54),
+                    })],
+                },
+            ),
+            (
+                nested_record_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![contains_resource_ty],
+                },
+            ),
+            (
+                wrapped_resource_record_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![wrapped_resource_record_ty],
+                },
+            ),
+            (
+                wrapped_plain_record_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![wrapped_plain_record_ty],
+                },
+            ),
+            (
+                recursive_a_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![recursive_b_ty],
+                },
+            ),
+            (
+                recursive_b_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![recursive_a_ty],
+                },
+            ),
+            (
+                incomplete_recursive_a_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![incomplete_recursive_b_ty],
+                },
+            ),
+            (
+                incomplete_recursive_b_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![incomplete_recursive_a_ty, incomplete_recursive_field_ty],
+                },
+            ),
+            (
+                recursive_loop_record_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![recursive_loop_use_ty],
+                },
+            ),
+            (
+                nested_wrapped_plain_record_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![nested_wrapped_plain_record_ty],
+                },
+            ),
+            (
+                array_resource_record_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![array_of_resource_record_ty],
+                },
+            ),
+            (
+                array_plain_record_def,
+                world_resource_containment::TypeRoots {
+                    owner,
+                    types: vec![array_of_plain_record_ty],
+                },
+            ),
+        ]);
+        let resource_containment = world_resource_containment::compute_source_containment(
+            &resource_roots,
+            &aliases,
+            &path_resolutions,
+            &canonical_types,
+            HashMap::new(),
+        );
+        assert_eq!(
+            resource_containment.get(&contains_resource_def),
+            Some(&sai_ty::boundary::ResourceContainment::Yes),
+            "record fields that name an interface resource propagate containment"
+        );
+        assert_eq!(
+            resource_containment.get(&plain_record_def),
+            Some(&sai_ty::boundary::ResourceContainment::No),
+            "resource-free records remain known resource-free"
+        );
+        assert_eq!(
+            resource_containment.get(&unknown_record_def),
+            Some(&sai_ty::boundary::ResourceContainment::Unknown),
+            "incomplete type information stays unknown"
+        );
+        assert_eq!(
+            resource_containment.get(&nested_record_def),
+            Some(&sai_ty::boundary::ResourceContainment::Yes),
+            "containment propagates through nested interface records"
+        );
+        assert_eq!(
+            resource_containment.get(&wrapped_resource_record_def),
+            Some(&sai_ty::boundary::ResourceContainment::Yes),
+            "a generic alias substitutes its actual resource-containing type argument"
+        );
+        assert_eq!(
+            resource_containment.get(&wrapped_plain_record_def),
+            Some(&sai_ty::boundary::ResourceContainment::No),
+            "a generic alias substitutes a known resource-free type argument"
+        );
+        assert_eq!(
+            resource_containment.get(&recursive_a_def),
+            Some(&sai_ty::boundary::ResourceContainment::No),
+            "closed resource-free recursive records resolve to No"
+        );
+        assert_eq!(
+            resource_containment.get(&recursive_b_def),
+            Some(&sai_ty::boundary::ResourceContainment::No),
+            "every record in a closed resource-free recursive component resolves to No"
+        );
+        assert_eq!(
+            resource_containment.get(&incomplete_recursive_a_def),
+            Some(&sai_ty::boundary::ResourceContainment::Unknown),
+            "an incomplete dependency keeps its recursive component unknown"
+        );
+        assert_eq!(
+            resource_containment.get(&incomplete_recursive_b_def),
+            Some(&sai_ty::boundary::ResourceContainment::Unknown),
+            "unknown propagates through the entire incomplete recursive component"
+        );
+        assert_eq!(
+            resource_containment.get(&recursive_loop_record_def),
+            Some(&sai_ty::boundary::ResourceContainment::Unknown),
+            "a generic alias cycle mediated through substitutions defers without recursion overflow"
+        );
+        assert_eq!(
+            resource_containment.get(&nested_wrapped_plain_record_def),
+            Some(&sai_ty::boundary::ResourceContainment::No),
+            "distinct nested applications of the same generic alias are finite"
+        );
+        assert_eq!(
+            resource_containment.get(&array_resource_record_def),
+            Some(&sai_ty::boundary::ResourceContainment::Yes),
+            "Array<T, N> propagates resource containment from its element type"
+        );
+        assert_eq!(
+            resource_containment.get(&array_plain_record_def),
+            Some(&sai_ty::boundary::ResourceContainment::No),
+            "Array<T, N> remains resource-free when its element type is resource-free"
+        );
+        let resource_context = sai_ty::boundary::BoundaryTypeContext {
+            path_resolutions: &path_resolutions,
+            canonical_types: &canonical_types,
+            definitions: &definitions,
+            aliases: &aliases,
+            resource_containment: Some(&resource_containment),
+            self_resource: None,
+        };
+        assert_eq!(
+            world_function_parameter_kind(
+                &resource_context,
+                recursive_loop_use_ty,
+                &mut HashSet::new(),
+                None,
+            ),
+            None,
+            "signature parameter-kind expansion defers a substitution-mediated recursive alias"
+        );
+        assert!(matches!(
+            sai_ty::boundary::boundary_type(
+                &resource_context,
+                owner,
+                slice_of_resource_record_ty,
+                sai_ty::boundary::Position::Param,
+            ),
+            sai_ty::boundary::BoundaryTypeOutcome::Incompatible(sai_ty::boundary::Incompatible {
+                reason: sai_ty::boundary::IncompatibleReason::SliceContainsResource,
+                ..
+            })
+        ));
+        assert!(
+            matches!(
+                sai_ty::boundary::boundary_type(
+                    &resource_context,
+                    owner,
+                    slice_of_wrapped_resource_record_ty,
+                    sai_ty::boundary::Position::Param,
+                ),
+                sai_ty::boundary::BoundaryTypeOutcome::Incompatible(
+                    sai_ty::boundary::Incompatible {
+                        reason: sai_ty::boundary::IncompatibleReason::SliceContainsResource,
+                        ..
+                    }
+                )
+            ),
+            "Slice<Wrap<ResourceRecord>> rejects resource containment through generic alias expansion"
+        );
+        assert_eq!(
+            sai_ty::boundary::boundary_type(
+                &resource_context,
+                owner,
+                slice_of_unknown_record_ty,
+                sai_ty::boundary::Position::Param,
+            ),
+            sai_ty::boundary::BoundaryTypeOutcome::Deferred,
+            "unknown containment defers instead of producing a false incompatibility"
+        );
+        let wrapped_plain_slice = sai_ty::boundary::boundary_type(
+            &resource_context,
+            owner,
+            slice_of_wrapped_plain_record_ty,
+            sai_ty::boundary::Position::Param,
+        );
+        let sai_ty::boundary::BoundaryTypeOutcome::Mapped(wrapped_plain_slice) =
+            wrapped_plain_slice
+        else {
+            panic!("resource-free types passed through a generic alias remain supported");
+        };
+        assert_eq!(
+            wrapped_plain_slice,
+            sai_ty::boundary::BoundaryType::List(Box::new(sai_ty::boundary::BoundaryType::Named(
+                plain_record_def
+            ))),
+            "Slice<Wrap<PlainRecord>> maps after resolving its resource-free containment"
+        );
+        let nested_wrapped_plain_slice = sai_ty::boundary::boundary_type(
+            &resource_context,
+            owner,
+            slice_of_nested_wrapped_plain_record_ty,
+            sai_ty::boundary::Position::Param,
+        );
+        let sai_ty::boundary::BoundaryTypeOutcome::Mapped(nested_wrapped_plain_slice) =
+            nested_wrapped_plain_slice
+        else {
+            panic!("finite nested generic aliases remain valid boundary types");
+        };
+        assert_eq!(
+            world_function_conformance_type_from_hir(
+                &resource_context,
+                slice_of_nested_wrapped_plain_record_ty,
+                nested_wrapped_plain_slice,
+                true,
+            ),
+            Some(WorldFunctionConformanceType::Slice(Box::new(
+                sai_ty::boundary::BoundaryType::Named(plain_record_def)
+            ))),
+            "signature normalization preserves Slice through nested generic alias applications"
+        );
+        let plain_slice = sai_ty::boundary::boundary_type(
+            &resource_context,
+            owner,
+            slice_of_plain_record_ty,
+            sai_ty::boundary::Position::Param,
+        );
+        let sai_ty::boundary::BoundaryTypeOutcome::Mapped(plain_slice) = plain_slice else {
+            panic!("resource-free records in Slice parameters remain supported");
+        };
+        assert_eq!(
+            world_function_conformance_type_from_hir(
+                &resource_context,
+                slice_of_plain_record_ty,
+                plain_slice,
+                true,
+            ),
+            Some(WorldFunctionConformanceType::Slice(Box::new(
+                sai_ty::boundary::BoundaryType::Named(plain_record_def)
+            ))),
+            "resource-free Slice<Record> remains eligible for signature normalization"
+        );
+
+        let borrow_mut_ty = arena.alloc_ty(Ty {
+            hir_id: HirId {
+                owner,
+                local_id: sai_hir::ItemLocalId::from_raw(29),
+            },
+            kind: TyKind::Borrow(sai_hir::Mutability::Mut, resource_ty),
+            span: test_span(29, 30),
+        });
+        let borrow_ty = arena.alloc_ty(Ty {
+            hir_id: HirId {
+                owner,
+                local_id: sai_hir::ItemLocalId::from_raw(30),
+            },
+            kind: TyKind::Borrow(sai_hir::Mutability::Not, resource_ty),
+            span: test_span(30, 31),
+        });
+        let mutable_borrow = world_function_conformance_type_from_hir(
+            &context,
+            borrow_mut_ty,
+            sai_ty::boundary::BoundaryType::Borrow(resource_def),
+            true,
+        )
+        .expect("mutable resource borrow normalizes");
+        let shared_borrow = world_function_conformance_type_from_hir(
+            &context,
+            borrow_ty,
+            sai_ty::boundary::BoundaryType::Borrow(resource_def),
+            true,
+        )
+        .expect("shared resource borrow normalizes");
+        assert_eq!(
+            mutable_borrow,
+            WorldFunctionConformanceType::BorrowMut(resource_def)
+        );
+        assert_ne!(
+            mutable_borrow, shared_borrow,
+            "borrow and borrow mut remain distinct SAI types"
+        );
+    }
+
+    #[test]
     fn world_package_references_resolve_wit_interfaces_and_worlds() {
         let root = concat!(
+            "use acme:phase1/child.{CrossFileWorldWord}\n",
+            "use acme:codec/types.{Value}\n",
+            "use acme:codec/types.{Values}\n",
+            "use acme:codec/types.{HandleList}\n",
             "world references {\n",
             "  import acme:codec\n",
             "  export acme:codec\n",
@@ -30477,16 +34004,35 @@ mod tests {
             "  import acme:codec/can\n",
             "  import acme:codex/api\n",
             "}\n",
+            "world include_external_export_checks {\n",
+            "  include acme:codec/exported-functions\n",
+            "}\n",
+            "world include_external_unsupported_export_checks {\n",
+            "  include acme:codec/retained-exports\n",
+            "}\n",
             "world independent {}\n",
             "world name_checks {\n",
             "  import fn userID(fetch_user: U32, _: U32)\n",
             "}\n",
             "type Pointer = USize\n",
             "type TypeOnlyWorldFunction = U32\n",
+            "type WorldWord = U32\n",
+            "type Identity<T> = T\n",
             "interface foo_bar {}\n",
             "interface same_named_non_function {}\n",
             "interface missing_api {}\n",
             "interface userID {}\n",
+            "interface local_types {\n",
+            "  resource Handle {}\n",
+            "  type ContainsHandle {\n",
+            "    handle: Handle\n",
+            "  }\n",
+            "  type PlainRecord {\n",
+            "    value: U32\n",
+            "  }\n",
+            "  type WorldWord = NestedWorldWord\n",
+            "  type NestedWorldWord = U32\n",
+            "}\n",
             "interface implemented_api {}\n",
             "impl implemented_api {}\n",
             "world namespace_checks {\n",
@@ -30516,6 +34062,36 @@ mod tests {
             "world non_function_impl_checks {\n",
             "  export fn same_named_non_function()\n",
             "}\n",
+            "world signature_mismatch_checks {\n",
+            "  export fn signature_mismatch(value: U32)\n",
+            "}\n",
+            "world alias_signature_checks {\n",
+            "  export fn alias_signature_match(value: U32)\n",
+            "}\n",
+            "world cross_file_alias_signature_checks {\n",
+            "  export fn cross_file_alias_signature(value: U32)\n",
+            "}\n",
+            "world wit_alias_signature_checks {\n",
+            "  export fn wit_alias_signature(value: Value)\n",
+            "}\n",
+            "world wit_list_alias_signature_checks {\n",
+            "  export fn wit_list_alias_signature(value: Values) -> Values\n",
+            "}\n",
+            "world wit_resource_list_alias_signature_checks {\n",
+            "  export fn wit_resource_list_alias_signature(value: HandleList) -> HandleList\n",
+            "}\n",
+            "world generic_alias_mismatch_checks {\n",
+            "  export fn generic_alias_mismatch(value: U32)\n",
+            "}\n",
+            "world generic_alias_match_checks {\n",
+            "  export fn generic_alias_match(value: U32)\n",
+            "}\n",
+            "world interface_alias_signature_checks {\n",
+            "  export fn interface_alias_signature(value: local_types.WorldWord)\n",
+            "}\n",
+            "world incompatible_implementation_type_checks {\n",
+            "  export fn incompatible_implementation_type(value: U32)\n",
+            "}\n",
             "world include_export_source { export missing_api }\n",
             "world direct_export_before_include {\n",
             "  export missing_api\n",
@@ -30532,10 +34108,24 @@ mod tests {
             "}\n",
             "world implicit_child { include acme:codec/implicit-child }\n",
             "fn external_world_field() { server.remote }\n",
+            "pub fn include_match(value: U32) {}\n",
+            "pub fn include_mismatch(value: U64) {}\n",
+            "pub fn include_matched(value: U32) {}\n",
+            "pub fn preserved() -> U32 {}\n",
             "fn implemented_world_function(input: U32) {}\n",
+            "fn signature_mismatch(value: U64) {}\n",
+            "fn alias_signature_match(value: WorldWord) {}\n",
+            "fn cross_file_alias_signature(value: CrossFileWorldWord) {}\n",
+            "fn wit_alias_signature(value: U32) {}\n",
+            "fn wit_list_alias_signature(value: Values) -> Values {}\n",
+            "fn wit_resource_list_alias_signature(value: HandleList) -> HandleList {}\n",
+            "fn generic_alias_mismatch(value: Identity<U64>) {}\n",
+            "fn generic_alias_match(value: Identity<U32>) {}\n",
+            "fn interface_alias_signature(value: U32) {}\n",
+            "fn incompatible_implementation_type(value: USize) {}\n",
         );
         let (mut database, module_tree, snapshot, root_package) =
-            phase1_fixture(root.as_bytes(), b"");
+            phase1_fixture(root.as_bytes(), b"pub type CrossFileWorldWord = U64\n");
         let parsed = database
             .parse_file(&snapshot, module_tree.modules[0].file)
             .expect("world source parses");
@@ -30620,7 +34210,12 @@ mod tests {
                 FileKey::new(codec_key.as_str(), "wit/api.wit").expect("WIT file key is valid"),
                 Arc::from(
                     &br#"package acme:codec@1.0.0;
-interface types { type value = u32; }
+interface types {
+  type value = u32;
+  type values = list<u32>;
+  resource handle {}
+  type handle-list = list<own<handle>>;
+}
 interface api { use types.{value}; run: func(value: value); }
 world cat {}
 interface car {}
@@ -30632,8 +34227,21 @@ world implicit-base { export api; }
 world implicit-child { include implicit-base; }
 interface distant {}
 world another {}
+world exported-function-leaf { export include-renamed: func(value: u32); }
+world exported-functions {
+  include exported-function-leaf with { include-renamed as include-matched }
+  export include-match: func(value: u32);
+  export include-mismatch: func(value: u32);
+  export include-missing: func(value: u32);
+}
+world signature-fixtures {
+  export list-param: func(values: list<u32>);
+  export list-result: func() -> list<u32>;
+  export string-param: func(value: string);
+}
 world unsupported { type hidden = u32; import rejected: func(); }
-world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
+world retained { import preserved: func() -> (first: u32, second: u32); }
+world retained-exports { export preserved: func() -> (first: u32, second: u32); }"#[..],
                 ),
                 Durability::Low,
             )
@@ -30668,6 +34276,79 @@ world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
         let member_scopes = database
             .collect_active_source_member_scopes(&collection, &graph, &[])
             .expect("empty source member closure validates");
+        let containment_packages = vec![
+            database
+                .world_boundary_alias_package_inputs(
+                    &snapshot,
+                    &collection,
+                    &member_scopes.source_packages,
+                )
+                .expect("world source interface inputs are available"),
+        ];
+        let mut containment_scopes = vec![collection.scopes()];
+        containment_scopes.extend(
+            member_scopes
+                .source_packages
+                .iter()
+                .map(Phase1ModuleMemberScopePackage::scopes),
+        );
+        let containment_module_members = ModuleMemberIndex::new_with_wit_views(
+            containment_scopes.iter().copied(),
+            wit_view_scopes.views().map(|foreign| foreign.view.as_ref()),
+            &database.symbols,
+        );
+        let containment_arena = HirArena::new();
+        let mut source_boundary_aliases = WorldBoundaryAliases {
+            definitions: HashMap::new(),
+            path_resolutions: HashMap::new(),
+            resource_type_roots: HashMap::new(),
+            resource_containment: HashMap::new(),
+        };
+        collect_world_boundary_aliases(
+            &mut source_boundary_aliases,
+            &containment_packages,
+            &snapshot,
+            &database.symbols,
+            &database.primitive_prelude,
+            &containment_module_members,
+            &containment_arena,
+            &database.def_paths,
+        )
+        .expect("source interface types lower with their field path resolutions");
+        database.complete_world_boundary_resource_containment(
+            &mut source_boundary_aliases,
+            Some(&wit_view_scopes),
+        );
+        let member_def = |name: &str| {
+            let name = database
+                .symbols
+                .intern(name)
+                .expect("interface member name interns");
+            collection
+                .scopes()
+                .interfaces
+                .values()
+                .find_map(|interface| interface.members.get(&name))
+                .and_then(|binding| match binding.res {
+                    Res::Def(_, definition) => Some(definition),
+                    _ => None,
+                })
+                .expect("source interface member resolves")
+        };
+        assert_eq!(
+            source_boundary_aliases
+                .resource_containment
+                .get(&member_def("ContainsHandle")),
+            Some(&sai_ty::boundary::ResourceContainment::Yes),
+            "lowered source record fields propagate resource containment"
+        );
+        assert_eq!(
+            source_boundary_aliases
+                .resource_containment
+                .get(&member_def("PlainRecord")),
+            Some(&sai_ty::boundary::ResourceContainment::No),
+            "lowered resource-free source records remain known resource-free"
+        );
         let resolutions = database
             .resolve_world_references_with_scopes(
                 &collection,
@@ -30729,6 +34410,148 @@ world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
             .and_then(|world| world.import_fns.get("remote"))
             .copied()
             .expect("codec server imports remote");
+        let signature_world = codec_view
+            .view
+            .worlds
+            .values()
+            .find(|world| codec_view.view.model.worlds[world.wit].name == "signature-fixtures")
+            .expect("the WIT signature fixture world is retained");
+        let signature_world_model = &codec_view.view.model.worlds[signature_world.wit];
+        let source_span = owner.references()[0].span;
+        let signature_source_span = sai_diagnostics::Span::new(source_span.file, source_span.range);
+        let indexed_scopes = [collection.scopes()];
+        let wit_origin_types = generated_wit_origin_type_definitions(
+            &indexed_scopes,
+            &wit_view_scopes,
+            &database.symbols,
+        );
+        let normalized_wit_export = |name: &str| {
+            let (item, _) = signature_world_model
+                .exports
+                .iter()
+                .enumerate()
+                .find(|(_, item)| {
+                    matches!(
+                        item,
+                        sai_wit::WitWorldItem::Func {
+                            name: item_name,
+                            ..
+                        } if item_name == name
+                    )
+                })
+                .expect("WIT signature fixture export exists");
+            let function = codec_view
+                .view
+                .definition_for_entity(sai_wit::WitViewEntity::WorldFunction {
+                    world: signature_world.wit,
+                    import: false,
+                    item: u32::try_from(item).expect("WIT world export index fits"),
+                })
+                .expect("WIT world export has a view definition");
+            normalized_wit_view_function_signature(
+                function,
+                owner.owner(),
+                signature_source_span,
+                &snapshot,
+                &wit_view_scopes,
+                &wit_origin_types,
+            )
+            .expect("WIT world export has a supported signature")
+            .expect("WIT world export signature normalizes")
+            .signature
+        };
+        assert_eq!(
+            normalized_wit_export("list-param").params,
+            vec![WorldFunctionConformanceType::Slice(Box::new(
+                sai_ty::boundary::BoundaryType::U32
+            ))],
+            "direct WIT lists in parameter position retain borrowed Slice semantics"
+        );
+        assert_eq!(
+            normalized_wit_export("list-result").result,
+            Some(WorldFunctionConformanceType::Vec(Box::new(
+                sai_ty::boundary::BoundaryType::U32
+            ))),
+            "direct WIT lists in result position use owned Vec semantics"
+        );
+        assert_eq!(
+            normalized_wit_export("string-param").params,
+            vec![WorldFunctionConformanceType::Str],
+            "direct WIT strings in parameter position retain borrowed Str semantics"
+        );
+        let types_interface = codec_view
+            .view
+            .interfaces
+            .values()
+            .find(|interface| codec_view.view.model.interfaces[interface.wit].name == "types")
+            .expect("the WIT type interface is retained");
+        let types_model = &codec_view.view.model.interfaces[types_interface.wit];
+        let wit_containment =
+            world_resource_containment::collect_wit_view_containment(&wit_view_scopes);
+        let wit_member_def = |name: &str| {
+            types_interface
+                .members
+                .values()
+                .find(|member| types_model.items[member.item].name == name)
+                .expect("WIT type member exists")
+                .def
+        };
+        assert_eq!(
+            wit_containment.get(&wit_member_def("values")),
+            Some(&sai_ty::boundary::ResourceContainment::No),
+            "WIT aliases to resource-free lists are known resource-free"
+        );
+        assert_eq!(
+            wit_containment.get(&wit_member_def("handle-list")),
+            Some(&sai_ty::boundary::ResourceContainment::Yes),
+            "WIT aliases to resource-containing lists retain resource containment"
+        );
+        let item_ref = |name: &str| {
+            let member = types_interface
+                .members
+                .values()
+                .find(|member| types_model.items[member.item].name == name)
+                .expect("WIT type member exists");
+            let item = member.item;
+            sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: types_interface.wit,
+                    name: types_model.name.clone(),
+                },
+                item,
+                item_name: name.to_owned(),
+            }
+        };
+        let handle_ref = item_ref("handle");
+        let handle_def = world_wit_type_def_id(&handle_ref, &wit_view_scopes)
+            .expect("WIT resource identity resolves");
+        let resource_list =
+            sai_wit::WitType::List(Box::new(sai_wit::WitType::Own(handle_ref.clone())));
+        assert_eq!(
+            world_function_conformance_type_from_wit(
+                &resource_list,
+                true,
+                &wit_view_scopes,
+                &wit_origin_types,
+            ),
+            Some(WorldFunctionConformanceType::Vec(Box::new(
+                sai_ty::boundary::BoundaryType::Own(handle_def)
+            ))),
+            "a direct list of resources uses owned Vec rather than a borrowed Slice"
+        );
+        assert_eq!(
+            world_function_conformance_type_from_wit(
+                &sai_wit::WitType::Named(item_ref("handle-list")),
+                true,
+                &wit_view_scopes,
+                &wit_origin_types,
+            ),
+            Some(WorldFunctionConformanceType::Vec(Box::new(
+                sai_ty::boundary::BoundaryType::Own(handle_def)
+            ))),
+            "a named WIT alias to a resource list also uses owned Vec"
+        );
         let local_world = owner.owner().def_id.to_def_id();
         let local_world_input = elaboration_input
             .local_worlds
@@ -30739,12 +34562,28 @@ world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
             !local_world_input.complete,
             "unresolved, wrong-kind, and unsupported references make only their owner incomplete"
         );
+        let independent_name = database
+            .symbols
+            .intern("independent")
+            .expect("independent world name interns");
+        let root_def_paths = database
+            .def_paths
+            .get(&root_package)
+            .expect("root definition paths exist");
         let independent = collection
             .scopes()
             .top_level_owners
             .iter()
             .find(|descriptor| {
-                descriptor.kind == TopLevelOwnerKind::World && descriptor.owner != owner.owner()
+                descriptor.kind == TopLevelOwnerKind::World
+                    && root_def_paths
+                        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| path.data().last().cloned())
+                        .is_some_and(|component| {
+                            matches!(component.data, DefPathData::World(name) if name == independent_name)
+                        })
             })
             .expect("independent world is collected")
             .owner
@@ -31438,6 +35277,102 @@ world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
                 )
                 .expect("world check resolves the requested local world")
         };
+        let included_external_exports =
+            check_world_by_name(&mut database, "include_external_export_checks");
+        let included_export_missing = included_external_exports
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented)
+            .expect("an unimplemented included external export is diagnosed");
+        assert_eq!(
+            included_export_missing.message,
+            "exported function `include-missing` has no implementation"
+        );
+        let included_export_mismatch = included_external_exports
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+            })
+            .expect("a mismatched included external export is diagnosed");
+        assert_eq!(
+            included_export_mismatch.message,
+            "implementation of included exported function `include-mismatch` does not match its signature"
+        );
+        assert_eq!(
+            included_external_exports
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+                        || diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+                })
+                .count(),
+            2,
+            "the matching included external export is accepted without a diagnostic: {:?}",
+            included_external_exports
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.code, diagnostic.message.as_str()))
+                .collect::<Vec<_>>()
+        );
+        let include_start = root
+            .find("include acme:codec/exported-functions")
+            .expect("the external world include is present");
+        let include_end = include_start + "include acme:codec/exported-functions".len();
+        for diagnostic in [included_export_missing, included_export_mismatch] {
+            let primary = diagnostic
+                .primary()
+                .expect("included external export diagnostics have an include-site location");
+            assert_eq!(primary.file.package.as_deref(), Some("acme:phase1@1.0.0"));
+            assert!(
+                primary.span.range.start().to_usize() >= include_start
+                    && primary.span.range.end().to_usize() <= include_end,
+                "included external export diagnostics point at their include item: {primary:?}"
+            );
+        }
+        let unsupported_included_export =
+            check_world_by_name(&mut database, "include_external_unsupported_export_checks");
+        let unsupported_included_function = unsupported_included_export
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitUnsupportedFeature)
+            .expect("an included WIT export with named results reports its unsupported signature");
+        assert!(
+            unsupported_included_export
+                .diagnostics
+                .iter()
+                .all(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::WitUnsupportedFeature
+                }),
+            "the matching root function does not hide the unsupported WIT export or produce a conformance diagnostic: {:?}",
+            unsupported_included_export
+                .diagnostics
+                .iter()
+                .map(|diagnostic| (diagnostic.code, diagnostic.message.as_str()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            unsupported_included_function.message,
+            "included WIT export function `preserved` uses unsupported feature `NamedResults`"
+        );
+        let unsupported_include_start = root
+            .find("include acme:codec/retained-exports")
+            .expect("the unsupported external world include is present");
+        let unsupported_include_end =
+            unsupported_include_start + "include acme:codec/retained-exports".len();
+        let unsupported_primary = unsupported_included_function
+            .primary()
+            .expect("unsupported included export diagnostics have an include-site location");
+        assert_eq!(
+            unsupported_primary.file.package.as_deref(),
+            Some("acme:phase1@1.0.0")
+        );
+        assert!(
+            unsupported_primary.span.range.start().to_usize() >= unsupported_include_start
+                && unsupported_primary.span.range.end().to_usize() <= unsupported_include_end,
+            "the unsupported exported function is diagnosed at its local include site: {unsupported_primary:?}"
+        );
         let missing_function_export =
             check_world_by_name(&mut database, "missing_function_impl_checks");
         let missing_function_impl = missing_function_export
@@ -31462,10 +35397,14 @@ world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
         let implemented_function_export =
             check_world_by_name(&mut database, "implemented_function_impl_checks");
         assert!(
-            !implemented_function_export.diagnostics.iter().any(
-                |diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
-            ),
-            "a matching root-module function implements the direct world export"
+            !implemented_function_export
+                .diagnostics
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+                        || diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+                }),
+            "a matching root-module function implements the direct world export signature"
         );
 
         let type_only_function_export =
@@ -31483,6 +35422,147 @@ world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
                 |diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
             ),
             "a same-named interface does not implement the exported function"
+        );
+
+        let signature_mismatch_export =
+            check_world_by_name(&mut database, "signature_mismatch_checks");
+        let signature_mismatch = signature_mismatch_export
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+            })
+            .expect("a direct exported function with a different parameter type is diagnosed");
+        let signature_mismatch_primary = signature_mismatch
+            .primary()
+            .expect("signature mismatch has an implementing source location");
+        assert_eq!(
+            &root[signature_mismatch_primary.span.range.start().to_usize()
+                ..signature_mismatch_primary.span.range.end().to_usize()],
+            "U64",
+            "parameter mismatches point to the implementing parameter type"
+        );
+        assert!(
+            signature_mismatch.children().iter().any(|child| {
+                child.message == "expected signature: export fn signature_mismatch(value: U32)"
+            }),
+            "signature mismatches include the written expected signature"
+        );
+        assert!(
+            signature_mismatch
+                .children()
+                .iter()
+                .any(|child| child.message
+                    == "actual implementation: fn signature_mismatch(value: U64) {}"),
+            "signature mismatches include the actual implementation signature"
+        );
+
+        let alias_signature_export = check_world_by_name(&mut database, "alias_signature_checks");
+        assert!(
+            !alias_signature_export.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+            }),
+            "a root function using an alias of the expected parameter type conforms"
+        );
+
+        let cross_file_alias_export =
+            check_world_by_name(&mut database, "cross_file_alias_signature_checks");
+        let cross_file_alias_mismatch = cross_file_alias_export
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+            })
+            .expect("cross-file aliases are expanded while comparing exported functions");
+        let cross_file_alias_primary = cross_file_alias_mismatch
+            .primary()
+            .expect("cross-file alias mismatch has an implementing source location");
+        assert_eq!(
+            &root[cross_file_alias_primary.span.range.start().to_usize()
+                ..cross_file_alias_primary.span.range.end().to_usize()],
+            "CrossFileWorldWord",
+            "cross-file alias mismatches point to the implementing type use"
+        );
+
+        let wit_alias_export = check_world_by_name(&mut database, "wit_alias_signature_checks");
+        assert!(
+            !wit_alias_export.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+            }),
+            "WIT aliases are expanded before comparing exported function signatures"
+        );
+
+        let wit_list_alias_export =
+            check_world_by_name(&mut database, "wit_list_alias_signature_checks");
+        assert!(
+            !wit_list_alias_export.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+            }),
+            "WIT aliases to lists keep their named-list parameter and result representation"
+        );
+
+        let wit_resource_list_alias_export =
+            check_world_by_name(&mut database, "wit_resource_list_alias_signature_checks");
+        assert!(
+            !wit_resource_list_alias_export
+                .diagnostics
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+                }),
+            "WIT aliases to resource lists retain owned Vec representation"
+        );
+
+        let generic_alias_mismatch =
+            check_world_by_name(&mut database, "generic_alias_mismatch_checks");
+        assert!(
+            generic_alias_mismatch.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+            }),
+            "a generic identity alias is expanded when comparing the implementation signature"
+        );
+        let generic_alias_match = check_world_by_name(&mut database, "generic_alias_match_checks");
+        assert!(
+            !generic_alias_match.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+            }),
+            "a matching generic identity alias conforms to the world function signature"
+        );
+
+        let interface_alias_export =
+            check_world_by_name(&mut database, "interface_alias_signature_checks");
+        assert!(
+            !interface_alias_export.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+            }),
+            "local interface aliases are expanded before comparing exported function signatures"
+        );
+
+        let incompatible_implementation_export =
+            check_world_by_name(&mut database, "incompatible_implementation_type_checks");
+        let incompatible_implementation_mismatch = incompatible_implementation_export
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+            })
+            .expect("a non-WIT implementation parameter differs from the expected type");
+        let incompatible_implementation_primary = incompatible_implementation_mismatch
+            .primary()
+            .expect("incompatible implementation type mismatch has a source location");
+        assert_eq!(
+            &root[incompatible_implementation_primary
+                .span
+                .range
+                .start()
+                .to_usize()
+                ..incompatible_implementation_primary
+                    .span
+                    .range
+                    .end()
+                    .to_usize()],
+            "USize",
+            "an incompatible implementing type remains an explicit signature mismatch"
         );
 
         let direct_before_include =
