@@ -21292,6 +21292,100 @@ mod tests {
         (database, package, collection, snapshot, manifest_file)
     }
 
+    fn artifact_export_world_fixture(
+        world_name: &str,
+        wit_source: &[u8],
+    ) -> (RootDatabase, PackageId, WorkspaceSnapshot, Vec<u8>) {
+        const PACKAGE_KEY: &str = "acme:phase1#1";
+        const PACKAGE_IDENTITY: &str = "acme:phase1@1.0.0";
+        const ROOT_KEY: &str = "acme:workspace#1";
+        let manifest = format!(
+            "package acme:phase1 @ 1.0.0\n\
+             artifact component {{}}\n\
+             wit \"wit\"\n\
+             export world {world_name}\n"
+        )
+        .into_bytes();
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let package = database
+            .intern_package(PACKAGE_KEY)
+            .expect("artifact package identity interns");
+        database
+            .intern_package(ROOT_KEY)
+            .expect("workspace root package identity interns");
+        let package_key = PackageKey::new(PACKAGE_KEY).expect("package key is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                PackageGraphNode::new(
+                    PackageKey::new(ROOT_KEY).expect("root package key is valid"),
+                    "acme:workspace",
+                    Version::parse("1.0.0").expect("root package version is valid"),
+                    PackageForm::Source,
+                    PackageGraphRole::Root,
+                    vec![graph_edge(PACKAGE_KEY, "acme:phase1")],
+                )
+                .expect("source root graph node is valid"),
+                PackageGraphNode::new(
+                    package_key.clone(),
+                    "acme:phase1",
+                    Version::parse("1.0.0").expect("package version is valid"),
+                    PackageForm::Artifact,
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                )
+                .expect("artifact dependency graph node is valid"),
+            ],
+        )
+        .expect("artifact package graph is valid");
+        database
+            .set_package_graph(Some(graph))
+            .expect("active artifact package graph is tracked");
+        database
+            .set_package_manifest(
+                package,
+                Arc::from(manifest.as_slice()),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("artifact manifest is tracked");
+
+        let wit_path = PackageRelativePath::new("wit/root.wit").expect("WIT path is valid");
+        database
+            .set_wit_files(
+                package_key.clone(),
+                WitFilesSnapshot::listed("wit", [wit_path.clone()])
+                    .expect("WIT inventory is valid"),
+                Durability::Low,
+            )
+            .expect("WIT inventory is tracked");
+        database
+            .set_file_contents(
+                FileKey::from_package_path(package_key.as_str(), wit_path)
+                    .expect("WIT file key is valid"),
+                Arc::from(wit_source),
+                Durability::Low,
+            )
+            .expect("WIT file bytes are tracked");
+
+        let manifest_file = database
+            .intern_package_file(
+                package,
+                PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+            )
+            .expect("manifest file is interned");
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(
+                SourceFile::decode(manifest_file, &manifest).expect("manifest source decodes"),
+            ),
+            "dep:acme:phase1@1.0.0/sai.package",
+            Some(PACKAGE_IDENTITY.to_owned()),
+            Some(42),
+        )])
+        .expect("artifact manifest snapshot is valid");
+        (database, package, snapshot, manifest)
+    }
+
     fn multi_package_fixture(
         database: &mut RootDatabase,
         package_key: &str,
@@ -34169,6 +34263,132 @@ mod tests {
 
         assert_eq!(result.world, Some(expected));
         assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn artifact_export_world_query_converts_sai_name_and_resolves_own_wit_world() {
+        let wit_source = b"package acme:phase1@1.0.0;\n\
+            world image-service {}\n\
+            world other {}\n";
+        let (mut database, package, snapshot, _) =
+            artifact_export_world_fixture("image_service", wit_source);
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("package version is valid"),
+        )
+        .expect("package version is valid");
+        let unit = WitUnit::dir(package, &database.packages, &selected)
+            .expect("artifact directory unit is valid");
+        let expected = database
+            .wit_view(&unit)
+            .expect("root artifact WIT view loads")
+            .worlds
+            .get("image-service")
+            .expect("WIT world uses its canonical kebab name")
+            .def;
+
+        let result = database
+            .resolve_artifact_export_world_from_contract(package, &snapshot)
+            .expect("artifact world resolves from the package's own WIT directory");
+
+        assert_eq!(result.world, Some(expected));
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn artifact_export_world_query_reports_missing_and_unsupported_worlds() {
+        let wit_source = b"package acme:phase1@1.0.0;\n\
+            world healthy {}\n\
+            world unsupported { type payload = u32; }\n";
+        let (mut missing_database, missing_package, missing_snapshot, missing_manifest) =
+            artifact_export_world_fixture("missing_world", wit_source);
+        let missing = missing_database
+            .resolve_artifact_export_world_from_contract(missing_package, &missing_snapshot)
+            .expect("a missing WIT world becomes a manifest diagnostic");
+        assert_eq!(missing.world, None);
+        assert_eq!(missing.diagnostics.len(), 1);
+        assert_eq!(
+            missing.diagnostics[0].code,
+            sai_diagnostics::Code::UnknownExportWorld
+        );
+        let primary = missing.diagnostics[0]
+            .primary()
+            .expect("missing artifact world has a primary");
+        assert!(missing.diagnostics[0].has_workspace_snapshot());
+        assert_eq!(
+            &missing_manifest
+                [primary.span.range.start().to_usize()..primary.span.range.end().to_usize()],
+            b"missing_world"
+        );
+        assert_eq!(primary.file.path, "dep:acme:phase1@1.0.0/sai.package");
+
+        let (
+            mut unsupported_database,
+            unsupported_package,
+            unsupported_snapshot,
+            unsupported_manifest,
+        ) = artifact_export_world_fixture("unsupported", wit_source);
+        let unsupported = unsupported_database
+            .resolve_artifact_export_world_from_contract(unsupported_package, &unsupported_snapshot)
+            .expect("an unsupported world becomes a manifest diagnostic");
+        assert_eq!(unsupported.world, None);
+        assert_eq!(unsupported.diagnostics.len(), 1);
+        assert_eq!(
+            unsupported.diagnostics[0].code,
+            sai_diagnostics::Code::WitUnsupportedFeature
+        );
+        assert_eq!(
+            unsupported.diagnostics[0].primary_label,
+            "unsupported WIT world"
+        );
+        assert!(unsupported.diagnostics[0].has_workspace_snapshot());
+        let primary = unsupported.diagnostics[0]
+            .primary()
+            .expect("unsupported artifact world has a primary");
+        assert_eq!(
+            &unsupported_manifest
+                [primary.span.range.start().to_usize()..primary.span.range.end().to_usize()],
+            b"unsupported"
+        );
+
+        let (mut healthy_database, healthy_package, healthy_snapshot, _) =
+            artifact_export_world_fixture("healthy", wit_source);
+        let healthy = healthy_database
+            .resolve_artifact_export_world_from_contract(healthy_package, &healthy_snapshot)
+            .expect("supported sibling worlds remain usable");
+        assert!(healthy.world.is_some());
+        assert!(healthy.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn artifact_export_world_query_preserves_wit_load_failures() {
+        let (mut database, package, snapshot, _) = artifact_export_world_fixture(
+            "target",
+            b"package acme:phase1@1.0.0;\nworld target {\n",
+        );
+
+        assert!(matches!(
+            database.resolve_artifact_export_world_from_contract(package, &snapshot),
+            Err(ExportWorldQueryError::WitView(WitViewQueryError::Package(
+                _
+            )))
+        ));
+    }
+
+    #[test]
+    fn artifact_export_world_query_leaves_invalid_local_name_to_manifest_validation() {
+        let (mut database, package, snapshot, _) = artifact_export_world_fixture(
+            "module/target",
+            b"package acme:phase1@1.0.0;\nworld target {}\n",
+        );
+
+        assert_eq!(
+            database.resolve_artifact_export_world_from_contract(package, &snapshot),
+            Err(ExportWorldQueryError::InvalidArtifactWorldName(
+                "module/target".to_owned()
+            )),
+            "artifact local names are one SAI identifier, never module paths"
+        );
     }
 
     #[test]
