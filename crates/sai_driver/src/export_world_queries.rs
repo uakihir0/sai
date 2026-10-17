@@ -158,7 +158,7 @@ fn export_world_diagnostic_result_with_note(
     snapshot: &WorkspaceSnapshot,
     note: Option<String>,
 ) -> Result<sai_resolve::ExportWorld, ExportWorldQueryError> {
-    let mut diagnostic = Diagnostic::new(code, Severity::Error, message, Some(location));
+    let mut diagnostic = Diagnostic::new(code, Severity::Error, message, Some(location.clone()));
     diagnostic.primary_label = primary_label.to_owned();
     diagnostic.package = Some(package_identity.to_owned());
     if let Some(message) = note {
@@ -177,6 +177,7 @@ fn export_world_diagnostic_result_with_note(
                 .with_workspace_snapshot(snapshot)
                 .map_err(|_| ExportWorldQueryError::DiagnosticSnapshotMismatch)?,
         ],
+        manifest_location: Some(location),
     })
 }
 
@@ -338,6 +339,7 @@ impl RootDatabase {
                 LocalExportWorldLookup::Resolved(world) => sai_resolve::ExportWorld {
                     world: Some(world),
                     diagnostics: Vec::new(),
+                    manifest_location: Some(location.clone()),
                 },
                 LocalExportWorldLookup::Missing => {
                     return export_world_diagnostic_result(
@@ -427,6 +429,7 @@ impl RootDatabase {
         Ok(sai_resolve::ExportWorld {
             world: Some(world.def),
             diagnostics: Vec::new(),
+            manifest_location: Some(location),
         })
     }
 
@@ -530,6 +533,7 @@ impl RootDatabase {
         Ok(sai_resolve::ExportWorld {
             world: Some(world.def),
             diagnostics: Vec::new(),
+            manifest_location: Some(location),
         })
     }
 

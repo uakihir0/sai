@@ -5607,6 +5607,9 @@ pub enum OwnerControlFlowResolutionError {
     MissingTargetDefPath(DefId),
     MissingInterfaceImplTarget(DefId),
     WorldElaboration(sai_resolve::WorldElaborationError),
+    ExportWorldQuery(ExportWorldQueryError),
+    ExportWorldSelectionMismatch,
+    MissingExportWorldLocation,
     InterfaceImplDiagnosticSourceMismatch {
         file_path: Option<String>,
     },
@@ -5630,6 +5633,7 @@ pub enum OwnerControlFlowResolutionError {
         current: ItemTreeKind,
     },
     MissingModuleScope(FileId),
+    MissingRootModuleScope,
     MissingInterfaceScope(OwnerId),
     MissingImportBinding {
         owner: OwnerId,
@@ -15754,6 +15758,376 @@ impl RootDatabase {
         Ok(elaborated)
     }
 
+    /// Checks implementations required by a package's selected export world.
+    ///
+    /// For an external WIT world, all missing-export and signature
+    /// diagnostics are anchored at the manifest value that selected it. The
+    /// selection is re-resolved from the current manifest and snapshot before
+    /// its world and source location are used. `None` means there is no
+    /// selected world; callers must still preserve `selection.diagnostics`.
+    pub fn export_world_check(
+        &mut self,
+        selection: &sai_resolve::ExportWorld,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        references: &WorldReferenceResolutions,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<Option<sai_resolve::ElaboratedWorld>, OwnerControlFlowResolutionError> {
+        let current_selection = self
+            .resolve_local_export_world_from_contract(
+                collection.module_tree.package,
+                collection,
+                snapshot,
+            )
+            .map_err(OwnerControlFlowResolutionError::ExportWorldQuery)?;
+        if selection != &current_selection {
+            return Err(OwnerControlFlowResolutionError::ExportWorldSelectionMismatch);
+        }
+        let Some(world) = current_selection.world else {
+            return Ok(None);
+        };
+        let export_location = current_selection
+            .manifest_location
+            .as_ref()
+            .ok_or(OwnerControlFlowResolutionError::MissingExportWorldLocation)?;
+        let elaborated = self.world_check(
+            world,
+            collection,
+            module_tree,
+            snapshot,
+            references,
+            member_scopes,
+            wit_view_scopes,
+        )?;
+        self.check_external_export_world_implementations(
+            elaborated,
+            export_location,
+            collection,
+            module_tree,
+            snapshot,
+            member_scopes,
+            wit_view_scopes,
+        )
+        .map(Some)
+    }
+
+    fn check_external_export_world_implementations(
+        &mut self,
+        mut elaborated: sai_resolve::ElaboratedWorld,
+        export_location: &sai_diagnostics::Location,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<sai_resolve::ElaboratedWorld, OwnerControlFlowResolutionError> {
+        let external_exports = elaborated
+            .exports
+            .iter()
+            .filter(|item| item.origin == sai_resolve::ElabOrigin::External)
+            .cloned()
+            .collect::<Vec<_>>();
+        if external_exports.is_empty() {
+            return Ok(elaborated);
+        }
+
+        let root_module = collection
+            .scopes()
+            .modules
+            .first()
+            .ok_or(OwnerControlFlowResolutionError::MissingRootModuleScope)?;
+        let root_owner = OwnerId {
+            def_id: root_module.module_def_id,
+        };
+        let package = export_location
+            .file
+            .package
+            .clone()
+            .unwrap_or_else(|| collection.package_key.as_str().to_owned());
+        let manifest_span = export_location.span;
+
+        let header_resolutions = self
+            .resolve_trait_impl_header_test_only_paths_with_member_scopes_and_wit_views(
+                collection,
+                module_tree,
+                snapshot,
+                member_scopes,
+                wit_view_scopes,
+            )?;
+        let member_resolutions = self
+            .resolve_trait_impl_member_test_only_paths_with_member_scopes_and_wit_views(
+                collection,
+                module_tree,
+                snapshot,
+                member_scopes,
+                wit_view_scopes,
+            )?;
+        let interface_impls = self.collect_interface_impls_with_header_resolutions(
+            collection,
+            module_tree,
+            snapshot,
+            member_scopes,
+            Some(wit_view_scopes),
+            &header_resolutions,
+            &member_resolutions,
+        )?;
+        let interface_redirects =
+            sai_resolve::interface_redirect::InterfaceRedirects::from_impls(&interface_impls);
+        let implementation_resources = interface_impls
+            .impls
+            .iter()
+            .flat_map(|implementation| implementation.resources.iter())
+            .map(|resource| resource.implementation_type)
+            .collect::<HashSet<_>>();
+
+        let mut root_function_definitions = HashMap::new();
+        let mut source_function_definitions = collection
+            .scopes()
+            .function_owners
+            .iter()
+            .map(|descriptor| descriptor.owner.def_id.to_def_id())
+            .collect::<HashSet<_>>();
+        source_function_definitions.extend(member_scopes.source_packages.iter().flat_map(
+            |source_package| {
+                source_package
+                    .scopes()
+                    .function_owners
+                    .iter()
+                    .map(|descriptor| descriptor.owner.def_id.to_def_id())
+            },
+        ));
+        for (symbol, binding) in &root_module.members {
+            let Res::Def(DefKind::Fn, function) = binding.res else {
+                continue;
+            };
+            let name = self
+                .symbols
+                .resolve(*symbol)
+                .map_err(OwnerControlFlowResolutionError::SymbolLookup)?;
+            root_function_definitions
+                .entry(name.to_string())
+                .or_insert((function, binding.name_span));
+        }
+
+        let mut indexed_scopes = Vec::with_capacity(1 + member_scopes.source_packages.len());
+        indexed_scopes.push(collection.scopes());
+        indexed_scopes.extend(
+            member_scopes
+                .source_packages
+                .iter()
+                .map(Phase1ModuleMemberScopePackage::scopes),
+        );
+        let wit_origin_types =
+            generated_wit_origin_type_definitions(&indexed_scopes, wit_view_scopes, &self.symbols);
+        let mut seen_interfaces = HashSet::new();
+        let mut seen_functions = HashSet::new();
+
+        for item in external_exports {
+            match item.kind {
+                sai_resolve::ElabKind::Interface(interface) => {
+                    if !seen_interfaces.insert(interface)
+                        || interface_impls.by_interface.contains_key(&interface)
+                    {
+                        continue;
+                    }
+                    let mut diagnostic = Diagnostic::new(
+                        sai_diagnostics::Code::WorldExportUnimplemented,
+                        sai_diagnostics::Severity::Error,
+                        format!("exported interface `{}` has no implementation", item.key),
+                        Some(export_location.clone()),
+                    );
+                    diagnostic.primary_label = "missing implementation".to_owned();
+                    diagnostic.package = Some(package.clone());
+                    elaborated.diagnostics.push(
+                        diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
+                            OwnerControlFlowResolutionError::InvalidSourceLocation(root_owner)
+                        })?,
+                    );
+                }
+                sai_resolve::ElabKind::Func(function) => {
+                    if !seen_functions.insert(function) {
+                        continue;
+                    }
+                    let expected = match normalized_wit_view_function_signature(
+                        function,
+                        root_owner,
+                        manifest_span,
+                        snapshot,
+                        wit_view_scopes,
+                        &wit_origin_types,
+                    ) {
+                        Ok(expected) => expected,
+                        Err(unsupported) => {
+                            let mut diagnostic = Diagnostic::new(
+                                sai_diagnostics::Code::WitUnsupportedFeature,
+                                sai_diagnostics::Severity::Error,
+                                format!(
+                                    "exported WIT function `{}` uses unsupported feature `{unsupported:?}`",
+                                    item.key
+                                ),
+                                Some(export_location.clone()),
+                            );
+                            diagnostic.primary_label = "unsupported WIT export function".to_owned();
+                            diagnostic.package = Some(package.clone());
+                            elaborated.diagnostics.push(
+                                diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
+                                    OwnerControlFlowResolutionError::InvalidSourceLocation(
+                                        root_owner,
+                                    )
+                                })?,
+                            );
+                            continue;
+                        }
+                    };
+                    let source_name = sai_wit::wit_name_to_sai(&item.key, false)
+                        .ok()
+                        .map(|name| name.strip_prefix("r#").unwrap_or(&name).to_owned());
+                    let implementation = source_name
+                        .as_deref()
+                        .and_then(|name| root_function_definitions.get(name))
+                        .copied()
+                        .filter(|(function, _)| source_function_definitions.contains(function));
+                    let Some((implementation, implementation_span)) = implementation else {
+                        let mut diagnostic = Diagnostic::new(
+                            sai_diagnostics::Code::WorldExportUnimplemented,
+                            sai_diagnostics::Severity::Error,
+                            format!("exported function `{}` has no implementation", item.key),
+                            Some(export_location.clone()),
+                        );
+                        diagnostic.primary_label = "missing implementation".to_owned();
+                        diagnostic.package = Some(package.clone());
+                        elaborated.diagnostics.push(
+                            diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
+                                OwnerControlFlowResolutionError::InvalidSourceLocation(root_owner)
+                            })?,
+                        );
+                        continue;
+                    };
+                    let Some(mut expected) = expected else {
+                        // Signature normalization owns failures caused by
+                        // unsupported or unresolved boundary types.
+                        continue;
+                    };
+                    let Some(mut actual) = self.normalized_root_function_signature(
+                        implementation,
+                        root_owner,
+                        implementation_span,
+                        collection,
+                        module_tree,
+                        snapshot,
+                        member_scopes,
+                        wit_view_scopes,
+                        &implementation_resources,
+                    )?
+                    else {
+                        continue;
+                    };
+                    redirect_world_function_signature(
+                        &mut expected.signature,
+                        &interface_redirects,
+                    );
+                    redirect_world_function_signature(&mut actual.signature, &interface_redirects);
+                    let Some(mismatch) = sai_ty::world::compare_normalized_signatures(
+                        &expected.signature,
+                        &actual.signature,
+                        actual.is_unsafe,
+                    ) else {
+                        continue;
+                    };
+                    let mismatch_span = match mismatch {
+                        sai_ty::world::NormalizedSignatureMismatch::ParameterType { index } => {
+                            Some(actual.parameter_type_spans[index])
+                        }
+                        sai_ty::world::NormalizedSignatureMismatch::ResultType => {
+                            actual.result_type_span
+                        }
+                        sai_ty::world::NormalizedSignatureMismatch::ParameterCount { .. }
+                        | sai_ty::world::NormalizedSignatureMismatch::Async
+                        | sai_ty::world::NormalizedSignatureMismatch::Unsafe => {
+                            Some(actual.name_span)
+                        }
+                    };
+                    let mismatch_location = if let Some(span) = mismatch_span {
+                        let snapshot_file = snapshot.file(span.file).ok_or(
+                            OwnerControlFlowResolutionError::MissingSnapshotFile(span.file),
+                        )?;
+                        let source_ref = SourceRef {
+                            path: snapshot_file.path().to_owned(),
+                            package: snapshot_file.package().map(str::to_owned),
+                            snapshot: snapshot_file.document_version(),
+                        };
+                        let source = Arc::clone(snapshot_file.source());
+                        Some(
+                            sai_diagnostics::Location::from_decoded_source(
+                                source_ref,
+                                sai_diagnostics::Span::new(span.file, span.range),
+                                source.as_ref(),
+                            )
+                            .ok_or(
+                                OwnerControlFlowResolutionError::InvalidSourceLocation(
+                                    actual.owner,
+                                ),
+                            )?,
+                        )
+                    } else {
+                        None
+                    };
+                    let mut diagnostic = Diagnostic::new(
+                        sai_diagnostics::Code::InterfaceImplSignatureMismatch,
+                        sai_diagnostics::Severity::Error,
+                        format!(
+                            "implementation of exported function `{}` does not match its signature",
+                            item.key
+                        ),
+                        Some(export_location.clone()),
+                    );
+                    diagnostic.primary_label = match mismatch {
+                        sai_ty::world::NormalizedSignatureMismatch::ParameterType { .. } => {
+                            "parameter type differs".to_owned()
+                        }
+                        sai_ty::world::NormalizedSignatureMismatch::ResultType => {
+                            "result type differs".to_owned()
+                        }
+                        _ => "function signature differs".to_owned(),
+                    };
+                    diagnostic.package = Some(package.clone());
+                    diagnostic
+                        .push_child(Child {
+                            kind: ChildKind::Note,
+                            message: format!("expected signature: {}", expected.syntax),
+                            location: Some(expected.location),
+                        })
+                        .expect("diagnostics accept an expected-signature note");
+                    diagnostic
+                        .push_child(Child {
+                            kind: ChildKind::Note,
+                            message: format!("actual implementation: {}", actual.syntax),
+                            location: Some(actual.location),
+                        })
+                        .expect("diagnostics accept an actual-signature note");
+                    if let Some(location) = mismatch_location {
+                        diagnostic
+                            .push_child(Child {
+                                kind: ChildKind::Note,
+                                message: "the implementing parameter or result differs here"
+                                    .to_owned(),
+                                location: Some(location),
+                            })
+                            .expect("diagnostics accept an implementation-location note");
+                    }
+                    elaborated.diagnostics.push(
+                        diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
+                            OwnerControlFlowResolutionError::InvalidSourceLocation(root_owner)
+                        })?,
+                    );
+                }
+            }
+        }
+        Ok(elaborated)
+    }
+
     fn normalized_root_function_signature(
         &mut self,
         function: DefId,
@@ -21308,6 +21682,155 @@ mod tests {
         let (database, package, collection, snapshot, _) =
             phase1_export_world_fixture(manifest.as_bytes());
         (database, package, collection, snapshot)
+    }
+
+    struct ExternalExportWorldCheckFixture {
+        database: RootDatabase,
+        module_tree: ModuleTree,
+        snapshot: WorkspaceSnapshot,
+        collection: Phase1PackageScopesCollection,
+        member_scopes: Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: Phase1ActiveWitViewScopes,
+        references: WorldReferenceResolutions,
+        selection: sai_resolve::ExportWorld,
+        manifest: Vec<u8>,
+        root_source: Vec<u8>,
+    }
+
+    fn external_export_world_check_fixture(
+        root_source: &[u8],
+        wit_source: &[u8],
+    ) -> ExternalExportWorldCheckFixture {
+        const PACKAGE_IDENTITY: &str = "acme:phase1@1.0.0";
+        let manifest = b"package acme:phase1 @ 1.0.0\n\
+            source \"src\"\n\
+            requires { acme:codec @ ^1 }\n\
+            export world acme:codec/target-world\n"
+            .to_vec();
+        let (mut database, module_tree, source_snapshot, package) =
+            phase1_fixture(root_source, b"");
+        let (_, codec_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:codec",
+            "1.4.0",
+            wit_source,
+        );
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:phase1#1",
+                    "acme:phase1",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge(codec_node.key().as_str(), "acme:codec")],
+                ),
+                codec_node,
+            ],
+        )
+        .expect("external export world graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is tracked");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest_file = database
+            .intern_package_file(
+                package,
+                PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+            )
+            .expect("manifest file is interned");
+        let mut files = source_snapshot.iter().cloned().collect::<Vec<_>>();
+        files.push(SnapshotFile::new(
+            Arc::new(
+                SourceFile::decode(manifest_file, &manifest).expect("manifest source decodes"),
+            ),
+            "sai.package",
+            Some(PACKAGE_IDENTITY.to_owned()),
+            Some(44),
+        ));
+        let snapshot = WorkspaceSnapshot::new(files).expect("manifest snapshot is valid");
+        let wit_view_scopes = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target_cfg, &graph)
+            .expect("external WIT view closure is available");
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                Arc::from(manifest.clone()),
+                PackageRole::Root,
+                &wit_view_scopes,
+            )
+            .expect("root source scopes collect with the tracked WIT closure");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty source member closure validates");
+        let references = database
+            .resolve_world_references_with_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("root world references resolve");
+        let selection = database
+            .resolve_local_export_world_from_contract(package, &collection, &snapshot)
+            .expect("external export world resolves from the manifest");
+
+        ExternalExportWorldCheckFixture {
+            database,
+            module_tree,
+            snapshot,
+            collection,
+            member_scopes,
+            wit_view_scopes,
+            references,
+            selection,
+            manifest,
+            root_source: root_source.to_vec(),
+        }
+    }
+
+    fn check_external_export_world(
+        fixture: &mut ExternalExportWorldCheckFixture,
+    ) -> sai_resolve::ElaboratedWorld {
+        fixture
+            .database
+            .export_world_check(
+                &fixture.selection,
+                &fixture.collection,
+                &fixture.module_tree,
+                &fixture.snapshot,
+                &fixture.references,
+                &fixture.member_scopes,
+                &fixture.wit_view_scopes,
+            )
+            .expect("external export selection remains current")
+            .expect("fixture export world resolves and is checked")
+    }
+
+    fn assert_export_world_diagnostic_at_manifest_value(
+        fixture: &ExternalExportWorldCheckFixture,
+        diagnostic: &Diagnostic,
+    ) {
+        let primary = diagnostic
+            .primary()
+            .expect("external export diagnostic has a primary");
+        let location = fixture
+            .selection
+            .manifest_location
+            .as_ref()
+            .expect("manifest-based resolution retains its value location");
+        assert_eq!(primary, location);
+        assert_eq!(
+            &fixture.manifest
+                [primary.span.range.start().to_usize()..primary.span.range.end().to_usize()],
+            b"acme:codec/target-world",
+            "diagnostics point at the selected manifest value"
+        );
+        assert!(diagnostic.has_workspace_snapshot());
     }
 
     fn install_external_artifact_world_package(
@@ -34569,6 +35092,212 @@ mod tests {
 
         assert_eq!(result.world, Some(expected));
         assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn external_export_world_checks_interface_implementations_at_manifest_value() {
+        let wit_source = b"package acme:codec@1.4.0;\n\
+            interface api {}\n\
+            world target-world { export api; }\n";
+        let mut missing = external_export_world_check_fixture(b"", wit_source);
+        let checked = check_external_export_world(&mut missing);
+        let unimplemented = checked
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented)
+            .collect::<Vec<_>>();
+        assert_eq!(unimplemented.len(), 1, "{:#?}", checked.diagnostics);
+        assert!(
+            unimplemented[0].message.contains("exported interface")
+                && unimplemented[0].message.contains("api"),
+            "the diagnostic names the missing external interface: {:#?}",
+            unimplemented[0]
+        );
+        assert_export_world_diagnostic_at_manifest_value(&missing, unimplemented[0]);
+
+        let mut implemented = external_export_world_check_fixture(
+            b"use acme:codec/api as api\nimpl api {}\n",
+            wit_source,
+        );
+        let checked = check_external_export_world(&mut implemented);
+        assert!(
+            !checked.diagnostics.iter().any(
+                |diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+            ),
+            "a collected interface impl satisfies the selected external export: {:#?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
+    fn external_export_world_checks_function_presence_and_signature_at_manifest_value() {
+        let wit_source = b"package acme:codec@1.4.0;\n\
+            world target-world { export convert: func(value: u32) -> u32; }\n";
+        let mut missing = external_export_world_check_fixture(b"", wit_source);
+        let checked = check_external_export_world(&mut missing);
+        let unimplemented = checked
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented)
+            .expect("missing exported function is diagnosed");
+        assert!(
+            unimplemented
+                .message
+                .contains("exported function `convert`")
+        );
+        assert_export_world_diagnostic_at_manifest_value(&missing, unimplemented);
+
+        let mut mismatch_fixture = external_export_world_check_fixture(
+            b"fn convert(value: U64) -> U32 { 0 }\n",
+            wit_source,
+        );
+        let checked = check_external_export_world(&mut mismatch_fixture);
+        let mismatch_diagnostic = checked
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::InterfaceImplSignatureMismatch
+            })
+            .expect("different implementation signature is diagnosed");
+        assert_export_world_diagnostic_at_manifest_value(&mismatch_fixture, mismatch_diagnostic);
+        let implementation_location = mismatch_diagnostic
+            .children()
+            .iter()
+            .find(|child| child.message == "the implementing parameter or result differs here")
+            .and_then(|child| child.location.as_ref())
+            .expect("signature mismatch points to the implementation parameter");
+        assert_eq!(
+            &mismatch_fixture.root_source[implementation_location.span.range.start().to_usize()
+                ..implementation_location.span.range.end().to_usize()],
+            b"U64"
+        );
+
+        let mut matching = external_export_world_check_fixture(
+            b"fn convert(value: U32) -> U32 { value }\n",
+            wit_source,
+        );
+        let checked = check_external_export_world(&mut matching);
+        assert!(
+            !checked.diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic.code,
+                sai_diagnostics::Code::WorldExportUnimplemented
+                    | sai_diagnostics::Code::InterfaceImplSignatureMismatch
+            )),
+            "matching root functions satisfy the selected external export: {:#?}",
+            checked.diagnostics
+        );
+    }
+
+    #[test]
+    fn external_export_world_check_rejects_a_world_paired_with_another_manifest_value() {
+        let mut fixture = external_export_world_check_fixture(
+            b"",
+            b"package acme:codec@1.4.0;\n\
+                world target-world {}\n\
+                world other-world {}\n",
+        );
+        let other_world = fixture
+            .wit_view_scopes
+            .views()
+            .find_map(|foreign| {
+                foreign
+                    .view
+                    .worlds
+                    .get("other-world")
+                    .map(|world| world.def)
+            })
+            .expect("the alternate WIT world is active");
+        let mut mismatched_selection = fixture.selection.clone();
+        mismatched_selection.world = Some(other_world);
+
+        assert_eq!(
+            fixture.database.export_world_check(
+                &mismatched_selection,
+                &fixture.collection,
+                &fixture.module_tree,
+                &fixture.snapshot,
+                &fixture.references,
+                &fixture.member_scopes,
+                &fixture.wit_view_scopes,
+            ),
+            Err(OwnerControlFlowResolutionError::ExportWorldSelectionMismatch),
+            "world and manifest location must come from one current contract query"
+        );
+    }
+
+    #[test]
+    fn unsupported_external_export_function_does_not_cascade_to_missing_implementation() {
+        let wit_source = b"package acme:codec@1.4.0;\n\
+            world target-world { export start: async func(); }\n";
+        let mut fixture = external_export_world_check_fixture(b"", wit_source);
+        let checked = check_external_export_world(&mut fixture);
+        let unsupported = checked
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitUnsupportedFeature)
+            .collect::<Vec<_>>();
+        assert_eq!(unsupported.len(), 1, "{:#?}", checked.diagnostics);
+        assert!(
+            !checked.diagnostics.iter().any(
+                |diagnostic| diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+            ),
+            "unsupported WIT items do not create missing-implementation cascades"
+        );
+        assert_export_world_diagnostic_at_manifest_value(&fixture, unsupported[0]);
+    }
+
+    #[test]
+    fn incomplete_external_world_projection_still_checks_retained_exports() {
+        let wit_source = b"package acme:codec@1.4.0;\n\
+            world target-world { export retained: func(); }\n";
+        let mut fixture = external_export_world_check_fixture(b"", wit_source);
+        let world = fixture
+            .selection
+            .world
+            .expect("fixture export world resolves");
+        let location = fixture
+            .selection
+            .manifest_location
+            .clone()
+            .expect("manifest value location is retained");
+        let mut projection = fixture
+            .database
+            .world_check(
+                world,
+                &fixture.collection,
+                &fixture.module_tree,
+                &fixture.snapshot,
+                &fixture.references,
+                &fixture.member_scopes,
+                &fixture.wit_view_scopes,
+            )
+            .expect("external world projection is available");
+        projection.complete = false;
+        let checked = fixture
+            .database
+            .check_external_export_world_implementations(
+                projection,
+                &location,
+                &fixture.collection,
+                &fixture.module_tree,
+                &fixture.snapshot,
+                &fixture.member_scopes,
+                &fixture.wit_view_scopes,
+            )
+            .expect("known retained items are checked independently");
+        assert!(
+            !checked.complete,
+            "the fixture marks the package projection incomplete"
+        );
+        let missing = checked
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::WorldExportUnimplemented
+                    && diagnostic.message.contains("retained")
+            })
+            .expect("a retained direct export is checked despite unrelated incompleteness");
+        assert_export_world_diagnostic_at_manifest_value(&fixture, missing);
     }
 
     #[test]
