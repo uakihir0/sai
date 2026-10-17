@@ -178,7 +178,7 @@ struct GeneratedWitCandidate {
     unit: WitUnit,
     identity: String,
     version: Version,
-    interfaces: Vec<(LocalDefId, WitInterface)>,
+    interfaces: Vec<(LocalDefId, WitIfaceIdx, WitInterface)>,
     complete: bool,
 }
 
@@ -202,17 +202,33 @@ impl GeneratedWitCandidate {
             declaration_order: Vec::new(),
         };
         let mut complete = self.complete && !has_interface_use_diagnostics;
-        let mut origins = Vec::with_capacity(self.interfaces.len());
-        for (definition, interface) in self.interfaces {
+        let mut surviving_interfaces = Vec::with_capacity(self.interfaces.len());
+        let mut interface_indices = HashMap::with_capacity(self.interfaces.len());
+        let mut final_interface_indices = WitIndexVec::<WitIfaceIdx, ()>::new();
+        for (definition, provisional_index, interface) in self.interfaces {
             if cyclic_interfaces.contains(&definition) {
                 complete = false;
                 continue;
+            }
+            let final_index = final_interface_indices
+                .push(())
+                .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+            interface_indices.insert(provisional_index, final_index);
+            surviving_interfaces.push((definition, provisional_index, interface));
+        }
+
+        let mut origins = Vec::with_capacity(surviving_interfaces.len());
+        for (definition, provisional_index, mut interface) in surviving_interfaces {
+            let final_index = interface_indices[&provisional_index];
+            for item in interface.items.iter_mut() {
+                remap_generated_item_interface_indices(item, &package.unit, &interface_indices);
             }
             let name = interface.name.clone();
             let index = package
                 .interfaces
                 .push(interface)
                 .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+            debug_assert_eq!(index, final_index);
             package
                 .declaration_order
                 .push(WitPackageDeclaration::Interface(index));
@@ -223,6 +239,109 @@ impl GeneratedWitCandidate {
             complete,
             origins: Arc::from(origins),
         })
+    }
+}
+
+fn remap_generated_item_interface_indices(
+    item: &mut WitItem,
+    generated_unit: &WitUnit,
+    interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+) {
+    fn remap_reference(
+        reference: &mut WitTypeRef,
+        generated_unit: &WitUnit,
+        interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+    ) {
+        if reference.interface.unit == *generated_unit {
+            reference.interface.interface = *interface_indices
+                .get(&reference.interface.interface)
+                .expect("generated local type references target an emitted interface");
+        }
+    }
+
+    fn remap_type(
+        ty: &mut WitType,
+        generated_unit: &WitUnit,
+        interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+    ) {
+        match ty {
+            WitType::List(inner)
+            | WitType::Option(inner)
+            | WitType::Future(Some(inner))
+            | WitType::Stream(Some(inner)) => {
+                remap_type(inner, generated_unit, interface_indices);
+            }
+            WitType::Result { ok, err } => {
+                for inner in ok.iter_mut().chain(err.iter_mut()) {
+                    remap_type(inner, generated_unit, interface_indices);
+                }
+            }
+            WitType::Tuple(elements) => {
+                for element in elements {
+                    remap_type(element, generated_unit, interface_indices);
+                }
+            }
+            WitType::Named(reference) | WitType::Own(reference) | WitType::Borrow(reference) => {
+                remap_reference(reference, generated_unit, interface_indices);
+            }
+            WitType::Future(None)
+            | WitType::Stream(None)
+            | WitType::Bool
+            | WitType::S8
+            | WitType::S16
+            | WitType::S32
+            | WitType::S64
+            | WitType::U8
+            | WitType::U16
+            | WitType::U32
+            | WitType::U64
+            | WitType::F32
+            | WitType::F64
+            | WitType::Char
+            | WitType::String
+            | WitType::Unsupported(_) => {}
+        }
+    }
+
+    fn remap_function(
+        function: &mut WitFunc,
+        generated_unit: &WitUnit,
+        interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+    ) {
+        for (_, ty) in &mut function.params {
+            remap_type(ty, generated_unit, interface_indices);
+        }
+        if let Some(result) = &mut function.result {
+            remap_type(result, generated_unit, interface_indices);
+        }
+    }
+
+    match &mut item.kind {
+        WitItemKind::Record(fields) => {
+            for field in fields {
+                remap_type(&mut field.ty, generated_unit, interface_indices);
+            }
+        }
+        WitItemKind::Variant(cases) => {
+            for case in cases {
+                if let Some(payload) = &mut case.payload {
+                    remap_type(payload, generated_unit, interface_indices);
+                }
+            }
+        }
+        WitItemKind::Resource(members) => {
+            for member in members {
+                remap_function(&mut member.func, generated_unit, interface_indices);
+            }
+        }
+        WitItemKind::Alias(ty) => remap_type(ty, generated_unit, interface_indices),
+        WitItemKind::Used(reference) => {
+            remap_reference(reference, generated_unit, interface_indices);
+        }
+        WitItemKind::Func(function) => {
+            remap_function(function, generated_unit, interface_indices);
+        }
+        WitItemKind::Enum(_) | WitItemKind::Flags(_) => {}
     }
 }
 
@@ -1273,6 +1392,7 @@ fn collect_interface_uses_input(
         })
         .transpose()?;
     let mut generated_interfaces = Vec::new();
+    let mut generated_interface_indices = WitIndexVec::<WitIfaceIdx, ()>::new();
     let mut interface_names_by_spelling = HashMap::<String, Vec<LocalDefId>>::new();
     for (definition, name) in &package_wit_names.names {
         interface_names_by_spelling
@@ -1509,11 +1629,24 @@ fn collect_interface_uses_input(
             && interface_name_is_unique
             && parent_hir.diagnostics.is_empty()
             && interface_attrs_complete;
+        let generated_interface_stability =
+            generated_stability(interface_attrs, prepared.generated_package_version.as_ref());
+        let generated_interface_index =
+            if generated_interface_eligible && generated_interface_stability.is_some() {
+                Some(
+                    generated_interface_indices
+                        .push(())
+                        .map_err(InterfaceUsesQueryError::WitIndexVec)?,
+                )
+            } else {
+                None
+            };
         if generated_unit.is_some() && !generated_interface_eligible {
             generated_complete = false;
         }
         let mut interface_item_names = Vec::with_capacity(member_entries.len());
         let mut generated_use_aliases = Vec::<GeneratedUseAlias>::new();
+        let mut generated_named_type_references = HashMap::<DefId, WitTypeRef>::new();
         for (entry, member_owner) in member_entries
             .into_iter()
             .zip(parent_members.iter().copied())
@@ -1638,6 +1771,7 @@ fn collect_interface_uses_input(
                                 entry,
                                 &member_hir,
                                 &boundary_conversions,
+                                &generated_named_type_references,
                                 &inputs.validated_attrs,
                                 prepared.generated_package_version.as_ref(),
                                 symbols,
@@ -1647,6 +1781,7 @@ fn collect_interface_uses_input(
                             entry,
                             &member_hir,
                             &boundary_conversions,
+                            &generated_named_type_references,
                             inputs.validated_attrs.get(&entry.ast_id),
                             prepared.generated_package_version.as_ref(),
                             symbols,
@@ -1658,9 +1793,32 @@ fn collect_interface_uses_input(
                 };
                 if let Some(item) = item {
                     if generated_item_names.insert(item.name.clone()) {
-                        generated_items
+                        let item_name = item.name.clone();
+                        let is_named_type =
+                            matches!(item.kind, WitItemKind::Alias(_) | WitItemKind::Record(_));
+                        let item_index = generated_items
                             .push(item)
                             .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+                        if is_named_type
+                            && let (Some(unit), Some(interface_index), Some(interface_name)) = (
+                                generated_unit.as_ref(),
+                                generated_interface_index,
+                                interface_wit_name.as_ref(),
+                            )
+                        {
+                            generated_named_type_references.insert(
+                                member_owner.def_id.to_def_id(),
+                                WitTypeRef {
+                                    interface: sai_wit::WitIfaceRef {
+                                        unit: unit.clone(),
+                                        interface: interface_index,
+                                        name: interface_name.clone(),
+                                    },
+                                    item: item_index,
+                                    item_name,
+                                },
+                            );
+                        }
                     } else {
                         generated_complete = false;
                     }
@@ -1816,13 +1974,13 @@ fn collect_interface_uses_input(
         });
         if generated_unit.is_some() {
             if generated_interface_eligible {
-                let stability = generated_stability(
-                    interface_attrs,
-                    prepared.generated_package_version.as_ref(),
-                );
-                if let (Some(name), Some((since, deprecated))) = (interface_wit_name, stability) {
+                if let (Some(name), Some((since, deprecated))) =
+                    (interface_wit_name, generated_interface_stability)
+                {
                     generated_interfaces.push((
                         descriptor.owner.def_id,
+                        generated_interface_index
+                            .expect("generated interface index exists for emitted interface"),
                         WitInterface {
                             name,
                             docs: parent_entry.docs.clone().map(Arc::from),
@@ -3130,6 +3288,7 @@ fn generated_function_item(
     entry: &ItemTreeEntry,
     owner: &HirOwner<'_>,
     conversions: &[sai_ty::boundary::BoundaryTypeConversion],
+    references: &HashMap<DefId, WitTypeRef>,
     attrs: Option<&sai_hir::attrs::ValidatedAttrs>,
     selected: Option<&sai_package::mvs::MvsPackageVersion>,
     symbols: &Interner,
@@ -3163,7 +3322,6 @@ fn generated_function_item(
         return Ok(None);
     };
 
-    let references = HashMap::new();
     let mut conversions = conversions.iter();
     let mut params = Vec::with_capacity(sig.params.len());
     for parameter in sig.params.iter().filter(|parameter| !parameter.is_self) {
@@ -3189,11 +3347,9 @@ fn generated_function_item(
         let BoundaryTypeOutcome::Mapped(boundary_type) = &conversion.outcome else {
             return Ok(None);
         };
-        let Ok(Some(parameter_type)) = sai_ty::boundary::materialize_boundary_type(
-            boundary_type,
-            &references,
-            Position::Param,
-        ) else {
+        let Ok(Some(parameter_type)) =
+            sai_ty::boundary::materialize_boundary_type(boundary_type, references, Position::Param)
+        else {
             return Ok(None);
         };
         params.push((parameter_name, parameter_type));
@@ -3208,7 +3364,7 @@ fn generated_function_item(
         };
         let Ok(result) = sai_ty::boundary::materialize_boundary_type(
             boundary_type,
-            &references,
+            references,
             Position::Result,
         ) else {
             return Ok(None);
@@ -3240,6 +3396,7 @@ fn generated_interface_type_item(
     entry: &ItemTreeEntry,
     owner: &HirOwner<'_>,
     conversions: &[sai_ty::boundary::BoundaryTypeConversion],
+    references: &HashMap<DefId, WitTypeRef>,
     validated_attrs: &BTreeMap<sai_hir::item_tree::ErasedAstId, sai_hir::attrs::ValidatedAttrs>,
     selected: Option<&sai_package::mvs::MvsPackageVersion>,
     symbols: &Interner,
@@ -3267,7 +3424,6 @@ fn generated_interface_type_item(
         return Ok(None);
     };
 
-    let references = HashMap::new();
     let kind = match item.kind {
         InterfaceItemKind::Alias { generics, .. } => {
             if !generics.params.is_empty() || !generics.where_preds.is_empty() {
@@ -3281,7 +3437,7 @@ fn generated_interface_type_item(
             };
             let Ok(Some(ty)) = sai_ty::boundary::materialize_boundary_type(
                 boundary_type,
-                &references,
+                references,
                 Position::Nested,
             ) else {
                 return Ok(None);
@@ -3329,7 +3485,7 @@ fn generated_interface_type_item(
                 };
                 let Ok(Some(ty)) = sai_ty::boundary::materialize_boundary_type(
                     boundary_type,
-                    &references,
+                    references,
                     Position::Nested,
                 ) else {
                     return Ok(None);

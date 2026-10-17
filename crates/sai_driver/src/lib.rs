@@ -44593,11 +44593,12 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             "  /// A request payload.\n",
             "  type Payload {\n",
             "    /// Request identifier.\n",
-            "    request_id: U32\n",
+            "    id: Id\n",
             "    label: U64\n",
             "  }\n",
             "  type Wrapped = Id\n",
-            "  fn read(value: Wrapped) -> U32\n",
+            "  fn read(value: Id) -> Payload\n",
+            "  fn read_wrapped(value: Wrapped) -> Id\n",
             "  fn ping(value: U32)\n",
             "}\n",
         );
@@ -44639,12 +44640,15 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .find(|(generated_unit, _)| generated_unit == &unit)
             .map(|(_, generated)| generated.as_ref())
             .expect("the generated root text is retained");
-        assert!(!generated.complete);
+        assert!(
+            generated.complete,
+            "all declarations and same-interface named references are emitted"
+        );
         let package_model = result.package.expect("generated WIT model loads");
-        let interface = package_model
+        let (interface_index, interface) = package_model
             .root()
             .interfaces
-            .iter()
+            .iter_enumerated()
             .next()
             .expect("the local interface is generated");
         let items = interface.items.iter().collect::<Vec<_>>();
@@ -44653,8 +44657,8 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 .iter()
                 .map(|item| item.name.as_str())
                 .collect::<Vec<_>>(),
-            ["id", "payload", "ping"],
-            "named references stay omitted while self-contained declarations and functions survive in source order"
+            ["id", "payload", "wrapped", "read", "read-wrapped", "ping"],
+            "named references to earlier declarations survive in source order"
         );
         assert_eq!(items[0].docs.as_deref(), Some("Stable identifier."));
         assert_eq!(
@@ -44670,21 +44674,54 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 .iter()
                 .map(|field| field.name.as_str())
                 .collect::<Vec<_>>(),
-            ["request-id", "label"]
+            ["id", "label"]
         );
         assert_eq!(
             fields[0].docs.as_deref(),
             Some("Request identifier."),
             "record field documentation is retained"
         );
-        assert_eq!(fields[0].ty, sai_wit::WitType::U32);
+        let sai_wit::WitType::Named(id_reference) = &fields[0].ty else {
+            panic!("the payload identifier refers to the earlier Id alias");
+        };
+        assert_eq!(id_reference.interface.interface, interface_index);
+        assert_eq!(id_reference.interface.name, "api");
+        assert_eq!(id_reference.item_name, "id");
         assert_eq!(fields[1].ty, sai_wit::WitType::U64);
-        assert!(!generated.text.contains("type Wrapped"));
-        assert!(!generated.text.contains("read: func"));
+        let sai_wit::WitItemKind::Alias(wrapped_type) = &items[2].kind else {
+            panic!("the wrapped alias is emitted");
+        };
+        let sai_wit::WitType::Named(wrapped_reference) = wrapped_type else {
+            panic!("the wrapped alias refers to Id");
+        };
+        assert_eq!(wrapped_reference.interface.interface, interface_index);
+        assert_eq!(wrapped_reference.item_name, "id");
+        let sai_wit::WitItemKind::Func(read) = &items[3].kind else {
+            panic!("the read function is emitted");
+        };
+        assert!(matches!(
+            read.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.interface == interface_index
+                    && reference.item_name == "id"
+        ));
+        assert!(matches!(
+            read.result,
+            Some(sai_wit::WitType::Named(ref reference))
+                if reference.interface.interface == interface_index
+                    && reference.item_name == "payload"
+        ));
+        assert!(generated.text.contains("id: id"));
+        assert!(generated.text.contains("read: func(value: id) -> payload"));
+        assert!(
+            generated
+                .text
+                .contains("read-wrapped: func(value: wrapped) -> id")
+        );
     }
 
     #[test]
-    fn generated_wit_omits_unimplemented_declarations_and_stays_incomplete() {
+    fn generated_wit_emits_named_consumers_in_an_incomplete_package() {
         let source = concat!(
             "interface api {\n",
             "  type Count = U32\n",
@@ -44751,8 +44788,8 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
         assert!(
-            !emitted_items.contains(&"read"),
-            "a function that refers to an omitted type is omitted"
+            emitted_items.contains(&"count") && emitted_items.contains(&"read"),
+            "eligible aliases and consumers survive even when a separate world keeps the package incomplete"
         );
         assert!(
             emitted_items.contains(&"write"),
@@ -44765,6 +44802,149 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
+    fn generated_wit_omits_consumers_of_unsupported_types_without_dangling_references() {
+        let source = concat!(
+            "interface api {\n",
+            "  type Pointer = USize\n",
+            "  type PointerWrapper = Pointer\n",
+            "  fn use_pointer(value: Pointer)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("incomplete generated WIT remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "omitting unsupported target types leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        let package_model = result.package.expect("partial WIT model loads");
+        let interface = package_model
+            .root()
+            .interfaces
+            .iter()
+            .next()
+            .expect("the interface with an independent function remains");
+        let emitted_items = interface
+            .items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            emitted_items,
+            ["independent"],
+            "the unsupported alias and every consumer are omitted while an unrelated function remains"
+        );
+        assert!(!generated.text.contains("pointer"));
+        assert!(generated.text.contains("independent: func(value: u32)"));
+    }
+
+    #[test]
+    fn generated_wit_omits_forward_named_references_and_alias_cycles() {
+        let source = concat!(
+            "interface api {\n",
+            "  type Before = After\n",
+            "  type CycleA = CycleB\n",
+            "  type CycleB = CycleA\n",
+            "  type After = U32\n",
+            "  fn independent(value: U64)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("partial generated WIT remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "omitting forward and cyclic references leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        let package_model = result.package.expect("partial WIT model loads");
+        let interface = package_model
+            .root()
+            .interfaces
+            .iter()
+            .next()
+            .expect("the interface remains");
+        let emitted_items = interface
+            .items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            emitted_items,
+            ["after", "independent"],
+            "forward targets are unavailable until emitted; cyclic aliases never acquire a reference"
+        );
+        assert!(!generated.text.contains("before"));
+        assert!(!generated.text.contains("cycle"));
+        assert!(generated.text.contains("type after = u32;"));
+        assert!(generated.text.contains("independent: func(value: u64)"));
+    }
+
+    #[test]
     fn generated_wit_omits_cyclic_interfaces_and_keeps_parseable_text() {
         let source = concat!(
             "interface first {\n",
@@ -44772,6 +44952,10 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             "}\n",
             "interface second {\n",
             "  type Response = first.Request\n",
+            "}\n",
+            "interface stable {\n",
+            "  type Id = U32\n",
+            "  fn lookup(value: Id)\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
@@ -44817,17 +45001,49 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             "unsupported declarations cannot claim completeness: {}",
             generated.text
         );
-        assert!(generated.origins.is_empty());
+        assert_eq!(
+            generated
+                .origins
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<Vec<_>>(),
+            ["stable"],
+            "the independent interface survives after both cyclic interfaces"
+        );
         assert!(!generated.text.contains("interface first"));
         assert!(!generated.text.contains("interface second"));
+        assert!(generated.text.contains("interface stable"));
+        let package_model = result.package.expect("the package model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the independent interface remains");
+        assert_eq!(
+            interface_index.raw(),
+            0,
+            "filtered cyclic interfaces do not leave index gaps"
+        );
+        let items = interface.items.iter().collect::<Vec<_>>();
+        assert_eq!(
+            items.len(),
+            2,
+            "the stable interface has an alias and a function"
+        );
+        let lookup = &items[1];
+        let sai_wit::WitItemKind::Func(lookup) = &lookup.kind else {
+            panic!("lookup is emitted as a function");
+        };
+        assert!(matches!(
+            lookup.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.interface == interface_index
+                    && reference.item_name == "id"
+        ));
         assert!(
-            result
-                .package
-                .expect("the package model loads")
-                .root()
-                .interfaces
-                .is_empty(),
-            "cyclic interfaces are omitted from both text and source origins"
+            generated.text.contains("lookup: func(value: id)"),
+            "same-interface references remain valid after provisional indices are remapped"
         );
     }
 
