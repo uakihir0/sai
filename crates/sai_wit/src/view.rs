@@ -13,7 +13,7 @@ use sai_hir::{
     DefPathInternerError, DisambiguatedDefPathData, IndexVec, PackageId, Symbol,
 };
 use sai_intern::{InternError, Interner, LookupError, PackageIdError, PackageInterner};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -152,6 +152,12 @@ pub struct ViewWorld {
     pub sai_name: Symbol,
     /// Imported world functions, ordered by their canonical SAI names.
     pub import_fns: BTreeMap<String, DefId>,
+    /// Exported world function names, ordered by their canonical SAI names.
+    ///
+    /// Export definitions remain in the view definition table; this set lets
+    /// name resolution recognize the exported function namespace without
+    /// constructing imported-function-style bindings for them.
+    pub export_fns: BTreeSet<String>,
 }
 
 /// A WIT item that is hidden by another item with the same SAI name.
@@ -446,6 +452,7 @@ impl WitView {
                     wit: plan.wit,
                     sai_name: plan.sai_name,
                     import_fns,
+                    export_fns: plan.export_fns,
                 },
             )?;
         }
@@ -914,6 +921,7 @@ struct WorldPlan {
     wit_name: String,
     sai_name: Symbol,
     import_functions: Vec<(String, u32)>,
+    export_fns: BTreeSet<String>,
 }
 
 fn make_interface_plans(
@@ -1308,6 +1316,7 @@ fn collect_world_candidates(
         let mut function_components = HashMap::new();
         let mut import_function_names = HashSet::new();
         let mut import_functions = Vec::new();
+        let mut export_fns = BTreeSet::new();
         collect_world_function_candidates(
             &world.imports,
             true,
@@ -1320,6 +1329,7 @@ fn collect_world_candidates(
             &mut function_components,
             &mut import_function_names,
             &mut import_functions,
+            &mut export_fns,
             candidates,
         )?;
         let mut export_function_names = HashSet::new();
@@ -1335,6 +1345,7 @@ fn collect_world_candidates(
             &mut function_components,
             &mut export_function_names,
             &mut Vec::new(),
+            &mut export_fns,
             candidates,
         )?;
         plans.push(WorldPlan {
@@ -1342,6 +1353,7 @@ fn collect_world_candidates(
             wit_name: world.name.clone(),
             sai_name: symbol,
             import_functions,
+            export_fns,
         });
     }
     Ok(plans)
@@ -1360,6 +1372,7 @@ fn collect_world_function_candidates(
     components: &mut HashMap<DefPathData, u32>,
     seen_names: &mut HashSet<String>,
     import_functions: &mut Vec<(String, u32)>,
+    export_functions: &mut BTreeSet<String>,
     candidates: &mut Vec<Candidate>,
 ) -> Result<(), WitViewError> {
     for (ordinal, item) in items.iter().enumerate() {
@@ -1400,6 +1413,8 @@ fn collect_world_function_candidates(
         )?;
         if import {
             import_functions.push((sai_name, ordinal));
+        } else {
+            export_functions.insert(sai_name);
         }
     }
     Ok(())
@@ -1631,12 +1646,13 @@ mod tests {
     use crate::{
         WitCase, WitField, WitIfaceIdx, WitIndexVec, WitInterface, WitItem, WitItemIdx,
         WitItemKind, WitMember, WitMemberKind, WitPackage, WitPackageName, WitType, WitUnit,
-        WitWorld, WitWorldItem,
+        WitWorld, WitWorldIdx, WitWorldItem,
     };
     use sai_hir::{DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, IndexVec};
     use sai_intern::{DefIndex, Interner, PackageInterner};
     use sai_package::mvs::MvsPackageVersion;
     use sai_package::version::Version;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     fn model(unit: WitUnit, reverse: bool) -> WitPackage {
@@ -1970,6 +1986,93 @@ mod tests {
             definition.entity,
             WitViewEntity::WorldFunction { import: false, .. }
         )));
+    }
+
+    #[test]
+    fn world_exports_expose_only_canonical_function_names() {
+        let packages = PackageInterner::new();
+        let symbols = Interner::new();
+        let unit_name = symbols.intern("cli").unwrap();
+        let unit = WitUnit::wasi(unit_name, &symbols, &Version::parse("0.2.3").unwrap()).unwrap();
+        let mut view_model = model(unit.clone(), false);
+        let client = &mut view_model.worlds[WitWorldIdx::from_raw(0)];
+        let WitWorldItem::Func { name, .. } = &mut client.exports[0] else {
+            panic!("fixture starts with a function export");
+        };
+        *name = "ready-to-shutdown".to_owned();
+        client.exports.push(interface_ref(&unit, 0, "files"));
+        client.exports.push(WitWorldItem::Func {
+            name: "type".to_owned(),
+            func: crate::WitFunc {
+                params: Vec::new(),
+                result: None,
+                is_async: false,
+            },
+            unsupported: None,
+            since: None,
+            deprecated: None,
+        });
+        client
+            .source_order
+            .push(crate::WitWorldItemOrder::export(1));
+        client
+            .source_order
+            .push(crate::WitWorldItemOrder::export(2));
+
+        let package = packages.intern(unit.stable_key()).unwrap();
+        let paths = Arc::new(DefPathInterner::new(package, &packages, &symbols).unwrap());
+        let view = WitView::build(view_model, &packages, &symbols, paths).unwrap();
+
+        let client = &view.worlds["client"];
+        assert_eq!(
+            client.export_fns,
+            BTreeSet::from(["ready_to_shutdown".to_owned(), "type".to_owned()])
+        );
+        assert_eq!(
+            client
+                .import_fns
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["connect"]
+        );
+
+        let mut reordered_model = model(unit.clone(), true);
+        let client = &mut reordered_model.worlds[WitWorldIdx::from_raw(1)];
+        let WitWorldItem::Func { name, .. } = &mut client.exports[0] else {
+            panic!("fixture starts with a function export");
+        };
+        *name = "ready-to-shutdown".to_owned();
+        let interface_name = reordered_model.interfaces[WitIfaceIdx::from_raw(0)]
+            .name
+            .clone();
+        client
+            .exports
+            .push(interface_ref(&unit, 0, &interface_name));
+        client.exports.push(WitWorldItem::Func {
+            name: "type".to_owned(),
+            func: crate::WitFunc {
+                params: Vec::new(),
+                result: None,
+                is_async: false,
+            },
+            unsupported: None,
+            since: None,
+            deprecated: None,
+        });
+        client
+            .source_order
+            .push(crate::WitWorldItemOrder::export(1));
+        client
+            .source_order
+            .push(crate::WitWorldItemOrder::export(2));
+        let reversed_paths = Arc::new(DefPathInterner::new(package, &packages, &symbols).unwrap());
+        let reordered =
+            WitView::build(reordered_model, &packages, &symbols, reversed_paths).unwrap();
+        assert_eq!(
+            reordered.worlds["client"].export_fns,
+            view.worlds["client"].export_fns
+        );
     }
 
     #[test]

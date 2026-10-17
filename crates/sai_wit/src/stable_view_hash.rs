@@ -93,6 +93,11 @@ impl StableHash for WitView {
                 function_name.stable_hash(hasher);
                 hash_definition_reference(self, *definition, hasher);
             }
+
+            hasher.write_len(u64::try_from(world.export_fns.len()).unwrap_or(u64::MAX));
+            for function_name in &world.export_fns {
+                function_name.stable_hash(hasher);
+            }
         }
     }
 }
@@ -270,7 +275,9 @@ interface api {
     record point { x: u32, y: u32 }
     draw: func(value: point) -> string;
 }
-world app {}
+world app {
+    export start: func();
+}
 ";
 
     #[test]
