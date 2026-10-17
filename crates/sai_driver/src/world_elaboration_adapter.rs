@@ -91,6 +91,12 @@ pub(super) fn build(
         .iter()
         .map(|interface| (interface.interface, interface.key.to_string()))
         .collect::<HashMap<_, _>>();
+    let interface_source_names = collection
+        .world_interface_uses
+        .interfaces()
+        .iter()
+        .map(|interface| (interface.interface, interface.source_name.clone()))
+        .collect::<HashMap<_, _>>();
     let external_world_data = collect_external_worlds(wit_view_scopes, &interface_keys)?;
     let local_world_ids = descriptors
         .iter()
@@ -176,6 +182,10 @@ pub(super) fn build(
                                 WorldSourceOrderKind::Import => {
                                     WorldElaborationSourceItem::ImportInterface {
                                         key: key.as_str().into(),
+                                        source_name: interface_source_names
+                                            .get(&interface)
+                                            .cloned()
+                                            .flatten(),
                                         interface,
                                         owner: source.hir_id(),
                                         location,
@@ -184,6 +194,10 @@ pub(super) fn build(
                                 WorldSourceOrderKind::Export => {
                                     WorldElaborationSourceItem::ExportInterface {
                                         key: key.as_str().into(),
+                                        source_name: interface_source_names
+                                            .get(&interface)
+                                            .cloned()
+                                            .flatten(),
                                         interface,
                                         owner: source.hir_id(),
                                         location,
@@ -231,6 +245,7 @@ pub(super) fn build(
                         WorldSourceOrderKind::ImportFunction => {
                             WorldElaborationSourceItem::ImportFunction {
                                 key: key.into(),
+                                source_name: name.into(),
                                 function,
                                 owner: source.hir_id(),
                                 location,
@@ -239,6 +254,7 @@ pub(super) fn build(
                         WorldSourceOrderKind::ExportFunction => {
                             WorldElaborationSourceItem::ExportFunction {
                                 key: key.into(),
+                                source_name: name.into(),
                                 function,
                                 owner: source.hir_id(),
                                 location,

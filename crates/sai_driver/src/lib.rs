@@ -13611,11 +13611,10 @@ impl RootDatabase {
             .map_err(OwnerControlFlowResolutionError::WorldElaboration)
     }
 
-    /// Returns the elaborated world and the checks available for directly
-    /// written world-function names.
+    /// Returns the elaborated world with direct world-function name and
+    /// boundary-type checks, plus collisions in its elaborated WIT namespace.
     ///
-    /// Boundary type compatibility, world-namespace collisions, and export
-    /// implementation checks are added by later world-check stages.
+    /// Export implementation checks are added by a later world-check stage.
     pub fn world_check(
         &mut self,
         world: DefId,
@@ -30331,6 +30330,11 @@ mod tests {
             "  import fn userID(fetch_user: U32, _: U32)\n",
             "}\n",
             "type Pointer = USize\n",
+            "interface foo_bar {}\n",
+            "world namespace_checks {\n",
+            "  import foo_bar\n",
+            "  import fn foo_bar()\n",
+            "}\n",
             "world boundary_checks {\n",
             "  import fn bad_param(size: USize)\n",
             "  import fn bad_alias(size: Pointer)\n",
@@ -30964,6 +30968,63 @@ world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
                 .collect::<Vec<_>>(),
             ["USize", "Pointer", "Never"],
             "boundary findings use the alias call site or the smallest incompatible source type"
+        );
+        let namespace_check_world = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::World
+                    && database
+                        .resolve_def_path(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| {
+                            path.data()
+                                .last()
+                                .and_then(|component| match &component.data {
+                                    DefPathData::World(symbol) => database
+                                        .resolve_symbol(*symbol)
+                                        .ok()
+                                        .map(|name| name.as_ref() == "namespace_checks"),
+                                    _ => None,
+                                })
+                        })
+                        .unwrap_or(false)
+            })
+            .expect("the package has a world with a local interface/function duplicate")
+            .owner
+            .def_id
+            .to_def_id();
+        let checked_namespace = database
+            .world_check(
+                namespace_check_world,
+                &collection,
+                &module_tree,
+                &snapshot,
+                &resolutions,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("world check detects duplicate names across elaborated item kinds");
+        let duplicate = checked_namespace
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::WorldDuplicateItem)
+            .expect("equal SAI names retain the duplicate-item diagnostic");
+        assert_eq!(duplicate.message, "world item `foo-bar` is duplicated");
+        let duplicate_primary = duplicate
+            .primary()
+            .expect("world duplicate has a primary location");
+        let duplicate_primary_range = duplicate_primary.span.range.start().to_usize()
+            ..duplicate_primary.span.range.end().to_usize();
+        assert_eq!(&root[duplicate_primary_range], "foo_bar");
+        assert_eq!(
+            duplicate.children()[0].location.as_ref().map(|location| {
+                &root[location.span.range.start().to_usize()..location.span.range.end().to_usize()]
+            }),
+            Some("foo_bar"),
+            "world duplicate points to both source declarations"
         );
         let server_include = owner
             .references()

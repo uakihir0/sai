@@ -745,6 +745,17 @@ fn local_interface_wit_name(
     prepared: &PreparedPhase1PackageScopes,
     symbols: &Interner,
 ) -> Result<Option<String>, InterfaceUsesQueryError> {
+    let Some(source_name) = local_interface_source_name(interface, prepared, symbols)? else {
+        return Ok(None);
+    };
+    Ok(sai_identifier_to_wit_name(&source_name))
+}
+
+fn local_interface_source_name(
+    interface: LocalDefId,
+    prepared: &PreparedPhase1PackageScopes,
+    symbols: &Interner,
+) -> Result<Option<String>, InterfaceUsesQueryError> {
     let path = prepared
         .def_paths
         .resolve_def_id(interface.to_def_id())
@@ -762,7 +773,7 @@ fn local_interface_wit_name(
         .resolve(*name)
         .map_err(OwnerControlFlowResolutionError::SymbolLookup)
         .map_err(InterfaceUsesQueryError::Collection)?;
-    Ok(sai_identifier_to_wit_name(&source_name))
+    Ok(Some(source_name.to_string()))
 }
 
 fn external_wit_interface_use_target(
@@ -852,6 +863,7 @@ fn collect_external_world_interface_data(
                     None,
                 )
                 .into(),
+                source_name: None,
                 uses_complete: true,
             });
             data.stable_identities.push(format!(
@@ -1648,7 +1660,8 @@ fn collect_interface_uses_input(
     let mut world_stable_identities =
         Vec::with_capacity(interface_ids.len() + external_world_interfaces.stable_identities.len());
     for interface in &interface_ids {
-        let name = local_interface_wit_name(*interface, prepared, symbols)?;
+        let source_name = local_interface_source_name(*interface, prepared, symbols)?;
+        let name = source_name.as_deref().and_then(sai_identifier_to_wit_name);
         let path = prepared
             .def_paths
             .resolve_def_id(interface.to_def_id())
@@ -1665,6 +1678,7 @@ fn collect_interface_uses_input(
         world_interfaces.push(WorldElaborationInterface {
             interface: interface.to_def_id(),
             key: name.as_deref().unwrap_or("").into(),
+            source_name: source_name.map(Into::into),
             uses_complete: name.is_some()
                 && local_world_use_completeness
                     .get(&interface.to_def_id())
@@ -3128,6 +3142,13 @@ fn stable_world_interface_use_graph(graph: &WorldInterfaceUseGraph, hasher: &mut
             .or_insert(u64::try_from(index).unwrap_or(u64::MAX));
         stable_identity.stable_hash(hasher);
         interface.key.as_str().stable_hash(hasher);
+        match &interface.source_name {
+            Some(source_name) => {
+                hasher.write_tag(1);
+                source_name.as_str().stable_hash(hasher);
+            }
+            None => hasher.write_tag(0),
+        }
         hasher.write_u8(u8::from(interface.uses_complete));
     }
     hasher.write_len(u64::try_from(graph.edges.len()).unwrap_or(u64::MAX));
@@ -3358,12 +3379,14 @@ fn refresh_location_reference(
 #[cfg(test)]
 mod tests {
     use super::{
-        InterfaceUsesQueryError, LocalAliasReference, expand_local_alias_interface_references,
-        interface_uses_error_fingerprint,
+        InterfaceUsesQueryError, LocalAliasReference, WorldInterfaceUseGraph,
+        expand_local_alias_interface_references, interface_uses_error_fingerprint,
+        stable_world_interface_uses_fingerprint,
     };
     use crate::OwnerControlFlowResolutionError;
     use sai_hir::{DefId, DefIndex, IndexVec};
     use sai_intern::PackageInterner;
+    use sai_resolve::WorldElaborationInterface;
     use sai_vfs::FileId;
     use std::collections::{HashMap, HashSet};
 
@@ -3379,6 +3402,36 @@ mod tests {
         assert_eq!(
             interface_uses_error_fingerprint(&first),
             interface_uses_error_fingerprint(&second)
+        );
+    }
+
+    #[test]
+    fn world_interface_use_fingerprint_tracks_source_name() {
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:test#1.0")
+            .expect("test package interns");
+        let mut definitions = IndexVec::<DefIndex, ()>::new();
+        let interface = DefId::from_foreign(
+            package,
+            definitions.push(()).expect("interface index is allocated"),
+        );
+        let graph = |source_name: &str| WorldInterfaceUseGraph {
+            package: "acme:test#1.0".to_owned(),
+            interfaces: vec![WorldElaborationInterface {
+                interface,
+                key: "foo-bar".into(),
+                source_name: Some(source_name.into()),
+                uses_complete: true,
+            }],
+            stable_identities: vec!["same-interface".to_owned()],
+            edges: Vec::new(),
+        };
+
+        assert_ne!(
+            stable_world_interface_uses_fingerprint(&graph("FooBar")),
+            stable_world_interface_uses_fingerprint(&graph("foo_bar")),
+            "source spellings affect name-collision classification even when the WIT key is unchanged"
         );
     }
 

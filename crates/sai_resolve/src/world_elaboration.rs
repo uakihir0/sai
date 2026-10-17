@@ -4,11 +4,13 @@
 //! all direct items in source order, and resolves their references before
 //! invoking this helper. External worlds are supplied as already-elaborated
 //! items in WIT order. This module expands includes, appends implicit imports
-//! from interface-use edges, and reports local duplicate items without
-//! inspecting HIR, WIT models, or package/query state.
+//! from interface-use edges, and reports local duplicate items or converted
+//! SAI-to-WIT name collisions without inspecting package/query state.
 
-use sai_diagnostics::{Child, ChildKind, Code, Diagnostic, Location, Severity};
+use crate::sai_identifier_to_wit_name;
+use sai_diagnostics::{Child, ChildKind, Code, Diagnostic, Location, Related, Severity};
 use sai_hir::{DefId, HirId};
+use sai_wit::wit_name_to_sai;
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -92,24 +94,28 @@ pub struct ElaboratedWorld {
 pub enum WorldElaborationSourceItem {
     ImportInterface {
         key: SmolStr,
+        source_name: Option<SmolStr>,
         interface: DefId,
         owner: HirId,
         location: Location,
     },
     ExportInterface {
         key: SmolStr,
+        source_name: Option<SmolStr>,
         interface: DefId,
         owner: HirId,
         location: Location,
     },
     ImportFunction {
         key: SmolStr,
+        source_name: SmolStr,
         function: DefId,
         owner: HirId,
         location: Location,
     },
     ExportFunction {
         key: SmolStr,
+        source_name: SmolStr,
         function: DefId,
         owner: HirId,
         location: Location,
@@ -158,6 +164,8 @@ pub struct WorldElaborationInterface {
     pub interface: DefId,
     /// The canonical WIT name used when the interface is implicitly imported.
     pub key: SmolStr,
+    /// Original SAI spelling when this is a local source interface.
+    pub source_name: Option<SmolStr>,
     /// False if an unsupported or unresolved boundary type prevented a
     /// complete interface-use graph from being collected.
     pub uses_complete: bool,
@@ -204,6 +212,10 @@ struct Occurrence {
     direction: WorldDirection,
     item: ElabItem,
     location: Option<Location>,
+    /// Semantic SAI spelling for local functions/interfaces, or the canonical
+    /// SAI spelling inferred from an external WIT key for mixed-namespace
+    /// collision classification.
+    source_name: Option<SmolStr>,
 }
 
 #[derive(Clone, Debug)]
@@ -655,64 +667,72 @@ pub fn elaborated_world(
             match source_item {
                 WorldElaborationSourceItem::ImportInterface {
                     key,
+                    source_name,
                     interface,
                     owner,
                     location,
                 } => push_occurrence(
                     &mut ordered_items,
                     &mut mergeable_identities,
-                    written_occurrence(
+                    written_interface_occurrence(
                         WorldDirection::Import,
                         key,
-                        ElabKind::Interface(*interface),
+                        source_name.as_ref(),
+                        *interface,
                         *owner,
                         location.clone(),
                     ),
                 ),
                 WorldElaborationSourceItem::ExportInterface {
                     key,
+                    source_name,
                     interface,
                     owner,
                     location,
                 } => push_occurrence(
                     &mut ordered_items,
                     &mut mergeable_identities,
-                    written_occurrence(
+                    written_interface_occurrence(
                         WorldDirection::Export,
                         key,
-                        ElabKind::Interface(*interface),
+                        source_name.as_ref(),
+                        *interface,
                         *owner,
                         location.clone(),
                     ),
                 ),
                 WorldElaborationSourceItem::ImportFunction {
                     key,
+                    source_name,
                     function,
                     owner,
                     location,
                 } => push_occurrence(
                     &mut ordered_items,
                     &mut mergeable_identities,
-                    written_occurrence(
+                    written_function_occurrence(
                         WorldDirection::Import,
                         key,
-                        ElabKind::Func(*function),
+                        source_name,
+                        *function,
                         *owner,
                         location.clone(),
                     ),
                 ),
                 WorldElaborationSourceItem::ExportFunction {
                     key,
+                    source_name,
                     function,
                     owner,
                     location,
                 } => push_occurrence(
                     &mut ordered_items,
                     &mut mergeable_identities,
-                    written_occurrence(
+                    written_function_occurrence(
                         WorldDirection::Export,
                         key,
-                        ElabKind::Func(*function),
+                        source_name,
+                        *function,
                         *owner,
                         location.clone(),
                     ),
@@ -958,25 +978,29 @@ fn fast_include_with_functions(
         match item {
             WorldElaborationSourceItem::ImportFunction {
                 key,
+                source_name,
                 function,
                 owner,
                 location,
-            } => pending_direct_items.push(written_occurrence(
+            } => pending_direct_items.push(written_function_occurrence(
                 WorldDirection::Import,
                 key,
-                ElabKind::Func(*function),
+                source_name,
+                *function,
                 *owner,
                 location.clone(),
             )),
             WorldElaborationSourceItem::ExportFunction {
                 key,
+                source_name,
                 function,
                 owner,
                 location,
-            } => pending_direct_items.push(written_occurrence(
+            } => pending_direct_items.push(written_function_occurrence(
                 WorldDirection::Export,
                 key,
-                ElabKind::Func(*function),
+                source_name,
+                *function,
                 *owner,
                 location.clone(),
             )),
@@ -1062,6 +1086,9 @@ fn external_sequence(world: &ExternalWorld) -> ExternalSequence {
                 direction: external_item.direction,
                 item,
                 location: None,
+                source_name: wit_name_to_sai(&external_item.item.key, false)
+                    .ok()
+                    .map(|name| SmolStr::new(name.strip_prefix("r#").unwrap_or(&name))),
             }
         })
         .collect::<Vec<_>>();
@@ -1165,7 +1192,41 @@ fn written_occurrence(
             origin: ElabOrigin::Written(owner),
         },
         location: Some(location),
+        source_name: None,
     }
+}
+
+fn written_function_occurrence(
+    direction: WorldDirection,
+    key: &SmolStr,
+    source_name: &SmolStr,
+    function: DefId,
+    owner: HirId,
+    location: Location,
+) -> Occurrence {
+    let mut occurrence =
+        written_occurrence(direction, key, ElabKind::Func(function), owner, location);
+    occurrence.source_name = Some(source_name.clone());
+    occurrence
+}
+
+fn written_interface_occurrence(
+    direction: WorldDirection,
+    key: &SmolStr,
+    source_name: Option<&SmolStr>,
+    interface: DefId,
+    owner: HirId,
+    location: Location,
+) -> Occurrence {
+    let mut occurrence = written_occurrence(
+        direction,
+        key,
+        ElabKind::Interface(interface),
+        owner,
+        location,
+    );
+    occurrence.source_name = source_name.cloned();
+    occurrence
 }
 
 fn included_occurrence(occurrence: &Occurrence, include: HirId, location: &Location) -> Occurrence {
@@ -1177,6 +1238,7 @@ fn included_occurrence(occurrence: &Occurrence, include: HirId, location: &Locat
             origin: ElabOrigin::Included { include },
         },
         location: Some(location.clone()),
+        source_name: occurrence.source_name.clone(),
     }
 }
 
@@ -1312,6 +1374,7 @@ fn append_implicit_imports(
                             origin: ElabOrigin::Implicit { cause, used_by },
                         },
                         location,
+                        source_name: metadata.source_name.clone(),
                     },
                 );
             }
@@ -1383,11 +1446,11 @@ fn normalize_items(
         if direct_duplicate {
             let first_direct =
                 &ordered_items[first_direct_index.expect("direct duplicate has a prior direct")];
-            diagnostics.push(duplicate_diagnostic(
+            diagnostics.push(duplicate_occurrence_diagnostic(
                 package,
                 &occurrence.item.key,
-                occurrence.location.clone(),
-                first_direct.location.clone(),
+                occurrence,
+                first_direct,
                 None,
             ));
             continue;
@@ -1405,11 +1468,11 @@ fn normalize_items(
         };
         if let Some(&first_index) = first_by_direction.get(&key) {
             let first = &ordered_items[first_index];
-            diagnostics.push(duplicate_diagnostic(
+            diagnostics.push(duplicate_occurrence_diagnostic(
                 package,
                 &occurrence.item.key,
-                occurrence.location.clone(),
-                first.location.clone(),
+                occurrence,
+                first,
                 opposite_direction_occurrence.and_then(|_| {
                     implicit_used_by_note(&occurrence.item, interfaces, interface_indices)
                 }),
@@ -1494,6 +1557,59 @@ fn duplicate_diagnostic(
                 location: Some(location),
             })
             .expect("an unbound diagnostic accepts a note");
+    }
+    if let Some(message) = extra_note {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message,
+                location: None,
+            })
+            .expect("an unbound diagnostic accepts a note");
+    }
+    diagnostic
+}
+
+fn duplicate_occurrence_diagnostic(
+    package: &str,
+    key: &str,
+    later: &Occurrence,
+    earlier: &Occurrence,
+    extra_note: Option<String>,
+) -> Diagnostic {
+    let represents_key = |source_name: &SmolStr| {
+        sai_identifier_to_wit_name(source_name).is_some_and(|wit_name| wit_name == key)
+    };
+    let distinct_sai_names = matches!(
+        (&earlier.source_name, &later.source_name),
+        (Some(earlier), Some(later))
+            if earlier != later && represents_key(earlier) && represents_key(later)
+    );
+    if !distinct_sai_names {
+        return duplicate_diagnostic(
+            package,
+            key,
+            later.location.clone(),
+            earlier.location.clone(),
+            extra_note,
+        );
+    }
+
+    let mut diagnostic = Diagnostic::new(
+        Code::WitNameCollision,
+        Severity::Error,
+        format!("multiple declarations map to WIT name `{key}`"),
+        later.location.clone(),
+    );
+    diagnostic.primary_label = "colliding WIT name".to_owned();
+    diagnostic.package = Some(package.to_owned());
+    if let Some(location) = earlier.location.clone() {
+        diagnostic
+            .push_related(Related::DeclaredHere {
+                location,
+                what: "earlier declaration mapping to the same WIT name".to_owned(),
+            })
+            .expect("an unbound diagnostic accepts a related location");
     }
     if let Some(message) = extra_note {
         diagnostic
@@ -1695,22 +1811,49 @@ mod tests {
             offset: u32,
         ) -> WorldElaborationSourceItem {
             let key = SmolStr::new(key);
+            let source_name = key.clone();
             let owner = self.hir(owner, 0);
             let location = self.location(offset);
             match direction {
                 WorldDirection::Import => WorldElaborationSourceItem::ImportFunction {
                     key,
+                    source_name,
                     function: self.def(function),
                     owner,
                     location,
                 },
                 WorldDirection::Export => WorldElaborationSourceItem::ExportFunction {
                     key,
+                    source_name,
                     function: self.def(function),
                     owner,
                     location,
                 },
             }
+        }
+
+        fn function_named(
+            &self,
+            direction: WorldDirection,
+            key: &str,
+            source_name: &str,
+            function: u32,
+            owner: u32,
+            offset: u32,
+        ) -> WorldElaborationSourceItem {
+            let mut item = self.function(direction, key, function, owner, offset);
+            match &mut item {
+                WorldElaborationSourceItem::ImportFunction {
+                    source_name: original,
+                    ..
+                }
+                | WorldElaborationSourceItem::ExportFunction {
+                    source_name: original,
+                    ..
+                } => *original = SmolStr::new(source_name),
+                _ => unreachable!("function helper creates a function item"),
+            }
+            item
         }
 
         fn interface(
@@ -1726,12 +1869,14 @@ mod tests {
             let location = self.location(offset);
             match direction {
                 WorldDirection::Import => WorldElaborationSourceItem::ImportInterface {
+                    source_name: Some(key.clone()),
                     key,
                     interface: self.def(interface),
                     owner,
                     location,
                 },
                 WorldDirection::Export => WorldElaborationSourceItem::ExportInterface {
+                    source_name: Some(key.clone()),
                     key,
                     interface: self.def(interface),
                     owner,
@@ -1752,6 +1897,7 @@ mod tests {
             WorldElaborationInterface {
                 interface: self.def(interface),
                 key: SmolStr::new(key),
+                source_name: Some(SmolStr::new(key)),
                 uses_complete: true,
             }
         }
@@ -2034,6 +2180,7 @@ mod tests {
                 origin: ElabOrigin::Written(fixture.hir(10, 0)),
             },
             location: Some(fixture.location(1)),
+            source_name: None,
         }];
         let location_index = reporting_locations(&ordered_items);
         let mut export_expanded_interfaces = HashSet::new();
@@ -2261,6 +2408,164 @@ mod tests {
     }
 
     #[test]
+    fn reports_distinct_sai_function_names_that_collide_in_wit() {
+        let fixture = Fixture::new();
+        assert_eq!(
+            sai_identifier_to_wit_name("GetValue").as_deref(),
+            Some("get-value")
+        );
+        assert_eq!(
+            sai_identifier_to_wit_name("get_value").as_deref(),
+            Some("get-value")
+        );
+        let root = fixture.local_world(
+            1,
+            vec![
+                fixture.function_named(WorldDirection::Import, "get-value", "GetValue", 100, 10, 1),
+                fixture.function_named(
+                    WorldDirection::Import,
+                    "get-value",
+                    "get_value",
+                    101,
+                    11,
+                    5,
+                ),
+            ],
+        );
+        let input = fixture.input(vec![root], vec![], vec![], vec![], []);
+
+        let result = elaborated_world(fixture.def(1), input).expect("root exists");
+
+        assert_eq!(result.imports.len(), 1);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code, Code::WitNameCollision);
+        assert_eq!(
+            result.diagnostics[0].message,
+            "multiple declarations map to WIT name `get-value`"
+        );
+        assert_eq!(result.diagnostics[0].primary_label, "colliding WIT name");
+        assert_eq!(result.diagnostics[0].primary(), Some(&fixture.location(5)));
+        assert_eq!(
+            result.diagnostics[0].related(),
+            [Related::DeclaredHere {
+                location: fixture.location(1),
+                what: "earlier declaration mapping to the same WIT name".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn reports_external_wit_and_local_sai_name_collisions() {
+        let fixture = Fixture::new();
+        let include_location = fixture.location(10);
+        let root = fixture.local_world(
+            1,
+            vec![
+                fixture.include(2, 20, 10),
+                fixture.function_named(
+                    WorldDirection::Import,
+                    "get-value",
+                    "GetValue",
+                    100,
+                    21,
+                    20,
+                ),
+            ],
+        );
+        let external = ExternalWorld {
+            world: fixture.def(2),
+            items: vec![ExternalWorldItem {
+                direction: WorldDirection::Import,
+                item: ElabItem {
+                    key: SmolStr::new("get-value"),
+                    kind: ElabKind::Func(fixture.def(200)),
+                    origin: ElabOrigin::External,
+                },
+            }],
+            complete: true,
+        };
+        let input = fixture.input(vec![root], vec![external.clone()], vec![], vec![], []);
+
+        let result = elaborated_world(fixture.def(1), input).expect("root exists");
+
+        assert_eq!(result.imports.len(), 1);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code, Code::WitNameCollision);
+        assert_eq!(result.diagnostics[0].primary(), Some(&fixture.location(20)));
+        assert_eq!(
+            result.diagnostics[0].related(),
+            [Related::DeclaredHere {
+                location: include_location,
+                what: "earlier declaration mapping to the same WIT name".to_owned(),
+            }]
+        );
+
+        let same_spelling_world = fixture.local_world(
+            1,
+            vec![
+                fixture.include(2, 20, 10),
+                fixture.function_named(
+                    WorldDirection::Import,
+                    "get-value",
+                    "get_value",
+                    100,
+                    21,
+                    20,
+                ),
+            ],
+        );
+        let same_spelling_input = fixture.input(
+            vec![same_spelling_world],
+            vec![external],
+            vec![],
+            vec![],
+            [],
+        );
+        let same_spelling_result =
+            elaborated_world(fixture.def(1), same_spelling_input).expect("root exists");
+        assert_eq!(same_spelling_result.diagnostics.len(), 1);
+        assert_eq!(
+            same_spelling_result.diagnostics[0].code,
+            Code::WorldDuplicateItem,
+            "the canonical SAI spelling of the external WIT name remains a duplicate"
+        );
+
+        let keyword_world = fixture.local_world(
+            1,
+            vec![
+                fixture.include(2, 20, 10),
+                fixture.function_named(WorldDirection::Import, "type", "type", 100, 21, 20),
+            ],
+        );
+        let keyword_external = ExternalWorld {
+            world: fixture.def(2),
+            items: vec![ExternalWorldItem {
+                direction: WorldDirection::Import,
+                item: ElabItem {
+                    key: SmolStr::new("type"),
+                    kind: ElabKind::Func(fixture.def(201)),
+                    origin: ElabOrigin::External,
+                },
+            }],
+            complete: true,
+        };
+        let keyword_input = fixture.input(
+            vec![keyword_world],
+            vec![keyword_external],
+            vec![],
+            vec![],
+            [],
+        );
+        let keyword_result = elaborated_world(fixture.def(1), keyword_input).expect("root exists");
+        assert_eq!(keyword_result.diagnostics.len(), 1);
+        assert_eq!(
+            keyword_result.diagnostics[0].code,
+            Code::WorldDuplicateItem,
+            "raw keyword escaping does not create a distinct semantic SAI name"
+        );
+    }
+
+    #[test]
     fn direct_duplicates_still_report_after_a_merge_eligible_occurrence() {
         let fixture = Fixture::new();
         let first_owner = fixture.hir(10, 0);
@@ -2284,6 +2589,7 @@ mod tests {
                         origin: ElabOrigin::Written(first_owner),
                     },
                     location: Some(fixture.location(0)),
+                    source_name: None,
                 },
                 Occurrence {
                     direction: WorldDirection::Import,
@@ -2293,6 +2599,7 @@ mod tests {
                         origin: middle_origin,
                     },
                     location: Some(fixture.location(1)),
+                    source_name: None,
                 },
                 Occurrence {
                     direction: WorldDirection::Import,
@@ -2302,6 +2609,7 @@ mod tests {
                         origin: ElabOrigin::Written(fixture.hir(13, 0)),
                     },
                     location: Some(fixture.location(2)),
+                    source_name: None,
                 },
             ];
             let (normalized, diagnostics) =
@@ -2337,6 +2645,7 @@ mod tests {
                         origin: special_origin,
                     },
                     location: Some(fixture.location(0)),
+                    source_name: None,
                 },
                 Occurrence {
                     direction: WorldDirection::Import,
@@ -2346,6 +2655,7 @@ mod tests {
                         origin: ElabOrigin::Written(fixture.hir(13, 0)),
                     },
                     location: Some(fixture.location(1)),
+                    source_name: None,
                 },
                 Occurrence {
                     direction: WorldDirection::Import,
@@ -2355,6 +2665,7 @@ mod tests {
                         origin: ElabOrigin::Written(fixture.hir(14, 0)),
                     },
                     location: Some(fixture.location(2)),
+                    source_name: None,
                 },
             ];
             let (normalized, diagnostics) =
@@ -3025,6 +3336,7 @@ mod tests {
                         origin: ElabOrigin::External,
                     },
                     location: None,
+                    source_name: None,
                 }]),
             );
         }
