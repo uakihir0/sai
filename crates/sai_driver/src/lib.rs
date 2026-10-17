@@ -4112,6 +4112,7 @@ pub enum OwnerControlFlowResolutionError {
     MissingDefPath(OwnerId),
     MissingTargetDefPath(DefId),
     MissingInterfaceImplTarget(DefId),
+    WorldElaboration(sai_resolve::WorldElaborationError),
     InterfaceImplDiagnosticSourceMismatch {
         file_path: Option<String>,
     },
@@ -13558,6 +13559,30 @@ impl RootDatabase {
             member_scopes,
             wit_view_scopes,
         )
+    }
+
+    /// Elaborates one local or active WIT-view world from matching
+    /// snapshot-bound references and scopes.
+    pub fn elaborated_world(
+        &mut self,
+        world: DefId,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        references: &WorldReferenceResolutions,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<sai_resolve::ElaboratedWorld, OwnerControlFlowResolutionError> {
+        let input = self.resolve_world_elaboration_input(
+            collection,
+            module_tree,
+            snapshot,
+            references,
+            member_scopes,
+            wit_view_scopes,
+        )?;
+        sai_resolve::elaborated_world(world, input)
+            .map_err(OwnerControlFlowResolutionError::WorldElaboration)
     }
 
     /// Builds the package-local include graph from matching world-reference
@@ -30399,6 +30424,18 @@ world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
         );
         let root_elaboration = sai_resolve::elaborated_world(local_world, elaboration_input)
             .expect("the local world has a partial recovery result");
+        let driver_elaboration = database
+            .elaborated_world(
+                local_world,
+                &collection,
+                &module_tree,
+                &snapshot,
+                &resolutions,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("the driver exposes elaboration for the same validated world");
+        assert_eq!(driver_elaboration, root_elaboration);
         assert!(!root_elaboration.complete);
         let server_include = owner
             .references()
