@@ -45485,6 +45485,260 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
+    fn generated_wit_emits_empty_resources_and_owned_borrowed_handles() {
+        let source = concat!(
+            "interface api {\n",
+            "  resource Handle {}\n",
+            "  fn take(value: Handle)\n",
+            "  fn inspect(value: borrow Handle)\n",
+            "  fn create() -> Handle\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("the generated resource package loads");
+        assert!(
+            result.failure.is_none(),
+            "generated resource declarations parse and resolve: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "empty resource handles are fully representable: {}",
+            generated.text
+        );
+        assert!(generated.text.contains("resource handle;"));
+        assert!(generated.text.contains("take: func(value: handle);"));
+        assert!(
+            generated
+                .text
+                .contains("inspect: func(value: borrow<handle>);")
+        );
+        assert!(generated.text.contains("create: func() -> handle;"));
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        let items = interface.items.iter().collect::<Vec<_>>();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["handle", "take", "inspect", "create"]
+        );
+        let resource_index = interface.items.iter_enumerated().next().unwrap().0;
+        let sai_wit::WitItemKind::Resource(members) = &items[0].kind else {
+            panic!("the empty source resource is represented as a WIT resource");
+        };
+        assert!(members.is_empty());
+        for (item, borrowed) in [(&items[1], false), (&items[2], true)] {
+            let sai_wit::WitItemKind::Func(function) = &item.kind else {
+                panic!("resource handle consumers are emitted as functions");
+            };
+            let reference = match (&function.params[0].1, borrowed) {
+                (sai_wit::WitType::Own(reference), false)
+                | (sai_wit::WitType::Borrow(reference), true) => reference,
+                _ => panic!("the handle uses the expected own or borrow WIT type"),
+            };
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.item, resource_index);
+            assert_eq!(reference.item_name, "handle");
+        }
+        let sai_wit::WitItemKind::Func(create) = &items[3].kind else {
+            panic!("the owned resource result consumer is emitted as a function");
+        };
+        let Some(sai_wit::WitType::Own(reference)) = &create.result else {
+            panic!("an owned resource may be returned from a function");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.item, resource_index);
+        assert_eq!(reference.item_name, "handle");
+    }
+
+    #[test]
+    fn generated_wit_omits_forward_resource_handle_references() {
+        let source = concat!(
+            "interface api {\n",
+            "  fn take(value: Handle)\n",
+            "  resource Handle {}\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("the incomplete generated resource package loads");
+        assert!(
+            result.failure.is_none(),
+            "omitting a forward handle reference leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "an unsupported forward resource reference keeps generated WIT incomplete"
+        );
+        assert!(generated.text.contains("resource handle;"));
+        assert!(!generated.text.contains("take:"));
+
+        let package_model = result.package.expect("partial WIT model loads");
+        let interface = package_model
+            .root()
+            .interfaces
+            .iter()
+            .next()
+            .expect("the local interface remains available");
+        assert_eq!(
+            interface
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["handle"],
+            "the later resource is emitted without a dangling forward reference"
+        );
+    }
+
+    #[test]
+    fn generated_wit_omits_nonempty_resources_and_handle_consumers() {
+        let source = concat!(
+            "interface api {\n",
+            "  resource Handle {\n",
+            "    fn reset()\n",
+            "  }\n",
+            "  fn take(value: Handle)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("the incomplete generated resource package loads");
+        assert!(
+            result.failure.is_none(),
+            "omitting unsupported resource declarations leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "a nonempty resource keeps generated WIT incomplete"
+        );
+        assert!(!generated.text.contains("resource handle"));
+        assert!(!generated.text.contains("take:"));
+        assert!(generated.text.contains("independent: func(value: u32);"));
+
+        let package_model = result.package.expect("partial WIT model loads");
+        let interface = package_model
+            .root()
+            .interfaces
+            .iter()
+            .next()
+            .expect("the local interface remains available");
+        assert_eq!(
+            interface
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["independent"],
+            "the unsupported resource and its consumer are omitted without dangling references"
+        );
+    }
+
+    #[test]
     fn generated_wit_emits_self_contained_aliases_and_records_in_source_order() {
         let source = concat!(
             "interface api {\n",

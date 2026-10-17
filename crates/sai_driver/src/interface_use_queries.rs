@@ -1790,6 +1790,16 @@ fn collect_interface_uses_input(
                             prepared.generated_package_version.as_ref(),
                             symbols,
                         )?,
+                        super::InterfaceMemberKind::Resource => generated_interface_type_item(
+                            entry,
+                            &member_hir,
+                            &boundary_conversions,
+                            &generated_named_type_references,
+                            flags_marker_accepted,
+                            &inputs.validated_attrs,
+                            prepared.generated_package_version.as_ref(),
+                            symbols,
+                        )?,
                         super::InterfaceMemberKind::Function => generated_function_item(
                             entry,
                             &member_hir,
@@ -1814,6 +1824,7 @@ fn collect_interface_uses_input(
                                 | WitItemKind::Variant(_)
                                 | WitItemKind::Enum(_)
                                 | WitItemKind::Flags(_)
+                                | WitItemKind::Resource(_)
                         );
                         let item_index = generated_items
                             .push(item)
@@ -3659,6 +3670,12 @@ fn generated_interface_type_item(
                     WitItemKind::Enum(case_names)
                 }
             }
+        }
+        InterfaceItemKind::Resource { members } => {
+            if !members.is_empty() || !conversions.is_empty() {
+                return Ok(None);
+            }
+            WitItemKind::Resource(Vec::new())
         }
         _ => return Ok(None),
     };
