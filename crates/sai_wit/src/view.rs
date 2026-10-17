@@ -1832,6 +1832,7 @@ mod tests {
                         unsupported: None,
                         since: None,
                         deprecated: None,
+                        span: None,
                     },
                     interface_ref(&unit, 0, &first_interface_name),
                 ],
@@ -1845,6 +1846,7 @@ mod tests {
                     unsupported: None,
                     since: None,
                     deprecated: None,
+                    span: None,
                 }],
                 includes: Vec::new(),
                 source_order: vec![
@@ -1898,6 +1900,7 @@ mod tests {
             },
             since: None,
             deprecated: None,
+            span: None,
         }
     }
 
@@ -2022,6 +2025,7 @@ mod tests {
             unsupported: None,
             since: None,
             deprecated: None,
+            span: None,
         });
         client
             .source_order
@@ -2070,6 +2074,7 @@ mod tests {
             unsupported: None,
             since: None,
             deprecated: None,
+            span: None,
         });
         client
             .source_order
@@ -2665,6 +2670,7 @@ mod tests {
             unsupported: None,
             since: None,
             deprecated: None,
+            span: None,
         };
         model.worlds[crate::WitWorldIdx::from_raw(0)]
             .imports

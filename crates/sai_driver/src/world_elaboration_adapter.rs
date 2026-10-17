@@ -681,7 +681,9 @@ fn project_external_item(
         WorldDirection::Export
     };
     let item = match item {
-        WitWorldItem::Interface { reference, .. } => {
+        WitWorldItem::Interface {
+            reference, span, ..
+        } => {
             let address = (
                 reference.unit.canonical_name().to_owned(),
                 reference.unit.stable_key().to_owned(),
@@ -693,9 +695,10 @@ fn project_external_item(
                 key,
                 kind: ElabKind::Interface(interface),
                 origin: ElabOrigin::External,
+                span: span.clone(),
             }
         }
-        WitWorldItem::Func { name, .. } => {
+        WitWorldItem::Func { name, span, .. } => {
             let function = world
                 .view
                 .definition_for_entity(WitViewEntity::WorldFunction {
@@ -707,6 +710,7 @@ fn project_external_item(
                 key: name.as_str().into(),
                 kind: ElabKind::Func(function),
                 origin: ElabOrigin::External,
+                span: span.clone(),
             }
         }
     };
@@ -793,6 +797,7 @@ fn append_included_external_items(
         if matches!(projected.item.kind, ElabKind::Func(_)) {
             projected.item.key = key;
         }
+        projected.item.span = include.span.clone().or_else(|| projected.item.span.clone());
         push_external_item(parent, projected);
     }
 }

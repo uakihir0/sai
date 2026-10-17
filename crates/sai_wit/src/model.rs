@@ -507,6 +507,9 @@ pub enum WitWorldItem {
         reference: WitIfaceRef,
         since: Option<WitStabilityVersion>,
         deprecated: Option<WitStabilityVersion>,
+        /// Source range of this `import` or `export` item when it came from
+        /// an authored WIT directory.
+        span: Option<WitSpan>,
     },
     Func {
         name: String,
@@ -514,6 +517,9 @@ pub enum WitWorldItem {
         unsupported: Option<Unsupported>,
         since: Option<WitStabilityVersion>,
         deprecated: Option<WitStabilityVersion>,
+        /// Source range of this `import` or `export` item when it came from
+        /// an authored WIT directory.
+        span: Option<WitSpan>,
     },
 }
 
@@ -566,10 +572,17 @@ pub struct WitWorldRef {
     pub names: Vec<(String, String)>,
     pub since: Option<WitStabilityVersion>,
     pub deprecated: Option<WitStabilityVersion>,
+    /// Source range of the include declaration when it came from an authored
+    /// WIT directory.
+    pub span: Option<WitSpan>,
 }
 
-/// A source file and byte range in the original WIT input.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// A snapshot-independent source path and byte range.
+///
+/// Spans attached to WIT model items refer to original WIT inputs. World
+/// elaboration may also use this representation for an authored SAI
+/// occurrence, where the path is resolved against the SAI workspace snapshot.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct WitSpan {
     pub path: String,
     pub range: Range<usize>,

@@ -10,7 +10,7 @@
 use crate::sai_identifier_to_wit_name;
 use sai_diagnostics::{Child, ChildKind, Code, Diagnostic, Location, Related, Severity};
 use sai_hir::{DefId, HirId};
-use sai_wit::wit_name_to_sai;
+use sai_wit::{WitSpan, wit_name_to_sai};
 use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -59,6 +59,13 @@ pub struct ElabItem {
     pub key: SmolStr,
     pub kind: ElabKind,
     pub origin: ElabOrigin,
+    /// Snapshot-independent source path and byte range for this occurrence.
+    ///
+    /// Local items carry an SAI source span following the reporting location
+    /// of `origin` (`Written`, `Included`, or `Implicit`). External items
+    /// retain their authored WIT item span when the model has one. Resolve
+    /// file IDs and snapshot versions only when binding diagnostics.
+    pub span: Option<WitSpan>,
 }
 
 /// The direction and position of an item in the combined world order.
@@ -1184,12 +1191,14 @@ fn written_occurrence(
     owner: HirId,
     location: Location,
 ) -> Occurrence {
+    let span = location_source_span(&location);
     Occurrence {
         direction,
         item: ElabItem {
             key: key.clone(),
             kind,
             origin: ElabOrigin::Written(owner),
+            span: Some(span),
         },
         location: Some(location),
         source_name: None,
@@ -1236,6 +1245,7 @@ fn included_occurrence(occurrence: &Occurrence, include: HirId, location: &Locat
             key: occurrence.item.key.clone(),
             kind: occurrence.item.kind,
             origin: ElabOrigin::Included { include },
+            span: Some(location_source_span(location)),
         },
         location: Some(location.clone()),
         source_name: occurrence.source_name.clone(),
@@ -1372,6 +1382,7 @@ fn append_implicit_imports(
                             key: metadata.key.clone(),
                             kind: ElabKind::Interface(interface),
                             origin: ElabOrigin::Implicit { cause, used_by },
+                            span: location.as_ref().map(location_source_span),
                         },
                         location,
                         source_name: metadata.source_name.clone(),
@@ -1384,6 +1395,13 @@ fn append_implicit_imports(
             };
             stack.extend(targets.iter().rev().map(|target| (*target, interface)));
         }
+    }
+}
+
+fn location_source_span(location: &Location) -> WitSpan {
+    WitSpan {
+        path: location.file.path.clone(),
+        range: location.span.range.start().to_usize()..location.span.range.end().to_usize(),
     }
 }
 
@@ -1985,6 +2003,30 @@ mod tests {
             },
             "nested include provenance is reported at the outer include"
         );
+        assert_eq!(
+            result.imports[0].span,
+            Some(WitSpan {
+                path: "src/lib.sai".to_owned(),
+                range: 1..2,
+            })
+        );
+        for included in [&result.imports[1], &result.imports[2], &result.exports[0]] {
+            assert_eq!(
+                included.span,
+                Some(WitSpan {
+                    path: "src/lib.sai".to_owned(),
+                    range: 10..11,
+                }),
+                "nested include output records the outer include's location"
+            );
+        }
+        assert_eq!(
+            result.exports[1].span,
+            Some(WitSpan {
+                path: "src/lib.sai".to_owned(),
+                range: 20..21,
+            })
+        );
         assert!(result.diagnostics.is_empty());
         assert!(result.complete);
     }
@@ -2065,6 +2107,27 @@ mod tests {
                 cause: import_cause,
                 used_by: fixture.def(2),
             }
+        );
+        assert_eq!(
+            result.imports[1].span,
+            Some(WitSpan {
+                path: "src/lib.sai".to_owned(),
+                range: 1..2,
+            })
+        );
+        assert_eq!(
+            result.imports[2].span,
+            Some(WitSpan {
+                path: "src/lib.sai".to_owned(),
+                range: 1..2,
+            })
+        );
+        assert_eq!(
+            result.imports[4].span,
+            Some(WitSpan {
+                path: "src/lib.sai".to_owned(),
+                range: 2..3,
+            })
         );
         assert!(result.diagnostics.is_empty());
     }
@@ -2178,6 +2241,7 @@ mod tests {
                 key: SmolStr::new("iface-0"),
                 kind: ElabKind::Interface(fixture.def(0)),
                 origin: ElabOrigin::Written(fixture.hir(10, 0)),
+                span: None,
             },
             location: Some(fixture.location(1)),
             source_name: None,
@@ -2480,6 +2544,7 @@ mod tests {
                     key: SmolStr::new("get-value"),
                     kind: ElabKind::Func(fixture.def(200)),
                     origin: ElabOrigin::External,
+                    span: None,
                 },
             }],
             complete: true,
@@ -2545,6 +2610,7 @@ mod tests {
                     key: SmolStr::new("type"),
                     kind: ElabKind::Func(fixture.def(201)),
                     origin: ElabOrigin::External,
+                    span: None,
                 },
             }],
             complete: true,
@@ -2587,6 +2653,7 @@ mod tests {
                         key: SmolStr::new("shared"),
                         kind: ElabKind::Interface(fixture.def(100)),
                         origin: ElabOrigin::Written(first_owner),
+                        span: None,
                     },
                     location: Some(fixture.location(0)),
                     source_name: None,
@@ -2597,6 +2664,7 @@ mod tests {
                         key: SmolStr::new("shared"),
                         kind: ElabKind::Interface(fixture.def(100)),
                         origin: middle_origin,
+                        span: None,
                     },
                     location: Some(fixture.location(1)),
                     source_name: None,
@@ -2607,6 +2675,7 @@ mod tests {
                         key: SmolStr::new("shared"),
                         kind: ElabKind::Interface(fixture.def(100)),
                         origin: ElabOrigin::Written(fixture.hir(13, 0)),
+                        span: None,
                     },
                     location: Some(fixture.location(2)),
                     source_name: None,
@@ -2643,6 +2712,7 @@ mod tests {
                         key: SmolStr::new("shared"),
                         kind: ElabKind::Interface(fixture.def(100)),
                         origin: special_origin,
+                        span: None,
                     },
                     location: Some(fixture.location(0)),
                     source_name: None,
@@ -2653,6 +2723,7 @@ mod tests {
                         key: SmolStr::new("shared"),
                         kind: ElabKind::Interface(fixture.def(100)),
                         origin: ElabOrigin::Written(fixture.hir(13, 0)),
+                        span: None,
                     },
                     location: Some(fixture.location(1)),
                     source_name: None,
@@ -2663,6 +2734,7 @@ mod tests {
                         key: SmolStr::new("shared"),
                         kind: ElabKind::Interface(fixture.def(100)),
                         origin: ElabOrigin::Written(fixture.hir(14, 0)),
+                        span: None,
                     },
                     location: Some(fixture.location(2)),
                     source_name: None,
@@ -3001,6 +3073,7 @@ mod tests {
                         key: SmolStr::new(format!("external-{index}")),
                         kind: ElabKind::Func(fixture.def(20_000 + index)),
                         origin: ElabOrigin::External,
+                        span: None,
                     },
                 })
                 .collect(),
@@ -3200,6 +3273,7 @@ mod tests {
                         key: SmolStr::new("external-in"),
                         kind: ElabKind::Func(fixture.def(201)),
                         origin: ElabOrigin::External,
+                        span: None,
                     },
                 },
                 ExternalWorldItem {
@@ -3208,6 +3282,7 @@ mod tests {
                         key: SmolStr::new("external-out"),
                         kind: ElabKind::Interface(fixture.def(202)),
                         origin: ElabOrigin::External,
+                        span: None,
                     },
                 },
                 ExternalWorldItem {
@@ -3216,6 +3291,7 @@ mod tests {
                         key: SmolStr::new("external-in-2"),
                         kind: ElabKind::Func(fixture.def(203)),
                         origin: ElabOrigin::External,
+                        span: None,
                     },
                 },
             ],
@@ -3334,6 +3410,7 @@ mod tests {
                         key: SmolStr::new(format!("item-{index}")),
                         kind: ElabKind::Func(fixture.def(index)),
                         origin: ElabOrigin::External,
+                        span: None,
                     },
                     location: None,
                     source_name: None,

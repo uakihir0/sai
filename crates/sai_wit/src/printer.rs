@@ -314,6 +314,7 @@ fn print_world_item(
             reference,
             since,
             deprecated,
+            ..
         } => {
             push_stability(output, since.as_ref(), deprecated.as_ref(), 1);
             let path = print_interface_path(package, reference);
@@ -741,6 +742,7 @@ mod tests {
                     unsupported: None,
                     since: None,
                     deprecated: None,
+                    span: None,
                 },
                 WitWorldItem::Func {
                     name: "second".to_owned(),
@@ -748,6 +750,7 @@ mod tests {
                     unsupported: None,
                     since: None,
                     deprecated: None,
+                    span: None,
                 },
             ],
             exports: vec![WitWorldItem::Func {
@@ -756,6 +759,7 @@ mod tests {
                 unsupported: None,
                 since: None,
                 deprecated: None,
+                span: None,
             }],
             includes: vec![WitWorldRef {
                 unit: included_unit,
@@ -764,6 +768,7 @@ mod tests {
                 names: Vec::new(),
                 since: None,
                 deprecated: None,
+                span: None,
             }],
             source_order: vec![
                 WitWorldItemOrder::import(0),
@@ -1060,6 +1065,7 @@ mod tests {
                     names: Vec::new(),
                     since: None,
                     deprecated: None,
+                    span: None,
                 }],
                 source_order: vec![WitWorldItemOrder::include(0)],
                 unsupported: None,

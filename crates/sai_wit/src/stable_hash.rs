@@ -269,6 +269,7 @@ impl StableHash for WitWorldRef {
         }
         stable_version(&self.since, hasher);
         stable_version(&self.deprecated, hasher);
+        self.span.stable_hash(hasher);
     }
 }
 
@@ -312,11 +313,13 @@ impl StableHash for WitWorldItem {
                 reference,
                 since,
                 deprecated,
+                span,
             } => {
                 hasher.write_tag(0x01);
                 reference.stable_hash(hasher);
                 stable_version(since, hasher);
                 stable_version(deprecated, hasher);
+                span.stable_hash(hasher);
             }
             Self::Func {
                 name,
@@ -324,6 +327,7 @@ impl StableHash for WitWorldItem {
                 unsupported,
                 since,
                 deprecated,
+                span,
             } => {
                 hasher.write_tag(0x02);
                 name.stable_hash(hasher);
@@ -331,6 +335,7 @@ impl StableHash for WitWorldItem {
                 unsupported.stable_hash(hasher);
                 stable_version(since, hasher);
                 stable_version(deprecated, hasher);
+                span.stable_hash(hasher);
             }
         }
     }
