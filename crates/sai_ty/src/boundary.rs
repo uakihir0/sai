@@ -11,7 +11,9 @@ use sai_hir::types::{
 use sai_hir::{DefId, HirId, OwnerId, Span};
 use sai_resolve::package_scopes::{DefKind, PathRes, Res};
 use sai_resolve::prelude::PrimTy;
+use sai_wit::{WitType, WitTypeRef};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 
 /// The boundary position of one HIR type.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -993,12 +995,128 @@ fn incompatible(span: Span, reason: IncompatibleReason) -> BoundaryTypeOutcome {
     BoundaryTypeOutcome::Incompatible(Incompatible { span, reason })
 }
 
+/// Why a boundary type could not be materialized as a WIT model type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BoundaryWitTypeError {
+    /// A named SAI boundary type has no generated or viewed WIT item.
+    MissingNamedReference(DefId),
+    /// A resource handle has no generated or viewed WIT resource item.
+    MissingResourceReference(DefId),
+    /// Unit is only representable as the absence of a function result.
+    UnitOutsideFunctionResult,
+}
+
+impl fmt::Display for BoundaryWitTypeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingNamedReference(definition) => {
+                write!(
+                    formatter,
+                    "missing WIT reference for named type {definition:?}"
+                )
+            }
+            Self::MissingResourceReference(definition) => write!(
+                formatter,
+                "missing WIT reference for resource type {definition:?}"
+            ),
+            Self::UnitOutsideFunctionResult => {
+                formatter.write_str("unit is only valid as a function result")
+            }
+        }
+    }
+}
+
+impl std::error::Error for BoundaryWitTypeError {}
+
+/// Materialize an index-free boundary type into the WIT model.
+///
+/// `references` must contain each named interface type and resource reachable
+/// from `ty`, keyed by its resolved definition identity. The caller supplies
+/// `Position::Result` only for a function's outermost result; unit there is
+/// represented by `Ok(None)`, while unit anywhere nested is an error.
+pub fn materialize_boundary_type(
+    ty: &BoundaryType,
+    references: &HashMap<DefId, WitTypeRef>,
+    position: Position,
+) -> Result<Option<WitType>, BoundaryWitTypeError> {
+    match ty {
+        BoundaryType::Unit if position == Position::Result => Ok(None),
+        BoundaryType::Unit => Err(BoundaryWitTypeError::UnitOutsideFunctionResult),
+        BoundaryType::Bool => Ok(Some(WitType::Bool)),
+        BoundaryType::S8 => Ok(Some(WitType::S8)),
+        BoundaryType::S16 => Ok(Some(WitType::S16)),
+        BoundaryType::S32 => Ok(Some(WitType::S32)),
+        BoundaryType::S64 => Ok(Some(WitType::S64)),
+        BoundaryType::U8 => Ok(Some(WitType::U8)),
+        BoundaryType::U16 => Ok(Some(WitType::U16)),
+        BoundaryType::U32 => Ok(Some(WitType::U32)),
+        BoundaryType::U64 => Ok(Some(WitType::U64)),
+        BoundaryType::F32 => Ok(Some(WitType::F32)),
+        BoundaryType::F64 => Ok(Some(WitType::F64)),
+        BoundaryType::Char => Ok(Some(WitType::Char)),
+        BoundaryType::String => Ok(Some(WitType::String)),
+        BoundaryType::List(inner) => Ok(Some(WitType::List(Box::new(
+            materialize_nested_boundary_type(inner, references)?,
+        )))),
+        BoundaryType::Option(inner) => Ok(Some(WitType::Option(Box::new(
+            materialize_nested_boundary_type(inner, references)?,
+        )))),
+        BoundaryType::Result { ok, err } => {
+            let ok = ok
+                .as_deref()
+                .map(|ty| materialize_nested_boundary_type(ty, references).map(Box::new))
+                .transpose()?;
+            let err = err
+                .as_deref()
+                .map(|ty| materialize_nested_boundary_type(ty, references).map(Box::new))
+                .transpose()?;
+            Ok(Some(WitType::Result { ok, err }))
+        }
+        BoundaryType::Tuple(elements) => Ok(Some(WitType::Tuple(
+            elements
+                .iter()
+                .map(|ty| materialize_nested_boundary_type(ty, references))
+                .collect::<Result<Vec<_>, _>>()?,
+        ))),
+        BoundaryType::Named(definition) => references
+            .get(definition)
+            .cloned()
+            .map(WitType::Named)
+            .map(Some)
+            .ok_or(BoundaryWitTypeError::MissingNamedReference(*definition)),
+        BoundaryType::Own(definition) => references
+            .get(definition)
+            .cloned()
+            .map(WitType::Own)
+            .map(Some)
+            .ok_or(BoundaryWitTypeError::MissingResourceReference(*definition)),
+        BoundaryType::Borrow(definition) => references
+            .get(definition)
+            .cloned()
+            .map(WitType::Borrow)
+            .map(Some)
+            .ok_or(BoundaryWitTypeError::MissingResourceReference(*definition)),
+    }
+}
+
+fn materialize_nested_boundary_type(
+    ty: &BoundaryType,
+    references: &HashMap<DefId, WitTypeRef>,
+) -> Result<WitType, BoundaryWitTypeError> {
+    // Nested values can never denote an absent function result. Keeping this
+    // assertion local makes the `Option<WitType>` at the public boundary
+    // unambiguously mean "no function result".
+    materialize_boundary_type(ty, references, Position::Nested)?
+        .ok_or(BoundaryWitTypeError::UnitOutsideFunctionResult)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BoundaryAlias, BoundaryDefinition, BoundaryType, BoundaryTypeContext, BoundaryTypeOutcome,
-        BoundaryTypeReference, CanonicalBoundaryType, Incompatible, IncompatibleReason, Position,
-        ResourceContainment, boundary_type, boundary_type_with_references,
+        BoundaryTypeReference, BoundaryWitTypeError, CanonicalBoundaryType, Incompatible,
+        IncompatibleReason, Position, ResourceContainment, boundary_type,
+        boundary_type_with_references, materialize_boundary_type,
     };
     use sai_hir::types::{
         ConstArg, GenericArg, GenericArgs, GenericParam, GenericParamKind, LangItem, Name, Path,
@@ -1012,6 +1130,7 @@ mod tests {
     use sai_resolve::package_scopes::{DefKind, PathRes, Res};
     use sai_resolve::prelude::PrimTy;
     use sai_vfs::{FileId, TextRange, TextSize};
+    use sai_wit::WitType;
     use std::collections::HashMap;
     use std::sync::OnceLock;
 
@@ -1217,6 +1336,153 @@ mod tests {
             resource_containment,
             self_resource,
         }
+    }
+
+    #[test]
+    fn materializes_primitives_and_structural_types_recursively() {
+        let references = HashMap::new();
+        let primitive_cases = [
+            (BoundaryType::Bool, WitType::Bool),
+            (BoundaryType::S8, WitType::S8),
+            (BoundaryType::S16, WitType::S16),
+            (BoundaryType::S32, WitType::S32),
+            (BoundaryType::S64, WitType::S64),
+            (BoundaryType::U8, WitType::U8),
+            (BoundaryType::U16, WitType::U16),
+            (BoundaryType::U32, WitType::U32),
+            (BoundaryType::U64, WitType::U64),
+            (BoundaryType::F32, WitType::F32),
+            (BoundaryType::F64, WitType::F64),
+            (BoundaryType::Char, WitType::Char),
+            (BoundaryType::String, WitType::String),
+        ];
+        for (boundary, wit) in primitive_cases {
+            assert_eq!(
+                materialize_boundary_type(&boundary, &references, Position::Nested),
+                Ok(Some(wit))
+            );
+        }
+
+        let boundary = BoundaryType::Tuple(vec![
+            BoundaryType::List(Box::new(BoundaryType::U8)),
+            BoundaryType::Option(Box::new(BoundaryType::String)),
+            BoundaryType::Result {
+                ok: Some(Box::new(BoundaryType::Tuple(vec![
+                    BoundaryType::Bool,
+                    BoundaryType::F64,
+                ]))),
+                err: None,
+            },
+            BoundaryType::Result {
+                ok: None,
+                err: Some(Box::new(BoundaryType::Char)),
+            },
+        ]);
+        let expected = WitType::Tuple(vec![
+            WitType::List(Box::new(WitType::U8)),
+            WitType::Option(Box::new(WitType::String)),
+            WitType::Result {
+                ok: Some(Box::new(WitType::Tuple(vec![WitType::Bool, WitType::F64]))),
+                err: None,
+            },
+            WitType::Result {
+                ok: None,
+                err: Some(Box::new(WitType::Char)),
+            },
+        ]);
+        assert_eq!(
+            materialize_boundary_type(&boundary, &references, Position::Nested),
+            Ok(Some(expected))
+        );
+        for (boundary, expected) in [
+            (
+                BoundaryType::Result {
+                    ok: None,
+                    err: Some(Box::new(BoundaryType::U32)),
+                },
+                WitType::Result {
+                    ok: None,
+                    err: Some(Box::new(WitType::U32)),
+                },
+            ),
+            (
+                BoundaryType::Result {
+                    ok: Some(Box::new(BoundaryType::U32)),
+                    err: None,
+                },
+                WitType::Result {
+                    ok: Some(Box::new(WitType::U32)),
+                    err: None,
+                },
+            ),
+        ] {
+            assert_eq!(
+                materialize_boundary_type(&boundary, &references, Position::Result),
+                Ok(Some(expected)),
+                "a unit Result arm is encoded by the missing WIT payload"
+            );
+        }
+    }
+
+    #[test]
+    fn materializes_unit_only_as_the_outer_function_result() {
+        let references = HashMap::new();
+        assert_eq!(
+            materialize_boundary_type(&BoundaryType::Unit, &references, Position::Result),
+            Ok(None)
+        );
+        assert_eq!(
+            materialize_boundary_type(&BoundaryType::Unit, &references, Position::Nested),
+            Err(BoundaryWitTypeError::UnitOutsideFunctionResult)
+        );
+        assert_eq!(
+            materialize_boundary_type(&BoundaryType::Unit, &references, Position::Param),
+            Err(BoundaryWitTypeError::UnitOutsideFunctionResult)
+        );
+        assert_eq!(
+            materialize_boundary_type(
+                &BoundaryType::List(Box::new(BoundaryType::Unit)),
+                &references,
+                Position::Nested
+            ),
+            Err(BoundaryWitTypeError::UnitOutsideFunctionResult)
+        );
+    }
+
+    #[test]
+    fn reports_missing_named_and_resource_references_by_kind() {
+        let ids = test_ids();
+        let references = HashMap::new();
+        assert_eq!(
+            materialize_boundary_type(
+                &BoundaryType::Named(def_id(&ids, 90)),
+                &references,
+                Position::Nested
+            ),
+            Err(BoundaryWitTypeError::MissingNamedReference(def_id(
+                &ids, 90
+            )))
+        );
+        assert_eq!(
+            materialize_boundary_type(
+                &BoundaryType::Own(def_id(&ids, 91)),
+                &references,
+                Position::Nested
+            ),
+            Err(BoundaryWitTypeError::MissingResourceReference(def_id(
+                &ids, 91
+            )))
+        );
+        assert_eq!(
+            materialize_boundary_type(
+                &BoundaryType::Borrow(def_id(&ids, 92)),
+                &references,
+                Position::Nested
+            ),
+            Err(BoundaryWitTypeError::MissingResourceReference(def_id(
+                &ids, 92
+            )))
+        );
     }
 
     #[test]

@@ -1,13 +1,14 @@
 use super::{
-    CurrentOwnerInputs, DetachedWorkspaceDiagnostic, InterfaceResourceMemberIds,
-    OwnedPhase1ModuleInput, OwnerControlFlowResolutionError, Phase1ActiveWitViewEntry,
-    Phase1ModuleScopes, Phase1PackageScopesQueryOutput, Prelude, PreparedPhase1PackageScopes,
-    PrimitivePreludeBuildError, STAGED_PHASE1_PACKAGE_SCOPES, TypeOwnerPathResolution,
-    append_interface_use_references, index_top_level_owner_descriptors_in_scopes,
-    interface_generation_order, interface_member_kind, local_interface_type_member_owners,
-    lower_interface_item_owner, lower_interface_resource_member_owner, lower_top_level_owner,
-    module_scope_for_scopes, owner_test_only_path_candidates, owner_type_generic_resolutions,
-    resolve_partial_type_owner_paths,
+    CurrentOwnerInputs, DetachedWorkspaceDiagnostic, InterfaceResourceMemberIds, ItemTreeEntry,
+    OwnedPhase1ModuleInput, OwnerControlFlowResolutionError, PackageWitNamesQueryError,
+    Phase1ActiveWitViewEntry, Phase1ModuleScopes, Phase1PackageScopesQueryOutput, Prelude,
+    PreparedPhase1PackageScopes, PrimitivePreludeBuildError, STAGED_PHASE1_PACKAGE_SCOPES,
+    TypeOwnerPathResolution, append_interface_use_references,
+    index_top_level_owner_descriptors_in_scopes, interface_generation_order, interface_member_kind,
+    local_interface_type_member_owners, lower_interface_item_owner,
+    lower_interface_resource_member_owner, lower_top_level_owner, module_scope_for_scopes,
+    owner_test_only_path_candidates, owner_type_generic_resolutions,
+    package_wit_name_queries::PackageWitNamesQueries, resolve_partial_type_owner_paths,
 };
 use sai_diagnostics::{
     Child, ChildKind, Diagnostic, Location, Related, Severity, SourceRef, Value,
@@ -22,12 +23,13 @@ use sai_hir::{
     OwnerId, Symbol,
 };
 use sai_intern::{Interner, PackageInterner};
+use sai_package::version::Version;
 use sai_query::{DerivedQuery, QueryDatabase, QueryError};
 use sai_resolve::module_member_lookup::ModuleMemberIndex;
 use sai_resolve::package_scopes::{
     DefKind, PackageScopesError, PathRes, Phase1PackageScopes, Res, TopLevelOwnerKind,
 };
-use sai_resolve::{InterfaceUse, WorldElaborationInterface};
+use sai_resolve::{InterfaceUse, PackageWitNames, WorldElaborationInterface};
 use sai_resolve::{
     InterfaceUseReference, InterfaceUses, InterfaceUsesInput, WitNameCollision, WitNameDefinition,
     interface_uses, sai_identifier_to_wit_name, wit_name_collisions,
@@ -42,10 +44,11 @@ use sai_ty::iface::{
 };
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
 use sai_wit::{
-    WitFunc, WitIfaceIdx, WitItem, WitItemKind, WitPackageDeclaration, WitType, WitTypeRef,
-    WitViewDefKind, WitViewEntity, wit_name_to_sai,
+    GeneratedText, WitFunc, WitIfaceIdx, WitIndexVec, WitInterface, WitItem, WitItemIdx,
+    WitItemKind, WitPackage, WitPackageDeclaration, WitPackageName, WitStabilityVersion, WitType,
+    WitTypeRef, WitUnit, WitViewDefKind, WitViewEntity, print_wit, wit_name_to_sai,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 struct LocalBoundaryAliases<'hir> {
@@ -131,9 +134,12 @@ pub enum InterfaceUsesQueryError {
     Query(QueryError),
     Collection(OwnerControlFlowResolutionError),
     PackageScopes(PackageScopesError),
+    PackageWitNames(PackageWitNamesQueryError),
     DefPath(DefPathError),
     DefPathInterner(DefPathInternerError),
     DiagnosticTemplate(String),
+    WitUnitIdentity(sai_wit::WitUnitIdentityError),
+    WitIndexVec(sai_wit::WitIndexVecError),
 }
 
 /// Ordered interface identities and use edges needed by world elaboration.
@@ -163,8 +169,61 @@ impl WorldInterfaceUseGraph {
 struct InterfaceUsesMemo {
     graph: InterfaceUses,
     world_graph: WorldInterfaceUseGraph,
+    generated_wit_text: Option<GeneratedText>,
     diagnostics: Vec<DetachedWorkspaceDiagnostic>,
     interface_check_diagnostics: Vec<DetachedWorkspaceDiagnostic>,
+}
+
+struct GeneratedWitCandidate {
+    unit: WitUnit,
+    identity: String,
+    version: Version,
+    interfaces: Vec<(LocalDefId, WitInterface)>,
+    complete: bool,
+}
+
+impl GeneratedWitCandidate {
+    fn into_text(
+        self,
+        cyclic_interfaces: &BTreeSet<LocalDefId>,
+        has_interface_use_diagnostics: bool,
+    ) -> Result<GeneratedText, InterfaceUsesQueryError> {
+        let identity = sai_package::identity::PackageIdentity::parse(&self.identity)
+            .expect("the active package graph validated its source identity");
+        let mut package = WitPackage {
+            unit: self.unit,
+            name: WitPackageName {
+                namespace: identity.namespace().to_owned(),
+                name: identity.name().to_owned(),
+                version: Some(self.version),
+            },
+            interfaces: WitIndexVec::new(),
+            worlds: WitIndexVec::new(),
+            declaration_order: Vec::new(),
+        };
+        let mut complete = self.complete && !has_interface_use_diagnostics;
+        let mut origins = Vec::with_capacity(self.interfaces.len());
+        for (definition, interface) in self.interfaces {
+            if cyclic_interfaces.contains(&definition) {
+                complete = false;
+                continue;
+            }
+            let name = interface.name.clone();
+            let index = package
+                .interfaces
+                .push(interface)
+                .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+            package
+                .declaration_order
+                .push(WitPackageDeclaration::Interface(index));
+            origins.push((name, definition.to_def_id()));
+        }
+        Ok(GeneratedText {
+            text: Arc::from(print_wit(&package)),
+            complete,
+            origins: Arc::from(origins),
+        })
+    }
 }
 
 impl PartialEq for InterfaceUsesMemo {
@@ -172,6 +231,7 @@ impl PartialEq for InterfaceUsesMemo {
         self.graph.uses == other.graph.uses
             && self.graph.cyclic == other.graph.cyclic
             && self.world_graph == other.world_graph
+            && self.generated_wit_text == other.generated_wit_text
             && self.diagnostics == other.diagnostics
             && self.interface_check_diagnostics == other.interface_check_diagnostics
     }
@@ -206,6 +266,7 @@ pub(super) struct InterfaceUsesQueries {
 impl InterfaceUsesQueries {
     pub(super) fn new(
         package_scopes: DerivedQuery<PackageKey, Phase1PackageScopesQueryOutput>,
+        package_wit_names: PackageWitNamesQueries,
         packages: Arc<PackageInterner>,
         symbols: Arc<Interner>,
         primitive_prelude: Result<Prelude, PrimitivePreludeBuildError>,
@@ -236,63 +297,81 @@ impl InterfaceUsesQueries {
                     })?
                     .scopes
                     .clone();
+                let (package_wit_names, _) = package_wit_names
+                    .get(database, key.clone(), &prepared.snapshot)
+                    .map_err(|error| QueryError::Panicked {
+                        query: "interface_uses".to_owned(),
+                        message: format!("package WIT names failed: {error:?}"),
+                    })?;
                 let result = collect_interface_uses_input(
                     key,
                     &prepared,
                     &scopes,
+                    &package_wit_names,
                     &primitive_prelude,
                     &packages,
                     &symbols,
                 )
-                .and_then(|(input, world_graph, interface_check_diagnostics)| {
-                    let graph = interface_uses(input.clone());
-                    let result_fingerprint = stable_interface_uses_fingerprint(
-                        key,
-                        &input,
-                        &graph,
-                        &world_graph,
-                        &interface_check_diagnostics,
-                        &prepared,
-                        &packages,
-                        &symbols,
-                    )?;
-                    let mut graph = graph;
-                    let diagnostics = std::mem::take(&mut graph.diagnostics)
-                        .into_iter()
-                        .map(|diagnostic| {
-                            let mut detached = DetachedWorkspaceDiagnostic::from_diagnostic(
-                                &diagnostic,
-                            )
-                            .map_err(|error| {
-                                InterfaceUsesQueryError::DiagnosticTemplate(format!("{error:?}"))
-                            })?;
-                            clear_document_versions(&mut detached);
-                            Ok(detached)
-                        })
-                        .collect::<Result<Vec<_>, InterfaceUsesQueryError>>()?;
-                    let interface_check_diagnostics = interface_check_diagnostics
-                        .iter()
-                        .map(|diagnostic| {
-                            let mut detached = DetachedWorkspaceDiagnostic::from_diagnostic(
-                                diagnostic,
-                            )
-                            .map_err(|error| {
-                                InterfaceUsesQueryError::DiagnosticTemplate(format!("{error:?}"))
-                            })?;
-                            clear_document_versions(&mut detached);
-                            Ok(detached)
-                        })
-                        .collect::<Result<Vec<_>, InterfaceUsesQueryError>>()?;
-                    Ok((
-                        InterfaceUsesMemo {
-                            graph,
-                            world_graph,
-                            diagnostics,
-                            interface_check_diagnostics,
-                        },
-                        result_fingerprint,
-                    ))
-                });
+                .and_then(
+                    |(input, world_graph, interface_check_diagnostics, generated_candidate)| {
+                        let graph = interface_uses(input.clone());
+                        let generated_wit_text = generated_candidate
+                            .map(|candidate| {
+                                candidate.into_text(&graph.cyclic, !graph.diagnostics.is_empty())
+                            })
+                            .transpose()?;
+                        let result_fingerprint = stable_interface_uses_fingerprint(
+                            key,
+                            &input,
+                            &graph,
+                            &world_graph,
+                            &interface_check_diagnostics,
+                            generated_wit_text.as_ref(),
+                            &prepared,
+                            &packages,
+                            &symbols,
+                        )?;
+                        let mut graph = graph;
+                        let diagnostics = std::mem::take(&mut graph.diagnostics)
+                            .into_iter()
+                            .map(|diagnostic| {
+                                let mut detached =
+                                    DetachedWorkspaceDiagnostic::from_diagnostic(&diagnostic)
+                                        .map_err(|error| {
+                                            InterfaceUsesQueryError::DiagnosticTemplate(format!(
+                                                "{error:?}"
+                                            ))
+                                        })?;
+                                clear_document_versions(&mut detached);
+                                Ok(detached)
+                            })
+                            .collect::<Result<Vec<_>, InterfaceUsesQueryError>>()?;
+                        let interface_check_diagnostics = interface_check_diagnostics
+                            .iter()
+                            .map(|diagnostic| {
+                                let mut detached =
+                                    DetachedWorkspaceDiagnostic::from_diagnostic(diagnostic)
+                                        .map_err(|error| {
+                                            InterfaceUsesQueryError::DiagnosticTemplate(format!(
+                                                "{error:?}"
+                                            ))
+                                        })?;
+                                clear_document_versions(&mut detached);
+                                Ok(detached)
+                            })
+                            .collect::<Result<Vec<_>, InterfaceUsesQueryError>>()?;
+                        Ok((
+                            InterfaceUsesMemo {
+                                graph,
+                                world_graph,
+                                generated_wit_text,
+                                diagnostics,
+                                interface_check_diagnostics,
+                            },
+                            result_fingerprint,
+                        ))
+                    },
+                );
                 let (result, result_fingerprint) = match result {
                     Ok((memo, fingerprint)) => (Ok(memo), fingerprint),
                     Err(error) => {
@@ -321,6 +400,7 @@ impl InterfaceUsesQueries {
             WorldInterfaceUseGraph,
             Fingerprint,
             Vec<Diagnostic>,
+            Option<GeneratedText>,
         ),
         InterfaceUsesQueryError,
     > {
@@ -350,6 +430,7 @@ impl InterfaceUsesQueries {
             memo.world_graph.clone(),
             world_interface_uses_fingerprint,
             interface_check_diagnostics,
+            memo.generated_wit_text.clone(),
         ))
     }
 }
@@ -457,7 +538,10 @@ pub(super) fn append_world_function_name_diagnostics(
             | InterfaceUsesQueryError::PackageScopes(_)
             | InterfaceUsesQueryError::DefPath(_)
             | InterfaceUsesQueryError::DefPathInterner(_)
-            | InterfaceUsesQueryError::DiagnosticTemplate(_) => {
+            | InterfaceUsesQueryError::DiagnosticTemplate(_)
+            | InterfaceUsesQueryError::PackageWitNames(_)
+            | InterfaceUsesQueryError::WitUnitIdentity(_)
+            | InterfaceUsesQueryError::WitIndexVec(_) => {
                 unreachable!("source-bound world name checks only return collection errors")
             }
         })?;
@@ -1156,11 +1240,19 @@ fn collect_interface_uses_input(
     package_key: &PackageKey,
     prepared: &PreparedPhase1PackageScopes,
     scopes: &Phase1PackageScopes,
+    package_wit_names: &PackageWitNames,
     primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
     packages: &PackageInterner,
     symbols: &Interner,
-) -> Result<(InterfaceUsesInput, WorldInterfaceUseGraph, Vec<Diagnostic>), InterfaceUsesQueryError>
-{
+) -> Result<
+    (
+        InterfaceUsesInput,
+        WorldInterfaceUseGraph,
+        Vec<Diagnostic>,
+        Option<GeneratedWitCandidate>,
+    ),
+    InterfaceUsesQueryError,
+> {
     let descriptors = interface_generation_order(
         &prepared.module_tree,
         scopes
@@ -1172,6 +1264,32 @@ fn collect_interface_uses_input(
         symbols,
     )
     .map_err(InterfaceUsesQueryError::Collection)?;
+    let generated_unit = prepared
+        .generated_package_version
+        .as_ref()
+        .map(|selected| {
+            WitUnit::generated(prepared.module_tree.package, packages, selected)
+                .map_err(InterfaceUsesQueryError::WitUnitIdentity)
+        })
+        .transpose()?;
+    let mut generated_interfaces = Vec::new();
+    let mut interface_names_by_spelling = HashMap::<String, Vec<LocalDefId>>::new();
+    for (definition, name) in &package_wit_names.names {
+        interface_names_by_spelling
+            .entry(name.to_string())
+            .or_default()
+            .push(*definition);
+    }
+    let duplicate_interface_names = interface_names_by_spelling
+        .values()
+        .filter(|definitions| definitions.len() > 1)
+        .flat_map(|definitions| definitions.iter().copied())
+        .collect::<HashSet<_>>();
+    let mut generated_complete = !scopes
+        .top_level_owners
+        .iter()
+        .any(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
+        && package_wit_names.diagnostics.is_empty();
     let interface_type_members = local_interface_type_member_owners(scopes, &descriptors);
     let external_world_interfaces =
         collect_external_world_interface_data(prepared.active_wit_view_entries.as_deref());
@@ -1371,9 +1489,29 @@ fn collect_interface_uses_input(
                 .map_err(InterfaceUsesQueryError::Collection)?;
         let mut owner_references = Vec::new();
         let mut owner_world_references = Vec::<(sai_vfs::TextSize, InterfaceUse)>::new();
-        let mut owner_uses_complete =
-            local_interface_wit_name(descriptor.owner.def_id, prepared, symbols)?.is_some()
-                && parent_hir.diagnostics.is_empty();
+        let interface_wit_name = package_wit_names
+            .names
+            .get(&descriptor.owner.def_id)
+            .map(ToString::to_string);
+        let interface_name_is_unique =
+            !duplicate_interface_names.contains(&descriptor.owner.def_id);
+        let interface_attrs = inputs.validated_attrs.get(&descriptor.item_id);
+        let interface_attrs_complete =
+            interface_attrs.is_none_or(|attrs| attrs.diagnostics.is_empty());
+        let mut owner_uses_complete = interface_wit_name.is_some()
+            && interface_name_is_unique
+            && parent_hir.diagnostics.is_empty()
+            && interface_attrs_complete;
+        let mut generated_items = WitIndexVec::<WitItemIdx, WitItem>::new();
+        let mut generated_item_names = HashSet::new();
+        let generated_interface_eligible = generated_unit.is_some()
+            && interface_wit_name.is_some()
+            && interface_name_is_unique
+            && parent_hir.diagnostics.is_empty()
+            && interface_attrs_complete;
+        if generated_unit.is_some() && !generated_interface_eligible {
+            generated_complete = false;
+        }
         let mut interface_item_names = Vec::with_capacity(member_entries.len());
         let mut generated_use_aliases = Vec::<GeneratedUseAlias>::new();
         for (entry, member_owner) in member_entries
@@ -1406,7 +1544,8 @@ fn collect_interface_uses_input(
             let flags_marker_accepted = inputs.accepted_flags_attributes.contains(&entry.ast_id);
             let member_issues =
                 collect_interface_item_issues(&member_hir, flags_marker_accepted, symbols)?;
-            if !member_issues.is_empty() {
+            let member_has_issues = !member_issues.is_empty();
+            if member_has_issues {
                 owner_uses_complete = false;
                 poisoned_owners.insert(member_owner);
             }
@@ -1463,29 +1602,59 @@ fn collect_interface_uses_input(
                 &mut owner_uses_complete,
                 inputs,
             )?;
-            let has_incompatible_boundary = append_interface_boundary_diagnostics(
-                &member_hir,
-                &resolution,
-                &interface_boundary_types,
-                &boundary_use_alias_names,
-                &mut local_boundary_aliases,
-                descriptor.owner.def_id,
-                &interface_type_members,
-                &world_interface_type_members,
-                &mut owner_references,
-                &mut owner_world_references,
-                &mut owner_uses_complete,
-                &module_inputs,
-                &inputs.source_ref,
-                &inputs.source,
-                &prepared.snapshot,
-                &mut generated_use_aliases,
-                &mut owner_dependencies,
-                &mut interface_check_diagnostics,
-            )?;
+            let (has_incompatible_boundary, boundary_conversions) =
+                append_interface_boundary_diagnostics(
+                    &member_hir,
+                    &resolution,
+                    &interface_boundary_types,
+                    &boundary_use_alias_names,
+                    &mut local_boundary_aliases,
+                    descriptor.owner.def_id,
+                    &interface_type_members,
+                    &world_interface_type_members,
+                    &mut owner_references,
+                    &mut owner_world_references,
+                    &mut owner_uses_complete,
+                    &module_inputs,
+                    &inputs.source_ref,
+                    &inputs.source,
+                    &prepared.snapshot,
+                    &mut generated_use_aliases,
+                    &mut owner_dependencies,
+                    &mut interface_check_diagnostics,
+                )?;
             if has_incompatible_boundary {
                 owner_uses_complete = false;
                 poisoned_owners.insert(member_owner);
+            }
+            if generated_interface_eligible {
+                let item = if kind == super::InterfaceMemberKind::Function
+                    && member_hir.diagnostics.is_empty()
+                    && !member_has_issues
+                    && !has_incompatible_boundary
+                {
+                    generated_function_item(
+                        entry,
+                        &member_hir,
+                        &boundary_conversions,
+                        inputs.validated_attrs.get(&entry.ast_id),
+                        prepared.generated_package_version.as_ref(),
+                        symbols,
+                    )?
+                } else {
+                    None
+                };
+                if let Some(item) = item {
+                    if generated_item_names.insert(item.name.clone()) {
+                        generated_items
+                            .push(item)
+                            .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+                    } else {
+                        generated_complete = false;
+                    }
+                } else {
+                    generated_complete = false;
+                }
             }
             if kind != super::InterfaceMemberKind::Resource {
                 continue;
@@ -1591,26 +1760,27 @@ fn collect_interface_uses_input(
                     &mut owner_uses_complete,
                     inputs,
                 )?;
-                let has_incompatible_boundary = append_interface_boundary_diagnostics(
-                    &method_hir,
-                    &resolution,
-                    &interface_boundary_types,
-                    &boundary_use_alias_names,
-                    &mut local_boundary_aliases,
-                    descriptor.owner.def_id,
-                    &interface_type_members,
-                    &world_interface_type_members,
-                    &mut owner_references,
-                    &mut owner_world_references,
-                    &mut owner_uses_complete,
-                    &module_inputs,
-                    &inputs.source_ref,
-                    &inputs.source,
-                    &prepared.snapshot,
-                    &mut generated_use_aliases,
-                    &mut owner_dependencies,
-                    &mut interface_check_diagnostics,
-                )?;
+                let (has_incompatible_boundary, _boundary_conversions) =
+                    append_interface_boundary_diagnostics(
+                        &method_hir,
+                        &resolution,
+                        &interface_boundary_types,
+                        &boundary_use_alias_names,
+                        &mut local_boundary_aliases,
+                        descriptor.owner.def_id,
+                        &interface_type_members,
+                        &world_interface_type_members,
+                        &mut owner_references,
+                        &mut owner_world_references,
+                        &mut owner_uses_complete,
+                        &module_inputs,
+                        &inputs.source_ref,
+                        &inputs.source,
+                        &prepared.snapshot,
+                        &mut generated_use_aliases,
+                        &mut owner_dependencies,
+                        &mut interface_check_diagnostics,
+                    )?;
                 if has_incompatible_boundary {
                     owner_uses_complete = false;
                     poisoned_owners.insert(method_owner);
@@ -1632,6 +1802,29 @@ fn collect_interface_uses_input(
             generated_use_aliases,
             local_definitions: interface_item_names,
         });
+        if generated_unit.is_some() {
+            if generated_interface_eligible {
+                let stability = generated_stability(
+                    interface_attrs,
+                    prepared.generated_package_version.as_ref(),
+                );
+                if let (Some(name), Some((since, deprecated))) = (interface_wit_name, stability) {
+                    generated_interfaces.push((
+                        descriptor.owner.def_id,
+                        WitInterface {
+                            name,
+                            docs: parent_entry.docs.clone().map(Arc::from),
+                            since,
+                            deprecated,
+                            items: generated_items,
+                            span: None,
+                        },
+                    ));
+                } else {
+                    generated_complete = false;
+                }
+            }
+        }
         // Direct path resolution and alias expansion are collected in
         // separate passes for each owner. Re-establish source order before
         // graph deduplication so the retained edge (and its diagnostic span)
@@ -1723,7 +1916,27 @@ fn collect_interface_uses_input(
         &prepared.snapshot,
         &mut interface_check_diagnostics,
     )?;
-    Ok((input, world_graph, interface_check_diagnostics))
+    let generated_candidate = if let Some(unit) = generated_unit {
+        let selected = prepared
+            .generated_package_version
+            .as_ref()
+            .expect("generated unit requires an active selected package version");
+        Some(GeneratedWitCandidate {
+            unit,
+            identity: selected.package().to_owned(),
+            version: selected.version().clone(),
+            interfaces: generated_interfaces,
+            complete: generated_complete && interface_check_diagnostics.is_empty(),
+        })
+    } else {
+        None
+    };
+    Ok((
+        input,
+        world_graph,
+        interface_check_diagnostics,
+        generated_candidate,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2477,7 +2690,7 @@ fn append_interface_boundary_diagnostics(
     generated_use_aliases: &mut Vec<GeneratedUseAlias>,
     owner_dependencies: &mut HashMap<OwnerId, HashSet<DefId>>,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Result<bool, InterfaceUsesQueryError> {
+) -> Result<(bool, Vec<sai_ty::boundary::BoundaryTypeConversion>), InterfaceUsesQueryError> {
     let owner_id = owner.id;
     let self_resource = match owner.node {
         OwnerNode::InterfaceItem(item) => match item.kind {
@@ -2540,6 +2753,7 @@ fn append_interface_boundary_diagnostics(
     };
     let owner_path_candidates = owner_test_only_path_candidates(owner);
     let mut has_incompatible_boundary = false;
+    let mut conversions = Vec::new();
 
     // The receiver is not emitted as a boundary parameter, but its type must
     // still be the enclosing resource. The syntax-only interface check owns
@@ -2600,7 +2814,8 @@ fn append_interface_boundary_diagnostics(
 
     for (ty, position) in interface_boundary_roots(owner) {
         let conversion = boundary_type_with_references(&boundary_context, owner_id, ty, position);
-        let incompatible = match conversion.outcome {
+        conversions.push(conversion.clone());
+        let incompatible = match &conversion.outcome {
             BoundaryTypeOutcome::Mapped(mapped) => {
                 let mut mapped_definitions = HashSet::new();
                 collect_boundary_type_definitions(&mapped, &mut mapped_definitions);
@@ -2621,7 +2836,7 @@ fn append_interface_boundary_diagnostics(
                 );
                 continue;
             }
-            BoundaryTypeOutcome::Incompatible(incompatible) => incompatible,
+            BoundaryTypeOutcome::Incompatible(incompatible) => *incompatible,
             BoundaryTypeOutcome::Suppressed | BoundaryTypeOutcome::Deferred => continue,
         };
         has_incompatible_boundary = true;
@@ -2673,7 +2888,7 @@ fn append_interface_boundary_diagnostics(
         }
         diagnostics.push(diagnostic);
     }
-    Ok(has_incompatible_boundary)
+    Ok((has_incompatible_boundary, conversions))
 }
 
 fn collect_generated_use_aliases(
@@ -2899,6 +3114,131 @@ fn interface_boundary_roots<'hir>(owner: &HirOwner<'hir>) -> Vec<(&'hir Ty<'hir>
     roots
 }
 
+fn generated_function_item(
+    entry: &ItemTreeEntry,
+    owner: &HirOwner<'_>,
+    conversions: &[sai_ty::boundary::BoundaryTypeConversion],
+    attrs: Option<&sai_hir::attrs::ValidatedAttrs>,
+    selected: Option<&sai_package::mvs::MvsPackageVersion>,
+    symbols: &Interner,
+) -> Result<Option<WitItem>, InterfaceUsesQueryError> {
+    let OwnerNode::InterfaceItem(item) = owner.node else {
+        return Ok(None);
+    };
+    let InterfaceItemKind::Fn { sig, generics } = item.kind else {
+        return Ok(None);
+    };
+    if item.name.is_error()
+        || sig.safety != sai_hir::Safety::Safe
+        || sig.borrows.is_some()
+        || sig.effects.is_some()
+        || !generics.params.is_empty()
+        || !generics.where_preds.is_empty()
+        || attrs.is_some_and(|attrs| !attrs.diagnostics.is_empty())
+    {
+        return Ok(None);
+    }
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let Some((since, deprecated)) = generated_stability(attrs, Some(selected)) else {
+        return Ok(None);
+    };
+    let Some(name_definition) = wit_name_definition(item.name, owner.id, symbols)? else {
+        return Ok(None);
+    };
+    let Some(name) = sai_identifier_to_wit_name(&name_definition.source_name) else {
+        return Ok(None);
+    };
+
+    let references = HashMap::new();
+    let mut conversions = conversions.iter();
+    let mut params = Vec::with_capacity(sig.params.len());
+    for parameter in sig.params.iter().filter(|parameter| !parameter.is_self) {
+        if parameter.mutable {
+            return Ok(None);
+        }
+        let Some(parameter_name) = parameter.name else {
+            return Ok(None);
+        };
+        if parameter_name.is_error() {
+            return Ok(None);
+        }
+        let parameter_source_name = symbols
+            .resolve(parameter_name.sym)
+            .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+            .map_err(InterfaceUsesQueryError::Collection)?;
+        let Some(parameter_name) = sai_identifier_to_wit_name(&parameter_source_name) else {
+            return Ok(None);
+        };
+        let Some(conversion) = conversions.next() else {
+            return Ok(None);
+        };
+        let BoundaryTypeOutcome::Mapped(boundary_type) = &conversion.outcome else {
+            return Ok(None);
+        };
+        let Ok(Some(parameter_type)) = sai_ty::boundary::materialize_boundary_type(
+            boundary_type,
+            &references,
+            Position::Param,
+        ) else {
+            return Ok(None);
+        };
+        params.push((parameter_name, parameter_type));
+    }
+
+    let result = if sig.ret.is_some() {
+        let Some(conversion) = conversions.next() else {
+            return Ok(None);
+        };
+        let BoundaryTypeOutcome::Mapped(boundary_type) = &conversion.outcome else {
+            return Ok(None);
+        };
+        let Ok(result) = sai_ty::boundary::materialize_boundary_type(
+            boundary_type,
+            &references,
+            Position::Result,
+        ) else {
+            return Ok(None);
+        };
+        result
+    } else {
+        None
+    };
+    if conversions.next().is_some() {
+        return Ok(None);
+    }
+
+    Ok(Some(WitItem {
+        name,
+        docs: entry.docs.clone().map(Arc::from),
+        since,
+        deprecated,
+        kind: WitItemKind::Func(WitFunc {
+            params,
+            result,
+            is_async: sig.is_async,
+        }),
+        unsupported: None,
+        span: None,
+    }))
+}
+
+fn generated_stability(
+    attrs: Option<&sai_hir::attrs::ValidatedAttrs>,
+    selected: Option<&sai_package::mvs::MvsPackageVersion>,
+) -> Option<(Option<WitStabilityVersion>, Option<WitStabilityVersion>)> {
+    if attrs.is_some_and(|attrs| !attrs.diagnostics.is_empty()) {
+        return None;
+    }
+    if attrs.and_then(|attrs| attrs.deprecated.as_ref()).is_none() {
+        return Some((None, None));
+    }
+    let selected = selected?;
+    let version = WitStabilityVersion::parse(&selected.version().to_string()).ok()?;
+    Some((Some(version.clone()), Some(version)))
+}
+
 fn boundary_position_name(position: Position) -> &'static str {
     match position {
         Position::Param => "parameter",
@@ -2998,6 +3338,7 @@ fn current_owner_inputs_from_prepared(input: &OwnedPhase1ModuleInput) -> Current
         root: input.root.clone(),
         ast_ids: input.ast_ids.clone(),
         filtered_item_tree,
+        validated_attrs: input.filtered.validated_attrs.clone(),
         retained_item_kinds,
         accepted_flags_attributes,
         source_ref: input.source_ref.clone(),
@@ -3028,6 +3369,7 @@ fn stable_interface_uses_fingerprint(
     graph: &InterfaceUses,
     world_graph: &WorldInterfaceUseGraph,
     interface_check_diagnostics: &[Diagnostic],
+    generated_wit_text: Option<&GeneratedText>,
     prepared: &PreparedPhase1PackageScopes,
     packages: &PackageInterner,
     symbols: &Interner,
@@ -3084,6 +3426,13 @@ fn stable_interface_uses_fingerprint(
         }
     }
     stable_world_interface_use_graph(world_graph, &mut hasher);
+    match generated_wit_text {
+        Some(generated) => {
+            hasher.write_tag(1);
+            generated.stable_hash(&mut hasher);
+        }
+        None => hasher.write_tag(0),
+    }
     hasher.write_len(u64::try_from(graph.diagnostics.len()).unwrap_or(u64::MAX));
     for diagnostic in &graph.diagnostics {
         diagnostic.code.as_str().stable_hash(&mut hasher);
@@ -3210,6 +3559,18 @@ fn interface_uses_error_fingerprint(error: &InterfaceUsesQueryError) -> Fingerpr
         InterfaceUsesQueryError::DiagnosticTemplate(error) => {
             hasher.write_tag(5);
             error.stable_hash(&mut hasher);
+        }
+        InterfaceUsesQueryError::PackageWitNames(error) => {
+            hasher.write_tag(6);
+            format!("{error:?}").stable_hash(&mut hasher);
+        }
+        InterfaceUsesQueryError::WitUnitIdentity(error) => {
+            hasher.write_tag(7);
+            format!("{error:?}").stable_hash(&mut hasher);
+        }
+        InterfaceUsesQueryError::WitIndexVec(error) => {
+            hasher.write_tag(8);
+            format!("{error:?}").stable_hash(&mut hasher);
         }
     }
     hasher.finish()

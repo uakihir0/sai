@@ -74,6 +74,7 @@ impl StableHash for PackageWitNamesQueryOutput {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct PackageWitNamesQueries {
     pub(super) query: DerivedQuery<PackageKey, PackageWitNamesQueryOutput>,
 }

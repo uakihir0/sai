@@ -352,7 +352,7 @@ pub struct WitInterface {
     /// The version when this item became stable, if declared by WIT.
     pub since: Option<WitStabilityVersion>,
     pub deprecated: Option<WitStabilityVersion>,
-    /// Items in WIT order: types first, followed by functions.
+    /// Items in their source or generation order.
     pub items: WitIndexVec<WitItemIdx, WitItem>,
     /// Absent for embedded and generated units.
     pub span: Option<WitSpan>,

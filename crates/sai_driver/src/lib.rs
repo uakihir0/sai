@@ -38,6 +38,7 @@ use sai_diagnostics::{
     SourceRef, source_text_status_diagnostic,
 };
 use sai_hir::arena::HirArena;
+use sai_hir::attrs::ValidatedAttrs;
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::expressions::{
     Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind,
@@ -192,6 +193,7 @@ pub struct RootDatabase {
     declared_requirements: DeclaredRequirementsQueries,
     wit_contracts: WitContractQueries,
     generated_wit_texts: GeneratedWitTextQueries,
+    phase1_generated_wit_packages: HashSet<PackageId>,
     wit_units: WitUnitOfQueries,
     package_graph: InputQuery<u8, Option<PackageGraph>>,
     wit_packages: WitPackageQueries,
@@ -1084,6 +1086,7 @@ struct PreparedPhase1PackageScopes {
     snapshot: WorkspaceSnapshot,
     target_cfg: TargetCfg,
     build_context: Phase1BuildContext,
+    generated_package_version: Option<MvsPackageVersion>,
     declared_requirements: Option<Arc<[DeclaredRequirement]>>,
     foreign_packages: Vec<Phase1ForeignPackageScopes>,
     foreign_wit_views: Vec<OwnedPhase1ForeignWitView>,
@@ -1882,6 +1885,7 @@ pub enum Phase1CollectionError {
     Query(QueryError),
     DeclaredRequirements(DeclaredRequirementsError),
     Package(PackageIdError),
+    GeneratedWitText(GeneratedWitTextError),
     PackageGraphMissingNode(PackageKey),
     PackageGraphRequirementEdgeMismatch {
         package: PackageKey,
@@ -5668,6 +5672,7 @@ struct CurrentOwnerInputs {
     root: SyntaxNode,
     ast_ids: ast::AstIdMap,
     filtered_item_tree: ItemTree,
+    validated_attrs: BTreeMap<ast::ErasedAstId, ValidatedAttrs>,
     retained_item_kinds: HashMap<ast::ErasedAstId, ItemTreeKind>,
     accepted_flags_attributes: HashSet<ast::ErasedAstId>,
     source_ref: SourceRef,
@@ -10126,6 +10131,7 @@ impl RootDatabase {
         )?;
         let interface_uses = InterfaceUsesQueries::new(
             package_scopes.query.clone(),
+            package_wit_names.clone(),
             Arc::clone(&packages),
             Arc::clone(&symbols),
             primitive_prelude.clone(),
@@ -10184,6 +10190,7 @@ impl RootDatabase {
             declared_requirements,
             wit_contracts,
             generated_wit_texts,
+            phase1_generated_wit_packages: HashSet::new(),
             wit_units,
             package_graph,
             wit_packages,
@@ -10516,10 +10523,13 @@ impl RootDatabase {
                 });
             }
         }
-        self.generated_wit_texts
+        let changed = self
+            .generated_wit_texts
             .input
             .set_at_durability(&mut self.query_database, package_key, generated, durability)
-            .map_err(GeneratedWitTextError::from)
+            .map_err(GeneratedWitTextError::from)?;
+        self.phase1_generated_wit_packages.remove(&package);
+        Ok(changed)
     }
 
     /// Removes a generated-WIT snapshot and invalidates readers that observed
@@ -10530,10 +10540,34 @@ impl RootDatabase {
     ) -> Result<bool, GeneratedWitTextError> {
         let package_name = self.packages.resolve(package)?;
         let package_key = PackageKey::new(package_name.as_ref())?;
-        self.generated_wit_texts
+        let changed = self
+            .generated_wit_texts
             .input
             .remove(&mut self.query_database, package_key)
-            .map_err(GeneratedWitTextError::from)
+            .map_err(GeneratedWitTextError::from)?;
+        self.phase1_generated_wit_packages.remove(&package);
+        Ok(changed)
+    }
+
+    fn publish_phase1_generated_wit_text(
+        &mut self,
+        package: PackageId,
+        generated: GeneratedText,
+        durability: Durability,
+    ) -> Result<bool, GeneratedWitTextError> {
+        let changed = self.set_generated_wit_text(package, generated, durability)?;
+        self.phase1_generated_wit_packages.insert(package);
+        Ok(changed)
+    }
+
+    fn remove_phase1_generated_wit_text(
+        &mut self,
+        package: PackageId,
+    ) -> Result<bool, GeneratedWitTextError> {
+        if !self.phase1_generated_wit_packages.contains(&package) {
+            return Ok(false);
+        }
+        self.remove_generated_wit_text(package)
     }
 
     /// Returns the current generated-WIT snapshot as a tracked query value.
@@ -11065,6 +11099,32 @@ impl RootDatabase {
         foreign_scopes: &[Phase1ForeignPackageScopes],
         wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
     ) -> Result<Phase1PackageScopesCollection, Phase1CollectionError> {
+        let result = self.collect_phase1_package_scopes_with_requirements_inner(
+            module_tree,
+            snapshot,
+            target_cfg,
+            build_context,
+            declared_requirements,
+            foreign_scopes,
+            wit_view_scopes,
+        );
+        if result.is_err() {
+            self.remove_phase1_generated_wit_text(module_tree.package)
+                .map_err(Phase1CollectionError::GeneratedWitText)?;
+        }
+        result
+    }
+
+    fn collect_phase1_package_scopes_with_requirements_inner(
+        &mut self,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        target_cfg: &TargetCfg,
+        build_context: Phase1BuildContext,
+        declared_requirements: Option<Arc<[DeclaredRequirement]>>,
+        foreign_scopes: &[Phase1ForeignPackageScopes],
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+    ) -> Result<Phase1PackageScopesCollection, Phase1CollectionError> {
         if module_tree.modules.len() > u32::MAX as usize {
             return Err(Phase1CollectionError::TooManyModules);
         }
@@ -11111,6 +11171,15 @@ impl RootDatabase {
         let graph = self.package_graph.get(&mut self.query_database, 0)?;
         let package_graph = phase1_package_graph_projection(graph.as_ref().as_ref(), &package_key)?;
         let package_graph_fingerprint = graph.as_ref().as_ref().map(fingerprint);
+        let generated_package_version = graph
+            .as_ref()
+            .as_ref()
+            .and_then(|graph| graph.node(&package_key))
+            .filter(|node| node.form() == PackageForm::Source)
+            .map(|node| {
+                MvsPackageVersion::new(node.identity(), node.version().clone())
+                    .expect("validated package graph nodes have valid MVS identities")
+            });
         let (
             foreign_wit_views,
             unavailable_foreign_wit_packages,
@@ -11251,6 +11320,7 @@ impl RootDatabase {
             snapshot: snapshot.clone(),
             target_cfg: target_cfg.clone(),
             build_context,
+            generated_package_version,
             declared_requirements,
             foreign_packages: foreign_scopes.to_vec(),
             foreign_wit_views,
@@ -11287,16 +11357,38 @@ impl RootDatabase {
             .package_wit_names
             .get(&mut self.query_database, package_key.clone(), snapshot)
             .map_err(Phase1CollectionError::PackageWitNamesQuery)?;
+        let interface_uses_result =
+            self.interface_uses
+                .get(&mut self.query_database, package_key.clone(), snapshot);
         let (
             interface_uses,
             interface_uses_fingerprint,
             world_interface_uses,
             world_interface_uses_fingerprint,
             interface_check_diagnostics,
-        ) = self
-            .interface_uses
-            .get(&mut self.query_database, package_key.clone(), snapshot)
-            .map_err(Phase1CollectionError::InterfaceUsesQuery)?;
+            generated_wit_text,
+        ) = match interface_uses_result {
+            Ok(output) => output,
+            Err(error) => {
+                self.remove_phase1_generated_wit_text(module_tree.package)
+                    .map_err(Phase1CollectionError::GeneratedWitText)?;
+                return Err(Phase1CollectionError::InterfaceUsesQuery(error));
+            }
+        };
+        if let Some(generated_wit_text) = generated_wit_text {
+            if let Err(error) = self.publish_phase1_generated_wit_text(
+                module_tree.package,
+                generated_wit_text,
+                Durability::Low,
+            ) {
+                self.remove_phase1_generated_wit_text(module_tree.package)
+                    .map_err(Phase1CollectionError::GeneratedWitText)?;
+                return Err(Phase1CollectionError::GeneratedWitText(error));
+            }
+        } else {
+            self.remove_phase1_generated_wit_text(module_tree.package)
+                .map_err(Phase1CollectionError::GeneratedWitText)?;
+        }
         let mut scopes = memo.scopes.clone();
         for input in &prepared.modules {
             scopes
@@ -11414,6 +11506,7 @@ impl RootDatabase {
             .iter()
             .filter_map(|(ast_id, attrs)| attrs.flags.map(|_| *ast_id))
             .collect();
+        let validated_attrs = filtered.validated_attrs.clone();
         let filtered_item_tree = filtered.item_tree;
         let retained_item_kinds = filtered_item_tree
             .items
@@ -11437,6 +11530,7 @@ impl RootDatabase {
             root: parsed.root,
             ast_ids,
             filtered_item_tree,
+            validated_attrs,
             retained_item_kinds,
             accepted_flags_attributes,
             source_ref,
@@ -38511,13 +38605,6 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             )
             .expect("source package contract is recorded");
         let target_cfg = target_cfg_for_check("wasm32-wasi").expect("target config is valid");
-        let wit_views = database
-            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target_cfg, &graph)
-            .expect("missing generated output remains in the WIT closure");
-        assert_eq!(
-            wit_views.unavailable_unit_names().collect::<Vec<_>>(),
-            ["acme:wit-source@1.0.0"]
-        );
         let source_manifest: Arc<[u8]> =
             Arc::from(&b"package acme:wit-source @ 1.0.0\nsource \"src\"\n"[..]);
         let source_collection = database
@@ -38535,6 +38622,16 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             )
             .expect("source dependency scopes collect");
         let source_member_package = source_collection.module_member_scope_package();
+        database
+            .remove_generated_wit_text(source_package)
+            .expect("the test removes the generated snapshot to model unavailable output");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target_cfg, &graph)
+            .expect("missing generated output remains in the WIT closure");
+        assert_eq!(
+            wit_views.unavailable_unit_names().collect::<Vec<_>>(),
+            ["acme:wit-source@1.0.0"]
+        );
         let root_manifest: Arc<[u8]> = Arc::from(
             &b"package acme:root @ 1.0.0\n\
               requires { acme:wit-source @ ^1 }\n"[..],
@@ -43651,6 +43748,530 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 "resource method parameters and block locals shadow the imported alias"
             );
         }
+    }
+
+    #[test]
+    fn phase1_publishes_generated_wit_for_source_interfaces() {
+        let source = concat!(
+            "fn helper() { 1 }\n",
+            "/// API documentation.\n",
+            "interface api {\n",
+            "  /// Reads a value.\n",
+            "  @deprecated(\"use read_value\")\n",
+            "  fn read(code: U32) -> U64\n",
+            "  /// Writes a flag.\n",
+            "  fn write(value: Bool)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+        let first_interface_use_fingerprint = collection.interface_uses_fingerprint();
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated WIT package query completes");
+        assert!(
+            result.failure.is_none(),
+            "generated WIT parses and resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        let first_text = Arc::clone(&generated.text);
+        assert!(
+            generated.complete,
+            "the supported Result signature remains complete: {}",
+            generated.text
+        );
+        assert!(generated.text.starts_with("package acme:phase1@1.0.0;"));
+        assert_eq!(generated.origins[0].0, "api");
+        assert_eq!(
+            collection.package_wit_names().names.len(),
+            1,
+            "the package WIT name query supplies the generated interface name"
+        );
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let interface = package_model
+            .root()
+            .interfaces
+            .iter()
+            .next()
+            .expect("the local interface is generated");
+        assert_eq!(interface.name, "api");
+        assert_eq!(interface.docs.as_deref(), Some("API documentation."));
+        let items = interface.items.iter().collect::<Vec<_>>();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read", "write"]
+        );
+        assert_eq!(items[0].docs.as_deref(), Some("Reads a value."));
+        assert_eq!(
+            items[0].since.as_ref().map(ToString::to_string).as_deref(),
+            Some("1.0.0")
+        );
+        assert_eq!(
+            items[0]
+                .deprecated
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("1.0.0")
+        );
+        let sai_wit::WitItemKind::Func(read) = &items[0].kind else {
+            panic!("the first source member remains a WIT function");
+        };
+        assert_eq!(read.params[0].0, "code");
+        assert_eq!(read.params[0].1, sai_wit::WitType::U32);
+        assert_eq!(read.result, Some(sai_wit::WitType::U64));
+        assert_eq!(items[1].docs.as_deref(), Some("Writes a flag."));
+
+        let edited_source = source.replace("fn helper() { 1 }", "fn helper() { 2 }");
+        database
+            .set_file_contents(
+                FileKey::new("acme:phase1#1", "src/lib.sai")
+                    .expect("root source file key is valid"),
+                Arc::from(edited_source.as_bytes()),
+                Durability::Low,
+            )
+            .expect("body-only source edit is recorded");
+        let edited_snapshot = phase1_snapshot_from_vfs(&mut database, &module_tree, 18);
+        let body_edited_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &edited_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 recollects after the body edit");
+        assert_eq!(
+            body_edited_collection.interface_uses_fingerprint(),
+            first_interface_use_fingerprint,
+            "body-only edits leave the generated-WIT derived fingerprint unchanged"
+        );
+        let edited_result = database
+            .wit_package(&unit)
+            .expect("generated package remains loadable after the body edit");
+        let edited_text = edited_result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| Arc::clone(&generated.text))
+            .expect("the recomputed generated text is retained");
+        assert_eq!(edited_text, first_text);
+
+        let docs_changed_source = edited_source.replace("API documentation.", "Updated API docs.");
+        database
+            .set_file_contents(
+                FileKey::new("acme:phase1#1", "src/lib.sai")
+                    .expect("root source file key is valid"),
+                Arc::from(docs_changed_source.as_bytes()),
+                Durability::Low,
+            )
+            .expect("documentation edit is recorded");
+        let docs_changed_snapshot = phase1_snapshot_from_vfs(&mut database, &module_tree, 19);
+        let docs_changed_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &docs_changed_snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 recollects after the documentation edit");
+        assert_ne!(
+            docs_changed_collection.interface_uses_fingerprint(),
+            first_interface_use_fingerprint,
+            "documentation is part of generated-WIT query output"
+        );
+        let docs_changed_result = database
+            .wit_package(&unit)
+            .expect("generated package remains loadable after the documentation edit");
+        let docs_changed_text = docs_changed_result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| Arc::clone(&generated.text))
+            .expect("the documentation-updated text is retained");
+        assert_ne!(docs_changed_text, first_text);
+        assert!(docs_changed_text.contains("Updated API docs."));
+    }
+
+    #[test]
+    fn generated_wit_omits_unimplemented_declarations_and_stays_incomplete() {
+        let source = concat!(
+            "interface api {\n",
+            "  type Count = U32\n",
+            "  fn read(value: Count) -> U64\n",
+            "  fn write(value: U32)\n",
+            "}\n",
+            "world server {}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("incomplete generated WIT remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "omitting unsupported declarations must leave parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "the duplicate-name result unexpectedly claims completeness: {}",
+            generated.text
+        );
+        assert!(!generated.text.contains("type Count"));
+        assert!(!generated.text.contains("world server"));
+        let package_model = result.package.expect("partial WIT model loads");
+        let interface = package_model
+            .root()
+            .interfaces
+            .iter()
+            .next()
+            .expect("the representable interface remains");
+        let emitted_items = interface
+            .items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !emitted_items.contains(&"read"),
+            "a function that refers to an omitted type is omitted"
+        );
+        assert!(
+            emitted_items.contains(&"write"),
+            "an independent representable function survives"
+        );
+        assert!(
+            package_model.root().worlds.is_empty(),
+            "world generation remains an explicitly incomplete part of this slice"
+        );
+    }
+
+    #[test]
+    fn generated_wit_omits_cyclic_interfaces_and_keeps_parseable_text() {
+        let source = concat!(
+            "interface first {\n",
+            "  type Request = second.Response\n",
+            "}\n",
+            "interface second {\n",
+            "  type Response = first.Request\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("cyclic generated WIT remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "cycle omission leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "unsupported declarations cannot claim completeness: {}",
+            generated.text
+        );
+        assert!(generated.origins.is_empty());
+        assert!(!generated.text.contains("interface first"));
+        assert!(!generated.text.contains("interface second"));
+        assert!(
+            result
+                .package
+                .expect("the package model loads")
+                .root()
+                .interfaces
+                .is_empty(),
+            "cyclic interfaces are omitted from both text and source origins"
+        );
+    }
+
+    #[test]
+    fn generated_wit_omits_all_interfaces_with_duplicate_canonical_names() {
+        let root = concat!("interface user_id {\n", "  fn first()\n", "}\n",);
+        let child = concat!("interface user_id {\n", "  fn second()\n", "}\n",);
+        let (mut database, module_tree, snapshot, package) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+        assert_eq!(
+            collection.package_wit_names().names.len(),
+            2,
+            "the package name query should retain both canonical collisions: {:?}",
+            collection.package_wit_names().names
+        );
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("duplicate-name generated WIT remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "omitting colliding names leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "duplicate-name output unexpectedly claims completeness: {}",
+            generated.text
+        );
+        assert!(generated.origins.is_empty());
+        assert!(!generated.text.contains("interface user-id"));
+        assert!(
+            result
+                .package
+                .expect("the package model loads")
+                .root()
+                .interfaces
+                .is_empty(),
+            "all interfaces that collide after canonical naming are omitted"
+        );
+    }
+
+    #[test]
+    fn phase1_clears_its_generated_wit_when_no_candidate_is_produced() {
+        let source = "interface api { fn read(value: U32) }\n";
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest = || Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]);
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest(),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 publishes generated WIT");
+        assert!(
+            database
+                .generated_wit_text(package)
+                .expect("generated WIT input is readable")
+                .is_some()
+        );
+
+        database
+            .set_package_graph(None)
+            .expect("the active package graph is removed");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest(),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 recollects without an active source graph");
+        assert!(
+            database
+                .generated_wit_text(package)
+                .expect("generated WIT input is readable after removal")
+                .is_none(),
+            "a Phase 1-owned snapshot is removed when no new candidate is available"
+        );
+    }
+
+    #[test]
+    fn phase1_preserves_caller_owned_generated_wit_without_a_candidate() {
+        let source = "interface api { fn read(value: U32) }\n";
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        let caller_snapshot = GeneratedText {
+            text: Arc::from("package acme:phase1@1.0.0; interface caller { }"),
+            complete: false,
+            origins: Arc::from([]),
+        };
+        database
+            .set_generated_wit_text(package, caller_snapshot.clone(), Durability::Low)
+            .expect("the caller-owned snapshot is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collects without a selected source graph");
+
+        let current = database
+            .generated_wit_text(package)
+            .expect("generated WIT input remains readable");
+        assert_eq!(
+            current.as_deref(),
+            Some(&caller_snapshot),
+            "Phase 1 cleanup only removes snapshots it published itself"
+        );
+    }
+
+    #[test]
+    fn phase1_clears_its_generated_wit_when_collection_fails() {
+        let source = "interface api { fn read(value: U32) }\n";
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 publishes generated WIT");
+        assert!(
+            database
+                .generated_wit_text(package)
+                .expect("generated WIT input is readable")
+                .is_some()
+        );
+
+        let mut invalid_module_tree = module_tree.clone();
+        invalid_module_tree.modules[0].file = FileId::new(u32::MAX);
+        assert!(
+            database
+                .collect_phase1_package_scopes_collection(
+                    &invalid_module_tree,
+                    &snapshot,
+                    &target,
+                    Phase1BuildContext::default(),
+                )
+                .is_err(),
+            "the deliberately incomplete snapshot fails Phase 1 collection"
+        );
+        assert!(
+            database
+                .generated_wit_text(package)
+                .expect("generated WIT input remains readable")
+                .is_none(),
+            "a failed Phase 1 regeneration removes its previous owned snapshot"
+        );
     }
 
     #[test]
