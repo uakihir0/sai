@@ -2373,6 +2373,8 @@ pub struct FunctionOwnerResolution {
     test_only_path_resolution:
         Result<Option<OwnerTestOnlyPathResolution>, FunctionOwnerResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, FunctionOwnerResolutionError>,
+    world_field_resolution:
+        Result<Option<sai_resolve::WorldFieldResolution>, FunctionOwnerResolutionError>,
     /// Diagnostics produced while lowering the owner, kept separate from the
     /// label resolver's diagnostics so the caller can preserve phase order.
     lowering_diagnostics: Vec<Diagnostic>,
@@ -2438,6 +2440,17 @@ impl FunctionOwnerResolution {
 
     pub fn test_only_diagnostics(&self) -> Result<&[Diagnostic], &FunctionOwnerResolutionError> {
         self.test_only_diagnostics.as_ref().map(Vec::as_slice)
+    }
+
+    /// World-function fields resolved while the lowered body and source map
+    /// were live. `None` means this owner analysis did not receive validated
+    /// world-reference inputs.
+    pub fn world_field_resolution(
+        &self,
+    ) -> Result<Option<&sai_resolve::WorldFieldResolution>, &FunctionOwnerResolutionError> {
+        self.world_field_resolution
+            .as_ref()
+            .map(|resolution| resolution.as_ref())
     }
 
     pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
@@ -3068,7 +3081,13 @@ pub struct WorldOwnerReferenceResolution {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WorldImportFnSourceItem {
     ImportFunction(sai_resolve::WorldImportFunction),
+    ExportFunction(String),
     Include(OwnerId),
+}
+
+struct FunctionOwnerWorldFieldInputs {
+    resolution: sai_resolve::WorldFieldResolutionInput,
+    wit_view_closure_fingerprint: Option<Fingerprint>,
 }
 
 impl WorldOwnerReferenceResolution {
@@ -3095,6 +3114,8 @@ pub struct WorldReferenceResolutions {
     snapshot_id: WorkspaceSnapshotId,
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
+    member_scope_closure_fingerprint: Option<Fingerprint>,
+    wit_view_closure_fingerprint: Option<Fingerprint>,
     session_token: SessionToken,
     owners: Vec<WorldOwnerReferenceResolution>,
 }
@@ -3113,6 +3134,26 @@ impl WorldReferenceResolutions {
             && self.snapshot_id == collection.snapshot_id
             && self.target_cfg == collection.target_cfg
             && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn matches_member_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && member_scopes.matches_collection(collection)
+            && self.member_scope_closure_fingerprint == Some(member_scopes.closure_fingerprint)
+    }
+
+    pub fn matches_wit_view_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && wit_view_scopes.matches_collection(collection)
+            && self.wit_view_closure_fingerprint == Some(wit_view_scopes.closure_fingerprint)
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -3565,7 +3606,9 @@ pub struct FunctionOwnerResolutions {
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
     member_scope_closure_fingerprint: Option<Fingerprint>,
+    wit_view_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<FunctionOwnerResolution>,
+    session_token: SessionToken,
 }
 
 impl FunctionOwnerResolutions {
@@ -3580,7 +3623,8 @@ impl FunctionOwnerResolutions {
     /// Checks whether these results were produced for the given package
     /// collection, including its non-snapshot package inputs.
     pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
-        self.snapshot_id == collection.snapshot_id
+        self.session_token == collection.session_token
+            && self.snapshot_id == collection.snapshot_id
             && self.target_cfg == collection.target_cfg
             && self.collection_input_fingerprint == collection.input_fingerprint
     }
@@ -3597,6 +3641,16 @@ impl FunctionOwnerResolutions {
 
     pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
         self.member_scope_closure_fingerprint
+    }
+
+    pub fn matches_wit_view_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && wit_view_scopes.matches_collection(collection)
+            && self.wit_view_closure_fingerprint == Some(wit_view_scopes.closure_fingerprint)
     }
 
     pub fn target_cfg(&self) -> &TargetCfg {
@@ -4029,6 +4083,7 @@ pub enum OwnerControlFlowResolutionError {
     Lowering(HirLoweringError),
     Labels(LabelResolutionError),
     Locals(LocalResolutionError),
+    WorldField(sai_resolve::WorldFieldResolutionError),
 }
 
 /// Compatibility name for the original function label adapter error.
@@ -9790,7 +9845,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<FunctionOwnerResolutions, FunctionOwnerResolutionError> {
-        self.resolve_function_owner_analyses_inner(collection, module_tree, snapshot, None)
+        self.resolve_function_owner_analyses_inner(collection, module_tree, snapshot, None, None)
     }
 
     /// Resolves function-owner type prefixes through a validated active-source
@@ -9814,6 +9869,83 @@ impl RootDatabase {
             module_tree,
             snapshot,
             Some(member_scopes),
+            None,
+        )
+    }
+
+    /// Resolves world-function fields in top-level function bodies while their
+    /// lowered HIR is live. World references and active views are validated
+    /// against this collection, and the local include graph is derived inside
+    /// this operation so callers cannot supply detached cycle data.
+    pub fn resolve_function_owner_analyses_with_world_fields(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        references: &WorldReferenceResolutions,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+    ) -> Result<FunctionOwnerResolutions, FunctionOwnerResolutionError> {
+        if collection.session_token != self.session_token {
+            return Err(OwnerControlFlowResolutionError::SessionMismatch);
+        }
+        if collection.snapshot_id != snapshot.id() || !references.matches_snapshot(snapshot) {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+        if !references.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+        }
+        match member_scopes {
+            Some(scopes) if references.matches_member_scopes(collection, scopes) => {}
+            None if references.member_scope_closure_fingerprint.is_none() => {}
+            _ => {
+                return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                    Phase1ModuleMemberScopeError::PackageGraphMismatch(
+                        collection.package_key.clone(),
+                    ),
+                ));
+            }
+        }
+        match wit_view_scopes {
+            Some(scopes) if references.matches_wit_view_scopes(collection, scopes) => {
+                self.validate_active_wit_view_scopes(collection, snapshot, scopes)?;
+            }
+            None if references.wit_view_closure_fingerprint.is_none() => {}
+            _ => {
+                return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                    Phase1ModuleMemberScopeError::WitViewScopeMismatch(
+                        collection.package_key.clone(),
+                    ),
+                ));
+            }
+        }
+
+        let includes = self.resolve_world_includes_for_world_fields(
+            collection,
+            module_tree,
+            snapshot,
+            references,
+        )?;
+        let resolution = self.world_field_resolution_input(
+            collection,
+            module_tree,
+            references,
+            &includes,
+            wit_view_scopes,
+        )?;
+        let world_fields = FunctionOwnerWorldFieldInputs {
+            resolution,
+            wit_view_closure_fingerprint: wit_view_scopes.map(|scopes| scopes.closure_fingerprint),
+        };
+        self.resolve_function_owner_analyses_inner(
+            collection,
+            module_tree,
+            snapshot,
+            member_scopes,
+            Some(&world_fields),
         )
     }
 
@@ -9823,6 +9955,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
         member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        world_fields: Option<&FunctionOwnerWorldFieldInputs>,
     ) -> Result<FunctionOwnerResolutions, FunctionOwnerResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(FunctionOwnerLabelResolutionError::SnapshotMismatch);
@@ -9871,6 +10004,8 @@ impl RootDatabase {
                                 module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
+                                world_field_resolution:
+                                    world_fields.map(|_| Err(error.clone())).unwrap_or(Ok(None)),
                                 lowering_diagnostics: Vec::new(),
                             },
                         ));
@@ -9892,6 +10027,7 @@ impl RootDatabase {
                 let mut module_path_diagnostics = None;
                 let mut test_only_path_resolution = None;
                 let mut test_only_diagnostics = None;
+                let mut world_field_resolution = None;
                 let resolution = (|| {
                     let owner_descriptor = find_top_level_owner_descriptor(
                         &top_level_owner_index,
@@ -10034,6 +10170,26 @@ impl RootDatabase {
                                         )),
                                         Err(error) => Err(error.clone()),
                                     };
+                                    world_field_resolution =
+                                        Some(match (world_fields, &module_paths) {
+                                            (Some(world_fields), Ok(module_paths)) => {
+                                                sai_resolve::resolve_owner_world_fields(
+                                                    body,
+                                                    &source_map,
+                                                    snapshot,
+                                                    &self.symbols,
+                                                    &locals,
+                                                    module_paths,
+                                                    &world_fields.resolution,
+                                                )
+                                                .map(Some)
+                                                .map_err(
+                                                    OwnerControlFlowResolutionError::WorldField,
+                                                )
+                                            }
+                                            (Some(_), Err(error)) => Err(error.clone()),
+                                            (None, _) => Ok(None),
+                                        });
                                     let test_only_paths = match (&module_scope, &mut module_paths) {
                                         (Ok(module_scope), Ok(module_paths)) => {
                                             collect_test_only_reference_diagnostics(
@@ -10062,6 +10218,9 @@ impl RootDatabase {
                                     local_resolution = Some(Ok(Some(locals)));
                                 }
                                 Err(error) => {
+                                    if world_fields.is_some() {
+                                        world_field_resolution = Some(Err(error.clone()));
+                                    }
                                     module_resolution = Some(Err(error.clone()));
                                     test_only_diagnostics = Some(signature_diagnostics);
                                     local_resolution = Some(Err(error));
@@ -10072,6 +10231,7 @@ impl RootDatabase {
                         None => {
                             local_resolution = Some(Ok(None));
                             module_resolution = Some(Ok(None));
+                            world_field_resolution = Some(Ok(None));
                             test_only_diagnostics = Some(signature_diagnostics);
                             Ok(LabelResolution::default())
                         }
@@ -10092,6 +10252,13 @@ impl RootDatabase {
                     test_only_path_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let test_only_diagnostics =
                     test_only_diagnostics.unwrap_or_else(|| resolution.clone().map(|_| Vec::new()));
+                let world_field_resolution = world_field_resolution.unwrap_or_else(|| {
+                    if world_fields.is_some() {
+                        resolution.clone().map(|_| None)
+                    } else {
+                        Ok(None)
+                    }
+                });
                 owners.push(FunctionOwnerResolution {
                     owner: descriptor.owner,
                     resolution,
@@ -10101,6 +10268,7 @@ impl RootDatabase {
                     module_path_diagnostics,
                     test_only_path_resolution,
                     test_only_diagnostics,
+                    world_field_resolution,
                     lowering_diagnostics,
                 });
             }
@@ -10112,7 +10280,10 @@ impl RootDatabase {
             collection_input_fingerprint: collection.input_fingerprint,
             member_scope_closure_fingerprint: member_scopes
                 .map(|scopes| scopes.closure_fingerprint),
+            wit_view_closure_fingerprint: world_fields
+                .and_then(|world_fields| world_fields.wit_view_closure_fingerprint),
             owners,
+            session_token: collection.session_token.clone(),
         })
     }
 
@@ -13230,6 +13401,8 @@ impl RootDatabase {
             snapshot_id: test_only.snapshot_id,
             target_cfg: test_only.target_cfg,
             collection_input_fingerprint: test_only.collection_input_fingerprint,
+            member_scope_closure_fingerprint: None,
+            wit_view_closure_fingerprint: None,
             session_token: collection.session_token.clone(),
             owners,
         })
@@ -13272,6 +13445,8 @@ impl RootDatabase {
             snapshot_id: test_only.snapshot_id,
             target_cfg: test_only.target_cfg,
             collection_input_fingerprint: test_only.collection_input_fingerprint,
+            member_scope_closure_fingerprint: Some(member_scopes.closure_fingerprint),
+            wit_view_closure_fingerprint: Some(wit_view_scopes.closure_fingerprint),
             session_token: collection.session_token.clone(),
             owners,
         })
@@ -13300,6 +13475,40 @@ impl RootDatabase {
             return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
         }
 
+        self.world_includes_from_references(collection, module_tree, snapshot, references, true)
+    }
+
+    fn resolve_world_includes_for_world_fields(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        references: &WorldReferenceResolutions,
+    ) -> Result<sai_resolve::WorldIncludes, OwnerControlFlowResolutionError> {
+        if collection.session_token != self.session_token {
+            return Err(OwnerControlFlowResolutionError::SessionMismatch);
+        }
+        if collection.snapshot_id != snapshot.id() || !references.matches_snapshot(snapshot) {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        if collection.module_tree != *module_tree {
+            return Err(OwnerControlFlowResolutionError::ModuleTreeMismatch);
+        }
+        if !references.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+        }
+
+        self.world_includes_from_references(collection, module_tree, snapshot, references, false)
+    }
+
+    fn world_includes_from_references(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        references: &WorldReferenceResolutions,
+        fail_on_semantic_owner_errors: bool,
+    ) -> Result<sai_resolve::WorldIncludes, OwnerControlFlowResolutionError> {
         let descriptors = interface_generation_order(
             module_tree,
             collection
@@ -13333,16 +13542,24 @@ impl RootDatabase {
                 .get(&descriptor.owner)
                 .copied()
                 .ok_or(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch)?;
-            if let Some(error) = &world.error {
+            if fail_on_semantic_owner_errors && let Some(error) = &world.error {
                 return Err(error.clone());
             }
-            if let Some((_, error)) = world.item_errors.first() {
+            if fail_on_semantic_owner_errors && let Some((_, error)) = world.item_errors.first() {
                 return Err(error.clone());
+            }
+            let world_def = descriptor.owner.def_id.to_def_id();
+            worlds.push(world_def);
+            if !fail_on_semantic_owner_errors
+                && (world.error.is_some() || !world.item_errors.is_empty())
+            {
+                // The package lookup builder will mark this world's lookup
+                // incomplete. Its partial edges cannot safely establish a
+                // cycle shape, and must not block independent worlds.
+                continue;
             }
             let inputs =
                 self.current_owner_inputs(snapshot, descriptor.file, &collection.target_cfg)?;
-            let world_def = descriptor.owner.def_id.to_def_id();
-            worlds.push(world_def);
             for reference in &world.references {
                 if reference.world_owner != descriptor.owner {
                     return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
@@ -13550,6 +13767,7 @@ impl RootDatabase {
                             function.clone(),
                         ));
                     }
+                    WorldImportFnSourceItem::ExportFunction(_) => {}
                     WorldImportFnSourceItem::Include(owner) => {
                         let reference = include_references.get(owner).ok_or(
                             OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch,
@@ -13600,6 +13818,262 @@ impl RootDatabase {
             },
         )
         .map_err(|_| OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch)
+    }
+
+    fn world_field_resolution_input(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        references: &WorldReferenceResolutions,
+        includes: &sai_resolve::WorldIncludes,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+    ) -> Result<sai_resolve::WorldFieldResolutionInput, OwnerControlFlowResolutionError> {
+        if !references.matches_collection(collection)
+            || !wit_view_scopes.is_none_or(|scopes| scopes.matches_collection(collection))
+        {
+            return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+        }
+
+        let descriptors = interface_generation_order(
+            module_tree,
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
+                .collect(),
+            &self.symbols,
+        )?;
+        let mut owner_resolutions = HashMap::with_capacity(references.owners.len());
+        for owner in &references.owners {
+            if owner_resolutions.insert(owner.owner, owner).is_some() {
+                return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+            }
+        }
+        if owner_resolutions.len() != descriptors.len()
+            || descriptors
+                .iter()
+                .any(|descriptor| !owner_resolutions.contains_key(&descriptor.owner))
+        {
+            return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+        }
+
+        let mut external_worlds = Vec::new();
+        let mut external_world_ids = HashSet::new();
+        let mut external_exports = HashMap::new();
+        if let Some(scopes) = wit_view_scopes {
+            for view in scopes.views() {
+                for world in view.view.worlds.values() {
+                    if !external_world_ids.insert(world.def) {
+                        return Err(
+                            OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch,
+                        );
+                    }
+                    external_worlds.push((world.def, world.import_fns.clone()));
+                    external_exports.insert(world.def, world.export_fns.clone());
+                }
+            }
+        }
+
+        let local_world_ids = descriptors
+            .iter()
+            .map(|descriptor| descriptor.owner.def_id.to_def_id())
+            .collect::<HashSet<_>>();
+        let cyclic_worlds = includes.cyclic.iter().copied().collect::<HashSet<_>>();
+        let mut worlds = Vec::with_capacity(descriptors.len());
+        let mut include_targets = HashMap::<DefId, Vec<DefId>>::with_capacity(descriptors.len());
+        let mut incomplete_includes = HashSet::new();
+        let mut direct_exports =
+            HashMap::<DefId, BTreeSet<String>>::with_capacity(descriptors.len());
+
+        for descriptor in &descriptors {
+            let world = owner_resolutions
+                .get(&descriptor.owner)
+                .copied()
+                .ok_or(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch)?;
+            if world
+                .references
+                .iter()
+                .any(|reference| reference.world_owner != descriptor.owner)
+            {
+                return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+            }
+            let owner_has_semantic_errors = world.error.is_some() || !world.item_errors.is_empty();
+
+            let mut include_references = HashMap::new();
+            for reference in world
+                .references
+                .iter()
+                .filter(|reference| reference.position == WorldReferencePosition::Include)
+            {
+                if include_references
+                    .insert(reference.owner, reference)
+                    .is_some()
+                {
+                    return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+                }
+            }
+            let source_include_count = world
+                .source_import_items
+                .iter()
+                .filter(|item| matches!(item, WorldImportFnSourceItem::Include(_)))
+                .count();
+            if source_include_count != include_references.len() && !owner_has_semantic_errors {
+                return Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch);
+            }
+
+            let world_def = descriptor.owner.def_id.to_def_id();
+            let mut items = Vec::with_capacity(world.source_import_items.len());
+            let mut resolved_include_targets = Vec::new();
+            let mut exports = BTreeSet::new();
+            let mut has_incomplete_include =
+                owner_has_semantic_errors || source_include_count != include_references.len();
+            for source_item in &world.source_import_items {
+                match source_item {
+                    WorldImportFnSourceItem::ImportFunction(function) => {
+                        items.push(sai_resolve::WorldImportFnItem::ImportFunction(
+                            function.clone(),
+                        ));
+                    }
+                    WorldImportFnSourceItem::ExportFunction(name) => {
+                        exports.insert(name.clone());
+                    }
+                    WorldImportFnSourceItem::Include(owner) => {
+                        let Some(reference) = include_references.get(owner) else {
+                            if owner_has_semantic_errors {
+                                has_incomplete_include = true;
+                                continue;
+                            }
+                            return Err(
+                                OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch,
+                            );
+                        };
+                        let path = match &reference.path_result {
+                            WorldReferencePathResult::Mod(path)
+                            | WorldReferencePathResult::ResolvedPkg(path)
+                                if path.resolved_segments == path.segment_count =>
+                            {
+                                Some(path)
+                            }
+                            _ => None,
+                        };
+                        let target = path.and_then(|path| match path.base {
+                            Res::Def(DefKind::World, target) => Some(target),
+                            _ => None,
+                        });
+                        let Some(target) = target.filter(|target| {
+                            local_world_ids.contains(target) || external_world_ids.contains(target)
+                        }) else {
+                            // This include already owns its path diagnostic, if
+                            // any. It still prevents a reachable later item from
+                            // being treated as the first complete lookup winner.
+                            has_incomplete_include = true;
+                            continue;
+                        };
+                        items.push(sai_resolve::WorldImportFnItem::Include(target));
+                        resolved_include_targets.push(target);
+                    }
+                }
+            }
+
+            if has_incomplete_include {
+                incomplete_includes.insert(world_def);
+            }
+            include_targets.insert(world_def, resolved_include_targets);
+            direct_exports.insert(world_def, exports);
+            worlds.push(sai_resolve::WorldImportFnWorld {
+                world: world_def,
+                items,
+            });
+        }
+
+        let resolver_input = sai_resolve::WorldImportFnsInput {
+            worlds: worlds.clone(),
+            external_worlds,
+        };
+        let mut world_imports = HashMap::with_capacity(worlds.len());
+        for world in &worlds {
+            let mut reachable = HashSet::new();
+            let mut stack = vec![world.world];
+            let mut incomplete = false;
+            while let Some(current) = stack.pop() {
+                if !reachable.insert(current) {
+                    continue;
+                }
+                if incomplete_includes.contains(&current) {
+                    incomplete = true;
+                    break;
+                }
+                for target in include_targets.get(&current).into_iter().flatten().rev() {
+                    if external_world_ids.contains(target) || cyclic_worlds.contains(target) {
+                        continue;
+                    }
+                    if local_world_ids.contains(target) {
+                        stack.push(*target);
+                    } else {
+                        incomplete = true;
+                    }
+                }
+            }
+
+            if incomplete {
+                world_imports.insert(
+                    world.world,
+                    sai_resolve::WorldImportFnLookup {
+                        imports: BTreeMap::new(),
+                        state: sai_resolve::WorldImportLookupState::Incomplete,
+                        export_fns: BTreeSet::new(),
+                    },
+                );
+                continue;
+            }
+
+            let imports = sai_resolve::world_import_fns_with_cycles(
+                world.world,
+                resolver_input
+                    .clone()
+                    .with_cyclic_worlds(cyclic_worlds.clone()),
+            )
+            .map_err(|_| OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch)?;
+
+            let mut export_fns = BTreeSet::new();
+            let mut export_stack = vec![world.world];
+            let mut export_visited = HashSet::new();
+            while let Some(current) = export_stack.pop() {
+                if !export_visited.insert(current) {
+                    continue;
+                }
+                if let Some(exports) = direct_exports.get(&current) {
+                    export_fns.extend(exports.iter().cloned());
+                } else if let Some(exports) = external_exports.get(&current) {
+                    export_fns.extend(exports.iter().cloned());
+                    continue;
+                } else {
+                    continue;
+                }
+                for target in include_targets.get(&current).into_iter().flatten().rev() {
+                    if cyclic_worlds.contains(target) {
+                        continue;
+                    }
+                    export_stack.push(*target);
+                }
+            }
+
+            world_imports.insert(
+                world.world,
+                sai_resolve::WorldImportFnLookup {
+                    imports,
+                    state: sai_resolve::WorldImportLookupState::Complete,
+                    export_fns,
+                },
+            );
+        }
+
+        Ok(sai_resolve::WorldFieldResolutionInput {
+            local_worlds: local_world_ids,
+            world_imports,
+        })
     }
 
     /// Resolves world function signature type paths through a validated
@@ -14846,6 +15320,16 @@ impl RootDatabase {
                                             def_id: item_owner.def_id.to_def_id(),
                                         },
                                     ))
+                                }
+                                WorldItemKind::ExportFn { name, .. }
+                                    if !name.is_error() && world_reference_owners.is_some() =>
+                                {
+                                    let name = self
+                                        .symbols
+                                        .resolve(name.sym)
+                                        .map_err(OwnerControlFlowResolutionError::SymbolLookup)?
+                                        .to_string();
+                                    Some(WorldImportFnSourceItem::ExportFunction(name))
                                 }
                                 WorldItemKind::ImportFn { .. } | WorldItemKind::ExportFn { .. } => {
                                     None
@@ -28712,6 +29196,7 @@ mod tests {
                         Some(function.def_id)
                     }
                     WorldImportFnSourceItem::ImportFunction(_)
+                    | WorldImportFnSourceItem::ExportFunction(_)
                     | WorldImportFnSourceItem::Include(_) => None,
                 })
                 .expect("world declares the expected import function")
@@ -28806,6 +29291,401 @@ mod tests {
     }
 
     #[test]
+    fn function_owner_world_fields_resolve_imports_and_report_exact_exported_misses() {
+        let source = concat!(
+            "world leaf {\n",
+            "  import fn nested()\n",
+            "  export fn exported()\n",
+            "}\n",
+            "world client {\n",
+            "  import fn direct()\n",
+            "  include leaf\n",
+            "}\n",
+            "fn direct_lookup() { client.direct }\n",
+            "fn include_lookup() { client.nested }\n",
+            "fn exported_miss() { client.exported }\n",
+            "fn ordinary_receiver(value: Bool) { value.member }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("package scopes collect");
+        let references = database
+            .resolve_world_references(&collection, &module_tree, &snapshot)
+            .expect("world references resolve");
+        let resolved = database
+            .resolve_function_owner_analyses_with_world_fields(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &references,
+                None,
+                None,
+            )
+            .expect("function bodies resolve with the current world-reference result");
+
+        let world_owner_named = |expected_name: &str| {
+            references
+                .owners()
+                .iter()
+                .find(|owner| {
+                    database
+                        .resolve_def_path(owner.owner().def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| {
+                            path.data()
+                                .last()
+                                .and_then(|component| match &component.data {
+                                    DefPathData::World(symbol) => database
+                                        .resolve_symbol(*symbol)
+                                        .ok()
+                                        .map(|name| name.as_ref() == expected_name),
+                                    _ => None,
+                                })
+                        })
+                        .unwrap_or(false)
+                })
+                .expect("world owner result exists")
+        };
+        let imported_function = |world: &WorldOwnerReferenceResolution, expected: &str| {
+            world
+                .source_import_items
+                .iter()
+                .find_map(|item| match item {
+                    WorldImportFnSourceItem::ImportFunction(function)
+                        if function.name == expected =>
+                    {
+                        Some(function.def_id)
+                    }
+                    WorldImportFnSourceItem::ImportFunction(_)
+                    | WorldImportFnSourceItem::ExportFunction(_)
+                    | WorldImportFnSourceItem::Include(_) => None,
+                })
+                .expect("world declares the expected import function")
+        };
+        let client = world_owner_named("client");
+        let leaf = world_owner_named("leaf");
+        let direct_def = imported_function(client, "direct");
+        let included_def = imported_function(leaf, "nested");
+
+        assert_eq!(resolved.owners().len(), 4);
+        for (index, expected) in [(0, direct_def), (1, included_def)] {
+            let fields = resolved.owners()[index]
+                .world_field_resolution()
+                .expect("world field analysis succeeds")
+                .expect("this entry point enables world field analysis");
+            assert_eq!(
+                fields.fields.values().copied().collect::<Vec<_>>(),
+                [Res::Def(DefKind::WorldFn, expected)],
+                "direct declarations and DFS-included declarations both resolve"
+            );
+            assert!(fields.diagnostics.is_empty());
+            assert!(fields.deferred.is_empty());
+        }
+
+        let exported_miss = resolved.owners()[2]
+            .world_field_resolution()
+            .expect("exported miss analysis succeeds")
+            .expect("this entry point enables world field analysis");
+        assert!(exported_miss.fields.is_empty());
+        assert_eq!(exported_miss.diagnostics.len(), 1);
+        let diagnostic = &exported_miss.diagnostics[0];
+        let name_start = source
+            .find("client.exported")
+            .expect("exported access exists")
+            + "client.".len();
+        assert_eq!(diagnostic.code, sai_diagnostics::Code::UnresolvedName);
+        assert_eq!(
+            diagnostic
+                .primary()
+                .expect("diagnostic has its field-name primary")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(name_start as u32),
+                sai_diagnostics::TextSize::new((name_start + "exported".len()) as u32),
+            )
+            .expect("name range is valid")
+        );
+        assert!(
+            diagnostic
+                .children()
+                .iter()
+                .any(|child| child.message.contains("exported world function")),
+            "an included export explains why the name is not an imported function"
+        );
+        let ordinary = resolved.owners()[3]
+            .world_field_resolution()
+            .expect("ordinary field fallthrough analysis succeeds")
+            .expect("world field analysis is enabled");
+        assert!(ordinary.fields.is_empty());
+        assert!(ordinary.diagnostics.is_empty());
+        assert_eq!(ordinary.deferred.len(), 1);
+        assert_eq!(
+            ordinary.deferred[0].reason,
+            sai_resolve::WorldMemberDeferral::OrdinaryMember
+        );
+
+        let mut mismatched_collection = collection.clone();
+        mismatched_collection.target_cfg =
+            target_cfg_for_check("wasm64-core").expect("second target is valid");
+        assert_eq!(
+            database.resolve_function_owner_analyses_with_world_fields(
+                &mismatched_collection,
+                &module_tree,
+                &snapshot,
+                &references,
+                None,
+                None,
+            ),
+            Err(OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch),
+            "world-reference results from another collection are rejected"
+        );
+        let stale_snapshot = phase1_snapshot_from_vfs(&mut database, &module_tree, 29);
+        assert_eq!(
+            database.resolve_function_owner_analyses_with_world_fields(
+                &collection,
+                &module_tree,
+                &stale_snapshot,
+                &references,
+                None,
+                None,
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch),
+            "world-reference results cannot be reused in another snapshot"
+        );
+        assert!(resolved.matches_collection(&collection));
+    }
+
+    #[test]
+    fn function_owner_world_fields_defer_incomplete_lookups_and_skip_cycle_targets() {
+        let source = concat!(
+            "world cycle_a {\n",
+            "  import fn local_a()\n",
+            "  include cycle_b\n",
+            "}\n",
+            "world cycle_b {\n",
+            "  import fn cycle_contribution()\n",
+            "  include cycle_a\n",
+            "}\n",
+            "world outer { include cycle_a }\n",
+            "world incomplete {\n",
+            "  import fn apparent_hit()\n",
+            "  include missing_world\n",
+            "}\n",
+            "fn cyclic_root_direct() { cycle_a.local_a }\n",
+            "fn cyclic_target_is_omitted() { outer.cycle_contribution }\n",
+            "fn incomplete_hit_is_deferred() { incomplete.apparent_hit }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("package scopes collect");
+        let references = database
+            .resolve_world_references(&collection, &module_tree, &snapshot)
+            .expect("world references resolve with recoverable misses");
+        let resolved = database
+            .resolve_function_owner_analyses_with_world_fields(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &references,
+                None,
+                None,
+            )
+            .expect("partial references still permit independent function analysis");
+
+        let cycle_a = resolved.owners()[0]
+            .world_field_resolution()
+            .expect("cyclic root direct import analysis succeeds")
+            .expect("world field analysis is enabled");
+        assert_eq!(
+            cycle_a.fields.values().copied().collect::<Vec<_>>(),
+            [Res::Def(
+                DefKind::WorldFn,
+                references
+                    .owners()
+                    .iter()
+                    .find(|owner| {
+                        database
+                            .resolve_def_path(owner.owner().def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .and_then(|path| {
+                                path.data()
+                                    .last()
+                                    .and_then(|component| match &component.data {
+                                        DefPathData::World(name) => database
+                                            .resolve_symbol(*name)
+                                            .ok()
+                                            .map(|name| name.as_ref() == "cycle_a"),
+                                        _ => None,
+                                    })
+                            })
+                            .unwrap_or(false)
+                    })
+                    .and_then(|owner| {
+                        owner
+                            .source_import_items
+                            .iter()
+                            .find_map(|item| match item {
+                                WorldImportFnSourceItem::ImportFunction(function)
+                                    if function.name == "local_a" =>
+                                {
+                                    Some(function.def_id)
+                                }
+                                _ => None,
+                            })
+                    })
+                    .expect("cycle root direct import is captured"),
+            )],
+            "known cyclic targets are suppressed while the root's direct imports remain usable"
+        );
+        assert!(cycle_a.diagnostics.is_empty());
+        assert!(cycle_a.deferred.is_empty());
+
+        let cycle_target = resolved.owners()[1]
+            .world_field_resolution()
+            .expect("cycle target access analysis succeeds")
+            .expect("world field analysis is enabled");
+        assert!(cycle_target.fields.is_empty());
+        assert_eq!(cycle_target.diagnostics.len(), 1);
+        assert_eq!(
+            cycle_target.diagnostics[0].code,
+            sai_diagnostics::Code::UnresolvedName,
+            "an import available only from a cyclic target does not resolve"
+        );
+
+        let incomplete = resolved.owners()[2]
+            .world_field_resolution()
+            .expect("incomplete lookup analysis succeeds")
+            .expect("world field analysis is enabled");
+        assert!(incomplete.fields.is_empty());
+        assert!(incomplete.diagnostics.is_empty());
+        assert_eq!(
+            incomplete.deferred.len(),
+            1,
+            "an apparent direct hit is deferred when an earlier include is unresolved"
+        );
+        assert_eq!(
+            incomplete.deferred[0].reason,
+            sai_resolve::WorldMemberDeferral::ImportLookupIncomplete
+        );
+    }
+
+    #[test]
+    fn function_owner_world_field_recovery_is_local_to_the_broken_world() {
+        let source = concat!(
+            "world broken {\n",
+            "  import fn unavailable()\n",
+            "  include missing_world\n",
+            "}\n",
+            "world clean { import fn available() }\n",
+            "fn clean_lookup() { clean.available }\n",
+            "fn broken_lookup() { broken.unavailable }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(source.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("package scopes collect");
+        let mut references = database
+            .resolve_world_references(&collection, &module_tree, &snapshot)
+            .expect("world references resolve");
+        let broken = references
+            .owners
+            .iter()
+            .position(|owner| {
+                database
+                    .resolve_def_path(owner.owner.def_id.to_def_id())
+                    .ok()
+                    .flatten()
+                    .and_then(|path| {
+                        path.data()
+                            .last()
+                            .and_then(|component| match &component.data {
+                                DefPathData::World(name) => database
+                                    .resolve_symbol(*name)
+                                    .ok()
+                                    .map(|name| name.as_ref() == "broken"),
+                                _ => None,
+                            })
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("broken world is present");
+        references.owners[broken].error =
+            Some(OwnerControlFlowResolutionError::TestAnalysisDisabled);
+        let include_count = references.owners[broken]
+            .references
+            .iter()
+            .filter(|reference| reference.position == WorldReferencePosition::Include)
+            .count();
+        references.owners[broken]
+            .references
+            .retain(|reference| reference.position != WorldReferencePosition::Include);
+        assert_eq!(
+            include_count, 1,
+            "broken world starts with one include result"
+        );
+
+        let resolved = database
+            .resolve_function_owner_analyses_with_world_fields(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &references,
+                None,
+                None,
+            )
+            .expect("a semantic world error does not abort all field lookups");
+        let clean = resolved.owners()[0]
+            .world_field_resolution()
+            .expect("clean world's field analysis succeeds")
+            .expect("world field analysis is enabled");
+        assert_eq!(clean.fields.len(), 1);
+        assert!(matches!(
+            clean.fields.values().next(),
+            Some(Res::Def(DefKind::WorldFn, _))
+        ));
+        assert!(clean.diagnostics.is_empty());
+
+        let broken = resolved.owners()[1]
+            .world_field_resolution()
+            .expect("broken world's field analysis remains available")
+            .expect("world field analysis is enabled");
+        assert!(broken.fields.is_empty());
+        assert!(broken.diagnostics.is_empty());
+        assert_eq!(
+            broken.deferred.len(),
+            1,
+            "a missing reference on an already-invalid owner makes only that world's lookup incomplete"
+        );
+        assert_eq!(
+            broken.deferred[0].reason,
+            sai_resolve::WorldMemberDeferral::ImportLookupIncomplete
+        );
+    }
+
+    #[test]
     fn world_package_references_resolve_wit_interfaces_and_worlds() {
         let root = concat!(
             "world references {\n",
@@ -28822,6 +29702,7 @@ mod tests {
             "  import acme:codec/can\n",
             "  import acme:codex/api\n",
             "}\n",
+            "fn external_world_field() { server.remote }\n",
         );
         let (mut database, module_tree, snapshot, root_package) =
             phase1_fixture(root.as_bytes(), b"");
@@ -28912,7 +29793,7 @@ mod tests {
               source \"src\"\n\
               requires { acme:codec @ ^1 }\n"[..],
         );
-        let collection = database
+        let mut collection = database
             .collect_phase1_package_scopes_with_manifest_and_wit_views(
                 &module_tree,
                 &snapshot,
@@ -28944,6 +29825,8 @@ mod tests {
             )
             .expect("package-qualified world paths resolve");
         assert!(resolutions.matches_collection(&collection));
+        assert!(resolutions.matches_member_scopes(&collection, &member_scopes));
+        assert!(resolutions.matches_wit_view_scopes(&collection, &wit_view_scopes));
         let owner = resolutions
             .owners()
             .iter()
@@ -28975,6 +29858,35 @@ mod tests {
             .and_then(|world| world.import_fns.get("remote"))
             .copied()
             .expect("codec server imports remote");
+        // The module-use path resolver has not yet added external worlds to
+        // ordinary value scopes. Inject the validated view identity here to
+        // exercise the downstream owner-field rule for an external `World`.
+        let server = database
+            .symbols
+            .intern("server")
+            .expect("server symbol interns");
+        let server_start = root
+            .find("server.remote")
+            .expect("external world field expression exists");
+        let server_span = sai_diagnostics::Span::new(
+            module_tree.modules[0].file,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(server_start as u32),
+                sai_diagnostics::TextSize::new((server_start + "server".len()) as u32),
+            )
+            .expect("world name span is valid"),
+        );
+        collection.scopes.modules[ModuleId::ROOT.raw() as usize]
+            .scope
+            .insert(
+                server,
+                sai_resolve::package_scopes::Binding {
+                    res: Res::Def(DefKind::World, expected_world),
+                    name_span: server_span,
+                    origin: BindingOrigin::Decl,
+                    visibility: sai_hir::Visibility::Private,
+                },
+            );
         let imported_functions = database
             .resolve_world_import_fns(
                 &collection,
@@ -28993,6 +29905,52 @@ mod tests {
         assert!(
             !imported_functions.contains_key("rejected"),
             "an unsupported external world does not contribute imported functions"
+        );
+        let function_owners = database
+            .resolve_function_owner_analyses_with_world_fields(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &resolutions,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+            )
+            .expect("world fields use the same validated active WIT closure");
+        assert!(function_owners.matches_collection(&collection));
+        assert!(function_owners.matches_member_scopes(&collection, &member_scopes));
+        assert!(function_owners.matches_wit_view_scopes(&collection, &wit_view_scopes));
+        let external_fields = function_owners.owners()[0]
+            .world_field_resolution()
+            .expect("external world field analysis succeeds")
+            .expect("world field analysis is enabled");
+        assert!(external_fields.fields.is_empty());
+        assert_eq!(
+            external_fields.diagnostics.len(),
+            1,
+            "fields: {external_fields:#?}; module paths: {:#?}; locals: {:#?}",
+            function_owners.owners()[0].module_resolution(),
+            function_owners.owners()[0].local_resolution(),
+        );
+        let external_diagnostic = &external_fields.diagnostics[0];
+        assert_eq!(
+            external_diagnostic.code,
+            sai_diagnostics::Code::WrongNameKind
+        );
+        let remote_start = root
+            .find("server.remote")
+            .expect("external world field expression exists")
+            + "server.".len();
+        assert_eq!(
+            external_diagnostic
+                .primary()
+                .expect("external world error has a primary")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(remote_start as u32),
+                sai_diagnostics::TextSize::new((remote_start + "remote".len()) as u32),
+            )
+            .expect("field name span is valid")
         );
         let reference_for = |line: &str, path: &str, position: WorldReferencePosition| {
             let line_start = root.find(line).expect("world item line exists");

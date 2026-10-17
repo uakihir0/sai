@@ -1535,3 +1535,13 @@ The data-only `sai_resolve::resolve_owner_world_fields` pass scans body expressi
 The lookup input distinguishes complete, incomplete, and cycle-unsafe maps. Incomplete and cycle-unsafe maps defer both hits and misses because either an earlier unresolved include or an unsuppressed cyclic include can invalidate the apparent first winner. This pass has no driver or type-checker integration yet.
 
 See [implementation-review.md](../design/implementation-review.md) for the decision record, tests, hostile review, human review items, and remaining integration scope.
+
+### IR-636: Resolve top-level function world fields in the driver
+
+`RootDatabase::resolve_function_owner_analyses_with_world_fields` uses the matching `WorldReferenceResolutions` and optional active source/WIT closures to derive local include cycles inside the same operation, build each local world's ordered import and export lookup, and call `sai_resolve::resolve_owner_world_fields` while each function body and source map are live. Its owned per-function result exposes field `Res` values, diagnostics, and deferrals alongside the existing local and module path results. Collection matching includes the database session token; the new entry point also checks snapshot, module tree, source-scope closure, and WIT-view closure provenance.
+
+Reachable unresolved includes mark only the affected world's lookup incomplete, so both apparent hits and misses defer. Known cycle targets are skipped by the cycle-aware import collector; direct imports in a cyclic root remain available. Local `export fn` names and active WIT `ViewWorld.export_fns` participate in the explanatory export set. `ViewWorld.export_fns` stores canonical elaborated export names and contributes to the stable view fingerprint.
+
+This bridge currently covers top-level function bodies. Associated function bodies, function signature/type checking, world duplicate and boundary checks, generated WIT, and CLI phase gating remain unimplemented. Hostile review found that a failed local-path prerequisite could be reported as “not run”; enabled world-field analysis now propagates that error.
+
+See [implementation-review.md](../design/implementation-review.md) for the decisions, verification, review notes, and explicit remaining scope.

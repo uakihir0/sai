@@ -2466,6 +2466,7 @@ fn owner_resolution_error_tag(error: &OwnerControlFlowResolutionError) -> u8 {
         OwnerControlFlowResolutionError::Lowering(_) => 27,
         OwnerControlFlowResolutionError::Labels(_) => 28,
         OwnerControlFlowResolutionError::Locals(_) => 29,
+        OwnerControlFlowResolutionError::WorldField(_) => 35,
         OwnerControlFlowResolutionError::MissingInterfaceScope(_) => 30,
         OwnerControlFlowResolutionError::MissingInterfaceImplTarget(_) => 31,
         OwnerControlFlowResolutionError::InterfaceImplDiagnosticSourceMismatch { .. } => 32,
