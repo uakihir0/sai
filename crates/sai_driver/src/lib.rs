@@ -21292,6 +21292,128 @@ mod tests {
         (database, package, collection, snapshot, manifest_file)
     }
 
+    fn phase1_external_export_world_fixture(
+        world_reference: &str,
+    ) -> (
+        RootDatabase,
+        PackageId,
+        Phase1PackageScopesCollection,
+        WorkspaceSnapshot,
+    ) {
+        let manifest = format!(
+            "package acme:phase1 @ 1.0.0\n\
+             source \"src\"\n\
+             export world {world_reference}\n"
+        );
+        let (database, package, collection, snapshot, _) =
+            phase1_export_world_fixture(manifest.as_bytes());
+        (database, package, collection, snapshot)
+    }
+
+    fn install_external_artifact_world_package(
+        database: &mut RootDatabase,
+        identity: &str,
+        version: &str,
+        wit_source: &[u8],
+    ) -> (PackageId, PackageGraphNode) {
+        let version = Version::parse(version).expect("package version is valid");
+        let package_key_text = format!("{identity}#{}", version.compatibility_line());
+        let package_identity = format!("{identity}@{version}");
+        let manifest = format!(
+            "package {identity} @ {version}\n\
+             artifact component {{}}\n\
+             wit \"wit\"\n"
+        );
+        let package = database
+            .intern_package(&package_key_text)
+            .expect("artifact package identity interns");
+        let package_key =
+            PackageKey::new(&package_key_text).expect("artifact package key is valid");
+        database
+            .set_package_manifest(
+                package,
+                Arc::from(manifest.as_bytes()),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("artifact manifest is tracked");
+        let wit_path = PackageRelativePath::new("wit/root.wit").expect("WIT path is valid");
+        database
+            .set_wit_files(
+                package_key.clone(),
+                WitFilesSnapshot::listed("wit", [wit_path.clone()])
+                    .expect("WIT inventory is valid"),
+                Durability::Low,
+            )
+            .expect("WIT inventory is tracked");
+        database
+            .set_file_contents(
+                FileKey::from_package_path(package_key.as_str(), wit_path)
+                    .expect("WIT file key is valid"),
+                Arc::from(wit_source),
+                Durability::Low,
+            )
+            .expect("WIT file bytes are tracked");
+        let graph_node = PackageGraphNode::new(
+            package_key,
+            identity,
+            version,
+            PackageForm::Artifact,
+            PackageGraphRole::Dependency,
+            Vec::new(),
+        )
+        .expect("artifact dependency graph node is valid");
+        assert_eq!(
+            database
+                .wit_contract(package)
+                .expect("artifact contract query runs")
+                .identity()
+                .to_string(),
+            identity
+        );
+        assert_eq!(
+            database
+                .wit_contract(package)
+                .expect("artifact contract query runs")
+                .version()
+                .to_string(),
+            package_identity
+                .strip_prefix(&format!("{identity}@"))
+                .expect("package identity has the expected prefix")
+        );
+        (package, graph_node)
+    }
+
+    fn install_external_source_graph_package(
+        database: &mut RootDatabase,
+        identity: &str,
+        version: &str,
+    ) -> PackageGraphNode {
+        let version = Version::parse(version).expect("package version is valid");
+        let package_key_text = format!("{identity}#{}", version.compatibility_line());
+        let manifest = format!("package {identity} @ {version}\nsource \"src\"\n");
+        let package = database
+            .intern_package(&package_key_text)
+            .expect("source package identity interns");
+        database
+            .set_package_manifest(
+                package,
+                Arc::from(manifest.as_bytes()),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("source dependency manifest is tracked");
+        PackageGraphNode::new(
+            PackageKey::new(&package_key_text).expect("source package key is valid"),
+            identity,
+            version,
+            PackageForm::Source,
+            PackageGraphRole::Dependency,
+            Vec::new(),
+        )
+        .expect("source dependency graph node is valid")
+    }
+
     fn artifact_export_world_fixture(
         world_name: &str,
         wit_source: &[u8],
@@ -34389,6 +34511,580 @@ mod tests {
             )),
             "artifact local names are one SAI identifier, never module paths"
         );
+    }
+
+    #[test]
+    fn external_export_world_query_resolves_the_unique_graph_package() {
+        let (mut database, package, collection, snapshot) =
+            phase1_external_export_world_fixture("acme:codec/target-world");
+        let branch_node =
+            install_external_source_graph_package(&mut database, "acme:branch", "1.0.0");
+        let (codec_package, codec_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:codec",
+            "1.4.0",
+            b"package acme:codec@1.4.0;\nworld target-world {}\n",
+        );
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:phase1#1",
+                    "acme:phase1",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge(branch_node.key().as_str(), "acme:branch")],
+                ),
+                PackageGraphNode::new(
+                    branch_node.key().clone(),
+                    branch_node.identity(),
+                    branch_node.version().clone(),
+                    branch_node.form(),
+                    branch_node.role(),
+                    vec![graph_edge(codec_node.key().as_str(), "acme:codec")],
+                )
+                .expect("branch dependency edge is valid"),
+                codec_node,
+            ],
+        )
+        .expect("active graph is valid");
+        database
+            .set_package_graph(Some(graph))
+            .expect("active package graph is tracked");
+        let unit = database
+            .wit_unit_of(codec_package)
+            .expect("active artifact unit is available")
+            .expect("artifact dependency has a dependent-facing unit");
+        let expected = database
+            .wit_view(&unit)
+            .expect("selected artifact WIT view loads")
+            .worlds
+            .get("target-world")
+            .expect("external WIT world is present")
+            .def;
+
+        let result = database
+            .resolve_local_export_world_from_contract(package, &collection, &snapshot)
+            .expect("unique graph package resolves the external world");
+
+        assert_eq!(result.world, Some(expected));
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn external_export_world_query_prefers_requester_direct_edge_to_ambiguous_graph_nodes() {
+        let (mut database, package, collection, snapshot) =
+            phase1_external_export_world_fixture("acme:codec/direct-world");
+        let branch_node =
+            install_external_source_graph_package(&mut database, "acme:branch", "1.0.0");
+        let (direct_package, direct_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:codec",
+            "1.4.0",
+            b"package acme:codec@1.4.0;\nworld direct-world {}\n",
+        );
+        let (_, transitive_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:codec",
+            "2.0.0",
+            b"package acme:codec@2.0.0;\nworld transitive-world {}\n",
+        );
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:phase1#1",
+                    "acme:phase1",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![
+                        graph_edge(direct_node.key().as_str(), "acme:codec"),
+                        graph_edge(branch_node.key().as_str(), "acme:branch"),
+                    ],
+                ),
+                PackageGraphNode::new(
+                    branch_node.key().clone(),
+                    branch_node.identity(),
+                    branch_node.version().clone(),
+                    branch_node.form(),
+                    branch_node.role(),
+                    vec![graph_edge(transitive_node.key().as_str(), "acme:codec")],
+                )
+                .expect("branch dependency edge is valid"),
+                direct_node,
+                transitive_node,
+            ],
+        )
+        .expect("active graph with parallel versions is valid");
+        database
+            .set_package_graph(Some(graph))
+            .expect("active package graph is tracked");
+        let unit = database
+            .wit_unit_of(direct_package)
+            .expect("direct artifact unit is available")
+            .expect("direct artifact has a dependent-facing unit");
+        let expected = database
+            .wit_view(&unit)
+            .expect("direct artifact WIT view loads")
+            .worlds
+            .get("direct-world")
+            .expect("direct WIT world is present")
+            .def;
+
+        let result = database
+            .resolve_local_export_world_from_contract(package, &collection, &snapshot)
+            .expect("requester's direct edge takes precedence");
+
+        assert_eq!(result.world, Some(expected));
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn external_export_world_query_uses_the_requester_package_edges() {
+        let (mut database, _, _, _) =
+            phase1_external_export_world_fixture("acme:phase1/root_world");
+        let (requester, requester_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:requester",
+            "1.0.0",
+            b"package acme:requester@1.0.0;\nworld own-world {}\n",
+        );
+        let (direct_codec, direct_codec_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:codec",
+            "1.4.0",
+            b"package acme:codec@1.4.0;\nworld requester-world {}\n",
+        );
+        let (_, root_codec_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:codec",
+            "2.0.0",
+            b"package acme:codec@2.0.0;\nworld root-world {}\n",
+        );
+        let requester_manifest = b"package acme:requester @ 1.0.0\n\
+            artifact component {}\n\
+            wit \"wit\"\n\
+            export world acme:codec/requester-world\n";
+        database
+            .set_package_manifest(
+                requester,
+                Arc::from(&requester_manifest[..]),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("requester external export declaration is tracked");
+        let requester_manifest_file = database
+            .intern_package_file(
+                requester,
+                PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+            )
+            .expect("requester manifest file is interned");
+        let requester_snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(
+                SourceFile::decode(requester_manifest_file, requester_manifest)
+                    .expect("requester manifest decodes"),
+            ),
+            "dep:acme:requester@1.0.0/sai.package",
+            Some("acme:requester@1.0.0".to_owned()),
+            Some(43),
+        )])
+        .expect("requester manifest snapshot is valid");
+        let requester_node = PackageGraphNode::new(
+            requester_node.key().clone(),
+            requester_node.identity(),
+            requester_node.version().clone(),
+            requester_node.form(),
+            requester_node.role(),
+            vec![graph_edge(direct_codec_node.key().as_str(), "acme:codec")],
+        )
+        .expect("requester dependency edge is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:phase1#1",
+                    "acme:phase1",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![
+                        graph_edge(requester_node.key().as_str(), "acme:requester"),
+                        graph_edge(root_codec_node.key().as_str(), "acme:codec"),
+                    ],
+                ),
+                requester_node,
+                direct_codec_node,
+                root_codec_node,
+            ],
+        )
+        .expect("active graph has requester-specific direct versions");
+        database
+            .set_package_graph(Some(graph))
+            .expect("active package graph is tracked");
+        let unit = database
+            .wit_unit_of(direct_codec)
+            .expect("requester direct WIT package unit is available")
+            .expect("artifact dependency has a dependent-facing unit");
+        let expected = database
+            .wit_view(&unit)
+            .expect("requester direct artifact WIT view loads")
+            .worlds
+            .get("requester-world")
+            .expect("requester direct world is present")
+            .def;
+        let result = database
+            .resolve_artifact_export_world_from_contract(requester, &requester_snapshot)
+            .expect("dependency export world resolves from that package's own edges");
+
+        assert_eq!(result.world, Some(expected));
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn external_export_world_query_reports_unknown_unsupported_and_ambiguous_worlds() {
+        let wit_source = b"package acme:codec@1.4.0;\n\
+            world healthy {}\n\
+            world unsupported { type payload = u32; }\n";
+
+        let (mut missing_database, missing_package, missing_collection, missing_snapshot) =
+            phase1_external_export_world_fixture("acme:codec/missing");
+        let (_, missing_node) = install_external_artifact_world_package(
+            &mut missing_database,
+            "acme:codec",
+            "1.4.0",
+            wit_source,
+        );
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:phase1#1",
+                    "acme:phase1",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge(missing_node.key().as_str(), "acme:codec")],
+                ),
+                missing_node,
+            ],
+        )
+        .expect("active graph is valid");
+        missing_database
+            .set_package_graph(Some(graph))
+            .expect("active package graph is tracked");
+        let missing = missing_database
+            .resolve_local_export_world_from_contract(
+                missing_package,
+                &missing_collection,
+                &missing_snapshot,
+            )
+            .expect("an absent external world becomes a manifest diagnostic");
+        assert_eq!(missing.world, None);
+        assert_eq!(missing.diagnostics.len(), 1);
+        assert_eq!(
+            missing.diagnostics[0].code,
+            sai_diagnostics::Code::UnknownExportWorld
+        );
+        assert!(missing.diagnostics[0].has_workspace_snapshot());
+        let primary = missing.diagnostics[0]
+            .primary()
+            .expect("missing external world has a primary");
+        assert_eq!(
+            &missing_snapshot
+                .file(primary.span.file)
+                .expect("manifest diagnostic file exists")
+                .source()
+                .raw_bytes()
+                [primary.span.range.start().to_usize()..primary.span.range.end().to_usize()],
+            b"acme:codec/missing"
+        );
+
+        let (
+            mut unsupported_database,
+            unsupported_package,
+            unsupported_collection,
+            unsupported_snapshot,
+        ) = phase1_external_export_world_fixture("acme:codec/unsupported");
+        let (_, unsupported_node) = install_external_artifact_world_package(
+            &mut unsupported_database,
+            "acme:codec",
+            "1.4.0",
+            wit_source,
+        );
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:phase1#1",
+                    "acme:phase1",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge(unsupported_node.key().as_str(), "acme:codec")],
+                ),
+                unsupported_node,
+            ],
+        )
+        .expect("active graph is valid");
+        unsupported_database
+            .set_package_graph(Some(graph))
+            .expect("active package graph is tracked");
+        let unsupported = unsupported_database
+            .resolve_local_export_world_from_contract(
+                unsupported_package,
+                &unsupported_collection,
+                &unsupported_snapshot,
+            )
+            .expect("an unsupported external world becomes a manifest diagnostic");
+        assert_eq!(unsupported.world, None);
+        assert_eq!(unsupported.diagnostics.len(), 1);
+        assert_eq!(
+            unsupported.diagnostics[0].code,
+            sai_diagnostics::Code::WitUnsupportedFeature
+        );
+        assert!(unsupported.diagnostics[0].has_workspace_snapshot());
+
+        let (mut ambiguous_database, ambiguous_package, ambiguous_collection, ambiguous_snapshot) =
+            phase1_external_export_world_fixture("acme:codec/target");
+        let (_, codec_v1_node) = install_external_artifact_world_package(
+            &mut ambiguous_database,
+            "acme:codec",
+            "1.4.0",
+            b"package acme:codec@1.4.0;\nworld target {}\n",
+        );
+        let (_, codec_v2_node) = install_external_artifact_world_package(
+            &mut ambiguous_database,
+            "acme:codec",
+            "2.0.0",
+            b"package acme:codec@2.0.0;\nworld target {}\n",
+        );
+        let branch_a_key = "acme:branch-a#1";
+        let branch_b_key = "acme:branch-b#1";
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:phase1#1",
+                    "acme:phase1",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![
+                        graph_edge(branch_a_key, "acme:branch-a"),
+                        graph_edge(branch_b_key, "acme:branch-b"),
+                    ],
+                ),
+                graph_node(
+                    branch_a_key,
+                    "acme:branch-a",
+                    "1.0.0",
+                    PackageGraphRole::Dependency,
+                    vec![graph_edge(codec_v1_node.key().as_str(), "acme:codec")],
+                ),
+                graph_node(
+                    branch_b_key,
+                    "acme:branch-b",
+                    "1.0.0",
+                    PackageGraphRole::Dependency,
+                    vec![graph_edge(codec_v2_node.key().as_str(), "acme:codec")],
+                ),
+                codec_v1_node,
+                codec_v2_node,
+            ],
+        )
+        .expect("active graph with two dependency paths is valid");
+        ambiguous_database
+            .set_package_graph(Some(graph))
+            .expect("active package graph is tracked");
+        let ambiguous = ambiguous_database
+            .resolve_local_export_world_from_contract(
+                ambiguous_package,
+                &ambiguous_collection,
+                &ambiguous_snapshot,
+            )
+            .expect("unqualified graph versions are ambiguous");
+        assert_eq!(ambiguous.world, None);
+        assert_eq!(ambiguous.diagnostics.len(), 1);
+        let diagnostic = &ambiguous.diagnostics[0];
+        assert_eq!(diagnostic.code, sai_diagnostics::Code::UnknownExportWorld);
+        assert_eq!(diagnostic.primary_label, "ambiguous export world");
+        assert_eq!(diagnostic.children().len(), 1);
+        assert_eq!(
+            diagnostic.children()[0].kind,
+            sai_diagnostics::ChildKind::Note
+        );
+        assert_eq!(
+            diagnostic.children()[0].message,
+            "available versions: 1.4.0, 2.0.0; add a direct dependency to select one"
+        );
+        assert!(diagnostic.has_workspace_snapshot());
+    }
+
+    #[test]
+    fn external_export_world_query_uses_the_embedded_wasi_unit() {
+        let (mut database, package, collection, snapshot) =
+            phase1_external_export_world_fixture("wasi:cli/command");
+        let unit = database
+            .wasi_unit("cli")
+            .expect("embedded WASI package unit is valid");
+        let expected = database
+            .wasi_view(unit.clone())
+            .expect("embedded WASI view loads")
+            .worlds
+            .get("command")
+            .expect("embedded command world exists")
+            .def;
+
+        let result = database
+            .resolve_local_export_world_from_contract(package, &collection, &snapshot)
+            .expect("WASI worlds resolve before package-graph lookup");
+
+        assert_eq!(result.world, Some(expected));
+        assert!(result.diagnostics.is_empty());
+
+        let (mut missing_database, missing_package, missing_collection, missing_snapshot) =
+            phase1_external_export_world_fixture("wasi:cli/not-a-world");
+        let missing = missing_database
+            .resolve_local_export_world_from_contract(
+                missing_package,
+                &missing_collection,
+                &missing_snapshot,
+            )
+            .expect("an absent embedded WASI world becomes a manifest diagnostic");
+        assert_eq!(missing.world, None);
+        assert_eq!(missing.diagnostics.len(), 1);
+        assert_eq!(
+            missing.diagnostics[0].code,
+            sai_diagnostics::Code::UnknownExportWorld
+        );
+        assert!(missing.diagnostics[0].has_workspace_snapshot());
+
+        let (mut unknown_package_database, unknown_package, unknown_collection, unknown_snapshot) =
+            phase1_external_export_world_fixture("wasi:unknown/world");
+        let unknown_package = unknown_package_database
+            .resolve_local_export_world_from_contract(
+                unknown_package,
+                &unknown_collection,
+                &unknown_snapshot,
+            )
+            .expect("an absent embedded WASI package becomes an unknown-world diagnostic");
+        assert_eq!(unknown_package.world, None);
+        assert_eq!(unknown_package.diagnostics.len(), 1);
+        assert_eq!(
+            unknown_package.diagnostics[0].code,
+            sai_diagnostics::Code::UnknownExportWorld
+        );
+        assert!(unknown_package.diagnostics[0].has_workspace_snapshot());
+    }
+
+    #[test]
+    fn external_export_world_query_keeps_package_graph_and_wit_load_failures_typed() {
+        let (mut missing_graph_database, package, collection, snapshot) =
+            phase1_external_export_world_fixture("acme:codec/target");
+        assert_eq!(
+            missing_graph_database.resolve_local_export_world_from_contract(
+                package,
+                &collection,
+                &snapshot,
+            ),
+            Err(ExportWorldQueryError::PackageGraphUnavailable),
+            "an unavailable package graph is not a semantic unknown-world result"
+        );
+
+        let (mut divergent_database, package, collection, snapshot) =
+            phase1_external_export_world_fixture("acme:codec/target");
+        let divergent_graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [graph_node(
+                "acme:phase1#1",
+                "acme:phase1",
+                "1.1.0",
+                PackageGraphRole::Root,
+                Vec::new(),
+            )],
+        )
+        .expect("same-line version-divergent graph is structurally valid");
+        divergent_database
+            .set_package_graph(Some(divergent_graph))
+            .expect("active package graph is tracked");
+        assert_eq!(
+            divergent_database.resolve_local_export_world_from_contract(
+                package,
+                &collection,
+                &snapshot,
+            ),
+            Err(ExportWorldQueryError::RequesterGraphContractMismatch {
+                package_key: "acme:phase1#1".to_owned(),
+                manifest_identity: "acme:phase1".to_owned(),
+                manifest_version: "1.0.0".to_owned(),
+                selected_identity: "acme:phase1".to_owned(),
+                selected_version: "1.1.0".to_owned(),
+                manifest_kind: sai_wit::WitPackageKind::Source,
+                selected_form: PackageForm::Source,
+            }),
+            "the requester manifest version must match its active graph node"
+        );
+
+        let (mut database, package, collection, snapshot) =
+            phase1_external_export_world_fixture("acme:codec/target");
+        let (_, codec_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:codec",
+            "1.4.0",
+            b"package acme:codec@1.4.0;\nworld target {\n",
+        );
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:phase1#1",
+                    "acme:phase1",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge(codec_node.key().as_str(), "acme:codec")],
+                ),
+                codec_node,
+            ],
+        )
+        .expect("active graph is valid");
+        database
+            .set_package_graph(Some(graph))
+            .expect("active package graph is tracked");
+
+        assert!(matches!(
+            database.resolve_local_export_world_from_contract(package, &collection, &snapshot),
+            Err(ExportWorldQueryError::WitView(WitViewQueryError::Package(
+                _
+            )))
+        ));
+    }
+
+    #[test]
+    fn external_export_world_query_treats_root_self_reference_as_unknown() {
+        let (mut database, package, collection, snapshot) =
+            phase1_external_export_world_fixture("acme:phase1/root_world");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [graph_node(
+                "acme:phase1#1",
+                "acme:phase1",
+                "1.0.0",
+                PackageGraphRole::Root,
+                Vec::new(),
+            )],
+        )
+        .expect("root-only graph is valid");
+        database
+            .set_package_graph(Some(graph))
+            .expect("root-only package graph is tracked");
+
+        let result = database
+            .resolve_local_export_world_from_contract(package, &collection, &snapshot)
+            .expect("root has no dependent-facing unit for external self-reference");
+
+        assert_eq!(result.world, None);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(
+            result.diagnostics[0].code,
+            sai_diagnostics::Code::UnknownExportWorld
+        );
+        assert!(result.diagnostics[0].has_workspace_snapshot());
     }
 
     #[test]

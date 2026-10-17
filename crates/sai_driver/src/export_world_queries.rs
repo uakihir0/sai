@@ -1,7 +1,10 @@
 //! Resolution helpers for the package-level `export world` declaration.
 
-use super::{Phase1PackageScopesCollection, RootDatabase, WitViewQueryError};
-use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef};
+use super::{
+    Phase1PackageScopesCollection, RootDatabase, WasiWitQueryError, WasiWitUnitError,
+    WitUnitOfError, WitViewQueryError,
+};
+use sai_diagnostics::{Child, ChildKind, Code, Diagnostic, Location, Severity, SourceRef};
 use sai_hir::DefId;
 use sai_intern::{InternError, Interner, PackageId, PackageIdError};
 use sai_package::mvs::{MvsInputError, MvsPackageVersion};
@@ -33,7 +36,7 @@ pub enum LocalExportWorldLookupError {
     MissingModuleScope(ModuleId),
 }
 
-/// Invalid state encountered while projecting a local world from a package
+/// Invalid state encountered while projecting an export world from a package
 /// manifest and binding its diagnostics to the current source snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExportWorldQueryError {
@@ -48,12 +51,27 @@ pub enum ExportWorldQueryError {
         found: String,
     },
     CollectionSnapshotMismatch,
-    NonLocalWorldReference(String),
     UnsupportedPackageKind,
     InvalidArtifactWorldName(String),
+    InvalidExternalWorldReference(String),
     PackageVersion(MvsInputError),
     ArtifactWitUnit(WitUnitIdentityError),
+    WasiWitUnit(WasiWitUnitError),
+    WasiWitView(WasiWitQueryError),
     WitView(WitViewQueryError),
+    PackageGraphUnavailable,
+    RequesterNotInPackageGraph(String),
+    RequesterGraphContractMismatch {
+        package_key: String,
+        manifest_identity: String,
+        manifest_version: String,
+        selected_identity: String,
+        selected_version: String,
+        manifest_kind: sai_wit::WitPackageKind,
+        selected_form: super::package_graph::PackageForm,
+    },
+    MissingPackageGraphTarget(String),
+    WitUnitOf(WitUnitOfError),
     MissingManifestFileKey(FileId),
     ManifestFileKeyMismatch {
         expected_package_key: String,
@@ -120,9 +138,38 @@ fn export_world_diagnostic_result(
     package_identity: &str,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<sai_resolve::ExportWorld, ExportWorldQueryError> {
+    export_world_diagnostic_result_with_note(
+        code,
+        message,
+        primary_label,
+        location,
+        package_identity,
+        snapshot,
+        None,
+    )
+}
+
+fn export_world_diagnostic_result_with_note(
+    code: Code,
+    message: String,
+    primary_label: &str,
+    location: Location,
+    package_identity: &str,
+    snapshot: &WorkspaceSnapshot,
+    note: Option<String>,
+) -> Result<sai_resolve::ExportWorld, ExportWorldQueryError> {
     let mut diagnostic = Diagnostic::new(code, Severity::Error, message, Some(location));
     diagnostic.primary_label = primary_label.to_owned();
     diagnostic.package = Some(package_identity.to_owned());
+    if let Some(message) = note {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Note,
+                message,
+                location: None,
+            })
+            .map_err(|_| ExportWorldQueryError::DiagnosticSnapshotMismatch)?;
+    }
     Ok(sai_resolve::ExportWorld {
         world: None,
         diagnostics: vec![
@@ -131,6 +178,12 @@ fn export_world_diagnostic_result(
                 .map_err(|_| ExportWorldQueryError::DiagnosticSnapshotMismatch)?,
         ],
     })
+}
+
+enum ExternalWorldUnitSelection {
+    Selected(WitUnit),
+    Missing,
+    Ambiguous(Vec<String>),
 }
 
 /// Resolves a slash-separated local world name using the finalized package
@@ -224,12 +277,12 @@ impl RootDatabase {
         lookup_local_export_world(collection, path, &self.symbols)
     }
 
-    /// Projects a source or hybrid package's local `export world` from its
-    /// tracked manifest, and binds an unknown-world diagnostic to the exact
-    /// manifest file in the current workspace snapshot.
+    /// Resolves a source or hybrid package's local or external `export world`
+    /// from its tracked manifest, and binds diagnostics to the exact manifest
+    /// file in the current workspace snapshot.
     ///
-    /// External references and artifact-local names are handled by the full
-    /// package export-world query.
+    /// Artifact-local names are resolved separately from the package's WIT
+    /// directory because they do not require a phase-one source collection.
     pub fn resolve_local_export_world_from_contract(
         &mut self,
         package: PackageId,
@@ -265,14 +318,18 @@ impl RootDatabase {
         let Some(export_world) = bound.contract.export_world() else {
             return Ok(sai_resolve::ExportWorld::default());
         };
-        if export_world.value().contains(':') {
-            return Err(ExportWorldQueryError::NonLocalWorldReference(
-                export_world.value().to_owned(),
-            ));
-        }
-
         let location =
             manifest_world_location(bound.file_id, bound.file, export_world.span().clone())?;
+        if export_world.value().contains(':') {
+            return self.resolve_external_export_world_from_contract(
+                package,
+                export_world.value(),
+                location,
+                &bound.contract,
+                &bound.package_identity,
+                snapshot,
+            );
+        }
 
         let result =
             match lookup_local_export_world(collection, export_world.value(), &self.symbols)
@@ -311,13 +368,18 @@ impl RootDatabase {
         let Some(export_world) = bound.contract.export_world() else {
             return Ok(sai_resolve::ExportWorld::default());
         };
-        if export_world.value().contains(':') {
-            return Err(ExportWorldQueryError::NonLocalWorldReference(
-                export_world.value().to_owned(),
-            ));
-        }
         let location =
             manifest_world_location(bound.file_id, bound.file, export_world.span().clone())?;
+        if export_world.value().contains(':') {
+            return self.resolve_external_export_world_from_contract(
+                package,
+                export_world.value(),
+                location,
+                &bound.contract,
+                &bound.package_identity,
+                snapshot,
+            );
+        }
         if export_world.value().contains('/') {
             return Err(ExportWorldQueryError::InvalidArtifactWorldName(
                 export_world.value().to_owned(),
@@ -366,6 +428,199 @@ impl RootDatabase {
             world: Some(world.def),
             diagnostics: Vec::new(),
         })
+    }
+
+    fn resolve_external_export_world_from_contract(
+        &mut self,
+        requester: PackageId,
+        value: &str,
+        location: Location,
+        contract: &sai_wit::WitContract,
+        package_identity: &str,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<sai_resolve::ExportWorld, ExportWorldQueryError> {
+        let Some((identity, world_name)) = value.split_once('/') else {
+            return Err(ExportWorldQueryError::InvalidExternalWorldReference(
+                value.to_owned(),
+            ));
+        };
+        if identity.is_empty() || world_name.is_empty() || world_name.contains('/') {
+            return Err(ExportWorldQueryError::InvalidExternalWorldReference(
+                value.to_owned(),
+            ));
+        }
+
+        let view = if let Some((namespace, package_name)) = identity.split_once(':')
+            && namespace == "wasi"
+        {
+            let unit = match self.wasi_unit(package_name) {
+                Ok(unit) => unit,
+                Err(WasiWitUnitError::Identity(WitUnitIdentityError::UnknownWasiPackage)) => {
+                    return export_world_diagnostic_result(
+                        Code::UnknownExportWorld,
+                        format!("export world `{value}` names no WIT world"),
+                        "unknown export world",
+                        location,
+                        package_identity,
+                        snapshot,
+                    );
+                }
+                Err(error) => return Err(ExportWorldQueryError::WasiWitUnit(error)),
+            };
+            let view = self
+                .wasi_view(unit)
+                .map_err(ExportWorldQueryError::WasiWitView)?;
+            Some(view)
+        } else {
+            match self.select_external_export_world_unit(requester, contract, identity)? {
+                ExternalWorldUnitSelection::Missing => None,
+                ExternalWorldUnitSelection::Ambiguous(versions) => {
+                    let version_list = versions.join(", ");
+                    return export_world_diagnostic_result_with_note(
+                        Code::UnknownExportWorld,
+                        format!(
+                            "export world `{value}` is ambiguous because `{identity}` has multiple active versions"
+                        ),
+                        "ambiguous export world",
+                        location,
+                        package_identity,
+                        snapshot,
+                        Some(format!(
+                            "available versions: {version_list}; add a direct dependency to select one"
+                        )),
+                    );
+                }
+                ExternalWorldUnitSelection::Selected(unit) => Some(
+                    self.wit_view(&unit)
+                        .map_err(ExportWorldQueryError::WitView)?,
+                ),
+            }
+        };
+
+        let Some(view) = view else {
+            return export_world_diagnostic_result(
+                Code::UnknownExportWorld,
+                format!("export world `{value}` names no WIT world"),
+                "unknown export world",
+                location,
+                package_identity,
+                snapshot,
+            );
+        };
+        let Some(world) = view.worlds.get(world_name) else {
+            return export_world_diagnostic_result(
+                Code::UnknownExportWorld,
+                format!("export world `{value}` names no WIT world"),
+                "unknown export world",
+                location,
+                package_identity,
+                snapshot,
+            );
+        };
+        if let Some(unsupported) = view.model.worlds[world.wit].unsupported {
+            return export_world_diagnostic_result(
+                Code::WitUnsupportedFeature,
+                format!("export world `{value}` uses unsupported feature `{unsupported:?}`"),
+                "unsupported WIT world",
+                location,
+                package_identity,
+                snapshot,
+            );
+        }
+        Ok(sai_resolve::ExportWorld {
+            world: Some(world.def),
+            diagnostics: Vec::new(),
+        })
+    }
+
+    fn select_external_export_world_unit(
+        &mut self,
+        requester: PackageId,
+        contract: &sai_wit::WitContract,
+        identity: &str,
+    ) -> Result<ExternalWorldUnitSelection, ExportWorldQueryError> {
+        let graph_input = self
+            .package_graph
+            .get(&mut self.query_database, 0)
+            .map_err(ExportWorldQueryError::Query)?;
+        let graph = graph_input
+            .as_ref()
+            .as_ref()
+            .ok_or(ExportWorldQueryError::PackageGraphUnavailable)?;
+        let requester_key = self
+            .packages
+            .resolve(requester)
+            .map_err(ExportWorldQueryError::Package)?;
+        let requester_key =
+            PackageKey::new(requester_key.as_ref()).map_err(ExportWorldQueryError::PackageKey)?;
+        let requester_node = graph.node(&requester_key).ok_or_else(|| {
+            ExportWorldQueryError::RequesterNotInPackageGraph(requester_key.as_str().to_owned())
+        })?;
+        let form_matches = match (contract.kind(), requester_node.form()) {
+            (sai_wit::WitPackageKind::Source, super::package_graph::PackageForm::Source)
+            | (sai_wit::WitPackageKind::Artifact, super::package_graph::PackageForm::Artifact)
+            | (sai_wit::WitPackageKind::Hybrid, _) => true,
+            _ => false,
+        };
+        if requester_node.identity() != contract.identity().to_string()
+            || requester_node.version() != contract.version()
+            || !form_matches
+        {
+            return Err(ExportWorldQueryError::RequesterGraphContractMismatch {
+                package_key: requester_key.as_str().to_owned(),
+                manifest_identity: contract.identity().to_string(),
+                manifest_version: contract.version().to_string(),
+                selected_identity: requester_node.identity().to_owned(),
+                selected_version: requester_node.version().to_string(),
+                manifest_kind: contract.kind(),
+                selected_form: requester_node.form(),
+            });
+        }
+
+        let selected_node = if let Some(edge) = requester_node
+            .active_edges()
+            .iter()
+            .find(|edge| edge.visible_identity() == identity)
+        {
+            Some(graph.node(edge.target()).ok_or_else(|| {
+                ExportWorldQueryError::MissingPackageGraphTarget(edge.target().as_str().to_owned())
+            })?)
+        } else {
+            let mut candidates = graph
+                .nodes()
+                .iter()
+                .filter(|node| node.identity() == identity)
+                .collect::<Vec<_>>();
+            if candidates.is_empty() {
+                return Ok(ExternalWorldUnitSelection::Missing);
+            }
+            if candidates.len() > 1 {
+                candidates.sort_by(|left, right| left.version().cmp(right.version()));
+                let versions = candidates
+                    .iter()
+                    .map(|node| node.version().to_string())
+                    .collect::<Vec<_>>();
+                return Ok(ExternalWorldUnitSelection::Ambiguous(versions));
+            }
+            candidates.pop()
+        };
+        let Some(selected_node) = selected_node else {
+            return Ok(ExternalWorldUnitSelection::Missing);
+        };
+        let selected_package = self
+            .packages
+            .intern(selected_node.key().as_str())
+            .map_err(ExportWorldQueryError::Package)?;
+        let Some(unit) = self
+            .wit_unit_of(selected_package)
+            .map_err(ExportWorldQueryError::WitUnitOf)?
+        else {
+            // The root package intentionally has no dependent-facing unit.
+            // A self-qualified external reference therefore cannot select a
+            // WIT world through the package graph.
+            return Ok(ExternalWorldUnitSelection::Missing);
+        };
+        Ok(ExternalWorldUnitSelection::Selected(unit))
     }
 
     fn bind_export_world_manifest<'a>(
