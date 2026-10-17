@@ -3697,6 +3697,37 @@ fn canonical_wit_path_name(name: &str) -> String {
         .join("-")
 }
 
+fn rank_unknown_wit_item_candidates(
+    name: &str,
+    candidates: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let candidates = candidates
+        .into_iter()
+        .filter(|candidate| seen.insert(candidate.clone()))
+        .collect::<Vec<_>>();
+    let include_all = candidates.len() <= 5;
+    let maximum_distance = (name.chars().count() / 3).max(1);
+    let mut ranked = candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(declaration_order, candidate)| {
+            let distance = damerau_levenshtein(name, &candidate);
+            (include_all || distance <= maximum_distance).then_some((
+                distance,
+                declaration_order,
+                candidate,
+            ))
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_by_key(|(distance, declaration_order, _)| (*distance, *declaration_order));
+    ranked
+        .into_iter()
+        .take(10)
+        .map(|(_, _, candidate)| candidate)
+        .collect()
+}
+
 fn generated_origin_identity(
     source_def: DefId,
     scope: &ForeignWitViewScope<'_>,
@@ -3767,28 +3798,14 @@ fn unknown_wit_item_diagnostic(
         .map(|name| symbols.resolve(name).map(|name| name.to_string()))
         .transpose()?
         .unwrap_or_default();
-    let mut candidates = view
-        .interfaces
-        .values()
-        .map(|interface| canonical_wit_path_name(&view.model.interfaces[interface.wit].name))
-        .collect::<Vec<_>>();
-    candidates.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
-    candidates.dedup();
-    let mut ranked = candidates
-        .into_iter()
-        .map(|candidate| (damerau_levenshtein(&name, &candidate), candidate))
-        .filter(|(distance, _)| *distance <= 2)
-        .collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.as_bytes().cmp(right.1.as_bytes()))
-    });
-    let candidates = ranked
-        .into_iter()
-        .take(3)
-        .map(|(_, candidate)| candidate)
-        .collect::<Vec<_>>();
+    let mut interfaces = view.interfaces.values().collect::<Vec<_>>();
+    interfaces.sort_by_key(|interface| interface.wit.index());
+    let candidates = rank_unknown_wit_item_candidates(
+        &name,
+        interfaces
+            .into_iter()
+            .map(|interface| canonical_wit_path_name(&view.model.interfaces[interface.wit].name)),
+    );
     let mut diagnostic = use_binding_diagnostic(
         Code::UnknownWitItem,
         Severity::Error,
@@ -5259,6 +5276,40 @@ mod tests {
         assert_eq!(path.base, Res::PrimTy(PrimTy::I64));
     }
 
+    #[test]
+    fn unknown_wit_item_suggestions_use_unicode_scalar_distance_and_threshold() {
+        let name = "猫犬鳥abc";
+        let candidates = [
+            "犬猫鳥abc",
+            "猫犬鳥abx",
+            "猫犬鳥axy",
+            "猫犬鳥xyz",
+            "delta",
+            "epsilon",
+        ]
+        .map(str::to_owned);
+
+        assert_eq!(
+            rank_unknown_wit_item_candidates(name, candidates),
+            ["犬猫鳥abc", "猫犬鳥abx", "猫犬鳥axy"].map(str::to_owned),
+            "the six-scalar written name has threshold two even though it occupies twelve UTF-8 bytes; transposition counts as one edit"
+        );
+    }
+
+    #[test]
+    fn unknown_wit_item_suggestions_are_capped_at_ten_in_declaration_order() {
+        let name = "z".repeat(30);
+        let candidates = (b'a'..=b'l')
+            .map(|first| format!("{}{}", char::from(first), "z".repeat(29)))
+            .collect::<Vec<_>>();
+        let expected = candidates.iter().take(10).cloned().collect::<Vec<_>>();
+
+        assert_eq!(
+            rank_unknown_wit_item_candidates(&name, candidates),
+            expected
+        );
+    }
+
     struct Fixture {
         package: PackageId,
         packages: PackageInterner,
@@ -6075,6 +6126,51 @@ mod tests {
         WitView::build(model, &fixture.packages, &fixture.symbols, paths).expect("WIT view builds")
     }
 
+    fn wit_view_with_interfaces(fixture: &Fixture, names: &[&str]) -> WitView {
+        let package = fixture
+            .packages
+            .intern("acme:foreign#1")
+            .expect("WIT package interns");
+        let version = Version::parse("1.0.0").expect("WIT package version parses");
+        let selected = MvsPackageVersion::new("acme:foreign", version.clone())
+            .expect("selected WIT package version");
+        let unit =
+            WitUnit::dir(package, &fixture.packages, &selected).expect("directory WIT unit builds");
+        let mut interfaces = WitIndexVec::new();
+        for name in names {
+            interfaces
+                .push(WitInterface {
+                    name: (*name).to_owned(),
+                    docs: None,
+                    since: None,
+                    deprecated: None,
+                    items: WitIndexVec::new(),
+                    span: None,
+                })
+                .expect("WIT interface appends");
+        }
+        let model = WitPackage {
+            unit: unit.clone(),
+            name: WitPackageName {
+                namespace: "acme".to_owned(),
+                name: "foreign".to_owned(),
+                version: Some(version),
+            },
+            interfaces,
+            worlds: WitIndexVec::new(),
+            declaration_order: Vec::new(),
+        };
+        let view_package = fixture
+            .packages
+            .intern(unit.stable_key())
+            .expect("WIT view package interns");
+        let paths = Arc::new(
+            DefPathInterner::new(view_package, &fixture.packages, &fixture.symbols)
+                .expect("WIT view interner"),
+        );
+        WitView::build(model, &fixture.packages, &fixture.symbols, paths).expect("WIT view builds")
+    }
+
     fn generated_test_view(
         fixture: &Fixture,
         source_def_paths: &DefPathInterner,
@@ -6184,6 +6280,7 @@ mod tests {
             },
             interfaces,
             worlds,
+            declaration_order: Vec::new(),
         };
         let view_package = fixture
             .packages
@@ -7453,6 +7550,54 @@ mod tests {
                 Code::FeatureNotImplemented | Code::UnknownModule
             )
         }));
+    }
+
+    #[test]
+    fn unknown_wit_item_diagnostic_preserves_declaration_order_and_small_sets() {
+        let fixture = Fixture::new("use acme:foreign/fop as missing\n", "wasm32-core");
+        let view = wit_view_with_interfaces(&fixture, &["foo", "fob", "very-far-away"]);
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let wit_scopes = [ForeignWitViewScope {
+            visible_identity: "acme:foreign",
+            view: &view,
+            source_def_paths: None,
+            directly_visible: true,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &[],
+                &wit_scopes,
+            );
+
+        let diagnostic = scopes
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == Code::UnknownWitItem)
+            .expect("unknown WIT interface produces a diagnostic");
+        let suggestions = match &diagnostic.data["candidates"] {
+            Value::Array(candidates) => candidates
+                .iter()
+                .map(|candidate| match candidate {
+                    Value::String(candidate) => candidate.clone(),
+                    _ => panic!("candidate is a string"),
+                })
+                .collect::<Vec<_>>(),
+            _ => panic!("candidates are an array"),
+        };
+        assert_eq!(
+            suggestions,
+            ["foo", "fob", "very-far-away"].map(str::to_owned),
+            "equidistant suggestions keep WIT declaration order, and all interfaces are shown when the candidate set has at most five members"
+        );
     }
 
     #[test]

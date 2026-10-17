@@ -297,6 +297,42 @@ pub struct WitPackage {
     pub interfaces: WitIndexVec<WitIfaceIdx, WitInterface>,
     /// Worlds in WIT declaration order.
     pub worlds: WitIndexVec<WitWorldIdx, WitWorld>,
+    /// Total declaration order across interfaces and worlds.
+    ///
+    /// Parsed directory and WASI packages preserve source order here.
+    /// Generated packages use interface order followed by world order.
+    /// Hand-built models may leave this empty; [`Self::declarations_in_order`]
+    /// then supplies a deterministic interfaces-then-worlds fallback.
+    pub declaration_order: Vec<WitPackageDeclaration>,
+}
+
+impl WitPackage {
+    /// Returns the package declarations in their total declaration order.
+    ///
+    /// The fallback is intended for hand-built models that do not have source
+    /// order information.
+    pub fn declarations_in_order(&self) -> Vec<WitPackageDeclaration> {
+        if !self.declaration_order.is_empty() {
+            return self.declaration_order.clone();
+        }
+
+        self.interfaces
+            .iter_enumerated()
+            .map(|(index, _)| WitPackageDeclaration::Interface(index))
+            .chain(
+                self.worlds
+                    .iter_enumerated()
+                    .map(|(index, _)| WitPackageDeclaration::World(index)),
+            )
+            .collect()
+    }
+}
+
+/// A top-level package declaration in total WIT source order.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum WitPackageDeclaration {
+    Interface(WitIfaceIdx),
+    World(WitWorldIdx),
 }
 
 /// The namespace, name, and optional version of a WIT package.
@@ -557,11 +593,12 @@ pub enum Unsupported {
 mod tests {
     use super::{
         Unsupported, WitCase, WitField, WitIfaceIdx, WitIfaceRef, WitIndexVec, WitInterface,
-        WitItem, WitItemIdx, WitItemKind, WitPackage, WitPackageName, WitStabilityVersion, WitType,
-        WitTypeRef, WitUnit, WitWorldIdx,
+        WitItem, WitItemIdx, WitItemKind, WitPackage, WitPackageDeclaration, WitPackageName,
+        WitStabilityVersion, WitType, WitTypeRef, WitUnit, WitWorld, WitWorldIdx,
     };
     use sai_intern::Interner;
     use sai_package::version::Version;
+    use sai_stable_hash::StableHash;
 
     fn wasi_unit(name: &str) -> WitUnit {
         let symbols = Interner::new();
@@ -653,7 +690,20 @@ mod tests {
                 interface("second-interface"),
             ])
             .expect("two interfaces fit the index"),
-            worlds: WitIndexVec::new(),
+            worlds: WitIndexVec::try_from_vec(vec![WitWorld {
+                name: "first-world".to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                imports: Vec::new(),
+                exports: Vec::new(),
+                includes: Vec::new(),
+                source_order: Vec::new(),
+                unsupported: None,
+                span: None,
+            }])
+            .expect("one world fits the index"),
+            declaration_order: Vec::new(),
         };
 
         assert_eq!(
@@ -671,6 +721,26 @@ mod tests {
                 .map(|item| item.name.as_str())
                 .collect::<Vec<_>>(),
             ["first", "second"]
+        );
+        assert_eq!(
+            package.declarations_in_order(),
+            [
+                WitPackageDeclaration::Interface(WitIfaceIdx::from_raw(0)),
+                WitPackageDeclaration::Interface(WitIfaceIdx::from_raw(1)),
+                WitPackageDeclaration::World(WitWorldIdx::from_raw(0)),
+            ]
+        );
+
+        let mut reordered = package.clone();
+        reordered.declaration_order = vec![
+            WitPackageDeclaration::World(WitWorldIdx::from_raw(0)),
+            WitPackageDeclaration::Interface(WitIfaceIdx::from_raw(1)),
+            WitPackageDeclaration::Interface(WitIfaceIdx::from_raw(0)),
+        ];
+        assert_ne!(
+            package.fingerprint(),
+            reordered.fingerprint(),
+            "the total declaration order participates in stable package hashing"
         );
     }
 

@@ -1858,6 +1858,7 @@ mod tests {
             },
             interfaces: interface_vec,
             worlds: world_vec,
+            declaration_order: Vec::new(),
         }
     }
 

@@ -469,6 +469,7 @@ mod tests {
             },
             interfaces: WitIndexVec::try_from_vec(interfaces).expect("test interface indices fit"),
             worlds: WitIndexVec::new(),
+            declaration_order: Vec::new(),
         }
     }
 

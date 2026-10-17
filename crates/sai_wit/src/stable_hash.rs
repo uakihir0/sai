@@ -3,8 +3,8 @@
 use crate::{
     Unsupported, WitCase, WitField, WitFunc, WitIfaceIdx, WitIfaceRef, WitIndex, WitIndexVec,
     WitInterface, WitItem, WitItemIdx, WitItemKind, WitMember, WitMemberKind, WitPackage,
-    WitPackageName, WitSpan, WitType, WitTypeRef, WitWorld, WitWorldIdx, WitWorldItem,
-    WitWorldItemDirection, WitWorldItemOrder, WitWorldRef,
+    WitPackageDeclaration, WitPackageName, WitSpan, WitType, WitTypeRef, WitWorld, WitWorldIdx,
+    WitWorldItem, WitWorldItemDirection, WitWorldItemOrder, WitWorldRef,
 };
 use sai_stable_hash::{StableHash, StableHasher};
 
@@ -65,6 +65,7 @@ impl StableHash for WitPackage {
         self.name.stable_hash(hasher);
         self.interfaces.stable_hash(hasher);
         self.worlds.stable_hash(hasher);
+        self.declaration_order.stable_hash(hasher);
     }
 }
 
@@ -268,6 +269,22 @@ impl StableHash for WitWorldRef {
         }
         stable_version(&self.since, hasher);
         stable_version(&self.deprecated, hasher);
+    }
+}
+
+impl StableHash for WitPackageDeclaration {
+    fn stable_hash(&self, hasher: &mut StableHasher) {
+        hasher.write_tag(0xD3);
+        match self {
+            Self::Interface(index) => {
+                hasher.write_tag(0x01);
+                index.stable_hash(hasher);
+            }
+            Self::World(index) => {
+                hasher.write_tag(0x02);
+                index.stable_hash(hasher);
+            }
+        }
     }
 }
 

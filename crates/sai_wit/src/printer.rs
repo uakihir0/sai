@@ -692,6 +692,7 @@ mod tests {
             },
             interfaces: WitIndexVec::try_from_vec(interfaces).expect("small interface list"),
             worlds: WitIndexVec::try_from_vec(worlds).expect("small world list"),
+            declaration_order: Vec::new(),
         }
     }
 

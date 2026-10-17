@@ -3,9 +3,9 @@
 use crate::{
     ParsedWitPackageGroup, Unsupported, WitCase, WitField, WitFunc, WitIfaceIdx, WitIfaceRef,
     WitIndexVec, WitInterface, WitItem, WitItemIdx, WitItemKind, WitMember, WitMemberKind,
-    WitPackage, WitPackageName, WitSourceLocation, WitSpan, WitStabilityVersion, WitType,
-    WitTypeRef, WitUnit, WitUnitKind, WitWorld, WitWorldIdx, WitWorldItem, WitWorldItemOrder,
-    WitWorldRef,
+    WitPackage, WitPackageDeclaration, WitPackageName, WitSourceLocation, WitSpan,
+    WitStabilityVersion, WitType, WitTypeRef, WitUnit, WitUnitKind, WitWorld, WitWorldIdx,
+    WitWorldItem, WitWorldItemOrder, WitWorldRef,
 };
 use sai_package::version::Version;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -384,6 +384,10 @@ fn model_package(
     for (index, id) in interface_ids.iter().copied().enumerate() {
         interface_indexes.insert(id, interface_index(index)?);
     }
+    let mut world_indexes = HashMap::with_capacity(world_ids.len());
+    for (index, id) in world_ids.iter().copied().enumerate() {
+        world_indexes.insert(id, world_index(index)?);
+    }
 
     let type_references = build_type_references(resolve, package_units)?;
     let unsupported_types = build_unsupported_types(resolve);
@@ -622,6 +626,16 @@ fn model_package(
         });
     }
 
+    let declaration_order = package_declaration_order(
+        unit.kind(),
+        resolve,
+        &interface_ids,
+        &world_ids,
+        &interface_indexes,
+        &world_indexes,
+        source_mappings,
+    )?;
+
     Ok(WitPackage {
         unit,
         name,
@@ -629,7 +643,102 @@ fn model_package(
             .map_err(|_| WitModelError::TooManyDefinitions)?,
         worlds: WitIndexVec::<WitWorldIdx, _>::try_from_vec(worlds)
             .map_err(|_| WitModelError::TooManyDefinitions)?,
+        declaration_order,
     })
+}
+
+fn package_declaration_order(
+    unit_kind: WitUnitKind,
+    resolve: &Resolve,
+    interface_ids: &[InterfaceId],
+    world_ids: &[WorldId],
+    interface_indexes: &HashMap<InterfaceId, WitIfaceIdx>,
+    world_indexes: &HashMap<WorldId, WitWorldIdx>,
+    source_mappings: &[(u32, crate::WitSourceMapping)],
+) -> Result<Vec<WitPackageDeclaration>, WitModelError> {
+    if matches!(unit_kind, WitUnitKind::Generated { .. }) {
+        return interface_ids
+            .iter()
+            .map(|id| {
+                interface_indexes
+                    .get(id)
+                    .copied()
+                    .map(WitPackageDeclaration::Interface)
+                    .ok_or(WitModelError::MissingInterface)
+            })
+            .chain(world_ids.iter().map(|id| {
+                world_indexes
+                    .get(id)
+                    .copied()
+                    .map(WitPackageDeclaration::World)
+                    .ok_or(WitModelError::MissingWorld)
+            }))
+            .collect();
+    }
+
+    let mut declarations = Vec::with_capacity(interface_ids.len() + world_ids.len());
+    for (index, id) in interface_ids.iter().copied().enumerate() {
+        let interface = resolve
+            .interfaces
+            .get(id)
+            .ok_or(WitModelError::MissingInterface)?;
+        let (file_order, path, byte_start) = source_order_position(interface.span, source_mappings)
+            .ok_or(WitModelError::UnmappedSourceSpan)?;
+        let declaration = interface_indexes
+            .get(&id)
+            .copied()
+            .map(WitPackageDeclaration::Interface)
+            .ok_or(WitModelError::MissingInterface)?;
+        declarations.push((file_order, path, byte_start, 0_u8, index, declaration));
+    }
+    for (index, id) in world_ids.iter().copied().enumerate() {
+        let world = resolve.worlds.get(id).ok_or(WitModelError::MissingWorld)?;
+        let (file_order, path, byte_start) = source_order_position(world.span, source_mappings)
+            .ok_or(WitModelError::UnmappedSourceSpan)?;
+        let declaration = world_indexes
+            .get(&id)
+            .copied()
+            .map(WitPackageDeclaration::World)
+            .ok_or(WitModelError::MissingWorld)?;
+        declarations.push((file_order, path, byte_start, 1_u8, index, declaration));
+    }
+
+    declarations.sort_by(|left, right| {
+        (&left.0, left.1.as_bytes(), &left.2, &left.3, &left.4).cmp(&(
+            &right.0,
+            right.1.as_bytes(),
+            &right.2,
+            &right.3,
+            &right.4,
+        ))
+    });
+    Ok(declarations
+        .into_iter()
+        .map(|(_, _, _, _, _, declaration)| declaration)
+        .collect())
+}
+
+fn source_order_position(
+    span: Span,
+    source_mappings: &[(u32, crate::WitSourceMapping)],
+) -> Option<(usize, String, usize)> {
+    if !span.is_known() {
+        return None;
+    }
+    let start = span.start();
+    source_mappings
+        .iter()
+        .enumerate()
+        .find_map(|(file_order, (base, source))| {
+            let source_start = base.checked_add(source.offset)?;
+            let source_end = source_start.checked_add(u32::try_from(source.parser_len).ok()?)?;
+            if start < source_start || start > source_end {
+                return None;
+            }
+            let parser_start = usize::try_from(start - source_start).ok()?;
+            let byte_start = *source.parser_to_source.get(parser_start)?;
+            Some((file_order, source.path.clone(), byte_start))
+        })
 }
 
 fn item_kind(
@@ -1570,11 +1679,11 @@ mod tests {
         UnsupportedEdge, WitModelError, WitResolveContext, resolve_transitive_unsupported,
     };
     use crate::{
-        Unsupported, WitIfaceIdx, WitItemIdx, WitItemKind, WitSourceFile, WitSourceLocation,
-        WitStabilityVersion, WitType, WitUnit, WitWorldIdx, WitWorldItem, WitWorldItemDirection,
-        parse_source_files, print_wit,
+        Unsupported, WitIfaceIdx, WitItemIdx, WitItemKind, WitPackage, WitPackageDeclaration,
+        WitSourceFile, WitSourceLocation, WitStabilityVersion, WitType, WitUnit, WitWorldIdx,
+        WitWorldItem, WitWorldItemDirection, parse_source_files, print_wit,
     };
-    use sai_intern::PackageInterner;
+    use sai_intern::{Interner, PackageInterner};
     use sai_package::{mvs::MvsPackageVersion, version::Version};
     use sai_stable_hash::StableHash;
     use std::collections::HashMap;
@@ -1602,6 +1711,147 @@ mod tests {
         )
         .expect("valid package version");
         WitUnit::dir(package, &packages, &version).expect("package ID matches package version")
+    }
+
+    fn generated_unit() -> WitUnit {
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:generated#1")
+            .expect("valid package key");
+        let version = MvsPackageVersion::new(
+            "acme:generated",
+            Version::parse("1.2.3").expect("valid test version"),
+        )
+        .expect("valid test package version");
+        WitUnit::generated(package, &packages, &version)
+            .expect("package ID matches package version")
+    }
+
+    fn declaration_names(package: &WitPackage) -> Vec<(char, String)> {
+        package
+            .declarations_in_order()
+            .into_iter()
+            .map(|declaration| match declaration {
+                WitPackageDeclaration::Interface(index) => {
+                    ('i', package.interfaces[index].name.clone())
+                }
+                WitPackageDeclaration::World(index) => ('w', package.worlds[index].name.clone()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn package_declaration_order_interleaves_directory_interfaces_and_worlds() {
+        let parsed = parse_source_files(
+            dir_unit(),
+            [
+                WitSourceFile::new(
+                    "z-last.wit",
+                    "package acme:graphics@1.2.3;\nworld late {} interface final {}",
+                ),
+                WitSourceFile::new(
+                    "a-first.wit",
+                    "package acme:graphics@1.2.3;\ninterface early {} world middle {}",
+                ),
+            ],
+        )
+        .expect("valid WIT parses");
+        let mut context = WitResolveContext::default();
+        let mut resolve = Resolve::default();
+        let package = context
+            .push_package(&mut resolve, parsed)
+            .expect("self-contained package resolves");
+
+        assert_eq!(
+            declaration_names(&package),
+            [
+                ('i', "early".to_owned()),
+                ('w', "middle".to_owned()),
+                ('w', "late".to_owned()),
+                ('i', "final".to_owned()),
+            ]
+        );
+        assert!(
+            package
+                .declaration_order
+                .iter()
+                .all(|declaration| match declaration {
+                    WitPackageDeclaration::Interface(index) => {
+                        package.interfaces[*index].span.is_some()
+                    }
+                    WitPackageDeclaration::World(index) => package.worlds[*index].span.is_some(),
+                }),
+            "directory package declarations retain their source spans"
+        );
+    }
+
+    #[test]
+    fn package_declaration_order_uses_wasi_source_file_order_without_public_spans() {
+        let symbols = Interner::new();
+        let package = symbols.intern("http").expect("WASI package symbol interns");
+        let version =
+            Version::parse(crate::EMBEDDED_WASI_VERSION).expect("embedded WASI version is valid");
+        let unit = WitUnit::wasi(package, &symbols, &version)
+            .expect("HTTP belongs to the embedded WASI catalog");
+        let loaded = crate::load_embedded_wasi_package(&unit, &symbols)
+            .expect("embedded HTTP package and its dependencies load");
+        let package = loaded.root();
+
+        assert_eq!(
+            declaration_names(package),
+            [
+                ('i', "incoming-handler".to_owned()),
+                ('i', "outgoing-handler".to_owned()),
+                ('w', "imports".to_owned()),
+                ('w', "proxy".to_owned()),
+                ('i', "types".to_owned()),
+            ]
+        );
+        assert!(
+            package
+                .interfaces
+                .iter()
+                .all(|interface| interface.span.is_none())
+                && package.worlds.iter().all(|world| world.span.is_none()),
+            "embedded WASI declaration ordering does not expose public source spans"
+        );
+    }
+
+    #[test]
+    fn generated_package_declaration_order_is_interfaces_then_worlds() {
+        let parsed = parse_source_files(
+            generated_unit(),
+            [WitSourceFile::new(
+                "generated.wit",
+                "package acme:generated@1.2.3;\nworld zeta {} interface omega {} world alpha {} interface beta {}",
+            )],
+        )
+        .expect("valid generated WIT parses");
+        let mut context = WitResolveContext::default();
+        let mut resolve = Resolve::default();
+        let package = context
+            .push_package(&mut resolve, parsed)
+            .expect("generated package resolves");
+
+        let expected = package
+            .interfaces
+            .iter_enumerated()
+            .map(|(index, _)| WitPackageDeclaration::Interface(index))
+            .chain(
+                package
+                    .worlds
+                    .iter_enumerated()
+                    .map(|(index, _)| WitPackageDeclaration::World(index)),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(package.declaration_order, expected);
+        assert!(
+            package
+                .interfaces
+                .iter()
+                .all(|interface| interface.span.is_none())
+        );
+        assert!(package.worlds.iter().all(|world| world.span.is_none()));
     }
 
     #[test]
