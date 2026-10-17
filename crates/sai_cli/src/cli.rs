@@ -713,6 +713,7 @@ fn run_check(
     ) {
         graph_package_manifests.push(CheckPackageManifestInput {
             package_key: root_package_key.to_owned(),
+            package_identity: root_identity.to_owned(),
             source: Arc::clone(manifest_source),
             role: sai_package::manifest::PackageRole::Root,
         });
@@ -800,6 +801,7 @@ fn run_check(
         graph_package_manifests.extend(locked_active_packages.iter().map(|package| {
             CheckPackageManifestInput {
                 package_key: package.package_key.as_str().to_owned(),
+                package_identity: package.package_identity.clone(),
                 source: Arc::clone(&package.directory.manifest_bytes()),
                 role: sai_package::manifest::PackageRole::Dependency,
             }
@@ -1875,6 +1877,7 @@ impl CheckLockedWitDirectory {
 
 struct CheckPackageManifestInput {
     package_key: String,
+    package_identity: String,
     source: Arc<[u8]>,
     role: sai_package::manifest::PackageRole,
 }
@@ -1883,6 +1886,7 @@ struct CheckWitDirectoryPackageInput {
     package_key: PackageKey,
     files: WitFilesSnapshot,
     file_inputs: Vec<(PackageRelativePath, Arc<[u8]>)>,
+    input_failure_reported: bool,
 }
 
 struct CheckLockedWitDirectoryInputs {
@@ -4046,7 +4050,19 @@ fn check_locked_wit_directory_inputs(
         errors: 0,
     };
 
-    for package in directories {
+    if budget.exhausted {
+        for package in directories {
+            result.packages.push(CheckWitDirectoryPackageInput {
+                package_key: package.package_key.clone(),
+                files: WitFilesSnapshot::not_applicable(),
+                file_inputs: Vec::new(),
+                input_failure_reported: true,
+            });
+        }
+        return Ok(result);
+    }
+
+    for (index, package) in directories.iter().enumerate() {
         if cancellation.is_cancelled() {
             return Err(());
         }
@@ -4091,8 +4107,17 @@ fn check_locked_wit_directory_inputs(
                     package_key: package.package_key.clone(),
                     files: WitFilesSnapshot::not_applicable(),
                     file_inputs: Vec::new(),
+                    input_failure_reported: true,
                 });
                 if !file_limit_only {
+                    for skipped in directories.iter().skip(index + 1) {
+                        result.packages.push(CheckWitDirectoryPackageInput {
+                            package_key: skipped.package_key.clone(),
+                            files: WitFilesSnapshot::not_applicable(),
+                            file_inputs: Vec::new(),
+                            input_failure_reported: true,
+                        });
+                    }
                     break;
                 }
                 continue;
@@ -4112,6 +4137,7 @@ fn check_locked_wit_directory_inputs(
                     package_key: package.package_key.clone(),
                     files: WitFilesSnapshot::not_applicable(),
                     file_inputs: Vec::new(),
+                    input_failure_reported: true,
                 });
                 continue;
             }
@@ -4131,6 +4157,7 @@ fn check_locked_wit_directory_inputs(
                     package_key: package.package_key.clone(),
                     files: WitFilesSnapshot::not_applicable(),
                     file_inputs: Vec::new(),
+                    input_failure_reported: true,
                 });
                 continue;
             }
@@ -4149,6 +4176,7 @@ fn check_locked_wit_directory_inputs(
                     package_key: package.package_key.clone(),
                     files: WitFilesSnapshot::not_applicable(),
                     file_inputs: Vec::new(),
+                    input_failure_reported: true,
                 });
                 continue;
             }
@@ -4179,6 +4207,7 @@ fn check_locked_wit_directory_inputs(
                         package_key: package.package_key.clone(),
                         files: WitFilesSnapshot::not_applicable(),
                         file_inputs: Vec::new(),
+                        input_failure_reported: true,
                     });
                     continue;
                 }
@@ -4199,6 +4228,7 @@ fn check_locked_wit_directory_inputs(
                 package_key: package.package_key.clone(),
                 files: WitFilesSnapshot::not_applicable(),
                 file_inputs: Vec::new(),
+                input_failure_reported: true,
             });
             continue;
         }
@@ -4245,9 +4275,11 @@ fn check_locked_wit_directory_inputs(
                 package_key: package.package_key.clone(),
                 files: WitFilesSnapshot::not_applicable(),
                 file_inputs: Vec::new(),
+                input_failure_reported: true,
             });
             continue;
         }
+        let mut input_failure_reported = non_regular.is_some();
         if let Some(path) = non_regular {
             result.diagnostics.push(check_dependency_source_read_failed(
                 &format!(
@@ -4260,6 +4292,15 @@ fn check_locked_wit_directory_inputs(
             ));
             result.errors = result.errors.saturating_add(1);
         }
+        if input_failure_reported {
+            result.packages.push(CheckWitDirectoryPackageInput {
+                package_key: package.package_key.clone(),
+                files: WitFilesSnapshot::not_applicable(),
+                file_inputs: Vec::new(),
+                input_failure_reported: true,
+            });
+            continue;
+        }
         let files = match WitFilesSnapshot::listed(package.wit_directory.as_str(), files) {
             Ok(files) => files,
             Err(_) => {
@@ -4271,6 +4312,7 @@ fn check_locked_wit_directory_inputs(
                     "invalid tracked file inventory",
                 ));
                 result.errors = result.errors.saturating_add(1);
+                input_failure_reported = true;
                 WitFilesSnapshot::not_applicable()
             }
         };
@@ -4278,6 +4320,7 @@ fn check_locked_wit_directory_inputs(
             package_key: package.package_key.clone(),
             files,
             file_inputs,
+            input_failure_reported,
         });
     }
     Ok(result)
@@ -4615,10 +4658,35 @@ fn wit_package_load_check_diagnostics(
     package_graph: &sai_driver::package_graph::PackageGraph,
     wit_packages: &[CheckWitDirectoryPackageInput],
     include_source_lines: bool,
-) -> Result<(Vec<CheckDiagnostic>, usize), String> {
+) -> Result<(Vec<CheckDiagnostic>, usize, HashSet<String>), String> {
     let mut diagnostics = Vec::new();
+    let mut reported_wit_input_failure_units = HashSet::new();
     for wit_package in wit_packages {
         let Some(directory) = wit_package.files.directory() else {
+            if wit_package.input_failure_reported {
+                let graph_node = package_graph
+                    .node(&wit_package.package_key)
+                    .ok_or_else(|| {
+                        format!(
+                            "unavailable WIT input belongs to inactive package {}",
+                            wit_package.package_key.as_str()
+                        )
+                    })?;
+                let package_id =
+                    database
+                        .intern_package(graph_node.key().as_str())
+                        .map_err(|error| {
+                            format!("could not intern unavailable WIT package: {error:?}")
+                        })?;
+                if let Some(unit) = database.wit_unit_of(package_id).map_err(|error| {
+                    format!(
+                        "WIT unit query failed for {}: {error:?}",
+                        graph_node.key().as_str()
+                    )
+                })? {
+                    reported_wit_input_failure_units.insert(unit.canonical_name().to_owned());
+                }
+            }
             continue;
         };
         let graph_node = package_graph
@@ -4646,6 +4714,7 @@ fn wit_package_load_check_diagnostics(
         else {
             continue;
         };
+        reported_wit_input_failure_units.insert(template.unit().canonical_name().to_owned());
 
         let code = template.code().as_str();
         let diagnostic = if let Some(location) = template.location() {
@@ -4701,7 +4770,93 @@ fn wit_package_load_check_diagnostics(
         ));
     }
     let errors = diagnostics.len();
-    Ok((diagnostics, errors))
+    Ok((diagnostics, errors, reported_wit_input_failure_units))
+}
+
+fn export_world_selection_for_check<T>(
+    result: Result<T, sai_driver::ExportWorldQueryError>,
+    reported_wit_input_failure_units: &HashSet<String>,
+    failure_context: &str,
+) -> Result<Option<T>, String> {
+    match result {
+        Ok(selection) => Ok(Some(selection)),
+        Err(sai_driver::ExportWorldQueryError::WitView(
+            sai_driver::WitViewQueryError::Package(sai_driver::WitPackageFailure::Load(error)),
+        )) if reported_wit_input_failure_units.contains(error.unit().canonical_name()) => {
+            // The workspace WIT capture or load pass has already emitted the
+            // owning package diagnostic. Avoid turning the same failure into
+            // an additional internal CLI error.
+            Ok(None)
+        }
+        Err(sai_driver::ExportWorldQueryError::WitView(
+            sai_driver::WitViewQueryError::Package(failure),
+        )) if failure.generated_text_missing_unit().is_some() => {
+            // Dependents see source packages through generated WIT, whose
+            // producer is still an unimplemented Stage 4 query. Keep the
+            // selection unavailable; `sai check` reports its incomplete
+            // feature diagnostic rather than converting this expected gap
+            // into an internal error or a false unknown-world diagnostic.
+            Ok(None)
+        }
+        Err(error) => Err(format!("{failure_context}: {error:?}")),
+    }
+}
+
+fn has_incomplete_wit_input_capture(wit_packages: &[CheckWitDirectoryPackageInput]) -> bool {
+    wit_packages
+        .iter()
+        .any(|wit_package| wit_package.input_failure_reported)
+}
+
+fn check_package_manifest_snapshot_files(
+    database: &mut RootDatabase,
+    manifests: &[CheckPackageManifestInput],
+) -> Result<Vec<SnapshotFile>, String> {
+    let mut package_keys = HashSet::with_capacity(manifests.len());
+    let mut snapshot_files = Vec::with_capacity(manifests.len());
+    for manifest in manifests {
+        let package_key = PackageKey::new(manifest.package_key.clone())
+            .map_err(|error| format!("invalid manifest package key: {error:?}"))?;
+        if !package_keys.insert(package_key.clone()) {
+            return Err(format!(
+                "duplicate manifest input for package {}",
+                package_key.as_str()
+            ));
+        }
+        let package_id = database
+            .intern_package(package_key.as_str())
+            .map_err(|error| format!("could not intern manifest package key: {error:?}"))?;
+        let manifest_file = database
+            .intern_package_file(
+                package_id,
+                PackageRelativePath::new("sai.package")
+                    .map_err(|error| format!("invalid package manifest path: {error:?}"))?,
+            )
+            .map_err(|error| format!("could not intern package manifest: {error:?}"))?;
+        database
+            .set_package_manifest(
+                package_id,
+                Arc::clone(&manifest.source),
+                manifest.role,
+                Durability::Low,
+            )
+            .map_err(|error| format!("could not set package manifest input: {error:?}"))?;
+        let path = match manifest.role {
+            sai_package::manifest::PackageRole::Root => "sai.package".to_owned(),
+            sai_package::manifest::PackageRole::Dependency => {
+                format!("dep:{}/sai.package", manifest.package_identity)
+            }
+        };
+        let source = SourceFile::decode(manifest_file, &manifest.source)
+            .map_err(|error| format!("could not decode {path}: {error:?}"))?;
+        snapshot_files.push(SnapshotFile::new(
+            Arc::new(source),
+            path,
+            Some(manifest.package_identity.clone()),
+            None,
+        ));
+    }
+    Ok(snapshot_files)
 }
 
 fn module_tree_workspace_check_diagnostics(
@@ -4767,21 +4922,8 @@ fn module_tree_workspace_check_diagnostics(
         package_ids.push((package_id, source_directory));
     }
 
-    for manifest in package_manifests {
-        let package_key = PackageKey::new(manifest.package_key.clone())
-            .map_err(|error| format!("invalid manifest package key: {error:?}"))?;
-        let package_id = database
-            .intern_package(package_key.as_str())
-            .map_err(|error| format!("could not intern manifest package key: {error:?}"))?;
-        database
-            .set_package_manifest(
-                package_id,
-                Arc::clone(&manifest.source),
-                manifest.role,
-                Durability::Low,
-            )
-            .map_err(|error| format!("could not set package manifest input: {error:?}"))?;
-    }
+    let manifest_snapshot_files =
+        check_package_manifest_snapshot_files(&mut database, package_manifests)?;
 
     let mut wit_package_keys = HashSet::with_capacity(wit_packages.len());
     for package in wit_packages {
@@ -4868,6 +5010,15 @@ fn module_tree_workspace_check_diagnostics(
                 Arc::clone(&input.manifest_source),
             ),
         );
+        if !input.is_root_package {
+            source_by_key.insert(
+                format!("dep:{}/sai.package", input.package_identity),
+                (
+                    input.manifest_path.clone(),
+                    Arc::clone(&input.manifest_source),
+                ),
+            );
+        }
         for (key_path, display_path, source) in &input.source_inputs {
             source_by_key.insert(key_path.clone(), (display_path.clone(), Arc::clone(source)));
             if !input.is_root_package {
@@ -4892,6 +5043,17 @@ fn module_tree_workspace_check_diagnostics(
                 workspace_source_by_key.insert(key.clone(), source.clone());
             }
         }
+    }
+    for manifest in package_manifests {
+        let path = match manifest.role {
+            sai_package::manifest::PackageRole::Root => "sai.package".to_owned(),
+            sai_package::manifest::PackageRole::Dependency => {
+                format!("dep:{}/sai.package", manifest.package_identity)
+            }
+        };
+        workspace_source_by_key
+            .entry(path.clone())
+            .or_insert_with(|| (path, Arc::clone(&manifest.source)));
     }
 
     let mut workspace_files = Vec::new();
@@ -4921,6 +5083,8 @@ fn module_tree_workspace_check_diagnostics(
             ));
         }
     }
+    let has_source_files = !workspace_files.is_empty();
+    workspace_files.extend(manifest_snapshot_files);
     let workspace_snapshot = if workspace_files.is_empty() {
         None
     } else {
@@ -4934,15 +5098,82 @@ fn module_tree_workspace_check_diagnostics(
     let mut errors = 0usize;
     let mut warnings = 0usize;
     let mut infos = 0usize;
+    let mut reported_wit_input_failure_units = HashSet::new();
+    // A partial capture cannot support WIT-dependent implementation checks.
+    // Local source-world selection still uses its complete source collection,
+    // and failed WIT-unit loads are suppressed only by exact unit identity.
+    let has_wit_capture_failures = has_incomplete_wit_input_capture(wit_packages);
     if let Some(package_graph) = package_graph_for_scopes.as_ref() {
-        let (wit_diagnostics, wit_errors) = wit_package_load_check_diagnostics(
+        let (wit_diagnostics, wit_errors, reported_units) = wit_package_load_check_diagnostics(
             &mut database,
             package_graph,
             wit_packages,
             include_source_lines,
         )?;
+        reported_wit_input_failure_units = reported_units;
         diagnostics.extend(wit_diagnostics);
         errors = errors.saturating_add(wit_errors);
+    }
+    if package_graph_for_scopes.is_some()
+        && !inputs.iter().any(|input| input.is_root_package)
+        && let (Some(root_manifest), Some(workspace_snapshot)) = (
+            package_manifests
+                .iter()
+                .find(|manifest| manifest.role == sai_package::manifest::PackageRole::Root),
+            workspace_snapshot.as_ref(),
+        )
+    {
+        let package_key = PackageKey::new(root_manifest.package_key.clone())
+            .map_err(|error| format!("invalid root package key: {error:?}"))?;
+        let package = database
+            .intern_package(package_key.as_str())
+            .map_err(|error| format!("could not intern root artifact package: {error:?}"))?;
+        let contract = database
+            .wit_contract(package)
+            .map_err(|error| format!("root artifact contract query failed: {error:?}"))?;
+        let root_wit_inventory_available = wit_packages.iter().any(|wit_package| {
+            wit_package.package_key == package_key
+                && wit_package.files.directory().is_some()
+                && !wit_package.input_failure_reported
+        });
+        if contract.export_world().is_some() && root_wit_inventory_available {
+            let selected_version = sai_package::mvs::MvsPackageVersion::new(
+                contract.identity().to_string(),
+                contract.version().clone(),
+            )
+            .map_err(|error| format!("invalid root artifact package version: {error:?}"))?;
+            let load_diagnostic = if contract.wit_directory().is_some() {
+                database
+                    .wit_directory_load_diagnostic_template(package, &selected_version)
+                    .map_err(|error| format!("root artifact WIT query failed: {error:?}"))?
+            } else {
+                None
+            };
+            if load_diagnostic.is_none() {
+                if let Some(selection) = export_world_selection_for_check(
+                    database
+                        .resolve_artifact_export_world_from_contract(package, workspace_snapshot),
+                    &reported_wit_input_failure_units,
+                    "artifact export-world query failed",
+                )? {
+                    let (
+                        selection_diagnostics,
+                        selection_errors,
+                        selection_warnings,
+                        selection_infos,
+                    ) = phase1_check_diagnostics(
+                        &selection.diagnostics,
+                        &workspace_source_by_key,
+                        &root_manifest.package_identity,
+                        include_source_lines,
+                    );
+                    diagnostics.extend(selection_diagnostics);
+                    errors = errors.saturating_add(selection_errors);
+                    warnings = warnings.saturating_add(selection_warnings);
+                    infos = infos.saturating_add(selection_infos);
+                }
+            }
+        }
     }
     for (index, _, module_tree, source_by_key) in &package_trees {
         let input = &inputs[*index];
@@ -5019,7 +5250,9 @@ fn module_tree_workspace_check_diagnostics(
         }
     }
 
-    if let (Some(target_cfg), Some(workspace_snapshot)) = (target_cfg, workspace_snapshot) {
+    if has_source_files
+        && let (Some(target_cfg), Some(workspace_snapshot)) = (target_cfg, workspace_snapshot)
+    {
         let collection_order =
             phase1_package_collection_order(inputs, package_graph_for_scopes.as_ref())?;
         let mut finalized_foreign_scopes =
@@ -5171,7 +5404,7 @@ fn module_tree_workspace_check_diagnostics(
                 if !complete_packages[index] {
                     continue;
                 }
-                let (_, _, module_tree, _) = &package_trees[index];
+                let (_, package_id, module_tree, _) = &package_trees[index];
                 let input = &inputs[index];
                 let package_key = PackageKey::new(input.package_key.clone())
                     .map_err(|error| format!("invalid package key: {error:?}"))?;
@@ -5539,6 +5772,75 @@ fn module_tree_workspace_check_diagnostics(
                                     Some(&input.package_identity),
                                 ));
                                 errors = errors.saturating_add(1);
+                            }
+                        }
+                    }
+                }
+                if input.is_root_package {
+                    if let Some(selection) = export_world_selection_for_check(
+                        database.resolve_local_export_world_from_contract(
+                            *package_id,
+                            collection,
+                            &workspace_snapshot,
+                        ),
+                        &reported_wit_input_failure_units,
+                        "export-world query failed",
+                    )? {
+                        let (
+                            selection_diagnostics,
+                            selection_errors,
+                            selection_warnings,
+                            selection_infos,
+                        ) = phase1_check_diagnostics(
+                            &selection.diagnostics,
+                            &workspace_source_by_key,
+                            &input.package_identity,
+                            include_source_lines,
+                        );
+                        diagnostics.extend(selection_diagnostics);
+                        errors = errors.saturating_add(selection_errors);
+                        warnings = warnings.saturating_add(selection_warnings);
+                        infos = infos.saturating_add(selection_infos);
+
+                        if selection.world.is_some() && !has_wit_capture_failures {
+                            let wit_view_scopes =
+                                finalized_wit_view_scopes.get(&package_key).ok_or_else(|| {
+                                    "root package has no active WIT view scopes".to_owned()
+                                })?;
+                            let world_references = database
+                                .resolve_world_references_with_scopes(
+                                    collection,
+                                    module_tree,
+                                    &workspace_snapshot,
+                                    &member_scopes,
+                                    wit_view_scopes,
+                                )
+                                .map_err(|error| {
+                                    format!("world-reference query failed: {error:?}")
+                                })?;
+                            if let Some(elaborated) = database
+                                .export_world_check(
+                                    &selection,
+                                    collection,
+                                    module_tree,
+                                    &workspace_snapshot,
+                                    &world_references,
+                                    &member_scopes,
+                                    wit_view_scopes,
+                                )
+                                .map_err(|error| format!("export-world check failed: {error:?}"))?
+                            {
+                                let (world_diagnostics, world_errors, world_warnings, world_infos) =
+                                    phase1_check_diagnostics(
+                                        &elaborated.diagnostics,
+                                        &workspace_source_by_key,
+                                        &input.package_identity,
+                                        include_source_lines,
+                                    );
+                                diagnostics.extend(world_diagnostics);
+                                errors = errors.saturating_add(world_errors);
+                                warnings = warnings.saturating_add(world_warnings);
+                                infos = infos.saturating_add(world_infos);
                             }
                         }
                     }
@@ -6062,6 +6364,7 @@ fn check_incomplete_diagnostic(command: &crate::args::ParsedCommand) -> CheckDia
         "import and use resolution",
         "type checking",
         "dependency and workspace analysis",
+        "generated WIT for source dependencies",
         "lints",
     ];
     let tail = command_tail(command);
@@ -12014,12 +12317,14 @@ mod tests {
     use super::{
         CancellationAwareStdin, CheckDiagnostic, CheckLockedDependencyPackage,
         CheckLockedDependencySource, CheckLockedWitDirectory, CheckModuleTreePackageInput,
-        CheckWorkspaceSourceBudget, CheckWorkspaceWitBudget, CliDiagnostic, CliLocation,
-        CliPosition, CliSourceIndex, EXPLAIN_CODE_SUMMARIES, PackageKey, PackageRelativePath,
-        RenderedSourceLine, StdinBroker, StdinReadError, check_locked_active_wit_directory_inputs,
+        CheckPackageManifestInput, CheckWorkspaceSourceBudget, CheckWorkspaceWitBudget,
+        CliDiagnostic, CliLocation, CliPosition, CliSourceIndex, EXPLAIN_CODE_SUMMARIES,
+        PackageKey, PackageRelativePath, RenderedSourceLine, StdinBroker, StdinReadError,
+        WorkspaceSnapshot, check_locked_active_wit_directory_inputs,
         check_locked_dependency_source_inputs, check_locked_wit_directory_inputs,
-        check_module_tree_workspace_exceeds_limits, cli_position, compare_check_diagnostics,
-        fmt_path_selection_signature, human_file_path, internal_fmt_diagnostic, parse_args,
+        check_module_tree_workspace_exceeds_limits, check_package_manifest_snapshot_files,
+        cli_position, compare_check_diagnostics, fmt_path_selection_signature,
+        has_incomplete_wit_input_capture, human_file_path, internal_fmt_diagnostic, parse_args,
         phase1_package_collection_order, read_file_limited_with_progress, relative_path,
         report_fmt_diagnostics, run, run_new_with_creator, run_with_cancellation,
         run_with_cancellation_and_input, write_file_atomically_in_directory,
@@ -12031,10 +12336,61 @@ mod tests {
         PackageForm, PackageGraph, PackageGraphEdge, PackageGraphNode, PackageGraphRole,
     };
     use sai_package::version::Version;
+    use std::collections::BTreeMap;
     use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn check_manifest_inputs_enter_the_workspace_snapshot_with_role_bound_paths() {
+        let mut database = sai_driver::RootDatabase::new().expect("query database initializes");
+        let root_source: Arc<[u8]> = Arc::from(&b"package acme:root @ 1.0.0\nsource \"src\"\n"[..]);
+        let dependency_source: Arc<[u8]> =
+            Arc::from(&b"package acme:codec @ 1.4.2\nwit \"wit\"\n"[..]);
+        let manifests = [
+            CheckPackageManifestInput {
+                package_key: "acme:root#1".to_owned(),
+                package_identity: "acme:root@1.0.0".to_owned(),
+                source: Arc::clone(&root_source),
+                role: sai_package::manifest::PackageRole::Root,
+            },
+            CheckPackageManifestInput {
+                package_key: "acme:codec#1".to_owned(),
+                package_identity: "acme:codec@1.4.2".to_owned(),
+                source: Arc::clone(&dependency_source),
+                role: sai_package::manifest::PackageRole::Dependency,
+            },
+        ];
+
+        let files = check_package_manifest_snapshot_files(&mut database, &manifests)
+            .expect("manifest inputs become snapshot files");
+        let snapshot = WorkspaceSnapshot::new(files).expect("snapshot paths are unique");
+        let entries = snapshot
+            .iter()
+            .map(|file| {
+                (
+                    file.path().to_owned(),
+                    (
+                        file.package().map(str::to_owned),
+                        file.source().raw_bytes().to_vec(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            entries.get("sai.package"),
+            Some(&(Some("acme:root@1.0.0".to_owned()), root_source.to_vec()))
+        );
+        assert_eq!(
+            entries.get("dep:acme:codec@1.4.2/sai.package"),
+            Some(&(
+                Some("acme:codec@1.4.2".to_owned()),
+                dependency_source.to_vec()
+            ))
+        );
+    }
 
     #[test]
     fn phase1_package_collection_orders_active_dependencies_before_consumers() {
@@ -12532,14 +12888,14 @@ mod tests {
             ),
             "SOURCE_READ_FAILED exposes the offending source reference and reason"
         );
-        assert!(matches!(
-            &result.packages[0].files,
-            sai_vfs::WitFilesSnapshot::Listed { files, .. }
-                if files.iter().map(PackageRelativePath::as_str).collect::<Vec<_>>()
-                    == ["api/good.wit"]
-        ));
-        assert_eq!(result.packages[0].file_inputs.len(), 1);
-        assert_eq!(result.packages[0].file_inputs[0].1.as_ref(), b"good bytes");
+        assert_eq!(
+            result.packages[0].files,
+            sai_vfs::WitFilesSnapshot::NotApplicable,
+            "do not treat the successfully read subset as a complete WIT inventory"
+        );
+        assert!(result.packages[0].file_inputs.is_empty());
+        assert!(result.packages[0].input_failure_reported);
+        assert!(has_incomplete_wit_input_capture(&result.packages));
 
         let root_input = CheckLockedWitDirectory {
             package_key: input.package_key.clone(),
@@ -12591,7 +12947,11 @@ mod tests {
                 is_root_package: false,
             }
         };
-        let packages = [make_package("first"), make_package("second")];
+        let packages = [
+            make_package("first"),
+            make_package("second"),
+            make_package("third"),
+        ];
         let mut budget = CheckWorkspaceWitBudget {
             total_wit_file_bytes: 6,
             ..CheckWorkspaceWitBudget::default()
@@ -12616,6 +12976,28 @@ mod tests {
         assert_eq!(
             result.packages[1].files,
             sai_vfs::WitFilesSnapshot::NotApplicable
+        );
+        assert!(result.packages[1].input_failure_reported);
+        assert_eq!(
+            result.packages.len(),
+            3,
+            "record every package skipped after the shared budget is exhausted"
+        );
+        assert!(
+            result
+                .packages
+                .iter()
+                .skip(1)
+                .all(|package| package.input_failure_reported),
+            "the package that hits the limit and every package after it are unavailable"
+        );
+        assert!(
+            !result.packages[0].input_failure_reported,
+            "the package captured before the budget stop keeps its complete inventory"
+        );
+        assert!(
+            has_incomplete_wit_input_capture(&result.packages),
+            "selection can identify every unavailable unit after the budget stops"
         );
         assert!(budget.exhausted);
 

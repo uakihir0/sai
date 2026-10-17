@@ -83,6 +83,27 @@ impl WitPackageFailure {
             | Self::Graph(_) => None,
         }
     }
+
+    /// Returns the generated unit whose source text has not been supplied.
+    ///
+    /// Source packages are viewed through generated WIT by their dependents.
+    /// Until the `sai_ty` producer is available, this is an expected
+    /// unavailable stage rather than a user-authored WIT load failure.
+    pub fn generated_text_missing_unit(&self) -> Option<&WitUnit> {
+        match self {
+            Self::Load(error)
+                if matches!(
+                    error.failure(),
+                    sai_wit::WitPackageLoadFailure::Source(
+                        WitPackageSourceFailure::GeneratedTextMissing
+                    )
+                ) =>
+            {
+                Some(error.unit())
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The result of loading one requested WIT unit and its reachable closure.

@@ -25,6 +25,66 @@ impl Drop for TestDirectory {
     }
 }
 
+fn locked_artifact_root_with_external_world(dependency_wit: &str) -> (TestDirectory, PathBuf) {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    let dependency = root.join("dep");
+    fs::create_dir_all(root.join("wit")).expect("create root WIT directory");
+    fs::create_dir_all(root.join("dist")).expect("create root artifact directory");
+    fs::create_dir_all(dependency.join("wit")).expect("create dependency WIT directory");
+    fs::create_dir_all(dependency.join("dist")).expect("create dependency artifact directory");
+
+    fs::write(
+        root.join("sai.package"),
+        concat!(
+            "package acme:binary @ 1.0.0\n",
+            "compiler ^0.1\n",
+            "wit \"wit\"\n",
+            "export world acme:dep/api\n",
+            "targets { wasm32-wasi }\n",
+            "requires { acme:dep @ ^1 from path \"dep\" }\n",
+            "artifact component { wasm32-wasi \"dist/binary.wasm\" }\n"
+        ),
+    )
+    .expect("write artifact root manifest");
+    fs::write(
+        root.join("wit/root.wit"),
+        "package acme:binary@1.0.0;\nworld local {}\n",
+    )
+    .expect("write root WIT");
+    fs::write(root.join("dist/binary.wasm"), b"component").expect("write root component");
+    fs::write(
+        dependency.join("sai.package"),
+        concat!(
+            "package acme:dep @ 1.0.0\n",
+            "wit \"wit\"\n",
+            "export world api\n",
+            "targets { wasm32-wasi }\n",
+            "artifact component { wasm32-wasi \"dist/dep.wasm\" }\n"
+        ),
+    )
+    .expect("write artifact dependency manifest");
+    fs::write(dependency.join("wit/api.wit"), dependency_wit).expect("write dependency WIT");
+    fs::write(dependency.join("dist/dep.wasm"), b"component")
+        .expect("write dependency component artifact");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:binary @ 1.0.0\n",
+            "    targets { wasm32-wasi }\n",
+            "    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n",
+            "\n",
+            "package acme:dep @ 1.0.0\n",
+            "    source path \"dep\"\n"
+        ),
+    )
+    .expect("write complete format-2 path lock");
+
+    (temporary, root)
+}
+
 #[test]
 fn locked_check_reports_syntax_errors_from_active_path_dependencies() {
     let temporary = TestDirectory::new();
@@ -135,6 +195,727 @@ fn locked_check_reports_syntax_errors_from_active_path_dependencies() {
     assert!(
         wit_collision.contains("\"path\":\"dep:acme:dep@1.0.0/src/a.sai\""),
         "{wit_collision}"
+    );
+}
+
+#[test]
+fn locked_check_reports_external_export_implementation_at_manifest_value() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    let dependency = root.join("dep");
+    fs::create_dir_all(root.join("src")).expect("create root source directory");
+    fs::create_dir_all(dependency.join("wit")).expect("create dependency WIT directory");
+    fs::create_dir_all(dependency.join("dist")).expect("create dependency artifact directory");
+
+    let manifest = concat!(
+        "package acme:check @ 0.1.0\n",
+        "compiler ^0.1\n",
+        "source \"src\"\n",
+        "targets { wasm32-wasi }\n",
+        "requires { acme:codec @ ^1 from path \"dep\" }\n",
+        "export world acme:codec/host\n"
+    );
+    fs::write(root.join("sai.package"), manifest).expect("write root package manifest");
+    fs::write(root.join("src/lib.sai"), "pub fn root() {}\n").expect("write root source");
+    fs::write(
+        dependency.join("sai.package"),
+        concat!(
+            "package acme:codec @ 1.0.0\n",
+            "wit \"wit\"\n",
+            "export world host\n",
+            "targets { wasm32-wasi }\n",
+            "artifact component { wasm32-wasi \"dist/codec.wasm\" }\n"
+        ),
+    )
+    .expect("write artifact dependency manifest");
+    fs::write(
+        dependency.join("wit/api.wit"),
+        "package acme:codec@1.0.0;\ninterface api {}\nworld host { export api; }\n",
+    )
+    .expect("write dependency WIT");
+    fs::write(dependency.join("dist/codec.wasm"), b"component")
+        .expect("write dependency component artifact");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:check @ 0.1.0\n",
+            "    targets { wasm32-wasi }\n",
+            "    requires acme:codec @ ^1 -> 1.0.0 from path \"dep\"\n",
+            "\n",
+            "package acme:codec @ 1.0.0\n",
+            "    source path \"dep\"\n"
+        ),
+    )
+    .expect("write complete format-2 path lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let diagnostic = stdout
+        .lines()
+        .find(|line| line.contains("\"code\":\"WORLD_EXPORT_UNIMPLEMENTED\""))
+        .unwrap_or_else(|| {
+            panic!("the external exported interface needs an implementation:\n{stdout}")
+        });
+    let value_start = manifest
+        .find("acme:codec/host")
+        .expect("manifest export value exists");
+    let value_end = value_start + "acme:codec/host".len();
+    assert!(
+        diagnostic.contains("\"package\":\"acme:check@0.1.0\"")
+            && diagnostic.contains("\"path\":\"sai.package\"")
+            && diagnostic.contains(&format!("\"start\":{{\"byte\":{value_start},"))
+            && diagnostic.contains(&format!("\"end\":{{\"byte\":{value_end},")),
+        "{diagnostic}"
+    );
+}
+
+#[test]
+fn locked_check_resolves_artifact_root_export_world_without_source_inputs() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    fs::create_dir_all(root.join("wit")).expect("create root WIT directory");
+    fs::create_dir_all(root.join("dist")).expect("create root artifact directory");
+
+    let manifest = concat!(
+        "package acme:binary @ 1.0.0\n",
+        "compiler ^0.1\n",
+        "wit \"wit\"\n",
+        "export world absent\n",
+        "targets { wasm32-wasi }\n",
+        "artifact component { wasm32-wasi \"dist/binary.wasm\" }\n"
+    );
+    fs::write(root.join("sai.package"), manifest).expect("write artifact root manifest");
+    fs::write(
+        root.join("wit/api.wit"),
+        "package acme:binary@1.0.0;\nworld present {}\n",
+    )
+    .expect("write root WIT");
+    fs::write(root.join("dist/binary.wasm"), b"component").expect("write root component");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:binary @ 1.0.0\n",
+            "    targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write complete format-2 root lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let diagnostic = stdout
+        .lines()
+        .find(|line| line.contains("\"code\":\"UNKNOWN_EXPORT_WORLD\""))
+        .unwrap_or_else(|| panic!("missing artifact export world should be diagnosed:\n{stdout}"));
+    let value_start = manifest.find("absent").expect("manifest value exists");
+    let value_end = value_start + "absent".len();
+    assert!(
+        diagnostic.contains("\"package\":\"acme:binary@1.0.0\"")
+            && diagnostic.contains("\"path\":\"sai.package\"")
+            && diagnostic.contains(&format!("\"start\":{{\"byte\":{value_start},"))
+            && diagnostic.contains(&format!("\"end\":{{\"byte\":{value_end},")),
+        "{diagnostic}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""),
+        "artifact world selection should be a user diagnostic:\n{stdout}"
+    );
+}
+
+#[test]
+fn locked_check_skips_artifact_export_world_query_when_root_wit_directory_is_missing() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    fs::create_dir_all(root.join("dist")).expect("create root artifact directory");
+
+    fs::write(
+        root.join("sai.package"),
+        concat!(
+            "package acme:binary @ 1.0.0\n",
+            "compiler ^0.1\n",
+            "wit \"wit\"\n",
+            "export world app\n",
+            "targets { wasm32-wasi }\n",
+            "artifact component { wasm32-wasi \"dist/binary.wasm\" }\n"
+        ),
+    )
+    .expect("write artifact root manifest");
+    fs::write(root.join("dist/binary.wasm"), b"component").expect("write root component");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:binary @ 1.0.0\n",
+            "    targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write complete format-2 root lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "missing root WIT should fail the check with its input diagnostic:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"WIT_DIR_NOT_FOUND\"")
+            && !stdout.contains("\"code\":\"UNKNOWN_EXPORT_WORLD\"")
+            && !stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""),
+        "unavailable root WIT input must not trigger export-world resolution:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn locked_check_does_not_resolve_artifact_world_from_a_partial_wit_inventory() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    fs::create_dir_all(root.join("wit")).expect("create root WIT directory");
+    fs::create_dir_all(root.join("dist")).expect("create root artifact directory");
+
+    fs::write(
+        root.join("sai.package"),
+        concat!(
+            "package acme:binary @ 1.0.0\n",
+            "compiler ^0.1\n",
+            "wit \"wit\"\n",
+            "export world hidden\n",
+            "targets { wasm32-wasi }\n",
+            "artifact component { wasm32-wasi \"dist/binary.wasm\" }\n"
+        ),
+    )
+    .expect("write artifact root manifest");
+    fs::write(
+        root.join("wit/present.wit"),
+        "package acme:binary@1.0.0;\nworld present {}\n",
+    )
+    .expect("write captured root WIT");
+    fs::write(
+        root.join("hidden.wit"),
+        "package acme:binary@1.0.0;\nworld hidden {}\n",
+    )
+    .expect("write WIT behind the symlink");
+    std::os::unix::fs::symlink(root.join("hidden.wit"), root.join("wit/hidden.wit"))
+        .expect("create WIT symlink");
+    fs::write(root.join("dist/binary.wasm"), b"component").expect("write root component");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:binary @ 1.0.0\n",
+            "    targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write complete format-2 root lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the unsafe WIT entry should fail the check:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("not a regular file")
+            && !stdout.contains("\"code\":\"UNKNOWN_EXPORT_WORLD\"")
+            && !stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""),
+        "selection must not use an incomplete captured WIT inventory:\n{stdout}"
+    );
+}
+
+#[test]
+fn locked_check_resolves_external_export_world_for_artifact_root() {
+    let (_temporary, root) =
+        locked_artifact_root_with_external_world("package acme:dep@1.0.0;\nworld api {}\n");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "artifact root should resolve its direct dependency's WIT world:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"UNKNOWN_EXPORT_WORLD\"")
+            && !stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\"")
+            && stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "external artifact export-world selection should complete cleanly:\n{stdout}"
+    );
+}
+
+#[test]
+fn locked_check_keeps_artifact_root_world_unresolved_when_dependency_wit_directory_is_missing() {
+    let (_temporary, root) =
+        locked_artifact_root_with_external_world("package acme:dep@1.0.0;\nworld api {}\n");
+    fs::remove_dir_all(root.join("dep/wit")).expect("remove captured dependency WIT directory");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the WIT capture diagnostic should own the missing dependency directory:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"WIT_DIR_NOT_FOUND\"")
+            && !stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\"")
+            && !stdout.contains("\"code\":\"UNKNOWN_EXPORT_WORLD\""),
+        "an unavailable dependency inventory must not cascade into selection:\n{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.contains("\"code\":\"WIT_DIR_NOT_FOUND\""))
+            .count(),
+        1,
+        "the dependency capture failure should be reported once:\n{stdout}"
+    );
+}
+
+#[test]
+fn locked_check_keeps_source_root_world_unresolved_when_dependency_wit_directory_is_missing() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    let dependency = root.join("dep");
+    fs::create_dir_all(root.join("src")).expect("create root source directory");
+    fs::create_dir_all(dependency.join("dist")).expect("create dependency artifact directory");
+
+    fs::write(
+        root.join("sai.package"),
+        concat!(
+            "package acme:app @ 1.0.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n",
+            "export world acme:dep/api\n",
+            "targets { wasm32-wasi }\n",
+            "requires { acme:dep @ ^1 from path \"dep\" }\n"
+        ),
+    )
+    .expect("write source root manifest");
+    fs::write(root.join("src/lib.sai"), "pub fn main() {}\n").expect("write root source");
+    fs::write(
+        dependency.join("sai.package"),
+        concat!(
+            "package acme:dep @ 1.0.0\n",
+            "wit \"wit\"\n",
+            "export world api\n",
+            "targets { wasm32-wasi }\n",
+            "artifact component { wasm32-wasi \"dist/dep.wasm\" }\n"
+        ),
+    )
+    .expect("write artifact dependency manifest");
+    fs::write(dependency.join("dist/dep.wasm"), b"component")
+        .expect("write dependency component artifact");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:app @ 1.0.0\n",
+            "    targets { wasm32-wasi }\n",
+            "    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n",
+            "\n",
+            "package acme:dep @ 1.0.0\n",
+            "    source path \"dep\"\n"
+        ),
+    )
+    .expect("write complete format-2 path lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the WIT capture diagnostic should own the missing dependency directory:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"WIT_DIR_NOT_FOUND\"")
+            && !stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\"")
+            && !stdout.contains("\"code\":\"UNKNOWN_EXPORT_WORLD\""),
+        "an unavailable dependency inventory must not cascade into selection:\n{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .lines()
+            .filter(|line| line.contains("\"code\":\"WIT_DIR_NOT_FOUND\""))
+            .count(),
+        1,
+        "the dependency capture failure should be reported once:\n{stdout}"
+    );
+}
+
+#[test]
+fn locked_check_still_resolves_local_source_worlds_when_an_unrelated_dependency_wit_is_missing() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    let dependency = root.join("dep");
+    fs::create_dir_all(root.join("src")).expect("create root source directory");
+    fs::create_dir_all(dependency.join("dist")).expect("create dependency artifact directory");
+
+    fs::write(
+        root.join("sai.package"),
+        concat!(
+            "package acme:app @ 1.0.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n",
+            "export world absent\n",
+            "targets { wasm32-wasi }\n",
+            "requires { acme:dep @ ^1 from path \"dep\" }\n"
+        ),
+    )
+    .expect("write source root manifest");
+    fs::write(root.join("src/lib.sai"), "pub fn main() {}\n").expect("write root source");
+    fs::write(
+        dependency.join("sai.package"),
+        concat!(
+            "package acme:dep @ 1.0.0\n",
+            "wit \"wit\"\n",
+            "export world api\n",
+            "targets { wasm32-wasi }\n",
+            "artifact component { wasm32-wasi \"dist/dep.wasm\" }\n"
+        ),
+    )
+    .expect("write artifact dependency manifest");
+    fs::write(dependency.join("dist/dep.wasm"), b"component")
+        .expect("write dependency component artifact");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:app @ 1.0.0\n",
+            "    targets { wasm32-wasi }\n",
+            "    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n",
+            "\n",
+            "package acme:dep @ 1.0.0\n",
+            "    source path \"dep\"\n"
+        ),
+    )
+    .expect("write complete format-2 path lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "both the incomplete dependency input and local miss are errors:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"WIT_DIR_NOT_FOUND\"")
+            && stdout.contains("\"code\":\"UNKNOWN_EXPORT_WORLD\"")
+            && !stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""),
+        "an unrelated dependency WIT capture failure must preserve local world lookup:\n{stdout}"
+    );
+}
+
+#[test]
+fn locked_check_does_not_report_missing_source_wit_generation_as_internal_error() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    let dependency = root.join("dep");
+    fs::create_dir_all(root.join("wit")).expect("create root WIT directory");
+    fs::create_dir_all(root.join("dist")).expect("create root artifact directory");
+    fs::create_dir_all(dependency.join("src")).expect("create source dependency directory");
+
+    fs::write(
+        root.join("sai.package"),
+        concat!(
+            "package acme:binary @ 1.0.0\n",
+            "compiler ^0.1\n",
+            "wit \"wit\"\n",
+            "export world acme:dep/api\n",
+            "targets { wasm32-wasi }\n",
+            "requires { acme:dep @ ^1 from path \"dep\" }\n",
+            "artifact component { wasm32-wasi \"dist/binary.wasm\" }\n"
+        ),
+    )
+    .expect("write artifact root manifest");
+    fs::write(
+        root.join("wit/root.wit"),
+        "package acme:binary@1.0.0;\nworld local {}\n",
+    )
+    .expect("write root WIT");
+    fs::write(root.join("dist/binary.wasm"), b"component").expect("write root component");
+    fs::write(
+        dependency.join("sai.package"),
+        concat!(
+            "package acme:dep @ 1.0.0\n",
+            "source \"src\"\n",
+            "targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write source dependency manifest");
+    fs::write(
+        dependency.join("src/lib.sai"),
+        "pub interface api {}\npub world api {}\n",
+    )
+    .expect("write valid source dependency");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:binary @ 1.0.0\n",
+            "    targets { wasm32-wasi }\n",
+            "    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n",
+            "\n",
+            "package acme:dep @ 1.0.0\n",
+            "    source path \"dep\"\n"
+        ),
+    )
+    .expect("write complete format-2 path lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "source dependency WIT generation remains an incomplete check stage:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && stdout.contains("generated WIT for source dependencies")
+            && !stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\"")
+            && !stdout.contains("\"code\":\"UNKNOWN_EXPORT_WORLD\""),
+        "missing generated WIT must not be misreported as an internal failure or an unknown world:\n{stdout}"
+    );
+}
+
+#[test]
+fn locked_check_keeps_source_root_world_unresolved_when_dependency_wit_is_not_generated() {
+    let temporary = TestDirectory::new();
+    let root = temporary.0.join("project");
+    let dependency = root.join("dep");
+    fs::create_dir_all(root.join("src")).expect("create root source directory");
+    fs::create_dir_all(dependency.join("src")).expect("create source dependency directory");
+
+    fs::write(
+        root.join("sai.package"),
+        concat!(
+            "package acme:app @ 1.0.0\n",
+            "compiler ^0.1\n",
+            "source \"src\"\n",
+            "export world acme:dep/api\n",
+            "targets { wasm32-wasi }\n",
+            "requires { acme:dep @ ^1 from path \"dep\" }\n"
+        ),
+    )
+    .expect("write source root manifest");
+    fs::write(root.join("src/lib.sai"), "pub fn main() {}\n").expect("write root source");
+    fs::write(
+        dependency.join("sai.package"),
+        concat!(
+            "package acme:dep @ 1.0.0\n",
+            "source \"src\"\n",
+            "targets { wasm32-wasi }\n"
+        ),
+    )
+    .expect("write source dependency manifest");
+    fs::write(
+        dependency.join("src/lib.sai"),
+        "pub interface api {}\npub world api {}\n",
+    )
+    .expect("write valid source dependency");
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:app @ 1.0.0\n",
+            "    targets { wasm32-wasi }\n",
+            "    requires acme:dep @ ^1 -> 1.0.0 from path \"dep\"\n",
+            "\n",
+            "package acme:dep @ 1.0.0\n",
+            "    source path \"dep\"\n"
+        ),
+    )
+    .expect("write complete format-2 path lock");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "source-root export-world checks remain incomplete without generated dependency WIT:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && stdout.contains("generated WIT for source dependencies")
+            && !stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\"")
+            && !stdout.contains("\"code\":\"UNKNOWN_EXPORT_WORLD\""),
+        "unavailable generated WIT must not become an internal error or a false unknown world:\n{stdout}"
+    );
+}
+
+#[test]
+fn locked_check_reports_artifact_external_world_load_failure_without_internal_error() {
+    let malformed_wit = "package acme:dep@1.0.0;\ninterface api { # }\n";
+    let (_temporary, root) = locked_artifact_root_with_external_world(malformed_wit);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_sai"))
+        .current_dir(&root)
+        .args([
+            "--format=json",
+            "check",
+            "--target",
+            "wasm32-wasi",
+            "--locked",
+            "--offline",
+        ])
+        .output()
+        .expect("run sai check subprocess");
+
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "malformed dependency WIT should fail the check:\n{stdout}"
+    );
+    assert!(output.stderr.is_empty());
+    let wit_diagnostics = stdout
+        .lines()
+        .filter(|line| line.contains("\"code\":\"WIT_PARSE_ERROR\""))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        wit_diagnostics.len(),
+        1,
+        "the WIT loader diagnostic should be emitted once by its owner:\n{stdout}"
+    );
+    assert!(
+        wit_diagnostics[0].contains("\"package\":\"acme:dep@1.0.0\"")
+            && wit_diagnostics[0].contains("\"path\":\"dep:acme:dep@1.0.0/wit/api.wit\"")
+            && !stdout.contains("\"code\":\"INTERNAL_COMPILER_ERROR\""),
+        "artifact external selection must not turn an owned WIT error into an internal error:\n{stdout}"
     );
 }
 
@@ -1128,7 +1909,13 @@ fn locked_check_reports_one_root_wit_loader_parse_diagnostic_with_source_range()
         .output()
         .expect("run sai check subprocess");
 
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     let wit_diagnostics = stdout

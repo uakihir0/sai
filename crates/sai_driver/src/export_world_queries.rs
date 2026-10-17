@@ -564,6 +564,14 @@ impl RootDatabase {
             (sai_wit::WitPackageKind::Source, super::package_graph::PackageForm::Source)
             | (sai_wit::WitPackageKind::Artifact, super::package_graph::PackageForm::Artifact)
             | (sai_wit::WitPackageKind::Hybrid, _) => true,
+            // Lock graphs do not carry the root's form. The locked CLI supplies
+            // the root manifest separately, so allow its verified artifact
+            // contract to use the adapter's source-form root placeholder.
+            (sai_wit::WitPackageKind::Artifact, super::package_graph::PackageForm::Source)
+                if requester_node.role() == super::package_graph::PackageGraphRole::Root =>
+            {
+                true
+            }
             _ => false,
         };
         if requester_node.identity() != contract.identity().to_string()
