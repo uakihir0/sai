@@ -44721,6 +44721,235 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
+    fn generated_wit_emits_unit_enums_with_named_consumers() {
+        let source = concat!(
+            "interface api {\n",
+            "  /// The outcome of a request.\n",
+            "  enum Status { Ready, NotReady }\n",
+            "  enum Mode { Read, Write }\n",
+            "  fn inspect(status: Status) -> Mode\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database.wit_package(&unit).expect("generated enums load");
+        assert!(
+            result.failure.is_none(),
+            "generated enum text parses and resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "unit enums without case attributes are fully represented: {}",
+            generated.text
+        );
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        let items = interface.items.iter().collect::<Vec<_>>();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["status", "mode", "inspect"]
+        );
+        assert_eq!(items[0].docs.as_deref(), Some("The outcome of a request."));
+        assert_eq!(
+            items[0].kind,
+            sai_wit::WitItemKind::Enum(vec!["ready".to_owned(), "not-ready".to_owned()])
+        );
+        assert_eq!(
+            items[1].kind,
+            sai_wit::WitItemKind::Enum(vec!["read".to_owned(), "write".to_owned()])
+        );
+        let sai_wit::WitItemKind::Func(inspect) = &items[2].kind else {
+            panic!("the function consuming the enum and flags is emitted");
+        };
+        assert!(matches!(
+            inspect.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.interface == interface_index
+                    && reference.item_name == "status"
+        ));
+        assert!(matches!(
+            inspect.result,
+            Some(sai_wit::WitType::Named(ref reference))
+                if reference.interface.interface == interface_index
+                    && reference.item_name == "mode"
+        ));
+        assert!(generated.text.contains("enum status {"));
+        assert!(generated.text.contains("enum mode {"));
+        assert!(
+            generated
+                .text
+                .contains("inspect: func(status: status) -> mode")
+        );
+    }
+
+    #[test]
+    fn generated_wit_omits_enums_whose_case_metadata_cannot_be_preserved() {
+        let source = concat!(
+            "interface api {\n",
+            "  enum Status {\n",
+            "    /// A ready result.\n",
+            "    Ready,\n",
+            "    Failed,\n",
+            "  }\n",
+            "  fn inspect(status: Status)\n",
+            "  enum Payload { Value(U32) }\n",
+            "  fn decode(payload: Payload)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("partial generated WIT remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "omitting the enum and its consumer leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        assert!(!generated.text.contains("status"));
+        assert!(!generated.text.contains("inspect"));
+        assert!(!generated.text.contains("payload"));
+        assert!(!generated.text.contains("decode"));
+        assert!(generated.text.contains("independent: func(value: u32)"));
+        let package_model = result.package.expect("partial WIT model loads");
+        let interface = package_model
+            .root()
+            .interfaces
+            .iter()
+            .next()
+            .expect("the interface with the independent function remains");
+        assert_eq!(
+            interface
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["independent"]
+        );
+    }
+
+    #[test]
+    fn generated_wit_omits_stage_gated_flags_and_their_consumers() {
+        let source = concat!(
+            "interface api {\n",
+            "  @flags\n",
+            "  enum Permissions { Read, Write }\n",
+            "  fn inspect(permission: Permissions)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("partial generated WIT remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "a stage-gated flags enum leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        assert!(!generated.text.contains("permissions"));
+        assert!(!generated.text.contains("inspect"));
+        assert!(generated.text.contains("independent: func(value: u32)"));
+    }
+
+    #[test]
     fn generated_wit_emits_named_consumers_in_an_incomplete_package() {
         let source = concat!(
             "interface api {\n",

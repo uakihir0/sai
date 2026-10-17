@@ -1772,11 +1772,22 @@ fn collect_interface_uses_input(
                                 &member_hir,
                                 &boundary_conversions,
                                 &generated_named_type_references,
+                                flags_marker_accepted,
                                 &inputs.validated_attrs,
                                 prepared.generated_package_version.as_ref(),
                                 symbols,
                             )?
                         }
+                        super::InterfaceMemberKind::Enum => generated_interface_type_item(
+                            entry,
+                            &member_hir,
+                            &boundary_conversions,
+                            &generated_named_type_references,
+                            flags_marker_accepted,
+                            &inputs.validated_attrs,
+                            prepared.generated_package_version.as_ref(),
+                            symbols,
+                        )?,
                         super::InterfaceMemberKind::Function => generated_function_item(
                             entry,
                             &member_hir,
@@ -1794,8 +1805,13 @@ fn collect_interface_uses_input(
                 if let Some(item) = item {
                     if generated_item_names.insert(item.name.clone()) {
                         let item_name = item.name.clone();
-                        let is_named_type =
-                            matches!(item.kind, WitItemKind::Alias(_) | WitItemKind::Record(_));
+                        let is_named_type = matches!(
+                            item.kind,
+                            WitItemKind::Alias(_)
+                                | WitItemKind::Record(_)
+                                | WitItemKind::Enum(_)
+                                | WitItemKind::Flags(_)
+                        );
                         let item_index = generated_items
                             .push(item)
                             .map_err(InterfaceUsesQueryError::WitIndexVec)?;
@@ -3397,6 +3413,7 @@ fn generated_interface_type_item(
     owner: &HirOwner<'_>,
     conversions: &[sai_ty::boundary::BoundaryTypeConversion],
     references: &HashMap<DefId, WitTypeRef>,
+    flags_marker_accepted: bool,
     validated_attrs: &BTreeMap<sai_hir::item_tree::ErasedAstId, sai_hir::attrs::ValidatedAttrs>,
     selected: Option<&sai_package::mvs::MvsPackageVersion>,
     symbols: &Interner,
@@ -3497,6 +3514,46 @@ fn generated_interface_type_item(
                 });
             }
             WitItemKind::Record(wit_fields)
+        }
+        InterfaceItemKind::Enum { generics, variants } => {
+            if !generics.params.is_empty() || !generics.where_preds.is_empty() {
+                return Ok(None);
+            }
+            let variant_entries = entry
+                .children
+                .iter()
+                .filter(|child| child.kind == ItemTreeKind::Variant)
+                .collect::<Vec<_>>();
+            if variants.len() != variant_entries.len() {
+                return Ok(None);
+            }
+            let mut case_names = Vec::with_capacity(variants.len());
+            let mut unique_case_names = HashSet::with_capacity(variants.len());
+            for (variant, variant_entry) in variants.iter().zip(variant_entries) {
+                if !matches!(variant.shape, VariantShape::Unit)
+                    || variant.has_explicit_discriminant
+                    || variant_entry.docs.is_some()
+                    || !variant_entry.raw_attrs.is_empty()
+                {
+                    return Ok(None);
+                }
+                let case_source_name = symbols
+                    .resolve(variant.name.sym)
+                    .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+                    .map_err(InterfaceUsesQueryError::Collection)?;
+                let Some(case_name) = sai_identifier_to_wit_name(&case_source_name) else {
+                    return Ok(None);
+                };
+                if !unique_case_names.insert(case_name.clone()) {
+                    return Ok(None);
+                }
+                case_names.push(case_name);
+            }
+            if flags_marker_accepted {
+                WitItemKind::Flags(case_names)
+            } else {
+                WitItemKind::Enum(case_names)
+            }
         }
         _ => return Ok(None),
     };
