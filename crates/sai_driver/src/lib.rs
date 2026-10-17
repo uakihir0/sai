@@ -3010,6 +3010,55 @@ pub enum WorldReferencePosition {
     Include,
 }
 
+/// The kind of one source-ordered world item captured for later elaboration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorldSourceOrderKind {
+    Import,
+    Export,
+    Include,
+    ImportFunction,
+    ExportFunction,
+}
+
+/// Source identity and span for one direct world item, in declaration order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorldSourceOrderItem {
+    owner: OwnerId,
+    hir_id: HirId,
+    span: sai_hir::Span,
+    kind: WorldSourceOrderKind,
+    name: Option<String>,
+}
+
+fn world_ref_source_id_span(reference: WorldRef<'_>) -> (HirId, sai_hir::Span) {
+    match reference {
+        WorldRef::Pkg { hir_id, span, .. } => (hir_id, span),
+        WorldRef::Mod(path) => (path.hir_id, path.span),
+    }
+}
+
+impl WorldSourceOrderItem {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub const fn hir_id(&self) -> HirId {
+        self.hir_id
+    }
+
+    pub const fn span(&self) -> sai_hir::Span {
+        self.span
+    }
+
+    pub const fn kind(&self) -> WorldSourceOrderKind {
+        self.kind
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+}
+
 /// The path-resolution state for one direct world reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WorldReferencePathResult {
@@ -3076,6 +3125,7 @@ pub struct WorldOwnerReferenceResolution {
     references: Vec<WorldReferencePathResolution>,
     item_errors: Vec<(OwnerId, OwnerControlFlowResolutionError)>,
     source_import_items: Vec<WorldImportFnSourceItem>,
+    source_order: Vec<WorldSourceOrderItem>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -3105,6 +3155,12 @@ impl WorldOwnerReferenceResolution {
 
     pub fn item_errors(&self) -> &[(OwnerId, OwnerControlFlowResolutionError)] {
         &self.item_errors
+    }
+
+    /// Returns every direct world item in source order, including interfaces,
+    /// functions, and includes, with source spans suitable for snapshot binding.
+    pub fn source_order(&self) -> &[WorldSourceOrderItem] {
+        &self.source_order
     }
 }
 
@@ -15120,6 +15176,7 @@ impl RootDatabase {
             let mut world_references = Vec::new();
             let mut world_reference_item_errors = Vec::new();
             let mut source_import_items = Vec::new();
+            let mut source_order = Vec::new();
             let inputs = match self.current_owner_inputs(
                 snapshot,
                 descriptor.file,
@@ -15134,6 +15191,7 @@ impl RootDatabase {
                             references: Vec::new(),
                             item_errors: Vec::new(),
                             source_import_items: Vec::new(),
+                            source_order: Vec::new(),
                         });
                     }
                     owners.push(WorldOwnerTestOnlyResolution {
@@ -15287,52 +15345,128 @@ impl RootDatabase {
                         )
                         .map_err(OwnerControlFlowResolutionError::Lowering)?;
                         item_lowering_diagnostics.extend(item_hir.diagnostics.iter().cloned());
-                        let source_import_item = match item_hir.node {
+                        let (source_order_item, source_import_item) = match item_hir.node {
                             OwnerNode::WorldItem(item) => match item.kind {
                                 WorldItemKind::Import(reference) => {
                                     world_reference_input =
                                         Some((WorldReferencePosition::Import, reference));
-                                    None
+                                    let (hir_id, span) = world_ref_source_id_span(reference);
+                                    (
+                                        world_reference_owners.is_some().then_some(
+                                            WorldSourceOrderItem {
+                                                owner: item_owner,
+                                                hir_id,
+                                                span,
+                                                kind: WorldSourceOrderKind::Import,
+                                                name: None,
+                                            },
+                                        ),
+                                        None,
+                                    )
                                 }
                                 WorldItemKind::Export(reference) => {
                                     world_reference_input =
                                         Some((WorldReferencePosition::Export, reference));
-                                    None
+                                    let (hir_id, span) = world_ref_source_id_span(reference);
+                                    (
+                                        world_reference_owners.is_some().then_some(
+                                            WorldSourceOrderItem {
+                                                owner: item_owner,
+                                                hir_id,
+                                                span,
+                                                kind: WorldSourceOrderKind::Export,
+                                                name: None,
+                                            },
+                                        ),
+                                        None,
+                                    )
                                 }
                                 WorldItemKind::Include(reference) => {
                                     world_reference_input =
                                         Some((WorldReferencePosition::Include, reference));
-                                    world_reference_owners
-                                        .is_some()
-                                        .then_some(WorldImportFnSourceItem::Include(item_owner))
+                                    let (hir_id, span) = world_ref_source_id_span(reference);
+                                    (
+                                        world_reference_owners.is_some().then_some(
+                                            WorldSourceOrderItem {
+                                                owner: item_owner,
+                                                hir_id,
+                                                span,
+                                                kind: WorldSourceOrderKind::Include,
+                                                name: None,
+                                            },
+                                        ),
+                                        world_reference_owners.is_some().then_some(
+                                            WorldImportFnSourceItem::Include(item_owner),
+                                        ),
+                                    )
                                 }
-                                WorldItemKind::ImportFn { name, .. }
-                                    if !name.is_error() && world_reference_owners.is_some() =>
-                                {
-                                    let name = self
-                                        .symbols
-                                        .resolve(name.sym)
-                                        .map_err(OwnerControlFlowResolutionError::SymbolLookup)?
-                                        .to_string();
-                                    Some(WorldImportFnSourceItem::ImportFunction(
-                                        sai_resolve::WorldImportFunction {
-                                            name,
-                                            def_id: item_owner.def_id.to_def_id(),
-                                        },
-                                    ))
+                                WorldItemKind::ImportFn { name, .. } => {
+                                    let name_text =
+                                        if name.is_error() || world_reference_owners.is_none() {
+                                            None
+                                        } else {
+                                            Some(
+                                            self.symbols
+                                                .resolve(name.sym)
+                                                .map_err(
+                                                    OwnerControlFlowResolutionError::SymbolLookup,
+                                                )?
+                                                .to_string(),
+                                        )
+                                        };
+                                    let source_order_item =
+                                        world_reference_owners.is_some().then(|| {
+                                            WorldSourceOrderItem {
+                                                owner: item_owner,
+                                                hir_id: HirId {
+                                                    owner: item_owner,
+                                                    local_id: sai_hir::ItemLocalId::default(),
+                                                },
+                                                span: name.span,
+                                                kind: WorldSourceOrderKind::ImportFunction,
+                                                name: name_text.clone(),
+                                            }
+                                        });
+                                    let source_import_item = name_text.map(|name| {
+                                        WorldImportFnSourceItem::ImportFunction(
+                                            sai_resolve::WorldImportFunction {
+                                                name,
+                                                def_id: item_owner.def_id.to_def_id(),
+                                            },
+                                        )
+                                    });
+                                    (source_order_item, source_import_item)
                                 }
-                                WorldItemKind::ExportFn { name, .. }
-                                    if !name.is_error() && world_reference_owners.is_some() =>
-                                {
-                                    let name = self
-                                        .symbols
-                                        .resolve(name.sym)
-                                        .map_err(OwnerControlFlowResolutionError::SymbolLookup)?
-                                        .to_string();
-                                    Some(WorldImportFnSourceItem::ExportFunction(name))
-                                }
-                                WorldItemKind::ImportFn { .. } | WorldItemKind::ExportFn { .. } => {
-                                    None
+                                WorldItemKind::ExportFn { name, .. } => {
+                                    let name_text =
+                                        if name.is_error() || world_reference_owners.is_none() {
+                                            None
+                                        } else {
+                                            Some(
+                                            self.symbols
+                                                .resolve(name.sym)
+                                                .map_err(
+                                                    OwnerControlFlowResolutionError::SymbolLookup,
+                                                )?
+                                                .to_string(),
+                                        )
+                                        };
+                                    let source_order_item =
+                                        world_reference_owners.is_some().then(|| {
+                                            WorldSourceOrderItem {
+                                                owner: item_owner,
+                                                hir_id: HirId {
+                                                    owner: item_owner,
+                                                    local_id: sai_hir::ItemLocalId::default(),
+                                                },
+                                                span: name.span,
+                                                kind: WorldSourceOrderKind::ExportFunction,
+                                                name: name_text.clone(),
+                                            }
+                                        });
+                                    let source_import_item =
+                                        name_text.map(WorldImportFnSourceItem::ExportFunction);
+                                    (source_order_item, source_import_item)
                                 }
                             },
                             _ => {
@@ -15341,6 +15475,9 @@ impl RootDatabase {
                                 ));
                             }
                         };
+                        if let Some(source_order_item) = source_order_item {
+                            source_order.push(source_order_item);
+                        }
                         if let Some(source_import_item) = source_import_item {
                             source_import_items.push(source_import_item);
                         }
@@ -15545,6 +15682,7 @@ impl RootDatabase {
                             references: world_references,
                             item_errors: world_reference_item_errors,
                             source_import_items,
+                            source_order,
                         });
                     }
                 }
@@ -15556,6 +15694,7 @@ impl RootDatabase {
                             references: Vec::new(),
                             item_errors: Vec::new(),
                             source_import_items: Vec::new(),
+                            source_order: Vec::new(),
                         });
                     }
                     owners.push(WorldOwnerTestOnlyResolution {
@@ -29125,11 +29264,13 @@ mod tests {
         let source = concat!(
             "interface api {}\n",
             "world root {\n",
+            "  import api\n",
             "  import fn root_before()\n",
             "  import fn direct_wins()\n",
             "  include child_world\n",
             "  import fn after()\n",
             "  export fn ignored()\n",
+            "  export api\n",
             "  include child_world\n",
             "  include api\n",
             "  include missing.world\n",
@@ -29204,6 +29345,55 @@ mod tests {
         let root = owner_named("root");
         let child = owner_named("child_world");
         let leaf = owner_named("leaf_world");
+        assert_eq!(
+            root.source_order()
+                .iter()
+                .map(|item| (item.kind(), item.name()))
+                .collect::<Vec<_>>(),
+            [
+                (WorldSourceOrderKind::Import, None),
+                (WorldSourceOrderKind::ImportFunction, Some("root_before")),
+                (WorldSourceOrderKind::ImportFunction, Some("direct_wins")),
+                (WorldSourceOrderKind::Include, None),
+                (WorldSourceOrderKind::ImportFunction, Some("after")),
+                (WorldSourceOrderKind::ExportFunction, Some("ignored")),
+                (WorldSourceOrderKind::Export, None),
+                (WorldSourceOrderKind::Include, None),
+                (WorldSourceOrderKind::Include, None),
+                (WorldSourceOrderKind::Include, None),
+            ],
+            "interface items, functions, and includes retain one source order"
+        );
+        assert!(
+            root.source_order()
+                .iter()
+                .all(|item| item.hir_id().owner == item.owner()),
+            "every source item retains an HIR identity owned by that item"
+        );
+        let source_item_text = root
+            .source_order()
+            .iter()
+            .map(|item| {
+                &source[item.span().range.start().raw() as usize
+                    ..item.span().range.end().raw() as usize]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            source_item_text,
+            [
+                "api",
+                "root_before",
+                "direct_wins",
+                "child_world",
+                "after",
+                "ignored",
+                "api",
+                "child_world",
+                "api",
+                "missing.world",
+            ],
+            "references retain their complete path spans and functions retain their names"
+        );
         let imports = database
             .resolve_world_import_fns(
                 &collection,
