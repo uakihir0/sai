@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod export_world;
 pub mod interface_impls;
 pub mod interface_redirect;
 pub mod interface_uses;
@@ -22,6 +23,7 @@ pub mod world_import_fns;
 pub mod world_includes;
 pub mod world_members;
 
+pub use export_world::ExportWorld;
 pub use interface_impls::{
     InterfaceImpl, InterfaceImplFunction, InterfaceImplInput, InterfaceImplInterface,
     InterfaceImplInterfaceItem, InterfaceImplInterfaceItemKind, InterfaceImplItem,

@@ -10,7 +10,9 @@ mod wit_package_queries;
 mod world_elaboration_adapter;
 mod world_resource_containment;
 
-pub use export_world_queries::{LocalExportWorldLookup, LocalExportWorldLookupError};
+pub use export_world_queries::{
+    ExportWorldQueryError, LocalExportWorldLookup, LocalExportWorldLookupError,
+};
 use interface_impl_resource_wit::{
     WitResourceIdentity, WitResourceOccurrenceIncomplete, WitResourceOccurrenceSearch,
     WitResourceOccurrenceSite, first_wit_resource_occurrence,
@@ -21228,6 +21230,68 @@ mod tests {
         .expect("workspace snapshot is valid")
     }
 
+    fn phase1_export_world_fixture(
+        manifest_bytes: &[u8],
+    ) -> (
+        RootDatabase,
+        PackageId,
+        Phase1PackageScopesCollection,
+        WorkspaceSnapshot,
+        FileId,
+    ) {
+        phase1_export_world_fixture_with_role_and_path(
+            manifest_bytes,
+            PackageRole::Root,
+            "sai.package",
+        )
+    }
+
+    fn phase1_export_world_fixture_with_role_and_path(
+        manifest_bytes: &[u8],
+        role: PackageRole,
+        manifest_path: &str,
+    ) -> (
+        RootDatabase,
+        PackageId,
+        Phase1PackageScopesCollection,
+        WorkspaceSnapshot,
+        FileId,
+    ) {
+        const PACKAGE_IDENTITY: &str = "acme:phase1@1.0.0";
+        let (mut database, module_tree, source_snapshot, package) =
+            phase1_fixture(b"world root_world {}\n", b"");
+        database
+            .set_package_manifest(package, Arc::from(manifest_bytes), role, Durability::Low)
+            .expect("package manifest input is tracked");
+        let manifest_file = database
+            .intern_package_file(
+                package,
+                PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+            )
+            .expect("manifest file is interned");
+        let mut files = source_snapshot.iter().cloned().collect::<Vec<_>>();
+        files.push(SnapshotFile::new(
+            Arc::new(
+                SourceFile::decode(manifest_file, manifest_bytes).expect("manifest source decodes"),
+            ),
+            manifest_path,
+            Some(PACKAGE_IDENTITY.to_owned()),
+            Some(42),
+        ));
+        let snapshot =
+            WorkspaceSnapshot::new(files).expect("manifest snapshot has unique file IDs");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("phase-one scopes bind to the manifest snapshot");
+        (database, package, collection, snapshot, manifest_file)
+    }
+
     fn multi_package_fixture(
         database: &mut RootDatabase,
         package_key: &str,
@@ -34081,6 +34145,288 @@ mod tests {
             other_database.resolve_local_export_world(&collection, "root_world"),
             Err(LocalExportWorldLookupError::SessionMismatch),
             "session-local definition IDs must not cross database sessions",
+        );
+    }
+
+    #[test]
+    fn export_world_query_projects_local_world_from_the_current_manifest() {
+        let manifest = b"package acme:phase1 @ 1.0.0\n\
+            source \"src\"\n\
+            export world root_world\n";
+        let (mut database, package, collection, snapshot, _) =
+            phase1_export_world_fixture(manifest);
+        let expected = match database
+            .resolve_local_export_world(&collection, "root_world")
+            .expect("local lookup succeeds")
+        {
+            LocalExportWorldLookup::Resolved(world) => world,
+            LocalExportWorldLookup::Missing => panic!("fixture world is declared"),
+        };
+
+        let result = database
+            .resolve_local_export_world_from_contract(package, &collection, &snapshot)
+            .expect("contract world resolves against the current snapshot");
+
+        assert_eq!(result.world, Some(expected));
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn export_world_query_validates_dependency_manifest_snapshot_path() {
+        let manifest = b"package acme:phase1 @ 1.0.0\n\
+            source \"src\"\n\
+            export world root_world\n";
+        let (mut database, package, collection, snapshot, manifest_file) =
+            phase1_export_world_fixture_with_role_and_path(
+                manifest,
+                PackageRole::Dependency,
+                "dep:acme:phase1@1.0.0/sai.package",
+            );
+
+        let result = database
+            .resolve_local_export_world_from_contract(package, &collection, &snapshot)
+            .expect("a dependency manifest uses its package-qualified snapshot path");
+        assert!(result.world.is_some());
+        assert!(result.diagnostics.is_empty());
+
+        let mut files = snapshot.iter().cloned().collect::<Vec<_>>();
+        let snapshot_manifest = files
+            .iter_mut()
+            .find(|file| file.source().id() == manifest_file)
+            .expect("manifest is present in the snapshot");
+        let source = Arc::clone(snapshot_manifest.source());
+        let package_name = snapshot_manifest.package().map(str::to_owned);
+        let document_version = snapshot_manifest.document_version();
+        *snapshot_manifest =
+            SnapshotFile::new(source, "sai.package", package_name, document_version);
+        let wrong_path_snapshot =
+            WorkspaceSnapshot::new(files).expect("wrong-path snapshot is structurally valid");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wrong_path_collection = database
+            .collect_phase1_package_scopes_collection(
+                &collection.module_tree,
+                &wrong_path_snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("the source collection binds to the wrong-path snapshot");
+
+        assert_eq!(
+            database.resolve_local_export_world_from_contract(
+                package,
+                &wrong_path_collection,
+                &wrong_path_snapshot,
+            ),
+            Err(ExportWorldQueryError::ManifestSnapshotPathMismatch(
+                "sai.package".to_owned()
+            )),
+            "dependency manifests cannot bind through the root manifest path"
+        );
+
+        let (mut database, package, collection, snapshot, _) =
+            phase1_export_world_fixture_with_role_and_path(
+                manifest,
+                PackageRole::Root,
+                "dep:acme:phase1@1.0.0/sai.package",
+            );
+        assert_eq!(
+            database.resolve_local_export_world_from_contract(package, &collection, &snapshot),
+            Err(ExportWorldQueryError::ManifestSnapshotPathMismatch(
+                "dep:acme:phase1@1.0.0/sai.package".to_owned()
+            )),
+            "root manifests cannot bind through a dependency path"
+        );
+    }
+
+    #[test]
+    fn export_world_query_validates_manifest_even_without_an_export_declaration() {
+        let manifest = b"package acme:phase1 @ 1.0.0\n\
+            source \"src\"\n";
+        let (mut database, package, collection, snapshot, manifest_file) =
+            phase1_export_world_fixture(manifest);
+
+        assert_eq!(
+            database
+                .resolve_local_export_world_from_contract(package, &collection, &snapshot)
+                .expect("a valid package without an export world has an empty projection"),
+            sai_resolve::ExportWorld::default()
+        );
+
+        let without_manifest = WorkspaceSnapshot::new(
+            snapshot
+                .iter()
+                .filter(|file| file.source().id() != manifest_file)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .expect("module-only snapshot is valid");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let module_only_collection = database
+            .collect_phase1_package_scopes_collection(
+                &collection.module_tree,
+                &without_manifest,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("module-only collection binds to its current snapshot");
+
+        assert_eq!(
+            database.resolve_local_export_world_from_contract(
+                package,
+                &module_only_collection,
+                &without_manifest,
+            ),
+            Err(ExportWorldQueryError::MissingManifestSnapshot(
+                manifest_file
+            )),
+            "an absent manifest must not be hidden by the lack of an export declaration"
+        );
+
+        let altered_manifest = b"package acme:phase1 @ 1.0.0\n\
+            source \"src/changed\"\n";
+        let mut files = snapshot.iter().cloned().collect::<Vec<_>>();
+        let manifest = files
+            .iter_mut()
+            .find(|file| file.source().id() == manifest_file)
+            .expect("manifest is present in the snapshot");
+        *manifest = SnapshotFile::new(
+            Arc::new(
+                SourceFile::decode(manifest_file, altered_manifest)
+                    .expect("altered manifest decodes"),
+            ),
+            manifest.path(),
+            manifest.package().map(str::to_owned),
+            Some(43),
+        );
+        let altered_snapshot =
+            WorkspaceSnapshot::new(files).expect("altered manifest snapshot is valid");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let altered_collection = database
+            .collect_phase1_package_scopes_collection(
+                &collection.module_tree,
+                &altered_snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("altered collection binds to the altered snapshot");
+        assert_eq!(
+            database.resolve_local_export_world_from_contract(
+                package,
+                &altered_collection,
+                &altered_snapshot,
+            ),
+            Err(ExportWorldQueryError::ManifestSnapshotBytesMismatch),
+            "a changed manifest cannot be hidden by the lack of an export declaration"
+        );
+    }
+
+    #[test]
+    fn export_world_query_binds_unknown_world_to_the_exact_manifest_value() {
+        let manifest = b"\xEF\xBB\xBF// \xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E \xF0\x9F\xA7\xAD\n\
+            package acme:phase1 @ 1.0.0\n\
+            source \"src\"\n\
+            export world missing /* \xF0\x9F\xA7\xAD */ / child\n";
+        let (mut database, package, collection, snapshot, _) =
+            phase1_export_world_fixture(manifest);
+
+        let result = database
+            .resolve_local_export_world_from_contract(package, &collection, &snapshot)
+            .expect("unknown local names become a manifest diagnostic");
+
+        assert_eq!(result.world, None);
+        assert_eq!(result.diagnostics.len(), 1);
+        let diagnostic = &result.diagnostics[0];
+        assert_eq!(diagnostic.code, sai_diagnostics::Code::UnknownExportWorld);
+        assert!(diagnostic.has_workspace_snapshot());
+        let primary = diagnostic.primary().expect("unknown world has a primary");
+        assert_eq!(
+            &manifest[primary.span.range.start().to_usize()..primary.span.range.end().to_usize()],
+            b"missing /* \xF0\x9F\xA7\xAD */ / child"
+        );
+        assert_eq!(primary.file.path, "sai.package");
+        assert_eq!(primary.file.package.as_deref(), Some("acme:phase1@1.0.0"));
+        assert_eq!(primary.file.snapshot, Some(42));
+        assert_eq!(diagnostic.primary_label, "unknown export world");
+    }
+
+    #[test]
+    fn export_world_query_rejects_missing_or_divergent_manifest_snapshots() {
+        let manifest = b"package acme:phase1 @ 1.0.0\n\
+            source \"src\"\n\
+            export world root_world\n";
+        let (mut database, package, collection, snapshot, manifest_file) =
+            phase1_export_world_fixture(manifest);
+
+        let without_manifest = WorkspaceSnapshot::new(
+            snapshot
+                .iter()
+                .filter(|file| file.source().id() != manifest_file)
+                .cloned()
+                .collect::<Vec<_>>(),
+        )
+        .expect("module-only snapshot is valid");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let module_only_collection = database
+            .collect_phase1_package_scopes_collection(
+                &collection.module_tree,
+                &without_manifest,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("module-only collection binds to its current snapshot");
+        assert_eq!(
+            database.resolve_local_export_world_from_contract(
+                package,
+                &module_only_collection,
+                &without_manifest,
+            ),
+            Err(ExportWorldQueryError::MissingManifestSnapshot(
+                manifest_file
+            )),
+            "the world value cannot bind when its manifest is absent from the snapshot"
+        );
+
+        let (mut database, package, collection, snapshot, _) =
+            phase1_export_world_fixture(manifest);
+        let altered_manifest = b"package acme:phase1 @ 1.0.0\n\
+            source \"src\"\n\
+            export world other_world\n";
+        let altered_file = database
+            .intern_package_file(
+                package,
+                PackageRelativePath::new("sai.package").expect("manifest path is valid"),
+            )
+            .expect("manifest file is interned");
+        let mut files = snapshot.iter().cloned().collect::<Vec<_>>();
+        files.retain(|file| file.source().id() != altered_file);
+        files.push(SnapshotFile::new(
+            Arc::new(
+                SourceFile::decode(altered_file, altered_manifest)
+                    .expect("altered manifest decodes"),
+            ),
+            "sai.package",
+            Some("acme:phase1@1.0.0".to_owned()),
+            Some(43),
+        ));
+        let altered_snapshot =
+            WorkspaceSnapshot::new(files).expect("altered manifest snapshot is valid");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let altered_collection = database
+            .collect_phase1_package_scopes_collection(
+                &collection.module_tree,
+                &altered_snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("altered collection binds to the altered snapshot");
+        assert_eq!(
+            database.resolve_local_export_world_from_contract(
+                package,
+                &altered_collection,
+                &altered_snapshot,
+            ),
+            Err(ExportWorldQueryError::ManifestSnapshotBytesMismatch),
+            "the snapshot manifest must equal the tracked contract input byte-for-byte"
         );
     }
 
