@@ -61,7 +61,11 @@ pub enum PackageDeclaration {
     Wit(Box<str>),
     ArtifactComponents(Vec<Spanned<ArtifactEntry>>),
     Targets(Vec<Spanned<Box<str>>>),
-    ExportWorld(Box<str>),
+    /// The normalized world spelling and the source envelope of its tokens.
+    ///
+    /// For local paths the source range can include trivia between path
+    /// segments, so the corresponding source slice need not equal `value`.
+    ExportWorld(Spanned<Box<str>>),
     Requires {
         test: bool,
         entries: Vec<Spanned<Requirement>>,
@@ -754,6 +758,7 @@ impl<'a> Parser<'a> {
     fn parse_export_world(&mut self) -> Option<PackageDeclaration> {
         self.bump(); // `export`
         self.expect_word("world")?;
+        let value_start = self.position;
         let world = if self.at_kind(PackageTokenKind::PackagePath) {
             let value = self.token_text(self.position).to_owned().into_boxed_str();
             self.bump();
@@ -765,7 +770,12 @@ impl<'a> Parser<'a> {
             }
             Some(segments.join("/").into_boxed_str())
         };
-        world.map(PackageDeclaration::ExportWorld)
+        world.map(|value| {
+            PackageDeclaration::ExportWorld(Spanned {
+                value,
+                span: self.span_from(value_start),
+            })
+        })
     }
 
     fn parse_requires(&mut self) -> Option<PackageDeclaration> {
@@ -2171,9 +2181,44 @@ mod tests {
         ));
         assert!(matches!(
             &output.file.declarations[4].value,
-            PackageDeclaration::ExportWorld(name) if name.as_ref() == "api/client"
+            PackageDeclaration::ExportWorld(name) if name.value.as_ref() == "api/client"
         ));
+        let world = match &output.file.declarations[4].value {
+            PackageDeclaration::ExportWorld(world) => world,
+            _ => unreachable!("export world declaration was parsed"),
+        };
+        assert_eq!(&source[world.span.clone()], "api/client");
         assert!(!output.file.trivia.is_empty());
+    }
+
+    #[test]
+    fn export_world_value_span_covers_spaced_and_commented_local_paths() {
+        let source = "package acme:image @ 1.2.3\n\
+            source \"src\"\n\
+            export world api /* path gap */ / server\n";
+        let output = parse_valid(source);
+        let world = match &output.file.declarations[1].value {
+            PackageDeclaration::ExportWorld(world) => world,
+            _ => unreachable!("export world declaration was parsed"),
+        };
+
+        assert_eq!(world.value.as_ref(), "api/server");
+        assert_eq!(&source[world.span.clone()], "api /* path gap */ / server");
+    }
+
+    #[test]
+    fn export_world_external_value_span_covers_one_package_path_token() {
+        let source = "package acme:image @ 1.2.3\n\
+            source \"src\"\n\
+            export world wasi:cli/command\n";
+        let output = parse_valid(source);
+        let world = match &output.file.declarations[1].value {
+            PackageDeclaration::ExportWorld(world) => world,
+            _ => unreachable!("export world declaration was parsed"),
+        };
+
+        assert_eq!(world.value.as_ref(), "wasi:cli/command");
+        assert_eq!(&source[world.span.clone()], "wasi:cli/command");
     }
 
     #[test]

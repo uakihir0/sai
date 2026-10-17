@@ -30,7 +30,10 @@ impl WitContractExportWorld {
         &self.value
     }
 
-    /// The half-open byte range of the `export world` declaration.
+    /// The half-open byte range of the `export world` value's source tokens.
+    ///
+    /// A local path range may include whitespace or comments between path
+    /// segments, so the corresponding source slice need not equal [`Self::value`].
     pub fn span(&self) -> &Range<usize> {
         &self.span
     }
@@ -230,8 +233,8 @@ impl WitContract {
                         &declaration.span,
                     )?;
                     export_world = Some(WitContractExportWorld {
-                        value: value.clone(),
-                        span: declaration.span.clone(),
+                        value: value.value.clone(),
+                        span: value.span.clone(),
                     });
                 }
                 _ => {}
@@ -379,7 +382,26 @@ mod tests {
         let world = contract.export_world().expect("world declaration");
         assert_eq!(world.value(), "app");
         let start = "package acme:codec@1.0.0\nsource \"src\"\nwit \"interface\"\n".len();
-        assert_eq!(world.span(), &(start..start + "export world app".len()));
+        assert_eq!(
+            world.span(),
+            &(start + "export world ".len()..start + "export world app".len())
+        );
+    }
+
+    #[test]
+    fn export_world_projection_preserves_raw_value_span_after_utf8_trivia() {
+        let source = "\u{feff}// 日本語 🙂\n\
+            package acme:codec@1.0.0\n\
+            source \"src\"\n\
+            export world api /* path note 🧭 */ / server\n";
+        let contract = project(source).expect("contract with a spaced local world path");
+        let world = contract.export_world().expect("export world declaration");
+
+        assert_eq!(world.value(), "api/server");
+        assert_eq!(
+            &source[world.span().clone()],
+            "api /* path note 🧭 */ / server"
+        );
     }
 
     #[test]

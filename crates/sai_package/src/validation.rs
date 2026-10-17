@@ -395,9 +395,9 @@ pub fn validate(
             PackageDeclaration::Wit(_) => has_wit = true,
             PackageDeclaration::ExportWorld(world) => {
                 has_export_world = true;
-                if !is_valid_export_world(world) {
+                if !is_valid_export_world(&world.value) {
                     output.errors.push(PackageValidationError {
-                        kind: PackageValidationErrorKind::InvalidWorldName(world.clone()),
+                        kind: PackageValidationErrorKind::InvalidWorldName(world.value.clone()),
                         span: declaration.span.clone(),
                     });
                 }
@@ -610,9 +610,12 @@ pub fn validate(
             let PackageDeclaration::ExportWorld(world) = &declaration.value else {
                 continue;
             };
-            if !world.contains(':') && world.contains('/') && is_valid_export_world(world) {
+            if !world.value.contains(':')
+                && world.value.contains('/')
+                && is_valid_export_world(&world.value)
+            {
                 output.errors.push(PackageValidationError {
-                    kind: PackageValidationErrorKind::InvalidWorldName(world.clone()),
+                    kind: PackageValidationErrorKind::InvalidWorldName(world.value.clone()),
                     span: declaration.span.clone(),
                 });
             }
