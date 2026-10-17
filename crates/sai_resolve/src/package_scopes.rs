@@ -201,6 +201,13 @@ pub struct Phase1ModuleScopes {
     pub declared: HashMap<Symbol, Binding>,
     /// Module member namespace, including declarations and local `pub use`s.
     pub members: HashMap<Symbol, Binding>,
+    /// Source-only re-exports retained when a dependent-facing generated WIT
+    /// view is unavailable. These bindings support analysis inside the
+    /// validated active source closure without entering ordinary module scope.
+    pub(crate) deferred_source_members: HashMap<Symbol, Binding>,
+    /// Public imports withheld from ordinary member lookup. They still
+    /// participate in source-order conflict diagnostics.
+    pub(crate) withheld_public_imports: HashSet<ImportIndex>,
     /// Module-level scope after local aliases and resolved item imports.
     pub scope: HashMap<Symbol, Binding>,
     /// Use bindings retained in source order for later resolution stages.
@@ -424,6 +431,18 @@ impl Phase1PackageScopes {
     }
 }
 
+impl Phase1ModuleScopes {
+    /// Names and source locations held only for diagnostic traversal.
+    ///
+    /// The unavailable source resolutions stay inside the resolver so callers
+    /// cannot consume them as ordinary bindings.
+    pub fn deferred_source_member_names(&self) -> impl Iterator<Item = (Symbol, Span)> + '_ {
+        self.deferred_source_members
+            .iter()
+            .map(|(name, binding)| (*name, binding.name_span))
+    }
+}
+
 /// Snapshot-bound inputs for one module whose top-level declarations have
 /// already been target-filtered.
 pub struct FilteredModule<'a> {
@@ -576,6 +595,8 @@ pub fn collect_phase1(
             module_def_id,
             declared: HashMap::new(),
             members: HashMap::new(),
+            deferred_source_members: HashMap::new(),
+            withheld_public_imports: HashSet::new(),
             scope: HashMap::new(),
             imports: Vec::new(),
         };
@@ -1715,24 +1736,27 @@ pub fn collect_module_alias_bindings_with_foreign_wit_views_unavailable_and_sour
                                                 Some((None, PendingItemTarget::Unavailable));
                                         }
                                     } else {
-                                        if unavailable_wit_view {
-                                            resolved_foreign_target =
-                                                Some((None, PendingItemTarget::Deferred));
-                                        } else {
-                                            diagnostics.push(
-                                                crate::use_target_diagnostics::unknown_module_diagnostic(
-                                                    entry,
-                                                    &parsed,
-                                                    matched_prefix,
-                                                    module_candidates,
-                                                    source_location(input, path_range)?,
-                                                    &package_identity,
-                                                    symbols,
-                                                )?,
-                                            );
-                                            resolved_foreign_target =
-                                                Some((None, PendingItemTarget::Unavailable));
-                                        }
+                                        // The active source module tree is
+                                        // authoritative for source-module
+                                        // targets even when its generated WIT
+                                        // view is unavailable. Known source
+                                        // interfaces were handled above; an
+                                        // unavailable view must not hide an
+                                        // exact miss in the captured module
+                                        // tree.
+                                        diagnostics.push(
+                                            crate::use_target_diagnostics::unknown_module_diagnostic(
+                                                entry,
+                                                &parsed,
+                                                matched_prefix,
+                                                module_candidates,
+                                                source_location(input, path_range)?,
+                                                &package_identity,
+                                                symbols,
+                                            )?,
+                                        );
+                                        resolved_foreign_target =
+                                            Some((None, PendingItemTarget::Unavailable));
                                     }
                                 }
                                 Err(ModuleTargetError::MissingRootModule) => {
@@ -2035,8 +2059,8 @@ pub fn collect_module_alias_bindings_with_foreign_wit_views_unavailable_and_sour
         pending_items,
         foreign_scopes,
         foreign_wit_views,
-        foreign_source_member_scopes,
         unavailable_wit_identities,
+        foreign_source_member_scopes,
         packages,
         symbols,
         &package_identity,
@@ -2102,8 +2126,8 @@ fn resolve_local_use_items(
     pending: Vec<PendingLocalUseItem>,
     foreign_scopes: &[ForeignPackageScope<'_>],
     foreign_wit_views: &[ForeignWitViewScope<'_>],
-    foreign_source_member_scopes: &[ForeignSourceMemberScope<'_>],
     unavailable_wit_identities: &[String],
+    foreign_source_member_scopes: &[ForeignSourceMemberScope<'_>],
     packages: &PackageInterner,
     symbols: &Interner,
     package_identity: &str,
@@ -2151,8 +2175,8 @@ fn resolve_local_use_items(
         pending: &pending,
         foreign_scopes,
         foreign_wit_views,
-        foreign_source_member_scopes,
         unavailable_wit_identities,
+        foreign_source_member_scopes,
         packages,
         wit_member_index,
         requesting_package,
@@ -2254,9 +2278,10 @@ fn insert_resolved_imports_into_scopes(
                 })
         });
         module_scope.scope.clear();
+        let mut conflict_scope = HashMap::<Symbol, Binding>::new();
         for (_, spelling, name, binding, import_index) in events {
             let location = source_location(input, binding.name_span.range)?;
-            let previous = module_scope.scope.get(&name).cloned();
+            let previous = conflict_scope.get(&name).cloned();
             let current_is_inactive = import_index.is_some_and(|index| {
                 module_scope
                     .imports
@@ -2272,6 +2297,8 @@ fn insert_resolved_imports_into_scopes(
                 };
                 import.is_some_and(|import| import.inactive)
             });
+            let current_is_withheld_public = import_index
+                .is_some_and(|index| module_scope.withheld_public_imports.contains(&index));
             match previous {
                 None => {
                     let import =
@@ -2289,6 +2316,7 @@ fn insert_resolved_imports_into_scopes(
                             def_paths,
                             symbols,
                         )?;
+                    conflict_scope.insert(name, binding.clone());
                     if is_prelude_reimport {
                         diagnostics.push(use_binding_diagnostic(
                             Code::RedundantImport,
@@ -2298,7 +2326,7 @@ fn insert_resolved_imports_into_scopes(
                             location.clone(),
                             package_identity,
                         ));
-                    } else {
+                    } else if !current_is_withheld_public {
                         module_scope.scope.insert(name, binding);
                     }
                     if is_module_alias && !is_err_binding && is_shadowable_prelude_name(&spelling) {
@@ -2351,6 +2379,30 @@ fn insert_resolved_imports_into_scopes(
                     }
                 }
                 Some(previous) => {
+                    let previous_is_nonmember_public_import = match previous.origin {
+                        BindingOrigin::Use { import } | BindingOrigin::PubUse { import } => {
+                            module_scope.withheld_public_imports.contains(&import)
+                                || module_scope.imports.get(import.0 as usize).is_some_and(
+                                    |previous_import| {
+                                        previous_import.is_pub
+                                            && previous_import.item_index.is_some()
+                                            && (previous_import.test_only
+                                                || previous_import.inactive
+                                                || matches!(
+                                                    previous_import.res,
+                                                    Res::Err | Res::TestOnly(_)
+                                                ))
+                                    },
+                                )
+                        }
+                        BindingOrigin::Decl => false,
+                    };
+                    if current_is_withheld_public || previous_is_nonmember_public_import {
+                        module_scope.deferred_source_members.remove(&name);
+                    }
+                    if previous_is_nonmember_public_import && !current_is_withheld_public {
+                        module_scope.members.remove(&name);
+                    }
                     if matches!(binding.origin, BindingOrigin::Decl)
                         && matches!(
                             previous.origin,
@@ -2398,6 +2450,9 @@ fn insert_resolved_imports_into_scopes(
 enum LocalMemberLookup {
     Missing,
     Deferred,
+    /// A validated source binding exists, but it cannot enter the ordinary
+    /// dependent-facing member namespace until its generated WIT view exists.
+    DeferredSource(Binding),
     Found(Binding),
     /// A dependency-owned error makes this binding unavailable. Keep its
     /// error resolution in scope to prevent a second unresolved-name error.
@@ -2424,8 +2479,8 @@ struct LocalModuleMemberResolver<'a> {
     pending: &'a [PendingLocalUseItem],
     foreign_scopes: &'a [ForeignPackageScope<'a>],
     foreign_wit_views: &'a [ForeignWitViewScope<'a>],
-    foreign_source_member_scopes: &'a [ForeignSourceMemberScope<'a>],
     unavailable_wit_identities: &'a [String],
+    foreign_source_member_scopes: &'a [ForeignSourceMemberScope<'a>],
     packages: &'a PackageInterner,
     wit_member_index: ModuleMemberIndex<'a>,
     requesting_package: PackageId,
@@ -2475,6 +2530,18 @@ impl LocalModuleMemberResolver<'_> {
             return Ok(());
         }
 
+        if item.is_pub
+            && item.test_only
+            && matches!(
+                item.target,
+                PendingItemTarget::ForeignModule { .. } | PendingItemTarget::WitInterface { .. }
+            )
+        {
+            self.set_import_res(item.module, item.import, Res::Err)?;
+            self.retain_import_for_conflicts(item.module, item.import)?;
+            return Ok(());
+        }
+
         let result = match item.target {
             PendingItemTarget::LocalModule(module) => self.lookup(module, item.source_name)?,
             PendingItemTarget::ForeignModule {
@@ -2520,6 +2587,46 @@ impl LocalModuleMemberResolver<'_> {
             .ok_or(PackageScopesError::InvalidModuleTree)?;
         debug_assert_eq!(recorded_import.item_index, Some(item.item_index));
         debug_assert_eq!(recorded_import.name, item.binding_name);
+        if let LocalMemberLookup::DeferredSource(target_binding) = &result {
+            let is_foreign_target = matches!(
+                item.target,
+                PendingItemTarget::ForeignModule { .. } | PendingItemTarget::WitInterface { .. }
+            );
+            if is_foreign_target && !item.is_pub && target_binding.visibility == Visibility::Private
+            {
+                self.report_private_item(item)?;
+                self.set_import_res(item.module, item.import, Res::Err)?;
+                return Ok(());
+            }
+            if item.is_pub && target_binding.visibility != Visibility::Pub {
+                self.report_private_reexport(item)?;
+                self.set_import_res(item.module, item.import, Res::Err)?;
+                return Ok(());
+            }
+            if item.is_pub {
+                let binding = Binding {
+                    res: target_binding.res,
+                    name_span: item.binding_span,
+                    origin: BindingOrigin::PubUse {
+                        import: item.import,
+                    },
+                    visibility: Visibility::Pub,
+                };
+                let module_scope = self
+                    .scopes
+                    .modules
+                    .get_mut(item.module.raw() as usize)
+                    .ok_or(PackageScopesError::MissingModuleInput(item.module))?;
+                module_scope
+                    .deferred_source_members
+                    .entry(item.binding_name)
+                    .or_insert(binding);
+                module_scope.withheld_public_imports.insert(item.import);
+                self.set_import_res(item.module, item.import, Res::Err)?;
+                self.retain_import_for_conflicts(item.module, item.import)?;
+            }
+            return Ok(());
+        }
         let (target_binding, retain_error_binding) = match result {
             LocalMemberLookup::Found(binding) => (binding, false),
             LocalMemberLookup::FoundSuppressed(binding) => (binding, true),
@@ -2533,6 +2640,9 @@ impl LocalModuleMemberResolver<'_> {
                 return Ok(());
             }
             LocalMemberLookup::Deferred => return Ok(()),
+            LocalMemberLookup::DeferredSource(_) => {
+                return Err(PackageScopesError::InvalidModuleTree);
+            }
         };
 
         let is_foreign_target = matches!(
@@ -2632,7 +2742,12 @@ impl LocalModuleMemberResolver<'_> {
             .modules
             .get(module.raw() as usize)
             .ok_or(PackageScopesError::ForeignPackageScopeMismatch)?;
-        let Some(mut binding) = module_scope.members.get(&name).cloned() else {
+        let Some(mut binding) = module_scope
+            .members
+            .get(&name)
+            .or_else(|| module_scope.deferred_source_members.get(&name))
+            .cloned()
+        else {
             return Ok(LocalMemberLookup::Missing);
         };
         let Res::Def(DefKind::Interface, source_interface) = binding.res else {
@@ -2651,11 +2766,7 @@ impl LocalModuleMemberResolver<'_> {
                     .iter()
                     .any(|identity| identity == foreign.visible_identity)
             {
-                // A source dependency may publicly re-export an interface
-                // owned by a transitive package, or its Generated producer
-                // may have failed. Do not leak the source definition when
-                // its WIT replacement cannot be selected.
-                return Ok(LocalMemberLookup::Deferred);
+                return Ok(LocalMemberLookup::DeferredSource(binding));
             }
             return Ok(LocalMemberLookup::Found(binding));
         };
@@ -2725,7 +2836,10 @@ impl LocalModuleMemberResolver<'_> {
                 }
             }
             ModuleMemberLookup::NotModule => Ok(LocalMemberLookup::Missing),
-            ModuleMemberLookup::Found(_) | ModuleMemberLookup::Inaccessible(_) => {
+            ModuleMemberLookup::Found(_)
+            | ModuleMemberLookup::DeferredSource
+            | ModuleMemberLookup::InaccessibleDeferred(_)
+            | ModuleMemberLookup::Inaccessible(_) => {
                 Err(PackageScopesError::ForeignPackageScopeMismatch)
             }
         }
@@ -2861,6 +2975,25 @@ impl LocalModuleMemberResolver<'_> {
                 | PendingItemTarget::TestOnly => continue,
             };
             match target {
+                LocalMemberLookup::DeferredSource(binding)
+                    if binding.visibility == Visibility::Pub =>
+                {
+                    let result = LocalMemberLookup::DeferredSource(Binding {
+                        res: binding.res,
+                        name_span: edge.binding_span,
+                        origin: BindingOrigin::PubUse {
+                            import: edge.import,
+                        },
+                        visibility: Visibility::Pub,
+                    });
+                    self.memo.insert(key, LocalMemberMemo::Done(result.clone()));
+                    return Ok(result);
+                }
+                LocalMemberLookup::DeferredSource(_) => {
+                    self.report_private_reexport(&edge)?;
+                    self.set_import_res(edge.module, edge.import, Res::Err)?;
+                    saw_failed = true;
+                }
                 LocalMemberLookup::Found(binding) if binding.visibility == Visibility::Pub => {
                     self.set_import_res(edge.module, edge.import, binding.res)?;
                     let result = LocalMemberLookup::Found(Binding {
@@ -5374,6 +5507,8 @@ mod tests {
                     module_def_id,
                     declared: HashMap::new(),
                     members: HashMap::new(),
+                    deferred_source_members: HashMap::new(),
+                    withheld_public_imports: HashSet::new(),
                     scope: HashMap::new(),
                     imports: Vec::new(),
                 })
@@ -6487,6 +6622,8 @@ mod tests {
                 module_def_id: root_id,
                 declared: HashMap::new(),
                 members: HashMap::new(),
+                deferred_source_members: HashMap::new(),
+                withheld_public_imports: HashSet::new(),
                 scope: HashMap::new(),
                 imports: Vec::new(),
             }],
@@ -6602,6 +6739,311 @@ mod tests {
         assert!(
             scopes.diagnostics.is_empty(),
             "an unavailable Generated producer does not turn valid source module access into a dependency error"
+        );
+    }
+
+    #[test]
+    fn unavailable_generated_view_keeps_public_source_reexports_out_of_import_scope() {
+        let fixture = Fixture::new("pub use acme:foreign/api.{codec}\n", "wasm32-core");
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let unavailable = ["acme:foreign".to_owned()];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views_unavailable_and_source_scopes(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &[],
+                &unavailable,
+                &[],
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let codec = fixture.symbols.intern("codec").unwrap();
+        assert!(
+            !root.scope.contains_key(&codec) && !root.members.contains_key(&codec),
+            "the unavailable generated interface must not become an ordinary import or re-export"
+        );
+        let deferred = root
+            .deferred_source_members
+            .get(&codec)
+            .expect("the validated source binding is retained for source-closure analysis");
+        assert_eq!(
+            deferred.res,
+            Res::Def(DefKind::Interface, foreign.codec_def_id)
+        );
+
+        let root_target =
+            ModuleTarget::from_res(Res::Def(DefKind::Module, root.module_def_id.to_def_id()))
+                .unwrap();
+        assert_eq!(
+            ModuleMemberIndex::new([&scopes, &foreign.scopes]).lookup_target(
+                root_target,
+                codec,
+                fixture.package
+            ),
+            ModuleMemberLookup::DeferredSource,
+            "indexed source lookup retains a non-resolvable deferred marker"
+        );
+    }
+
+    #[test]
+    fn unavailable_generated_view_reexport_alias_conflicts_do_not_leave_a_fallback() {
+        let fixture = Fixture::new(
+            concat!(
+                "pub use acme:foreign/api.{codec as exposed}\n",
+                "pub use acme:foreign/api.{codec as exposed}\n",
+            ),
+            "wasm32-core",
+        );
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let unavailable = ["acme:foreign".to_owned()];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views_unavailable_and_source_scopes(
+                &[],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &[],
+                &unavailable,
+                &[],
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let exposed = fixture.symbols.intern("exposed").unwrap();
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+                .count(),
+            1,
+            "deferred re-exports still participate in source-order conflict checks"
+        );
+        assert!(
+            !root.deferred_source_members.contains_key(&exposed),
+            "an ambiguous deferred alias is not available to diagnostic-only path traversal"
+        );
+    }
+
+    #[test]
+    fn normal_reexport_after_deferred_alias_conflict_does_not_leak_a_member() {
+        let fixture = Fixture::new(
+            concat!(
+                "pub use acme:foreign/api.{codec as exposed}\n",
+                "pub use acme:phase1/model.{Widget as exposed}\n",
+            ),
+            "wasm32-core",
+        );
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: false,
+        }];
+        let unavailable = ["acme:foreign".to_owned()];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views_unavailable_and_source_scopes(
+                &[("model", "pub type Widget {}\n")],
+                Some(&requirements),
+                false,
+                true,
+                &foreign_scopes,
+                &[],
+                &unavailable,
+                &[],
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let exposed = fixture.symbols.intern("exposed").unwrap();
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+                .count(),
+            1,
+            "the later normal public re-export conflicts with the deferred earlier name"
+        );
+        assert!(
+            !root.members.contains_key(&exposed)
+                && !root.deferred_source_members.contains_key(&exposed),
+            "the ambiguous name is unavailable to dependent member lookup"
+        );
+    }
+
+    #[test]
+    fn test_only_unavailable_source_reexport_never_enters_the_sidecar() {
+        let fixture = Fixture::new("pub use acme:foreign/api.{codec}\n", "wasm32-core");
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let foreign_scopes = [foreign.scope()];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: true,
+        }];
+        let unavailable = ["acme:foreign".to_owned()];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views_unavailable_and_source_scopes(
+                &[],
+                Some(&requirements),
+                true,
+                true,
+                &foreign_scopes,
+                &[],
+                &unavailable,
+                &[],
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let codec = fixture.symbols.intern("codec").unwrap();
+        assert!(
+            !root.deferred_source_members.contains_key(&codec),
+            "test-only dependencies cannot add source fallbacks to the ordinary package closure"
+        );
+        assert!(
+            !root.members.contains_key(&codec),
+            "a test-only public use does not enter the source member namespace"
+        );
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::TestDependencyOutsideTest),
+            "the existing test-dependency export diagnostic remains visible"
+        );
+    }
+
+    #[test]
+    fn test_only_reexport_with_available_wit_view_never_enters_member_scope() {
+        let fixture = Fixture::new(
+            concat!(
+                "pub use acme:foreign/api.{codec as exposed}\n",
+                "pub use acme:phase1/model.{Widget as exposed}\n",
+            ),
+            "wasm32-core",
+        );
+        let foreign = ForeignScopeFixture::new(&fixture);
+        let foreign_scopes = [foreign.scope()];
+        let view = generated_test_view(&fixture, &foreign.def_paths, "codec", foreign.codec_def_id);
+        let wit_scopes = [ForeignWitViewScope {
+            visible_identity: "acme:foreign",
+            view: &view,
+            source_def_paths: Some(&foreign.def_paths),
+            directly_visible: true,
+        }];
+        let requirements = [PackageUseRequirement {
+            identity: "acme:foreign".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: true,
+        }];
+        let (scopes, _) = fixture
+            .collect_with_local_modules_and_paths_and_optional_requirements_for_package_and_foreign_wit_views_unavailable_and_source_scopes(
+                &[("model", "pub type Widget {}\n")],
+                Some(&requirements),
+                true,
+                true,
+                &foreign_scopes,
+                &wit_scopes,
+                &[],
+                &[],
+            );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let exposed = fixture.symbols.intern("exposed").unwrap();
+        assert_eq!(
+            root.scope.get(&exposed).map(|binding| binding.res),
+            Some(Res::Err),
+            "the diagnosed public test-only import still binds its name to suppress cascades"
+        );
+        assert!(
+            !root.members.contains_key(&exposed)
+                && !root.deferred_source_members.contains_key(&exposed),
+            "a later valid re-export cannot leak through a test-only alias conflict"
+        );
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+                .count(),
+            1,
+            "the test-only alias remains part of duplicate name checking"
+        );
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::TestDependencyOutsideTest),
+            "the public test-dependency diagnostic remains visible"
+        );
+    }
+
+    #[test]
+    fn unavailable_test_only_public_use_conflicts_without_leaking_later_member() {
+        let fixture = Fixture::new(
+            concat!(
+                "pub use acme:test-support.{first as exposed}\n",
+                "pub use acme:phase1/model.{Widget as exposed}\n",
+            ),
+            "wasm32-core",
+        );
+        let requirements = [PackageUseRequirement {
+            identity: "acme:test-support".to_owned(),
+            declaration_order: 0,
+            only: None,
+            test: true,
+        }];
+        let (scopes, _) = fixture.collect_with_local_modules_and_paths_and_requirements(
+            &[("model", "pub type Widget {}\n")],
+            &requirements,
+            false,
+        );
+
+        let root = &scopes.modules[ModuleId::ROOT.raw() as usize];
+        let exposed = fixture.symbols.intern("exposed").unwrap();
+        assert!(matches!(root.imports[0].res, Res::TestOnly(_)));
+        assert_eq!(root.imports[1].res, Res::Err);
+        assert!(
+            !root.members.contains_key(&exposed)
+                && !root.deferred_source_members.contains_key(&exposed),
+            "a later valid re-export cannot leak through an unavailable test-only alias"
+        );
+        assert_eq!(
+            scopes
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == Code::DuplicateBinding)
+                .count(),
+            1,
+            "unavailable test-only names remain part of source-order conflict checking"
+        );
+        assert!(
+            scopes
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == Code::TestDependencyOutsideTest),
+            "the test dependency remains diagnosed outside test analysis"
         );
     }
 

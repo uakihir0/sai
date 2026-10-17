@@ -51,6 +51,15 @@ impl ModuleTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModuleMemberLookup<'a> {
     Found(&'a Binding),
+    /// A source-only member whose generated WIT view is unavailable.
+    ///
+    /// The binding is available only to qualified-path analysis for
+    /// diagnostics. `resolve_module_prefix` never returns it as the path's
+    /// resolved base.
+    DeferredSource,
+    /// A private member in an unavailable source scope. Carry only its
+    /// declaration span so diagnostic callers cannot observe its `Res`.
+    InaccessibleDeferred(sai_vfs::Span),
     /// A WIT member definition, which has no SAI source span.
     ///
     /// WIT view members are public and intentionally do not use `Binding`.
@@ -62,19 +71,33 @@ pub enum ModuleMemberLookup<'a> {
 
 #[derive(Clone, Copy)]
 enum MemberScope<'a> {
-    Source(&'a HashMap<Symbol, Binding>),
+    Source {
+        members: &'a HashMap<Symbol, Binding>,
+        deferred_source_members: Option<&'a HashMap<Symbol, Binding>>,
+    },
     WitInterface(&'a ViewInterface),
 }
 
 enum MemberLookupValue<'a> {
     Source(&'a Binding),
+    DeferredSource(&'a Binding),
     Wit(Res),
 }
 
 impl<'a> MemberScope<'a> {
     fn get(self, name: Symbol, symbols: Option<&Interner>) -> Option<MemberLookupValue<'a>> {
         match self {
-            Self::Source(members) => members.get(&name).map(MemberLookupValue::Source),
+            Self::Source {
+                members,
+                deferred_source_members,
+            } => members
+                .get(&name)
+                .map(MemberLookupValue::Source)
+                .or_else(|| {
+                    deferred_source_members
+                        .and_then(|fallback| fallback.get(&name))
+                        .map(MemberLookupValue::DeferredSource)
+                }),
             Self::WitInterface(interface) => {
                 let spelling = symbols?.resolve(name).ok()?;
                 interface
@@ -88,9 +111,32 @@ impl<'a> MemberScope<'a> {
 
     fn iter(self) -> Option<impl Iterator<Item = (Symbol, &'a Binding)> + 'a> {
         match self {
-            Self::Source(members) => Some(members.iter().map(|(name, binding)| (*name, binding))),
+            Self::Source { members, .. } => {
+                Some(members.iter().map(|(name, binding)| (*name, binding)))
+            }
             // This legacy enumeration API returns source-backed Bindings.
             // WIT lookup has a separate span-free result representation.
+            Self::WitInterface(_) => None,
+        }
+    }
+
+    fn diagnostic_iter(self) -> Option<impl Iterator<Item = (Symbol, &'a Binding)> + 'a> {
+        match self {
+            Self::Source {
+                members,
+                deferred_source_members,
+            } => Some(
+                members
+                    .iter()
+                    .map(|(name, binding)| (*name, binding))
+                    .chain(
+                        deferred_source_members
+                            .into_iter()
+                            .flat_map(|fallback| fallback.iter())
+                            .filter(|(name, _)| !members.contains_key(name))
+                            .map(|(name, binding)| (*name, binding)),
+                    ),
+            ),
             Self::WitInterface(_) => None,
         }
     }
@@ -109,6 +155,7 @@ struct IndexedTarget<'a> {
 /// and original bindings, while WIT results are span-free.
 pub struct ModuleMemberIndex<'a> {
     targets: HashMap<DefId, IndexedTarget<'a>>,
+    unavailable_source_interfaces: std::collections::HashSet<DefId>,
     wit_symbols: Option<&'a Interner>,
 }
 
@@ -120,7 +167,7 @@ impl<'a> ModuleMemberIndex<'a> {
     /// definition from a transitive package, so direct dependencies alone may
     /// not be enough.
     pub fn new(package_scopes: impl IntoIterator<Item = &'a Phase1PackageScopes>) -> Self {
-        Self::build(package_scopes, std::iter::empty(), None)
+        Self::build(package_scopes, std::iter::empty(), None, false)
     }
 
     /// Build an index over source scopes and foreign WIT views.
@@ -130,37 +177,70 @@ impl<'a> ModuleMemberIndex<'a> {
     /// the interner used to construct those paths and views. WIT members are
     /// returned as [`ModuleMemberLookup::WitMember`], without manufacturing
     /// source spans or `Binding`s.
+    ///
+    /// `wit_views` must be the complete validated view closure for the
+    /// supplied source scopes. A foreign source interface without a matching
+    /// generated-view origin is treated as unavailable. Use [`Self::new`]
+    /// when only source scopes should be traversable.
     pub fn new_with_wit_views(
         package_scopes: impl IntoIterator<Item = &'a Phase1PackageScopes>,
         wit_views: impl IntoIterator<Item = &'a WitView>,
         symbols: &'a Interner,
     ) -> Self {
-        Self::build(package_scopes, wit_views, Some(symbols))
+        Self::build(package_scopes, wit_views, Some(symbols), true)
     }
 
     fn build(
         package_scopes: impl IntoIterator<Item = &'a Phase1PackageScopes>,
         wit_views: impl IntoIterator<Item = &'a WitView>,
         wit_symbols: Option<&'a Interner>,
+        defer_source_interfaces_without_view: bool,
     ) -> Self {
         let mut targets = HashMap::new();
+        let mut source_interfaces = std::collections::HashSet::new();
+        let mut represented_source_interfaces = std::collections::HashSet::new();
+        let wit_views = wit_views.into_iter().collect::<Vec<_>>();
+
+        for view in &wit_views {
+            represented_source_interfaces.extend(
+                view.interfaces
+                    .values()
+                    .filter_map(|interface| interface.origin),
+            );
+        }
 
         for package in package_scopes {
             for module in &package.modules {
                 let def_id = module.module_def_id.to_def_id();
                 targets.entry(def_id).or_insert(IndexedTarget {
                     package: module.module_def_id.package(),
-                    scope: MemberScope::Source(&module.members),
+                    scope: MemberScope::Source {
+                        members: &module.members,
+                        deferred_source_members: Some(&module.deferred_source_members),
+                    },
                 });
             }
 
             for (def_id, interface) in &package.interfaces {
+                source_interfaces.insert(*def_id);
                 targets.entry(*def_id).or_insert(IndexedTarget {
                     package: def_id.package,
-                    scope: MemberScope::Source(&interface.members),
+                    scope: MemberScope::Source {
+                        members: &interface.members,
+                        deferred_source_members: None,
+                    },
                 });
             }
         }
+
+        let unavailable_source_interfaces = if defer_source_interfaces_without_view {
+            source_interfaces
+                .into_iter()
+                .filter(|def_id| !represented_source_interfaces.contains(def_id))
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
 
         for view in wit_views {
             for interface in view.interfaces.values() {
@@ -173,8 +253,22 @@ impl<'a> ModuleMemberIndex<'a> {
 
         Self {
             targets,
+            unavailable_source_interfaces,
             wit_symbols,
         }
+    }
+
+    pub(crate) fn is_unavailable_source_interface(
+        &self,
+        res: Res,
+        requesting_package: PackageId,
+    ) -> bool {
+        source_interface(res).is_some_and(|def_id| {
+            self.targets
+                .get(&def_id)
+                .is_some_and(|target| target.package != requesting_package)
+                && self.unavailable_source_interfaces.contains(&def_id)
+        })
     }
 
     /// Look up a member of a module or interface `Res`.
@@ -205,11 +299,41 @@ impl<'a> ModuleMemberIndex<'a> {
         let Some(indexed) = self.targets.get(&target.def_id) else {
             return ModuleMemberLookup::NotModule;
         };
+        let target_is_unavailable_source_interface = indexed.package != requesting_package
+            && self.unavailable_source_interfaces.contains(&target.def_id);
         let Some(member) = indexed.scope.get(name, self.wit_symbols) else {
             return ModuleMemberLookup::Missing;
         };
         match member {
             MemberLookupValue::Wit(res) => ModuleMemberLookup::WitMember(res),
+            MemberLookupValue::DeferredSource(binding) => {
+                if indexed.package != requesting_package
+                    && !matches!(binding.visibility, Visibility::Pub | Visibility::Export)
+                {
+                    ModuleMemberLookup::InaccessibleDeferred(binding.name_span)
+                } else {
+                    ModuleMemberLookup::DeferredSource
+                }
+            }
+            MemberLookupValue::Source(binding) if target_is_unavailable_source_interface => {
+                if !matches!(binding.visibility, Visibility::Pub | Visibility::Export) {
+                    ModuleMemberLookup::InaccessibleDeferred(binding.name_span)
+                } else {
+                    ModuleMemberLookup::DeferredSource
+                }
+            }
+            MemberLookupValue::Source(binding)
+                if indexed.package != requesting_package
+                    && source_interface(binding.res).is_some_and(|interface| {
+                        self.unavailable_source_interfaces.contains(&interface)
+                    }) =>
+            {
+                if !matches!(binding.visibility, Visibility::Pub | Visibility::Export) {
+                    ModuleMemberLookup::InaccessibleDeferred(binding.name_span)
+                } else {
+                    ModuleMemberLookup::DeferredSource
+                }
+            }
             MemberLookupValue::Source(binding) => {
                 if indexed.package != requesting_package
                     && !matches!(binding.visibility, Visibility::Pub | Visibility::Export)
@@ -220,6 +344,43 @@ impl<'a> ModuleMemberIndex<'a> {
                 }
             }
         }
+    }
+
+    /// Retrieve a source-only fallback after `lookup_target` reported
+    /// `DeferredSource`. This is crate-internal so ordinary callers cannot
+    /// obtain the source `Res`; only the module-path diagnostic walker uses it
+    /// to continue the incomplete-source path and report suffix errors.
+    pub(crate) fn deferred_source_binding(
+        &self,
+        target: ModuleTarget,
+        name: Symbol,
+        requesting_package: PackageId,
+    ) -> Option<&'a Binding> {
+        let indexed = self.targets.get(&target.def_id)?;
+        let binding = match indexed.scope.get(name, self.wit_symbols)? {
+            MemberLookupValue::DeferredSource(binding) => binding,
+            MemberLookupValue::Source(binding)
+                if indexed.package != requesting_package
+                    && self.unavailable_source_interfaces.contains(&target.def_id) =>
+            {
+                binding
+            }
+            MemberLookupValue::Source(binding)
+                if indexed.package != requesting_package
+                    && source_interface(binding.res).is_some_and(|interface| {
+                        self.unavailable_source_interfaces.contains(&interface)
+                    }) =>
+            {
+                binding
+            }
+            MemberLookupValue::Source(_) | MemberLookupValue::Wit(_) => return None,
+        };
+        if indexed.package != requesting_package
+            && !matches!(binding.visibility, Visibility::Pub | Visibility::Export)
+        {
+            return None;
+        }
+        Some(binding)
     }
 
     /// Enumerate source-backed bindings visible through a module or interface.
@@ -233,13 +394,52 @@ impl<'a> ModuleMemberIndex<'a> {
         &self,
         target: ModuleTarget,
         requesting_package: PackageId,
-    ) -> Option<impl Iterator<Item = (Symbol, &'a Binding)> + 'a> {
+    ) -> Option<impl Iterator<Item = (Symbol, &'a Binding)> + '_> {
         let indexed = *self.targets.get(&target.def_id)?;
+        if indexed.package != requesting_package
+            && self.unavailable_source_interfaces.contains(&target.def_id)
+        {
+            return None;
+        }
+        let unavailable_source_interfaces = &self.unavailable_source_interfaces;
         Some(indexed.scope.iter()?.filter_map(move |(name, binding)| {
+            let is_unavailable_source_interface = source_interface(binding.res)
+                .is_some_and(|interface| unavailable_source_interfaces.contains(&interface));
             (indexed.package == requesting_package
-                || matches!(binding.visibility, Visibility::Pub | Visibility::Export))
+                || (!is_unavailable_source_interface
+                    && matches!(binding.visibility, Visibility::Pub | Visibility::Export)))
             .then_some((name, binding))
         }))
+    }
+
+    /// Enumerate visible source spellings and declaration spans for diagnostic
+    /// suggestions. Unlike `visible_members`, this may include source scopes
+    /// hidden because their generated WIT view is unavailable. It never
+    /// exposes a binding or resolution and never changes path lookup.
+    pub fn visible_diagnostic_members(
+        &self,
+        target: ModuleTarget,
+        requesting_package: PackageId,
+    ) -> Option<impl Iterator<Item = (Symbol, sai_vfs::Span)> + '_> {
+        let indexed = *self.targets.get(&target.def_id)?;
+        let include_private = indexed.package == requesting_package;
+        Some(
+            indexed
+                .scope
+                .diagnostic_iter()?
+                .filter_map(move |(name, binding)| {
+                    (include_private
+                        || matches!(binding.visibility, Visibility::Pub | Visibility::Export))
+                    .then_some((name, binding.name_span))
+                }),
+        )
+    }
+}
+
+fn source_interface(res: Res) -> Option<DefId> {
+    match res {
+        Res::Def(DefKind::Interface, def_id) => Some(def_id),
+        Res::Def(_, _) | Res::Local(_) | Res::PrimTy(_) | Res::Err | Res::TestOnly(_) => None,
     }
 }
 
@@ -316,6 +516,8 @@ mod tests {
             module_def_id,
             declared: HashMap::new(),
             members: HashMap::new(),
+            deferred_source_members: HashMap::new(),
+            withheld_public_imports: std::collections::HashSet::new(),
             scope: HashMap::new(),
             imports: Vec::new(),
         }

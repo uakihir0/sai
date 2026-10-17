@@ -310,6 +310,26 @@ checks. The locked-source integration test covers a root-to-middle-to-leaf
 re-export chain. This is a `check`-specific assembly path, not a general
 tracked `package_scopes(PackageId)` query.
 
+When a validated active source scope contains a public interface binding but
+its generated WIT view is unavailable, a successful public re-export is kept
+in a separate deferred-source map. A validated WIT-view closure also marks
+foreign source interfaces without a matching generated-view origin as
+unavailable, including interfaces reached through a module alias. These
+interfaces do not enter ordinary foreign member lookup or enumeration, and
+ordinary imports remain deferred. Qualified-path diagnostic traversal may
+inspect their source suffixes to report missing or inaccessible members, but
+a path that traverses one always returns `Res::Err`; the unavailable source
+interface or member cannot be consumed as a resolved name. Duplicate aliases
+still receive normal source-order conflict diagnostics and do not leave a
+deferred fallback. Test-only re-exports never enter the sidecar. WIT-only
+targets retain their separate deferred lookup path, and the
+incomplete-analysis diagnostic remains.
+
+Source-only type-path queries use the validated source closure directly and
+do not infer WIT-view omissions. Queries that explicitly receive an active
+WIT-view closure treat source interfaces without a matching generated origin
+as unavailable; that closure must cover the source scopes used by the query.
+
 When a valid manifest is available, Phase 1 collection compares its target-
 and test-filtered requirements with the set of active outgoing dependency
 identities. A supplied foreign scope is checked against an active direct edge

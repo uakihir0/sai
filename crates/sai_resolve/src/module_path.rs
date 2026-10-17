@@ -21,6 +21,10 @@ pub enum ModulePathStop {
     /// An earlier error resolution or an error-symbol segment already
     /// represents a diagnosed syntax/name error.
     SuppressedError,
+    /// A source-only re-export was traversed for suffix diagnostics, but its
+    /// generated WIT replacement is unavailable. The returned base is always
+    /// `Res::Err`, so callers cannot consume the source definition.
+    DeferredSource,
 }
 
 /// The resolved prefix and the first segment the caller still needs to handle.
@@ -81,6 +85,15 @@ pub fn resolve_module_prefix(
 ) -> Result<ModulePathPrefix, ModulePathError> {
     let mut current = starting_res;
     let mut consumed_segments = 0;
+    let mut traversed_deferred_source = false;
+
+    if segments.is_empty() && members.is_unavailable_source_interface(current, requesting_package) {
+        return Ok(ModulePathPrefix {
+            base: Res::Err,
+            consumed_segments: 0,
+            stop: ModulePathStop::DeferredSource,
+        });
+    }
 
     for (segment_index, segment) in segments.iter().enumerate() {
         if current == Res::Err {
@@ -101,9 +114,17 @@ pub fn resolve_module_prefix(
 
         let Some(target) = ModuleTarget::from_res(current) else {
             return Ok(ModulePathPrefix {
-                base: current,
+                base: if traversed_deferred_source {
+                    Res::Err
+                } else {
+                    current
+                },
                 consumed_segments,
-                stop: ModulePathStop::NonModule,
+                stop: if traversed_deferred_source {
+                    ModulePathStop::DeferredSource
+                } else {
+                    ModulePathStop::NonModule
+                },
             });
         };
 
@@ -130,6 +151,21 @@ pub fn resolve_module_prefix(
                     });
                 }
             }
+            ModuleMemberLookup::DeferredSource => {
+                let binding = members
+                    .deferred_source_binding(target, segment.name.sym, requesting_package)
+                    .expect("deferred source lookup has its source fallback");
+                current = binding.res;
+                consumed_segments += 1;
+                traversed_deferred_source = true;
+                if current == Res::Err {
+                    return Ok(ModulePathPrefix {
+                        base: Res::Err,
+                        consumed_segments,
+                        stop: ModulePathStop::DeferredSource,
+                    });
+                }
+            }
             ModuleMemberLookup::Missing => {
                 return Err(ModulePathError::MissingMember {
                     segment_index,
@@ -146,6 +182,14 @@ pub fn resolve_module_prefix(
                     declaration_span: binding.name_span,
                 });
             }
+            ModuleMemberLookup::InaccessibleDeferred(declaration_span) => {
+                return Err(ModulePathError::InaccessibleMember {
+                    segment_index,
+                    name: segment.name.sym,
+                    span: segment.name.span,
+                    declaration_span,
+                });
+            }
             // `target` came from a module/interface `Res`, so this result
             // means the index was built without the scope that owns it.
             ModuleMemberLookup::NotModule => {
@@ -159,11 +203,17 @@ pub fn resolve_module_prefix(
 
     let stop = if current == Res::Err {
         ModulePathStop::SuppressedError
+    } else if traversed_deferred_source {
+        ModulePathStop::DeferredSource
     } else {
         ModulePathStop::SegmentsExhausted
     };
     Ok(ModulePathPrefix {
-        base: current,
+        base: if traversed_deferred_source {
+            Res::Err
+        } else {
+            current
+        },
         consumed_segments,
         stop,
     })
@@ -256,6 +306,8 @@ mod tests {
             module_def_id,
             declared: HashMap::new(),
             members: HashMap::new(),
+            deferred_source_members: HashMap::new(),
+            withheld_public_imports: std::collections::HashSet::new(),
             scope: HashMap::new(),
             imports: Vec::new(),
         }
@@ -440,6 +492,117 @@ mod tests {
     }
 
     #[test]
+    fn deferred_source_reexport_reports_suffix_errors_without_resolving_the_source_def() {
+        let packages = PackageInterner::new();
+        let symbols = Interner::new();
+        let requester = package_id(&packages, "acme:app#1.0");
+        let dependency = package_id(&packages, "acme:dependency#1.0");
+        let app_root = local_def_id(requester, &packages, &symbols, Vec::new());
+        let dependency_root = local_def_id(dependency, &packages, &symbols, Vec::new());
+        let codec = symbol(&symbols, "codec");
+        let entry = symbol(&symbols, "Entry");
+        let missing = symbol(&symbols, "Entyr");
+        let interface = local_def_id(
+            dependency,
+            &packages,
+            &symbols,
+            vec![DefPathData::Interface(codec)],
+        )
+        .to_def_id();
+        let entry_def = local_def_id(
+            dependency,
+            &packages,
+            &symbols,
+            vec![DefPathData::Interface(codec), DefPathData::TypeNs(entry)],
+        )
+        .to_def_id();
+        let mut app_root_scope = module_scope(app_root);
+        app_root_scope.deferred_source_members.insert(
+            codec,
+            binding(
+                Res::Def(DefKind::Interface, interface),
+                sai_hir::Visibility::Pub,
+                source_span(0, 5),
+            ),
+        );
+        let app_scopes = package_scopes(vec![app_root_scope], HashMap::new());
+        let mut dependency_root_scope = module_scope(dependency_root);
+        dependency_root_scope.members.insert(
+            codec,
+            binding(
+                Res::Def(DefKind::Interface, interface),
+                sai_hir::Visibility::Pub,
+                source_span(10, 15),
+            ),
+        );
+        let dependency_scopes = package_scopes(
+            vec![dependency_root_scope],
+            HashMap::from([(
+                interface,
+                InterfaceScope {
+                    members: HashMap::from([(
+                        entry,
+                        binding(
+                            Res::Def(DefKind::Struct, entry_def),
+                            sai_hir::Visibility::Pub,
+                            source_span(20, 25),
+                        ),
+                    )]),
+                },
+            )]),
+        );
+        let index = ModuleMemberIndex::new([&app_scopes, &dependency_scopes]);
+        let target = ModuleTarget::from_res(Res::Def(DefKind::Module, app_root.to_def_id()))
+            .expect("the root module is a path target");
+        assert_eq!(
+            index.lookup_target(target, codec, requester),
+            ModuleMemberLookup::DeferredSource
+        );
+
+        let valid_segments = [
+            segment(app_root, 1, codec, 0, 5, None),
+            segment(app_root, 2, entry, 6, 11, None),
+        ];
+        let valid_prefix = resolve_module_prefix(
+            Res::Def(DefKind::Module, app_root.to_def_id()),
+            &valid_segments,
+            requester,
+            &index,
+        )
+        .expect("source closure can check a valid suffix");
+        assert_eq!(
+            valid_prefix,
+            ModulePathPrefix {
+                base: Res::Err,
+                consumed_segments: 2,
+                stop: ModulePathStop::DeferredSource,
+            },
+            "the source interface and member are never returned as a usable path result"
+        );
+
+        let missing_segments = [
+            segment(app_root, 3, codec, 0, 5, None),
+            segment(app_root, 4, missing, 6, 11, None),
+        ];
+        assert_eq!(
+            resolve_module_prefix(
+                Res::Def(DefKind::Module, app_root.to_def_id()),
+                &missing_segments,
+                requester,
+                &index,
+            ),
+            Err(ModulePathError::MissingMember {
+                segment_index: 1,
+                name: missing,
+                span: span(6, 11),
+                target: ModuleTarget::from_res(Res::Def(DefKind::Interface, interface))
+                    .expect("the source interface is a diagnostic path target"),
+            }),
+            "diagnostic traversal can report missing source members under the deferred interface"
+        );
+    }
+
+    #[test]
     fn inaccessible_member_reports_reference_and_declaration_spans() {
         let packages = PackageInterner::new();
         let symbols = Interner::new();
@@ -545,6 +708,260 @@ mod tests {
                 consumed_segments: 1,
                 stop: ModulePathStop::SuppressedError,
             }
+        );
+    }
+
+    #[test]
+    fn foreign_source_interface_without_generated_view_is_diagnostic_only() {
+        let packages = PackageInterner::new();
+        let symbols = Interner::new();
+        let requester = package_id(&packages, "acme:app#1.0");
+        let dependency = package_id(&packages, "acme:dependency#1.0");
+        let root = local_def_id(dependency, &packages, &symbols, Vec::new());
+        let api_name = symbol(&symbols, "api");
+        let api = local_def_id(
+            dependency,
+            &packages,
+            &symbols,
+            vec![DefPathData::Module(api_name)],
+        );
+        let codec_name = symbol(&symbols, "codec");
+        let private_codec_name = symbol(&symbols, "private_codec");
+        let codec = local_def_id(
+            dependency,
+            &packages,
+            &symbols,
+            vec![
+                DefPathData::Module(api_name),
+                DefPathData::Interface(codec_name),
+            ],
+        )
+        .to_def_id();
+        let entry_name = symbol(&symbols, "Entry");
+        let private_entry_name = symbol(&symbols, "PrivateEntry");
+        let entry = local_def_id(
+            dependency,
+            &packages,
+            &symbols,
+            vec![
+                DefPathData::Module(api_name),
+                DefPathData::Interface(codec_name),
+                DefPathData::TypeNs(entry_name),
+            ],
+        )
+        .to_def_id();
+        let private_entry = local_def_id(
+            dependency,
+            &packages,
+            &symbols,
+            vec![
+                DefPathData::Module(api_name),
+                DefPathData::Interface(codec_name),
+                DefPathData::TypeNs(private_entry_name),
+            ],
+        )
+        .to_def_id();
+
+        let mut root_scope = module_scope(root);
+        root_scope.members.insert(
+            api_name,
+            binding(
+                Res::Def(DefKind::Module, api.to_def_id()),
+                sai_hir::Visibility::Pub,
+                source_span(0, 3),
+            ),
+        );
+        let mut api_scope = module_scope(api);
+        api_scope.members.insert(
+            codec_name,
+            binding(
+                Res::Def(DefKind::Interface, codec),
+                sai_hir::Visibility::Pub,
+                source_span(4, 9),
+            ),
+        );
+        api_scope.members.insert(
+            private_codec_name,
+            binding(
+                Res::Def(DefKind::Interface, codec),
+                sai_hir::Visibility::Private,
+                source_span(28, 41),
+            ),
+        );
+        let dependency_scopes = package_scopes(
+            vec![root_scope, api_scope],
+            HashMap::from([(
+                codec,
+                InterfaceScope {
+                    members: HashMap::from([
+                        (
+                            entry_name,
+                            binding(
+                                Res::Def(DefKind::Struct, entry),
+                                sai_hir::Visibility::Pub,
+                                source_span(10, 15),
+                            ),
+                        ),
+                        (
+                            private_entry_name,
+                            binding(
+                                Res::Def(DefKind::Struct, private_entry),
+                                sai_hir::Visibility::Private,
+                                source_span(16, 27),
+                            ),
+                        ),
+                    ]),
+                },
+            )]),
+        );
+        let index = ModuleMemberIndex::new_with_wit_views([&dependency_scopes], [], &symbols);
+        let api_target =
+            ModuleTarget::from_res(Res::Def(DefKind::Module, api.to_def_id())).unwrap();
+
+        assert_eq!(
+            index.lookup_target(api_target, codec_name, requester),
+            ModuleMemberLookup::DeferredSource,
+            "a foreign source interface with no generated-view origin is not an ordinary member"
+        );
+        assert!(
+            index
+                .visible_members(api_target, requester)
+                .unwrap()
+                .all(|(name, _)| name != codec_name),
+            "ordinary member enumeration must not advertise the unavailable interface"
+        );
+        assert!(matches!(
+            index.lookup_target(api_target, codec_name, dependency),
+            ModuleMemberLookup::Found(binding)
+                if binding.res == Res::Def(DefKind::Interface, codec)
+        ));
+        assert!(
+            index
+                .visible_members(api_target, dependency)
+                .unwrap()
+                .any(|(name, _)| name == codec_name),
+            "the source package can still inspect its own interface members"
+        );
+
+        let path = [
+            segment(root, 1, codec_name, 0, 5, None),
+            segment(root, 2, entry_name, 6, 11, None),
+        ];
+        assert_eq!(
+            resolve_module_prefix(
+                Res::Def(DefKind::Module, api.to_def_id()),
+                &path,
+                requester,
+                &index,
+            )
+            .expect("diagnostic traversal can inspect source suffixes"),
+            ModulePathPrefix {
+                base: Res::Err,
+                consumed_segments: 2,
+                stop: ModulePathStop::DeferredSource,
+            },
+            "the unavailable generated view must never expose a source type resolution"
+        );
+        assert_eq!(
+            resolve_module_prefix(
+                Res::Def(DefKind::Module, api.to_def_id()),
+                &path,
+                dependency,
+                &index,
+            )
+            .expect("the owning package retains its source path"),
+            ModulePathPrefix {
+                base: Res::Def(DefKind::Struct, entry),
+                consumed_segments: 2,
+                stop: ModulePathStop::SegmentsExhausted,
+            }
+        );
+
+        let codec_target = ModuleTarget::from_res(Res::Def(DefKind::Interface, codec)).unwrap();
+        assert_eq!(
+            index.lookup_target(codec_target, entry_name, requester),
+            ModuleMemberLookup::DeferredSource,
+            "starting from a previously resolved foreign source interface is also deferred"
+        );
+        assert!(
+            index.visible_members(codec_target, requester).is_none(),
+            "ordinary enumeration cannot expose members of the unavailable interface"
+        );
+        assert_eq!(
+            index
+                .visible_diagnostic_members(codec_target, requester)
+                .unwrap()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>(),
+            vec![entry_name],
+            "diagnostics can use source member spellings without receiving their Res"
+        );
+        assert_eq!(
+            index.lookup_target(codec_target, private_entry_name, requester),
+            ModuleMemberLookup::InaccessibleDeferred(source_span(16, 27)),
+            "ordinary lookup reports private declarations without exposing their Res"
+        );
+        let private_segment = segment(root, 4, private_entry_name, 28, 40, None);
+        assert_eq!(
+            resolve_module_prefix(
+                Res::Def(DefKind::Interface, codec),
+                &[private_segment],
+                requester,
+                &index,
+            ),
+            Err(ModulePathError::InaccessibleMember {
+                segment_index: 0,
+                name: private_entry_name,
+                span: private_segment.name.span,
+                declaration_span: source_span(16, 27),
+            }),
+            "private source suffix diagnostics remain available through the span-only result"
+        );
+        assert_eq!(
+            index.lookup_target(api_target, private_codec_name, requester),
+            ModuleMemberLookup::InaccessibleDeferred(source_span(28, 41)),
+            "a private binding to an unavailable source interface also exposes only its span"
+        );
+        let private_codec_segment = segment(root, 5, private_codec_name, 42, 55, None);
+        assert_eq!(
+            resolve_module_prefix(
+                Res::Def(DefKind::Module, api.to_def_id()),
+                &[private_codec_segment],
+                requester,
+                &index,
+            ),
+            Err(ModulePathError::InaccessibleMember {
+                segment_index: 0,
+                name: private_codec_name,
+                span: private_codec_segment.name.span,
+                declaration_span: source_span(28, 41),
+            }),
+            "diagnostics for private interface aliases do not need the source Res"
+        );
+        assert_eq!(
+            resolve_module_prefix(
+                Res::Def(DefKind::Interface, codec),
+                &[segment(root, 3, entry_name, 12, 17, None)],
+                requester,
+                &index,
+            )
+            .expect("diagnostic traversal can start at an unavailable interface"),
+            ModulePathPrefix {
+                base: Res::Err,
+                consumed_segments: 1,
+                stop: ModulePathStop::DeferredSource,
+            },
+            "the interface target itself cannot leak a source member resolution"
+        );
+        assert_eq!(
+            resolve_module_prefix(Res::Def(DefKind::Interface, codec), &[], requester, &index,)
+                .expect("an unavailable source interface can be masked with no suffix"),
+            ModulePathPrefix {
+                base: Res::Err,
+                consumed_segments: 0,
+                stop: ModulePathStop::DeferredSource,
+            },
+            "an empty suffix cannot return an unavailable starting interface"
         );
     }
 

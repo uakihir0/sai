@@ -1241,6 +1241,7 @@ struct PreparedTypeOwnerPathQuery {
     package_scopes: Phase1PackageScopes,
     foreign_package_scopes: Vec<Phase1PackageScopes>,
     wit_views: Vec<Arc<WitView>>,
+    wit_view_closure_supplied: bool,
     symbols: Arc<Interner>,
     requesting_package: PackageId,
     source_graph_packages: HashSet<PackageId>,
@@ -1272,6 +1273,16 @@ fn type_owner_scope_lookup_fingerprint(
         for module in &scopes.modules {
             format!("{:?}", module.module_def_id).stable_hash(hasher);
             hash_bindings(&module.members, hasher);
+            let mut deferred_names = module
+                .deferred_source_member_names()
+                .map(|(name, span)| (format!("{name:?}"), format!("{span:?}")))
+                .collect::<Vec<_>>();
+            deferred_names.sort();
+            hasher.write_len(u64::try_from(deferred_names.len()).unwrap_or(u64::MAX));
+            for (name, span) in deferred_names {
+                name.stable_hash(hasher);
+                span.stable_hash(hasher);
+            }
         }
 
         let mut interfaces = scopes
@@ -2977,6 +2988,131 @@ impl WorldTestOnlyResolutions {
     }
 }
 
+/// The direct world-item position that supplies a world-reference kind rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorldReferencePosition {
+    Import,
+    Export,
+    Include,
+}
+
+/// The path-resolution state for one direct world reference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorldReferencePathResult {
+    /// A local module path, including an `Err` result after a local path
+    /// diagnostic.
+    Mod(PathRes),
+    /// A module path whose suffix needs a foreign member scope not supplied
+    /// to the current local-only pass.
+    DeferredMod(PathRes),
+    /// A package reference retained for later package/WIT lookup.
+    Pkg(String),
+}
+
+/// Path result and diagnostics for one import, export, or include reference.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorldReferencePathResolution {
+    world_owner: OwnerId,
+    owner: OwnerId,
+    position: WorldReferencePosition,
+    hir_id: HirId,
+    span: sai_hir::Span,
+    path_result: WorldReferencePathResult,
+    diagnostics: Vec<Diagnostic>,
+}
+
+impl WorldReferencePathResolution {
+    pub const fn world_owner(&self) -> OwnerId {
+        self.world_owner
+    }
+
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub const fn position(&self) -> WorldReferencePosition {
+        self.position
+    }
+
+    pub const fn hir_id(&self) -> HirId {
+        self.hir_id
+    }
+
+    pub const fn span(&self) -> sai_hir::Span {
+        self.span
+    }
+
+    pub fn path_result(&self) -> &WorldReferencePathResult {
+        &self.path_result
+    }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
+}
+
+/// Reference results and recoverable errors for one current-target world.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorldOwnerReferenceResolution {
+    owner: OwnerId,
+    error: Option<OwnerControlFlowResolutionError>,
+    references: Vec<WorldReferencePathResolution>,
+    item_errors: Vec<(OwnerId, OwnerControlFlowResolutionError)>,
+}
+
+impl WorldOwnerReferenceResolution {
+    pub const fn owner(&self) -> OwnerId {
+        self.owner
+    }
+
+    pub fn error(&self) -> Option<&OwnerControlFlowResolutionError> {
+        self.error.as_ref()
+    }
+
+    pub fn references(&self) -> &[WorldReferencePathResolution] {
+        &self.references
+    }
+
+    pub fn item_errors(&self) -> &[(OwnerId, OwnerControlFlowResolutionError)] {
+        &self.item_errors
+    }
+}
+
+/// Snapshot- and collection-bound results for current-package world references.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorldReferenceResolutions {
+    snapshot_id: WorkspaceSnapshotId,
+    target_cfg: TargetCfg,
+    collection_input_fingerprint: Fingerprint,
+    session_token: SessionToken,
+    owners: Vec<WorldOwnerReferenceResolution>,
+}
+
+impl WorldReferenceResolutions {
+    pub const fn snapshot_id(&self) -> WorkspaceSnapshotId {
+        self.snapshot_id
+    }
+
+    pub fn matches_snapshot(&self, snapshot: &WorkspaceSnapshot) -> bool {
+        self.snapshot_id == snapshot.id()
+    }
+
+    pub fn matches_collection(&self, collection: &Phase1PackageScopesCollection) -> bool {
+        self.session_token == collection.session_token
+            && self.snapshot_id == collection.snapshot_id
+            && self.target_cfg == collection.target_cfg
+            && self.collection_input_fingerprint == collection.input_fingerprint
+    }
+
+    pub fn target_cfg(&self) -> &TargetCfg {
+        &self.target_cfg
+    }
+
+    pub fn owners(&self) -> &[WorldOwnerReferenceResolution] {
+        &self.owners
+    }
+}
+
 /// The kind of associated trait or impl declaration checked by the
 /// test-only reference pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4388,6 +4524,105 @@ fn module_scope_for_file<'a>(
     file: FileId,
 ) -> Result<&'a Phase1ModuleScopes, OwnerControlFlowResolutionError> {
     module_scope_for_scopes(&collection.scopes, module_tree, file)
+}
+
+fn world_reference_kind_diagnostic(
+    owner: OwnerId,
+    position: WorldReferencePosition,
+    span: sai_hir::Span,
+    path_resolution: PathRes,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<Diagnostic>, OwnerControlFlowResolutionError> {
+    let expected = match position {
+        WorldReferencePosition::Import | WorldReferencePosition::Export => "interface",
+        WorldReferencePosition::Include => "world",
+    };
+    let incomplete = path_resolution.resolved_segments < path_resolution.segment_count;
+    let Some(found) = world_reference_found_kind(path_resolution.base) else {
+        return Ok(None);
+    };
+
+    let (code, primary_label) = if !incomplete
+        && ((expected == "interface" && found == "world")
+            || (expected == "world" && found == "interface"))
+    {
+        (
+            sai_diagnostics::Code::InvalidWorldItem,
+            "invalid world item",
+        )
+    } else if !incomplete && found == expected {
+        return Ok(None);
+    } else {
+        (sai_diagnostics::Code::WrongNameKind, "wrong name kind")
+    };
+    let location = sai_diagnostics::Location::from_decoded_source(
+        inputs.source_ref.clone(),
+        sai_diagnostics::Span::new(span.file, span.range),
+        &inputs.source,
+    )
+    .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        owner,
+    ))?;
+    let mut diagnostic = Diagnostic::new(
+        code,
+        sai_diagnostics::Severity::Error,
+        format!(
+            "expected {} {expected} for this world item, found {} {found}",
+            if matches!(expected, "interface" | "effect") {
+                "an"
+            } else {
+                "a"
+            },
+            if matches!(found, "interface" | "effect") {
+                "an"
+            } else {
+                "a"
+            }
+        ),
+        Some(location),
+    );
+    diagnostic.primary_label = primary_label.to_owned();
+    diagnostic.package = inputs.source_ref.package.clone();
+    Ok(Some(diagnostic.with_workspace_snapshot(snapshot).map_err(
+        |_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
+    )?))
+}
+
+fn world_reference_found_kind(resolution: Res) -> Option<&'static str> {
+    Some(match resolution {
+        Res::Def(DefKind::Interface, _) => "interface",
+        Res::Def(DefKind::World, _) => "world",
+        Res::Def(DefKind::Module, _) => "module",
+        Res::Def(
+            DefKind::Fn
+            | DefKind::AssocFn
+            | DefKind::WorldFn
+            | DefKind::ExternFn
+            | DefKind::Closure
+            | DefKind::AsyncBlock,
+            _,
+        ) => "function",
+        Res::Def(
+            DefKind::Struct
+            | DefKind::Enum
+            | DefKind::Distinct
+            | DefKind::Refined
+            | DefKind::Alias
+            | DefKind::AssocTy,
+            _,
+        ) => "type",
+        Res::Def(DefKind::Variant, _) => "variant",
+        Res::Def(DefKind::Resource, _) => "resource",
+        Res::Def(DefKind::Trait, _) => "trait",
+        Res::Def(DefKind::TyParam, _) => "type parameter",
+        Res::Def(DefKind::ConstParam, _) => "const parameter",
+        Res::Def(DefKind::Const, _) => "constant",
+        Res::Def(DefKind::Effect, _) => "effect",
+        Res::PrimTy(_) => "primitive type",
+        Res::Local(_) => "local value",
+        Res::Err | Res::TestOnly(_) => return None,
+    })
 }
 
 fn module_scope_for_scopes<'a>(
@@ -7007,11 +7242,17 @@ fn resolve_prepared_type_owner_paths(
             segments,
         })
         .collect::<Vec<_>>();
-    let members = ModuleMemberIndex::new_with_wit_views(
-        std::iter::once(&prepared.package_scopes).chain(&prepared.foreign_package_scopes),
-        prepared.wit_views.iter().map(|view| view.as_ref()),
-        &prepared.symbols,
-    );
+    let members = if prepared.wit_view_closure_supplied {
+        ModuleMemberIndex::new_with_wit_views(
+            std::iter::once(&prepared.package_scopes).chain(&prepared.foreign_package_scopes),
+            prepared.wit_views.iter().map(|view| view.as_ref()),
+            &prepared.symbols,
+        )
+    } else {
+        ModuleMemberIndex::new(
+            std::iter::once(&prepared.package_scopes).chain(&prepared.foreign_package_scopes),
+        )
+    };
     resolve_type_owner_module_paths(
         prepared.owner,
         &candidates,
@@ -9243,7 +9484,7 @@ impl RootDatabase {
                         &inputs.root,
                         &arena,
                         &self.symbols,
-                        def_paths,
+                        &def_paths,
                     );
                     let (hir_owner, source_map) = lower_top_level_owner(
                         owner_descriptor,
@@ -12131,6 +12372,7 @@ impl RootDatabase {
                             .flat_map(Phase1ActiveWitViewScopes::views)
                             .map(|view| Arc::clone(&view.view))
                             .collect(),
+                        wit_view_closure_supplied: wit_view_scopes.is_some(),
                         symbols: Arc::clone(&self.symbols),
                         requesting_package: collection.module_tree.package,
                         source_graph_packages: member_scopes.map_or_else(
@@ -12347,10 +12589,10 @@ impl RootDatabase {
                         member_scopes,
                     )?;
                     let mut candidates = Vec::new();
-                    if let Some(visible_members) = members
-                        .and_then(|index| index.visible_members(target, owner.def_id.package()))
-                    {
-                        for (symbol, binding) in visible_members {
+                    if let Some(visible_members) = members.and_then(|index| {
+                        index.visible_diagnostic_members(target, owner.def_id.package())
+                    }) {
+                        for (symbol, name_span) in visible_members {
                             if symbol.is_error() {
                                 continue;
                             }
@@ -12361,7 +12603,7 @@ impl RootDatabase {
                             if let Some(distance) = edit_distance_at_most_two(&name, &spelling) {
                                 candidates.push((
                                     distance,
-                                    binding.name_span.range.start().raw(),
+                                    name_span.range.start().raw(),
                                     spelling.to_string(),
                                 ));
                             }
@@ -12515,7 +12757,37 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
     ) -> Result<WorldTestOnlyResolutions, OwnerControlFlowResolutionError> {
-        self.resolve_world_test_only_paths_inner(collection, module_tree, snapshot, None)
+        self.resolve_world_test_only_paths_inner(collection, module_tree, snapshot, None, None)
+    }
+
+    /// Resolves direct world references from current-package world owners
+    /// recorded by the validated Phase 1 collection. This shares the existing
+    /// world-item lowering traversal;
+    /// package references and foreign member-scope suffixes remain deferred.
+    pub fn resolve_world_references(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<WorldReferenceResolutions, OwnerControlFlowResolutionError> {
+        if collection.session_token != self.session_token {
+            return Err(OwnerControlFlowResolutionError::SessionMismatch);
+        }
+        let mut owners = Vec::new();
+        let test_only = self.resolve_world_test_only_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            None,
+            Some(&mut owners),
+        )?;
+        Ok(WorldReferenceResolutions {
+            snapshot_id: test_only.snapshot_id,
+            target_cfg: test_only.target_cfg,
+            collection_input_fingerprint: test_only.collection_input_fingerprint,
+            session_token: collection.session_token.clone(),
+            owners,
+        })
     }
 
     /// Resolves world function signature type paths through a validated
@@ -12537,7 +12809,275 @@ impl RootDatabase {
             module_tree,
             snapshot,
             Some(member_scopes),
+            None,
         )
+    }
+
+    fn resolve_world_reference(
+        &mut self,
+        world_owner: OwnerId,
+        owner: OwnerId,
+        position: WorldReferencePosition,
+        reference: WorldRef<'_>,
+        module_scope: &Phase1ModuleScopes,
+        module_members: &ModuleMemberIndex<'_>,
+        requesting_package: PackageId,
+        inputs: &CurrentOwnerInputs,
+        snapshot: &WorkspaceSnapshot,
+        target_cfg: &TargetCfg,
+    ) -> Result<WorldReferencePathResolution, OwnerControlFlowResolutionError> {
+        let (hir_id, span, path_result, diagnostics) = match reference {
+            WorldRef::Pkg { hir_id, path, span } => (
+                hir_id,
+                span,
+                WorldReferencePathResult::Pkg(path.to_owned()),
+                Vec::new(),
+            ),
+            WorldRef::Mod(path) => {
+                let segment_count = u32::try_from(path.segments.len())
+                    .expect("a HIR path fits its stored segment count");
+                let error_resolution = PathRes {
+                    base: Res::Err,
+                    resolved_segments: segment_count,
+                    segment_count,
+                };
+                if path.root != PathRoot::Plain || path.segments.is_empty() {
+                    (
+                        path.hir_id,
+                        path.span,
+                        WorldReferencePathResult::Mod(error_resolution),
+                        Vec::new(),
+                    )
+                } else {
+                    let first = path.segments[0];
+                    if first.name.is_error() {
+                        (
+                            path.hir_id,
+                            path.span,
+                            WorldReferencePathResult::Mod(PathRes {
+                                base: Res::Err,
+                                resolved_segments: 1,
+                                segment_count,
+                            }),
+                            Vec::new(),
+                        )
+                    } else if let Some(binding) = module_scope.scope.get(&first.name.sym) {
+                        let start = binding.res;
+                        if matches!(start, Res::Err | Res::TestOnly(_)) {
+                            (
+                                path.hir_id,
+                                path.span,
+                                WorldReferencePathResult::Mod(PathRes {
+                                    base: start,
+                                    resolved_segments: 1,
+                                    segment_count,
+                                }),
+                                Vec::new(),
+                            )
+                        } else {
+                            let mut path_resolution = PathRes {
+                                base: start,
+                                resolved_segments: 1,
+                                segment_count,
+                            };
+                            let mut module_path_errors = Vec::new();
+                            let mut deferred_module_scope = false;
+                            let suffix = &path.segments[1..];
+                            if !suffix.is_empty() {
+                                match resolve_module_prefix(
+                                    start,
+                                    suffix,
+                                    requesting_package,
+                                    module_members,
+                                ) {
+                                    Ok(prefix) => {
+                                        path_resolution.base = prefix.base;
+                                        path_resolution.resolved_segments =
+                                            u32::try_from(1 + prefix.consumed_segments)
+                                                .expect("a HIR path fits its stored segment count");
+                                    }
+                                    Err(error @ ModulePathError::MissingTargetScope { .. }) => {
+                                        let segment_index = module_path_error_segment_index(error);
+                                        let prefix = resolve_module_prefix(
+                                            start,
+                                            &suffix[..segment_index],
+                                            requesting_package,
+                                            module_members,
+                                        )
+                                        .expect("the prefix before a missing scope is traversable");
+                                        path_resolution.base = prefix.base;
+                                        path_resolution.resolved_segments =
+                                            u32::try_from(1 + prefix.consumed_segments)
+                                                .expect("a HIR path fits its stored segment count");
+                                        deferred_module_scope = true;
+                                    }
+                                    Err(error) => {
+                                        let failed_segment = module_path_error_segment_index(error);
+                                        path_resolution.base = Res::Err;
+                                        path_resolution.resolved_segments =
+                                            u32::try_from(1 + failed_segment + 1)
+                                                .unwrap_or(segment_count);
+                                        module_path_errors.push(TypeOwnerModulePathError {
+                                            hir_id: path.hir_id,
+                                            error,
+                                        });
+                                    }
+                                }
+                            }
+
+                            let mut diagnostics = if module_path_errors.is_empty() {
+                                Vec::new()
+                            } else {
+                                let errors = TypeOwnerPathResolution {
+                                    owner,
+                                    paths: HashMap::from([(path.hir_id, path_resolution)]),
+                                    deferred_paths: Vec::new(),
+                                    module_path_errors,
+                                };
+                                self.type_owner_module_path_diagnostics(
+                                    owner,
+                                    &errors,
+                                    inputs,
+                                    Some(module_members),
+                                    snapshot,
+                                    target_cfg,
+                                    None,
+                                )?
+                            };
+                            if !deferred_module_scope
+                                && path_resolution.base != Res::Err
+                                && !matches!(path_resolution.base, Res::TestOnly(_))
+                                && let Some(diagnostic) = world_reference_kind_diagnostic(
+                                    owner,
+                                    position,
+                                    path.span,
+                                    path_resolution,
+                                    inputs,
+                                    snapshot,
+                                )?
+                            {
+                                diagnostics.push(diagnostic);
+                            }
+                            sort_phase1_diagnostics(&mut diagnostics);
+                            let path_result = if deferred_module_scope {
+                                WorldReferencePathResult::DeferredMod(path_resolution)
+                            } else {
+                                WorldReferencePathResult::Mod(path_resolution)
+                            };
+                            (path.hir_id, path.span, path_result, diagnostics)
+                        }
+                    } else {
+                        let name = self
+                            .symbols
+                            .resolve(first.name.sym)
+                            .map_err(OwnerControlFlowResolutionError::SymbolLookup)?;
+                        let location = sai_diagnostics::Location::from_decoded_source(
+                            inputs.source_ref.clone(),
+                            sai_diagnostics::Span::new(first.name.span.file, first.name.span.range),
+                            &inputs.source,
+                        )
+                        .ok_or(
+                            OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
+                        )?;
+                        let mut diagnostic = Diagnostic::new(
+                            sai_diagnostics::Code::UnresolvedName,
+                            sai_diagnostics::Severity::Error,
+                            format!("no item `{name}` in the module containing this world"),
+                            Some(location),
+                        );
+                        diagnostic.primary_label = "unresolved world reference".to_owned();
+                        diagnostic.package = inputs.source_ref.package.clone();
+                        let mut candidates = Vec::new();
+                        for (candidate, binding) in &module_scope.scope {
+                            if candidate.is_error()
+                                || matches!(binding.res, Res::Err | Res::TestOnly(_))
+                            {
+                                continue;
+                            }
+                            let spelling = self
+                                .symbols
+                                .resolve(*candidate)
+                                .map_err(OwnerControlFlowResolutionError::SymbolLookup)?;
+                            if let Some(distance) = edit_distance_at_most_two(&name, &spelling) {
+                                candidates.push((
+                                    distance,
+                                    binding.name_span.range.start().raw(),
+                                    spelling.to_string(),
+                                ));
+                            }
+                        }
+                        candidates.sort_by(|left, right| {
+                            (left.0, left.1, left.2.as_bytes()).cmp(&(
+                                right.0,
+                                right.1,
+                                right.2.as_bytes(),
+                            ))
+                        });
+                        candidates.truncate(3);
+                        let candidate_names = candidates
+                            .iter()
+                            .map(|(_, _, spelling)| spelling.clone())
+                            .collect::<Vec<_>>();
+                        diagnostic.data.insert(
+                            "name".to_owned(),
+                            sai_diagnostics::Value::String(name.to_string()),
+                        );
+                        diagnostic.data.insert(
+                            "candidates".to_owned(),
+                            sai_diagnostics::Value::Array(
+                                candidate_names
+                                    .iter()
+                                    .cloned()
+                                    .map(sai_diagnostics::Value::String)
+                                    .collect(),
+                            ),
+                        );
+                        if !candidate_names.is_empty() {
+                            diagnostic
+                                .push_child(Child {
+                                    kind: ChildKind::Help,
+                                    message: format!(
+                                        "similar names: {}",
+                                        candidate_names
+                                            .iter()
+                                            .map(|candidate| format!("`{candidate}`"))
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    ),
+                                    location: None,
+                                })
+                                .map_err(|_| {
+                                    OwnerControlFlowResolutionError::InvalidSourceLocation(owner)
+                                })?;
+                        }
+                        let diagnostic =
+                            diagnostic.with_workspace_snapshot(snapshot).map_err(|_| {
+                                OwnerControlFlowResolutionError::InvalidSourceLocation(owner)
+                            })?;
+                        (
+                            path.hir_id,
+                            path.span,
+                            WorldReferencePathResult::Mod(PathRes {
+                                base: Res::Err,
+                                resolved_segments: 1,
+                                segment_count,
+                            }),
+                            vec![diagnostic],
+                        )
+                    }
+                }
+            }
+        };
+
+        Ok(WorldReferencePathResolution {
+            world_owner,
+            owner,
+            position,
+            hir_id,
+            span,
+            path_result,
+            diagnostics,
+        })
     }
 
     fn resolve_world_test_only_paths_inner(
@@ -12546,6 +13086,7 @@ impl RootDatabase {
         module_tree: &ModuleTree,
         snapshot: &WorkspaceSnapshot,
         member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        mut world_reference_owners: Option<&mut Vec<WorldOwnerReferenceResolution>>,
     ) -> Result<WorldTestOnlyResolutions, OwnerControlFlowResolutionError> {
         if collection.snapshot_id != snapshot.id() {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
@@ -12573,6 +13114,7 @@ impl RootDatabase {
             );
         }
         let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let local_module_members = ModuleMemberIndex::new([collection.scopes()]);
         let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
         let source_graph_packages = member_scopes
             .map(|scopes| &scopes.source_graph_packages)
@@ -12581,6 +13123,8 @@ impl RootDatabase {
         let mut owners = Vec::with_capacity(descriptors.len());
 
         for descriptor in descriptors {
+            let mut world_references = Vec::new();
+            let mut world_reference_item_errors = Vec::new();
             let inputs = match self.current_owner_inputs(
                 snapshot,
                 descriptor.file,
@@ -12588,6 +13132,14 @@ impl RootDatabase {
             ) {
                 Ok(inputs) => inputs,
                 Err(error) => {
+                    if let Some(reference_owners) = world_reference_owners.as_deref_mut() {
+                        reference_owners.push(WorldOwnerReferenceResolution {
+                            owner: descriptor.owner,
+                            error: Some(error.clone()),
+                            references: Vec::new(),
+                            item_errors: Vec::new(),
+                        });
+                    }
                     owners.push(WorldOwnerTestOnlyResolution {
                         owner: descriptor.owner,
                         error: Some(error),
@@ -12639,6 +13191,7 @@ impl RootDatabase {
                 let def_paths = self
                     .def_paths
                     .get(&descriptor.owner.def_id.package())
+                    .map(Arc::clone)
                     .ok_or(OwnerControlFlowResolutionError::MissingDefPath(
                         descriptor.owner,
                     ))?;
@@ -12649,21 +13202,23 @@ impl RootDatabase {
                         descriptor.owner,
                     ))?;
                 let arena = HirArena::new();
-                let context = HirLoweringContext::new(
-                    &inputs.ast_ids,
-                    snapshot,
-                    &inputs.root,
-                    &arena,
-                    &self.symbols,
-                    def_paths,
-                );
-                let (parent_hir, _) = lower_top_level_owner(
-                    parent_descriptor,
-                    &expected_parent_path,
-                    &inputs.filtered_item_tree,
-                    &inputs.retained_item_kinds,
-                    &context,
-                )?;
+                let (parent_hir, _) = {
+                    let context = HirLoweringContext::new(
+                        &inputs.ast_ids,
+                        snapshot,
+                        &inputs.root,
+                        &arena,
+                        &self.symbols,
+                        &def_paths,
+                    );
+                    lower_top_level_owner(
+                        parent_descriptor,
+                        &expected_parent_path,
+                        &inputs.filtered_item_tree,
+                        &inputs.retained_item_kinds,
+                        &context,
+                    )?
+                };
                 lowering_diagnostics.extend(parent_hir.diagnostics.iter().cloned());
                 let parent_items = match parent_hir.node {
                     OwnerNode::Item(item) => match item.kind {
@@ -12705,6 +13260,7 @@ impl RootDatabase {
                         ),
                     )?;
                     let mut type_path_resolution = None;
+                    let mut world_reference_input = None;
                     let mut item_lowering_diagnostics = Vec::new();
                     let item_result: Result<
                         (OwnerTestOnlyPathResolution, Vec<Diagnostic>),
@@ -12714,6 +13270,14 @@ impl RootDatabase {
                             .resolve_def_id(item_owner.def_id.to_def_id())
                             .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
                             .ok_or(OwnerControlFlowResolutionError::MissingDefPath(item_owner))?;
+                        let context = HirLoweringContext::new(
+                            &inputs.ast_ids,
+                            snapshot,
+                            &inputs.root,
+                            &arena,
+                            &self.symbols,
+                            &def_paths,
+                        );
                         let (item_hir, _) = lower_world_item_owner(
                             item_owner,
                             &expected_item_path,
@@ -12727,6 +13291,27 @@ impl RootDatabase {
                         )
                         .map_err(OwnerControlFlowResolutionError::Lowering)?;
                         item_lowering_diagnostics.extend(item_hir.diagnostics.iter().cloned());
+                        world_reference_input = match item_hir.node {
+                            OwnerNode::WorldItem(item) => match item.kind {
+                                WorldItemKind::Import(reference) => {
+                                    Some((WorldReferencePosition::Import, reference))
+                                }
+                                WorldItemKind::Export(reference) => {
+                                    Some((WorldReferencePosition::Export, reference))
+                                }
+                                WorldItemKind::Include(reference) => {
+                                    Some((WorldReferencePosition::Include, reference))
+                                }
+                                WorldItemKind::ImportFn { .. } | WorldItemKind::ExportFn { .. } => {
+                                    None
+                                }
+                            },
+                            _ => {
+                                return Err(OwnerControlFlowResolutionError::Lowering(
+                                    HirLoweringError::ItemTreeEntryMismatch,
+                                ));
+                            }
+                        };
                         let signature_type_candidates =
                             world_item_signature_type_path_candidates(&item_hir);
                         let type_resolution = match signature_type_candidates {
@@ -12822,6 +13407,37 @@ impl RootDatabase {
                         sort_phase1_diagnostics(&mut diagnostics);
                         Ok((path_resolution, diagnostics))
                     })();
+                    let world_reference_path_resolution = if world_reference_owners.is_some() {
+                        Some(match (&item_result, world_reference_input) {
+                            (Ok(_), Some((position, reference))) => self
+                                .resolve_world_reference(
+                                    descriptor.owner,
+                                    item_owner,
+                                    position,
+                                    reference,
+                                    &module_scope,
+                                    &local_module_members,
+                                    collection.module_tree.package,
+                                    &inputs,
+                                    snapshot,
+                                    &collection.target_cfg,
+                                )
+                                .map(Some),
+                            (Ok(_), None) => Ok(None),
+                            (Err(error), _) => Err(error.clone()),
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(result) = world_reference_path_resolution {
+                        match result {
+                            Ok(Some(reference)) => world_references.push(reference),
+                            Ok(None) => {}
+                            Err(error) => {
+                                world_reference_item_errors.push((item_owner, error));
+                            }
+                        }
+                    }
                     let type_path_resolution = match (type_path_resolution, &item_result) {
                         (Some(resolution), _) => resolution,
                         (None, Err(error)) => Err(error.clone()),
@@ -12887,13 +13503,31 @@ impl RootDatabase {
                         lowering_diagnostics,
                         items,
                     });
+                    if let Some(reference_owners) = world_reference_owners.as_deref_mut() {
+                        reference_owners.push(WorldOwnerReferenceResolution {
+                            owner: descriptor.owner,
+                            error: None,
+                            references: world_references,
+                            item_errors: world_reference_item_errors,
+                        });
+                    }
                 }
-                Err(error) => owners.push(WorldOwnerTestOnlyResolution {
-                    owner: descriptor.owner,
-                    error: Some(error),
-                    lowering_diagnostics,
-                    items: Vec::new(),
-                }),
+                Err(error) => {
+                    if let Some(reference_owners) = world_reference_owners.as_deref_mut() {
+                        reference_owners.push(WorldOwnerReferenceResolution {
+                            owner: descriptor.owner,
+                            error: Some(error.clone()),
+                            references: Vec::new(),
+                            item_errors: Vec::new(),
+                        });
+                    }
+                    owners.push(WorldOwnerTestOnlyResolution {
+                        owner: descriptor.owner,
+                        error: Some(error),
+                        lowering_diagnostics,
+                        items: Vec::new(),
+                    });
+                }
             }
         }
 
@@ -25956,6 +26590,380 @@ mod tests {
     }
 
     #[test]
+    fn world_reference_paths_resolve_local_kinds_and_defer_package_paths() {
+        let root = concat!(
+            "use acme:phase1/child\n",
+            "interface api {}\n",
+            "world local {}\n",
+            "fn ordinary() {}\n",
+            "world references {\n",
+            "  import api\n",
+            "  export api\n",
+            "  include local\n",
+            "  import local\n",
+            "  export local\n",
+            "  include api\n",
+            "  import child\n",
+            "  import ordinary\n",
+            "  import ordinary.child\n",
+            "  import ap\n",
+            "  import ordinar\n",
+            "  include child.absent\n",
+            "  import child.child_api\n",
+            "  include child.child_world\n",
+            "  import acme:test-support/fixtures\n",
+            "  include acme:test-support/world\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(
+            root.as_bytes(),
+            b"interface child_api {}\nworld child_world {}\n",
+        );
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("world source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-target world owners are collected");
+        let results = database
+            .resolve_world_references(&collection, &module_tree, &snapshot)
+            .expect("world module paths resolve");
+        assert!(results.matches_snapshot(&snapshot));
+        assert!(results.matches_collection(&collection));
+        assert_eq!(results.target_cfg(), &target_cfg);
+        assert!(
+            results.owners().iter().all(|owner| owner.error().is_none()),
+            "a local reference failure is reported on that reference, not as an owner failure"
+        );
+        assert_eq!(
+            results.owners().len(),
+            3,
+            "worlds in both source modules are returned in package source order"
+        );
+
+        let references = results
+            .owners()
+            .iter()
+            .find(|owner| owner.references().len() == 16)
+            .expect("the source world has all direct references");
+        let interface = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::Interface)
+            .expect("local interface descriptor exists")
+            .owner
+            .def_id
+            .to_def_id();
+        let local_world = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::World
+                    && descriptor.owner != references.owner()
+                    && descriptor.file == module_tree.modules[0].file
+            })
+            .expect("local world descriptor exists")
+            .owner
+            .def_id
+            .to_def_id();
+        let child_interface = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::Interface
+                    && descriptor.file == module_tree.modules[1].file
+            })
+            .expect("child interface descriptor exists")
+            .owner
+            .def_id
+            .to_def_id();
+        let child_world = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::World
+                    && descriptor.file == module_tree.modules[1].file
+            })
+            .expect("child world descriptor exists")
+            .owner
+            .def_id
+            .to_def_id();
+        let resolved_bases = references
+            .references()
+            .iter()
+            .filter_map(|reference| match reference.path_result() {
+                WorldReferencePathResult::Mod(path) => Some(path.base),
+                WorldReferencePathResult::DeferredMod(_) | WorldReferencePathResult::Pkg(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            resolved_bases.contains(&Res::Def(DefKind::Interface, interface)),
+            "local import/export references resolve to the interface identity"
+        );
+        assert!(
+            resolved_bases.contains(&Res::Def(DefKind::World, local_world)),
+            "a local world reference resolves to the world identity"
+        );
+        assert!(
+            resolved_bases.contains(&Res::Def(DefKind::Interface, child_interface)),
+            "qualified local module paths resolve through ModuleMemberIndex"
+        );
+        assert!(
+            resolved_bases.contains(&Res::Def(DefKind::World, child_world)),
+            "qualified world includes resolve through ModuleMemberIndex"
+        );
+
+        let code_and_range = references
+            .references()
+            .iter()
+            .flat_map(|reference| reference.diagnostics())
+            .filter_map(|diagnostic| Some((diagnostic.code, diagnostic.primary()?.span.range)))
+            .collect::<Vec<_>>();
+        let target_range = |line: &str, name: &str| {
+            let start = root.find(line).expect("world item line exists");
+            let name_start = line.find(name).expect("world item has a target name");
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new((start + name_start) as u32),
+                sai_diagnostics::TextSize::new((start + name_start + name.len()) as u32),
+            )
+            .expect("target range is ordered")
+        };
+        for (line, name) in [
+            ("  import local\n", "local"),
+            ("  export local\n", "local"),
+            ("  include api\n", "api"),
+        ] {
+            assert!(
+                code_and_range.contains(&(
+                    sai_diagnostics::Code::InvalidWorldItem,
+                    target_range(line, name),
+                )),
+                "opposite world/interface kinds use INVALID_WORLD_ITEM at the WorldRef"
+            );
+        }
+        for (line, name) in [
+            ("  import child\n", "child"),
+            ("  import ordinary\n", "ordinary"),
+            ("  import ordinary.child\n", "ordinary.child"),
+        ] {
+            assert!(
+                code_and_range.contains(&(
+                    sai_diagnostics::Code::WrongNameKind,
+                    target_range(line, name),
+                )),
+                "other resolved entities use WRONG_NAME_KIND at the WorldRef"
+            );
+        }
+        assert!(
+            code_and_range.contains(&(
+                sai_diagnostics::Code::UnresolvedName,
+                target_range("  import ap\n", "ap"),
+            )),
+            "an unresolved local first segment reports UNRESOLVED_NAME at that segment"
+        );
+        assert!(
+            code_and_range.contains(&(
+                sai_diagnostics::Code::UnresolvedName,
+                target_range("  include child.absent\n", "absent"),
+            )),
+            "an unresolved local member reports UNRESOLVED_NAME at the missing segment"
+        );
+        let missing_first = references
+            .references()
+            .iter()
+            .flat_map(|reference| reference.diagnostics())
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::UnresolvedName
+                    && diagnostic.primary().is_some_and(|location| {
+                        location.span.range == target_range("  import ap\n", "ap")
+                    })
+            })
+            .expect("the missing first segment has its own diagnostic");
+        assert_eq!(
+            missing_first.data.get("candidates"),
+            Some(&sai_diagnostics::Value::Array(vec![
+                sai_diagnostics::Value::String("api".to_owned())
+            ])),
+            "first-segment suggestions include the closest visible module binding"
+        );
+        assert!(
+            missing_first
+                .children()
+                .iter()
+                .any(|child| child.message == "similar names: `api`"),
+            "first-segment suggestions are rendered as help"
+        );
+        let ordinary = database
+            .symbols
+            .intern("ordinary")
+            .expect("ordinary symbol is interned");
+        let mut test_only_candidate_scope = collection.clone();
+        test_only_candidate_scope.scopes.modules[ModuleId::ROOT.raw() as usize]
+            .scope
+            .get_mut(&ordinary)
+            .expect("ordinary function is in the current module")
+            .res = Res::TestOnly(sai_resolve::package_scopes::ImportIndex(0));
+        let test_only_candidate_results = database
+            .resolve_world_references(&test_only_candidate_scope, &module_tree, &snapshot)
+            .expect("test-only names are excluded from suggestions");
+        let test_only_candidate_diagnostic = test_only_candidate_results
+            .owners()
+            .iter()
+            .flat_map(|owner| owner.references())
+            .flat_map(|reference| reference.diagnostics())
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::UnresolvedName
+                    && diagnostic.primary().is_some_and(|location| {
+                        location.span.range == target_range("  import ordinar\n", "ordinar")
+                    })
+            })
+            .expect("the unresolved miss remains diagnosed");
+        assert_eq!(
+            test_only_candidate_diagnostic.data.get("candidates"),
+            Some(&sai_diagnostics::Value::Array(Vec::new())),
+            "a test-only module binding is not offered as a visible-name suggestion"
+        );
+        let partial_function = references
+            .references()
+            .iter()
+            .flat_map(|reference| reference.diagnostics())
+            .find(|diagnostic| {
+                diagnostic.code == sai_diagnostics::Code::WrongNameKind
+                    && diagnostic.primary().is_some_and(|location| {
+                        location.span.range
+                            == target_range("  import ordinary.child\n", "ordinary.child")
+                    })
+            })
+            .expect("a suffix after a resolved function is a wrong-kind path");
+        assert!(
+            partial_function.message.contains("found a function"),
+            "partial paths report the resolved prefix kind"
+        );
+        assert!(
+            references
+                .references()
+                .iter()
+                .filter(|reference| matches!(
+                    reference.path_result(),
+                    WorldReferencePathResult::Pkg(_)
+                ))
+                .all(|reference| reference.diagnostics().is_empty()),
+            "package references stay deferred to the package/WIT resolver"
+        );
+        let package_reference = references
+            .references()
+            .iter()
+            .find(|reference| {
+                reference.position() == WorldReferencePosition::Import
+                    && matches!(reference.path_result(), WorldReferencePathResult::Pkg(_))
+            })
+            .expect("the package import is retained as a deferred reference");
+        assert_eq!(
+            package_reference.span().range,
+            target_range(
+                "  import acme:test-support/fixtures\n",
+                "acme:test-support/fixtures"
+            ),
+            "a deferred package path retains its exact WorldRef span"
+        );
+
+        let api = database
+            .symbols
+            .intern("api")
+            .expect("api symbol is interned");
+        let mut errored_scope = collection.clone();
+        errored_scope.scopes.modules[ModuleId::ROOT.raw() as usize]
+            .scope
+            .get_mut(&api)
+            .expect("local interface is in module scope")
+            .res = Res::Err;
+        let errored = database
+            .resolve_world_references(&errored_scope, &module_tree, &snapshot)
+            .expect("an existing error resolution suppresses kind cascades");
+        let errored_references = errored
+            .owners()
+            .iter()
+            .find(|owner| owner.owner() == references.owner())
+            .expect("source world result remains available");
+        let api_references = errored_references
+            .references()
+            .iter()
+            .filter(|reference| {
+                matches!(
+                    reference.position(),
+                    WorldReferencePosition::Import | WorldReferencePosition::Export
+                ) && matches!(
+                    reference.path_result(),
+                    WorldReferencePathResult::Mod(PathRes { base: Res::Err, .. })
+                ) && ["  import api\n", "  export api\n"]
+                    .iter()
+                    .any(|line| reference.span().range == target_range(line, "api"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(api_references.len(), 2);
+        assert!(
+            api_references
+                .iter()
+                .all(|reference| reference.diagnostics().is_empty()),
+            "an existing Res::Err is not followed by a duplicate kind diagnostic"
+        );
+
+        let child = database
+            .symbols
+            .intern("child")
+            .expect("child symbol is interned");
+        let unavailable_package = database
+            .intern_package("acme:unavailable#1")
+            .expect("foreign package identity is interned");
+        let unavailable_module = Res::Def(
+            DefKind::Module,
+            DefId::from_foreign(unavailable_package, sai_hir::DefIndex::default()),
+        );
+        let mut deferred_scope = collection.clone();
+        deferred_scope.scopes.modules[ModuleId::ROOT.raw() as usize]
+            .scope
+            .get_mut(&child)
+            .expect("child module alias exists")
+            .res = unavailable_module;
+        let deferred_results = database
+            .resolve_world_references(&deferred_scope, &module_tree, &snapshot)
+            .expect("foreign member suffixes remain deferred");
+        let deferred_reference = deferred_results
+            .owners()
+            .iter()
+            .flat_map(|owner| owner.references())
+            .find(|reference| {
+                reference.span().range
+                    == target_range("  import child.child_api\n", "child.child_api")
+            })
+            .expect("the qualified foreign reference remains in the result");
+        assert_eq!(
+            deferred_reference.path_result(),
+            &WorldReferencePathResult::DeferredMod(PathRes {
+                base: unavailable_module,
+                resolved_segments: 1,
+                segment_count: 2,
+            }),
+            "a missing foreign member scope preserves its resolved module prefix"
+        );
+        assert!(
+            deferred_reference.diagnostics().is_empty(),
+            "a foreign member suffix does not become a local missing-name error"
+        );
+    }
+
+    #[test]
     fn world_test_only_paths_recover_forbidden_function_syntax_and_shadows() {
         let root = concat!(
             "use acme:test-support/fixtures as fixture\n",
@@ -27375,6 +28383,14 @@ mod tests {
                 &[deep_member_package.as_foreign_package_scopes("acme:deep")],
             )
             .expect("middle re-export scopes collect");
+        let middle_root_scope = middle_collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("middle root module scope exists");
+        assert!(
+            middle_root_scope.members.contains_key(&api_symbol),
+            "the source-only middle collection retains its transitive public interface re-export"
+        );
         let middle_member_package = middle_collection.module_member_scope_package();
         let root_manifest: Arc<[u8]> = Arc::from(
             &b"package acme:check @ 1.0.0\n\
@@ -27397,6 +28413,35 @@ mod tests {
                 ],
             )
             .expect("root scopes collect");
+        let middle_name = database
+            .symbols
+            .intern("middle")
+            .expect("middle alias name interns");
+        let root_scope = root_collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope exists");
+        let middle_res = root_scope
+            .scope
+            .get(&middle_name)
+            .expect("middle module alias is in scope")
+            .res;
+        let source_member_index =
+            ModuleMemberIndex::new(std::iter::once(root_collection.scopes()).chain([
+                middle_collection.scopes(),
+                leaf_collection.scopes(),
+                deep_collection.scopes(),
+            ]));
+        assert!(matches!(
+            source_member_index.lookup(middle_res, api_symbol, root_tree.package),
+            sai_resolve::module_member_lookup::ModuleMemberLookup::Found(binding)
+                if binding.res == expected_deep_interface
+        ));
+        assert!(matches!(
+            source_member_index.lookup(expected_deep_interface, public_type_symbol, root_tree.package),
+            sai_resolve::module_member_lookup::ModuleMemberLookup::Found(binding)
+                if binding.res == expected_deep_public_type
+        ));
         let member_scopes = database
             .collect_active_source_member_scopes(
                 &root_collection,

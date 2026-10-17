@@ -945,8 +945,12 @@ The `WitIfaceRef` of a local interface of the root refers to `Generated(root)`, 
    - `import` and `export` require an interface, and `include` requires a world. A world in `import` or `export`, or an interface in `include`, is `INVALID_WORLD_ITEM` (spec/13 §13.4.1) at the `WorldRef`.
    - A whole package (`wasi:http`) in `include` is also `INVALID_WORLD_ITEM`. In `import` or `export` it is `WORLD_IMPORT_NEEDS_INTERFACE`, which validation reports ([02](02-frontend-ast-hir.md) §2.5.12).
    - Any other entity (a module, a type, a function) is `WRONG_NAME_KIND`.
-4. **Nothing found.** In a WIT package, a name that matches nothing is `UNKNOWN_WIT_ITEM`. In a SAI package, it is the error of spec/04 §4.3.2 step 2 (`UNKNOWN_MODULE`, `PRIVATE_ITEM`).
+4. **Nothing found.**
+   - For a `ModPath`, use spec/04 §4.5.2: a missing first name or qualified member is `UNRESOLVED_NAME`, and an inaccessible qualified member is `PRIVATE_ITEM`.
+   - For a `PKG_PATH`, SAI package lookup uses spec/04 §4.3.2 (`UNKNOWN_MODULE`, or `PRIVATE_ITEM` for an inaccessible interface); a missing item in a WIT package is `UNKNOWN_WIT_ITEM`.
 5. **Unsupported worlds.** An `include` of a world marked `unsupported` (§16.3.3) is `WIT_UNSUPPORTED_FEATURE` at the `WorldRef`.
+
+**Implementation progress (IR-626).** The snapshot-bound `resolve_world_references` adapter reuses the existing world-item lowering traversal without adding reference data to the test-only result. It resolves direct local `ModPath` references through their containing module scope and the package-local `ModuleMemberIndex`, records one per-reference `PathRes` and `WorldRef` span, and emits `INVALID_WORLD_ITEM`, `WRONG_NAME_KIND`, or `UNRESOLVED_NAME` with the specified world-reference or missing-segment span. Missing first segments include up to three deterministic suggestions from non-error, non-test-only current-module bindings. A `ModPath` suffix whose member scope is absent remains deferred with its resolved prefix, and `Pkg` references are retained as deferred package paths. Worlds cannot carry `@target` under spec/15 §15.11; owners are taken from the validated Phase 1 collection. Exact-name `use` fixes requiring dependency metadata are deferred by this local-only slice; adding those fixes also needs the syntax-aware fix planner, which the repository does not yet provide. The Stage 0 gate and `sai check` integration are unchanged.
 
 ### 16.8.2 World functions
 

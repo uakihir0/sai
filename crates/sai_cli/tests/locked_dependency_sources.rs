@@ -229,6 +229,11 @@ fn locked_check_resolves_foreign_imports_after_dependency_reexports() {
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stderr.is_empty());
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"stage\":0,\"feature\":\"sai check\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "partial source-scope diagnostics keep check incomplete:\n{stdout}"
+    );
     let unresolved = stdout
         .lines()
         .find(|line| line.contains("\"code\":\"UNRESOLVED_IMPORT\""))
