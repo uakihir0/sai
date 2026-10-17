@@ -44668,6 +44668,215 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
+    fn generated_wit_references_named_types_from_generated_source_dependencies() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface local {\n",
+            "  type LocalAlias = api.Data\n",
+            "  fn local_member(value: api.Data)\n",
+            "}\n",
+        );
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", root_source.as_bytes())],
+        );
+        let (codec_package, codec_tree, codec_files) = multi_package_fixture(
+            &mut database,
+            "acme:codec#1",
+            "acme:codec@1.2.3",
+            &[("lib.sai", b"pub interface api { type Data = U32 }\n")],
+        );
+        snapshot_files.extend(codec_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:codec#1", "acme:codec")],
+                ),
+                graph_node(
+                    "acme:codec#1",
+                    "acme:codec",
+                    "1.2.3",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("generated-source dependency graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let codec_manifest: Arc<[u8]> =
+            Arc::from(&b"package acme:codec @ 1.2.3\nsource \"src\"\n"[..]);
+        let codec_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &codec_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                codec_manifest,
+                PackageRole::Dependency,
+                &[],
+            )
+            .expect("generated-source dependency scopes collect");
+        let codec_member_package = codec_collection.module_member_scope_package();
+        let codec_generated = database
+            .generated_wit_text(codec_package)
+            .expect("dependency generated WIT query succeeds")
+            .expect("source dependency publishes a generated WIT snapshot");
+        assert!(codec_generated.complete);
+        let api_symbol = database
+            .symbols
+            .intern("api")
+            .expect("source interface symbol interns");
+        let codec_interface_def = match codec_collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("generated dependency root module scope exists")
+            .scope
+            .get(&api_symbol)
+            .expect("generated source interface is bound")
+            .res
+        {
+            Res::Def(DefKind::Interface, interface) => interface,
+            other => panic!("source api resolves to its interface, got {other:?}"),
+        };
+        assert!(
+            codec_generated
+                .origins
+                .iter()
+                .any(|(name, def)| name == "api" && *def == codec_interface_def),
+            "the generated view carries the exact source interface origin"
+        );
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target, &graph)
+            .expect("active generated-source WIT view loads");
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the direct source dependency has a generated WIT view");
+        assert!(matches!(
+            codec_view.view.unit.kind(),
+            WitUnitKind::Generated { .. }
+        ));
+        let codec_interface = codec_view
+            .view
+            .interfaces
+            .get("api")
+            .expect("generated dependency retains its source interface origin");
+        assert_eq!(codec_view.view.unit.canonical_name(), "acme:codec@1.2.3");
+        assert_eq!(codec_interface.origin, Some(codec_interface_def));
+        let codec_item = codec_interface
+            .members
+            .get("Data")
+            .expect("generated dependency retains its source item origin");
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        let root_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &[codec_member_package.as_foreign_package_scopes("acme:codec")],
+                &wit_views,
+            )
+            .expect("root generated WIT collection uses the validated source dependency view");
+        assert_eq!(root_collection.package_key().as_str(), "acme:root#1");
+        let selected = MvsPackageVersion::new(
+            "acme:root",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses the active package version");
+        let generated_result = database
+            .wit_package(&generated_unit)
+            .expect("root WIT package loads with the generated source dependency");
+        assert!(
+            generated_result.failure.is_none(),
+            "generated source type references resolve: {:?}",
+            generated_result.failure
+        );
+        let generated = generated_result
+            .generated_texts
+            .iter()
+            .find(|(unit, _)| unit == &generated_unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the root generated text is retained");
+        assert!(generated.complete);
+        assert!(generated.text.contains("use acme:codec/api@1.2.3.{data};"));
+        assert!(generated.text.contains("type local-alias = data;"));
+        assert!(generated.text.contains("local-member: func(value: data);"));
+
+        let root_model = generated_result
+            .package
+            .as_ref()
+            .expect("root generated WIT model is available");
+        let (root_interface_index, root_interface) = root_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("root source interface is generated");
+        assert_eq!(root_interface.name, "local");
+        let items = root_interface.items.iter().collect::<Vec<_>>();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["data", "local-alias", "local-member"]
+        );
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(foreign_reference)) =
+            &items[0].kind
+        else {
+            panic!("the direct generated-source type is retained as an exact WIT reference");
+        };
+        assert_eq!(foreign_reference.interface.unit, codec_view.view.unit);
+        assert_eq!(foreign_reference.interface.interface, codec_interface.wit);
+        assert_eq!(foreign_reference.item, codec_item.item);
+        assert_eq!(foreign_reference.item_name, "data");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(local_reference)) = &items[1].kind
+        else {
+            panic!("the source alias refers to the generated import alias");
+        };
+        assert_eq!(local_reference.interface.unit, generated_unit);
+        assert_eq!(local_reference.interface.interface, root_interface_index);
+        assert_eq!(local_reference.item_name, "data");
+        let sai_wit::WitItemKind::Func(local_member) = &items[2].kind else {
+            panic!("the source function refers to the generated import alias");
+        };
+        assert!(matches!(
+            local_member.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == root_interface_index
+                    && reference.item_name == "data"
+        ));
+    }
+
+    #[test]
     fn generated_wit_emits_self_contained_aliases_and_records_in_source_order() {
         let source = concat!(
             "interface api {\n",
