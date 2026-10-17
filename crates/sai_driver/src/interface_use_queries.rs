@@ -1,7 +1,7 @@
 use super::{
     CurrentOwnerInputs, DetachedWorkspaceDiagnostic, InterfaceResourceMemberIds,
-    OwnedPhase1ModuleInput, OwnerControlFlowResolutionError, Phase1ModuleScopes,
-    Phase1PackageScopesQueryOutput, Prelude, PreparedPhase1PackageScopes,
+    OwnedPhase1ModuleInput, OwnerControlFlowResolutionError, Phase1ActiveWitViewEntry,
+    Phase1ModuleScopes, Phase1PackageScopesQueryOutput, Prelude, PreparedPhase1PackageScopes,
     PrimitivePreludeBuildError, STAGED_PHASE1_PACKAGE_SCOPES, TypeOwnerPathResolution,
     append_interface_use_references, index_top_level_owner_descriptors_in_scopes,
     interface_generation_order, interface_member_kind, local_interface_type_member_owners,
@@ -27,6 +27,7 @@ use sai_resolve::module_member_lookup::ModuleMemberIndex;
 use sai_resolve::package_scopes::{
     DefKind, PackageScopesError, PathRes, Phase1PackageScopes, Res, TopLevelOwnerKind,
 };
+use sai_resolve::{InterfaceUse, WorldElaborationInterface};
 use sai_resolve::{
     InterfaceUseReference, InterfaceUses, InterfaceUsesInput, WitNameCollision, WitNameDefinition,
     interface_uses, sai_identifier_to_wit_name, wit_name_collisions,
@@ -40,14 +41,20 @@ use sai_ty::iface::{
     InterfaceCheckError, InterfaceCheckIssue, InterfaceCheckIssueKind, interface_item_check,
 };
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
-use sai_wit::{WitViewDefKind, WitViewEntity, wit_name_to_sai};
+use sai_wit::{
+    WitFunc, WitIfaceIdx, WitItem, WitItemKind, WitPackageDeclaration, WitType, WitTypeRef,
+    WitViewDefKind, WitViewEntity, wit_name_to_sai,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 struct LocalBoundaryAliases<'hir> {
     definitions: HashMap<DefId, BoundaryAlias<'hir>>,
     path_resolutions: HashMap<sai_hir::HirId, PathRes>,
-    interface_references: HashMap<DefId, Vec<DefId>>,
+    alias_references: HashMap<DefId, Vec<LocalAliasReference>>,
+    known_aliases: HashSet<DefId>,
+    incomplete_aliases: HashSet<DefId>,
+    expanded_aliases_by_interface: HashMap<DefId, HashSet<DefId>>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +109,22 @@ enum LocalAliasReference {
     ModuleAlias(DefId),
 }
 
+struct LocalAliasExpansionFrame {
+    alias: DefId,
+    next_reference: usize,
+    complete: bool,
+}
+
+impl LocalAliasExpansionFrame {
+    fn new(alias: DefId, complete: bool) -> Self {
+        Self {
+            alias,
+            next_reference: 0,
+            complete,
+        }
+    }
+}
+
 /// A failure while deriving or rebinding `interface_uses(P)`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum InterfaceUsesQueryError {
@@ -113,9 +136,33 @@ pub enum InterfaceUsesQueryError {
     DiagnosticTemplate(String),
 }
 
+/// Ordered interface identities and use edges needed by world elaboration.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorldInterfaceUseGraph {
+    package: String,
+    interfaces: Vec<WorldElaborationInterface>,
+    stable_identities: Vec<String>,
+    edges: Vec<InterfaceUse>,
+}
+
+impl WorldInterfaceUseGraph {
+    pub fn package(&self) -> &str {
+        &self.package
+    }
+
+    pub fn interfaces(&self) -> &[WorldElaborationInterface] {
+        &self.interfaces
+    }
+
+    pub fn edges(&self) -> &[InterfaceUse] {
+        &self.edges
+    }
+}
+
 #[derive(Clone, Debug)]
 struct InterfaceUsesMemo {
     graph: InterfaceUses,
+    world_graph: WorldInterfaceUseGraph,
     diagnostics: Vec<DetachedWorkspaceDiagnostic>,
     interface_check_diagnostics: Vec<DetachedWorkspaceDiagnostic>,
 }
@@ -124,6 +171,7 @@ impl PartialEq for InterfaceUsesMemo {
     fn eq(&self, other: &Self) -> bool {
         self.graph.uses == other.graph.uses
             && self.graph.cyclic == other.graph.cyclic
+            && self.world_graph == other.world_graph
             && self.diagnostics == other.diagnostics
             && self.interface_check_diagnostics == other.interface_check_diagnostics
     }
@@ -193,14 +241,16 @@ impl InterfaceUsesQueries {
                     &prepared,
                     &scopes,
                     &primitive_prelude,
+                    &packages,
                     &symbols,
                 )
-                .and_then(|(input, interface_check_diagnostics)| {
+                .and_then(|(input, world_graph, interface_check_diagnostics)| {
                     let graph = interface_uses(input.clone());
                     let result_fingerprint = stable_interface_uses_fingerprint(
                         key,
                         &input,
                         &graph,
+                        &world_graph,
                         &interface_check_diagnostics,
                         &prepared,
                         &packages,
@@ -236,6 +286,7 @@ impl InterfaceUsesQueries {
                     Ok((
                         InterfaceUsesMemo {
                             graph,
+                            world_graph,
                             diagnostics,
                             interface_check_diagnostics,
                         },
@@ -263,7 +314,16 @@ impl InterfaceUsesQueries {
         database: &mut QueryDatabase,
         key: PackageKey,
         snapshot: &WorkspaceSnapshot,
-    ) -> Result<(InterfaceUses, Fingerprint, Vec<Diagnostic>), InterfaceUsesQueryError> {
+    ) -> Result<
+        (
+            InterfaceUses,
+            Fingerprint,
+            WorldInterfaceUseGraph,
+            Fingerprint,
+            Vec<Diagnostic>,
+        ),
+        InterfaceUsesQueryError,
+    > {
         let output = self
             .query
             .get(database, key)
@@ -282,9 +342,13 @@ impl InterfaceUsesQueries {
             .map(|diagnostic| bind_current_snapshot(diagnostic, snapshot))
             .collect::<Result<Vec<_>, _>>()
             .map_err(InterfaceUsesQueryError::PackageScopes)?;
+        let world_interface_uses_fingerprint =
+            stable_world_interface_uses_fingerprint(&memo.world_graph);
         Ok((
             graph,
             output.result_fingerprint,
+            memo.world_graph.clone(),
+            world_interface_uses_fingerprint,
             interface_check_diagnostics,
         ))
     }
@@ -595,6 +659,249 @@ fn external_wit_interface_use_target(
     target
 }
 
+struct ExternalWorldInterfaceData {
+    interfaces: Vec<WorldElaborationInterface>,
+    stable_identities: Vec<String>,
+    type_member_owners: HashMap<DefId, DefId>,
+    interface_by_exact_unit_index: HashMap<(String, String, u32), DefId>,
+    uses: Vec<InterfaceUse>,
+}
+
+fn collect_external_world_interface_data(
+    entries: Option<&[Phase1ActiveWitViewEntry]>,
+) -> ExternalWorldInterfaceData {
+    let mut data = ExternalWorldInterfaceData {
+        interfaces: Vec::new(),
+        stable_identities: Vec::new(),
+        type_member_owners: HashMap::new(),
+        interface_by_exact_unit_index: HashMap::new(),
+        uses: Vec::new(),
+    };
+    let mut metadata_by_identity = HashMap::<DefId, usize>::new();
+    let Some(entries) = entries else {
+        return data;
+    };
+
+    // The active closure is already in stable package-key order. Within each
+    // view, declarations and interface items retain their WIT model order.
+    for entry in entries {
+        let Some(foreign) = &entry.available else {
+            continue;
+        };
+        let view = foreign.view.as_ref();
+        let interfaces_by_wit = view
+            .interfaces
+            .values()
+            .map(|interface| (interface.wit, interface))
+            .collect::<HashMap<WitIfaceIdx, _>>();
+
+        for declaration in view.model.declarations_in_order() {
+            let WitPackageDeclaration::Interface(wit_index) = declaration else {
+                continue;
+            };
+            let Some(wit_interface) = view.model.interfaces.get(wit_index) else {
+                continue;
+            };
+            let Some(interface) = interfaces_by_wit.get(&wit_index).copied() else {
+                continue;
+            };
+            if metadata_by_identity.contains_key(&interface.def) {
+                continue;
+            }
+
+            let index = data.interfaces.len();
+            metadata_by_identity.insert(interface.def, index);
+            data.interface_by_exact_unit_index
+                .entry((
+                    view.unit.canonical_name().to_owned(),
+                    view.unit.stable_key().to_owned(),
+                    wit_index.raw(),
+                ))
+                .or_insert(interface.def);
+            data.interfaces.push(WorldElaborationInterface {
+                interface: interface.def,
+                key: external_wit_interface_use_target(
+                    &view.model.name.namespace,
+                    &view.model.name.name,
+                    &wit_interface.name,
+                    None,
+                )
+                .into(),
+                uses_complete: true,
+            });
+            data.stable_identities.push(format!(
+                "external:{}:{}:{}",
+                view.unit.canonical_name(),
+                view.unit.stable_key(),
+                wit_index.raw()
+            ));
+
+            for member in interface.members.values() {
+                if matches!(
+                    member.kind,
+                    WitViewDefKind::Struct
+                        | WitViewDefKind::Enum
+                        | WitViewDefKind::Resource
+                        | WitViewDefKind::Alias
+                ) {
+                    data.type_member_owners
+                        .entry(member.def)
+                        .or_insert(interface.def);
+                }
+            }
+        }
+    }
+
+    for entry in entries {
+        let Some(foreign) = &entry.available else {
+            continue;
+        };
+        let view = foreign.view.as_ref();
+        let interfaces_by_wit = view
+            .interfaces
+            .values()
+            .map(|interface| (interface.wit, interface))
+            .collect::<HashMap<WitIfaceIdx, _>>();
+        for declaration in view.model.declarations_in_order() {
+            let WitPackageDeclaration::Interface(wit_index) = declaration else {
+                continue;
+            };
+            let Some(wit_interface) = view.model.interfaces.get(wit_index) else {
+                continue;
+            };
+            let Some(interface) = interfaces_by_wit.get(&wit_index).copied() else {
+                continue;
+            };
+            let Some(&metadata_index) = metadata_by_identity.get(&interface.def) else {
+                continue;
+            };
+            let mut seen_targets = HashSet::new();
+            for item in wit_interface.items.iter() {
+                let (type_references, item_complete) = wit_item_interface_references(item);
+                if !item_complete {
+                    data.interfaces[metadata_index].uses_complete = false;
+                }
+                for reference in type_references {
+                    let exact_unit_name = reference.interface.unit.canonical_name().to_owned();
+                    let exact_unit_key = reference.interface.unit.stable_key().to_owned();
+                    let target = data
+                        .interface_by_exact_unit_index
+                        .get(&(
+                            exact_unit_name,
+                            exact_unit_key,
+                            reference.interface.interface.raw(),
+                        ))
+                        .copied();
+                    let Some(target) = target else {
+                        data.interfaces[metadata_index].uses_complete = false;
+                        continue;
+                    };
+                    if target != interface.def && seen_targets.insert(target) {
+                        data.uses.push(InterfaceUse {
+                            from: interface.def,
+                            to: target,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    data
+}
+
+fn wit_item_interface_references(item: &WitItem) -> (Vec<WitTypeRef>, bool) {
+    let mut references = Vec::new();
+    let mut complete = item.unsupported.is_none();
+    match &item.kind {
+        WitItemKind::Record(fields) => {
+            for field in fields {
+                collect_wit_type_interface_references(&field.ty, &mut references, &mut complete);
+            }
+        }
+        WitItemKind::Variant(cases) => {
+            for case in cases {
+                if let Some(payload) = &case.payload {
+                    collect_wit_type_interface_references(payload, &mut references, &mut complete);
+                }
+            }
+        }
+        WitItemKind::Enum(_) | WitItemKind::Flags(_) => {}
+        WitItemKind::Resource(members) => {
+            for member in members {
+                if member.unsupported.is_some() {
+                    complete = false;
+                }
+                collect_wit_func_interface_references(&member.func, &mut references, &mut complete);
+            }
+        }
+        WitItemKind::Alias(ty) => {
+            collect_wit_type_interface_references(ty, &mut references, &mut complete)
+        }
+        WitItemKind::Used(reference) => references.push(reference.clone()),
+        WitItemKind::Func(function) => {
+            collect_wit_func_interface_references(function, &mut references, &mut complete)
+        }
+    }
+    (references, complete)
+}
+
+fn collect_wit_func_interface_references(
+    function: &WitFunc,
+    references: &mut Vec<WitTypeRef>,
+    complete: &mut bool,
+) {
+    for (_, ty) in &function.params {
+        collect_wit_type_interface_references(ty, references, complete);
+    }
+    if let Some(result) = &function.result {
+        collect_wit_type_interface_references(result, references, complete);
+    }
+}
+
+fn collect_wit_type_interface_references(
+    ty: &WitType,
+    references: &mut Vec<WitTypeRef>,
+    complete: &mut bool,
+) {
+    match ty {
+        WitType::List(inner)
+        | WitType::Option(inner)
+        | WitType::Future(Some(inner))
+        | WitType::Stream(Some(inner)) => {
+            collect_wit_type_interface_references(inner, references, complete)
+        }
+        WitType::Result { ok, err } => {
+            for inner in ok.iter().chain(err) {
+                collect_wit_type_interface_references(inner, references, complete);
+            }
+        }
+        WitType::Tuple(elements) => {
+            for element in elements {
+                collect_wit_type_interface_references(element, references, complete);
+            }
+        }
+        WitType::Named(reference) | WitType::Own(reference) | WitType::Borrow(reference) => {
+            references.push(reference.clone())
+        }
+        WitType::Future(None) | WitType::Stream(None) => {}
+        WitType::Unsupported(_) => *complete = false,
+        WitType::Bool
+        | WitType::S8
+        | WitType::S16
+        | WitType::S32
+        | WitType::S64
+        | WitType::U8
+        | WitType::U16
+        | WitType::U32
+        | WitType::U64
+        | WitType::F32
+        | WitType::F64
+        | WitType::Char
+        | WitType::String => {}
+    }
+}
+
 fn render_wit_name(name: &str) -> String {
     let name = name.strip_prefix('%').unwrap_or(name);
     sai_wit::wit_identifier(name)
@@ -713,8 +1020,10 @@ fn collect_interface_uses_input(
     prepared: &PreparedPhase1PackageScopes,
     scopes: &Phase1PackageScopes,
     primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
+    packages: &PackageInterner,
     symbols: &Interner,
-) -> Result<(InterfaceUsesInput, Vec<Diagnostic>), InterfaceUsesQueryError> {
+) -> Result<(InterfaceUsesInput, WorldInterfaceUseGraph, Vec<Diagnostic>), InterfaceUsesQueryError>
+{
     let descriptors = interface_generation_order(
         &prepared.module_tree,
         scopes
@@ -727,6 +1036,18 @@ fn collect_interface_uses_input(
     )
     .map_err(InterfaceUsesQueryError::Collection)?;
     let interface_type_members = local_interface_type_member_owners(scopes, &descriptors);
+    let external_world_interfaces =
+        collect_external_world_interface_data(prepared.active_wit_view_entries.as_deref());
+    let mut world_interface_type_members = interface_type_members
+        .iter()
+        .map(|(member, owner)| (*member, owner.to_def_id()))
+        .collect::<HashMap<_, _>>();
+    world_interface_type_members.extend(
+        external_world_interfaces
+            .type_member_owners
+            .iter()
+            .map(|(member, owner)| (*member, *owner)),
+    );
     let indexed_scopes = std::iter::once(scopes).chain(
         prepared
             .foreign_packages
@@ -780,7 +1101,7 @@ fn collect_interface_uses_input(
         ));
     }
     let alias_arena = HirArena::new();
-    let local_boundary_aliases = collect_local_boundary_aliases(
+    let mut local_boundary_aliases = collect_local_boundary_aliases(
         prepared,
         scopes,
         &module_inputs,
@@ -789,11 +1110,13 @@ fn collect_interface_uses_input(
         primitive_prelude,
         symbols,
         &alias_arena,
-        &interface_type_members,
+        &world_interface_type_members,
     )?;
 
     let mut package_identity = None;
     let mut references = Vec::<InterfaceUseReference>::new();
+    let mut world_interface_uses = Vec::<InterfaceUse>::new();
+    let mut local_world_use_completeness = HashMap::<DefId, bool>::new();
     let mut interface_check_diagnostics = Vec::new();
     let mut collision_inputs = Vec::with_capacity(descriptors.len());
     let mut poisoned_owners = HashSet::<OwnerId>::new();
@@ -910,6 +1233,10 @@ fn collect_interface_uses_input(
             module_scope_with_interface_members(module_scope, scopes, descriptor.owner)
                 .map_err(InterfaceUsesQueryError::Collection)?;
         let mut owner_references = Vec::new();
+        let mut owner_world_references = Vec::<(sai_vfs::TextSize, InterfaceUse)>::new();
+        let mut owner_uses_complete =
+            local_interface_wit_name(descriptor.owner.def_id, prepared, symbols)?.is_some()
+                && parent_hir.diagnostics.is_empty();
         let mut interface_item_names = Vec::with_capacity(member_entries.len());
         let mut generated_use_aliases = Vec::<GeneratedUseAlias>::new();
         for (entry, member_owner) in member_entries
@@ -936,10 +1263,14 @@ fn collect_interface_uses_input(
             )
             .map_err(OwnerControlFlowResolutionError::Lowering)
             .map_err(InterfaceUsesQueryError::Collection)?;
+            if !member_hir.diagnostics.is_empty() {
+                owner_uses_complete = false;
+            }
             let flags_marker_accepted = inputs.accepted_flags_attributes.contains(&entry.ast_id);
             let member_issues =
                 collect_interface_item_issues(&member_hir, flags_marker_accepted, symbols)?;
             if !member_issues.is_empty() {
+                owner_uses_complete = false;
                 poisoned_owners.insert(member_owner);
             }
             append_interface_item_diagnostics(
@@ -989,17 +1320,24 @@ fn collect_interface_uses_input(
                 &source_graph_packages,
                 primitive_prelude,
                 &interface_type_members,
+                &world_interface_type_members,
+                &local_boundary_aliases,
+                &mut owner_world_references,
+                &mut owner_uses_complete,
                 inputs,
             )?;
-            if append_interface_boundary_diagnostics(
+            let has_incompatible_boundary = append_interface_boundary_diagnostics(
                 &member_hir,
                 &resolution,
                 &interface_boundary_types,
                 &boundary_use_alias_names,
-                &local_boundary_aliases,
+                &mut local_boundary_aliases,
                 descriptor.owner.def_id,
                 &interface_type_members,
+                &world_interface_type_members,
                 &mut owner_references,
+                &mut owner_world_references,
+                &mut owner_uses_complete,
                 &module_inputs,
                 &inputs.source_ref,
                 &inputs.source,
@@ -1007,7 +1345,9 @@ fn collect_interface_uses_input(
                 &mut generated_use_aliases,
                 &mut owner_dependencies,
                 &mut interface_check_diagnostics,
-            )? {
+            )?;
+            if has_incompatible_boundary {
+                owner_uses_complete = false;
                 poisoned_owners.insert(member_owner);
             }
             if kind != super::InterfaceMemberKind::Resource {
@@ -1074,8 +1414,12 @@ fn collect_interface_uses_input(
                 )
                 .map_err(OwnerControlFlowResolutionError::Lowering)
                 .map_err(InterfaceUsesQueryError::Collection)?;
+                if !method_hir.diagnostics.is_empty() {
+                    owner_uses_complete = false;
+                }
                 let method_issues = collect_interface_item_issues(&method_hir, false, symbols)?;
                 if !method_issues.is_empty() {
+                    owner_uses_complete = false;
                     poisoned_owners.insert(method_owner);
                 }
                 append_interface_item_diagnostics(
@@ -1104,17 +1448,24 @@ fn collect_interface_uses_input(
                     &source_graph_packages,
                     primitive_prelude,
                     &interface_type_members,
+                    &world_interface_type_members,
+                    &local_boundary_aliases,
+                    &mut owner_world_references,
+                    &mut owner_uses_complete,
                     inputs,
                 )?;
-                if append_interface_boundary_diagnostics(
+                let has_incompatible_boundary = append_interface_boundary_diagnostics(
                     &method_hir,
                     &resolution,
                     &interface_boundary_types,
                     &boundary_use_alias_names,
-                    &local_boundary_aliases,
+                    &mut local_boundary_aliases,
                     descriptor.owner.def_id,
                     &interface_type_members,
+                    &world_interface_type_members,
                     &mut owner_references,
+                    &mut owner_world_references,
+                    &mut owner_uses_complete,
                     &module_inputs,
                     &inputs.source_ref,
                     &inputs.source,
@@ -1122,7 +1473,9 @@ fn collect_interface_uses_input(
                     &mut generated_use_aliases,
                     &mut owner_dependencies,
                     &mut interface_check_diagnostics,
-                )? {
+                )?;
+                if has_incompatible_boundary {
+                    owner_uses_complete = false;
                     poisoned_owners.insert(method_owner);
                 }
             }
@@ -1148,6 +1501,14 @@ fn collect_interface_uses_input(
         // points to the first WIT reference written by the user.
         owner_references.sort_by_key(|reference| reference.location.span.range.start());
         references.extend(owner_references);
+        owner_world_references.sort_by_key(|(start, _)| *start);
+        world_interface_uses.extend(
+            owner_world_references
+                .into_iter()
+                .map(|(_, use_edge)| use_edge),
+        );
+        local_world_use_completeness
+            .insert(descriptor.owner.def_id.to_def_id(), owner_uses_complete);
     }
 
     let package = package_identity.unwrap_or_else(|| {
@@ -1157,6 +1518,51 @@ fn collect_interface_uses_input(
             .map_or(package_key.as_str(), |(identity, _)| identity)
             .to_owned()
     });
+    let mut world_interfaces =
+        Vec::with_capacity(interface_ids.len() + external_world_interfaces.interfaces.len());
+    let mut world_stable_identities =
+        Vec::with_capacity(interface_ids.len() + external_world_interfaces.stable_identities.len());
+    for interface in &interface_ids {
+        let name = local_interface_wit_name(*interface, prepared, symbols)?;
+        let path = prepared
+            .def_paths
+            .resolve_def_id(interface.to_def_id())
+            .map_err(OwnerControlFlowResolutionError::DefPathInterner)
+            .map_err(InterfaceUsesQueryError::Collection)?
+            .ok_or_else(|| {
+                InterfaceUsesQueryError::Collection(
+                    OwnerControlFlowResolutionError::MissingDefPath(OwnerId { def_id: *interface }),
+                )
+            })?;
+        let path_hash = sai_hir::DefPathHash::compute(&path, packages, symbols)
+            .map_err(InterfaceUsesQueryError::DefPath)?;
+        world_stable_identities.push(format!("local:{:032x}", path_hash.raw()));
+        world_interfaces.push(WorldElaborationInterface {
+            interface: interface.to_def_id(),
+            key: name.as_deref().unwrap_or("").into(),
+            uses_complete: name.is_some()
+                && local_world_use_completeness
+                    .get(&interface.to_def_id())
+                    .copied()
+                    .unwrap_or(false),
+        });
+    }
+    world_interfaces.extend(external_world_interfaces.interfaces);
+    world_stable_identities.extend(external_world_interfaces.stable_identities);
+    world_interface_uses.extend(external_world_interfaces.uses);
+    let mut seen_world_edges = HashMap::<DefId, HashSet<DefId>>::new();
+    world_interface_uses.retain(|edge| {
+        seen_world_edges
+            .entry(edge.from)
+            .or_default()
+            .insert(edge.to)
+    });
+    let world_graph = WorldInterfaceUseGraph {
+        package: package.clone(),
+        interfaces: world_interfaces,
+        stable_identities: world_stable_identities,
+        edges: world_interface_uses,
+    };
     for reference in &mut references {
         reference.location.file.snapshot = None;
     }
@@ -1178,7 +1584,7 @@ fn collect_interface_uses_input(
         &prepared.snapshot,
         &mut interface_check_diagnostics,
     )?;
-    Ok((input, interface_check_diagnostics))
+    Ok((input, world_graph, interface_check_diagnostics))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1382,8 +1788,18 @@ fn collect_owner_references(
     source_graph_packages: &HashSet<sai_hir::PackageId>,
     primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
     interface_type_members: &HashMap<sai_hir::DefId, LocalDefId>,
+    world_interface_type_members: &HashMap<DefId, DefId>,
+    local_boundary_aliases: &LocalBoundaryAliases<'_>,
+    world_references: &mut Vec<(sai_vfs::TextSize, InterfaceUse)>,
+    uses_complete: &mut bool,
     inputs: &CurrentOwnerInputs,
 ) -> Result<TypeOwnerPathResolution, InterfaceUsesQueryError> {
+    if interface_use_type_roots(hir_owner)
+        .into_iter()
+        .any(|ty| type_has_incomplete_world_interface_reference(ty))
+    {
+        *uses_complete = false;
+    }
     let candidates = owner_test_only_path_candidates(hir_owner);
     let interface_use_candidates = interface_use_path_candidates(hir_owner, &candidates);
     let mut generic_resolutions = owner_type_generic_resolutions(hir_owner);
@@ -1410,7 +1826,69 @@ fn collect_owner_references(
         inputs,
     )
     .map_err(InterfaceUsesQueryError::Collection)?;
+    append_world_interface_use_references(
+        world_references,
+        interface.to_def_id(),
+        &interface_use_candidates,
+        &resolution,
+        world_interface_type_members,
+        local_boundary_aliases,
+        uses_complete,
+    );
     Ok(resolution)
+}
+
+fn append_world_interface_use_references(
+    references: &mut Vec<(sai_vfs::TextSize, InterfaceUse)>,
+    interface: DefId,
+    candidates: &[super::OwnerPathHead<'_>],
+    resolution: &TypeOwnerPathResolution,
+    interface_type_members: &HashMap<DefId, DefId>,
+    local_boundary_aliases: &LocalBoundaryAliases<'_>,
+    uses_complete: &mut bool,
+) {
+    for candidate in candidates {
+        let Some(path_resolution) = resolution.paths().get(&candidate.hir_id) else {
+            *uses_complete = false;
+            continue;
+        };
+        if path_resolution.resolved_segments < path_resolution.segment_count {
+            *uses_complete = false;
+            continue;
+        }
+        match path_resolution.base {
+            Res::PrimTy(_) => {}
+            Res::Def(
+                DefKind::Struct
+                | DefKind::Enum
+                | DefKind::Distinct
+                | DefKind::Refined
+                | DefKind::Alias
+                | DefKind::Resource,
+                target,
+            ) => {
+                if let Some(&used_interface) = interface_type_members.get(&target) {
+                    if used_interface != interface {
+                        references.push((
+                            candidate.span.range.start(),
+                            InterfaceUse {
+                                from: interface,
+                                to: used_interface,
+                            },
+                        ));
+                    }
+                } else if matches!(path_resolution.base, Res::Def(DefKind::Alias, _))
+                    && (!local_boundary_aliases.known_aliases.contains(&target)
+                        || local_boundary_aliases.incomplete_aliases.contains(&target))
+                {
+                    *uses_complete = false;
+                }
+            }
+            Res::Err | Res::TestOnly(_) | Res::Local(_) | Res::Def(_, _) => {
+                *uses_complete = false;
+            }
+        }
+    }
 }
 
 fn interface_use_path_candidates<'hir>(
@@ -1511,6 +1989,33 @@ fn interface_use_type_roots<'hir>(owner: &HirOwner<'hir>) -> Vec<&'hir Ty<'hir>>
     roots
 }
 
+fn type_has_incomplete_world_interface_reference(ty: &Ty<'_>) -> bool {
+    match ty.kind {
+        TyKind::Path(path) => path.segments.iter().any(|segment| {
+            let Some(arguments) = segment.args else {
+                return false;
+            };
+            arguments.args.iter().any(|argument| match *argument {
+                GenericArg::Type(ty) | GenericArg::Binding { ty, .. } => {
+                    type_has_incomplete_world_interface_reference(ty)
+                }
+                GenericArg::Const(_) => false,
+            })
+        }),
+        TyKind::Borrow(_, inner) => type_has_incomplete_world_interface_reference(inner),
+        TyKind::Tuple(elements) => elements
+            .iter()
+            .any(|ty| type_has_incomplete_world_interface_reference(ty)),
+        TyKind::FnPtr { params, ret, .. } => {
+            params
+                .iter()
+                .any(|ty| type_has_incomplete_world_interface_reference(ty))
+                || ret.is_some_and(|ty| type_has_incomplete_world_interface_reference(ty))
+        }
+        TyKind::Infer | TyKind::Err => true,
+    }
+}
+
 fn collect_local_boundary_aliases<'hir>(
     prepared: &PreparedPhase1PackageScopes,
     scopes: &Phase1PackageScopes,
@@ -1520,18 +2025,25 @@ fn collect_local_boundary_aliases<'hir>(
     primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
     symbols: &Interner,
     arena: &'hir HirArena<'hir>,
-    interface_type_members: &HashMap<DefId, LocalDefId>,
+    world_interface_type_members: &HashMap<DefId, DefId>,
 ) -> Result<LocalBoundaryAliases<'hir>, InterfaceUsesQueryError> {
     let mut aliases = HashMap::new();
     let mut path_resolutions = HashMap::new();
     let mut alias_references = HashMap::new();
-    for descriptor in scopes
+    let alias_descriptors = scopes
         .top_level_owners
         .iter()
         .copied()
         .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::Alias)
-    {
+        .collect::<Vec<_>>();
+    let known_aliases = alias_descriptors
+        .iter()
+        .map(|descriptor| descriptor.owner.def_id.to_def_id())
+        .collect::<HashSet<_>>();
+    let mut incomplete_aliases = HashSet::new();
+    for descriptor in alias_descriptors {
         let Some(inputs) = module_inputs.get(&descriptor.file) else {
+            incomplete_aliases.insert(descriptor.owner.def_id.to_def_id());
             continue;
         };
         let expected_path = prepared
@@ -1558,12 +2070,15 @@ fn collect_local_boundary_aliases<'hir>(
         ) else {
             // Existing lowering diagnostics own malformed or unsupported alias
             // declarations. They cannot provide a sound expansion target.
+            incomplete_aliases.insert(descriptor.owner.def_id.to_def_id());
             continue;
         };
         let OwnerNode::Item(item) = hir_owner.node else {
+            incomplete_aliases.insert(descriptor.owner.def_id.to_def_id());
             continue;
         };
         let ItemKind::Alias { generics, ty } = item.kind else {
+            incomplete_aliases.insert(descriptor.owner.def_id.to_def_id());
             continue;
         };
         let candidates = owner_test_only_path_candidates(&hir_owner);
@@ -1585,25 +2100,46 @@ fn collect_local_boundary_aliases<'hir>(
         )
         .map_err(InterfaceUsesQueryError::Collection)?;
         let has_generic_params = !generics.params.is_empty();
+        let mut alias_is_complete =
+            hir_owner.diagnostics.is_empty() && !type_has_incomplete_world_interface_reference(ty);
         let references = candidates
             .iter()
             .filter_map(|candidate| {
-                let PathRes {
-                    base: Res::Def(kind, target),
-                    ..
-                } = resolution.paths().get(&candidate.hir_id).copied()?
+                let Some(path_resolution) = resolution.paths().get(&candidate.hir_id).copied()
                 else {
+                    alias_is_complete = false;
                     return None;
                 };
-                if interface_type_members.contains_key(&target) {
-                    Some(LocalAliasReference::InterfaceType(target))
-                } else if kind == DefKind::Alias {
-                    Some(LocalAliasReference::ModuleAlias(target))
-                } else {
-                    None
+                if path_resolution.resolved_segments < path_resolution.segment_count {
+                    alias_is_complete = false;
+                    return None;
+                }
+                match path_resolution.base {
+                    Res::PrimTy(_) | Res::Local(_) | Res::Def(DefKind::TyParam, _) => None,
+                    Res::Def(_, target) if world_interface_type_members.contains_key(&target) => {
+                        Some(LocalAliasReference::InterfaceType(target))
+                    }
+                    Res::Def(DefKind::Alias, target) => {
+                        Some(LocalAliasReference::ModuleAlias(target))
+                    }
+                    Res::Def(
+                        DefKind::Struct
+                        | DefKind::Enum
+                        | DefKind::Distinct
+                        | DefKind::Refined
+                        | DefKind::Resource,
+                        _,
+                    ) => None,
+                    Res::Def(_, _) | Res::Err | Res::TestOnly(_) => {
+                        alias_is_complete = false;
+                        None
+                    }
                 }
             })
             .collect::<Vec<_>>();
+        if !alias_is_complete {
+            incomplete_aliases.insert(descriptor.owner.def_id.to_def_id());
+        }
         aliases.insert(
             descriptor.owner.def_id.to_def_id(),
             BoundaryAlias {
@@ -1620,57 +2156,96 @@ fn collect_local_boundary_aliases<'hir>(
                 .map(|(hir_id, resolution)| (*hir_id, *resolution)),
         );
     }
-    let mut expanded_references = HashMap::with_capacity(aliases.len());
-    for alias in aliases.keys().copied() {
-        let mut references = Vec::new();
-        expand_local_alias_interface_references(
-            alias,
-            &alias_references,
-            &aliases,
-            &mut HashSet::new(),
-            &mut references,
-        );
-        expanded_references.insert(alias, references);
-    }
     Ok(LocalBoundaryAliases {
         definitions: aliases,
         path_resolutions,
-        interface_references: expanded_references,
+        alias_references,
+        known_aliases,
+        incomplete_aliases,
+        expanded_aliases_by_interface: HashMap::new(),
     })
 }
 
 fn expand_local_alias_interface_references(
     alias: DefId,
     alias_references: &HashMap<DefId, Vec<LocalAliasReference>>,
-    aliases: &HashMap<DefId, BoundaryAlias<'_>>,
-    visiting: &mut HashSet<DefId>,
-    output: &mut Vec<DefId>,
-) {
-    if !aliases.contains_key(&alias) || !visiting.insert(alias) {
-        return;
+    known_aliases: &HashSet<DefId>,
+    incomplete_aliases: &HashSet<DefId>,
+    expanded_aliases: &mut HashSet<DefId>,
+) -> (Vec<DefId>, bool, usize) {
+    if !known_aliases.contains(&alias) || !alias_references.contains_key(&alias) {
+        return (Vec::new(), false, 0);
     }
-    for reference in alias_references.get(&alias).into_iter().flatten() {
+    if !expanded_aliases.insert(alias) {
+        return (Vec::new(), !incomplete_aliases.contains(&alias), 0);
+    }
+    let mut visiting = HashSet::from([alias]);
+    let mut targets = Vec::new();
+    let mut seen_targets = HashSet::new();
+    let mut work_units = 0usize;
+    let mut stack = vec![LocalAliasExpansionFrame::new(
+        alias,
+        !incomplete_aliases.contains(&alias),
+    )];
+    while let Some(frame) = stack.last_mut() {
+        let references = alias_references
+            .get(&frame.alias)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        if frame.next_reference >= references.len() {
+            let finished = stack.pop().expect("current alias expansion exists");
+            visiting.remove(&finished.alias);
+            if let Some(parent) = stack.last_mut() {
+                parent.complete &= finished.complete;
+            } else {
+                return (targets, finished.complete, work_units);
+            }
+            continue;
+        }
+        let reference = references[frame.next_reference];
+        frame.next_reference += 1;
+        work_units = work_units.saturating_add(1);
         match reference {
-            LocalAliasReference::InterfaceType(definition) => output.push(*definition),
-            LocalAliasReference::ModuleAlias(nested) => expand_local_alias_interface_references(
-                *nested,
-                alias_references,
-                aliases,
-                visiting,
-                output,
-            ),
+            LocalAliasReference::InterfaceType(definition) => {
+                if seen_targets.insert(definition) {
+                    targets.push(definition);
+                }
+            }
+            LocalAliasReference::ModuleAlias(nested) => {
+                if !known_aliases.contains(&nested) || !alias_references.contains_key(&nested) {
+                    frame.complete = false;
+                    continue;
+                }
+                if incomplete_aliases.contains(&nested) {
+                    frame.complete = false;
+                }
+                if visiting.contains(&nested) {
+                    frame.complete = false;
+                    continue;
+                }
+                if expanded_aliases.insert(nested) {
+                    visiting.insert(nested);
+                    stack.push(LocalAliasExpansionFrame::new(
+                        nested,
+                        !incomplete_aliases.contains(&nested),
+                    ));
+                }
+            }
         }
     }
-    visiting.remove(&alias);
+    unreachable!("the root alias expansion returns when its frame is finished")
 }
 
 fn append_local_alias_interface_use_references(
     owner: &HirOwner<'_>,
     resolution: &TypeOwnerPathResolution,
-    local_boundary_aliases: &LocalBoundaryAliases<'_>,
+    local_boundary_aliases: &mut LocalBoundaryAliases<'_>,
     interface: LocalDefId,
     interface_type_members: &HashMap<DefId, LocalDefId>,
+    world_interface_type_members: &HashMap<DefId, DefId>,
     references: &mut Vec<InterfaceUseReference>,
+    world_references: &mut Vec<(sai_vfs::TextSize, InterfaceUse)>,
+    uses_complete: &mut bool,
     module_inputs: &HashMap<FileId, CurrentOwnerInputs>,
     source_ref: &SourceRef,
     source: &sai_vfs::SourceFile,
@@ -1687,12 +2262,26 @@ fn append_local_alias_interface_use_references(
         else {
             continue;
         };
-        if interface_type_members.contains_key(alias) {
+        if world_interface_type_members.contains_key(alias) {
             continue;
         }
-        let Some(hidden_references) = local_boundary_aliases.interface_references.get(alias) else {
-            continue;
-        };
+        if local_boundary_aliases.incomplete_aliases.contains(alias) {
+            *uses_complete = false;
+        }
+        let expanded_aliases = local_boundary_aliases
+            .expanded_aliases_by_interface
+            .entry(interface.to_def_id())
+            .or_default();
+        let (hidden_references, complete, _) = expand_local_alias_interface_references(
+            *alias,
+            &local_boundary_aliases.alias_references,
+            &local_boundary_aliases.known_aliases,
+            &local_boundary_aliases.incomplete_aliases,
+            expanded_aliases,
+        );
+        if !complete {
+            *uses_complete = false;
+        }
         let (reference_source_ref, reference_source) = module_inputs
             .get(&candidate.span.file)
             .map(|inputs| (inputs.source_ref.clone(), inputs.source.as_ref()))
@@ -1708,14 +2297,24 @@ fn append_local_alias_interface_use_references(
             )
         })?;
         for hidden_reference in hidden_references {
-            let Some(&to) = interface_type_members.get(hidden_reference) else {
-                continue;
-            };
-            references.push(InterfaceUseReference {
-                from: interface,
-                to,
-                location: location.clone(),
-            });
+            if let Some(&to) = interface_type_members.get(&hidden_reference) {
+                references.push(InterfaceUseReference {
+                    from: interface,
+                    to,
+                    location: location.clone(),
+                });
+            }
+            if let Some(&to) = world_interface_type_members.get(&hidden_reference) {
+                if to != interface.to_def_id() {
+                    world_references.push((
+                        candidate.span.range.start(),
+                        InterfaceUse {
+                            from: interface.to_def_id(),
+                            to,
+                        },
+                    ));
+                }
+            }
         }
     }
     Ok(())
@@ -1726,10 +2325,13 @@ fn append_interface_boundary_diagnostics(
     resolution: &TypeOwnerPathResolution,
     interface_boundary_types: &HashMap<DefId, BoundaryDefinition>,
     boundary_use_alias_names: &HashMap<DefId, BoundaryUseAliasName>,
-    local_boundary_aliases: &LocalBoundaryAliases<'_>,
+    local_boundary_aliases: &mut LocalBoundaryAliases<'_>,
     interface: LocalDefId,
     interface_type_members: &HashMap<DefId, LocalDefId>,
+    world_interface_type_members: &HashMap<DefId, DefId>,
     references: &mut Vec<InterfaceUseReference>,
+    world_references: &mut Vec<(sai_vfs::TextSize, InterfaceUse)>,
+    uses_complete: &mut bool,
     module_inputs: &HashMap<FileId, CurrentOwnerInputs>,
     source_ref: &SourceRef,
     source: &sai_vfs::SourceFile,
@@ -1759,7 +2361,10 @@ fn append_interface_boundary_diagnostics(
         local_boundary_aliases,
         interface,
         interface_type_members,
+        world_interface_type_members,
         references,
+        world_references,
+        uses_complete,
         module_inputs,
         source_ref,
         source,
@@ -2283,6 +2888,7 @@ fn stable_interface_uses_fingerprint(
     package_key: &PackageKey,
     input: &InterfaceUsesInput,
     graph: &InterfaceUses,
+    world_graph: &WorldInterfaceUseGraph,
     interface_check_diagnostics: &[Diagnostic],
     prepared: &PreparedPhase1PackageScopes,
     packages: &PackageInterner,
@@ -2339,6 +2945,7 @@ fn stable_interface_uses_fingerprint(
             hash_range(span, &mut hasher);
         }
     }
+    stable_world_interface_use_graph(world_graph, &mut hasher);
     hasher.write_len(u64::try_from(graph.diagnostics.len()).unwrap_or(u64::MAX));
     for diagnostic in &graph.diagnostics {
         diagnostic.code.as_str().stable_hash(&mut hasher);
@@ -2372,6 +2979,37 @@ fn stable_interface_uses_fingerprint(
         }
     }
     Ok(hasher.finish())
+}
+
+fn stable_world_interface_uses_fingerprint(graph: &WorldInterfaceUseGraph) -> Fingerprint {
+    let mut hasher = StableHasher::new();
+    hasher.write_tag(0xEC);
+    stable_world_interface_use_graph(graph, &mut hasher);
+    hasher.finish()
+}
+
+fn stable_world_interface_use_graph(graph: &WorldInterfaceUseGraph, hasher: &mut StableHasher) {
+    graph.package.stable_hash(hasher);
+    hasher.write_len(u64::try_from(graph.interfaces.len()).unwrap_or(u64::MAX));
+    let mut interface_indices = HashMap::with_capacity(graph.interfaces.len());
+    for (index, (interface, stable_identity)) in graph
+        .interfaces
+        .iter()
+        .zip(&graph.stable_identities)
+        .enumerate()
+    {
+        interface_indices
+            .entry(interface.interface)
+            .or_insert(u64::try_from(index).unwrap_or(u64::MAX));
+        stable_identity.stable_hash(hasher);
+        interface.key.as_str().stable_hash(hasher);
+        hasher.write_u8(u8::from(interface.uses_complete));
+    }
+    hasher.write_len(u64::try_from(graph.edges.len()).unwrap_or(u64::MAX));
+    for edge in &graph.edges {
+        hasher.write_len(*interface_indices.get(&edge.from).unwrap_or(&u64::MAX));
+        hasher.write_len(*interface_indices.get(&edge.to).unwrap_or(&u64::MAX));
+    }
 }
 
 fn hash_optional_location(
@@ -2593,9 +3231,15 @@ fn refresh_location_reference(
 
 #[cfg(test)]
 mod tests {
-    use super::{InterfaceUsesQueryError, interface_uses_error_fingerprint};
+    use super::{
+        InterfaceUsesQueryError, LocalAliasReference, expand_local_alias_interface_references,
+        interface_uses_error_fingerprint,
+    };
     use crate::OwnerControlFlowResolutionError;
+    use sai_hir::{DefId, DefIndex, IndexVec};
+    use sai_intern::PackageInterner;
     use sai_vfs::FileId;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn error_fingerprint_excludes_session_local_file_ids() {
@@ -2610,5 +3254,67 @@ mod tests {
             interface_uses_error_fingerprint(&first),
             interface_uses_error_fingerprint(&second)
         );
+    }
+
+    #[test]
+    fn local_alias_expansion_visits_shared_suffixes_linearly() {
+        const ALIASES: usize = 4096;
+
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:test#1.0")
+            .expect("test package interns");
+        let mut definitions = IndexVec::<DefIndex, ()>::new();
+        let aliases = (0..ALIASES)
+            .map(|_| {
+                DefId::from_foreign(
+                    package,
+                    definitions.push(()).expect("alias index is allocated"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let targets = (0..ALIASES)
+            .map(|_| {
+                DefId::from_foreign(
+                    package,
+                    definitions
+                        .push(())
+                        .expect("target interface index is allocated"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let alias_references = aliases
+            .iter()
+            .enumerate()
+            .map(|(index, alias)| {
+                let mut references = vec![LocalAliasReference::InterfaceType(targets[index])];
+                if index + 1 < aliases.len() {
+                    references.push(LocalAliasReference::ModuleAlias(aliases[index + 1]));
+                    references.push(LocalAliasReference::ModuleAlias(aliases[index + 1]));
+                }
+                (*alias, references)
+            })
+            .collect::<HashMap<_, _>>();
+        let known_aliases = aliases.iter().copied().collect::<HashSet<_>>();
+        let incomplete_aliases = HashSet::new();
+        let mut expanded_aliases = HashSet::new();
+        let mut expanded_targets = Vec::new();
+        let mut work_units = 0usize;
+
+        for alias in &aliases {
+            let (targets, complete, alias_work_units) = expand_local_alias_interface_references(
+                *alias,
+                &alias_references,
+                &known_aliases,
+                &incomplete_aliases,
+                &mut expanded_aliases,
+            );
+            assert!(complete);
+            expanded_targets.extend(targets);
+            work_units += alias_work_units;
+        }
+
+        assert_eq!(expanded_targets, targets);
+        assert_eq!(work_units, ALIASES * 3 - 2);
     }
 }

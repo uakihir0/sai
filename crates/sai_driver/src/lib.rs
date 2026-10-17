@@ -16,6 +16,7 @@ use interface_resource_alias::{
 };
 use interface_use_queries::InterfaceUsesQueries;
 pub use interface_use_queries::InterfaceUsesQueryError;
+pub use interface_use_queries::WorldInterfaceUseGraph;
 pub use sai_wit::WitPackageDiagnosticTemplate;
 pub use wit_package_queries::{
     WitPackageFailure, WitPackageQueryError, WitPackageResult, WitPackageSourceFailure,
@@ -1079,6 +1080,7 @@ struct PreparedPhase1PackageScopes {
     declared_requirements: Option<Arc<[DeclaredRequirement]>>,
     foreign_packages: Vec<Phase1ForeignPackageScopes>,
     foreign_wit_views: Vec<OwnedPhase1ForeignWitView>,
+    active_wit_view_entries: Option<Vec<Phase1ActiveWitViewEntry>>,
     unavailable_foreign_wit_packages: Vec<String>,
     modules: Vec<OwnedPhase1ModuleInput>,
     def_paths: Arc<DefPathInterner>,
@@ -2275,6 +2277,8 @@ pub struct Phase1PackageScopesCollection {
     package_wit_names_fingerprint: Fingerprint,
     interface_uses: InterfaceUses,
     interface_uses_fingerprint: Fingerprint,
+    world_interface_uses: WorldInterfaceUseGraph,
+    world_interface_uses_fingerprint: Fingerprint,
     interface_check_diagnostics: Vec<Diagnostic>,
     input_fingerprint: Fingerprint,
     snapshot_id: WorkspaceSnapshotId,
@@ -2331,6 +2335,17 @@ impl Phase1PackageScopesCollection {
     /// definition paths, never the session-local order of the graph maps.
     pub const fn interface_uses_fingerprint(&self) -> Fingerprint {
         self.interface_uses_fingerprint
+    }
+
+    /// Ordered local and external interface-use identities consumed by world
+    /// elaboration.
+    pub fn world_interface_uses(&self) -> &WorldInterfaceUseGraph {
+        &self.world_interface_uses
+    }
+
+    /// Stable fingerprint for the ordered world interface-use projection.
+    pub const fn world_interface_uses_fingerprint(&self) -> Fingerprint {
+        self.world_interface_uses_fingerprint
     }
 
     /// Snapshot-bound interface-item diagnostics derived while collecting
@@ -9739,6 +9754,7 @@ impl RootDatabase {
             declared_requirements,
             foreign_packages: foreign_scopes.to_vec(),
             foreign_wit_views,
+            active_wit_view_entries: wit_view_scopes.map(|scopes| scopes.entries.clone()),
             unavailable_foreign_wit_packages,
             modules: owned_inputs,
             def_paths: Arc::clone(&def_paths),
@@ -9771,7 +9787,13 @@ impl RootDatabase {
             .package_wit_names
             .get(&mut self.query_database, package_key.clone(), snapshot)
             .map_err(Phase1CollectionError::PackageWitNamesQuery)?;
-        let (interface_uses, interface_uses_fingerprint, interface_check_diagnostics) = self
+        let (
+            interface_uses,
+            interface_uses_fingerprint,
+            world_interface_uses,
+            world_interface_uses_fingerprint,
+            interface_check_diagnostics,
+        ) = self
             .interface_uses
             .get(&mut self.query_database, package_key.clone(), snapshot)
             .map_err(Phase1CollectionError::InterfaceUsesQuery)?;
@@ -9796,6 +9818,8 @@ impl RootDatabase {
             package_wit_names_fingerprint,
             interface_uses,
             interface_uses_fingerprint,
+            world_interface_uses,
+            world_interface_uses_fingerprint,
             interface_check_diagnostics,
             input_fingerprint: output.input_fingerprint,
             snapshot_id: snapshot.id(),
@@ -36022,6 +36046,35 @@ mod tests {
         );
         assert_eq!(collection.interface_uses().uses, result.uses);
         assert_eq!(collection.interface_uses().cyclic, result.cyclic);
+        let world_uses = collection.world_interface_uses();
+        assert_eq!(world_uses.interfaces().len(), 2);
+        assert_eq!(
+            world_uses
+                .interfaces()
+                .iter()
+                .map(|interface| interface.key.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(
+            world_uses
+                .interfaces()
+                .iter()
+                .all(|interface| interface.uses_complete)
+        );
+        assert_eq!(
+            world_uses.edges(),
+            [
+                sai_resolve::InterfaceUse {
+                    from: first.to_def_id(),
+                    to: second.to_def_id(),
+                },
+                sai_resolve::InterfaceUse {
+                    from: second.to_def_id(),
+                    to: first.to_def_id(),
+                },
+            ]
+        );
         assert_eq!(
             collection.interface_uses().diagnostics[0]
                 .primary()
@@ -36035,6 +36088,126 @@ mod tests {
             Fingerprint::default(),
             "tracked interface uses have a stable result fingerprint"
         );
+        assert_ne!(
+            collection.world_interface_uses_fingerprint(),
+            Fingerprint::default(),
+            "world interface uses have a stable result fingerprint"
+        );
+    }
+
+    #[test]
+    fn world_interface_use_projection_marks_unresolved_type_paths_incomplete() {
+        let root = concat!(
+            "interface api {\n",
+            "  type Request = missing.Response\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+
+        let graph = collection.world_interface_uses();
+        assert_eq!(graph.interfaces().len(), 1);
+        assert_eq!(graph.interfaces()[0].key, "api");
+        assert!(!graph.interfaces()[0].uses_complete);
+        assert!(graph.edges().is_empty());
+    }
+
+    #[test]
+    fn world_interface_use_projection_marks_recovered_type_nodes_incomplete() {
+        let root = concat!(
+            "type Inferred = _\n",
+            "type Missing =\n",
+            "interface direct {\n",
+            "  type Value = _\n",
+            "}\n",
+            "interface through_alias {\n",
+            "  type Value = Inferred\n",
+            "}\n",
+            "interface recovered_alias {\n",
+            "  type Value = Missing\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+
+        let graph = collection.world_interface_uses();
+        assert_eq!(graph.interfaces().len(), 3);
+        assert!(
+            graph
+                .interfaces()
+                .iter()
+                .all(|interface| !interface.uses_complete),
+            "{:?}",
+            graph.interfaces()
+        );
+        assert!(graph.edges().is_empty());
+    }
+
+    #[test]
+    fn world_interface_use_projection_keeps_resolved_generic_alias_complete() {
+        let root = concat!(
+            "type Identity<T> = T\n",
+            "interface api {\n",
+            "  type Value = Identity<U32>\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+
+        let graph = collection.world_interface_uses();
+        assert_eq!(graph.interfaces().len(), 1);
+        assert_eq!(graph.interfaces()[0].key, "api");
+        assert!(graph.interfaces()[0].uses_complete);
+        assert!(graph.edges().is_empty());
+    }
+
+    #[test]
+    fn world_interface_use_projection_omits_local_self_uses() {
+        let root = concat!(
+            "interface api {\n",
+            "  type Value = U32\n",
+            "  fn echo(value: Value) -> Value\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 interface scopes collect");
+
+        let graph = collection.world_interface_uses();
+        assert_eq!(graph.interfaces().len(), 1);
+        assert!(graph.interfaces()[0].uses_complete);
+        assert!(graph.edges().is_empty());
     }
 
     #[test]
@@ -36724,8 +36897,15 @@ mod tests {
     fn interface_check_reports_generated_use_alias_from_foreign_wit() {
         let root = concat!(
             "use acme:codec/iface as codec\n",
+            "use acme:codec/base as base\n",
+            "type RemoteUser = codec.FetchUser\n",
+            "type RemoteProfile = base.Profile\n",
             "interface api {\n",
             "  fn fetch_user(value: codec.FetchUser)\n",
+            "}\n",
+            "interface adapter {\n",
+            "  fn store_user(value: RemoteUser)\n",
+            "  fn store_profile(value: RemoteProfile)\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
@@ -36789,7 +36969,7 @@ mod tests {
             .set_file_contents(
                 FileKey::new(codec_key.as_str(), "wit/api.wit").expect("WIT file key is valid"),
                 Arc::from(
-                    &b"package acme:codec@1.0.0; interface iface { record fetch-user { value: u32 } }"[..],
+                    &b"package acme:codec@1.0.0; interface base { record fetch-user { value: u32 } record profile { value: string } } interface iface { use base.{fetch-user}; }"[..],
                 ),
                 Durability::Low,
             )
@@ -36833,6 +37013,53 @@ mod tests {
                     location.span.range.start().to_usize()..location.span.range.end().to_usize()
                 ).is_some_and(|text| text.contains("codec.FetchUser"))
         ));
+        let world_uses = collection.world_interface_uses();
+        let api = world_uses
+            .interfaces()
+            .iter()
+            .find(|interface| interface.key == "api")
+            .expect("local API interface is present")
+            .interface;
+        let adapter = world_uses
+            .interfaces()
+            .iter()
+            .find(|interface| interface.key == "adapter")
+            .expect("local adapter interface is present")
+            .interface;
+        let base = world_uses
+            .interfaces()
+            .iter()
+            .find(|interface| interface.key == "acme:codec/base")
+            .expect("foreign base interface is present");
+        let iface = world_uses
+            .interfaces()
+            .iter()
+            .find(|interface| interface.key == "acme:codec/iface")
+            .expect("foreign used interface is present");
+        assert!(base.uses_complete);
+        assert!(iface.uses_complete);
+        assert!(world_uses.edges().contains(&sai_resolve::InterfaceUse {
+            from: api,
+            to: iface.interface,
+        }));
+        assert!(
+            world_uses.edges().contains(&sai_resolve::InterfaceUse {
+                from: adapter,
+                to: iface.interface,
+            }),
+            "aliases of WIT Used items preserve local-to-view interface use edges"
+        );
+        assert!(
+            world_uses.edges().contains(&sai_resolve::InterfaceUse {
+                from: adapter,
+                to: base.interface,
+            }),
+            "aliases of WIT records preserve local-to-view interface use edges"
+        );
+        assert!(world_uses.edges().contains(&sai_resolve::InterfaceUse {
+            from: iface.interface,
+            to: base.interface,
+        }));
     }
 
     #[test]
