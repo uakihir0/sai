@@ -180,6 +180,7 @@ pub struct WitView {
     /// `None` entries are stable indices of definitions removed by a later
     /// revision of this view.
     pub defs: IndexVec<DefIndex, Option<WitViewDef>>,
+    definition_by_entity: HashMap<WitViewEntity, DefId>,
     /// The model is retained so entity addresses in `defs` remain meaningful.
     pub model: WitPackage,
     /// Owns the scope used by this view's `DefId`s.
@@ -463,9 +464,19 @@ impl WitView {
             interfaces,
             worlds,
             defs,
+            definition_by_entity: entity_defs,
             model,
             def_paths,
         })
+    }
+
+    /// Returns the exact scoped `DefId` for one view entity.
+    ///
+    /// Reconstructing a foreign ID from its package and index loses the
+    /// definition-path scope carried by the view, so adapters that translate
+    /// model addresses must use this lookup.
+    pub fn definition_for_entity(&self, entity: WitViewEntity) -> Option<DefId> {
+        self.definition_by_entity.get(&entity).copied()
     }
 
     /// Returns a view definition by a runtime `DefId`.
@@ -2164,6 +2175,64 @@ mod tests {
         assert_eq!(foreign_id.index, definition.index);
         assert_ne!(foreign_id, definition);
         assert!(view.definition(foreign_id).is_none());
+    }
+
+    #[test]
+    fn entity_lookup_returns_exact_scoped_interface_world_and_function_ids() {
+        let view = built(false, false);
+        let interface = &view.interfaces["files"];
+        assert_eq!(
+            view.definition_for_entity(WitViewEntity::Interface {
+                interface: interface.wit
+            }),
+            Some(interface.def)
+        );
+
+        let world = &view.worlds["client"];
+        assert_eq!(
+            view.definition_for_entity(WitViewEntity::World { world: world.wit }),
+            Some(world.def)
+        );
+
+        let import = view
+            .definition_for_entity(WitViewEntity::WorldFunction {
+                world: world.wit,
+                import: true,
+                item: 0,
+            })
+            .expect("the imported function has a view definition");
+        assert_eq!(world.import_fns.get("connect"), Some(&import));
+        assert_eq!(
+            view.definition(import).map(|definition| definition.entity),
+            Some(WitViewEntity::WorldFunction {
+                world: world.wit,
+                import: true,
+                item: 0,
+            })
+        );
+        let export = view
+            .definition_for_entity(WitViewEntity::WorldFunction {
+                world: world.wit,
+                import: false,
+                item: 0,
+            })
+            .expect("the exported function has a view definition");
+        assert_eq!(
+            view.definition(export).map(|definition| definition.entity),
+            Some(WitViewEntity::WorldFunction {
+                world: world.wit,
+                import: false,
+                item: 0,
+            })
+        );
+        assert_eq!(
+            view.definition_for_entity(WitViewEntity::WorldFunction {
+                world: world.wit,
+                import: true,
+                item: 100,
+            }),
+            None
+        );
     }
 
     #[test]
