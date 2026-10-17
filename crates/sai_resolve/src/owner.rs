@@ -121,6 +121,23 @@ impl LocalResolution {
             && source_map.matches_snapshot_file(snapshot)
             && self.module_aliases == *module_aliases
     }
+
+    /// Checks that these lexical results belong to the supplied body and
+    /// snapshot, without rechecking the module-alias set used during binding
+    /// shadow analysis.
+    pub fn matches_body_source(
+        &self,
+        body: &Body<'_>,
+        source_map: &HirSourceMap,
+        snapshot: &WorkspaceSnapshot,
+    ) -> bool {
+        self.owner == body.owner
+            && self.source_file == source_map.file()
+            && self.body_source_id == body.source_id
+            && self.source_ref == *source_map.source_ref()
+            && source_map.matches_body(body)
+            && source_map.matches_snapshot_file(snapshot)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1775,6 +1792,10 @@ fn push_path_args<'hir>(work: &mut Vec<Work<'hir>>, path: sai_hir::types::Path<'
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world_members::{
+        DeferredWorldField, WorldFieldResolution, WorldFieldResolutionInput, WorldImportFnLookup,
+        WorldMemberDeferral, resolve_owner_world_fields,
+    };
     use sai_hir::arena::HirArena;
     use sai_hir::body::{BodyParam, Contract, ContractKind};
     use sai_hir::expressions::{CaptureBy, Closure, LoopSource, MatchSource};
@@ -1782,8 +1803,8 @@ mod tests {
     use sai_hir::source_map::HirSourceMapBuilder;
     use sai_hir::types::{Name, Path, PathRoot, PathSegment};
     use sai_hir::{
-        DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, OwnerId,
-        Span as HirSpan, SpanCtxt,
+        DefId, DefIndex, DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId,
+        OwnerId, Span as HirSpan, SpanCtxt,
     };
     use sai_intern::{Idx, Interner, ItemLocalId, PackageInterner};
     use sai_syntax::ast::AstIdMap;
@@ -1988,6 +2009,546 @@ mod tests {
             contracts,
             invariant_preds: &[],
         })
+    }
+
+    fn test_def_id(owner: OwnerId, index: u32) -> DefId {
+        DefId::from_foreign(owner.def_id.package(), DefIndex::from_raw(index))
+    }
+
+    fn resolve_world_field_fixture<'hir>(
+        arena: &'hir HirArena<'hir>,
+        owner: OwnerId,
+        root: &'hir Expr<'hir>,
+        text: &str,
+        symbols: &Interner,
+        local_paths: HashMap<HirId, PathRes>,
+        module_paths: HashMap<HirId, PathRes>,
+        input: WorldFieldResolutionInput,
+    ) -> WorldFieldResolution {
+        let (snapshot, source_map) = local_source_context_with(owner, text, None);
+        let body = body(arena, owner, source_map.source_id(), &[], root, &[]);
+        let mut locals = LocalResolution::new(
+            owner,
+            source_map.source_ref().clone(),
+            source_map.file(),
+            source_map.source_id(),
+            &HashSet::new(),
+        );
+        locals.paths = local_paths;
+        let module_paths = ModuleResolution {
+            owner,
+            paths: module_paths,
+            deferred_paths: Vec::new(),
+        };
+        resolve_owner_world_fields(
+            body,
+            &source_map,
+            &snapshot,
+            symbols,
+            &locals,
+            &module_paths,
+            &input,
+        )
+        .expect("world fields resolve")
+    }
+
+    fn world_member_path<'hir>(
+        arena: &'hir HirArena<'hir>,
+        owner: OwnerId,
+        local: u32,
+        symbol: sai_hir::Symbol,
+    ) -> (&'hir Expr<'hir>, HirId) {
+        let path_expr = local_path_expr(arena, owner, local, 0, 1, symbol, PathRoot::Plain);
+        let path_hir_id = match path_expr.kind {
+            ExprKind::Path(path) => path.hir_id,
+            _ => unreachable!("test helper constructs a path"),
+        };
+        (path_expr, path_hir_id)
+    }
+
+    fn world_field_expr<'hir>(
+        arena: &'hir HirArena<'hir>,
+        owner: OwnerId,
+        local: u32,
+        base: &'hir Expr<'hir>,
+        name: sai_hir::Symbol,
+        start: u32,
+        end: u32,
+    ) -> &'hir Expr<'hir> {
+        expr(
+            arena,
+            owner,
+            local,
+            0,
+            end,
+            ExprKind::Field {
+                base,
+                name: local_name(name, start, end),
+                args: None,
+            },
+        )
+    }
+
+    #[test]
+    fn world_import_field_resolves_to_its_function_definition() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let world_name = symbols.intern("w").expect("world name interns");
+        let field_name = symbols.intern("f").expect("field name interns");
+        let world = test_def_id(owner, 101);
+        let function = test_def_id(owner, 102);
+        let (base, path_hir_id) = world_member_path(&arena, owner, 0, world_name);
+        let field = world_field_expr(&arena, owner, 10, base, field_name, 2, 3);
+        let mut input = WorldFieldResolutionInput::default();
+        input.local_worlds.insert(world);
+        input.world_imports.insert(
+            world,
+            WorldImportFnLookup {
+                imports: std::collections::BTreeMap::from([("f".to_owned(), function)]),
+                state: crate::world_members::WorldImportLookupState::Complete,
+                export_fns: std::collections::BTreeSet::new(),
+            },
+        );
+        let result = resolve_world_field_fixture(
+            &arena,
+            owner,
+            field,
+            "w.f",
+            &symbols,
+            HashMap::new(),
+            HashMap::from([(
+                path_hir_id,
+                PathRes {
+                    base: Res::Def(crate::package_scopes::DefKind::World, world),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            )]),
+            input,
+        );
+
+        assert_eq!(
+            result.fields.get(&field.hir_id),
+            Some(&Res::Def(crate::package_scopes::DefKind::WorldFn, function))
+        );
+        assert!(result.diagnostics.is_empty());
+        assert!(result.deferred.is_empty());
+    }
+
+    #[test]
+    fn world_import_field_respects_local_shadow_and_falls_through_non_worlds() {
+        let owner = owner_id();
+        let world = test_def_id(owner, 101);
+        let function = test_def_id(owner, 102);
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let world_name = symbols.intern("w").expect("world name interns");
+        let field_name = symbols.intern("f").expect("field name interns");
+        let (base, path_hir_id) = world_member_path(&arena, owner, 0, world_name);
+        let field = world_field_expr(&arena, owner, 10, base, field_name, 2, 3);
+        let mut input = WorldFieldResolutionInput::default();
+        input.local_worlds.insert(world);
+        input.world_imports.insert(
+            world,
+            WorldImportFnLookup {
+                imports: std::collections::BTreeMap::from([("f".to_owned(), function)]),
+                state: crate::world_members::WorldImportLookupState::Complete,
+                export_fns: std::collections::BTreeSet::new(),
+            },
+        );
+        let shadowed = resolve_world_field_fixture(
+            &arena,
+            owner,
+            field,
+            "w.f",
+            &symbols,
+            HashMap::from([(
+                path_hir_id,
+                PathRes {
+                    base: Res::Local(BindingId::from_raw(0)),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            )]),
+            HashMap::from([(
+                path_hir_id,
+                PathRes {
+                    base: Res::Def(crate::package_scopes::DefKind::World, world),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            )]),
+            input.clone(),
+        );
+
+        assert!(shadowed.fields.is_empty());
+        assert!(shadowed.diagnostics.is_empty());
+        assert_eq!(
+            shadowed.deferred,
+            [DeferredWorldField {
+                hir_id: field.hir_id,
+                reason: WorldMemberDeferral::OrdinaryMember,
+            }]
+        );
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let world_name = symbols.intern("w").expect("world name interns");
+        let field_name = symbols.intern("f").expect("field name interns");
+        let (base, path_hir_id) = world_member_path(&arena, owner, 20, world_name);
+        let field = world_field_expr(&arena, owner, 30, base, field_name, 2, 3);
+        let non_world = resolve_world_field_fixture(
+            &arena,
+            owner,
+            field,
+            "w.f",
+            &symbols,
+            HashMap::new(),
+            HashMap::from([(
+                path_hir_id,
+                PathRes {
+                    base: Res::Def(crate::package_scopes::DefKind::Fn, function),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            )]),
+            input,
+        );
+        assert!(non_world.fields.is_empty());
+        assert!(non_world.diagnostics.is_empty());
+        assert_eq!(
+            non_world.deferred,
+            [DeferredWorldField {
+                hir_id: field.hir_id,
+                reason: WorldMemberDeferral::OrdinaryMember,
+            }]
+        );
+    }
+
+    #[test]
+    fn partial_world_base_path_is_deferred() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let world_name = symbols.intern("w").expect("world name interns");
+        let field_name = symbols.intern("f").expect("field name interns");
+        let world = test_def_id(owner, 101);
+        let function = test_def_id(owner, 102);
+        let (base, path_hir_id) = world_member_path(&arena, owner, 0, world_name);
+        let field = world_field_expr(&arena, owner, 10, base, field_name, 2, 3);
+        let mut input = WorldFieldResolutionInput::default();
+        input.local_worlds.insert(world);
+        input.world_imports.insert(
+            world,
+            WorldImportFnLookup {
+                imports: std::collections::BTreeMap::from([("f".to_owned(), function)]),
+                state: crate::world_members::WorldImportLookupState::Complete,
+                export_fns: std::collections::BTreeSet::new(),
+            },
+        );
+        let result = resolve_world_field_fixture(
+            &arena,
+            owner,
+            field,
+            "w.f",
+            &symbols,
+            HashMap::new(),
+            HashMap::from([(
+                path_hir_id,
+                PathRes {
+                    base: Res::Def(crate::package_scopes::DefKind::World, world),
+                    resolved_segments: 1,
+                    segment_count: 2,
+                },
+            )]),
+            input,
+        );
+
+        assert!(result.fields.is_empty());
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(
+            result.deferred,
+            [DeferredWorldField {
+                hir_id: field.hir_id,
+                reason: WorldMemberDeferral::BasePathUnresolved,
+            }]
+        );
+    }
+
+    #[test]
+    fn missing_world_import_notes_an_elaborated_export_from_an_included_world() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let symbols = Interner::new();
+        let world_name = symbols.intern("w").expect("world name interns");
+        let field_name = symbols.intern("f").expect("field name interns");
+        let world = test_def_id(owner, 101);
+        let (base, path_hir_id) = world_member_path(&arena, owner, 0, world_name);
+        let field = world_field_expr(&arena, owner, 10, base, field_name, 2, 3);
+        let mut input = WorldFieldResolutionInput::default();
+        input.local_worlds.insert(world);
+        input.world_imports.insert(
+            world,
+            WorldImportFnLookup {
+                imports: std::collections::BTreeMap::new(),
+                state: crate::world_members::WorldImportLookupState::Complete,
+                // The caller supplies this world's elaborated export set,
+                // including functions contributed by `include`.
+                export_fns: std::collections::BTreeSet::from(["f".to_owned()]),
+            },
+        );
+        let result = resolve_world_field_fixture(
+            &arena,
+            owner,
+            field,
+            "w.f",
+            &symbols,
+            HashMap::new(),
+            HashMap::from([(
+                path_hir_id,
+                PathRes {
+                    base: Res::Def(crate::package_scopes::DefKind::World, world),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            )]),
+            input,
+        );
+
+        assert_eq!(result.diagnostics.len(), 1);
+        let diagnostic = &result.diagnostics[0];
+        assert_eq!(diagnostic.code, Code::UnresolvedName);
+        assert_eq!(diagnostic.primary_label, "unresolved world function");
+        assert_eq!(
+            diagnostic.primary().expect("primary location").span.range,
+            TextRange::new(TextSize::new(2), TextSize::new(3)).expect("span")
+        );
+        assert_eq!(diagnostic.children().len(), 1);
+        assert_eq!(
+            diagnostic.children()[0].kind,
+            sai_diagnostics::ChildKind::Note
+        );
+        assert_eq!(
+            diagnostic.children()[0].message,
+            "an exported world function is called through its implementation."
+        );
+    }
+
+    #[test]
+    fn incomplete_or_cycle_unsafe_world_lookup_defers_even_known_hits() {
+        for (state, reason) in [
+            (
+                crate::world_members::WorldImportLookupState::Incomplete,
+                WorldMemberDeferral::ImportLookupIncomplete,
+            ),
+            (
+                crate::world_members::WorldImportLookupState::CycleUnsafe,
+                WorldMemberDeferral::CycleUnsafeImportLookup,
+            ),
+        ] {
+            let arena = HirArena::new();
+            let owner = owner_id();
+            let symbols = Interner::new();
+            let world_name = symbols.intern("w").expect("world name interns");
+            let field_name = symbols.intern("f").expect("field name interns");
+            let world = test_def_id(owner, 101);
+            let function = test_def_id(owner, 102);
+            let (base, path_hir_id) = world_member_path(&arena, owner, 0, world_name);
+            let field = world_field_expr(&arena, owner, 10, base, field_name, 2, 3);
+            let mut input = WorldFieldResolutionInput::default();
+            input.local_worlds.insert(world);
+            input.world_imports.insert(
+                world,
+                WorldImportFnLookup {
+                    imports: std::collections::BTreeMap::from([("f".to_owned(), function)]),
+                    state,
+                    export_fns: std::collections::BTreeSet::new(),
+                },
+            );
+            let result = resolve_world_field_fixture(
+                &arena,
+                owner,
+                field,
+                "w.f",
+                &symbols,
+                HashMap::new(),
+                HashMap::from([(
+                    path_hir_id,
+                    PathRes {
+                        base: Res::Def(crate::package_scopes::DefKind::World, world),
+                        resolved_segments: 1,
+                        segment_count: 1,
+                    },
+                )]),
+                input,
+            );
+            assert!(result.fields.is_empty());
+            assert!(result.diagnostics.is_empty());
+            assert_eq!(
+                result.deferred,
+                [DeferredWorldField {
+                    hir_id: field.hir_id,
+                    reason,
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn external_world_field_is_wrong_name_kind() {
+        let arena = HirArena::new();
+        let owner = owner_id();
+        let packages = PackageInterner::new();
+        let external_package = packages
+            .intern("other:package#1.0")
+            .expect("external package interns");
+        let external_world = DefId::from_foreign(external_package, DefIndex::from_raw(1));
+        let symbols = Interner::new();
+        let world_name = symbols.intern("foreign").expect("world name interns");
+        let field_name = symbols.intern("f").expect("field name interns");
+        let (base, path_hir_id) = world_member_path(&arena, owner, 0, world_name);
+        let field = world_field_expr(&arena, owner, 10, base, field_name, 8, 9);
+        let result = resolve_world_field_fixture(
+            &arena,
+            owner,
+            field,
+            "foreign.f",
+            &symbols,
+            HashMap::new(),
+            HashMap::from([(
+                path_hir_id,
+                PathRes {
+                    base: Res::Def(crate::package_scopes::DefKind::World, external_world),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            )]),
+            WorldFieldResolutionInput::default(),
+        );
+
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.diagnostics[0].code, Code::WrongNameKind);
+        assert_eq!(
+            result.diagnostics[0]
+                .primary()
+                .expect("primary location")
+                .span
+                .range
+                .start()
+                .raw(),
+            8
+        );
+    }
+
+    #[test]
+    fn world_fn_extra_field_errors_but_call_result_field_falls_through() {
+        let owner = owner_id();
+        let world = test_def_id(owner, 101);
+        let function = test_def_id(owner, 102);
+        let mut input = WorldFieldResolutionInput::default();
+        input.local_worlds.insert(world);
+        input.world_imports.insert(
+            world,
+            WorldImportFnLookup {
+                imports: std::collections::BTreeMap::from([("f".to_owned(), function)]),
+                state: crate::world_members::WorldImportLookupState::Complete,
+                export_fns: std::collections::BTreeSet::new(),
+            },
+        );
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let world_name = symbols.intern("w").expect("world name interns");
+        let f_name = symbols.intern("f").expect("field name interns");
+        let g_name = symbols.intern("g").expect("field name interns");
+        let (base, path_hir_id) = world_member_path(&arena, owner, 0, world_name);
+        let imported_fn = world_field_expr(&arena, owner, 10, base, f_name, 2, 3);
+        let extra_field = world_field_expr(&arena, owner, 11, imported_fn, g_name, 4, 5);
+        let wrong_kind = resolve_world_field_fixture(
+            &arena,
+            owner,
+            extra_field,
+            "w.f.g",
+            &symbols,
+            HashMap::new(),
+            HashMap::from([(
+                path_hir_id,
+                PathRes {
+                    base: Res::Def(crate::package_scopes::DefKind::World, world),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            )]),
+            input.clone(),
+        );
+        assert_eq!(
+            wrong_kind.fields.get(&imported_fn.hir_id),
+            Some(&Res::Def(crate::package_scopes::DefKind::WorldFn, function))
+        );
+        assert_eq!(wrong_kind.diagnostics.len(), 1);
+        assert_eq!(wrong_kind.diagnostics[0].code, Code::WrongNameKind);
+        assert_eq!(
+            wrong_kind.diagnostics[0]
+                .primary()
+                .expect("primary location")
+                .span
+                .range
+                .start()
+                .raw(),
+            4
+        );
+
+        let arena = HirArena::new();
+        let symbols = Interner::new();
+        let world_name = symbols.intern("w").expect("world name interns");
+        let f_name = symbols.intern("f").expect("field name interns");
+        let g_name = symbols.intern("g").expect("field name interns");
+        let (base, path_hir_id) = world_member_path(&arena, owner, 0, world_name);
+        let imported_fn = world_field_expr(&arena, owner, 10, base, f_name, 2, 3);
+        let call = expr(
+            &arena,
+            owner,
+            12,
+            0,
+            5,
+            ExprKind::Call {
+                callee: imported_fn,
+                args: &[],
+                base: None,
+            },
+        );
+        let call_result_field = world_field_expr(&arena, owner, 13, call, g_name, 4, 5);
+        let call_result = resolve_world_field_fixture(
+            &arena,
+            owner,
+            call_result_field,
+            "w.f().g",
+            &symbols,
+            HashMap::new(),
+            HashMap::from([(
+                path_hir_id,
+                PathRes {
+                    base: Res::Def(crate::package_scopes::DefKind::World, world),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            )]),
+            input,
+        );
+        assert_eq!(
+            call_result.fields.get(&imported_fn.hir_id),
+            Some(&Res::Def(crate::package_scopes::DefKind::WorldFn, function))
+        );
+        assert!(call_result.diagnostics.is_empty());
+        assert_eq!(
+            call_result.deferred,
+            [DeferredWorldField {
+                hir_id: call_result_field.hir_id,
+                reason: WorldMemberDeferral::OrdinaryMember,
+            }]
+        );
     }
 
     #[test]

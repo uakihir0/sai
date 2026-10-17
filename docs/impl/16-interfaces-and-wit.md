@@ -1527,3 +1527,11 @@ See [implementation-review.md](../design/implementation-review.md) for the decis
 The snapshot- and collection-bound `resolve_world_import_fns` adapter now captures direct local `import fn` declarations and include references in one source-ordered sequence, builds external import maps from the validated active WIT-view closure, and calls `sai_resolve::world_import_fns`. Foreign source-package worlds resolve to their matching Generated WIT world by the source collection's `package_wit_names` entry. An unavailable generated view leaves the package path deferred. An include of a WIT world marked unsupported receives `WIT_UNSUPPORTED_FEATURE` at its `WorldRef` and does not contribute functions.
 
 See [implementation-review.md](../design/implementation-review.md) for the decision record, verification, hostile review, human review items, and remaining `w.f` expression-resolution scope.
+
+### IR-635: Resolve world import fields in HIR bodies
+
+The data-only `sai_resolve::resolve_owner_world_fields` pass scans body expressions for `Field` nodes. A complete direct path resolving to a local package world looks up the canonical SAI member name in its supplied imported-function map and records `Res::Def(DefKind::WorldFn, DefId)` by the field expression's `HirId`. It emits `UNRESOLVED_NAME` at the field name only for complete lookups, adds the export-implementation note when the world's elaborated export set contains that name, and emits `WRONG_NAME_KIND` for a foreign world or a further field after a world function. Ordinary receivers, local shadows, incomplete bases, and call-result member access remain deferred.
+
+The lookup input distinguishes complete, incomplete, and cycle-unsafe maps. Incomplete and cycle-unsafe maps defer both hits and misses because either an earlier unresolved include or an unsuppressed cyclic include can invalidate the apparent first winner. This pass has no driver or type-checker integration yet.
+
+See [implementation-review.md](../design/implementation-review.md) for the decision record, tests, hostile review, human review items, and remaining integration scope.

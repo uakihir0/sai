@@ -19,6 +19,7 @@ pub mod wit_name;
 pub mod wit_name_collisions;
 pub mod world_import_fns;
 pub mod world_includes;
+pub mod world_members;
 
 pub use interface_impls::{
     InterfaceImpl, InterfaceImplFunction, InterfaceImplInput, InterfaceImplInterface,
@@ -40,6 +41,10 @@ pub use world_import_fns::{
 };
 pub use world_includes::{
     WorldIncludeReference, WorldIncludes, WorldIncludesInput, world_includes,
+};
+pub use world_members::{
+    DeferredWorldField, WorldFieldResolution, WorldFieldResolutionError, WorldFieldResolutionInput,
+    WorldImportFnLookup, WorldImportLookupState, WorldMemberDeferral, resolve_owner_world_fields,
 };
 
 use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Value};
