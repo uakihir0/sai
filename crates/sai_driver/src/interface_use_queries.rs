@@ -472,6 +472,76 @@ pub(super) fn append_world_function_name_diagnostics(
     Ok(())
 }
 
+pub(super) fn append_world_function_boundary_diagnostics(
+    issues: &[sai_ty::world::WorldFunctionBoundaryIssue],
+    snapshot: &WorkspaceSnapshot,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<(), OwnerControlFlowResolutionError> {
+    let mut issues = issues.to_vec();
+    issues.sort_by_key(|issue| {
+        (
+            issue.incompatible.span.file,
+            issue.incompatible.span.range.start(),
+            issue.incompatible.span.range.end(),
+        )
+    });
+    for issue in issues {
+        let span = issue.incompatible.span;
+        let snapshot_file = snapshot.file(span.file).ok_or(
+            OwnerControlFlowResolutionError::MissingSnapshotFile(span.file),
+        )?;
+        let source = Arc::clone(snapshot_file.source());
+        let source_ref = SourceRef {
+            path: snapshot_file.path().to_owned(),
+            package: snapshot_file.package().map(str::to_owned),
+            snapshot: snapshot_file.document_version(),
+        };
+        let location = Location::from_decoded_source(
+            source_ref,
+            sai_diagnostics::Span::new(span.file, span.range),
+            source.as_ref(),
+        )
+        .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+            issue.owner,
+        ))?;
+        let position_name = boundary_position_name(issue.position);
+        let (reason_name, reason_message) =
+            boundary_incompatibility_message(issue.incompatible.reason);
+        let mut diagnostic = Diagnostic::new(
+            sai_diagnostics::Code::WitIncompatibleType,
+            Severity::Error,
+            format!("{reason_message} in {position_name} position"),
+            Some(location),
+        );
+        diagnostic.primary_label = "incompatible WIT boundary type".to_owned();
+        diagnostic.package = snapshot_file.package().map(str::to_owned);
+        diagnostic.data.insert(
+            "wit_position".to_owned(),
+            Value::String(position_name.to_owned()),
+        );
+        diagnostic.data.insert(
+            "wit_incompatibility".to_owned(),
+            Value::String(reason_name.to_owned()),
+        );
+        if let Some(help) = boundary_incompatibility_help(issue.incompatible.reason) {
+            diagnostic
+                .push_child(Child {
+                    kind: ChildKind::Help,
+                    message: help.to_owned(),
+                    location: None,
+                })
+                .expect("unbound diagnostics accept help children");
+        }
+        diagnostics.push(
+            diagnostic
+                .with_workspace_snapshot(snapshot)
+                .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(issue.owner))?,
+        );
+    }
+    super::sort_phase1_diagnostics(diagnostics);
+    Ok(())
+}
+
 fn wit_name_definition(
     name: Name,
     owner: OwnerId,

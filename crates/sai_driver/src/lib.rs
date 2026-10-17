@@ -2880,6 +2880,11 @@ pub enum WorldItemTestOnlyKind {
     Include,
 }
 
+struct WorldBoundaryAliases<'hir> {
+    definitions: HashMap<DefId, sai_ty::boundary::BoundaryAlias<'hir>>,
+    path_resolutions: HashMap<HirId, PathRes>,
+}
+
 /// Test-only references found in one direct world item.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorldItemTestOnlyResolution {
@@ -2887,6 +2892,7 @@ pub struct WorldItemTestOnlyResolution {
     owner: OwnerId,
     kind: WorldItemTestOnlyKind,
     world_function_name_issues: Vec<sai_ty::iface::InterfaceCheckIssue>,
+    world_function_boundary_issues: Vec<sai_ty::world::WorldFunctionBoundaryIssue>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
@@ -2909,6 +2915,10 @@ impl WorldItemTestOnlyResolution {
 
     pub fn world_function_name_issues(&self) -> &[sai_ty::iface::InterfaceCheckIssue] {
         &self.world_function_name_issues
+    }
+
+    pub fn world_function_boundary_issues(&self) -> &[sai_ty::world::WorldFunctionBoundaryIssue] {
+        &self.world_function_boundary_issues
     }
 
     pub fn type_path_resolution(
@@ -2982,6 +2992,7 @@ pub struct WorldTestOnlyResolutions {
     target_cfg: TargetCfg,
     collection_input_fingerprint: Fingerprint,
     member_scope_closure_fingerprint: Option<Fingerprint>,
+    wit_view_closure_fingerprint: Option<Fingerprint>,
     owners: Vec<WorldOwnerTestOnlyResolution>,
 }
 
@@ -3008,6 +3019,16 @@ impl WorldTestOnlyResolutions {
         self.matches_collection(collection)
             && member_scopes.matches_collection(collection)
             && self.member_scope_closure_fingerprint == Some(member_scopes.closure_fingerprint)
+    }
+
+    pub fn matches_wit_view_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> bool {
+        self.matches_collection(collection)
+            && wit_view_scopes.matches_collection(collection)
+            && self.wit_view_closure_fingerprint == Some(wit_view_scopes.closure_fingerprint)
     }
 
     pub const fn member_scope_closure_fingerprint(&self) -> Option<Fingerprint> {
@@ -13620,13 +13641,15 @@ impl RootDatabase {
             return Ok(elaborated);
         }
 
-        let test_only = self.resolve_world_test_only_paths_with_member_scopes(
+        let test_only = self.resolve_world_test_only_paths_with_scopes(
             collection,
             module_tree,
             snapshot,
             member_scopes,
+            wit_view_scopes,
         )?;
         if !test_only.matches_member_scopes(collection, member_scopes)
+            || !test_only.matches_wit_view_scopes(collection, wit_view_scopes)
             || !test_only.matches_snapshot(snapshot)
         {
             return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
@@ -13660,8 +13683,19 @@ impl RootDatabase {
             .flat_map(WorldItemTestOnlyResolution::world_function_name_issues)
             .cloned()
             .collect::<Vec<_>>();
+        let boundary_issues = owner_result
+            .items()
+            .iter()
+            .flat_map(WorldItemTestOnlyResolution::world_function_boundary_issues)
+            .copied()
+            .collect::<Vec<_>>();
         interface_use_queries::append_world_function_name_diagnostics(
             &issues,
+            snapshot,
+            &mut elaborated.diagnostics,
+        )?;
+        interface_use_queries::append_world_function_boundary_diagnostics(
+            &boundary_issues,
             snapshot,
             &mut elaborated.diagnostics,
         )?;
@@ -14313,6 +14347,39 @@ impl RootDatabase {
             Some(member_scopes),
             None,
             None,
+        )
+    }
+
+    /// Resolves world-function signatures with both validated source-member
+    /// and WIT-view closures available for boundary type classification.
+    pub fn resolve_world_test_only_paths_with_scopes(
+        &mut self,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<WorldTestOnlyResolutions, OwnerControlFlowResolutionError> {
+        if collection.session_token != self.session_token {
+            return Err(OwnerControlFlowResolutionError::SessionMismatch);
+        }
+        if !member_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::PackageGraphMismatch(collection.package_key.clone()),
+            ));
+        }
+        if !wit_view_scopes.matches_collection(collection) {
+            return Err(OwnerControlFlowResolutionError::ModuleMemberScopes(
+                Phase1ModuleMemberScopeError::WitViewScopeMismatch(collection.package_key.clone()),
+            ));
+        }
+        self.resolve_world_test_only_paths_inner(
+            collection,
+            module_tree,
+            snapshot,
+            Some(member_scopes),
+            None,
+            Some((member_scopes, wit_view_scopes)),
         )
     }
 
@@ -15323,13 +15390,63 @@ impl RootDatabase {
                     .map(Phase1ModuleMemberScopePackage::scopes),
             );
         }
-        let module_members = ModuleMemberIndex::new(indexed_scopes);
+        let world_symbols = Arc::clone(&self.symbols);
+        let module_members = match world_reference_scopes {
+            Some((_, wit_view_scopes)) => ModuleMemberIndex::new_with_wit_views(
+                indexed_scopes.clone(),
+                wit_view_scopes.views().map(|foreign| foreign.view.as_ref()),
+                &world_symbols,
+            ),
+            None => ModuleMemberIndex::new(indexed_scopes.clone()),
+        };
         let local_module_members = ModuleMemberIndex::new([collection.scopes()]);
         let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
         let source_graph_packages = member_scopes
             .map(|scopes| &scopes.source_graph_packages)
             .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let mut world_boundary_definitions = HashMap::new();
+        for scopes in &indexed_scopes {
+            for interface in scopes.interfaces.values() {
+                for binding in interface.members.values() {
+                    let Res::Def(kind, def_id) = binding.res else {
+                        continue;
+                    };
+                    let definition = match kind {
+                        DefKind::Resource => Some(sai_ty::boundary::BoundaryDefinition::Resource),
+                        DefKind::Struct | DefKind::Enum | DefKind::Alias => {
+                            Some(sai_ty::boundary::BoundaryDefinition::InterfaceType)
+                        }
+                        _ => None,
+                    };
+                    if let Some(definition) = definition {
+                        world_boundary_definitions.insert(def_id, definition);
+                    }
+                }
+            }
+        }
+        if let Some((_, wit_view_scopes)) = world_reference_scopes {
+            for foreign in wit_view_scopes.views() {
+                for interface in foreign.view.interfaces.values() {
+                    for member in interface.members.values() {
+                        let definition = match member.kind {
+                            WitViewDefKind::Resource => {
+                                Some(sai_ty::boundary::BoundaryDefinition::Resource)
+                            }
+                            WitViewDefKind::Struct
+                            | WitViewDefKind::Enum
+                            | WitViewDefKind::Alias => {
+                                Some(sai_ty::boundary::BoundaryDefinition::InterfaceType)
+                            }
+                            _ => None,
+                        };
+                        if let Some(definition) = definition {
+                            world_boundary_definitions.insert(member.def, definition);
+                        }
+                    }
+                }
+            }
+        }
         let mut owners = Vec::with_capacity(descriptors.len());
 
         for descriptor in descriptors {
@@ -15464,6 +15581,79 @@ impl RootDatabase {
                 }
 
                 let module_scope = module_scope_for_file(collection, module_tree, descriptor.file)?;
+                let mut boundary_aliases = WorldBoundaryAliases {
+                    definitions: HashMap::new(),
+                    path_resolutions: HashMap::new(),
+                };
+                for alias_descriptor in
+                    collection
+                        .scopes
+                        .top_level_owners
+                        .iter()
+                        .copied()
+                        .filter(|alias| {
+                            alias.kind == TopLevelOwnerKind::Alias && alias.file == descriptor.file
+                        })
+                {
+                    let Some(expected_alias_path) = def_paths
+                        .resolve_def_id(alias_descriptor.owner.def_id.to_def_id())
+                        .map_err(OwnerControlFlowResolutionError::DefPathInterner)?
+                    else {
+                        continue;
+                    };
+                    let alias_context = HirLoweringContext::new(
+                        &inputs.ast_ids,
+                        snapshot,
+                        &inputs.root,
+                        &arena,
+                        &self.symbols,
+                        &def_paths,
+                    );
+                    let Ok((alias_owner, _)) = lower_top_level_owner(
+                        alias_descriptor,
+                        &expected_alias_path,
+                        &inputs.filtered_item_tree,
+                        &inputs.retained_item_kinds,
+                        &alias_context,
+                    ) else {
+                        continue;
+                    };
+                    let OwnerNode::Item(alias_item) = alias_owner.node else {
+                        continue;
+                    };
+                    let ItemKind::Alias { generics, ty } = alias_item.kind else {
+                        continue;
+                    };
+                    let alias_candidates = owner_test_only_path_candidates(&alias_owner)
+                        .into_iter()
+                        .filter(|candidate| candidate.kind == OwnerPathKind::Type)
+                        .collect::<Vec<_>>();
+                    if let Ok(resolution) = resolve_partial_type_owner_paths(
+                        alias_descriptor.owner,
+                        &alias_candidates,
+                        &owner_type_generic_resolutions(&alias_owner),
+                        &self.primitive_prelude,
+                        &module_scope,
+                        collection.module_tree.package,
+                        Some(&module_members),
+                        Some(source_graph_packages),
+                    ) {
+                        boundary_aliases.path_resolutions.extend(
+                            resolution
+                                .paths()
+                                .iter()
+                                .map(|(hir_id, resolution)| (*hir_id, *resolution)),
+                        );
+                    }
+                    boundary_aliases.definitions.insert(
+                        alias_descriptor.owner.def_id.to_def_id(),
+                        sai_ty::boundary::BoundaryAlias {
+                            owner: alias_owner.id,
+                            ty,
+                            has_generic_params: !generics.params.is_empty(),
+                        },
+                    );
+                }
                 let mut items = Vec::with_capacity(child_entries.len());
                 for (entry, item_owner) in
                     child_entries.into_iter().zip(parent_items.iter().copied())
@@ -15477,6 +15667,7 @@ impl RootDatabase {
                     let mut world_reference_input = None;
                     let mut item_lowering_diagnostics = Vec::new();
                     let mut world_function_name_issues = Vec::new();
+                    let mut world_function_boundary_issues = Vec::new();
                     let item_result: Result<
                         (OwnerTestOnlyPathResolution, Vec<Diagnostic>),
                         OwnerControlFlowResolutionError,
@@ -15688,6 +15879,49 @@ impl RootDatabase {
                             }
                             None => Ok(None),
                         };
+                        if let Ok(Some(path_resolution)) = &type_resolution {
+                            let mut definitions = world_boundary_definitions.clone();
+                            let mut boundary_path_resolutions = path_resolution.paths().clone();
+                            boundary_path_resolutions.extend(
+                                boundary_aliases
+                                    .path_resolutions
+                                    .iter()
+                                    .map(|(hir_id, resolution)| (*hir_id, *resolution)),
+                            );
+                            for path_resolution in boundary_path_resolutions.values() {
+                                let Res::Def(kind, def_id) = path_resolution.base else {
+                                    continue;
+                                };
+                                let definition = match kind {
+                                    DefKind::Alias => {
+                                        Some(sai_ty::boundary::BoundaryDefinition::ModuleAlias)
+                                    }
+                                    DefKind::Struct | DefKind::Enum | DefKind::Resource => {
+                                        Some(
+                                            sai_ty::boundary::BoundaryDefinition::OutsideInterfaceNominal,
+                                        )
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(definition) = definition {
+                                    definitions.entry(def_id).or_insert(definition);
+                                }
+                            }
+                            let canonical_types = HashMap::new();
+                            let boundary_context = sai_ty::boundary::BoundaryTypeContext {
+                                path_resolutions: &boundary_path_resolutions,
+                                canonical_types: &canonical_types,
+                                definitions: &definitions,
+                                aliases: &boundary_aliases.definitions,
+                                resource_containment: None,
+                                self_resource: None,
+                            };
+                            world_function_boundary_issues =
+                                sai_ty::world::world_function_boundary_check(
+                                    &item_hir,
+                                    &boundary_context,
+                                );
+                        }
                         type_path_resolution = Some(type_resolution);
                         let mut candidates = owner_test_only_path_candidates(&item_hir);
                         let (mut recovered_candidates, generic_parameters, local_heads) =
@@ -15792,6 +16026,7 @@ impl RootDatabase {
                                 owner: item_owner,
                                 kind,
                                 world_function_name_issues,
+                                world_function_boundary_issues,
                                 type_path_resolution,
                                 module_path_diagnostics: Ok(None),
                                 test_only_path_resolution: Ok(path_resolution),
@@ -15805,6 +16040,7 @@ impl RootDatabase {
                                 owner: item_owner,
                                 kind,
                                 world_function_name_issues,
+                                world_function_boundary_issues,
                                 type_path_resolution,
                                 module_path_diagnostics: Ok(None),
                                 test_only_path_resolution: Err(error.clone()),
@@ -15883,6 +16119,8 @@ impl RootDatabase {
             collection_input_fingerprint: collection.input_fingerprint,
             member_scope_closure_fingerprint: member_scopes
                 .map(|scopes| scopes.closure_fingerprint),
+            wit_view_closure_fingerprint: world_reference_scopes
+                .map(|(_, scopes)| scopes.closure_fingerprint),
             owners,
         })
     }
@@ -25584,6 +25822,32 @@ mod tests {
             ),
             Err(OwnerControlFlowResolutionError::SessionMismatch)
         ));
+        let wit_view_scopes = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target_cfg, &graph)
+            .expect("first session WIT-view scopes collect");
+        let other_wit_view_scopes = other_database
+            .collect_active_wit_view_scopes(&other_tree, &snapshot, &target_cfg, &graph)
+            .expect("second session WIT-view scopes collect");
+        assert!(matches!(
+            database.resolve_world_test_only_paths_with_scopes(
+                &other_collection,
+                &other_tree,
+                &snapshot,
+                &other_member_scopes,
+                &other_wit_view_scopes,
+            ),
+            Err(OwnerControlFlowResolutionError::SessionMismatch)
+        ));
+        assert!(matches!(
+            other_database.resolve_world_test_only_paths_with_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+                &wit_view_scopes,
+            ),
+            Err(OwnerControlFlowResolutionError::SessionMismatch)
+        ));
     }
 
     #[test]
@@ -30066,6 +30330,12 @@ mod tests {
             "world name_checks {\n",
             "  import fn userID(fetch_user: U32, _: U32)\n",
             "}\n",
+            "type Pointer = USize\n",
+            "world boundary_checks {\n",
+            "  import fn bad_param(size: USize)\n",
+            "  import fn bad_alias(size: Pointer)\n",
+            "  export fn bad_result() -> Never\n",
+            "}\n",
             "world implicit_child { include acme:codec/implicit-child }\n",
             "fn external_world_field() { server.remote }\n",
         );
@@ -30091,7 +30361,7 @@ mod tests {
                 .iter()
                 .all(|diagnostic| diagnostic.code
                     == sai_diagnostics::Code::WorldImportNeedsInterface),
-            "the new world-name fixture introduces no parser diagnostics: {:?}",
+            "the new world-function fixtures introduce no parser diagnostics: {:?}",
             parsed.errors
         );
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -30598,6 +30868,102 @@ world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
                 .iter()
                 .all(sai_diagnostics::Diagnostic::has_workspace_snapshot),
             "world name diagnostics are bound to the current source snapshot"
+        );
+        let boundary_checks_world = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::World
+                    && database
+                        .resolve_def_path(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| {
+                            path.data()
+                                .last()
+                                .and_then(|component| match &component.data {
+                                    DefPathData::World(symbol) => database
+                                        .resolve_symbol(*symbol)
+                                        .ok()
+                                        .map(|name| name.as_ref() == "boundary_checks"),
+                                    _ => None,
+                                })
+                        })
+                        .unwrap_or(false)
+            })
+            .expect("the package has a world whose function boundaries can be checked")
+            .owner
+            .def_id
+            .to_def_id();
+        let checked_boundaries = database
+            .world_check(
+                boundary_checks_world,
+                &collection,
+                &module_tree,
+                &snapshot,
+                &resolutions,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("world check returns boundary type diagnostics");
+        let incompatible = checked_boundaries
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WitIncompatibleType)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            incompatible.len(),
+            3,
+            "{:?}",
+            checked_boundaries.diagnostics
+        );
+        assert_eq!(
+            incompatible
+                .iter()
+                .map(|diagnostic| diagnostic.data.get("wit_position"))
+                .collect::<Vec<_>>(),
+            [
+                Some(&sai_diagnostics::Value::String("parameter".to_owned())),
+                Some(&sai_diagnostics::Value::String("parameter".to_owned())),
+                Some(&sai_diagnostics::Value::String("result".to_owned())),
+            ]
+        );
+        assert_eq!(
+            incompatible
+                .iter()
+                .map(|diagnostic| diagnostic.data.get("wit_incompatibility"))
+                .collect::<Vec<_>>(),
+            [
+                Some(&sai_diagnostics::Value::String(
+                    "pointer_sized_integer".to_owned()
+                )),
+                Some(&sai_diagnostics::Value::String(
+                    "pointer_sized_integer".to_owned()
+                )),
+                Some(&sai_diagnostics::Value::String("never".to_owned())),
+            ]
+        );
+        assert!(
+            incompatible
+                .iter()
+                .all(|diagnostic| diagnostic.has_workspace_snapshot()),
+            "world boundary diagnostics are bound to the current source snapshot"
+        );
+        assert_eq!(
+            incompatible
+                .iter()
+                .map(|diagnostic| {
+                    let primary = diagnostic
+                        .primary()
+                        .expect("boundary diagnostic has a primary location");
+                    let range =
+                        primary.span.range.start().to_usize()..primary.span.range.end().to_usize();
+                    &root[range]
+                })
+                .collect::<Vec<_>>(),
+            ["USize", "Pointer", "Never"],
+            "boundary findings use the alias call site or the smallest incompatible source type"
         );
         let server_include = owner
             .references()
