@@ -44877,6 +44877,147 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
+    fn generated_wit_references_named_types_from_embedded_wasi_views() {
+        let source = concat!(
+            "use wasi:clocks/wall-clock as wall_clock\n",
+            "interface local {\n",
+            "  type Timestamp = wall_clock.Datetime\n",
+            "  fn now() -> wall_clock.Datetime\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, root_package) =
+            phase1_fixture(source.as_bytes(), b"");
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target, &graph)
+            .expect("embedded WASI views load");
+        let clocks_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "wasi:clocks")
+            .expect("the embedded clocks package is in the active view closure");
+        assert_eq!(clocks_view.view.unit.canonical_name(), "wasi:clocks@0.2.3");
+        let clocks_interface = clocks_view
+            .view
+            .interfaces
+            .get("wall-clock")
+            .expect("the embedded clocks view contains wall-clock");
+        let datetime = clocks_interface
+            .members
+            .get("Datetime")
+            .expect("the embedded wall-clock interface contains datetime");
+
+        let manifest: Arc<[u8]> = Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]);
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("Phase 1 scopes use the active embedded WASI views");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses the active package version");
+        let generated_result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT package loads with its embedded WASI dependency");
+        assert!(
+            generated_result.failure.is_none(),
+            "the generated package and its WASI type references resolve: {:?}",
+            generated_result.failure
+        );
+        let generated = generated_result
+            .generated_texts
+            .iter()
+            .find(|(unit, _)| unit == &generated_unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the root generated text is retained");
+        assert!(
+            generated.complete,
+            "incomplete generated WASI view: {}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("use wasi:clocks/wall-clock@0.2.3.{datetime};")
+        );
+        assert!(generated.text.contains("type timestamp = datetime;"));
+        assert!(generated.text.contains("now: func() -> datetime;"));
+
+        let root_model = generated_result
+            .package
+            .as_ref()
+            .expect("root generated WIT model is available");
+        let (root_interface_index, root_interface) = root_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("root source interface is generated");
+        assert_eq!(root_interface.name, "local");
+        let items = root_interface.items.iter().collect::<Vec<_>>();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["datetime", "timestamp", "now"]
+        );
+        let (generated_import_index, generated_import) = root_interface
+            .items
+            .iter_enumerated()
+            .next()
+            .expect("the generated interface contains its foreign import alias");
+        assert_eq!(generated_import.name, "datetime");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(foreign_reference)) =
+            &items[0].kind
+        else {
+            panic!("the generated foreign import retains its exact embedded WASI reference");
+        };
+        assert_eq!(foreign_reference.interface.unit, clocks_view.view.unit);
+        assert_eq!(foreign_reference.interface.interface, clocks_interface.wit);
+        assert_eq!(foreign_reference.item, datetime.item);
+        assert_eq!(foreign_reference.item_name, "datetime");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(local_reference)) = &items[1].kind
+        else {
+            panic!("the source alias refers to the generated WASI import alias");
+        };
+        assert_eq!(local_reference.interface.unit, generated_unit);
+        assert_eq!(local_reference.interface.interface, root_interface_index);
+        assert_eq!(local_reference.item, generated_import_index);
+        assert_eq!(local_reference.item_name, "datetime");
+        let sai_wit::WitItemKind::Func(now) = &items[2].kind else {
+            panic!("the generated function retains its embedded WASI result reference");
+        };
+        assert!(matches!(
+            now.result,
+            Some(sai_wit::WitType::Named(ref reference))
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == root_interface_index
+                    && reference.item == generated_import_index
+                    && reference.item_name == "datetime"
+        ));
+        assert_eq!(
+            collection.package_key().as_str(),
+            "acme:phase1#1",
+            "the generated source and active WASI closure share the root package identity"
+        );
+    }
+
+    #[test]
     fn generated_wit_emits_self_contained_aliases_and_records_in_source_order() {
         let source = concat!(
             "interface api {\n",
