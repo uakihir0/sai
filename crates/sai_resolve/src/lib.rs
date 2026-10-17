@@ -17,6 +17,8 @@ pub mod use_target;
 pub mod use_target_diagnostics;
 pub mod wit_name;
 pub mod wit_name_collisions;
+pub mod world_import_fns;
+pub mod world_includes;
 
 pub use interface_impls::{
     InterfaceImpl, InterfaceImplFunction, InterfaceImplInput, InterfaceImplInterface,
@@ -32,6 +34,13 @@ pub use interface_uses::{
 pub use package_wit_names::{PackageWitNames, PackageWitNamesError, package_wit_names};
 pub use wit_name::{sai_identifier_to_wit_name, suggested_representable_name};
 pub use wit_name_collisions::{WitNameCollision, WitNameDefinition, wit_name_collisions};
+pub use world_import_fns::{
+    MissingLocalWorld, WorldImportFnItem, WorldImportFnWorld, WorldImportFnsInput,
+    WorldImportFunction, world_import_fns,
+};
+pub use world_includes::{
+    WorldIncludeReference, WorldIncludes, WorldIncludesInput, world_includes,
+};
 
 use sai_diagnostics::{Code, Diagnostic, Location, Severity, SourceRef, Value};
 use sai_intern::{InternError, Interner, PackageId, PackageIdError, PackageInterner, Symbol};
