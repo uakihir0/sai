@@ -1,4 +1,4 @@
-//! WIT name checks for world function declarations.
+//! WIT name checks and normalized signature comparison for world functions.
 
 use crate::boundary::{
     BoundaryTypeContext, BoundaryTypeOutcome, Incompatible, Position, boundary_type,
@@ -10,6 +10,64 @@ use crate::iface::{
 use sai_hir::OwnerId;
 use sai_hir::items::{HirOwner, OwnerNode, WorldItemKind};
 use sai_intern::Interner;
+
+/// The first difference between normalized expected and actual signatures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NormalizedSignatureMismatch {
+    ParameterCount { expected: usize, actual: usize },
+    ParameterType { index: usize },
+    ResultType,
+    Async,
+    Unsafe,
+}
+
+/// A function signature whose parameter and result types are already
+/// normalized for identity-based conformance comparison.
+///
+/// Parameter order is significant. Parameter names and mutability are absent
+/// because they do not affect conformance.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NormalizedSignature<T> {
+    pub params: Vec<T>,
+    pub result: Option<T>,
+    pub is_async: bool,
+}
+
+/// Compares signatures after aliases have been expanded, regions erased, and
+/// resource bindings mapped to their concrete definition identities.
+///
+/// Unsafe-ness is checked only after the signature itself, so a structural
+/// mismatch keeps its prescribed source location priority.
+pub fn compare_normalized_signatures<T: Eq>(
+    expected: &NormalizedSignature<T>,
+    actual: &NormalizedSignature<T>,
+    actual_is_unsafe: bool,
+) -> Option<NormalizedSignatureMismatch> {
+    if expected.params.len() != actual.params.len() {
+        return Some(NormalizedSignatureMismatch::ParameterCount {
+            expected: expected.params.len(),
+            actual: actual.params.len(),
+        });
+    }
+
+    for (index, (expected_type, actual_type)) in
+        expected.params.iter().zip(&actual.params).enumerate()
+    {
+        if expected_type != actual_type {
+            return Some(NormalizedSignatureMismatch::ParameterType { index });
+        }
+    }
+
+    if expected.result != actual.result {
+        return Some(NormalizedSignatureMismatch::ResultType);
+    }
+
+    if expected.is_async != actual.is_async {
+        return Some(NormalizedSignatureMismatch::Async);
+    }
+
+    actual_is_unsafe.then_some(NormalizedSignatureMismatch::Unsafe)
+}
 
 /// One incompatible parameter or result in a directly written world function.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -405,6 +463,115 @@ mod tests {
         assert_eq!(
             issues[0].incompatible.reason,
             IncompatibleReason::UnitOutsideResult
+        );
+    }
+}
+
+#[cfg(test)]
+mod normalized_signature_tests {
+    use super::{NormalizedSignature, NormalizedSignatureMismatch, compare_normalized_signatures};
+    use crate::boundary::BoundaryType;
+    use sai_hir::{DefId, DefIndex};
+    use sai_intern::{Idx, PackageInterner};
+
+    fn signature(
+        params: &[BoundaryType],
+        result: Option<BoundaryType>,
+        is_async: bool,
+    ) -> NormalizedSignature<BoundaryType> {
+        NormalizedSignature {
+            params: params.to_vec(),
+            result,
+            is_async,
+        }
+    }
+
+    fn resource_definition_ids() -> (DefId, DefId) {
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:signature#1.0")
+            .expect("package interns");
+        (
+            DefId::from_foreign(package, DefIndex::from_raw(1)),
+            DefId::from_foreign(package, DefIndex::from_raw(2)),
+        )
+    }
+
+    #[test]
+    fn compares_normalized_types_without_parameter_names_or_mutability() {
+        let expected = signature(&[BoundaryType::U32], None, false);
+        let actual = signature(&[BoundaryType::U32], None, false);
+
+        assert_eq!(
+            compare_normalized_signatures(&expected, &actual, false),
+            None
+        );
+    }
+
+    #[test]
+    fn parameter_count_has_priority_over_other_mismatches() {
+        let expected = signature(&[BoundaryType::U32], Some(BoundaryType::Bool), false);
+        let actual = signature(&[], Some(BoundaryType::String), true);
+
+        assert_eq!(
+            compare_normalized_signatures(&expected, &actual, true),
+            Some(NormalizedSignatureMismatch::ParameterCount {
+                expected: 1,
+                actual: 0
+            })
+        );
+    }
+
+    #[test]
+    fn reports_the_first_differing_parameter_type() {
+        let (expected_resource, actual_resource) = resource_definition_ids();
+        let expected = signature(
+            &[BoundaryType::U32, BoundaryType::Own(expected_resource)],
+            Some(BoundaryType::String),
+            false,
+        );
+        let actual = signature(
+            &[BoundaryType::U32, BoundaryType::Own(actual_resource)],
+            Some(BoundaryType::Bool),
+            true,
+        );
+
+        assert_eq!(
+            compare_normalized_signatures(&expected, &actual, false),
+            Some(NormalizedSignatureMismatch::ParameterType { index: 1 })
+        );
+    }
+
+    #[test]
+    fn result_type_precedes_async_mismatch() {
+        let expected = signature(&[], Some(BoundaryType::String), false);
+        let actual = signature(&[], Some(BoundaryType::Bool), true);
+
+        assert_eq!(
+            compare_normalized_signatures(&expected, &actual, false),
+            Some(NormalizedSignatureMismatch::ResultType)
+        );
+    }
+
+    #[test]
+    fn reports_async_mismatch_after_other_signature_parts_match() {
+        let expected = signature(&[BoundaryType::U32], None, false);
+        let actual = signature(&[BoundaryType::U32], None, true);
+
+        assert_eq!(
+            compare_normalized_signatures(&expected, &actual, false),
+            Some(NormalizedSignatureMismatch::Async)
+        );
+    }
+
+    #[test]
+    fn reports_unsafe_implementor_when_signature_matches() {
+        let expected = signature(&[BoundaryType::U32], Some(BoundaryType::Bool), false);
+        let actual = signature(&[BoundaryType::U32], Some(BoundaryType::Bool), false);
+
+        assert_eq!(
+            compare_normalized_signatures(&expected, &actual, true),
+            Some(NormalizedSignatureMismatch::Unsafe)
         );
     }
 }
