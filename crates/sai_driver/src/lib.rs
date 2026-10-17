@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod export_world_queries;
 mod interface_impl_resource_wit;
 mod interface_resource_alias;
 mod interface_use_queries;
@@ -9,6 +10,7 @@ mod wit_package_queries;
 mod world_elaboration_adapter;
 mod world_resource_containment;
 
+pub use export_world_queries::{LocalExportWorldLookup, LocalExportWorldLookupError};
 use interface_impl_resource_wit::{
     WitResourceIdentity, WitResourceOccurrenceIncomplete, WitResourceOccurrenceSearch,
     WitResourceOccurrenceSite, first_wit_resource_occurrence,
@@ -33980,6 +33982,105 @@ mod tests {
         assert_ne!(
             mutable_borrow, shared_borrow,
             "borrow and borrow mut remain distinct SAI types"
+        );
+    }
+
+    #[test]
+    fn local_export_world_paths_select_root_and_nested_module_worlds() {
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(
+            b"use acme:phase1/child.{child_world}\n\
+              pub use acme:phase1/child.{child_world as reexported_world}\n\
+              world root_world {}\n\
+              type not_a_world = U32\n",
+            b"pub world child_world {}\n",
+        );
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+
+        let root_world = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .and_then(|module| {
+                module
+                    .scope
+                    .get(&database.symbols.intern("root_world").expect("name interns"))
+            })
+            .map(|binding| binding.res);
+        let child_world = collection
+            .scopes()
+            .module(ModuleId::from_raw(1))
+            .and_then(|module| {
+                module.scope.get(
+                    &database
+                        .symbols
+                        .intern("child_world")
+                        .expect("name interns"),
+                )
+            })
+            .map(|binding| binding.res);
+        let (
+            Some(Res::Def(DefKind::World, expected_root_world)),
+            Some(Res::Def(DefKind::World, expected_child_world)),
+        ) = (root_world, child_world)
+        else {
+            panic!("fixture world declarations are present in their module scopes");
+        };
+
+        assert_eq!(
+            database.resolve_local_export_world(&collection, "root_world"),
+            Ok(LocalExportWorldLookup::Resolved(expected_root_world)),
+        );
+        assert_eq!(
+            database.resolve_local_export_world(&collection, "child/child_world"),
+            Ok(LocalExportWorldLookup::Resolved(expected_child_world)),
+        );
+        let root = collection
+            .scopes()
+            .module(ModuleId::ROOT)
+            .expect("root module scope is collected");
+        let imported_world = database
+            .symbols
+            .intern("child_world")
+            .expect("import name interns");
+        assert!(
+            root.scope.contains_key(&imported_world),
+            "plain use binds the dependency in module scope"
+        );
+        assert!(
+            !root.members.contains_key(&imported_world),
+            "plain use does not add the world to the module member namespace"
+        );
+        assert_eq!(
+            database.resolve_local_export_world(&collection, "reexported_world"),
+            Ok(LocalExportWorldLookup::Resolved(expected_child_world)),
+            "a public re-export is part of the module member namespace"
+        );
+        for missing in [
+            "missing_world",
+            "missing/child_world",
+            "child/missing_world",
+            "child_world",
+            "not_a_world",
+            "child//child_world",
+        ] {
+            assert_eq!(
+                database.resolve_local_export_world(&collection, missing),
+                Ok(LocalExportWorldLookup::Missing),
+                "{missing} is not a resolvable local world path",
+            );
+        }
+        let other_database = RootDatabase::new().expect("second driver initializes");
+        assert_eq!(
+            other_database.resolve_local_export_world(&collection, "root_world"),
+            Err(LocalExportWorldLookupError::SessionMismatch),
+            "session-local definition IDs must not cross database sessions",
         );
     }
 
