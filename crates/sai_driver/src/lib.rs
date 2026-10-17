@@ -2886,6 +2886,7 @@ pub struct WorldItemTestOnlyResolution {
     world_owner: OwnerId,
     owner: OwnerId,
     kind: WorldItemTestOnlyKind,
+    world_function_name_issues: Vec<sai_ty::iface::InterfaceCheckIssue>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
@@ -2904,6 +2905,10 @@ impl WorldItemTestOnlyResolution {
 
     pub const fn kind(&self) -> WorldItemTestOnlyKind {
         self.kind
+    }
+
+    pub fn world_function_name_issues(&self) -> &[sai_ty::iface::InterfaceCheckIssue] {
+        &self.world_function_name_issues
     }
 
     pub fn type_path_resolution(
@@ -13585,6 +13590,84 @@ impl RootDatabase {
             .map_err(OwnerControlFlowResolutionError::WorldElaboration)
     }
 
+    /// Returns the elaborated world and the checks available for directly
+    /// written world-function names.
+    ///
+    /// Boundary type compatibility, world-namespace collisions, and export
+    /// implementation checks are added by later world-check stages.
+    pub fn world_check(
+        &mut self,
+        world: DefId,
+        collection: &Phase1PackageScopesCollection,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        references: &WorldReferenceResolutions,
+        member_scopes: &Phase1ActiveSourceMemberScopes,
+        wit_view_scopes: &Phase1ActiveWitViewScopes,
+    ) -> Result<sai_resolve::ElaboratedWorld, OwnerControlFlowResolutionError> {
+        let input = self.resolve_world_elaboration_input(
+            collection,
+            module_tree,
+            snapshot,
+            references,
+            member_scopes,
+            wit_view_scopes,
+        )?;
+        let is_local = input.local_worlds.iter().any(|local| local.world == world);
+        let mut elaborated = sai_resolve::elaborated_world(world, input)
+            .map_err(OwnerControlFlowResolutionError::WorldElaboration)?;
+        if !is_local {
+            return Ok(elaborated);
+        }
+
+        let test_only = self.resolve_world_test_only_paths_with_member_scopes(
+            collection,
+            module_tree,
+            snapshot,
+            member_scopes,
+        )?;
+        if !test_only.matches_member_scopes(collection, member_scopes)
+            || !test_only.matches_snapshot(snapshot)
+        {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        let world_descriptor = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::World
+                    && descriptor.owner.def_id.to_def_id() == world
+            })
+            .ok_or(OwnerControlFlowResolutionError::MissingTargetDefPath(world))?;
+        let world_owner = world_descriptor.owner;
+        let owner_result = test_only
+            .owners()
+            .iter()
+            .find(|owner| owner.owner() == world_owner)
+            .ok_or(
+                OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                    owner: world_owner,
+                    file: world_descriptor.file,
+                },
+            )?;
+        if let Some(error) = owner_result.error() {
+            return Err(error.clone());
+        }
+        let issues = owner_result
+            .items()
+            .iter()
+            .flat_map(WorldItemTestOnlyResolution::world_function_name_issues)
+            .cloned()
+            .collect::<Vec<_>>();
+        interface_use_queries::append_world_function_name_diagnostics(
+            &issues,
+            snapshot,
+            &mut elaborated.diagnostics,
+        )?;
+        Ok(elaborated)
+    }
+
     /// Builds the package-local include graph from matching world-reference
     /// results. Only complete references to local worlds become graph edges;
     /// foreign, deferred, failed, and wrong-kind paths remain outside it.
@@ -15393,6 +15476,7 @@ impl RootDatabase {
                     let mut type_path_resolution = None;
                     let mut world_reference_input = None;
                     let mut item_lowering_diagnostics = Vec::new();
+                    let mut world_function_name_issues = Vec::new();
                     let item_result: Result<
                         (OwnerTestOnlyPathResolution, Vec<Diagnostic>),
                         OwnerControlFlowResolutionError,
@@ -15422,6 +15506,13 @@ impl RootDatabase {
                         )
                         .map_err(OwnerControlFlowResolutionError::Lowering)?;
                         item_lowering_diagnostics.extend(item_hir.diagnostics.iter().cloned());
+                        world_function_name_issues =
+                            sai_ty::world::world_function_name_check(&item_hir, &self.symbols)
+                                .map_err(|error| match error {
+                                    sai_ty::iface::InterfaceCheckError::SymbolLookup(error) => {
+                                        OwnerControlFlowResolutionError::SymbolLookup(error)
+                                    }
+                                })?;
                         let (source_order_item, source_import_item) = match item_hir.node {
                             OwnerNode::WorldItem(item) => match item.kind {
                                 WorldItemKind::Import(reference) => {
@@ -15700,6 +15791,7 @@ impl RootDatabase {
                                 world_owner: descriptor.owner,
                                 owner: item_owner,
                                 kind,
+                                world_function_name_issues,
                                 type_path_resolution,
                                 module_path_diagnostics: Ok(None),
                                 test_only_path_resolution: Ok(path_resolution),
@@ -15712,6 +15804,7 @@ impl RootDatabase {
                                 world_owner: descriptor.owner,
                                 owner: item_owner,
                                 kind,
+                                world_function_name_issues,
                                 type_path_resolution,
                                 module_path_diagnostics: Ok(None),
                                 test_only_path_resolution: Err(error.clone()),
@@ -29970,6 +30063,9 @@ mod tests {
             "  import acme:codex/api\n",
             "}\n",
             "world independent {}\n",
+            "world name_checks {\n",
+            "  import fn userID(fetch_user: U32, _: U32)\n",
+            "}\n",
             "world implicit_child { include acme:codec/implicit-child }\n",
             "fn external_world_field() { server.remote }\n",
         );
@@ -29988,6 +30084,15 @@ mod tests {
                 .count(),
             2,
             "the parser owns whole-package import and export diagnostics"
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code
+                    == sai_diagnostics::Code::WorldImportNeedsInterface),
+            "the new world-name fixture introduces no parser diagnostics: {:?}",
+            parsed.errors
         );
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
         let root_key = PackageKey::new("acme:phase1#1").expect("root key is valid");
@@ -30437,6 +30542,63 @@ world retained { import preserved: func() -> (first: u32, second: u32); }"#[..],
             .expect("the driver exposes elaboration for the same validated world");
         assert_eq!(driver_elaboration, root_elaboration);
         assert!(!root_elaboration.complete);
+        let name_checks_world = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::World
+                    && database
+                        .resolve_def_path(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .and_then(|path| {
+                            path.data()
+                                .last()
+                                .and_then(|component| match &component.data {
+                                    DefPathData::World(symbol) => database
+                                        .resolve_symbol(*symbol)
+                                        .ok()
+                                        .map(|name| name.as_ref() == "name_checks"),
+                                    _ => None,
+                                })
+                        })
+                        .unwrap_or(false)
+            })
+            .expect("the package has a world whose names can be checked")
+            .owner
+            .def_id
+            .to_def_id();
+        let checked_names = database
+            .world_check(
+                name_checks_world,
+                &collection,
+                &module_tree,
+                &snapshot,
+                &resolutions,
+                &member_scopes,
+                &wit_view_scopes,
+            )
+            .expect("world check returns the elaboration and available name diagnostics");
+        assert_eq!(
+            checked_names
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::WitNameNotRepresentable,
+                sai_diagnostics::Code::WitNameNotRepresentable,
+            ],
+            "world-function names and unnamed parameters are checked"
+        );
+        assert!(
+            checked_names
+                .diagnostics
+                .iter()
+                .all(sai_diagnostics::Diagnostic::has_workspace_snapshot),
+            "world name diagnostics are bound to the current source snapshot"
+        );
         let server_include = owner
             .references()
             .iter()

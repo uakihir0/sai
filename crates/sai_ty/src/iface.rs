@@ -88,7 +88,7 @@ impl InterfaceCheckIssue {
                 format!("SAI name `{name}` cannot be represented as a WIT name")
             }
             (InterfaceCheckIssueKind::WitNameNotRepresentable, None) => {
-                "unnamed interface parameters cannot be represented as WIT names".to_owned()
+                "unnamed parameters cannot be represented as WIT names".to_owned()
             }
             (InterfaceCheckIssueKind::WitNameCollision, Some(name)) => {
                 format!("multiple declarations map to WIT name `{name}`")
@@ -276,7 +276,7 @@ pub fn interface_item_check(
     Ok(issues)
 }
 
-fn push_name_issue(
+pub(super) fn push_name_issue(
     issues: &mut Vec<InterfaceCheckIssue>,
     owner: OwnerId,
     name: Name,
@@ -306,7 +306,7 @@ fn push_name_issue(
     }))
 }
 
-fn push_name_collisions(
+pub(super) fn push_name_collisions(
     issues: &mut Vec<InterfaceCheckIssue>,
     definitions: impl IntoIterator<Item = WitNameDefinition>,
 ) {

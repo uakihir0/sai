@@ -354,7 +354,7 @@ impl InterfaceUsesQueries {
     }
 }
 
-fn append_interface_item_diagnostics(
+pub(super) fn append_interface_item_diagnostics(
     issues: Vec<InterfaceCheckIssue>,
     source_ref: &SourceRef,
     source: &sai_vfs::SourceFile,
@@ -414,6 +414,61 @@ fn append_interface_item_diagnostics(
         }
         diagnostics.push(diagnostic);
     }
+    Ok(())
+}
+
+pub(super) fn append_world_function_name_diagnostics(
+    issues: &[InterfaceCheckIssue],
+    snapshot: &WorkspaceSnapshot,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<(), OwnerControlFlowResolutionError> {
+    let mut by_file = std::collections::BTreeMap::<FileId, Vec<InterfaceCheckIssue>>::new();
+    for issue in issues {
+        by_file
+            .entry(issue.span.file)
+            .or_default()
+            .push(issue.clone());
+    }
+    for (file, issues) in by_file {
+        let owner = issues
+            .first()
+            .map(|issue| issue.owner)
+            .expect("each grouped world name finding has an owner");
+        let snapshot_file = snapshot
+            .file(file)
+            .ok_or(OwnerControlFlowResolutionError::MissingSnapshotFile(file))?;
+        let source = Arc::clone(snapshot_file.source());
+        let source_ref = SourceRef {
+            path: snapshot_file.path().to_owned(),
+            package: snapshot_file.package().map(str::to_owned),
+            snapshot: snapshot_file.document_version(),
+        };
+        let diagnostic_start = diagnostics.len();
+        append_interface_item_diagnostics(
+            issues,
+            &source_ref,
+            source.as_ref(),
+            snapshot,
+            diagnostics,
+        )
+        .map_err(|error| match error {
+            InterfaceUsesQueryError::Collection(error) => error,
+            InterfaceUsesQueryError::Query(_)
+            | InterfaceUsesQueryError::PackageScopes(_)
+            | InterfaceUsesQueryError::DefPath(_)
+            | InterfaceUsesQueryError::DefPathInterner(_)
+            | InterfaceUsesQueryError::DiagnosticTemplate(_) => {
+                unreachable!("source-bound world name checks only return collection errors")
+            }
+        })?;
+        for diagnostic in &mut diagnostics[diagnostic_start..] {
+            *diagnostic = diagnostic
+                .clone()
+                .with_workspace_snapshot(snapshot)
+                .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+        }
+    }
+    super::sort_phase1_diagnostics(diagnostics);
     Ok(())
 }
 
