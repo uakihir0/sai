@@ -29825,6 +29825,89 @@ mod tests {
                 .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::ImplTargetNotInterface),
             "the existing resolved-path owner remains the sole target-kind diagnostic"
         );
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(module_tree.package, &database.packages, &selected)
+                .expect("root generated WIT unit uses the active package version");
+        let generated_result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT package loads with its direct dependency");
+        assert!(
+            generated_result.failure.is_none(),
+            "the generated package and its versioned type use resolve: {:?}",
+            generated_result.failure
+        );
+        let generated = generated_result
+            .generated_texts
+            .iter()
+            .find(|(unit, _)| unit == &generated_unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the root generated text is retained");
+        assert!(generated.complete, "the foreign named type is fully mapped");
+        assert!(generated.text.contains("use acme:codec/api@1.0.0.{data};"));
+        assert!(generated.text.contains("type local-alias = data;"));
+        assert!(generated.text.contains("local-member: func(value: data);"));
+
+        let external_view = wit_view_scopes
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the direct authored WIT dependency remains in the active closure");
+        let external_interface = external_view
+            .view
+            .interfaces
+            .get("api")
+            .expect("the selected view contains the api interface");
+        let external_item = external_interface
+            .members
+            .get("Data")
+            .expect("the selected interface contains the data type");
+        let package_model = generated_result
+            .package
+            .as_ref()
+            .expect("the generated root WIT model is available");
+        let (generated_interface_index, generated_interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the root local interface is generated");
+        assert_eq!(generated_interface.name, "local");
+        let generated_items = generated_interface.items.iter().collect::<Vec<_>>();
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(alias_reference)) =
+            &generated_items[0].kind
+        else {
+            panic!("the generated use item retains its exact external type reference");
+        };
+        assert_eq!(alias_reference.interface.unit, external_view.view.unit);
+        assert_eq!(alias_reference.interface.interface, external_interface.wit);
+        assert_eq!(alias_reference.item, external_item.item);
+        assert_eq!(alias_reference.item_name, "data");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(local_alias_reference)) =
+            &generated_items[1].kind
+        else {
+            panic!("the source alias points at the generated import alias");
+        };
+        assert_eq!(local_alias_reference.interface.unit, generated_unit);
+        assert_eq!(
+            local_alias_reference.interface.interface,
+            generated_interface_index
+        );
+        assert_eq!(local_alias_reference.item_name, "data");
+        let sai_wit::WitItemKind::Func(local_member) = &generated_items[2].kind else {
+            panic!("the source function retains its generated import alias reference");
+        };
+        assert!(matches!(
+            local_member.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == generated_interface_index
+                    && reference.item_name == "data"
+        ));
     }
 
     #[test]

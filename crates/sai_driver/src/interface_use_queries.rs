@@ -1447,6 +1447,7 @@ fn collect_interface_uses_input(
         .collect::<HashSet<_>>();
     let interface_boundary_types =
         interface_boundary_type_definitions(&interface_type_members, scopes, prepared);
+    let foreign_named_type_references = generated_foreign_named_type_references(prepared);
     let mut ineligible_interfaces = HashSet::new();
     let boundary_use_alias_names = interface_boundary_use_alias_names(
         &interface_type_members,
@@ -1646,7 +1647,7 @@ fn collect_interface_uses_input(
         }
         let mut interface_item_names = Vec::with_capacity(member_entries.len());
         let mut generated_use_aliases = Vec::<GeneratedUseAlias>::new();
-        let mut generated_named_type_references = HashMap::<DefId, WitTypeRef>::new();
+        let mut generated_named_type_references = foreign_named_type_references.clone();
         for (entry, member_owner) in member_entries
             .into_iter()
             .zip(parent_members.iter().copied())
@@ -3267,6 +3268,68 @@ fn interface_boundary_type_definitions(
         }
     }
     definitions
+}
+
+fn generated_foreign_named_type_references(
+    prepared: &PreparedPhase1PackageScopes,
+) -> HashMap<DefId, WitTypeRef> {
+    let mut references = HashMap::new();
+    for foreign in &prepared.foreign_wit_views {
+        if !foreign.directly_visible {
+            continue;
+        }
+        let view = foreign.view.as_ref();
+        for interface in view.interfaces.values() {
+            let Some(wit_interface) = view.model.interfaces.get(interface.wit) else {
+                continue;
+            };
+            for member in interface.members.values() {
+                if member.unsupported.is_some() {
+                    continue;
+                }
+                let Some(definition) = view.definition(member.def) else {
+                    continue;
+                };
+                if definition.kind != member.kind
+                    || definition.entity
+                        != (WitViewEntity::Item {
+                            interface: interface.wit,
+                            item: member.item,
+                        })
+                {
+                    continue;
+                }
+                let Some(wit_item) = wit_interface.items.get(member.item) else {
+                    continue;
+                };
+                if wit_item.unsupported.is_some()
+                    || !matches!(
+                        wit_item.kind,
+                        WitItemKind::Alias(_)
+                            | WitItemKind::Record(_)
+                            | WitItemKind::Variant(_)
+                            | WitItemKind::Enum(_)
+                            | WitItemKind::Flags(_)
+                    )
+                {
+                    continue;
+                }
+                references.insert(
+                    member.def,
+                    WitTypeRef {
+                        interface: sai_wit::WitIfaceRef {
+                            unit: view.unit.clone(),
+                            interface: interface.wit,
+                            name: wit_interface.name.clone(),
+                        },
+                        item: member.item,
+                        item_name: wit_item.name.clone(),
+                    },
+                );
+            }
+        }
+    }
+    references
 }
 
 fn interface_boundary_roots<'hir>(owner: &HirOwner<'hir>) -> Vec<(&'hir Ty<'hir>, Position)> {
