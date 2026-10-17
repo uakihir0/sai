@@ -44,9 +44,10 @@ use sai_ty::iface::{
 };
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
 use sai_wit::{
-    GeneratedText, WitField, WitFunc, WitIfaceIdx, WitIndexVec, WitInterface, WitItem, WitItemIdx,
-    WitItemKind, WitPackage, WitPackageDeclaration, WitPackageName, WitStabilityVersion, WitType,
-    WitTypeRef, WitUnit, WitViewDefKind, WitViewEntity, print_wit, wit_name_to_sai,
+    GeneratedText, WitCase, WitField, WitFunc, WitIfaceIdx, WitIndexVec, WitInterface, WitItem,
+    WitItemIdx, WitItemKind, WitPackage, WitPackageDeclaration, WitPackageName,
+    WitStabilityVersion, WitType, WitTypeRef, WitUnit, WitViewDefKind, WitViewEntity, print_wit,
+    wit_name_to_sai,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -1810,6 +1811,7 @@ fn collect_interface_uses_input(
                             item.kind,
                             WitItemKind::Alias(_)
                                 | WitItemKind::Record(_)
+                                | WitItemKind::Variant(_)
                                 | WitItemKind::Enum(_)
                                 | WitItemKind::Flags(_)
                         );
@@ -3590,14 +3592,13 @@ fn generated_interface_type_item(
             if variants.len() != variant_entries.len() {
                 return Ok(None);
             }
-            let mut case_names = Vec::with_capacity(variants.len());
+            let mut cases = Vec::with_capacity(variants.len());
             let mut unique_case_names = HashSet::with_capacity(variants.len());
+            let mut payload_conversions = conversions.iter();
+            let mut has_payload = false;
+            let mut has_case_docs = false;
             for (variant, variant_entry) in variants.iter().zip(variant_entries) {
-                if !matches!(variant.shape, VariantShape::Unit)
-                    || variant.has_explicit_discriminant
-                    || variant_entry.docs.is_some()
-                    || !variant_entry.raw_attrs.is_empty()
-                {
+                if variant.has_explicit_discriminant || !variant_entry.raw_attrs.is_empty() {
                     return Ok(None);
                 }
                 let case_source_name = symbols
@@ -3610,12 +3611,53 @@ fn generated_interface_type_item(
                 if !unique_case_names.insert(case_name.clone()) {
                     return Ok(None);
                 }
-                case_names.push(case_name);
+                let payload = match variant.shape {
+                    VariantShape::Unit => None,
+                    VariantShape::Tuple([_]) => {
+                        let Some(conversion) = payload_conversions.next() else {
+                            return Ok(None);
+                        };
+                        let BoundaryTypeOutcome::Mapped(boundary_type) = &conversion.outcome else {
+                            return Ok(None);
+                        };
+                        let Ok(Some(payload)) = sai_ty::boundary::materialize_boundary_type(
+                            boundary_type,
+                            references,
+                            Position::Nested,
+                        ) else {
+                            return Ok(None);
+                        };
+                        has_payload = true;
+                        Some(payload)
+                    }
+                    VariantShape::Tuple(_) | VariantShape::Record(_) => return Ok(None),
+                };
+                let docs = variant_entry.docs.clone().map(Arc::from);
+                has_case_docs |= docs.is_some();
+                cases.push(WitCase {
+                    name: case_name,
+                    docs,
+                    payload,
+                });
             }
-            if flags_marker_accepted {
-                WitItemKind::Flags(case_names)
+            if payload_conversions.next().is_some() {
+                return Ok(None);
+            }
+            if has_payload {
+                if flags_marker_accepted {
+                    return Ok(None);
+                }
+                WitItemKind::Variant(cases)
             } else {
-                WitItemKind::Enum(case_names)
+                if has_case_docs {
+                    return Ok(None);
+                }
+                let case_names = cases.into_iter().map(|case| case.name).collect();
+                if flags_marker_accepted {
+                    WitItemKind::Flags(case_names)
+                } else {
+                    WitItemKind::Enum(case_names)
+                }
             }
         }
         _ => return Ok(None),

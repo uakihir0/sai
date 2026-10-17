@@ -44804,13 +44804,22 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
-    fn generated_wit_emits_unit_enums_with_named_consumers() {
+    fn generated_wit_emits_unit_enums_and_single_payload_variants_with_named_consumers() {
         let source = concat!(
             "interface api {\n",
             "  /// The outcome of a request.\n",
             "  enum Status { Ready, NotReady }\n",
             "  enum Mode { Read, Write }\n",
+            "  type Id = U32\n",
+            "  type Code = U64\n",
+            "  enum Payload {\n",
+            "    Empty,\n",
+            "    /// A decoded value.\n",
+            "    Value(Id),\n",
+            "    Other(Code),\n",
+            "  }\n",
             "  fn inspect(status: Status) -> Mode\n",
+            "  fn decode(payload: Payload) -> Id\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
@@ -44867,7 +44876,9 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 .iter()
                 .map(|item| item.name.as_str())
                 .collect::<Vec<_>>(),
-            ["status", "mode", "inspect"]
+            [
+                "status", "mode", "id", "code", "payload", "inspect", "decode"
+            ]
         );
         assert_eq!(items[0].docs.as_deref(), Some("The outcome of a request."));
         assert_eq!(
@@ -44878,7 +44889,32 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             items[1].kind,
             sai_wit::WitItemKind::Enum(vec!["read".to_owned(), "write".to_owned()])
         );
-        let sai_wit::WitItemKind::Func(inspect) = &items[2].kind else {
+        assert_eq!(
+            items[2].kind,
+            sai_wit::WitItemKind::Alias(sai_wit::WitType::U32)
+        );
+        let sai_wit::WitItemKind::Variant(cases) = &items[4].kind else {
+            panic!("the single-payload enum is emitted as a WIT variant");
+        };
+        assert_eq!(cases.len(), 3);
+        assert_eq!(cases[0].name, "empty");
+        assert_eq!(cases[0].payload, None);
+        assert_eq!(cases[1].name, "value");
+        assert_eq!(cases[1].docs.as_deref(), Some("A decoded value."));
+        assert!(matches!(
+            cases[1].payload,
+            Some(sai_wit::WitType::Named(ref reference))
+                if reference.interface.interface == interface_index
+                    && reference.item_name == "id"
+        ));
+        assert_eq!(cases[2].name, "other");
+        assert!(matches!(
+            cases[2].payload,
+            Some(sai_wit::WitType::Named(ref reference))
+                if reference.interface.interface == interface_index
+                    && reference.item_name == "code"
+        ));
+        let sai_wit::WitItemKind::Func(inspect) = &items[5].kind else {
             panic!("the function consuming the enum and flags is emitted");
         };
         assert!(matches!(
@@ -44893,17 +44929,41 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 if reference.interface.interface == interface_index
                     && reference.item_name == "mode"
         ));
+        let sai_wit::WitItemKind::Func(decode) = &items[6].kind else {
+            panic!("the function consuming the variant is emitted");
+        };
+        assert!(matches!(
+            decode.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.interface == interface_index
+                    && reference.item_name == "payload"
+        ));
+        assert!(matches!(
+            decode.result,
+            Some(sai_wit::WitType::Named(ref reference))
+                if reference.interface.interface == interface_index
+                    && reference.item_name == "id"
+        ));
         assert!(generated.text.contains("enum status {"));
         assert!(generated.text.contains("enum mode {"));
+        assert!(generated.text.contains("variant payload {"));
+        assert!(generated.text.contains("value(id)"));
+        assert!(generated.text.contains("other(code)"));
+        assert!(generated.text.contains("/// A decoded value."));
         assert!(
             generated
                 .text
                 .contains("inspect: func(status: status) -> mode")
         );
+        assert!(
+            generated
+                .text
+                .contains("decode: func(payload: payload) -> id")
+        );
     }
 
     #[test]
-    fn generated_wit_omits_enums_whose_case_metadata_cannot_be_preserved() {
+    fn generated_wit_omits_enums_with_unrepresentable_cases_and_consumers() {
         let source = concat!(
             "interface api {\n",
             "  enum Status {\n",
@@ -44912,8 +44972,17 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             "    Failed,\n",
             "  }\n",
             "  fn inspect(status: Status)\n",
-            "  enum Payload { Value(U32) }\n",
-            "  fn decode(payload: Payload)\n",
+            "  enum Multi { Pair(U32, U32) }\n",
+            "  fn merge(value: Multi)\n",
+            "  enum RecordPayload { Pair(left: U32) }\n",
+            "  fn record_value(value: RecordPayload)\n",
+            "  enum Explicit { Ready = 1, Waiting }\n",
+            "  fn explicit_value(value: Explicit)\n",
+            "  enum Attributed {\n",
+            "    @deprecated(\"old case\") Old,\n",
+            "    Ready,\n",
+            "  }\n",
+            "  fn use_attributed(value: Attributed)\n",
             "  fn independent(value: U32)\n",
             "}\n",
         );
@@ -44958,8 +45027,14 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         assert!(!generated.complete);
         assert!(!generated.text.contains("status"));
         assert!(!generated.text.contains("inspect"));
-        assert!(!generated.text.contains("payload"));
-        assert!(!generated.text.contains("decode"));
+        assert!(!generated.text.contains("multi"));
+        assert!(!generated.text.contains("merge"));
+        assert!(!generated.text.contains("record-payload"));
+        assert!(!generated.text.contains("record-value"));
+        assert!(!generated.text.contains("explicit"));
+        assert!(!generated.text.contains("explicit-value"));
+        assert!(!generated.text.contains("attributed"));
+        assert!(!generated.text.contains("use-attributed"));
         assert!(generated.text.contains("independent: func(value: u32)"));
         let package_model = result.package.expect("partial WIT model loads");
         let interface = package_model
