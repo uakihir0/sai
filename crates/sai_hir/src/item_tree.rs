@@ -261,6 +261,10 @@ pub struct ItemTreeEntry {
     pub kind: ItemTreeKind,
     /// `Symbol::ERROR` means the name was missing or could not be recovered.
     pub name: Symbol,
+    /// Documentation payload attached to this declaration, without SAI's
+    /// `///` delimiters. Snapshot-independent text is retained so generated
+    /// WIT can pass it directly to the canonical printer.
+    pub docs: Option<String>,
     pub vis: crate::Visibility,
     pub raw_attrs: Vec<RawAttr>,
     /// Direct declarations and generic parameters, in source order.
@@ -379,6 +383,7 @@ struct StableItemTreeEntry {
     ast_id: ErasedAstId,
     kind: ItemTreeKind,
     name: StableSymbol,
+    docs: Option<String>,
     vis: crate::Visibility,
     raw_attrs: Vec<StableRawAttr>,
     children: Vec<StableItemTreeEntry>,
@@ -591,6 +596,10 @@ fn bind_stable_entry(
         syntax.children().filter_map(ast::Attribute::cast),
         symbols,
     )?;
+    let docs = declaration_docs(source, &syntax)?;
+    if docs != stable.docs {
+        return Err(ItemTreeError::StableShapeMismatch);
+    }
     if stable_raw_attrs(&raw_attrs, symbols).map_err(ItemTreeError::StableShape)?
         != stable.raw_attrs
     {
@@ -606,6 +615,7 @@ fn bind_stable_entry(
         ast_id: stable.ast_id,
         kind: stable.kind,
         name: stable.name.intern(symbols)?,
+        docs,
         vis: stable.vis,
         raw_attrs,
         children,
@@ -648,6 +658,7 @@ impl StableItemTreeEntry {
             ast_id: entry.ast_id,
             kind: entry.kind,
             name: stable_symbol(entry.name, symbols)?,
+            docs: entry.docs.clone(),
             vis: entry.vis,
             raw_attrs: stable_raw_attrs(&entry.raw_attrs, symbols)?,
             children: entry
@@ -786,6 +797,7 @@ impl StableHash for StableItemTreeEntry {
         self.ast_id.index().stable_hash(hasher);
         stable_hash_item_kind(self.kind, hasher);
         self.name.stable_hash(hasher);
+        stable_hash_option(&self.docs, hasher);
         stable_hash_visibility(self.vis, hasher);
         self.raw_attrs.stable_hash(hasher);
         self.children.stable_hash(hasher);
@@ -2444,11 +2456,32 @@ where
         ast_id: erased_id(node, ast_ids)?,
         kind,
         name,
+        docs: declaration_docs(source, node.syntax())?,
         vis,
         raw_attrs: raw_attrs(file, source, attrs, symbols)?,
         children: Vec::new(),
         header_hash,
     })
+}
+
+fn declaration_docs(source: &str, syntax: &SyntaxNode) -> Result<Option<String>, ItemTreeError> {
+    let Some(docs) = syntax.children().find_map(ast::Docs::cast) else {
+        return Ok(None);
+    };
+    let raw = node_text(source, docs.syntax())?
+        .replace("\r\n", "\n")
+        .replace('\r', "\n");
+    let payload = raw
+        .lines()
+        .map(|line| {
+            let line = line.trim_start();
+            line.strip_prefix("///")
+                .map(|content| content.strip_prefix(' ').unwrap_or(content))
+                .unwrap_or(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(Some(payload))
 }
 
 pub(crate) fn named_symbol<N: AstNode>(
@@ -4002,6 +4035,116 @@ mod tests {
             .expect("changed item tree resolves through its interner");
         assert_ne!(second_shape, changed_shape);
         assert_ne!(second_shape.fingerprint(), changed_shape.fingerprint());
+    }
+
+    #[test]
+    fn item_tree_retains_nested_declaration_docs_in_stable_shapes() {
+        let source = concat!(
+            "/// Interface documentation.\n",
+            "/// A second line.\n",
+            "interface api {\n",
+            "    /// Type documentation.\n",
+            "    type Payload {\n",
+            "        /// Field documentation.\n",
+            "        value: U32\n",
+            "    }\n",
+            "    /// Function documentation.\n",
+            "    fn send(payload: Payload) -> U32\n",
+            "}\n",
+            "/// World documentation.\n",
+            "world client {\n",
+            "    /// Import documentation.\n",
+            "    import api\n",
+            "    /// Include documentation.\n",
+            "    include base\n",
+            "}\n",
+            "/// Helper documentation.\n",
+            "fn helper() { 1 }\n",
+        );
+        let file = FileId::new(719);
+        let (parsed, ast_ids, symbols, tree, _) = collect_with_snapshot(source, file);
+        assert!(
+            parsed.errors.is_empty(),
+            "documentation fixture should parse: {:?}",
+            parsed.errors
+        );
+
+        let interface = &tree.items[0];
+        assert_eq!(
+            interface.docs.as_deref(),
+            Some("Interface documentation.\nA second line.")
+        );
+        assert_eq!(
+            interface.children[0].docs.as_deref(),
+            Some("Type documentation.")
+        );
+        assert_eq!(
+            interface.children[0].children[0].docs.as_deref(),
+            Some("Field documentation.")
+        );
+        assert_eq!(
+            interface.children[1].docs.as_deref(),
+            Some("Function documentation.")
+        );
+        assert_eq!(tree.items[1].docs.as_deref(), Some("World documentation."));
+        assert_eq!(
+            tree.items[1].children[0].docs.as_deref(),
+            Some("Import documentation.")
+        );
+        assert_eq!(
+            tree.items[1].children[1].docs.as_deref(),
+            Some("Include documentation.")
+        );
+
+        let stable = tree
+            .stable_shape(&symbols)
+            .expect("documentation is part of the stable item-tree shape");
+        let rebound = stable
+            .bind_to_snapshot(file, source, &parsed.root, &ast_ids, &symbols)
+            .expect("documentation-bearing entries rebind");
+        assert_eq!(rebound, tree);
+
+        let changed_docs_source = source.replace(
+            "/// Function documentation.",
+            "/// Changed function documentation.",
+        );
+        let (changed_docs, changed_docs_ids) = parse_snapshot(&changed_docs_source, file);
+        let changed_docs_tree = ItemTree::collect(
+            file,
+            &changed_docs_source,
+            &changed_docs.root,
+            &changed_docs_ids,
+            &symbols,
+        )
+        .expect("changed documentation tree collects");
+        let changed_docs_shape = changed_docs_tree
+            .stable_shape(&symbols)
+            .expect("changed documentation shape collects");
+        assert_ne!(stable, changed_docs_shape);
+        assert_ne!(stable.fingerprint(), changed_docs_shape.fingerprint());
+
+        let changed_body_source = source.replace("{ 1 }", "{ 123456 }");
+        let (changed_body, changed_body_ids) = parse_snapshot(&changed_body_source, file);
+        let changed_body_tree = ItemTree::collect(
+            file,
+            &changed_body_source,
+            &changed_body.root,
+            &changed_body_ids,
+            &symbols,
+        )
+        .expect("body-only edit tree collects");
+        let changed_body_shape = changed_body_tree
+            .stable_shape(&symbols)
+            .expect("body-only edit keeps a stable item-tree shape");
+        assert_eq!(stable, changed_body_shape);
+        assert_eq!(stable.fingerprint(), changed_body_shape.fingerprint());
+
+        let mut tampered = stable.clone();
+        tampered.items[0].children[1].docs = Some("/// forged documentation".to_owned());
+        assert_eq!(
+            tampered.bind_to_snapshot(file, source, &parsed.root, &ast_ids, &symbols),
+            Err(ItemTreeError::StableShapeMismatch)
+        );
     }
 
     #[test]
