@@ -1170,6 +1170,11 @@ pub fn replace_file_in_directory_if_unchanged(
             "destination contents changed after they were read",
         ));
     }
+    // Windows can reject replacement while a handle to the destination is
+    // still open, even when that handle allows delete sharing. The identity
+    // and contents check is complete; cooperating writers remain serialized
+    // by the caller's workspace lock until the rename below.
+    drop(current);
     replace_file_in_directory(parent, source_name, destination_name)
 }
 
@@ -1834,6 +1839,7 @@ mod windows_tests {
         open_directory_path_for_child_updates_without_following,
         open_directory_path_for_file_updates_without_following,
         open_directory_path_without_following, remove_file_in_directory, replace_file_in_directory,
+        replace_file_in_directory_if_unchanged,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1881,6 +1887,38 @@ mod windows_tests {
 
         remove_file_in_directory(&package_handle, std::ffi::OsStr::new("sai.package")).unwrap();
         assert!(!package.join("sai.package").exists());
+    }
+
+    #[test]
+    fn compare_before_replace_releases_the_destination_handle() {
+        let directory = TestDirectory::new();
+        fs::write(directory.0.join("temporary"), b"formatted").unwrap();
+        fs::write(directory.0.join("sai.package"), b"original").unwrap();
+
+        let package_path = fs::canonicalize(&directory.0).unwrap();
+        let package =
+            open_directory_path_for_file_updates_without_following(&package_path).unwrap();
+        let current = super::open_file_without_following(
+            &package,
+            &package_path,
+            std::ffi::OsStr::new("sai.package"),
+        )
+        .unwrap();
+        let identity_guard = file_identity(&current).unwrap();
+
+        replace_file_in_directory_if_unchanged(
+            &package,
+            std::ffi::OsStr::new("temporary"),
+            std::ffi::OsStr::new("sai.package"),
+            identity_guard,
+            b"original",
+        )
+        .unwrap();
+        assert_eq!(file_identity(&current).unwrap(), identity_guard);
+        assert_eq!(
+            fs::read(directory.0.join("sai.package")).unwrap(),
+            b"formatted"
+        );
     }
 
     #[test]
