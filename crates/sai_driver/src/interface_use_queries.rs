@@ -1922,8 +1922,10 @@ fn collect_interface_uses_input(
                 );
             }
             let mut resource_member_names = Vec::with_capacity(method_entries.len());
-            let mut generated_resource_members = Vec::with_capacity(1);
-            let mut resource_members_supported = resource_members.is_empty();
+            let mut resource_constructor_names = Vec::new();
+            let mut generated_resource_members = Vec::with_capacity(resource_members.len());
+            let mut resource_members_supported = true;
+            let mut resource_constructor_count = 0;
             for (method_entry, method_owner) in method_entries
                 .into_iter()
                 .zip(resource_members.iter().copied())
@@ -1972,10 +1974,14 @@ fn collect_interface_uses_input(
                 )?;
                 if let OwnerNode::InterfaceItem(item) = method_hir.node
                     && let InterfaceItemKind::ResourceMember { role, .. } = item.kind
-                    && role != MemberRole::Constructor
                     && let Some(definition) = wit_name_definition(item.name, method_owner, symbols)?
                 {
-                    resource_member_names.push(definition);
+                    if role == MemberRole::Constructor {
+                        resource_constructor_count += 1;
+                        resource_constructor_names.push(definition);
+                    } else {
+                        resource_member_names.push(definition);
+                    }
                 }
                 let resolution = collect_owner_references(
                     &mut owner_references,
@@ -2020,8 +2026,7 @@ fn collect_interface_uses_input(
                     owner_uses_complete = false;
                     poisoned_owners.insert(method_owner);
                 }
-                let generated_resource_member = if resource_members.len() == 1
-                    && !method_has_diagnostics
+                let generated_resource_member = if !method_has_diagnostics
                     && !method_has_issues
                     && !has_incompatible_boundary
                     && !generated_resource_member_has_unsupported_syntax(method_entry, inputs)
@@ -2042,10 +2047,39 @@ fn collect_interface_uses_input(
                 };
                 if let Some(member) = generated_resource_member {
                     generated_resource_members.push(member);
-                    resource_members_supported = true;
+                } else {
+                    resource_members_supported = false;
                 }
             }
+            if resource_constructor_count > 1 {
+                resource_members_supported = false;
+                resource_member_names.extend(resource_constructor_names.into_iter().map(
+                    |definition| WitNameDefinition {
+                        source_name: "constructor".to_owned(),
+                        owner: definition.owner,
+                        span: definition.span,
+                    },
+                ));
+            }
+            if append_wit_name_collision_diagnostics(
+                resource_member_names,
+                &inputs.source_ref,
+                &inputs.source,
+                &prepared.snapshot,
+                &mut interface_check_diagnostics,
+            )? {
+                resource_members_supported = false;
+                poisoned_owners.insert(member_owner);
+            }
             if resource_members_supported && let Some(mut item) = staged_resource_item {
+                if let Some(constructor_position) = generated_resource_members
+                    .iter()
+                    .position(|member| member.kind == WitMemberKind::Constructor)
+                    && constructor_position != 0
+                {
+                    let constructor = generated_resource_members.remove(constructor_position);
+                    generated_resource_members.insert(0, constructor);
+                }
                 item.kind = WitItemKind::Resource(generated_resource_members);
                 let item_name = item.name.clone();
                 if generated_item_names.insert(item_name.clone()) {
@@ -2075,15 +2109,6 @@ fn collect_interface_uses_input(
                 }
             } else {
                 generated_complete = false;
-            }
-            if append_wit_name_collision_diagnostics(
-                resource_member_names,
-                &inputs.source_ref,
-                &inputs.source,
-                &prepared.snapshot,
-                &mut interface_check_diagnostics,
-            )? {
-                poisoned_owners.insert(member_owner);
             }
         }
         collision_inputs.push(InterfaceNameCollisionInput {

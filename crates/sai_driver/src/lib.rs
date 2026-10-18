@@ -46274,11 +46274,160 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
+    fn generated_wit_emits_multiple_supported_resource_members_atomically() {
+        let source = concat!(
+            "interface api {\n",
+            "  resource Handle {\n",
+            "    fn set(self: borrow Self, enabled: Bool)\n",
+            "    fn from_raw(raw: U64) -> Self\n",
+            "    fn constructor(value: U16)\n",
+            "    fn new(seed: U32) -> Self\n",
+            "  }\n",
+            "  fn take(value: Handle)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("the generated resource package loads");
+        assert!(
+            result.failure.is_none(),
+            "the generated resource members parse and resolve: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "all supported members are emitted together: {}",
+            generated.text
+        );
+        let constructor_position = generated
+            .text
+            .find("constructor(seed: u32);")
+            .expect("the constructor is emitted");
+        let method_position = generated
+            .text
+            .find("set: func(enabled: bool);")
+            .expect("the method is emitted");
+        let static_position = generated
+            .text
+            .find("from-raw: static func(raw: u64) -> handle;")
+            .expect("the static function is emitted");
+        let escaped_static_position = generated
+            .text
+            .find("%constructor: static func(value: u16);")
+            .expect("the reserved static function name is escaped");
+        assert!(constructor_position < method_position);
+        assert!(method_position < static_position);
+        assert!(static_position < escaped_static_position);
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        let (resource_index, resource) = interface.items.iter_enumerated().next().unwrap();
+        let sai_wit::WitItemKind::Resource(members) = &resource.kind else {
+            panic!("the source resource is emitted");
+        };
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| (member.name.as_str(), member.kind))
+                .collect::<Vec<_>>(),
+            [
+                ("constructor", sai_wit::WitMemberKind::Constructor),
+                ("set", sai_wit::WitMemberKind::Method),
+                ("from-raw", sai_wit::WitMemberKind::Static),
+                ("constructor", sai_wit::WitMemberKind::Static),
+            ]
+        );
+        assert_eq!(
+            members[0].func.params,
+            [("seed".to_owned(), sai_wit::WitType::U32)]
+        );
+        let sai_wit::WitType::Own(constructor_result) = members[0]
+            .func
+            .result
+            .as_ref()
+            .expect("the parsed constructor has its implicit owned result")
+        else {
+            panic!("the constructor result is the current resource");
+        };
+        let sai_wit::WitType::Borrow(method_receiver) = &members[1].func.params[0].1 else {
+            panic!("the method model retains its borrowed receiver");
+        };
+        let sai_wit::WitType::Own(static_result) = members[2]
+            .func
+            .result
+            .as_ref()
+            .expect("the static function returns its resource")
+        else {
+            panic!("the static result is an owned resource");
+        };
+        for reference in [constructor_result, static_result, method_receiver] {
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.item, resource_index);
+            assert_eq!(reference.item_name, "handle");
+        }
+        assert_eq!(
+            members[3].func.params,
+            [("value".to_owned(), sai_wit::WitType::U16)]
+        );
+        let sai_wit::WitItemKind::Func(take) = &interface.items.iter().nth(1).unwrap().kind else {
+            panic!("the handle consumer is emitted after the resource");
+        };
+        let sai_wit::WitType::Own(handle) = &take.params[0].1 else {
+            panic!("the consumer receives the owned resource");
+        };
+        assert_eq!(handle.item, resource_index);
+    }
+
+    #[test]
     fn generated_wit_omits_unsupported_resource_member_shapes() {
         let cases = [
             (
-                "an extra method",
-                "fn new() -> Self\nfn close(self: borrow Self)\n",
+                "one unsupported member among supported resource members",
+                "fn close(self: borrow Self)\nfn ping(var value: U32)\n",
+            ),
+            (
+                "duplicate constructors",
+                "fn new() -> Self\nfn new() -> Self\n",
+            ),
+            (
+                "WIT-normalized resource member name collision",
+                "fn ChangeData(self: borrow Self)\nfn change_data(value: U32)\n",
             ),
             (
                 "a mutable constructor parameter",
