@@ -5261,3 +5261,13 @@
 - **Review:** Hostile review found no P0–P2 issues. It confirmed source-order parameter conversion, parameter validation including attributed parameters, exact resource result identity, syntax gating, and all-or-nothing omission.
 - **Human review:** **Review required:** Confirm that supporting any representable named immutable constructor parameters is the right boundary while keeping constructors as the resource's sole member; mutable, unnamed, attributed, and unsupported parameter forms remain deferred.
 - **Remaining scope:** Add resource methods and static functions, support aggregates that contain resource handles, resolve forward resource references, generate worlds, and complete transitive poisoning and completeness accounting.
+
+### IR-664: Generate a void static resource function
+
+- **Decision:** Emit a resource only when its sole member is one safe synchronous nongeneric static function with no parameters and no result or an explicit unit result. Print it as a WIT static function, preserving its WIT member name, docs, and stability.
+- **Decision:** Require the resource member's exact parent `DefId`, and reject static functions with parameters, non-unit results, bodies, contracts, parser errors, or invalid attributes. Omit the resource and handle consumers on rejection.
+- **Reason:** The existing WIT model/printer already represents static resource functions, and unit results map to the same no-result WIT signature. This narrow shape adds static-role output without yet encoding parameter conversions or resource receiver semantics.
+- **Verification:** The generated-WIT test group passes (28 tests), `cargo test --workspace --locked --quiet` passes (294 `sai_driver` tests), `cargo check --workspace --locked --quiet`, `cargo fmt --all -- --check`, and `git diff --check` pass.
+- **Review:** Hostile review found and closed one P2: an explicit unit result is representable as a WIT void result. The positive fixture now covers `-> ()`, non-unit results remain rejected, and the final hostile review found no remaining P0–P2 issues.
+- **Human review:** **Review required:** Confirm that no-parameter static functions with void or explicit unit results are the right initial static-resource boundary while parameterized/result-bearing statics and methods remain deferred.
+- **Remaining scope:** Support static parameters and non-unit results, resource methods and multiple resource members, aggregates that contain resource handles, forward resource references, worlds, and complete transitive poisoning/completeness accounting.
