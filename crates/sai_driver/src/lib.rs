@@ -45842,13 +45842,117 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
+    fn generated_wit_emits_a_parameterized_resource_constructor() {
+        let source = concat!(
+            "interface api {\n",
+            "  resource Handle {\n",
+            "    /// Create a seeded handle.\n",
+            "    fn new(seed: U32, enabled: Bool) -> Self\n",
+            "  }\n",
+            "  fn take(value: Handle)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("the generated constructor package loads");
+        assert!(
+            result.failure.is_none(),
+            "the generated constructor parses and resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "a supported parameterized constructor is fully representable: {}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("constructor(seed: u32, enabled: bool);")
+        );
+        assert!(generated.text.contains("/// Create a seeded handle."));
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        let resource_index = interface.items.iter_enumerated().next().unwrap().0;
+        let resource = interface.items.iter().next().unwrap();
+        let sai_wit::WitItemKind::Resource(members) = &resource.kind else {
+            panic!("the source resource is emitted");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, "constructor");
+        assert_eq!(members[0].kind, sai_wit::WitMemberKind::Constructor);
+        assert_eq!(members[0].docs.as_deref(), Some("Create a seeded handle."));
+        assert_eq!(
+            members[0].func.params,
+            [
+                ("seed".to_owned(), sai_wit::WitType::U32),
+                ("enabled".to_owned(), sai_wit::WitType::Bool),
+            ]
+        );
+        let Some(sai_wit::WitType::Own(constructor_result)) = &members[0].func.result else {
+            panic!("the parsed constructor retains its implicit owned resource result");
+        };
+        assert_eq!(constructor_result.interface.unit, unit);
+        assert_eq!(constructor_result.interface.interface, interface_index);
+        assert_eq!(constructor_result.item, resource_index);
+        assert_eq!(constructor_result.item_name, "handle");
+    }
+
+    #[test]
     fn generated_wit_omits_unsupported_resource_constructor_shapes() {
         let cases = [
             (
                 "an extra method",
                 "fn new() -> Self\nfn close(self: borrow Self)\n",
             ),
-            ("constructor parameters", "fn new(value: U32) -> Self\n"),
+            (
+                "a mutable constructor parameter",
+                "fn new(var value: U32) -> Self\n",
+            ),
+            (
+                "an unnamed constructor parameter",
+                "fn new(_: U32) -> Self\n",
+            ),
+            (
+                "a constructor parameter attribute",
+                "fn new(\n  @doc(hidden)\n  seed: U32\n) -> Self\n",
+            ),
             (
                 "a static new function returning a result",
                 "fn new() -> Result<Self, U32>\n",

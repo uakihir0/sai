@@ -2007,8 +2007,10 @@ fn collect_interface_uses_input(
                         &method_hir,
                         member_owner.def_id.to_def_id(),
                         &boundary_conversions,
+                        &generated_named_type_references,
                         inputs.validated_attrs.get(&method_entry.ast_id),
                         prepared.generated_package_version.as_ref(),
+                        symbols,
                     )
                 {
                     generated_resource_members.push(member);
@@ -3549,8 +3551,10 @@ fn generated_resource_constructor_member(
     owner: &HirOwner<'_>,
     resource: DefId,
     conversions: &[sai_ty::boundary::BoundaryTypeConversion],
+    references: &HashMap<DefId, WitTypeRef>,
     attrs: Option<&sai_hir::attrs::ValidatedAttrs>,
     selected: Option<&sai_package::mvs::MvsPackageVersion>,
+    symbols: &Interner,
 ) -> Option<WitMember> {
     let OwnerNode::InterfaceItem(item) = owner.node else {
         return None;
@@ -3568,22 +3572,44 @@ fn generated_resource_constructor_member(
         || item.name.is_error()
         || sig.safety != sai_hir::Safety::Safe
         || sig.is_async
-        || !sig.params.is_empty()
         || sig.borrows.is_some()
         || sig.effects.is_some()
         || !generics.params.is_empty()
         || !generics.where_preds.is_empty()
         || attrs.is_some_and(|attrs| !attrs.diagnostics.is_empty())
+        || sig.ret.is_none()
     {
         return None;
     }
-    let [conversion] = conversions else {
-        return None;
-    };
+    let mut conversions = conversions.iter();
+    let mut params = Vec::with_capacity(sig.params.len());
+    for parameter in sig.params {
+        if parameter.is_self || parameter.mutable {
+            return None;
+        }
+        let parameter_name = parameter.name?;
+        if parameter_name.is_error() {
+            return None;
+        }
+        let parameter_source_name = symbols.resolve(parameter_name.sym).ok()?;
+        let parameter_name = sai_identifier_to_wit_name(&parameter_source_name)?;
+        let conversion = conversions.next()?;
+        let BoundaryTypeOutcome::Mapped(boundary_type) = &conversion.outcome else {
+            return None;
+        };
+        let Ok(Some(parameter_type)) =
+            sai_ty::boundary::materialize_boundary_type(boundary_type, references, Position::Param)
+        else {
+            return None;
+        };
+        params.push((parameter_name, parameter_type));
+    }
+    let conversion = conversions.next()?;
     if !matches!(
         &conversion.outcome,
         BoundaryTypeOutcome::Mapped(BoundaryType::Own(definition)) if *definition == resource
-    ) {
+    ) || conversions.next().is_some()
+    {
         return None;
     }
     let selected = selected?;
@@ -3593,7 +3619,7 @@ fn generated_resource_constructor_member(
         name: "constructor".to_owned(),
         kind: WitMemberKind::Constructor,
         func: WitFunc {
-            params: Vec::new(),
+            params,
             result: None,
             is_async: false,
         },
@@ -3618,11 +3644,17 @@ fn generated_resource_constructor_has_unsupported_syntax(
         // cannot be inspected. Signature-only lowering omits bodies and contracts.
         return true;
     };
+    let has_param_attributes = function.params().is_some_and(|params| {
+        params
+            .params()
+            .any(|parameter| parameter.attrs().next().is_some())
+    });
     function.body().is_some()
         || function
             .syntax()
             .descendants()
             .any(|node| node.kind() == SyntaxKind::ERROR)
+        || has_param_attributes
         || function.requires_clauses().next().is_some()
         || function.ensures_clauses().next().is_some()
 }
