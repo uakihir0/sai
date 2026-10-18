@@ -1220,6 +1220,8 @@ pub struct GeneratedWit {
 
 **Generated-WIT progress (IR-664):** A resource whose sole member is one safe synchronous nongeneric static function with no parameters and either no result or an explicit unit result is emitted as `name: static func();`. Its member docs and stability are preserved. Static functions with parameters or non-unit results and resources with other unsupported members remain omitted with their consumers; generated output stays incomplete.
 
+**Generated-WIT progress (IR-665):** A resource whose sole member is one safe synchronous nongeneric static function may have any number of named, immutable parameters with materializable boundary types and an optional materializable result. Parameters retain source order; an explicit unit result prints as void. The current resource is available through a provisional exact WIT item reference while its member is generated, so `Self` own handles in static parameters and results retain the resource's identity. That reference is published for later declarations only if the complete resource is emitted; forward references remain unsupported. Mutable, unnamed, attributed, unsafe, async, generic, body-bearing, contract-bearing, or otherwise unrepresentable members keep the resource and its handle consumers omitted. The full §16.10.1 plan remains incomplete.
+
 ### 16.10.2 Clients
 
 1. **Bindgen.** `sai bindgen wit` ([13](13-cli.md) §13.6.19 item 1) checks the root, and writes `generated_wit_text(root).text` only when the root has no errors and the text is `complete`.
