@@ -1898,6 +1898,29 @@ fn collect_interface_uses_input(
                     ),
                 ));
             }
+            let mut resource_named_type_references = generated_named_type_references.clone();
+            if let Some(resource_item) = staged_resource_item.as_ref()
+                && !generated_item_names.contains(&resource_item.name)
+                && let (Some(unit), Some(interface_index), Some(interface_name)) = (
+                    generated_unit.as_ref(),
+                    generated_interface_index,
+                    interface_wit_name.as_ref(),
+                )
+                && let Ok(item_index) = generated_items.next_index()
+            {
+                resource_named_type_references.insert(
+                    member_owner.def_id.to_def_id(),
+                    WitTypeRef {
+                        interface: sai_wit::WitIfaceRef {
+                            unit: unit.clone(),
+                            interface: interface_index,
+                            name: interface_name.clone(),
+                        },
+                        item: item_index,
+                        item_name: resource_item.name.clone(),
+                    },
+                );
+            }
             let mut resource_member_names = Vec::with_capacity(method_entries.len());
             let mut generated_resource_members = Vec::with_capacity(1);
             let mut resource_members_supported = resource_members.is_empty();
@@ -2008,7 +2031,7 @@ fn collect_interface_uses_input(
                         &method_hir,
                         member_owner.def_id.to_def_id(),
                         &boundary_conversions,
-                        &generated_named_type_references,
+                        &resource_named_type_references,
                         inputs.validated_attrs.get(&method_entry.ast_id),
                         prepared.generated_package_version.as_ref(),
                         symbols,
@@ -3701,7 +3724,6 @@ fn generated_resource_static_member(
         || item.name.is_error()
         || sig.safety != sai_hir::Safety::Safe
         || sig.is_async
-        || !sig.params.is_empty()
         || sig.borrows.is_some()
         || sig.effects.is_some()
         || !generics.params.is_empty()
@@ -3710,24 +3732,57 @@ fn generated_resource_static_member(
     {
         return Ok(None);
     }
-    if sig.ret.is_some() {
-        let [conversion] = conversions else {
-            return Ok(None);
-        };
-        let BoundaryTypeOutcome::Mapped(BoundaryType::Unit) = &conversion.outcome else {
-            return Ok(None);
-        };
-        if !matches!(
-            sai_ty::boundary::materialize_boundary_type(
-                &BoundaryType::Unit,
-                references,
-                Position::Result,
-            ),
-            Ok(None)
-        ) {
+    let mut conversions = conversions.iter();
+    let mut params = Vec::with_capacity(sig.params.len());
+    for parameter in sig.params {
+        if parameter.is_self || parameter.mutable {
             return Ok(None);
         }
-    } else if !conversions.is_empty() {
+        let Some(parameter_name) = parameter.name else {
+            return Ok(None);
+        };
+        if parameter_name.is_error() {
+            return Ok(None);
+        }
+        let parameter_source_name = symbols
+            .resolve(parameter_name.sym)
+            .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+            .map_err(InterfaceUsesQueryError::Collection)?;
+        let Some(parameter_name) = sai_identifier_to_wit_name(&parameter_source_name) else {
+            return Ok(None);
+        };
+        let Some(conversion) = conversions.next() else {
+            return Ok(None);
+        };
+        let BoundaryTypeOutcome::Mapped(boundary_type) = &conversion.outcome else {
+            return Ok(None);
+        };
+        let Ok(Some(parameter_type)) =
+            sai_ty::boundary::materialize_boundary_type(boundary_type, references, Position::Param)
+        else {
+            return Ok(None);
+        };
+        params.push((parameter_name, parameter_type));
+    }
+    let result = if sig.ret.is_some() {
+        let Some(conversion) = conversions.next() else {
+            return Ok(None);
+        };
+        let BoundaryTypeOutcome::Mapped(boundary_type) = &conversion.outcome else {
+            return Ok(None);
+        };
+        let Ok(result) = sai_ty::boundary::materialize_boundary_type(
+            boundary_type,
+            references,
+            Position::Result,
+        ) else {
+            return Ok(None);
+        };
+        result
+    } else {
+        None
+    };
+    if conversions.next().is_some() {
         return Ok(None);
     }
     let Some(name_definition) = wit_name_definition(item.name, owner.id, symbols)? else {
@@ -3747,8 +3802,8 @@ fn generated_resource_static_member(
         name,
         kind: WitMemberKind::Static,
         func: WitFunc {
-            params: Vec::new(),
-            result: None,
+            params,
+            result,
             is_async: false,
         },
         docs: entry.docs.clone().map(Arc::from),

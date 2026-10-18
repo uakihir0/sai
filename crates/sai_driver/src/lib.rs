@@ -46030,6 +46030,137 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
+    fn generated_wit_emits_a_parameterized_resource_static_function() {
+        let source = concat!(
+            "interface api {\n",
+            "  resource Handle {\n",
+            "    fn check(seed: U32, enabled: Bool) -> U64\n",
+            "  }\n",
+            "  resource Other {\n",
+            "    fn identity(value: Self) -> Self\n",
+            "  }\n",
+            "  fn take(value: Handle, other: Other)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("the generated static member package loads");
+        assert!(
+            result.failure.is_none(),
+            "the generated static member parses and resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "a supported parameterized static member is fully representable: {}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("check: static func(seed: u32, enabled: bool) -> u64;")
+        );
+        assert!(
+            generated
+                .text
+                .contains("identity: static func(value: other) -> other;"),
+            "{}",
+            generated.text
+        );
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        let resource_index = interface.items.iter_enumerated().next().unwrap().0;
+        let resource = interface.items.iter().next().unwrap();
+        let sai_wit::WitItemKind::Resource(members) = &resource.kind else {
+            panic!("the source resource is emitted");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, "check");
+        assert_eq!(members[0].kind, sai_wit::WitMemberKind::Static);
+        assert_eq!(
+            members[0].func.params,
+            [
+                ("seed".to_owned(), sai_wit::WitType::U32),
+                ("enabled".to_owned(), sai_wit::WitType::Bool),
+            ]
+        );
+        assert_eq!(members[0].func.result, Some(sai_wit::WitType::U64));
+        let (other_index, other) = interface.items.iter_enumerated().nth(1).unwrap();
+        let sai_wit::WitItemKind::Resource(other_members) = &other.kind else {
+            panic!("the second resource is emitted");
+        };
+        assert_eq!(other_members.len(), 1);
+        let sai_wit::WitType::Own(self_parameter) = &other_members[0].func.params[0].1 else {
+            panic!("the static parameter refers to the current resource");
+        };
+        let sai_wit::WitType::Own(self_result) = other_members[0]
+            .func
+            .result
+            .as_ref()
+            .expect("the static function returns the current resource")
+        else {
+            panic!("the static result refers to the current resource");
+        };
+        for reference in [self_parameter, self_result] {
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.item, other_index);
+            assert_eq!(reference.item_name, "other");
+        }
+        let sai_wit::WitItemKind::Func(take) = &interface.items.iter().nth(2).unwrap().kind else {
+            panic!("the resource handle consumer is emitted");
+        };
+        let sai_wit::WitType::Own(handle) = &take.params[0].1 else {
+            panic!("the consumer receives the owned resource");
+        };
+        assert_eq!(handle.interface.unit, unit);
+        assert_eq!(handle.interface.interface, interface_index);
+        assert_eq!(handle.item, resource_index);
+        assert_eq!(handle.item_name, "handle");
+        let sai_wit::WitType::Own(other_handle) = &take.params[1].1 else {
+            panic!("the consumer receives the second owned resource");
+        };
+        assert_eq!(other_handle.item, other_index);
+        assert_eq!(other_handle.item_name, "other");
+    }
+
+    #[test]
     fn generated_wit_omits_unsupported_resource_member_shapes() {
         let cases = [
             (
@@ -46053,10 +46184,10 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 "fn new() -> Result<Self, U32>\n",
             ),
             (
-                "a static function with a parameter",
-                "fn ping(value: U32)\n",
+                "a mutable static function parameter",
+                "fn ping(var value: U32)\n",
             ),
-            ("a static function with a result", "fn ping() -> U32\n"),
+            ("an unnamed static function parameter", "fn ping(_: U32)\n"),
             (
                 "a constructor precondition",
                 "fn new() -> Self requires true\n",
