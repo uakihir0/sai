@@ -8862,7 +8862,10 @@ fn write_file_atomically_in_directory(
             options.mode(0o600);
         }
         let temporary_parent = parent.try_clone().map_err(|source| AtomicFmtWriteError {
-            source,
+            source: contextual_atomic_fmt_write_error(
+                source,
+                "could not retain the formatter directory capability",
+            ),
             installed: false,
         })?;
         let mut temporary_file = match parent.open_with(&temporary_name, &options) {
@@ -8870,7 +8873,10 @@ fn write_file_atomically_in_directory(
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(source) => {
                 return Err(AtomicFmtWriteError {
-                    source,
+                    source: contextual_atomic_fmt_write_error(
+                        source,
+                        "could not create the formatter temporary file",
+                    ),
                     installed: false,
                 });
             }
@@ -8883,26 +8889,38 @@ fn write_file_atomically_in_directory(
         temporary_file
             .write_all(contents)
             .map_err(|source| AtomicFmtWriteError {
-                source,
+                source: contextual_atomic_fmt_write_error(
+                    source,
+                    "could not write the formatter temporary file",
+                ),
                 installed: false,
             })?;
         temporary_file
             .set_permissions(permissions.clone())
             .map_err(|source| AtomicFmtWriteError {
-                source,
+                source: contextual_atomic_fmt_write_error(
+                    source,
+                    "could not copy permissions to the formatter temporary file",
+                ),
                 installed: false,
             })?;
         temporary_file
             .sync_all()
             .map_err(|source| AtomicFmtWriteError {
-                source,
+                source: contextual_atomic_fmt_write_error(
+                    source,
+                    "could not sync the formatter temporary file",
+                ),
                 installed: false,
             })?;
         drop(temporary_file);
         let parent_handle = parent
             .try_clone()
             .map_err(|source| AtomicFmtWriteError {
-                source,
+                source: contextual_atomic_fmt_write_error(
+                    source,
+                    "could not retain the formatter directory capability",
+                ),
                 installed: false,
             })?
             .into_std_file();
@@ -8914,12 +8932,18 @@ fn write_file_atomically_in_directory(
             expected_contents,
         )
         .map_err(|source| AtomicFmtWriteError {
-            source,
+            source: contextual_atomic_fmt_write_error(
+                source,
+                "could not atomically replace the formatted file",
+            ),
             installed: false,
         })?;
         temporary.published = true;
         sync_fmt_parent_directory(parent).map_err(|source| AtomicFmtWriteError {
-            source,
+            source: contextual_atomic_fmt_write_error(
+                source,
+                "could not sync the formatter directory",
+            ),
             installed: true,
         })?;
         return Ok(());
@@ -8931,6 +8955,10 @@ fn write_file_atomically_in_directory(
         ),
         installed: false,
     })
+}
+
+fn contextual_atomic_fmt_write_error(source: io::Error, context: &str) -> io::Error {
+    io::Error::new(source.kind(), format!("{context}: {source}"))
 }
 
 struct TemporaryFmtFile {
@@ -17170,6 +17198,20 @@ mod tests {
         assert_eq!(selected_contents, b"selected bytes");
         assert_eq!(fs::read(manifest).unwrap(), b"replacement bytes");
         assert!(file.identity_guard.is_some());
+    }
+
+    #[test]
+    fn formatter_atomic_write_context_preserves_io_error_kind() {
+        let error = super::contextual_atomic_fmt_write_error(
+            io::Error::new(io::ErrorKind::PermissionDenied, "access denied"),
+            "could not create the formatter temporary file",
+        );
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "could not create the formatter temporary file: access denied"
+        );
     }
 
     #[test]
