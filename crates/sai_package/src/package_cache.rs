@@ -1833,12 +1833,21 @@ fn inspect_cached_source(root: &Path) -> Result<SourceTreeInspection, PackageCac
             root_directory,
         } => (source_directory, root_name, root_directory),
     };
-    let root_metadata =
-        capability_directory_metadata(&root_directory).map_err(|source| PackageCacheError::Io {
-            operation: "inspect opened cached package source",
-            path: root.to_path_buf(),
-            source,
-        })?;
+    let root_metadata = match capability_directory_metadata(&root_directory) {
+        Ok(metadata) => metadata,
+        Err(source) if cached_entry_error_is_corruption(&source) => {
+            return Ok(SourceTreeInspection::Corrupt {
+                actual_checksum: None,
+            });
+        }
+        Err(source) => {
+            return Err(PackageCacheError::Io {
+                operation: "inspect opened cached package source",
+                path: root.to_path_buf(),
+                source,
+            });
+        }
+    };
     if !root_metadata.is_dir()
         || !cached_directory_entry_matches(&source_directory, &root_name, &root_directory)?
     {
@@ -1860,12 +1869,21 @@ fn inspect_cached_source(root: &Path) -> Result<SourceTreeInspection, PackageCac
     while let Some((directory, directory_name, parent_directory, parent_relative_path)) =
         pending.pop()
     {
-        let directory_metadata =
-            capability_directory_metadata(&directory).map_err(|source| PackageCacheError::Io {
-                operation: "inspect opened cached package source directory",
-                path: root.join(&parent_relative_path),
-                source,
-            })?;
+        let directory_metadata = match capability_directory_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(source) if cached_entry_error_is_corruption(&source) => {
+                return Ok(SourceTreeInspection::Corrupt {
+                    actual_checksum: None,
+                });
+            }
+            Err(source) => {
+                return Err(PackageCacheError::Io {
+                    operation: "inspect opened cached package source directory",
+                    path: root.join(&parent_relative_path),
+                    source,
+                });
+            }
+        };
         if !directory_metadata.is_dir() || !is_traversable_directory(&directory_metadata) {
             return Ok(SourceTreeInspection::Corrupt {
                 actual_checksum: None,
@@ -1971,14 +1989,21 @@ fn inspect_cached_source(root: &Path) -> Result<SourceTreeInspection, PackageCac
                         });
                     }
                 };
-                let child_metadata =
-                    capability_directory_metadata(&child_directory).map_err(|source| {
-                        PackageCacheError::Io {
+                let child_metadata = match capability_directory_metadata(&child_directory) {
+                    Ok(metadata) => metadata,
+                    Err(source) if cached_entry_error_is_corruption(&source) => {
+                        return Ok(SourceTreeInspection::Corrupt {
+                            actual_checksum: None,
+                        });
+                    }
+                    Err(source) => {
+                        return Err(PackageCacheError::Io {
                             operation: "inspect opened cached package source directory",
                             path: root.join(&relative_path),
                             source,
-                        }
-                    })?;
+                        });
+                    }
+                };
                 if !child_metadata.is_dir()
                     || !cached_directory_entry_matches(&directory, &name, &child_directory)?
                 {
