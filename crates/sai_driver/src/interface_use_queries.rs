@@ -1997,12 +1997,13 @@ fn collect_interface_uses_input(
                     owner_uses_complete = false;
                     poisoned_owners.insert(method_owner);
                 }
-                if resource_members.len() == 1
+                let generated_resource_member = if resource_members.len() == 1
                     && !method_has_diagnostics
                     && !method_has_issues
                     && !has_incompatible_boundary
-                    && !generated_resource_constructor_has_unsupported_syntax(method_entry, inputs)
-                    && let Some(member) = generated_resource_constructor_member(
+                    && !generated_resource_member_has_unsupported_syntax(method_entry, inputs)
+                {
+                    generated_resource_member(
                         method_entry,
                         &method_hir,
                         member_owner.def_id.to_def_id(),
@@ -2011,8 +2012,11 @@ fn collect_interface_uses_input(
                         inputs.validated_attrs.get(&method_entry.ast_id),
                         prepared.generated_package_version.as_ref(),
                         symbols,
-                    )
-                {
+                    )?
+                } else {
+                    None
+                };
+                if let Some(member) = generated_resource_member {
                     generated_resource_members.push(member);
                     resource_members_supported = true;
                 }
@@ -3546,6 +3550,47 @@ fn generated_function_item(
     }))
 }
 
+fn generated_resource_member(
+    entry: &ItemTreeEntry,
+    owner: &HirOwner<'_>,
+    resource: DefId,
+    conversions: &[sai_ty::boundary::BoundaryTypeConversion],
+    references: &HashMap<DefId, WitTypeRef>,
+    attrs: Option<&sai_hir::attrs::ValidatedAttrs>,
+    selected: Option<&sai_package::mvs::MvsPackageVersion>,
+    symbols: &Interner,
+) -> Result<Option<WitMember>, InterfaceUsesQueryError> {
+    let OwnerNode::InterfaceItem(item) = owner.node else {
+        return Ok(None);
+    };
+    let InterfaceItemKind::ResourceMember { role, .. } = item.kind else {
+        return Ok(None);
+    };
+    match role {
+        MemberRole::Constructor => Ok(generated_resource_constructor_member(
+            entry,
+            owner,
+            resource,
+            conversions,
+            references,
+            attrs,
+            selected,
+            symbols,
+        )),
+        MemberRole::Static => generated_resource_static_member(
+            entry,
+            owner,
+            resource,
+            conversions,
+            references,
+            attrs,
+            selected,
+            symbols,
+        ),
+        MemberRole::Method => Ok(None),
+    }
+}
+
 fn generated_resource_constructor_member(
     entry: &ItemTreeEntry,
     owner: &HirOwner<'_>,
@@ -3630,7 +3675,90 @@ fn generated_resource_constructor_member(
     })
 }
 
-fn generated_resource_constructor_has_unsupported_syntax(
+fn generated_resource_static_member(
+    entry: &ItemTreeEntry,
+    owner: &HirOwner<'_>,
+    resource: DefId,
+    conversions: &[sai_ty::boundary::BoundaryTypeConversion],
+    references: &HashMap<DefId, WitTypeRef>,
+    attrs: Option<&sai_hir::attrs::ValidatedAttrs>,
+    selected: Option<&sai_package::mvs::MvsPackageVersion>,
+    symbols: &Interner,
+) -> Result<Option<WitMember>, InterfaceUsesQueryError> {
+    let OwnerNode::InterfaceItem(item) = owner.node else {
+        return Ok(None);
+    };
+    let InterfaceItemKind::ResourceMember {
+        resource: owner_resource,
+        role: MemberRole::Static,
+        sig,
+        generics,
+    } = item.kind
+    else {
+        return Ok(None);
+    };
+    if owner_resource.to_def_id() != resource
+        || item.name.is_error()
+        || sig.safety != sai_hir::Safety::Safe
+        || sig.is_async
+        || !sig.params.is_empty()
+        || sig.borrows.is_some()
+        || sig.effects.is_some()
+        || !generics.params.is_empty()
+        || !generics.where_preds.is_empty()
+        || attrs.is_some_and(|attrs| !attrs.diagnostics.is_empty())
+    {
+        return Ok(None);
+    }
+    if sig.ret.is_some() {
+        let [conversion] = conversions else {
+            return Ok(None);
+        };
+        let BoundaryTypeOutcome::Mapped(BoundaryType::Unit) = &conversion.outcome else {
+            return Ok(None);
+        };
+        if !matches!(
+            sai_ty::boundary::materialize_boundary_type(
+                &BoundaryType::Unit,
+                references,
+                Position::Result,
+            ),
+            Ok(None)
+        ) {
+            return Ok(None);
+        }
+    } else if !conversions.is_empty() {
+        return Ok(None);
+    }
+    let Some(name_definition) = wit_name_definition(item.name, owner.id, symbols)? else {
+        return Ok(None);
+    };
+    let Some(name) = sai_identifier_to_wit_name(&name_definition.source_name) else {
+        return Ok(None);
+    };
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let Some((since, deprecated)) = generated_stability(attrs, Some(selected)) else {
+        return Ok(None);
+    };
+
+    Ok(Some(WitMember {
+        name,
+        kind: WitMemberKind::Static,
+        func: WitFunc {
+            params: Vec::new(),
+            result: None,
+            is_async: false,
+        },
+        docs: entry.docs.clone().map(Arc::from),
+        since,
+        deprecated,
+        unsupported: None,
+    }))
+}
+
+fn generated_resource_member_has_unsupported_syntax(
     entry: &ItemTreeEntry,
     inputs: &CurrentOwnerInputs,
 ) -> bool {
@@ -3640,8 +3768,8 @@ fn generated_resource_constructor_has_unsupported_syntax(
         .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.root))
         .and_then(ast::FnDecl::cast)
     else {
-        // Constructor generation is intentionally fail-closed when its source syntax
-        // cannot be inspected. Signature-only lowering omits bodies and contracts.
+        // Resource member generation is intentionally fail-closed when its source
+        // syntax cannot be inspected. Signature-only lowering omits bodies/contracts.
         return true;
     };
     let has_param_attributes = function.params().is_some_and(|params| {

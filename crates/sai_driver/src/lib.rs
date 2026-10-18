@@ -45668,7 +45668,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         let source = concat!(
             "interface api {\n",
             "  resource Handle {\n",
-            "    fn reset()\n",
+            "    fn reset(self: borrow Self)\n",
             "  }\n",
             "  fn take(value: Handle)\n",
             "  fn independent(value: U32)\n",
@@ -45935,7 +45935,102 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
-    fn generated_wit_omits_unsupported_resource_constructor_shapes() {
+    fn generated_wit_emits_a_resource_static_function() {
+        let source = concat!(
+            "interface api {\n",
+            "  resource Handle {\n",
+            "    /// Check whether handles are enabled.\n",
+            "    fn is_enabled() -> ()\n",
+            "  }\n",
+            "  fn take(value: Handle)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("the generated static member package loads");
+        assert!(
+            result.failure.is_none(),
+            "the generated static member parses and resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "a supported static member is fully representable: {}",
+            generated.text
+        );
+        assert!(generated.text.contains("is-enabled: static func();"));
+        assert!(
+            generated
+                .text
+                .contains("/// Check whether handles are enabled.")
+        );
+        assert!(generated.text.contains("take: func(value: handle);"));
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        let resource_index = interface.items.iter_enumerated().next().unwrap().0;
+        let resource = interface.items.iter().next().unwrap();
+        let sai_wit::WitItemKind::Resource(members) = &resource.kind else {
+            panic!("the source resource is emitted");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, "is-enabled");
+        assert_eq!(members[0].kind, sai_wit::WitMemberKind::Static);
+        assert_eq!(
+            members[0].docs.as_deref(),
+            Some("Check whether handles are enabled.")
+        );
+        assert!(members[0].func.params.is_empty());
+        assert!(members[0].func.result.is_none());
+        let sai_wit::WitItemKind::Func(take) = &interface.items.iter().nth(1).unwrap().kind else {
+            panic!("the resource handle consumer is emitted");
+        };
+        let sai_wit::WitType::Own(handle) = &take.params[0].1 else {
+            panic!("the consumer receives the owned resource");
+        };
+        assert_eq!(handle.interface.unit, unit);
+        assert_eq!(handle.interface.interface, interface_index);
+        assert_eq!(handle.item, resource_index);
+        assert_eq!(handle.item_name, "handle");
+    }
+
+    #[test]
+    fn generated_wit_omits_unsupported_resource_member_shapes() {
         let cases = [
             (
                 "an extra method",
@@ -45957,6 +46052,11 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 "a static new function returning a result",
                 "fn new() -> Result<Self, U32>\n",
             ),
+            (
+                "a static function with a parameter",
+                "fn ping(value: U32)\n",
+            ),
+            ("a static function with a result", "fn ping() -> U32\n"),
             (
                 "a constructor precondition",
                 "fn new() -> Self requires true\n",
