@@ -45593,6 +45593,113 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
+    fn generated_wit_emits_owned_resource_handles_in_nested_types() {
+        let source = concat!(
+            "interface api {\n",
+            "  resource Handle {}\n",
+            "  type HandleAlias = Handle\n",
+            "  type Payload {\n",
+            "    handle: Handle\n",
+            "  }\n",
+            "  enum Outcome { Empty, Returned(Handle) }\n",
+            "  fn echo(payload: Payload) -> Outcome\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+        assert!(
+            collection.interface_check_diagnostics().is_empty(),
+            "nested handle declarations should pass boundary checks: {:?}",
+            collection.interface_check_diagnostics()
+        );
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("nested resource handles generate WIT");
+        assert!(
+            result.failure.is_none(),
+            "nested owned resource handles parse and resolve: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "nested owned resource handles are representable: {}",
+            generated.text
+        );
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        let items = interface.items.iter().collect::<Vec<_>>();
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["handle", "handle-alias", "payload", "outcome", "echo"]
+        );
+        let resource_index = interface.items.iter_enumerated().next().unwrap().0;
+        let assert_handle = |ty: &sai_wit::WitType| {
+            let sai_wit::WitType::Own(reference) = ty else {
+                panic!("nested resource leaves use owned handles");
+            };
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.item, resource_index);
+            assert_eq!(reference.item_name, "handle");
+        };
+
+        let sai_wit::WitItemKind::Alias(alias) = &items[1].kind else {
+            panic!("the resource handle alias is emitted");
+        };
+        assert_handle(alias);
+
+        let sai_wit::WitItemKind::Record(fields) = &items[2].kind else {
+            panic!("the handle payload is emitted as a record");
+        };
+        assert_handle(&fields[0].ty);
+
+        let sai_wit::WitItemKind::Variant(cases) = &items[3].kind else {
+            panic!("the handle outcome is emitted as a variant");
+        };
+        assert_handle(cases[1].payload.as_ref().expect("handle payload"));
+        assert!(generated.text.contains("type handle-alias = handle;"));
+        assert!(generated.text.contains("handle: handle,"));
+        assert!(generated.text.contains("returned(handle)"));
+    }
+
+    #[test]
     fn generated_wit_omits_forward_resource_handle_references() {
         let source = concat!(
             "interface api {\n",
