@@ -2745,11 +2745,10 @@ fn is_missing_object_message(message: &BStr) -> bool {
     let Ok(message) = message.to_str() else {
         return false;
     };
+    let message = message.trim().to_ascii_lowercase();
     let message = message
-        .trim()
-        .strip_prefix("upload-pack: ")
-        .unwrap_or(message.trim())
-        .to_ascii_lowercase();
+        .rsplit_once("upload-pack: ")
+        .map_or(message.as_str(), |(_, message)| message);
     message.starts_with("not our ref ")
         || message.starts_with("unadvertised object ")
         || message.contains("does not allow request for unadvertised object")
@@ -3262,9 +3261,10 @@ mod tests {
         GitRemoteTagListError, SelectedGitReleaseFetchError, SelectedGitReleaseFetchPlan,
         TemporaryGitDirectory, credential_overrides_from_file, credential_overrides_from_path,
         exact_release_tag_refspec_for_name, fetch_release_tree_in_repository,
-        find_release_tag_in_repository, list_release_tags_in_repository, map_transport_error,
-        plan_selected_git_release_fetch, proxy_environment_overrides, release_tag_name,
-        release_tag_refspec, user_credential_config_paths, verify_locked_git_path_package,
+        find_release_tag_in_repository, is_missing_object_message, list_release_tags_in_repository,
+        map_transport_error, plan_selected_git_release_fetch, proxy_environment_overrides,
+        release_tag_name, release_tag_refspec, user_credential_config_paths,
+        verify_locked_git_path_package,
     };
     use crate::git_path_requirements::{
         GitPathRequirementDiscoveryError, GitPathRequirementEdge, discover_git_path_requirements,
@@ -3293,10 +3293,40 @@ mod tests {
         ResolverPackageSource, ResolverPathPinSource, ResolverSourceReason,
     };
     use crate::validation::PackageValidationContext;
+    use gix::bstr::ByteSlice;
     use gix::objs::tree::{Entry, EntryKind};
     use sai_vfs::{SnapshotFile, SourceFile, WorkspaceSnapshot};
 
     const TEST_CANONICAL_GIT_URL: &str = "https://example.test/acme/sample.git";
+
+    #[test]
+    fn missing_object_classification_accepts_git_upload_pack_prefixes() {
+        for message in [
+            "upload-pack: not our ref ffffffffffffffffffffffffffffffffffffffff",
+            "fatal: git upload-pack: not our ref ffffffffffffffffffffffffffffffffffffffff",
+            "upload-pack: unadvertised object ffffffffffffffffffffffffffffffffffffffff",
+            "fatal: git upload-pack: does not allow request for unadvertised object",
+        ] {
+            assert!(
+                is_missing_object_message(message.as_bytes().as_bstr()),
+                "expected missing-object classification for {message:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_object_classification_rejects_unrelated_upload_pack_errors() {
+        for message in [
+            "upload-pack: repository not found",
+            "fatal: git upload-pack: temporary service failure",
+            "not an upload-pack response",
+        ] {
+            assert!(
+                !is_missing_object_message(message.as_bytes().as_bstr()),
+                "unexpected missing-object classification for {message:?}"
+            );
+        }
+    }
 
     fn source_byte_span(source: &[u8], text: &[u8]) -> Range<usize> {
         let start = source
