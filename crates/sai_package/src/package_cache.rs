@@ -2576,6 +2576,7 @@ fn open_cached_source_file(directory: &CapabilityDir, name: &OsStr) -> io::Resul
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
         if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2714,6 +2715,16 @@ fn make_capability_tree_removable(
             path: path.to_path_buf(),
             source,
         })?;
+    if !cached_directory_entry_matches(parent_directory, name, &directory)? {
+        return Err(PackageCacheError::Io {
+            operation: "recheck inconsistent package cache directory",
+            path: path.to_path_buf(),
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cache entry changed while opening",
+            ),
+        });
+    }
     for entry in directory
         .entries()
         .map_err(|source| PackageCacheError::Io {
@@ -2766,21 +2777,20 @@ fn make_capability_tree_removable(
         }
     }
 
-    let directory_file = CapabilityDir::reopen_dir(&directory)
-        .map_err(|source| PackageCacheError::Io {
-            operation: "retain inconsistent package cache directory handle",
+    // The directory was made writable through its verified parent before it
+    // was opened. Recheck that the name still points to that handle; chmod on
+    // a reopened O_PATH directory handle can return EBADF on overlayfs.
+    if !cached_directory_entry_matches(parent_directory, name, &directory)? {
+        return Err(PackageCacheError::Io {
+            operation: "recheck inconsistent package cache directory",
             path: path.to_path_buf(),
-            source,
-        })?
-        .into_std_file();
-    let directory_metadata = directory_file
-        .metadata()
-        .map_err(|source| PackageCacheError::Io {
-            operation: "inspect inconsistent package cache directory permissions",
-            path: path.to_path_buf(),
-            source,
-        })?;
-    set_writable_file_handle(&directory_file, &directory_metadata, path)
+            source: io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cache entry changed while making it removable",
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn set_writable_file_handle(
@@ -2912,6 +2922,22 @@ fn set_capability_directory_writable_nofollow(
             ),
         })
     }
+}
+
+#[cfg(not(unix))]
+fn set_capability_directory_writable_nofollow(
+    _parent_directory: &CapabilityDir,
+    _name: &OsStr,
+    path: &Path,
+) -> Result<(), PackageCacheError> {
+    Err(PackageCacheError::Io {
+        operation: "make inconsistent package cache directory readable",
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::Unsupported,
+            "no-follow directory permission changes are unavailable",
+        ),
+    })
 }
 
 fn writable_capability_permissions(
@@ -3219,15 +3245,15 @@ fn set_read_only_directory_permissions(path: &Path) -> Result<(), PackageCacheEr
     set_directory_mode(path, 0o555, true)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 fn prepare_source_directory_rename(path: &Path) -> Result<(), PackageCacheError> {
-    // APFS requires the moved directory itself to be writable for a rename
-    // between different parents. The source parent is private; the directory
-    // is sealed again immediately after publication.
-    set_directory_mode(path, 0o755, false)
+    // APFS and overlayfs require the moved directory itself to be writable
+    // when it is renamed between different parents. The staging parent is
+    // private, and the directory is sealed again immediately after publish.
+    set_directory_mode(path, 0o700, false)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(unix))]
 fn prepare_source_directory_rename(_path: &Path) -> Result<(), PackageCacheError> {
     Ok(())
 }
@@ -3523,6 +3549,8 @@ mod tests {
     use crate::git_tree::GitTreeReader;
     use gix::objs::tree::{Entry, EntryKind};
     use std::fs;
+    #[cfg(windows)]
+    use std::fs::File;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -4412,6 +4440,7 @@ mod tests {
                 .unwrap();
         let outside = temp.path().join("outside");
         fs::create_dir(&outside).unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o755)).unwrap();
         let link = parent_path.join("entry");
         symlink(&outside, &link).unwrap();
 
@@ -5176,12 +5205,12 @@ mod tests {
         assert_eq!(fs::read(outside_marker).unwrap(), b"outside marker");
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(unix)]
     #[test]
-    fn macos_cross_parent_publish_temporarily_needs_a_writable_source_root() {
+    fn cross_parent_publish_temporarily_needs_a_writable_source_root() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = TestDirectory::new("macos-cross-parent-rename");
+        let temp = TestDirectory::new("unix-cross-parent-rename");
         let cache = PackageCache::open(temp.path().join("cache")).unwrap();
         let stage = cache.temporary_directory().join("rename-check");
         let target = cache.source_directory.join("rename-check");
@@ -5189,9 +5218,11 @@ mod tests {
         fs::write(stage.join("file"), b"verified").unwrap();
         super::make_tree_read_only(&stage).unwrap();
 
-        assert!(fs::rename(&stage, &target).is_err());
-
         super::prepare_source_directory_rename(&stage).unwrap();
+        assert_eq!(
+            fs::metadata(&stage).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         fs::rename(&stage, &target).unwrap();
         super::seal_published_source_directory(&target).unwrap();
         assert_eq!(

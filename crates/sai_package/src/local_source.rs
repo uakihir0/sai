@@ -3571,12 +3571,16 @@ mod tests {
         LocalPackageSourceEntryKind, LocalPackageSourceLimit, LocalPackageSourceResolveError,
         LocalPackageSourceRootStatus, LocalPackageSourceSnapshotError,
         LocalPackageSourceSnapshotLimits, LocalPackageSourceSnapshotProgress,
-        LocalPackageWitDirectorySnapshotAccumulator, LocalPackageWitDirectorySnapshotError,
-        LocalPackageWitDirectorySnapshotLimit, LocalPackageWitDirectorySnapshotLimits,
-        LocalPackageWitDirectorySnapshotProgress, LocalPackageWitDirectoryStatus,
-        LocalPackageWitEntryKind, MAX_LOCAL_PACKAGE_WIT_FILE_BYTES, read_local_wit_bytes,
+        LocalPackageWitDirectorySnapshotError, LocalPackageWitDirectorySnapshotLimit,
+        LocalPackageWitDirectorySnapshotLimits, LocalPackageWitDirectorySnapshotProgress,
+        LocalPackageWitDirectoryStatus, LocalPackageWitEntryKind, MAX_LOCAL_PACKAGE_WIT_FILE_BYTES,
         resolve_local_path_packages,
     };
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    use super::{LocalPackageWitDirectorySnapshotAccumulator, read_local_wit_bytes};
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
