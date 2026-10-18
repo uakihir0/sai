@@ -23,7 +23,7 @@ use sai_hir::lower::HirLoweringContext;
 use sai_hir::types::{GenericArg, Name, Ty, TyKind};
 use sai_hir::{
     DefId, DefPathData, DefPathError, DefPathHash, DefPathInterner, DefPathInternerError, HirId,
-    LocalDefId, OwnerId, Symbol,
+    LocalDefId, OwnerId, Symbol, Visibility,
 };
 use sai_intern::{Interner, PackageId, PackageInterner};
 use sai_package::version::Version;
@@ -52,7 +52,7 @@ use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
 use sai_wit::{
     GeneratedText, WitCase, WitField, WitFunc, WitIfaceIdx, WitIfaceRef, WitIndexVec, WitInterface,
     WitItem, WitItemIdx, WitItemKind, WitMember, WitMemberKind, WitPackage, WitPackageDeclaration,
-    WitPackageName, WitStabilityVersion, WitType, WitTypeRef, WitUnit, WitViewDefKind,
+    WitPackageName, WitStabilityVersion, WitType, WitTypeRef, WitUnit, WitUnitKind, WitViewDefKind,
     WitViewEntity, WitWorld, WitWorldIdx, WitWorldItem, WitWorldItemDirection, WitWorldItemOrder,
     WitWorldRef, print_wit, wit_name_to_sai,
 };
@@ -893,6 +893,185 @@ fn generated_world_interface_item(
         deprecated,
         span: None,
     }))
+}
+
+fn generated_external_world_interface_item(
+    entry: &ItemTreeEntry,
+    owner: &HirOwner<'_>,
+    inputs: &CurrentOwnerInputs,
+    prepared: &PreparedPhase1PackageScopes,
+    symbols: &Interner,
+    selected: Option<&sai_package::mvs::MvsPackageVersion>,
+) -> Result<Option<(WitWorldItem, bool)>, InterfaceUsesQueryError> {
+    let path = match owner.node {
+        OwnerNode::WorldItem(item) => match item.kind {
+            WorldItemKind::Import(sai_hir::items::WorldRef::Pkg { path, .. })
+            | WorldItemKind::Export(sai_hir::items::WorldRef::Pkg { path, .. }) => path,
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let attrs = inputs.validated_attrs.get(&entry.ast_id);
+    let Some((since, deprecated)) = generated_stability(attrs, Some(selected)) else {
+        return Ok(None);
+    };
+    let use_entry = sai_hir::item_tree::UseEntry {
+        ast_id: ast::ErasedAstId::new(0),
+        is_pub: false,
+        pkg_path: path.to_owned(),
+        alias: None,
+        has_items: false,
+        items: Vec::new(),
+        raw_attrs: Vec::new(),
+    };
+    let Ok(parsed) = sai_resolve::use_path::parse_use_path(&use_entry, symbols) else {
+        return Ok(None);
+    };
+    let Some(interface_name) = parsed.segments.last().copied() else {
+        return Ok(None);
+    };
+    let requested_name = symbols
+        .resolve(interface_name)
+        .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+        .map_err(InterfaceUsesQueryError::Collection)?;
+    let requested_name = super::canonical_wit_path_name(&requested_name);
+
+    // Phase 1 has already selected these WIT views from the active package
+    // graph. Only one exact, directly visible identity can authorize this
+    // external interface reference.
+    let mut matches = prepared.foreign_wit_views.iter().filter(|foreign| {
+        foreign.directly_visible && foreign.visible_identity == parsed.package_identity
+    });
+    let Some(foreign) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Ok(None);
+    }
+
+    let view = foreign.view.as_ref();
+    let (index, interface) = match view.unit.kind() {
+        WitUnitKind::Generated { package } => {
+            // Generated source views can contain private interfaces. Resolve
+            // the full source module path and require the visible source
+            // binding to be public before exposing its generated WIT entry.
+            let mut source_scopes = prepared.foreign_packages.iter().filter(|source| {
+                source.visible_identity == parsed.package_identity
+                    && source.module_tree.package == package
+            });
+            let Some(source) = source_scopes.next() else {
+                return Ok(None);
+            };
+            if source_scopes.next().is_some()
+                || foreign
+                    .source_def_paths
+                    .as_ref()
+                    .is_none_or(|def_paths| def_paths.package() != package)
+            {
+                return Ok(None);
+            }
+
+            let parent_path = &parsed.segments[..parsed.segments.len() - 1];
+            let mut modules = source
+                .module_tree
+                .modules
+                .iter()
+                .enumerate()
+                .filter(|(_, module)| module.path.as_slice() == parent_path);
+            let Some((module_index, _)) = modules.next() else {
+                return Ok(None);
+            };
+            if modules.next().is_some() {
+                return Ok(None);
+            }
+            let Some(module_scope) = source.scopes.modules.get(module_index) else {
+                return Ok(None);
+            };
+            let Some(binding) = module_scope
+                .members
+                .get(&interface_name)
+                .or_else(|| module_scope.declared.get(&interface_name))
+            else {
+                return Ok(None);
+            };
+            let Res::Def(DefKind::Interface, origin) = binding.res else {
+                return Ok(None);
+            };
+            if binding.visibility != Visibility::Pub || origin.package != package {
+                return Ok(None);
+            }
+
+            let mut interfaces = view
+                .interfaces
+                .values()
+                .filter(|candidate| candidate.origin == Some(origin));
+            let Some(candidate) = interfaces.next() else {
+                // An incomplete generated dependency view cannot prove a
+                // miss, and a missing source origin must not be inferred from
+                // an interface spelling.
+                return Ok(None);
+            };
+            if interfaces.next().is_some() {
+                return Ok(None);
+            }
+            let Some(interface) = view.model.interfaces.get(candidate.wit) else {
+                return Ok(None);
+            };
+            (candidate.wit, interface)
+        }
+        WitUnitKind::Dir { .. } | WitUnitKind::Wasi { .. } => {
+            // Authored WIT and embedded WASI paths name one interface
+            // segment. Their interface visibility is defined by the view.
+            let [only_segment] = parsed.segments.as_slice() else {
+                return Ok(None);
+            };
+            if *only_segment != interface_name {
+                return Ok(None);
+            }
+            let mut interfaces =
+                view.model
+                    .declarations_in_order()
+                    .into_iter()
+                    .filter_map(|declaration| {
+                        let WitPackageDeclaration::Interface(index) = declaration else {
+                            return None;
+                        };
+                        let interface = view.model.interfaces.get(index)?;
+                        (super::canonical_wit_path_name(&interface.name) == requested_name)
+                            .then_some((index, interface))
+                    });
+            let Some((index, interface)) = interfaces.next() else {
+                return Ok(None);
+            };
+            if interfaces.next().is_some()
+                || !view
+                    .interfaces
+                    .values()
+                    .any(|candidate| candidate.wit == index)
+            {
+                return Ok(None);
+            }
+            (index, interface)
+        }
+    };
+
+    Ok(Some((
+        WitWorldItem::Interface {
+            reference: WitIfaceRef {
+                unit: view.unit.clone(),
+                interface: index,
+                name: interface.name.clone(),
+            },
+            docs: entry.docs.clone().map(Arc::from),
+            since,
+            deprecated,
+            span: None,
+        },
+        view.complete,
+    )))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3167,7 +3346,7 @@ fn collect_interface_uses_input(
                 let Some(is_import) = is_import else {
                     unreachable!("world includes are handled above");
                 };
-                let item = generated_world_interface_item(
+                let local_interface_item = generated_world_interface_item(
                     entry,
                     &item_hir,
                     item_owner,
@@ -3179,27 +3358,44 @@ fn collect_interface_uses_input(
                     primitive_prelude,
                     prepared.generated_package_version.as_ref(),
                     &generated_interface_references,
-                )?
-                .or(generated_world_function_item(
+                )?;
+                let (item, target_view_complete) = if let Some(item) = local_interface_item {
+                    (Some(item), true)
+                } else if let Some((item, complete)) = generated_external_world_interface_item(
                     entry,
                     &item_hir,
-                    descriptor.owner.def_id,
-                    item_owner,
                     inputs,
-                    module_scope,
                     prepared,
-                    &module_members,
-                    &source_graph_packages,
-                    primitive_prelude,
-                    &local_boundary_aliases,
-                    prepared.generated_package_version.as_ref(),
-                    packages,
                     symbols,
-                )?);
+                    prepared.generated_package_version.as_ref(),
+                )? {
+                    (Some(item), complete)
+                } else {
+                    (
+                        generated_world_function_item(
+                            entry,
+                            &item_hir,
+                            descriptor.owner.def_id,
+                            item_owner,
+                            inputs,
+                            module_scope,
+                            prepared,
+                            &module_members,
+                            &source_graph_packages,
+                            primitive_prelude,
+                            &local_boundary_aliases,
+                            prepared.generated_package_version.as_ref(),
+                            packages,
+                            symbols,
+                        )?,
+                        true,
+                    )
+                };
                 let Some(item) = item else {
                     generated_complete = false;
                     continue;
                 };
+                generated_complete &= target_view_complete;
                 let name = match &item {
                     WitWorldItem::Func { name, .. } => name.clone(),
                     WitWorldItem::Interface { reference, .. } => reference.name.clone(),

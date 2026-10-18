@@ -39349,6 +39349,11 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             include acme:wit-source/server\n\
             include acme:wit-facade/facade\n\
         }\n\
+            world source_interfaces {\n\
+                import acme:wit-source/public\n\
+                import acme:wit-source/hidden\n\
+                import acme:wit-source/nested/api\n\
+            }\n\
             fn use_omitted_import() { references.unsupported }\n";
         let mut database = RootDatabase::new().expect("driver initializes");
         let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
@@ -39361,10 +39366,15 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             &mut database,
             "acme:wit-source#1",
             "acme:wit-source@1.0.0",
-            &[(
-                "lib.sai",
-                b"pub world server { import fn unsupported(pointer: USize) }\n",
-            )],
+            &[
+                (
+                    "lib.sai",
+                    b"pub interface public {}\n\
+                      interface hidden {}\n\
+                      pub world server { import fn unsupported(pointer: USize) }\n",
+                ),
+                ("nested.sai", b"pub interface api {}\n"),
+            ],
         );
         let (facade_package, facade_node) = install_external_artifact_world_package(
             &mut database,
@@ -39471,6 +39481,10 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .find(|scope| scope.view.unit.canonical_name() == "acme:wit-source@1.0.0")
             .expect("the generated WIT view is present");
         assert!(!generated_view.view.complete);
+        assert!(
+            generated_view.view.interfaces.contains_key("hidden"),
+            "generated source views include the private interface, so world generation must enforce source visibility"
+        );
         let facade_view = partial_views
             .views()
             .find(|scope| scope.view.unit.canonical_name() == "acme:wit-facade@1.0.0")
@@ -39510,6 +39524,22 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 .text
                 .contains("include acme:wit-source/server@1.0.0;")
         );
+        assert!(
+            root_generated
+                .text
+                .contains("import acme:wit-source/public@1.0.0;")
+        );
+        assert!(
+            root_generated
+                .text
+                .contains("import acme:wit-source/api@1.0.0;")
+        );
+        assert!(
+            !root_generated
+                .text
+                .contains("import acme:wit-source/hidden@1.0.0;"),
+            "private source interfaces must not be emitted from a generated WIT view"
+        );
         let root_unit = WitUnit::generated(
             root_package,
             &database.packages,
@@ -39535,6 +39565,40 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .iter()
             .find(|world| world.name == "references")
             .expect("root references world is generated");
+        let interface_world = root_wit
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "source-interfaces")
+            .expect("root source interface references world is generated");
+        let emitted_interfaces = interface_world
+            .imports
+            .iter()
+            .filter_map(|item| match item {
+                sai_wit::WitWorldItem::Interface { reference, .. } => Some(reference),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            emitted_interfaces
+                .iter()
+                .map(|reference| reference.name.as_str())
+                .collect::<Vec<_>>(),
+            ["public", "api"],
+            "the public root interface and nested-module interface survive, while the private one is omitted"
+        );
+        let nested_api = emitted_interfaces
+            .iter()
+            .find(|reference| reference.name == "api")
+            .expect("the nested module interface is imported from the partial view");
+        assert_eq!(
+            nested_api.unit, generated_view.view.unit,
+            "the import keeps the exact partial generated-source unit"
+        );
+        assert_eq!(
+            nested_api.interface, generated_view.view.interfaces["api"].wit,
+            "the nested source path keeps the selected interface index"
+        );
         let source_include = root_world
             .includes
             .iter()
@@ -39565,8 +39629,16 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .owners()
             .iter()
             .flat_map(|owner| owner.references())
-            .next()
-            .expect("one package reference is retained");
+            .find(|reference| {
+                matches!(
+                    reference.path_result(),
+                    WorldReferencePathResult::ResolvedPkg(PathRes {
+                        base: Res::Def(sai_resolve::package_scopes::DefKind::World, _),
+                        ..
+                    })
+                )
+            })
+            .expect("the generated source world package reference is retained");
         assert!(
             matches!(
                 partial_reference.path_result(),
@@ -39752,8 +39824,16 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .owners()
             .iter()
             .flat_map(|owner| owner.references())
-            .next()
-            .expect("one package reference is retained");
+            .find(|reference| {
+                matches!(
+                    reference.path_result(),
+                    WorldReferencePathResult::ResolvedPkg(PathRes {
+                        base: Res::Def(sai_resolve::package_scopes::DefKind::World, _),
+                        ..
+                    })
+                )
+            })
+            .expect("the generated source world package reference is retained");
         assert!(
             matches!(
                 complete_reference.path_result(),
@@ -48521,6 +48601,261 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 sai_wit::WitWorldItemOrder::export(0),
             ],
             "omitted wrong-kind and missing targets do not disturb direct-item order"
+        );
+    }
+
+    #[test]
+    fn generated_wit_emits_external_world_interfaces_from_direct_selected_views() {
+        let source = b"world facade {\n\
+            import fn before()\n\
+            /// Direct API interface.\n\
+            import acme:direct/api\n\
+            import acme:direct/api\n\
+            import acme:direct/api/extra\n\
+            import acme:direct/wrong-kind\n\
+            import acme:transitive/api\n\
+            import acme:direct/missing\n\
+            import acme:unavailable/ghost\n\
+            /// Direct service interface.\n\
+            export acme:direct/service\n\
+            export acme:direct/service\n\
+            export fn after()\n\
+        }\n";
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (root_package, root_tree, root_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", source)],
+        );
+        let (direct_package, direct_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:direct",
+            "1.4.12",
+            b"package acme:direct@1.4.12;\n\
+              interface api {}\n\
+              interface service {}\n\
+              world wrong-kind {}",
+        );
+        let direct_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:direct @ 1.4.12\n\
+              artifact component {}\n\
+              wit \"wit\"\n\
+              requires { acme:transitive @ ^1 }\n"[..],
+        );
+        database
+            .set_package_manifest(
+                direct_package,
+                direct_manifest,
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("direct package contract records its transitive dependency");
+        let direct_node = PackageGraphNode::new(
+            direct_node.key().clone(),
+            direct_node.identity(),
+            direct_node.version().clone(),
+            direct_node.form(),
+            direct_node.role(),
+            vec![graph_edge("acme:transitive#1", "acme:transitive")],
+        )
+        .expect("direct graph node includes its transitive package edge");
+        let (_, transitive_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:transitive",
+            "1.0.0",
+            b"package acme:transitive@1.0.0;\ninterface api {}",
+        );
+        let snapshot = WorkspaceSnapshot::new(root_files).expect("workspace snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:direct#1", "acme:direct")],
+                ),
+                direct_node,
+                transitive_node,
+            ],
+        )
+        .expect("active package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target, &graph)
+            .expect("the selected direct and transitive WIT views are available");
+        let expected_view = wit_views
+            .views()
+            .find(|foreign| foreign.visible_identity == "acme:direct")
+            .expect("the directly selected WIT view is available");
+        let expected_interface = expected_view
+            .view
+            .model
+            .interfaces
+            .iter_enumerated()
+            .find_map(|(index, interface)| (interface.name == "api").then_some((index, interface)))
+            .expect("the selected direct view declares api");
+        let expected_service_index = expected_view
+            .view
+            .model
+            .interfaces
+            .iter_enumerated()
+            .find_map(|(index, interface)| (interface.name == "service").then_some(index))
+            .expect("the selected direct view declares service");
+        let expected_definition = expected_view
+            .view
+            .interfaces
+            .values()
+            .find(|interface| interface.wit == expected_interface.0)
+            .expect("the interface index has an exact view definition")
+            .def;
+
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:direct @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root Phase 1 scopes collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:root",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = WitUnit::generated(root_package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated world package query completes");
+        assert!(
+            result.failure.is_none(),
+            "the exact external interfaces and recoverable omissions keep WIT parseable: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &unit);
+        assert!(!generated.complete);
+        assert!(generated.text.contains("import acme:direct/api@1.4.12;"));
+        assert!(
+            generated
+                .text
+                .contains("export acme:direct/service@1.4.12;")
+        );
+        assert!(!generated.text.contains("import acme:direct/api/extra"));
+        assert!(!generated.text.contains("import acme:direct/wrong-kind"));
+        assert!(!generated.text.contains("import acme:transitive/api"));
+        assert!(!generated.text.contains("import acme:direct/missing"));
+        assert!(!generated.text.contains("import acme:unavailable/ghost"));
+        assert_eq!(
+            generated
+                .text
+                .matches("import acme:direct/api@1.4.12;")
+                .count(),
+            1,
+            "a duplicate same-direction name is omitted"
+        );
+        assert_eq!(
+            generated
+                .text
+                .matches("export acme:direct/service@1.4.12;")
+                .count(),
+            1,
+            "export collisions are checked independently"
+        );
+        let before = generated
+            .text
+            .find("import before:")
+            .expect("the independent function import remains");
+        let api = generated
+            .text
+            .find("import acme:direct/api@1.4.12;")
+            .expect("the exact direct API import remains");
+        let service = generated
+            .text
+            .find("export acme:direct/service@1.4.12;")
+            .expect("the exact direct service export remains");
+        let after = generated
+            .text
+            .find("export after:")
+            .expect("the independent function export remains");
+        assert!(before < api && api < service && service < after);
+
+        let package = result.package.expect("generated WIT model loads");
+        let world = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "facade")
+            .expect("facade world is generated");
+        assert!(generated.text.contains("/// Direct API interface."));
+        assert!(generated.text.contains("/// Direct service interface."));
+        let sai_wit::WitWorldItem::Interface { reference, .. } = world
+            .imports
+            .iter()
+            .find(|item| {
+                matches!(
+                    item,
+                    sai_wit::WitWorldItem::Interface { reference, .. }
+                        if reference.name == "api"
+                )
+            })
+            .expect("the external API import remains")
+        else {
+            unreachable!("the matched API import is an interface");
+        };
+        assert_eq!(reference.unit, expected_view.view.unit);
+        assert_eq!(reference.interface, expected_interface.0);
+        assert_eq!(reference.name, "api");
+        assert_eq!(
+            expected_view
+                .view
+                .interfaces
+                .get("api")
+                .expect("the direct view binds api")
+                .def,
+            expected_definition
+        );
+
+        let sai_wit::WitWorldItem::Interface { reference, .. } = world
+            .exports
+            .iter()
+            .find(|item| {
+                matches!(
+                    item,
+                    sai_wit::WitWorldItem::Interface { reference, .. }
+                        if reference.name == "service"
+                )
+            })
+            .expect("the external service export remains")
+        else {
+            unreachable!("the matched service export is an interface");
+        };
+        assert_eq!(reference.unit.canonical_name(), "acme:direct@1.4.12");
+        assert_eq!(reference.interface, expected_service_index);
+        assert_eq!(reference.name, "service");
+        assert_eq!(
+            world.source_order,
+            [
+                sai_wit::WitWorldItemOrder::import(1),
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::export(1),
+                sai_wit::WitWorldItemOrder::export(0),
+            ],
+            "omitted references do not disturb import/export source order"
         );
     }
 
