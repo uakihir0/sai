@@ -17101,7 +17101,7 @@ mod tests {
         assert_eq!(exit_code, 0);
         assert!(stdout.is_empty());
         assert!(stderr.starts_with("formatted "));
-        assert!(stderr.ends_with("/sai.package\n"));
+        assert!(stderr.replace('\\', "/").ends_with("/sai.package\n"));
 
         fs::write(
             directory.child("sai.package"),
