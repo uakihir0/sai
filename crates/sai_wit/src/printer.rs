@@ -322,17 +322,19 @@ fn print_world_item(
         }
         WitWorldItem::Func {
             name,
+            docs,
             func,
             since,
             deprecated,
             ..
         } => {
+            push_docs(output, docs.as_deref(), 1);
             push_stability(output, since.as_ref(), deprecated.as_ref(), 1);
             let _ = writeln!(
                 output,
                 "  {direction} {}: {};",
                 wit_identifier(name),
-                print_function(func, true)
+                print_function(func, false)
             );
         }
     }
@@ -738,6 +740,7 @@ mod tests {
             imports: vec![
                 WitWorldItem::Func {
                     name: "first".to_owned(),
+                    docs: None,
                     func: function(Vec::new(), None),
                     unsupported: None,
                     since: None,
@@ -746,6 +749,7 @@ mod tests {
                 },
                 WitWorldItem::Func {
                     name: "second".to_owned(),
+                    docs: None,
                     func: function(Vec::new(), None),
                     unsupported: None,
                     since: None,
@@ -755,6 +759,7 @@ mod tests {
             ],
             exports: vec![WitWorldItem::Func {
                 name: "middle".to_owned(),
+                docs: None,
                 func: function(Vec::new(), None),
                 unsupported: None,
                 since: None,

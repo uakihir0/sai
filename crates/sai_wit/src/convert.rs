@@ -1603,6 +1603,7 @@ fn world_items(
                 let source_start = span_start(function.span);
                 let item_span = source_world_item_span(direct_items, direction, &source_key)
                     .or_else(|| source_span(function.span, unit, source_mappings));
+                let item_docs = docs(&function.docs.contents);
                 let (since, deprecated) = stability(&function.stability)?;
                 let (function, found) = function_model(
                     function,
@@ -1616,6 +1617,7 @@ fn world_items(
                 result.push((
                     WitWorldItem::Func {
                         name,
+                        docs: item_docs,
                         func: function,
                         unsupported: found,
                         since,

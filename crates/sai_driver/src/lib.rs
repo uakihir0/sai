@@ -17225,6 +17225,8 @@ impl RootDatabase {
 
         let mut external_worlds = Vec::new();
         let mut external_world_ids = HashSet::new();
+        let mut external_worlds_by_address = HashMap::new();
+        let mut incomplete_external_world_ids = HashSet::new();
         let mut external_exports = HashMap::new();
         if let Some(scopes) = wit_view_scopes {
             for view in scopes.views() {
@@ -17234,10 +17236,71 @@ impl RootDatabase {
                             OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch,
                         );
                     }
+                    let address = (
+                        view.view.unit.canonical_name().to_owned(),
+                        view.view.unit.stable_key().to_owned(),
+                        world.wit.raw(),
+                    );
+                    if external_worlds_by_address
+                        .insert(address, world.def)
+                        .is_some()
+                    {
+                        return Err(
+                            OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch,
+                        );
+                    }
+                    if !view.view.complete {
+                        // Generated source views can be partial projections.
+                        // An omitted world function is not authoritative
+                        // evidence that the source package lacks that name.
+                        incomplete_external_world_ids.insert(world.def);
+                    }
                     external_worlds.push((world.def, world.import_fns.clone()));
                     external_exports.insert(world.def, world.export_fns.clone());
                 }
             }
+        }
+        let mut external_world_includes = HashMap::<DefId, Vec<DefId>>::new();
+        if let Some(scopes) = wit_view_scopes {
+            for view in scopes.views() {
+                for world in view.view.worlds.values() {
+                    let model = &view.view.model.worlds[world.wit];
+                    let mut targets = Vec::with_capacity(model.includes.len());
+                    for include in &model.includes {
+                        let address = (
+                            include.unit.canonical_name().to_owned(),
+                            include.unit.stable_key().to_owned(),
+                            include.world.raw(),
+                        );
+                        if let Some(target) = external_worlds_by_address.get(&address).copied() {
+                            targets.push(target);
+                        } else {
+                            // A WIT view can resolve a complete facade world
+                            // whose included package world is unavailable in
+                            // this active closure. Its member set is still
+                            // incomplete for downstream name lookup.
+                            incomplete_external_world_ids.insert(world.def);
+                        }
+                    }
+                    external_world_includes.insert(world.def, targets);
+                }
+            }
+        }
+        loop {
+            let newly_incomplete = external_world_includes
+                .iter()
+                .filter(|(_, targets)| {
+                    targets
+                        .iter()
+                        .any(|target| incomplete_external_world_ids.contains(target))
+                })
+                .map(|(world, _)| *world)
+                .filter(|world| !incomplete_external_world_ids.contains(world))
+                .collect::<Vec<_>>();
+            if newly_incomplete.is_empty() {
+                break;
+            }
+            incomplete_external_world_ids.extend(newly_incomplete);
         }
 
         let local_world_ids = descriptors
@@ -17370,7 +17433,14 @@ impl RootDatabase {
                     break;
                 }
                 for target in include_targets.get(&current).into_iter().flatten().rev() {
-                    if external_world_ids.contains(target) || cyclic_worlds.contains(target) {
+                    if external_world_ids.contains(target) {
+                        if incomplete_external_world_ids.contains(target) {
+                            incomplete = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    if cyclic_worlds.contains(target) {
                         continue;
                     }
                     if local_world_ids.contains(target) {
@@ -39219,8 +39289,9 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
-    fn world_package_reference_defers_when_generated_source_view_is_incomplete() {
-        let root_source = b"world references { import acme:wit-source/server }\n";
+    fn world_package_reference_resolves_when_generated_source_world_is_present() {
+        let root_source = b"world references { include acme:wit-facade/facade }\n\
+            fn use_omitted_import() { references.unsupported }\n";
         let mut database = RootDatabase::new().expect("driver initializes");
         let (_, root_tree, mut snapshot_files) = multi_package_fixture(
             &mut database,
@@ -39232,8 +39303,41 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             &mut database,
             "acme:wit-source#1",
             "acme:wit-source@1.0.0",
-            &[("lib.sai", b"pub world server {}\n")],
+            &[(
+                "lib.sai",
+                b"pub world server { import fn unsupported(pointer: USize) }\n",
+            )],
         );
+        let (facade_package, facade_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:wit-facade",
+            "1.0.0",
+            b"package acme:wit-facade@1.0.0;\n\
+              world facade { include acme:wit-source/server; }",
+        );
+        let facade_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:wit-facade @ 1.0.0\n\
+              artifact component {}\n\
+              wit \"wit\"\n\
+              requires { acme:wit-source @ ^1 }\n"[..],
+        );
+        database
+            .set_package_manifest(
+                facade_package,
+                facade_manifest,
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("facade contract declares the generated-world dependency");
+        let facade_node = PackageGraphNode::new(
+            facade_node.key().clone(),
+            facade_node.identity(),
+            facade_node.version().clone(),
+            facade_node.form(),
+            facade_node.role(),
+            vec![graph_edge("acme:wit-source#1", "acme:wit-source")],
+        )
+        .expect("facade package graph node includes the generated source dependency");
         snapshot_files.extend(source_files);
         let snapshot =
             WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
@@ -39248,7 +39352,10 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                     Version::parse("1.0.0").expect("root package version is valid"),
                     PackageForm::Source,
                     PackageGraphRole::Root,
-                    vec![graph_edge("acme:wit-source#1", "acme:wit-source")],
+                    vec![
+                        graph_edge("acme:wit-source#1", "acme:wit-source"),
+                        graph_edge("acme:wit-facade#1", "acme:wit-facade"),
+                    ],
                 )
                 .expect("root package graph node is valid"),
                 PackageGraphNode::new(
@@ -39260,6 +39367,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                     Vec::new(),
                 )
                 .expect("source package graph node is valid"),
+                facade_node,
             ],
         )
         .expect("package graph is valid");
@@ -39305,10 +39413,21 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .find(|scope| scope.view.unit.canonical_name() == "acme:wit-source@1.0.0")
             .expect("the generated WIT view is present");
         assert!(!generated_view.view.complete);
+        let facade_view = partial_views
+            .views()
+            .find(|scope| scope.view.unit.canonical_name() == "acme:wit-facade@1.0.0")
+            .expect("the authored facade WIT view is present");
+        assert!(
+            facade_view.view.complete,
+            "the facade view itself is complete even though it includes a partial generated world"
+        );
 
         let root_manifest: Arc<[u8]> = Arc::from(
             &b"package acme:root @ 1.0.0\n\
-              requires { acme:wit-source @ ^1 }\n"[..],
+              requires {\n\
+                acme:wit-source @ ^1\n\
+                acme:wit-facade @ ^1\n\
+              }\n"[..],
         );
         let root_collection = database
             .collect_phase1_package_scopes_with_manifest_and_foreign_scopes_and_wit_views(
@@ -39337,18 +39456,114 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 &member_scopes,
                 &partial_views,
             )
-            .expect("partial generated view leaves an absent source world deferred");
+            .expect("partial generated view can resolve an emitted source world");
         let partial_reference = partial_resolutions
             .owners()
             .iter()
             .flat_map(|owner| owner.references())
             .next()
             .expect("one package reference is retained");
-        assert_eq!(
-            partial_reference.path_result(),
-            &WorldReferencePathResult::Pkg("acme:wit-source/server".to_owned())
+        assert!(
+            matches!(
+                partial_reference.path_result(),
+                WorldReferencePathResult::ResolvedPkg(PathRes {
+                    base: Res::Def(sai_resolve::package_scopes::DefKind::World, _),
+                    ..
+                })
+            ),
+            "{:?}",
+            partial_reference.path_result()
         );
-        assert!(partial_reference.diagnostics().is_empty());
+        assert!(
+            partial_reference.diagnostics().is_empty(),
+            "{:?}",
+            partial_reference.diagnostics()
+        );
+        let function_resolutions = database
+            .resolve_function_owner_analyses_with_world_fields(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &partial_resolutions,
+                Some(&member_scopes),
+                Some(&partial_views),
+            )
+            .expect("world member lookup consumes the partial generated view");
+        assert_eq!(function_resolutions.owners().len(), 1);
+        let world_fields = function_resolutions.owners()[0]
+            .world_field_resolution()
+            .expect("world field resolution succeeds")
+            .expect("the requested analysis includes world fields");
+        assert!(
+            world_fields.diagnostics.is_empty(),
+            "an omitted function in a partial view is not an authoritative miss: {:#?}",
+            world_fields.diagnostics
+        );
+        assert_eq!(
+            world_fields
+                .deferred
+                .iter()
+                .map(|field| field.reason)
+                .collect::<Vec<_>>(),
+            [sai_resolve::WorldMemberDeferral::ImportLookupIncomplete],
+            "a partial external world makes the including world's import lookup incomplete"
+        );
+        let local_world = root_collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
+            .expect("the root package declares one world")
+            .owner
+            .def_id
+            .to_def_id();
+        let partial_elaboration_input = database
+            .resolve_world_elaboration_input(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &partial_resolutions,
+                &member_scopes,
+                &partial_views,
+            )
+            .expect("partial generated worlds are available for elaboration");
+        let partial_server = generated_view
+            .view
+            .worlds
+            .get("server")
+            .expect("partial generated view contains the emitted world")
+            .def;
+        let partial_external_server = partial_elaboration_input
+            .external_worlds
+            .iter()
+            .find(|world| world.world == partial_server)
+            .expect("partial generated world is projected into elaboration");
+        assert!(
+            !partial_external_server.complete,
+            "external world frame inherits the partial view status"
+        );
+        let partial_facade = facade_view
+            .view
+            .worlds
+            .get("facade")
+            .expect("the authored facade view contains its world")
+            .def;
+        let partial_external_facade = partial_elaboration_input
+            .external_worlds
+            .iter()
+            .find(|world| world.world == partial_facade)
+            .expect("authored facade world is projected into elaboration");
+        assert!(
+            !partial_external_facade.complete,
+            "facade frame inherits incompleteness from its included generated world"
+        );
+        let partial_elaboration =
+            sai_resolve::elaborated_world(local_world, partial_elaboration_input)
+                .expect("the including local world elaborates for recovery");
+        assert!(
+            !partial_elaboration.complete,
+            "the local world remains incomplete when it includes a partial generated world"
+        );
 
         let complete_generated = sai_wit::GeneratedText {
             complete: true,
@@ -39384,6 +39599,18 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         let complete_views = database
             .collect_active_wit_view_scopes(&root_tree, &snapshot, &target_cfg, &graph)
             .expect("complete generated view reloads");
+        let complete_view = complete_views
+            .views()
+            .find(|scope| scope.view.unit.canonical_name() == "acme:wit-source@1.0.0")
+            .expect("the complete generated view is present");
+        let complete_facade_view = complete_views
+            .views()
+            .find(|scope| scope.view.unit.canonical_name() == "acme:wit-facade@1.0.0")
+            .expect("the complete authored facade view is present");
+        assert!(
+            complete_view.view.complete,
+            "the generated snapshot is complete"
+        );
         assert_ne!(
             partial_views.closure_fingerprint(),
             complete_views.closure_fingerprint(),
@@ -39416,18 +39643,105 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 &complete_member_scopes,
                 &complete_views,
             )
-            .expect("a complete generated view authoritatively omits the world");
+            .expect("a complete generated view keeps the emitted world resolvable");
         let complete_reference = complete_resolutions
             .owners()
             .iter()
             .flat_map(|owner| owner.references())
             .next()
             .expect("one package reference is retained");
-        assert!(matches!(
-            complete_reference.path_result(),
-            WorldReferencePathResult::ResolvedPkg(PathRes { base: Res::Err, .. })
-        ));
+        assert!(
+            matches!(
+                complete_reference.path_result(),
+                WorldReferencePathResult::ResolvedPkg(PathRes {
+                    base: Res::Def(sai_resolve::package_scopes::DefKind::World, _),
+                    ..
+                })
+            ),
+            "{:?}",
+            complete_reference.path_result()
+        );
         assert!(complete_reference.diagnostics().is_empty());
+        let complete_local_world = complete_collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
+            .expect("the refreshed root package declares one world")
+            .owner
+            .def_id
+            .to_def_id();
+        let complete_elaboration_input = database
+            .resolve_world_elaboration_input(
+                &complete_collection,
+                &root_tree,
+                &snapshot,
+                &complete_resolutions,
+                &complete_member_scopes,
+                &complete_views,
+            )
+            .expect("complete generated worlds are available for elaboration");
+        let complete_server = complete_view
+            .view
+            .worlds
+            .get("server")
+            .expect("complete generated view contains the emitted world")
+            .def;
+        assert!(
+            complete_elaboration_input
+                .external_worlds
+                .iter()
+                .find(|world| world.world == complete_server)
+                .expect("complete generated world is projected into elaboration")
+                .complete,
+            "external world frame inherits the complete view status"
+        );
+        let complete_facade = complete_facade_view
+            .view
+            .worlds
+            .get("facade")
+            .expect("the complete facade view contains its world")
+            .def;
+        assert!(
+            complete_elaboration_input
+                .external_worlds
+                .iter()
+                .find(|world| world.world == complete_facade)
+                .expect("complete facade world is projected into elaboration")
+                .complete,
+            "facade frame stays complete when its included generated world is complete"
+        );
+        let complete_elaboration =
+            sai_resolve::elaborated_world(complete_local_world, complete_elaboration_input)
+                .expect("the complete including world elaborates");
+        assert!(
+            complete_elaboration.complete,
+            "a complete generated view keeps the including world complete"
+        );
+        let complete_function_resolutions = database
+            .resolve_function_owner_analyses_with_world_fields(
+                &complete_collection,
+                &root_tree,
+                &snapshot,
+                &complete_resolutions,
+                Some(&complete_member_scopes),
+                Some(&complete_views),
+            )
+            .expect("complete generated views enable authoritative world misses");
+        let complete_world_fields = complete_function_resolutions.owners()[0]
+            .world_field_resolution()
+            .expect("complete world field resolution succeeds")
+            .expect("the requested analysis includes world fields");
+        assert_eq!(
+            complete_world_fields
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::UnresolvedName],
+            "a complete view can authoritatively reject the absent function"
+        );
+        assert!(complete_world_fields.deferred.is_empty());
     }
 
     #[test]
@@ -47789,7 +48103,217 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
-    fn generated_wit_emits_named_consumers_in_an_incomplete_package() {
+    fn generated_wit_preserves_supported_world_function_order() {
+        let source = concat!(
+            "type Count = U32\n",
+            "/// Runtime entry points.\n",
+            "world server {\n",
+            "  /// An outgoing reply.\n",
+            "  export fn reply(ok: Bool)\n",
+            "  /// A requested lookup.\n",
+            "  import fn lookup(id: U32) -> U64\n",
+            "  import fn shared(value: U32)\n",
+            "  import fn count(value: Count)\n",
+            "  import fn reveal(r#self: U32)\n",
+            "  export fn finish(value: U8)\n",
+            "  export fn shared(value: U32)\n",
+            "}\n",
+            "world empty {}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated world package query completes");
+        assert!(
+            result.failure.is_none(),
+            "generated worlds parse and resolve: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "supported worlds remain complete: {}",
+            generated.text
+        );
+        let reply_offset = generated
+            .text
+            .find("export reply:")
+            .expect("the first source export is printed");
+        let lookup_offset = generated
+            .text
+            .find("import lookup:")
+            .expect("the source import is printed");
+        let finish_offset = generated
+            .text
+            .find("export finish:")
+            .expect("the final source export is printed");
+        let shared_import_offset = generated
+            .text
+            .find("import shared:")
+            .expect("same-named import remains distinct from its export");
+        let shared_export_offset = generated
+            .text
+            .find("export shared:")
+            .expect("same-named export remains distinct from its import");
+        assert!(
+            reply_offset < lookup_offset
+                && lookup_offset < shared_import_offset
+                && shared_import_offset < finish_offset
+                && finish_offset < shared_export_offset
+        );
+        assert!(generated.text.contains("count: func(value: u32)"));
+        assert!(generated.text.contains("self: u32"));
+        assert!(generated.text.contains("/// An outgoing reply."));
+        assert!(generated.text.contains("/// A requested lookup."));
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let worlds = package_model.root().worlds.iter().collect::<Vec<_>>();
+        assert_eq!(worlds.len(), 2);
+        assert_eq!(worlds[0].name, "server");
+        assert_eq!(worlds[0].docs.as_deref(), Some("Runtime entry points."));
+        assert_eq!(worlds[0].imports.len(), 4);
+        assert_eq!(worlds[0].exports.len(), 3);
+        assert_eq!(
+            worlds[0].source_order,
+            [
+                sai_wit::WitWorldItemOrder::export(0),
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::import(1),
+                sai_wit::WitWorldItemOrder::import(2),
+                sai_wit::WitWorldItemOrder::import(3),
+                sai_wit::WitWorldItemOrder::export(1),
+                sai_wit::WitWorldItemOrder::export(2),
+            ]
+        );
+        let sai_wit::WitWorldItem::Func {
+            name: lookup_name,
+            func: lookup,
+            docs: lookup_docs,
+            ..
+        } = &worlds[0].imports[0]
+        else {
+            panic!("the world import remains a function");
+        };
+        assert_eq!(lookup_name, "lookup");
+        assert_eq!(lookup_docs.as_deref(), Some("A requested lookup."));
+        assert_eq!(lookup.params[0].1, sai_wit::WitType::U32);
+        assert_eq!(lookup.result, Some(sai_wit::WitType::U64));
+        let sai_wit::WitWorldItem::Func { func, .. } = &worlds[0].imports[3] else {
+            panic!("the world function with a raw self parameter remains a function");
+        };
+        assert_eq!(
+            func.params,
+            vec![("self".to_owned(), sai_wit::WitType::U32)]
+        );
+        assert_eq!(worlds[1].name, "empty");
+        assert!(worlds[1].imports.is_empty() && worlds[1].exports.is_empty());
+    }
+
+    #[test]
+    fn generated_wit_omits_unsupported_world_functions_atomically() {
+        let source = concat!(
+            "interface api {\n",
+            "  type Id = U32\n",
+            "}\n",
+            "world mixed {\n",
+            "  import fn named(value: api.Id)\n",
+            "  import fn omitted(pointer: USize)\n",
+            "  import async fn asynchronous()\n",
+            "  export fn retained(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("partial generated world package remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "omitting an unsupported signature leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "omitting an unsupported world function marks the output incomplete"
+        );
+        assert!(!generated.text.contains("omitted:"));
+        assert!(!generated.text.contains("named:"));
+        assert!(!generated.text.contains("asynchronous:"));
+        assert!(generated.text.contains("retained: func(value: u32)"));
+
+        let package_model = result.package.expect("partial WIT model loads");
+        let world = package_model
+            .root()
+            .worlds
+            .iter()
+            .next()
+            .expect("the partially supported world remains");
+        assert!(world.imports.is_empty());
+        assert_eq!(world.exports.len(), 1);
+        assert!(matches!(
+            &world.exports[0],
+            sai_wit::WitWorldItem::Func { name, .. } if name == "retained"
+        ));
+    }
+
+    #[test]
+    fn generated_wit_emits_named_consumers_and_empty_world_completely() {
         let source = concat!(
             "interface api {\n",
             "  type Count = U32\n",
@@ -47837,12 +48361,12 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .map(|(_, generated)| generated.as_ref())
             .expect("the generated root text is retained");
         assert!(
-            !generated.complete,
-            "the duplicate-name result unexpectedly claims completeness: {}",
+            generated.complete,
+            "the empty world is represented: {}",
             generated.text
         );
         assert!(!generated.text.contains("type Count"));
-        assert!(!generated.text.contains("world server"));
+        assert!(generated.text.contains("world server {}"));
         let package_model = result.package.expect("partial WIT model loads");
         let interface = package_model
             .root()
@@ -47857,16 +48381,19 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .collect::<Vec<_>>();
         assert!(
             emitted_items.contains(&"count") && emitted_items.contains(&"read"),
-            "eligible aliases and consumers survive even when a separate world keeps the package incomplete"
+            "eligible aliases and consumers retain their generated WIT names"
         );
         assert!(
             emitted_items.contains(&"write"),
             "an independent representable function survives"
         );
-        assert!(
-            package_model.root().worlds.is_empty(),
-            "world generation remains an explicitly incomplete part of this slice"
-        );
+        let world = package_model
+            .root()
+            .worlds
+            .iter()
+            .next()
+            .expect("the empty source world is generated");
+        assert_eq!(world.name, "server");
     }
 
     #[test]

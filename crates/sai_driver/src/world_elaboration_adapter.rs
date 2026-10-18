@@ -633,7 +633,8 @@ fn new_external_world_frame<'a>(
         import_candidates,
         export_candidates,
         seen_items: HashSet::new(),
-        complete: model.unsupported.is_none()
+        complete: world.view.complete
+            && model.unsupported.is_none()
             && (!model.source_order.is_empty() || model.includes.is_empty()),
         items: Vec::new(),
         implicit_imports_insert_at: None,

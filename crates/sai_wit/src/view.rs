@@ -1859,6 +1859,7 @@ mod tests {
                 imports: vec![
                     WitWorldItem::Func {
                         name: "connect".to_owned(),
+                        docs: None,
                         func: crate::WitFunc {
                             params: Vec::new(),
                             result: None,
@@ -1873,6 +1874,7 @@ mod tests {
                 ],
                 exports: vec![WitWorldItem::Func {
                     name: "shutdown".to_owned(),
+                    docs: None,
                     func: crate::WitFunc {
                         params: Vec::new(),
                         result: None,
@@ -2052,6 +2054,7 @@ mod tests {
         client.exports.push(interface_ref(&unit, 0, "files"));
         client.exports.push(WitWorldItem::Func {
             name: "type".to_owned(),
+            docs: None,
             func: crate::WitFunc {
                 params: Vec::new(),
                 result: None,
@@ -2101,6 +2104,7 @@ mod tests {
             .push(interface_ref(&unit, 0, &interface_name));
         client.exports.push(WitWorldItem::Func {
             name: "type".to_owned(),
+            docs: None,
             func: crate::WitFunc {
                 params: Vec::new(),
                 result: None,
@@ -2697,6 +2701,7 @@ mod tests {
         let mut model = model(unit, false);
         let duplicate = |name: &str| WitWorldItem::Func {
             name: name.to_owned(),
+            docs: None,
             func: crate::WitFunc {
                 params: Vec::new(),
                 result: None,

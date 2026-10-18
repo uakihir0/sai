@@ -368,7 +368,7 @@ pub struct WitWorld {
 }
 pub enum WitWorldItem {
     Interface { reference: WitIfaceRef, since: Option<WitStabilityVersion>, deprecated: Option<WitStabilityVersion> },
-    Func { name: String, func: WitFunc, unsupported: Option<Unsupported>, since: Option<WitStabilityVersion>, deprecated: Option<WitStabilityVersion> },
+    Func { name: String, docs: Option<Arc<str>>, func: WitFunc, unsupported: Option<Unsupported>, since: Option<WitStabilityVersion>, deprecated: Option<WitStabilityVersion> },
 }
 pub struct WitWorldRef {
     pub unit: WitUnit,
@@ -422,7 +422,7 @@ An interface that appears in a world, an elaborated world or a component world i
 
 ### 16.3.4 The canonical printer
 
-`sai_wit::print_wit(&WitPackage) -> String` writes the text of a package by the rules of spec/13 §13.11.2, §13.11.3 and §13.11.4. It writes interfaces, worlds and items in model order. A world's `source_order` interleaves its import, export and include vectors. Cross-interface `use` statements are computed from item type references, grouped and sorted by the rendered path, with member names sorted byte-wise. It preserves retained `@since` and `@deprecated` annotations, and treats a deprecation without its source `since` version as a model invariant failure. It is used only for generated units (§16.10.1), whose model is already in generation order. The text of a `Dir` unit is always the file as written. The printer has no options, and its output is a pure function of the model. Generated models omit unsupported types before printing; because the model no longer contains enough information to reconstruct such a type, encountering one is an invariant failure.
+`sai_wit::print_wit(&WitPackage) -> String` writes the text of a package by the rules of spec/13 §13.11.2, §13.11.3 and §13.11.4. It writes interfaces, worlds and items in model order. A world's `source_order` interleaves its import, export and include vectors. Cross-interface `use` statements are computed from item type references, grouped and sorted by the rendered path, with member names sorted byte-wise. It preserves retained documentation and `@since`/`@deprecated` annotations, and treats a deprecation without its source `since` version as a model invariant failure. It is used only for generated units (§16.10.1), whose model is already in generation order. The text of a `Dir` unit is always the file as written. The printer has no options, and its output is a pure function of the model. Generated models omit unsupported types before printing; because the model no longer contains enough information to reconstruct such a type, encountering one is an invariant failure.
 
 ---
 
@@ -1203,7 +1203,7 @@ pub struct GeneratedWit {
    - Resource members keep their roles.
    - Documentation comments and `@deprecated` are carried over. WIT `@since` and `@deprecated` versions are preserved when reading authored WIT. SAI `@deprecated` has no version or introduction history, so generated WIT records the selected package version for both `since` and `deprecated`, marking the item deprecated in that generated snapshot.
    - The `use` statements are derived from the references, one per referenced interface (spec/13 §13.11.3).
-3. **Worlds.** All local worlds are included after all interfaces, in generation order. Their items are taken as written, not elaborated (spec/13 §13.11.1). An `include` prints as `include`.
+3. **Worlds.** All local worlds with representable names are included after all interfaces, in generation order. World documentation and stability metadata are retained. Their direct items are taken as written, not elaborated (spec/13 §13.11.1), and supported `import fn`/`export fn` items retain their documentation and source order. The current generated slice accepts safe synchronous nongeneric functions with named immutable parameters, no contracts, effects or borrows, and signatures whose types the boundary materializer can represent. An empty world is complete. An unsupported or duplicate same-direction item is omitted while independent supported items survive, and makes the generated package incomplete. Interface-valued imports/exports, includes, named references such as `iface.T`, and other unrepresentable items are omitted and make the package incomplete. Import and export names are checked independently.
 4. **References.** References to WASI and to dependencies are written with the selected versions (spec/13 §13.11.4).
 5. **Poisoning.** The following items are omitted:
    - an item at or inside which an error was reported by `resolve_owner`, `adt_def`, `interface_check`, `world_check`, `package_wit_names(P)` or `interface_uses(P)`;
@@ -1231,6 +1231,8 @@ pub struct GeneratedWit {
 **Generated-WIT progress (IR-669):** Interface and resource-member boundary checks now classify canonical container types by the exact resolved `DefId` and canonical `DefPath`, including zero disambiguators. The checkout does not include the `library/core` or `library/alloc` source tree, so an end-to-end generated-WIT test cannot resolve a real standard-library `Vec`. Tests exercise exact canonical identity through an injected session interner and confirm that a same-spelling interface type remains a named WIT type. The full §16.10.1 plan remains incomplete.
 
 **Generated-WIT progress (IR-670):** A synthetic exact `sai:alloc/vec.Vec` identity now flows through canonical path classification, boundary conversion, WIT type materialization, printing, and reparsing. `Vec<Handle>` retains the exact `Own` resource reference in the model; the printer emits WIT's `list<handle>` spelling, and reparsing recovers the same owned resource type. The corresponding exact `sai:core/slice.Slice` identity rejects `Slice<Handle>` with `SliceContainsResource`. This test uses an injected session interner because the checkout has no standard-library source scopes; it verifies the converter/materializer and WIT round-trip but does not claim to run the complete interface generator over real prelude resolution. The full §16.10.1 plan remains incomplete.
+
+**Generated-WIT progress (IR-671):** Local worlds are emitted after interfaces, including empty worlds. Representable direct `import fn` and `export fn` declarations preserve their interleaved source order, docs, and named parameters; names are unique per direction, so one import and one export may share a name. The current slice omits a whole unsupported function item, keeps independent supported items, and sets `complete=false`. Partial source worlds retain their identity and incompleteness through includes, so a missing member in a partial view is deferred instead of diagnosed as absent. It supports only synchronous nongeneric signatures whose parameters and result materialize without named interface-type references. Interface imports/exports, includes, `iface.T` world-function types, and other unsupported entries remain omitted. The full §16.10.1 plan remains incomplete.
 
 ### 16.10.2 Clients
 

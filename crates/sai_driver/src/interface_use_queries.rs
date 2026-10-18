@@ -3,11 +3,11 @@ use super::{
     OwnedPhase1ModuleInput, OwnerControlFlowResolutionError, PackageWitNamesQueryError,
     Phase1ActiveWitViewEntry, Phase1ModuleScopes, Phase1PackageScopesQueryOutput, Prelude,
     PreparedPhase1PackageScopes, PrimitivePreludeBuildError, STAGED_PHASE1_PACKAGE_SCOPES,
-    TypeOwnerPathResolution, append_interface_use_references,
+    TypeOwnerPathResolution, WorldItemIds, append_interface_use_references,
     index_top_level_owner_descriptors_in_scopes, interface_generation_order, interface_member_kind,
     local_interface_type_member_owners, lower_interface_item_owner,
-    lower_interface_resource_member_owner, lower_top_level_owner, module_scope_for_scopes,
-    owner_test_only_path_candidates, owner_type_generic_resolutions,
+    lower_interface_resource_member_owner, lower_top_level_owner, lower_world_item_owner,
+    module_scope_for_scopes, owner_test_only_path_candidates, owner_type_generic_resolutions,
     package_wit_name_queries::PackageWitNamesQueries, resolve_partial_type_owner_paths,
 };
 use sai_diagnostics::{
@@ -15,7 +15,9 @@ use sai_diagnostics::{
 };
 use sai_hir::arena::HirArena;
 use sai_hir::item_tree::ItemTreeKind;
-use sai_hir::items::{HirOwner, InterfaceItemKind, ItemKind, MemberRole, OwnerNode, VariantShape};
+use sai_hir::items::{
+    HirOwner, InterfaceItemKind, ItemKind, MemberRole, OwnerNode, VariantShape, WorldItemKind,
+};
 use sai_hir::lower::HirLoweringContext;
 use sai_hir::types::{GenericArg, Name, Ty, TyKind};
 use sai_hir::{
@@ -49,7 +51,7 @@ use sai_wit::{
     GeneratedText, WitCase, WitField, WitFunc, WitIfaceIdx, WitIndexVec, WitInterface, WitItem,
     WitItemIdx, WitItemKind, WitMember, WitMemberKind, WitPackage, WitPackageDeclaration,
     WitPackageName, WitStabilityVersion, WitType, WitTypeRef, WitUnit, WitViewDefKind,
-    WitViewEntity, print_wit, wit_name_to_sai,
+    WitViewEntity, WitWorld, WitWorldItem, WitWorldItemOrder, print_wit, wit_name_to_sai,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -182,6 +184,7 @@ struct GeneratedWitCandidate {
     identity: String,
     version: Version,
     interfaces: Vec<(LocalDefId, WitIfaceIdx, WitInterface)>,
+    worlds: Vec<WitWorld>,
     complete: bool,
 }
 
@@ -236,6 +239,15 @@ impl GeneratedWitCandidate {
                 .declaration_order
                 .push(WitPackageDeclaration::Interface(index));
             origins.push((name, definition.to_def_id()));
+        }
+        for world in self.worlds {
+            let index = package
+                .worlds
+                .push(world)
+                .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+            package
+                .declaration_order
+                .push(WitPackageDeclaration::World(index));
         }
         Ok(GeneratedText {
             text: Arc::from(print_wit(&package)),
@@ -346,6 +358,201 @@ fn remap_generated_item_interface_indices(
         }
         WitItemKind::Enum(_) | WitItemKind::Flags(_) => {}
     }
+}
+
+fn generated_world_function_item(
+    entry: &ItemTreeEntry,
+    owner: &HirOwner<'_>,
+    world_owner: LocalDefId,
+    item_owner: OwnerId,
+    inputs: &CurrentOwnerInputs,
+    module_scope: &Phase1ModuleScopes,
+    prepared: &PreparedPhase1PackageScopes,
+    module_members: &ModuleMemberIndex,
+    source_graph_packages: &HashSet<PackageId>,
+    primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
+    local_boundary_aliases: &LocalBoundaryAliases<'_>,
+    selected: Option<&sai_package::mvs::MvsPackageVersion>,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) -> Result<Option<WitWorldItem>, InterfaceUsesQueryError> {
+    let (name, sig) = match owner.node {
+        OwnerNode::WorldItem(item) => match item.kind {
+            WorldItemKind::ImportFn { name, sig } | WorldItemKind::ExportFn { name, sig } => {
+                (name, sig)
+            }
+            WorldItemKind::Import(_) | WorldItemKind::Export(_) | WorldItemKind::Include(_) => {
+                return Ok(None);
+            }
+        },
+        _ => return Ok(None),
+    };
+    if name.is_error()
+        || sig.safety != sai_hir::Safety::Safe
+        || sig.is_async
+        || sig.borrows.is_some()
+        || sig.effects.is_some()
+        || !sig.requires.is_empty()
+        || !sig.ensures.is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let attrs = inputs.validated_attrs.get(&entry.ast_id);
+    let Some((since, deprecated)) = generated_stability(attrs, Some(selected)) else {
+        return Ok(None);
+    };
+    let source_name = symbols
+        .resolve(name.sym)
+        .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+        .map_err(InterfaceUsesQueryError::Collection)?;
+    let Some(name) = sai_identifier_to_wit_name(&source_name) else {
+        return Ok(None);
+    };
+
+    let generic_names = super::world_item_syntax_generic_parameter_names(
+        entry,
+        OwnerId {
+            def_id: world_owner,
+        },
+        item_owner,
+        inputs,
+        symbols,
+    )
+    .map_err(InterfaceUsesQueryError::Collection)?;
+    if !generic_names.is_empty() {
+        return Ok(None);
+    }
+    let Some(candidates) = super::world_item_signature_type_path_candidates(owner) else {
+        return Ok(None);
+    };
+    let generic_resolutions = owner_type_generic_resolutions(owner);
+    let resolution = resolve_partial_type_owner_paths(
+        item_owner,
+        &candidates,
+        &generic_resolutions,
+        primitive_prelude,
+        module_scope,
+        prepared.module_tree.package,
+        Some(module_members),
+        Some(source_graph_packages),
+    )
+    .map_err(InterfaceUsesQueryError::Collection)?;
+    let mut path_resolutions = resolution.paths().clone();
+    path_resolutions.extend(
+        local_boundary_aliases
+            .path_resolutions
+            .iter()
+            .map(|(hir_id, resolution)| (*hir_id, *resolution)),
+    );
+    let mut definitions = HashMap::new();
+    for path_resolution in path_resolutions.values() {
+        let Res::Def(kind, def_id) = path_resolution.base else {
+            continue;
+        };
+        let definition = match kind {
+            DefKind::Alias => Some(BoundaryDefinition::ModuleAlias),
+            DefKind::Struct
+            | DefKind::Enum
+            | DefKind::Distinct
+            | DefKind::Refined
+            | DefKind::Resource => Some(BoundaryDefinition::OutsideInterfaceNominal),
+            _ => None,
+        };
+        if let Some(definition) = definition {
+            definitions.insert(def_id, definition);
+        }
+    }
+    let canonical_types = super::canonical_boundary_types_for_paths(
+        &path_resolutions,
+        &prepared.known_def_paths,
+        packages,
+        symbols,
+    );
+    let boundary_context = BoundaryTypeContext {
+        path_resolutions: &path_resolutions,
+        canonical_types: &canonical_types,
+        definitions: &definitions,
+        resource_containment: None,
+        aliases: &local_boundary_aliases.definitions,
+        self_resource: None,
+    };
+
+    let mut params = Vec::with_capacity(sig.params.len());
+    for parameter in sig.params {
+        if parameter.is_self || parameter.mutable {
+            return Ok(None);
+        }
+        let Some(parameter_name) = parameter.name else {
+            return Ok(None);
+        };
+        if parameter_name.is_error() {
+            return Ok(None);
+        }
+        let parameter_source_name = symbols
+            .resolve(parameter_name.sym)
+            .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+            .map_err(InterfaceUsesQueryError::Collection)?;
+        let Some(parameter_name) = sai_identifier_to_wit_name(&parameter_source_name) else {
+            return Ok(None);
+        };
+        let outcome = boundary_type_with_references(
+            &boundary_context,
+            item_owner,
+            parameter.ty,
+            Position::Param,
+        )
+        .outcome;
+        let BoundaryTypeOutcome::Mapped(boundary_type) = outcome else {
+            return Ok(None);
+        };
+        let Ok(Some(parameter_type)) = sai_ty::boundary::materialize_boundary_type(
+            &boundary_type,
+            &HashMap::new(),
+            Position::Param,
+        ) else {
+            return Ok(None);
+        };
+        params.push((parameter_name, parameter_type));
+    }
+    let result = if let Some(result_type) = sig.ret {
+        let outcome = boundary_type_with_references(
+            &boundary_context,
+            item_owner,
+            result_type,
+            Position::Result,
+        )
+        .outcome;
+        let BoundaryTypeOutcome::Mapped(boundary_type) = outcome else {
+            return Ok(None);
+        };
+        let Ok(result) = sai_ty::boundary::materialize_boundary_type(
+            &boundary_type,
+            &HashMap::new(),
+            Position::Result,
+        ) else {
+            return Ok(None);
+        };
+        result
+    } else {
+        None
+    };
+
+    Ok(Some(WitWorldItem::Func {
+        name,
+        docs: entry.docs.clone().map(Arc::from),
+        func: WitFunc {
+            params,
+            result,
+            is_async: sig.is_async,
+        },
+        unsupported: None,
+        since,
+        deprecated,
+        span: None,
+    }))
 }
 
 impl PartialEq for InterfaceUsesMemo {
@@ -1408,11 +1615,7 @@ fn collect_interface_uses_input(
         .filter(|definitions| definitions.len() > 1)
         .flat_map(|definitions| definitions.iter().copied())
         .collect::<HashSet<_>>();
-    let mut generated_complete = !scopes
-        .top_level_owners
-        .iter()
-        .any(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
-        && package_wit_names.diagnostics.is_empty();
+    let mut generated_complete = package_wit_names.diagnostics.is_empty();
     let interface_type_members = local_interface_type_member_owners(scopes, &descriptors);
     let external_world_interfaces =
         collect_external_world_interface_data(prepared.active_wit_view_entries.as_deref());
@@ -2162,6 +2365,256 @@ fn collect_interface_uses_input(
             .insert(descriptor.owner.def_id.to_def_id(), owner_uses_complete);
     }
 
+    let mut generated_worlds = Vec::new();
+    if generated_unit.is_some() {
+        let world_descriptors = interface_generation_order(
+            &prepared.module_tree,
+            scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .filter(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
+                .collect(),
+            symbols,
+        )
+        .map_err(InterfaceUsesQueryError::Collection)?;
+        for descriptor in world_descriptors {
+            let inputs = module_inputs.get(&descriptor.file).ok_or_else(|| {
+                InterfaceUsesQueryError::Collection(
+                    OwnerControlFlowResolutionError::ModuleTreeMismatch,
+                )
+            })?;
+            let parent_descriptor = super::find_top_level_owner_descriptor(
+                &owner_index,
+                descriptor.owner,
+                descriptor.file,
+                descriptor.item_id,
+                TopLevelOwnerKind::World,
+            )
+            .map_err(InterfaceUsesQueryError::Collection)?;
+            if inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&ItemTreeKind::World) {
+                return Err(InterfaceUsesQueryError::Collection(
+                    OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                        owner: descriptor.owner,
+                        file: descriptor.file,
+                    },
+                ));
+            }
+            let parent_entry = inputs
+                .filtered_item_tree
+                .items
+                .iter()
+                .find(|entry| {
+                    entry.ast_id == descriptor.item_id && entry.kind == ItemTreeKind::World
+                })
+                .ok_or_else(|| {
+                    InterfaceUsesQueryError::Collection(
+                        OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                            owner: descriptor.owner,
+                            file: descriptor.file,
+                        },
+                    )
+                })?;
+            let Some(world_name) = package_wit_names
+                .names
+                .get(&descriptor.owner.def_id)
+                .map(ToString::to_string)
+            else {
+                generated_complete = false;
+                continue;
+            };
+            let attrs = inputs.validated_attrs.get(&descriptor.item_id);
+            let Some((since, deprecated)) =
+                generated_stability(attrs, prepared.generated_package_version.as_ref())
+            else {
+                generated_complete = false;
+                continue;
+            };
+            if duplicate_interface_names.contains(&descriptor.owner.def_id) {
+                generated_complete = false;
+                continue;
+            }
+
+            let def_paths = &prepared.def_paths;
+            let expected_parent_path = def_paths
+                .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                .map_err(OwnerControlFlowResolutionError::DefPathInterner)
+                .map_err(InterfaceUsesQueryError::Collection)?
+                .ok_or_else(|| {
+                    InterfaceUsesQueryError::Collection(
+                        OwnerControlFlowResolutionError::MissingDefPath(descriptor.owner),
+                    )
+                })?;
+            let arena = HirArena::new();
+            let context = HirLoweringContext::new(
+                &inputs.ast_ids,
+                &prepared.snapshot,
+                &inputs.root,
+                &arena,
+                symbols,
+                def_paths,
+            );
+            let (parent_hir, _) = lower_top_level_owner(
+                parent_descriptor,
+                &expected_parent_path,
+                &inputs.filtered_item_tree,
+                &inputs.retained_item_kinds,
+                &context,
+            )
+            .map_err(InterfaceUsesQueryError::Collection)?;
+            if !parent_hir.diagnostics.is_empty() {
+                generated_complete = false;
+                continue;
+            }
+            let parent_items = match parent_hir.node {
+                OwnerNode::Item(item) => match item.kind {
+                    ItemKind::World { items } => items,
+                    _ => {
+                        return Err(InterfaceUsesQueryError::Collection(
+                            OwnerControlFlowResolutionError::TopLevelOwnerKindMismatch {
+                                owner: descriptor.owner,
+                                file: descriptor.file,
+                                descriptor: TopLevelOwnerKind::World,
+                                current: ItemTreeKind::World,
+                            },
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(InterfaceUsesQueryError::Collection(
+                        OwnerControlFlowResolutionError::TopLevelOwnerDescriptorMismatch {
+                            owner: descriptor.owner,
+                            file: descriptor.file,
+                        },
+                    ));
+                }
+            };
+            let child_entries = parent_entry
+                .children
+                .iter()
+                .filter(|entry| super::world_item_test_only_kind(entry.kind).is_some())
+                .collect::<Vec<_>>();
+            if child_entries.len() != parent_items.len() {
+                return Err(InterfaceUsesQueryError::Collection(
+                    OwnerControlFlowResolutionError::Lowering(
+                        sai_hir::lower::HirLoweringError::ItemTreeEntryMismatch,
+                    ),
+                ));
+            }
+            let module_scope =
+                module_scope_for_scopes(scopes, &prepared.module_tree, descriptor.file)
+                    .map_err(InterfaceUsesQueryError::Collection)?;
+            let mut imports = Vec::new();
+            let mut exports = Vec::new();
+            let mut source_order = Vec::with_capacity(child_entries.len());
+            let mut import_names = HashSet::new();
+            let mut export_names = HashSet::new();
+            for (entry, item_owner) in child_entries.into_iter().zip(parent_items.iter().copied()) {
+                let expected_item_path = def_paths
+                    .resolve_def_id(item_owner.def_id.to_def_id())
+                    .map_err(OwnerControlFlowResolutionError::DefPathInterner)
+                    .map_err(InterfaceUsesQueryError::Collection)?
+                    .ok_or_else(|| {
+                        InterfaceUsesQueryError::Collection(
+                            OwnerControlFlowResolutionError::MissingDefPath(item_owner),
+                        )
+                    })?;
+                let (item_hir, _) = lower_world_item_owner(
+                    item_owner,
+                    &expected_item_path,
+                    &parent_hir,
+                    WorldItemIds {
+                        world: descriptor.item_id,
+                        item: entry.ast_id,
+                    },
+                    &inputs.filtered_item_tree,
+                    &context,
+                )
+                .map_err(OwnerControlFlowResolutionError::Lowering)
+                .map_err(InterfaceUsesQueryError::Collection)?;
+                if !item_hir.diagnostics.is_empty() {
+                    generated_complete = false;
+                    continue;
+                }
+                let is_import = match entry.kind {
+                    ItemTreeKind::WorldItem { import: true } => true,
+                    ItemTreeKind::WorldItem { import: false } => false,
+                    ItemTreeKind::WorldInclude => {
+                        generated_complete = false;
+                        continue;
+                    }
+                    _ => {
+                        return Err(InterfaceUsesQueryError::Collection(
+                            OwnerControlFlowResolutionError::Lowering(
+                                sai_hir::lower::HirLoweringError::ItemTreeEntryMismatch,
+                            ),
+                        ));
+                    }
+                };
+                let Some(item) = generated_world_function_item(
+                    entry,
+                    &item_hir,
+                    descriptor.owner.def_id,
+                    item_owner,
+                    inputs,
+                    module_scope,
+                    prepared,
+                    &module_members,
+                    &source_graph_packages,
+                    primitive_prelude,
+                    &local_boundary_aliases,
+                    prepared.generated_package_version.as_ref(),
+                    packages,
+                    symbols,
+                )?
+                else {
+                    generated_complete = false;
+                    continue;
+                };
+                let name = match &item {
+                    WitWorldItem::Func { name, .. } => name,
+                    WitWorldItem::Interface { .. } => unreachable!(),
+                };
+                let names = if is_import {
+                    &mut import_names
+                } else {
+                    &mut export_names
+                };
+                if !names.insert(name.clone()) {
+                    generated_complete = false;
+                    continue;
+                }
+                if is_import {
+                    let Ok(index) = u32::try_from(imports.len()) else {
+                        generated_complete = false;
+                        continue;
+                    };
+                    imports.push(item);
+                    source_order.push(WitWorldItemOrder::import(index));
+                } else {
+                    let Ok(index) = u32::try_from(exports.len()) else {
+                        generated_complete = false;
+                        continue;
+                    };
+                    exports.push(item);
+                    source_order.push(WitWorldItemOrder::export(index));
+                }
+            }
+            generated_worlds.push(WitWorld {
+                name: world_name,
+                docs: parent_entry.docs.clone().map(Arc::from),
+                since,
+                deprecated,
+                imports,
+                exports,
+                includes: Vec::new(),
+                source_order,
+                unsupported: None,
+                span: None,
+            });
+        }
+    }
+
     let package = package_identity.unwrap_or_else(|| {
         package_key
             .as_str()
@@ -2247,6 +2700,7 @@ fn collect_interface_uses_input(
             identity: selected.package().to_owned(),
             version: selected.version().clone(),
             interfaces: generated_interfaces,
+            worlds: generated_worlds,
             complete: generated_complete && interface_check_diagnostics.is_empty(),
         })
     } else {

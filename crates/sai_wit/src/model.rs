@@ -519,6 +519,8 @@ pub enum WitWorldItem {
     },
     Func {
         name: String,
+        /// Documentation attached to this world function.
+        docs: Option<Arc<str>>,
         func: WitFunc,
         unsupported: Option<Unsupported>,
         since: Option<WitStabilityVersion>,
