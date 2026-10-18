@@ -1094,6 +1094,7 @@ struct PreparedPhase1PackageScopes {
     unavailable_foreign_wit_packages: Vec<String>,
     modules: Vec<OwnedPhase1ModuleInput>,
     def_paths: Arc<DefPathInterner>,
+    known_def_paths: HashMap<PackageId, Arc<DefPathInterner>>,
 }
 
 thread_local! {
@@ -3438,6 +3439,9 @@ fn canonical_boundary_type_for_path(
         .map_or(package_identity, |(identity, _)| identity);
     let mut path_segments = Vec::with_capacity(path.data().len());
     for component in path.data() {
+        if component.disambiguator != 0 {
+            return None;
+        }
         let (kind, symbol) = match &component.data {
             DefPathData::Module(symbol) => (0_u8, *symbol),
             DefPathData::TypeNs(symbol) => (1_u8, *symbol),
@@ -3480,6 +3484,36 @@ fn canonical_boundary_type_for_path(
             _ => None,
         }
     })
+}
+
+fn canonical_boundary_types_for_paths(
+    path_resolutions: &HashMap<HirId, PathRes>,
+    def_paths: &HashMap<PackageId, Arc<DefPathInterner>>,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) -> HashMap<DefId, sai_ty::boundary::CanonicalBoundaryType> {
+    let mut canonical_types = HashMap::new();
+    for path_resolution in path_resolutions.values() {
+        let Res::Def(_, def_id) = path_resolution.base else {
+            continue;
+        };
+        let Some(def_paths) = def_paths.get(&def_id.package) else {
+            continue;
+        };
+        let Ok(Some(path)) = def_paths.resolve_def_id(def_id) else {
+            continue;
+        };
+        let Ok(package_identity) = packages.resolve(def_id.package) else {
+            continue;
+        };
+        let Some(canonical) =
+            canonical_boundary_type_for_path(&path, package_identity.as_ref(), symbols)
+        else {
+            continue;
+        };
+        canonical_types.insert(def_id, canonical);
+    }
+    canonical_types
 }
 
 enum WorldWitAliasTarget<'a> {
@@ -11375,6 +11409,7 @@ impl RootDatabase {
             unavailable_foreign_wit_packages,
             modules: owned_inputs,
             def_paths: Arc::clone(&def_paths),
+            known_def_paths: self.def_paths.clone(),
         });
         let _staged_input = StagedPhase1InputGuard::install(
             package_key.clone(),
@@ -16755,28 +16790,12 @@ impl RootDatabase {
         &self,
         path_resolutions: &HashMap<HirId, PathRes>,
     ) -> HashMap<DefId, sai_ty::boundary::CanonicalBoundaryType> {
-        let mut canonical_types = HashMap::new();
-        for path_resolution in path_resolutions.values() {
-            let Res::Def(_, def_id) = path_resolution.base else {
-                continue;
-            };
-            let Some(def_paths) = self.def_paths.get(&def_id.package) else {
-                continue;
-            };
-            let Ok(Some(path)) = def_paths.resolve_def_id(def_id) else {
-                continue;
-            };
-            let Ok(package_identity) = self.packages.resolve(def_id.package) else {
-                continue;
-            };
-            let Some(canonical) =
-                canonical_boundary_type_for_path(&path, package_identity.as_ref(), &self.symbols)
-            else {
-                continue;
-            };
-            canonical_types.insert(def_id, canonical);
-        }
-        canonical_types
+        canonical_boundary_types_for_paths(
+            path_resolutions,
+            &self.def_paths,
+            &self.packages,
+            &self.symbols,
+        )
     }
 
     fn complete_world_boundary_resource_containment(
@@ -45697,6 +45716,272 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         assert!(generated.text.contains("type handle-alias = handle;"));
         assert!(generated.text.contains("handle: handle,"));
         assert!(generated.text.contains("returned(handle)"));
+    }
+
+    #[test]
+    fn canonical_boundary_types_require_exact_definition_paths() {
+        use sai_intern::Idx;
+
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let owner_package = database
+            .intern_package("acme:owner#1")
+            .expect("owner package interns");
+        let alloc_package = database
+            .intern_package("sai:alloc")
+            .expect("canonical package interns");
+        let shadow_package = database
+            .intern_package("acme:shadow#1")
+            .expect("shadow package interns");
+        let owner_def_paths =
+            DefPathInterner::new(owner_package, &database.packages, &database.symbols)
+                .expect("owner definition paths initialize");
+        let owner_name = database
+            .symbols
+            .intern("owner")
+            .expect("owner name interns");
+        let owner = OwnerId {
+            def_id: owner_def_paths
+                .intern(
+                    DefPath::new(
+                        owner_package,
+                        vec![sai_hir::DisambiguatedDefPathData {
+                            data: DefPathData::ValueNs(owner_name),
+                            disambiguator: 0,
+                        }],
+                        &database.packages,
+                        &database.symbols,
+                    )
+                    .expect("owner path is valid"),
+                )
+                .expect("owner path interns"),
+        };
+        let module_vec = database
+            .symbols
+            .intern("vec")
+            .expect("canonical module name interns");
+        let module_shadow = database
+            .symbols
+            .intern("shadow")
+            .expect("noncanonical module name interns");
+        let type_vec = database.symbols.intern("Vec").expect("type name interns");
+        let alloc_def_paths = Arc::new(
+            DefPathInterner::new(alloc_package, &database.packages, &database.symbols)
+                .expect("canonical package definition paths initialize"),
+        );
+        let shadow_def_paths = Arc::new(
+            DefPathInterner::new(shadow_package, &database.packages, &database.symbols)
+                .expect("shadow package definition paths initialize"),
+        );
+        let canonical_vec = alloc_def_paths
+            .intern(
+                DefPath::new(
+                    alloc_package,
+                    vec![
+                        sai_hir::DisambiguatedDefPathData {
+                            data: DefPathData::Module(module_vec),
+                            disambiguator: 0,
+                        },
+                        sai_hir::DisambiguatedDefPathData {
+                            data: DefPathData::TypeNs(type_vec),
+                            disambiguator: 0,
+                        },
+                    ],
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("canonical Vec path is valid"),
+            )
+            .expect("canonical Vec path interns")
+            .to_def_id();
+        let noncanonical_module_vec = alloc_def_paths
+            .intern(
+                DefPath::new(
+                    alloc_package,
+                    vec![
+                        sai_hir::DisambiguatedDefPathData {
+                            data: DefPathData::Module(module_shadow),
+                            disambiguator: 0,
+                        },
+                        sai_hir::DisambiguatedDefPathData {
+                            data: DefPathData::TypeNs(type_vec),
+                            disambiguator: 0,
+                        },
+                    ],
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("noncanonical module path is valid"),
+            )
+            .expect("noncanonical module path interns")
+            .to_def_id();
+        let noncanonical_disambiguator_vec = alloc_def_paths
+            .intern(
+                DefPath::new(
+                    alloc_package,
+                    vec![
+                        sai_hir::DisambiguatedDefPathData {
+                            data: DefPathData::Module(module_vec),
+                            disambiguator: 0,
+                        },
+                        sai_hir::DisambiguatedDefPathData {
+                            data: DefPathData::TypeNs(type_vec),
+                            disambiguator: 1,
+                        },
+                    ],
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("disambiguated type path is valid"),
+            )
+            .expect("disambiguated type path interns")
+            .to_def_id();
+        let noncanonical_module_disambiguator_vec = alloc_def_paths
+            .intern(
+                DefPath::new(
+                    alloc_package,
+                    vec![
+                        sai_hir::DisambiguatedDefPathData {
+                            data: DefPathData::Module(module_vec),
+                            disambiguator: 1,
+                        },
+                        sai_hir::DisambiguatedDefPathData {
+                            data: DefPathData::TypeNs(type_vec),
+                            disambiguator: 0,
+                        },
+                    ],
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("disambiguated module path is valid"),
+            )
+            .expect("disambiguated module path interns")
+            .to_def_id();
+        let shadow_vec = shadow_def_paths
+            .intern(
+                DefPath::new(
+                    shadow_package,
+                    vec![sai_hir::DisambiguatedDefPathData {
+                        data: DefPathData::TypeNs(type_vec),
+                        disambiguator: 0,
+                    }],
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("shadow Vec path is valid"),
+            )
+            .expect("shadow Vec path interns")
+            .to_def_id();
+        database.def_paths.insert(alloc_package, alloc_def_paths);
+        database.def_paths.insert(shadow_package, shadow_def_paths);
+
+        let path_resolutions = [
+            canonical_vec,
+            noncanonical_module_vec,
+            noncanonical_disambiguator_vec,
+            noncanonical_module_disambiguator_vec,
+            shadow_vec,
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, def_id)| {
+            (
+                HirId {
+                    owner,
+                    local_id: sai_hir::ItemLocalId::from_raw(
+                        u32::try_from(index).expect("test path index fits"),
+                    ),
+                },
+                PathRes {
+                    base: Res::Def(DefKind::Struct, def_id),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+        let canonical_types = database.canonical_boundary_types_for_paths(&path_resolutions);
+        assert_eq!(
+            canonical_types.get(&canonical_vec),
+            Some(&sai_ty::boundary::CanonicalBoundaryType::Vec),
+            "the exact canonical sai:alloc/vec.Vec path is recognized"
+        );
+        assert!(
+            !canonical_types.contains_key(&noncanonical_module_vec),
+            "a Vec in another canonical-package module is not recognized"
+        );
+        assert!(
+            !canonical_types.contains_key(&noncanonical_disambiguator_vec),
+            "a nonzero path disambiguator is not part of the canonical identity"
+        );
+        assert!(
+            !canonical_types.contains_key(&noncanonical_module_disambiguator_vec),
+            "a nonzero module disambiguator is not part of the canonical identity"
+        );
+        assert!(
+            !canonical_types.contains_key(&shadow_vec),
+            "a shadow type named Vec in another package is not recognized"
+        );
+    }
+
+    #[test]
+    fn generated_wit_preserves_interface_types_named_like_containers() {
+        let source = concat!(
+            "interface api {\n",
+            "  resource Handle {}\n",
+            "  type Vec = Handle\n",
+            "  fn echo(value: Vec) -> Vec\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("a user type with a container name generates WIT");
+        assert!(
+            result.failure.is_none(),
+            "the shadow type package parses: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "a local Vec type is represented as a named WIT type: {}",
+            generated.text
+        );
+        assert!(generated.text.contains("type vec = handle;"));
+        assert!(generated.text.contains("echo: func(value: vec) -> vec;"));
+        assert!(
+            !generated.text.contains("list<handle>"),
+            "the local spelling Vec does not become a canonical list"
+        );
     }
 
     #[test]

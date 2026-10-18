@@ -19,10 +19,10 @@ use sai_hir::items::{HirOwner, InterfaceItemKind, ItemKind, MemberRole, OwnerNod
 use sai_hir::lower::HirLoweringContext;
 use sai_hir::types::{GenericArg, Name, Ty, TyKind};
 use sai_hir::{
-    DefId, DefPathData, DefPathError, DefPathHash, DefPathInternerError, HirId, LocalDefId,
-    OwnerId, Symbol,
+    DefId, DefPathData, DefPathError, DefPathHash, DefPathInterner, DefPathInternerError, HirId,
+    LocalDefId, OwnerId, Symbol,
 };
-use sai_intern::{Interner, PackageInterner};
+use sai_intern::{Interner, PackageId, PackageInterner};
 use sai_package::version::Version;
 use sai_query::{DerivedQuery, QueryDatabase, QueryError};
 use sai_resolve::module_member_lookup::ModuleMemberIndex;
@@ -1749,6 +1749,9 @@ fn collect_interface_uses_input(
                     descriptor.owner.def_id,
                     &interface_type_members,
                     &world_interface_type_members,
+                    &prepared.known_def_paths,
+                    packages,
+                    symbols,
                     &mut owner_references,
                     &mut owner_world_references,
                     &mut owner_uses_complete,
@@ -2011,6 +2014,9 @@ fn collect_interface_uses_input(
                         descriptor.owner.def_id,
                         &interface_type_members,
                         &world_interface_type_members,
+                        &prepared.known_def_paths,
+                        packages,
+                        symbols,
                         &mut owner_references,
                         &mut owner_world_references,
                         &mut owner_uses_complete,
@@ -2995,6 +3001,9 @@ fn append_interface_boundary_diagnostics(
     interface: LocalDefId,
     interface_type_members: &HashMap<DefId, LocalDefId>,
     world_interface_type_members: &HashMap<DefId, DefId>,
+    known_def_paths: &HashMap<PackageId, Arc<DefPathInterner>>,
+    packages: &PackageInterner,
+    symbols: &Interner,
     references: &mut Vec<InterfaceUseReference>,
     world_references: &mut Vec<(sai_vfs::TextSize, InterfaceUse)>,
     uses_complete: &mut bool,
@@ -3057,7 +3066,12 @@ fn append_interface_boundary_diagnostics(
             definitions.insert(def_id, definition);
         }
     }
-    let canonical_types = HashMap::new();
+    let canonical_types = super::canonical_boundary_types_for_paths(
+        &path_resolutions,
+        known_def_paths,
+        packages,
+        symbols,
+    );
     let boundary_context = BoundaryTypeContext {
         path_resolutions: &path_resolutions,
         canonical_types: &canonical_types,
