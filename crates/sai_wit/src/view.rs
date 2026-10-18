@@ -1935,6 +1935,7 @@ mod tests {
                 interface: crate::WitIfaceIdx::from_raw(index),
                 name: name.to_owned(),
             },
+            docs: None,
             since: None,
             deprecated: None,
             span: None,

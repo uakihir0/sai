@@ -1,14 +1,15 @@
 use super::{
     CurrentOwnerInputs, DetachedWorkspaceDiagnostic, InterfaceResourceMemberIds, ItemTreeEntry,
-    OwnedPhase1ModuleInput, OwnerControlFlowResolutionError, PackageWitNamesQueryError,
-    Phase1ActiveWitViewEntry, Phase1ModuleScopes, Phase1PackageScopesQueryOutput, Prelude,
-    PreparedPhase1PackageScopes, PrimitivePreludeBuildError, STAGED_PHASE1_PACKAGE_SCOPES,
-    TypeOwnerPathResolution, WorldItemIds, append_interface_use_references,
-    index_top_level_owner_descriptors_in_scopes, interface_generation_order, interface_member_kind,
-    local_interface_type_member_owners, lower_interface_item_owner,
-    lower_interface_resource_member_owner, lower_top_level_owner, lower_world_item_owner,
-    module_scope_for_scopes, owner_test_only_path_candidates, owner_type_generic_resolutions,
-    package_wit_name_queries::PackageWitNamesQueries, resolve_partial_type_owner_paths,
+    OwnedPhase1ModuleInput, OwnerControlFlowResolutionError, OwnerPathKind,
+    PackageWitNamesQueryError, Phase1ActiveWitViewEntry, Phase1ModuleScopes,
+    Phase1PackageScopesQueryOutput, Prelude, PreparedPhase1PackageScopes,
+    PrimitivePreludeBuildError, STAGED_PHASE1_PACKAGE_SCOPES, TypeOwnerPathResolution,
+    WorldItemIds, append_interface_use_references, index_top_level_owner_descriptors_in_scopes,
+    interface_generation_order, interface_member_kind, local_interface_type_member_owners,
+    lower_interface_item_owner, lower_interface_resource_member_owner, lower_top_level_owner,
+    lower_world_item_owner, module_scope_for_scopes, owner_test_only_path_candidates,
+    owner_type_generic_resolutions, package_wit_name_queries::PackageWitNamesQueries,
+    resolve_partial_type_owner_paths,
 };
 use sai_diagnostics::{
     Child, ChildKind, Diagnostic, Location, Related, Severity, SourceRef, Value,
@@ -48,12 +49,13 @@ use sai_ty::iface::{
 };
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
 use sai_wit::{
-    GeneratedText, WitCase, WitField, WitFunc, WitIfaceIdx, WitIndexVec, WitInterface, WitItem,
-    WitItemIdx, WitItemKind, WitMember, WitMemberKind, WitPackage, WitPackageDeclaration,
+    GeneratedText, WitCase, WitField, WitFunc, WitIfaceIdx, WitIfaceRef, WitIndexVec, WitInterface,
+    WitItem, WitItemIdx, WitItemKind, WitMember, WitMemberKind, WitPackage, WitPackageDeclaration,
     WitPackageName, WitStabilityVersion, WitType, WitTypeRef, WitUnit, WitViewDefKind,
-    WitViewEntity, WitWorld, WitWorldItem, WitWorldItemOrder, print_wit, wit_name_to_sai,
+    WitViewEntity, WitWorld, WitWorldItem, WitWorldItemDirection, WitWorldItemOrder, print_wit,
+    wit_name_to_sai,
 };
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 struct LocalBoundaryAliases<'hir> {
@@ -223,11 +225,22 @@ impl GeneratedWitCandidate {
             surviving_interfaces.push((definition, provisional_index, interface));
         }
 
+        let (item_indices, items_complete) = prune_generated_item_references(
+            &mut surviving_interfaces,
+            &package.unit,
+            &interface_indices,
+        )?;
+        complete &= items_complete;
         let mut origins = Vec::with_capacity(surviving_interfaces.len());
         for (definition, provisional_index, mut interface) in surviving_interfaces {
             let final_index = interface_indices[&provisional_index];
             for item in interface.items.iter_mut() {
-                remap_generated_item_interface_indices(item, &package.unit, &interface_indices);
+                remap_generated_item_interface_indices(
+                    item,
+                    &package.unit,
+                    &interface_indices,
+                    &item_indices,
+                );
             }
             let name = interface.name.clone();
             let index = package
@@ -241,6 +254,9 @@ impl GeneratedWitCandidate {
             origins.push((name, definition.to_def_id()));
         }
         for world in self.worlds {
+            let (world, world_complete) =
+                remap_generated_world_interfaces(world, &package.unit, &interface_indices);
+            complete &= world_complete;
             let index = package
                 .worlds
                 .push(world)
@@ -257,20 +273,200 @@ impl GeneratedWitCandidate {
     }
 }
 
+fn prune_generated_item_references(
+    interfaces: &mut [(LocalDefId, WitIfaceIdx, WitInterface)],
+    generated_unit: &WitUnit,
+    interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+) -> Result<(HashMap<WitIfaceIdx, HashMap<WitItemIdx, WitItemIdx>>, bool), InterfaceUsesQueryError>
+{
+    let interfaces_by_index = interfaces
+        .iter()
+        .map(|(_, index, interface)| (*index, interface))
+        .collect::<HashMap<_, _>>();
+    let mut retained_items = interfaces
+        .iter()
+        .map(|(_, index, interface)| {
+            (
+                *index,
+                interface
+                    .items
+                    .iter_enumerated()
+                    .map(|(item, _)| item)
+                    .collect::<HashSet<_>>(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut dependents =
+        HashMap::<(WitIfaceIdx, WitItemIdx), Vec<(WitIfaceIdx, WitItemIdx)>>::new();
+    let mut invalid_queue = VecDeque::new();
+    for (_, source_interface, interface) in interfaces.iter() {
+        for (source_item, item) in interface.items.iter_enumerated() {
+            let source = (*source_interface, source_item);
+            let (references, item_complete) = wit_item_interface_references(item);
+            if !item_complete {
+                invalid_queue.push_back(source);
+            }
+            for reference in references {
+                if reference.interface.unit != *generated_unit {
+                    continue;
+                }
+                let target_interface = reference.interface.interface;
+                if !interface_indices.contains_key(&target_interface) {
+                    invalid_queue.push_back(source);
+                    continue;
+                }
+                let Some(target) = interfaces_by_index.get(&target_interface) else {
+                    invalid_queue.push_back(source);
+                    continue;
+                };
+                if target.items.get(reference.item).is_none() {
+                    invalid_queue.push_back(source);
+                    continue;
+                }
+                dependents
+                    .entry((target_interface, reference.item))
+                    .or_default()
+                    .push(source);
+            }
+        }
+    }
+
+    let mut invalid_items = HashSet::new();
+    while let Some(invalid) = invalid_queue.pop_front() {
+        if !invalid_items.insert(invalid) {
+            continue;
+        }
+        if let Some(items) = retained_items.get_mut(&invalid.0) {
+            items.remove(&invalid.1);
+        }
+        if let Some(consumers) = dependents.get(&invalid) {
+            invalid_queue.extend(consumers.iter().copied());
+        }
+    }
+
+    let mut item_indices = HashMap::with_capacity(interfaces.len());
+    for (_, provisional_interface, interface) in interfaces.iter_mut() {
+        let retained = retained_items
+            .get(provisional_interface)
+            .expect("every surviving interface has an item set");
+        let mut compacted = WitIndexVec::<WitItemIdx, WitItem>::new();
+        let mut indices = HashMap::with_capacity(retained.len());
+        for (old_index, item) in interface.items.iter_enumerated() {
+            if !retained.contains(&old_index) {
+                continue;
+            }
+            let new_index = compacted
+                .push(item.clone())
+                .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+            indices.insert(old_index, new_index);
+        }
+        interface.items = compacted;
+        item_indices.insert(*provisional_interface, indices);
+    }
+    Ok((item_indices, invalid_items.is_empty()))
+}
+
+fn remap_generated_world_interfaces(
+    mut world: WitWorld,
+    generated_unit: &WitUnit,
+    interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+) -> (WitWorld, bool) {
+    fn remap_items(
+        items: &mut Vec<WitWorldItem>,
+        generated_unit: &WitUnit,
+        interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+        complete: &mut bool,
+    ) -> Vec<Option<u32>> {
+        let mut remapped = Vec::with_capacity(items.len());
+        let mut indices = Vec::with_capacity(items.len());
+        for mut item in std::mem::take(items) {
+            if let WitWorldItem::Interface { reference, .. } = &mut item
+                && reference.unit == *generated_unit
+            {
+                let Some(index) = interface_indices.get(&reference.interface).copied() else {
+                    *complete = false;
+                    indices.push(None);
+                    continue;
+                };
+                reference.interface = index;
+            }
+            let Ok(index) = u32::try_from(remapped.len()) else {
+                *complete = false;
+                indices.push(None);
+                continue;
+            };
+            indices.push(Some(index));
+            remapped.push(item);
+        }
+        *items = remapped;
+        indices
+    }
+
+    let mut complete = true;
+    let import_indices = remap_items(
+        &mut world.imports,
+        generated_unit,
+        interface_indices,
+        &mut complete,
+    );
+    let export_indices = remap_items(
+        &mut world.exports,
+        generated_unit,
+        interface_indices,
+        &mut complete,
+    );
+    if !world.source_order.is_empty() {
+        world.source_order = world
+            .source_order
+            .into_iter()
+            .filter_map(|order| {
+                let (indices, direction) = match order.direction {
+                    WitWorldItemDirection::Import => {
+                        (import_indices.get(order.index as usize), order.direction)
+                    }
+                    WitWorldItemDirection::Export => {
+                        (export_indices.get(order.index as usize), order.direction)
+                    }
+                    WitWorldItemDirection::Include => return Some(order),
+                };
+                match indices {
+                    Some(Some(index)) => Some(WitWorldItemOrder {
+                        direction,
+                        index: *index,
+                    }),
+                    Some(None) => None,
+                    None => {
+                        complete = false;
+                        None
+                    }
+                }
+            })
+            .collect();
+    }
+    (world, complete)
+}
+
 fn remap_generated_item_interface_indices(
     item: &mut WitItem,
     generated_unit: &WitUnit,
     interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+    item_indices: &HashMap<WitIfaceIdx, HashMap<WitItemIdx, WitItemIdx>>,
 ) {
     fn remap_reference(
         reference: &mut WitTypeRef,
         generated_unit: &WitUnit,
         interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+        item_indices: &HashMap<WitIfaceIdx, HashMap<WitItemIdx, WitItemIdx>>,
     ) {
         if reference.interface.unit == *generated_unit {
+            let provisional_interface = reference.interface.interface;
             reference.interface.interface = *interface_indices
                 .get(&reference.interface.interface)
                 .expect("generated local type references target an emitted interface");
+            reference.item = *item_indices
+                .get(&provisional_interface)
+                .and_then(|indices| indices.get(&reference.item))
+                .expect("generated local type references target an emitted item");
         }
     }
 
@@ -278,26 +474,27 @@ fn remap_generated_item_interface_indices(
         ty: &mut WitType,
         generated_unit: &WitUnit,
         interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+        item_indices: &HashMap<WitIfaceIdx, HashMap<WitItemIdx, WitItemIdx>>,
     ) {
         match ty {
             WitType::List(inner)
             | WitType::Option(inner)
             | WitType::Future(Some(inner))
             | WitType::Stream(Some(inner)) => {
-                remap_type(inner, generated_unit, interface_indices);
+                remap_type(inner, generated_unit, interface_indices, item_indices);
             }
             WitType::Result { ok, err } => {
                 for inner in ok.iter_mut().chain(err.iter_mut()) {
-                    remap_type(inner, generated_unit, interface_indices);
+                    remap_type(inner, generated_unit, interface_indices, item_indices);
                 }
             }
             WitType::Tuple(elements) => {
                 for element in elements {
-                    remap_type(element, generated_unit, interface_indices);
+                    remap_type(element, generated_unit, interface_indices, item_indices);
                 }
             }
             WitType::Named(reference) | WitType::Own(reference) | WitType::Borrow(reference) => {
-                remap_reference(reference, generated_unit, interface_indices);
+                remap_reference(reference, generated_unit, interface_indices, item_indices);
             }
             WitType::Future(None)
             | WitType::Stream(None)
@@ -322,39 +519,50 @@ fn remap_generated_item_interface_indices(
         function: &mut WitFunc,
         generated_unit: &WitUnit,
         interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+        item_indices: &HashMap<WitIfaceIdx, HashMap<WitItemIdx, WitItemIdx>>,
     ) {
         for (_, ty) in &mut function.params {
-            remap_type(ty, generated_unit, interface_indices);
+            remap_type(ty, generated_unit, interface_indices, item_indices);
         }
         if let Some(result) = &mut function.result {
-            remap_type(result, generated_unit, interface_indices);
+            remap_type(result, generated_unit, interface_indices, item_indices);
         }
     }
 
     match &mut item.kind {
         WitItemKind::Record(fields) => {
             for field in fields {
-                remap_type(&mut field.ty, generated_unit, interface_indices);
+                remap_type(
+                    &mut field.ty,
+                    generated_unit,
+                    interface_indices,
+                    item_indices,
+                );
             }
         }
         WitItemKind::Variant(cases) => {
             for case in cases {
                 if let Some(payload) = &mut case.payload {
-                    remap_type(payload, generated_unit, interface_indices);
+                    remap_type(payload, generated_unit, interface_indices, item_indices);
                 }
             }
         }
         WitItemKind::Resource(members) => {
             for member in members {
-                remap_function(&mut member.func, generated_unit, interface_indices);
+                remap_function(
+                    &mut member.func,
+                    generated_unit,
+                    interface_indices,
+                    item_indices,
+                );
             }
         }
-        WitItemKind::Alias(ty) => remap_type(ty, generated_unit, interface_indices),
+        WitItemKind::Alias(ty) => remap_type(ty, generated_unit, interface_indices, item_indices),
         WitItemKind::Used(reference) => {
-            remap_reference(reference, generated_unit, interface_indices);
+            remap_reference(reference, generated_unit, interface_indices, item_indices);
         }
         WitItemKind::Func(function) => {
-            remap_function(function, generated_unit, interface_indices);
+            remap_function(function, generated_unit, interface_indices, item_indices);
         }
         WitItemKind::Enum(_) | WitItemKind::Flags(_) => {}
     }
@@ -549,6 +757,81 @@ fn generated_world_function_item(
             is_async: sig.is_async,
         },
         unsupported: None,
+        since,
+        deprecated,
+        span: None,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generated_world_interface_item(
+    entry: &ItemTreeEntry,
+    owner: &HirOwner<'_>,
+    item_owner: OwnerId,
+    inputs: &CurrentOwnerInputs,
+    module_scope: &Phase1ModuleScopes,
+    prepared: &PreparedPhase1PackageScopes,
+    module_members: &ModuleMemberIndex<'_>,
+    source_graph_packages: &HashSet<PackageId>,
+    primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
+    selected: Option<&sai_package::mvs::MvsPackageVersion>,
+    generated_interfaces: &HashMap<DefId, WitIfaceRef>,
+) -> Result<Option<WitWorldItem>, InterfaceUsesQueryError> {
+    let kind = match owner.node {
+        OwnerNode::WorldItem(item) => item.kind,
+        _ => return Ok(None),
+    };
+    if !matches!(
+        kind,
+        WorldItemKind::Import(sai_hir::items::WorldRef::Mod(_))
+            | WorldItemKind::Export(sai_hir::items::WorldRef::Mod(_))
+    ) {
+        return Ok(None);
+    }
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let attrs = inputs.validated_attrs.get(&entry.ast_id);
+    let Some((since, deprecated)) = generated_stability(attrs, Some(selected)) else {
+        return Ok(None);
+    };
+    let candidates = owner_test_only_path_candidates(owner)
+        .into_iter()
+        .filter(|candidate| candidate.kind == OwnerPathKind::Type)
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        return Ok(None);
+    }
+    let generic_resolutions = owner_type_generic_resolutions(owner);
+    let resolution = resolve_partial_type_owner_paths(
+        item_owner,
+        &candidates,
+        &generic_resolutions,
+        primitive_prelude,
+        module_scope,
+        prepared.module_tree.package,
+        Some(module_members),
+        Some(source_graph_packages),
+    )
+    .map_err(InterfaceUsesQueryError::Collection)?;
+    let candidate = &candidates[0];
+    let Some(PathRes {
+        base: Res::Def(DefKind::Interface, definition),
+        resolved_segments,
+        segment_count,
+    }) = resolution.paths().get(&candidate.hir_id)
+    else {
+        return Ok(None);
+    };
+    if resolved_segments != segment_count || *segment_count != candidate.segment_count {
+        return Ok(None);
+    }
+    let Some(reference) = generated_interfaces.get(definition) else {
+        return Ok(None);
+    };
+    Ok(Some(WitWorldItem::Interface {
+        reference: reference.clone(),
+        docs: entry.docs.clone().map(Arc::from),
         since,
         deprecated,
         span: None,
@@ -2367,6 +2650,24 @@ fn collect_interface_uses_input(
 
     let mut generated_worlds = Vec::new();
     if generated_unit.is_some() {
+        let generated_interface_references = generated_unit
+            .as_ref()
+            .map(|unit| {
+                generated_interfaces
+                    .iter()
+                    .map(|(definition, index, interface)| {
+                        (
+                            definition.to_def_id(),
+                            WitIfaceRef {
+                                unit: unit.clone(),
+                                interface: *index,
+                                name: interface.name.clone(),
+                            },
+                        )
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         let world_descriptors = interface_generation_order(
             &prepared.module_tree,
             scopes
@@ -2551,7 +2852,20 @@ fn collect_interface_uses_input(
                         ));
                     }
                 };
-                let Some(item) = generated_world_function_item(
+                let item = generated_world_interface_item(
+                    entry,
+                    &item_hir,
+                    item_owner,
+                    inputs,
+                    module_scope,
+                    prepared,
+                    &module_members,
+                    &source_graph_packages,
+                    primitive_prelude,
+                    prepared.generated_package_version.as_ref(),
+                    &generated_interface_references,
+                )?
+                .or(generated_world_function_item(
                     entry,
                     &item_hir,
                     descriptor.owner.def_id,
@@ -2566,21 +2880,21 @@ fn collect_interface_uses_input(
                     prepared.generated_package_version.as_ref(),
                     packages,
                     symbols,
-                )?
-                else {
+                )?);
+                let Some(item) = item else {
                     generated_complete = false;
                     continue;
                 };
                 let name = match &item {
-                    WitWorldItem::Func { name, .. } => name,
-                    WitWorldItem::Interface { .. } => unreachable!(),
+                    WitWorldItem::Func { name, .. } => name.clone(),
+                    WitWorldItem::Interface { reference, .. } => reference.name.clone(),
                 };
                 let names = if is_import {
                     &mut import_names
                 } else {
                     &mut export_names
                 };
-                if !names.insert(name.clone()) {
+                if !names.insert(name) {
                     generated_complete = false;
                     continue;
                 }
@@ -5214,16 +5528,85 @@ fn refresh_location_reference(
 #[cfg(test)]
 mod tests {
     use super::{
-        InterfaceUsesQueryError, LocalAliasReference, WorldInterfaceUseGraph,
-        expand_local_alias_interface_references, interface_uses_error_fingerprint,
-        stable_world_interface_uses_fingerprint,
+        GeneratedWitCandidate, InterfaceUsesQueryError, LocalAliasReference,
+        WorldInterfaceUseGraph, expand_local_alias_interface_references,
+        interface_uses_error_fingerprint, stable_world_interface_uses_fingerprint,
     };
     use crate::OwnerControlFlowResolutionError;
-    use sai_hir::{DefId, DefIndex, IndexVec};
-    use sai_intern::PackageInterner;
+    use sai_hir::{
+        DefId, DefIndex, DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, IndexVec,
+        LocalDefId,
+    };
+    use sai_intern::{Interner, PackageInterner};
+    use sai_package::{mvs::MvsPackageVersion, version::Version};
     use sai_resolve::WorldElaborationInterface;
     use sai_vfs::FileId;
-    use std::collections::{HashMap, HashSet};
+    use sai_wit::{
+        WitIfaceRef, WitIndexVec, WitInterface, WitItem, WitItemIdx, WitItemKind, WitType,
+        WitTypeRef, WitUnit, WitWorld, WitWorldItem, WitWorldItemOrder,
+    };
+    use std::collections::{BTreeSet, HashMap, HashSet};
+
+    struct TestIds {
+        packages: PackageInterner,
+        symbols: Interner,
+        paths: DefPathInterner,
+        package: sai_hir::PackageId,
+    }
+
+    impl TestIds {
+        fn new() -> Self {
+            let packages = PackageInterner::new();
+            let package = packages
+                .intern("acme:generated-pruning#1")
+                .expect("test package interns");
+            let symbols = Interner::new();
+            let paths = DefPathInterner::new(package, &packages, &symbols)
+                .expect("test definition paths initialize");
+            Self {
+                packages,
+                symbols,
+                paths,
+                package,
+            }
+        }
+
+        fn local_definition(&self, name: &str) -> LocalDefId {
+            let data = vec![DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(self.symbols.intern(name).expect("name interns")),
+                disambiguator: 0,
+            }];
+            self.paths
+                .intern(
+                    DefPath::new(self.package, data, &self.packages, &self.symbols)
+                        .expect("test definition path is valid"),
+                )
+                .expect("test definition path interns")
+        }
+    }
+
+    fn generated_item(name: &str, kind: WitItemKind) -> WitItem {
+        WitItem {
+            name: name.to_owned(),
+            docs: None,
+            since: None,
+            deprecated: None,
+            kind,
+            unsupported: None,
+            span: None,
+        }
+    }
+
+    fn generated_interface(name: &str, items: WitIndexVec<WitItemIdx, WitItem>) -> WitInterface {
+        WitInterface {
+            name: name.to_owned(),
+            docs: None,
+            since: None,
+            deprecated: None,
+            items,
+            span: None,
+        }
+    }
 
     #[test]
     fn error_fingerprint_excludes_session_local_file_ids() {
@@ -5267,6 +5650,216 @@ mod tests {
             stable_world_interface_uses_fingerprint(&graph("FooBar")),
             stable_world_interface_uses_fingerprint(&graph("foo_bar")),
             "source spellings affect name-collision classification even when the WIT key is unchanged"
+        );
+    }
+
+    #[test]
+    fn generated_candidate_prunes_transitive_references_to_cyclic_interfaces() {
+        let ids = TestIds::new();
+        let selected = MvsPackageVersion::new(
+            "acme:generated-pruning",
+            Version::parse("1.0.0").expect("version is valid"),
+        )
+        .expect("selected package version is valid");
+        let unit = WitUnit::generated(ids.package, &ids.packages, &selected)
+            .expect("generated unit matches selected package");
+        let first_definition = ids.local_definition("first");
+        let public_definition = ids.local_definition("public");
+
+        let mut interfaces = sai_wit::WitIndexVec::new();
+        let mut first_items = WitIndexVec::new();
+        let first_request = first_items
+            .push(generated_item("request", WitItemKind::Alias(WitType::U32)))
+            .expect("first request item index is valid");
+        let first_index = interfaces
+            .push(generated_interface("first", first_items))
+            .expect("first interface index is valid");
+        let public_index = interfaces
+            .next_index()
+            .expect("public interface index is valid");
+
+        let first_reference = WitTypeRef {
+            interface: WitIfaceRef {
+                unit: unit.clone(),
+                interface: first_index,
+                name: "first".to_owned(),
+            },
+            item: first_request,
+            item_name: "request".to_owned(),
+        };
+        let local_reference = |item, item_name: &str| WitTypeRef {
+            interface: WitIfaceRef {
+                unit: unit.clone(),
+                interface: public_index,
+                name: "public".to_owned(),
+            },
+            item,
+            item_name: item_name.to_owned(),
+        };
+        let mut public_items = WitIndexVec::new();
+        let depends_index = public_items
+            .push(generated_item(
+                "depends",
+                WitItemKind::Alias(WitType::Named(first_reference)),
+            ))
+            .expect("dependent item index is valid");
+        let transitive_index = public_items
+            .push(generated_item(
+                "transitive",
+                WitItemKind::Alias(WitType::Named(local_reference(depends_index, "depends"))),
+            ))
+            .expect("transitive item index is valid");
+        let independent_index = public_items
+            .push(generated_item(
+                "independent",
+                WitItemKind::Alias(WitType::U32),
+            ))
+            .expect("independent item index is valid");
+        public_items
+            .push(generated_item(
+                "consumer",
+                WitItemKind::Func(sai_wit::WitFunc {
+                    params: vec![(
+                        "value".to_owned(),
+                        WitType::Named(local_reference(transitive_index, "transitive")),
+                    )],
+                    result: None,
+                    is_async: false,
+                }),
+            ))
+            .expect("transitive consumer index is valid");
+        public_items
+            .push(generated_item(
+                "independent-consumer",
+                WitItemKind::Func(sai_wit::WitFunc {
+                    params: vec![(
+                        "value".to_owned(),
+                        WitType::Named(local_reference(independent_index, "independent")),
+                    )],
+                    result: None,
+                    is_async: false,
+                }),
+            ))
+            .expect("independent consumer index is valid");
+        assert_eq!(
+            interfaces
+                .push(generated_interface("public", public_items))
+                .expect("public interface index is valid"),
+            public_index
+        );
+
+        let world = WitWorld {
+            name: "server".to_owned(),
+            docs: None,
+            since: None,
+            deprecated: None,
+            imports: vec![
+                WitWorldItem::Interface {
+                    reference: WitIfaceRef {
+                        unit: unit.clone(),
+                        interface: first_index,
+                        name: "first".to_owned(),
+                    },
+                    docs: None,
+                    since: None,
+                    deprecated: None,
+                    span: None,
+                },
+                WitWorldItem::Interface {
+                    reference: WitIfaceRef {
+                        unit: unit.clone(),
+                        interface: public_index,
+                        name: "public".to_owned(),
+                    },
+                    docs: None,
+                    since: None,
+                    deprecated: None,
+                    span: None,
+                },
+            ],
+            exports: Vec::new(),
+            includes: Vec::new(),
+            source_order: vec![WitWorldItemOrder::import(0), WitWorldItemOrder::import(1)],
+            unsupported: None,
+            span: None,
+        };
+        let generated = GeneratedWitCandidate {
+            unit: unit.clone(),
+            identity: "acme:generated-pruning".to_owned(),
+            version: Version::parse("1.0.0").expect("version is valid"),
+            interfaces: vec![
+                (
+                    first_definition,
+                    first_index,
+                    interfaces[first_index].clone(),
+                ),
+                (
+                    public_definition,
+                    public_index,
+                    interfaces[public_index].clone(),
+                ),
+            ],
+            worlds: vec![world],
+            complete: true,
+        }
+        .into_text(&BTreeSet::from([first_definition]), false)
+        .expect("candidate model remaps without dangling references");
+
+        assert!(!generated.complete);
+        assert!(generated.text.contains("type independent = u32"));
+        assert!(
+            generated
+                .text
+                .contains("independent-consumer: func(value: independent)")
+        );
+        assert!(!generated.text.contains("depends"));
+        assert!(!generated.text.contains("transitive"));
+        assert!(!generated.text.contains("\n  consumer: func("));
+        assert!(generated.text.contains("world server"));
+        assert!(generated.text.contains("import public"));
+        assert!(!generated.text.contains("import first"));
+
+        let parsed = sai_wit::parse_source_files(
+            unit,
+            [sai_wit::WitSourceFile::new(
+                "generated.wit",
+                generated.text.as_bytes().to_vec(),
+            )],
+        )
+        .expect("pruned candidate output remains parseable");
+        assert_eq!(
+            parsed.main_name().to_string(),
+            "acme:generated-pruning@1.0.0"
+        );
+        let mut resolve = wit_parser::Resolve::default();
+        let reparsed = sai_wit::WitResolveContext::default()
+            .push_package(&mut resolve, parsed)
+            .expect("pruned candidate output resolves");
+        assert_eq!(reparsed.interfaces.len(), 1);
+        let (public_index, public) = reparsed
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the public interface remains");
+        assert_eq!(public_index.index(), 0);
+        assert_eq!(public.name, "public");
+        assert_eq!(public.items.len(), 2);
+        let independent_consumer = public
+            .items
+            .iter()
+            .find(|item| item.name == "independent-consumer")
+            .expect("the independent consumer survives");
+        let WitItemKind::Func(independent_consumer) = &independent_consumer.kind else {
+            panic!("the independent consumer remains a function");
+        };
+        let WitType::Named(independent_reference) = &independent_consumer.params[0].1 else {
+            panic!("the independent consumer retains its named type reference");
+        };
+        assert_eq!(independent_reference.interface.interface, public_index);
+        assert_eq!(
+            independent_reference.item.index(),
+            0,
+            "the retained alias is compacted to the first item index"
         );
     }
 

@@ -511,6 +511,8 @@ pub struct WitWorld {
 pub enum WitWorldItem {
     Interface {
         reference: WitIfaceRef,
+        /// Documentation attached to this world interface import or export.
+        docs: Option<Arc<str>>,
         since: Option<WitStabilityVersion>,
         deprecated: Option<WitStabilityVersion>,
         /// Source range of this `import` or `export` item when it came from

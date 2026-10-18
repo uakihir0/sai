@@ -1583,6 +1583,7 @@ fn world_items(
                 result.push((
                     WitWorldItem::Interface {
                         reference,
+                        docs: None,
                         since,
                         deprecated,
                         span: item_span,

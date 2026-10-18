@@ -312,10 +312,12 @@ fn print_world_item(
     match item {
         WitWorldItem::Interface {
             reference,
+            docs,
             since,
             deprecated,
             ..
         } => {
+            push_docs(output, docs.as_deref(), 1);
             push_stability(output, since.as_ref(), deprecated.as_ref(), 1);
             let path = print_interface_path(package, reference);
             let _ = writeln!(output, "  {direction} {path};");

@@ -311,12 +311,14 @@ impl StableHash for WitWorldItem {
         match self {
             Self::Interface {
                 reference,
+                docs,
                 since,
                 deprecated,
                 span,
             } => {
                 hasher.write_tag(0x01);
                 reference.stable_hash(hasher);
+                docs.stable_hash(hasher);
                 stable_version(since, hasher);
                 stable_version(deprecated, hasher);
                 span.stable_hash(hasher);

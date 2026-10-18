@@ -48105,9 +48105,15 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     #[test]
     fn generated_wit_preserves_supported_world_function_order() {
         let source = concat!(
+            "interface api {}\n",
+            "interface runtime {}\n",
             "type Count = U32\n",
             "/// Runtime entry points.\n",
             "world server {\n",
+            "  /// Import the public API.\n",
+            "  import api\n",
+            "  /// Export the runtime API.\n",
+            "  export runtime\n",
             "  /// An outgoing reply.\n",
             "  export fn reply(ok: Bool)\n",
             "  /// A requested lookup.\n",
@@ -48193,32 +48199,70 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         assert!(generated.text.contains("self: u32"));
         assert!(generated.text.contains("/// An outgoing reply."));
         assert!(generated.text.contains("/// A requested lookup."));
+        assert!(generated.text.contains("/// Import the public API."));
+        assert!(generated.text.contains("/// Export the runtime API."));
 
         let package_model = result.package.expect("generated WIT model loads");
         let worlds = package_model.root().worlds.iter().collect::<Vec<_>>();
         assert_eq!(worlds.len(), 2);
         assert_eq!(worlds[0].name, "server");
         assert_eq!(worlds[0].docs.as_deref(), Some("Runtime entry points."));
-        assert_eq!(worlds[0].imports.len(), 4);
-        assert_eq!(worlds[0].exports.len(), 3);
+        assert_eq!(worlds[0].imports.len(), 5);
+        assert_eq!(worlds[0].exports.len(), 4);
         assert_eq!(
             worlds[0].source_order,
             [
-                sai_wit::WitWorldItemOrder::export(0),
                 sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::export(3),
+                sai_wit::WitWorldItemOrder::export(0),
                 sai_wit::WitWorldItemOrder::import(1),
                 sai_wit::WitWorldItemOrder::import(2),
                 sai_wit::WitWorldItemOrder::import(3),
+                sai_wit::WitWorldItemOrder::import(4),
                 sai_wit::WitWorldItemOrder::export(1),
                 sai_wit::WitWorldItemOrder::export(2),
             ]
         );
+        let sai_wit::WitWorldItem::Interface {
+            reference: api_reference,
+            ..
+        } = &worlds[0].imports[0]
+        else {
+            panic!("the generated world import remains an interface");
+        };
+        assert_eq!(api_reference.name, "api");
+        assert_eq!(api_reference.unit, unit);
+        let api_index = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find_map(|(index, interface)| (interface.name == "api").then_some(index))
+            .expect("the imported interface is generated");
+        assert_eq!(api_reference.interface, api_index);
+        let sai_wit::WitWorldItem::Interface {
+            reference: runtime_reference,
+            ..
+        } = worlds[0]
+            .exports
+            .iter()
+            .find(|item| {
+                matches!(
+                    item,
+                    sai_wit::WitWorldItem::Interface { reference, .. }
+                        if reference.name == "runtime"
+                )
+            })
+            .expect("the generated world export remains an interface")
+        else {
+            unreachable!("the matched export is an interface");
+        };
+        assert_eq!(runtime_reference.name, "runtime");
         let sai_wit::WitWorldItem::Func {
             name: lookup_name,
             func: lookup,
             docs: lookup_docs,
             ..
-        } = &worlds[0].imports[0]
+        } = &worlds[0].imports[1]
         else {
             panic!("the world import remains a function");
         };
@@ -48226,7 +48270,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         assert_eq!(lookup_docs.as_deref(), Some("A requested lookup."));
         assert_eq!(lookup.params[0].1, sai_wit::WitType::U32);
         assert_eq!(lookup.result, Some(sai_wit::WitType::U64));
-        let sai_wit::WitWorldItem::Func { func, .. } = &worlds[0].imports[3] else {
+        let sai_wit::WitWorldItem::Func { func, .. } = &worlds[0].imports[4] else {
             panic!("the world function with a raw self parameter remains a function");
         };
         assert_eq!(
@@ -48235,6 +48279,159 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         );
         assert_eq!(worlds[1].name, "empty");
         assert!(worlds[1].imports.is_empty() && worlds[1].exports.is_empty());
+    }
+
+    #[test]
+    fn generated_wit_drops_world_interfaces_that_are_omitted_as_cyclic() {
+        let source = concat!(
+            "interface first {\n",
+            "  type Request = second.Response\n",
+            "}\n",
+            "interface second {\n",
+            "  type Response = first.Request\n",
+            "}\n",
+            "interface stable { type Id = U32 }\n",
+            "world server {\n",
+            "  import first\n",
+            "  import stable\n",
+            "  export fn run()\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("partial generated world remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "omitting a cyclic world interface leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        assert!(!generated.text.contains("import first;"));
+        assert!(generated.text.contains("import stable;"));
+        assert!(generated.text.contains("export run: func();"));
+        let package_model = result.package.expect("the partial package model loads");
+        let world = package_model
+            .root()
+            .worlds
+            .iter()
+            .next()
+            .expect("the world remains");
+        assert_eq!(
+            world.source_order,
+            [
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::export(0),
+            ],
+            "the omitted interface is removed and later world item indices are compacted"
+        );
+        let sai_wit::WitWorldItem::Interface { reference, .. } = &world.imports[0] else {
+            panic!("the surviving import remains an interface");
+        };
+        assert_eq!(reference.name, "stable");
+        assert_eq!(reference.interface.index(), 0);
+    }
+
+    #[test]
+    fn generated_world_interface_and_function_names_collide_per_direction() {
+        let source = concat!(
+            "interface api {}\n",
+            "world server {\n",
+            "  import api\n",
+            "  import fn api()\n",
+            "  export api\n",
+            "  export fn api()\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("partially supported generated world remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "same-direction collision omission leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        assert_eq!(generated.text.matches("import api;").count(), 1);
+        assert_eq!(generated.text.matches("export api;").count(), 1);
+        assert!(!generated.text.contains("import api: func();"));
+        assert!(!generated.text.contains("export api: func();"));
+        let package_model = result.package.expect("the partial package model loads");
+        let world = package_model
+            .root()
+            .worlds
+            .iter()
+            .next()
+            .expect("the world remains");
+        assert_eq!(world.imports.len(), 1);
+        assert_eq!(world.exports.len(), 1);
+        assert_eq!(
+            world.source_order,
+            [
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::export(0),
+            ],
+            "a name can be reused across directions, but duplicate same-direction items are omitted"
+        );
     }
 
     #[test]
@@ -48640,6 +48837,108 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             generated.text.contains("lookup: func(value: id)"),
             "same-interface references remain valid after provisional indices are remapped"
         );
+    }
+
+    #[test]
+    fn generated_wit_prunes_items_that_depend_on_cyclic_interfaces() {
+        let source = concat!(
+            "interface first {\n",
+            "  type Request = second.Response\n",
+            "}\n",
+            "interface second {\n",
+            "  type Response = first.Request\n",
+            "}\n",
+            "interface public {\n",
+            "  type Handle = first.Request\n",
+            "  fn read(value: Handle)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+            "world server {\n",
+            "  import first\n",
+            "  import public\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("partial generated WIT remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning cyclic interface consumers leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        assert!(!generated.text.contains("interface first"));
+        assert!(!generated.text.contains("interface second"));
+        assert!(!generated.text.contains("type handle"));
+        assert!(!generated.text.contains("read:"));
+        assert!(generated.text.contains("interface public"));
+        assert!(generated.text.contains("independent: func(value: u32)"));
+        assert!(!generated.text.contains("import first;"));
+        assert!(generated.text.contains("import public;"));
+
+        let package_model = result.package.expect("the partial package model loads");
+        let public = package_model
+            .root()
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "public")
+            .expect("the independent interface remains");
+        assert_eq!(
+            public
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["independent"],
+            "the omitted cross-interface type also removes its consumer"
+        );
+        let world = package_model
+            .root()
+            .worlds
+            .iter()
+            .next()
+            .expect("the world remains");
+        assert_eq!(world.imports.len(), 1);
+        assert_eq!(
+            world.source_order,
+            [sai_wit::WitWorldItemOrder::import(0)],
+            "the surviving world interface import is remapped after the cyclic one is removed"
+        );
+        let sai_wit::WitWorldItem::Interface { reference, .. } = &world.imports[0] else {
+            panic!("the surviving import remains an interface");
+        };
+        assert_eq!(reference.name, "public");
+        assert_eq!(reference.interface.index(), 0);
     }
 
     #[test]
