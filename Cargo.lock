@@ -3076,6 +3076,7 @@ dependencies = [
  "sai_ty",
  "sai_vfs",
  "sai_wit",
+ "wit-parser",
 ]
 
 [[package]]

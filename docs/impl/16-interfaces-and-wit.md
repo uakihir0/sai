@@ -1230,6 +1230,8 @@ pub struct GeneratedWit {
 
 **Generated-WIT progress (IR-669):** Interface and resource-member boundary checks now classify canonical container types by the exact resolved `DefId` and canonical `DefPath`, including zero disambiguators. The checkout does not include the `library/core` or `library/alloc` source tree, so an end-to-end generated-WIT test cannot resolve a real standard-library `Vec`. Tests exercise exact canonical identity through an injected session interner and confirm that a same-spelling interface type remains a named WIT type. The full §16.10.1 plan remains incomplete.
 
+**Generated-WIT progress (IR-670):** A synthetic exact `sai:alloc/vec.Vec` identity now flows through canonical path classification, boundary conversion, WIT type materialization, printing, and reparsing. `Vec<Handle>` retains the exact `Own` resource reference in the model; the printer emits WIT's `list<handle>` spelling, and reparsing recovers the same owned resource type. The corresponding exact `sai:core/slice.Slice` identity rejects `Slice<Handle>` with `SliceContainsResource`. This test uses an injected session interner because the checkout has no standard-library source scopes; it verifies the converter/materializer and WIT round-trip but does not claim to run the complete interface generator over real prelude resolution. The full §16.10.1 plan remains incomplete.
+
 ### 16.10.2 Clients
 
 1. **Bindgen.** `sai bindgen wit` ([13](13-cli.md) §13.6.19 item 1) checks the root, and writes `generated_wit_text(root).text` only when the root has no errors and the text is `complete`.

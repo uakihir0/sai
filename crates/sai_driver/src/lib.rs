@@ -45925,6 +45925,406 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
+    fn canonical_resource_containers_reach_wit_materialization() {
+        use sai_intern::Idx;
+        use sai_ty::boundary::{
+            BoundaryDefinition, BoundaryType, BoundaryTypeContext, BoundaryTypeOutcome,
+            IncompatibleReason, Position, boundary_type_with_references,
+        };
+        use sai_wit::WitType;
+
+        fn test_span(start: u32, end: u32) -> sai_hir::Span {
+            sai_hir::Span {
+                file: FileId::new(0),
+                range: sai_vfs::TextRange::new(
+                    sai_vfs::TextSize::new(start),
+                    sai_vfs::TextSize::new(end),
+                )
+                .expect("test span is ordered"),
+                ctxt: sai_hir::SpanCtxt::Root,
+            }
+        }
+
+        fn path_type<'hir>(
+            arena: &'hir HirArena<'hir>,
+            owner: OwnerId,
+            symbols: &Interner,
+            local_id: u32,
+            spelling: &str,
+        ) -> (&'hir Ty<'hir>, HirId) {
+            let span = test_span(local_id, local_id + 1);
+            let path_hir_id = HirId {
+                owner,
+                local_id: sai_hir::ItemLocalId::from_raw(local_id + 1),
+            };
+            let segments = arena.alloc_path_segments(&[PathSegment {
+                hir_id: HirId {
+                    owner,
+                    local_id: sai_hir::ItemLocalId::from_raw(local_id + 2),
+                },
+                name: Name {
+                    sym: symbols.intern(spelling).expect("type name interns"),
+                    span,
+                },
+                args: None,
+            }]);
+            let path = arena.alloc_path(HirPath {
+                hir_id: path_hir_id,
+                root: PathRoot::Plain,
+                segments,
+                span,
+            });
+            (
+                arena.alloc_ty(Ty {
+                    hir_id: HirId {
+                        owner,
+                        local_id: sai_hir::ItemLocalId::from_raw(local_id),
+                    },
+                    kind: TyKind::Path(*path),
+                    span,
+                }),
+                path_hir_id,
+            )
+        }
+
+        fn generic_path_type<'hir>(
+            arena: &'hir HirArena<'hir>,
+            owner: OwnerId,
+            symbols: &Interner,
+            local_id: u32,
+            spelling: &str,
+            argument: &'hir Ty<'hir>,
+        ) -> (&'hir Ty<'hir>, HirId) {
+            let span = test_span(local_id, local_id + 1);
+            let path_hir_id = HirId {
+                owner,
+                local_id: sai_hir::ItemLocalId::from_raw(local_id + 1),
+            };
+            let arguments = arena.alloc_generic_args(GenericArgs {
+                args: arena.alloc_generic_args_list(&[GenericArg::Type(argument)]),
+                span,
+            });
+            let segments = arena.alloc_path_segments(&[PathSegment {
+                hir_id: HirId {
+                    owner,
+                    local_id: sai_hir::ItemLocalId::from_raw(local_id + 2),
+                },
+                name: Name {
+                    sym: symbols.intern(spelling).expect("generic type name interns"),
+                    span,
+                },
+                args: Some(arguments),
+            }]);
+            let path = arena.alloc_path(HirPath {
+                hir_id: path_hir_id,
+                root: PathRoot::Plain,
+                segments,
+                span,
+            });
+            (
+                arena.alloc_ty(Ty {
+                    hir_id: HirId {
+                        owner,
+                        local_id: sai_hir::ItemLocalId::from_raw(local_id),
+                    },
+                    kind: TyKind::Path(*path),
+                    span,
+                }),
+                path_hir_id,
+            )
+        }
+
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let owner_package = database
+            .intern_package("acme:phase1#1")
+            .expect("owner package interns");
+        let alloc_package = database
+            .intern_package("sai:alloc")
+            .expect("canonical alloc package interns");
+        let core_package = database
+            .intern_package("sai:core")
+            .expect("canonical core package interns");
+
+        let owner_name = database
+            .symbols
+            .intern("BoundaryOwner")
+            .expect("owner name interns");
+        let handle_name = database
+            .symbols
+            .intern("Handle")
+            .expect("resource name interns");
+        let owner_def_paths = Arc::new(
+            DefPathInterner::new(owner_package, &database.packages, &database.symbols)
+                .expect("owner definition paths initialize"),
+        );
+        let owner_def_id = owner_def_paths
+            .intern(
+                DefPath::new(
+                    owner_package,
+                    vec![sai_hir::DisambiguatedDefPathData {
+                        data: DefPathData::TypeNs(owner_name),
+                        disambiguator: 0,
+                    }],
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("owner path is valid"),
+            )
+            .expect("owner definition interns");
+        let resource_def = owner_def_paths
+            .intern(
+                DefPath::new(
+                    owner_package,
+                    vec![sai_hir::DisambiguatedDefPathData {
+                        data: DefPathData::TypeNs(handle_name),
+                        disambiguator: 0,
+                    }],
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("resource path is valid"),
+            )
+            .expect("resource definition interns")
+            .to_def_id();
+        database.def_paths.insert(owner_package, owner_def_paths);
+
+        let mut canonical_type = |package, module_name: &str, type_name: &str| {
+            let module = database
+                .symbols
+                .intern(module_name)
+                .expect("canonical module name interns");
+            let ty = database
+                .symbols
+                .intern(type_name)
+                .expect("canonical type name interns");
+            let paths = Arc::new(
+                DefPathInterner::new(package, &database.packages, &database.symbols)
+                    .expect("canonical definition paths initialize"),
+            );
+            let def_id = paths
+                .intern(
+                    DefPath::new(
+                        package,
+                        vec![
+                            sai_hir::DisambiguatedDefPathData {
+                                data: DefPathData::Module(module),
+                                disambiguator: 0,
+                            },
+                            sai_hir::DisambiguatedDefPathData {
+                                data: DefPathData::TypeNs(ty),
+                                disambiguator: 0,
+                            },
+                        ],
+                        &database.packages,
+                        &database.symbols,
+                    )
+                    .expect("canonical type path is valid"),
+                )
+                .expect("canonical type definition interns")
+                .to_def_id();
+            database.def_paths.insert(package, paths);
+            def_id
+        };
+        let vec_def = canonical_type(alloc_package, "vec", "Vec");
+        let slice_def = canonical_type(core_package, "slice", "Slice");
+
+        let owner = OwnerId {
+            def_id: owner_def_id,
+        };
+        let arena = HirArena::new();
+        let (handle_ty, handle_path) = path_type(&arena, owner, &database.symbols, 1, "Handle");
+        let (vec_ty, vec_path) =
+            generic_path_type(&arena, owner, &database.symbols, 5, "Vec", handle_ty);
+        let (slice_ty, slice_path) =
+            generic_path_type(&arena, owner, &database.symbols, 9, "Slice", handle_ty);
+        let path_resolutions = HashMap::from([
+            (
+                handle_path,
+                PathRes {
+                    base: Res::Def(DefKind::Struct, resource_def),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+            (
+                vec_path,
+                PathRes {
+                    base: Res::Def(DefKind::Struct, vec_def),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+            (
+                slice_path,
+                PathRes {
+                    base: Res::Def(DefKind::Struct, slice_def),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+        ]);
+        let canonical_types = database.canonical_boundary_types_for_paths(&path_resolutions);
+        assert_eq!(
+            canonical_types.get(&vec_def),
+            Some(&sai_ty::boundary::CanonicalBoundaryType::Vec)
+        );
+        assert_eq!(
+            canonical_types.get(&slice_def),
+            Some(&sai_ty::boundary::CanonicalBoundaryType::Slice)
+        );
+        let definitions = HashMap::from([(resource_def, BoundaryDefinition::Resource)]);
+        let aliases = HashMap::new();
+        let boundary_context = BoundaryTypeContext {
+            path_resolutions: &path_resolutions,
+            canonical_types: &canonical_types,
+            definitions: &definitions,
+            aliases: &aliases,
+            resource_containment: None,
+            self_resource: None,
+        };
+
+        let converted_vec =
+            boundary_type_with_references(&boundary_context, owner, vec_ty, Position::Param)
+                .outcome;
+        assert_eq!(
+            converted_vec,
+            BoundaryTypeOutcome::Mapped(BoundaryType::List(Box::new(BoundaryType::Own(
+                resource_def
+            ))))
+        );
+
+        let unit_version = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = WitUnit::generated(owner_package, &database.packages, &unit_version)
+            .expect("generated WIT unit matches the package");
+        let mut interfaces =
+            sai_wit::WitIndexVec::<sai_wit::WitIfaceIdx, sai_wit::WitInterface>::new();
+        let interface_index = interfaces
+            .next_index()
+            .expect("the interface index is available");
+        let mut items = sai_wit::WitIndexVec::<sai_wit::WitItemIdx, sai_wit::WitItem>::new();
+        let resource_index = items
+            .push(sai_wit::WitItem {
+                name: "handle".to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                kind: sai_wit::WitItemKind::Resource(Vec::new()),
+                unsupported: None,
+                span: None,
+            })
+            .expect("resource item index is available");
+        let resource_reference = sai_wit::WitTypeRef {
+            interface: sai_wit::WitIfaceRef {
+                unit: unit.clone(),
+                interface: interface_index,
+                name: "api".to_owned(),
+            },
+            item: resource_index,
+            item_name: "handle".to_owned(),
+        };
+        let references = HashMap::from([(resource_def, resource_reference.clone())]);
+        let materialized_vec = sai_ty::boundary::materialize_boundary_type(
+            &match converted_vec {
+                BoundaryTypeOutcome::Mapped(boundary_type) => boundary_type,
+                _ => unreachable!("the canonical Vec conversion is mapped"),
+            },
+            &references,
+            Position::Param,
+        )
+        .expect("converted Vec materializes")
+        .expect("a parameter has a WIT type");
+        assert_eq!(
+            materialized_vec,
+            WitType::List(Box::new(WitType::Own(resource_reference)))
+        );
+        items
+            .push(sai_wit::WitItem {
+                name: "consume".to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                kind: sai_wit::WitItemKind::Func(sai_wit::WitFunc {
+                    params: vec![("values".to_owned(), materialized_vec.clone())],
+                    result: None,
+                    is_async: false,
+                }),
+                unsupported: None,
+                span: None,
+            })
+            .expect("function item index is available");
+        interfaces
+            .push(sai_wit::WitInterface {
+                name: "api".to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                items,
+                span: None,
+            })
+            .expect("interface index is available");
+        let package_name = unit_version.package().to_owned();
+        let (namespace, name) = package_name
+            .split_once(':')
+            .expect("selected package has a namespace");
+        let package = sai_wit::WitPackage {
+            unit,
+            name: sai_wit::WitPackageName {
+                namespace: namespace.to_owned(),
+                name: name.to_owned(),
+                version: Some(unit_version.version().clone()),
+            },
+            interfaces,
+            worlds: sai_wit::WitIndexVec::new(),
+            declaration_order: vec![sai_wit::WitPackageDeclaration::Interface(interface_index)],
+        };
+        let printed = sai_wit::print_wit(&package);
+        assert!(
+            printed.contains("consume: func(values: list<handle>);"),
+            "WIT prints a list of owned handles using the resource name: {printed}"
+        );
+        let parsed = sai_wit::parse_source_files(
+            package.unit.clone(),
+            [sai_wit::WitSourceFile::new(
+                "generated.wit",
+                printed.as_bytes().to_vec(),
+            )],
+        )
+        .expect("the printed WIT parses");
+        let mut resolve = wit_parser::Resolve::default();
+        let reparsed = sai_wit::WitResolveContext::default()
+            .push_package(&mut resolve, parsed)
+            .expect("the printed WIT resolves");
+        let reparsed_function = reparsed.interfaces[interface_index]
+            .items
+            .iter()
+            .find(|item| item.name == "consume")
+            .expect("the consume function is present");
+        let sai_wit::WitItemKind::Func(reparsed_function) = &reparsed_function.kind else {
+            panic!("the consume declaration is a function");
+        };
+        assert_eq!(
+            reparsed_function.params[0].1, materialized_vec,
+            "the printed list retains the exact owned resource type after parsing"
+        );
+
+        assert!(
+            matches!(
+                boundary_type_with_references(&boundary_context, owner, slice_ty, Position::Param)
+                    .outcome,
+                BoundaryTypeOutcome::Incompatible(sai_ty::boundary::Incompatible {
+                    reason: IncompatibleReason::SliceContainsResource,
+                    ..
+                })
+            ),
+            "the exact canonical Slice rejects an owned resource element"
+        );
+    }
+
+    #[test]
     fn generated_wit_preserves_interface_types_named_like_containers() {
         let source = concat!(
             "interface api {\n",
