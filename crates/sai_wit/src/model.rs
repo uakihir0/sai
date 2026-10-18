@@ -112,8 +112,14 @@ impl<I: WitIndex, T> WitIndexVec<I, T> {
     }
 
     pub fn push(&mut self, value: T) -> Result<I, WitIndexVecError> {
-        let index = u32::try_from(self.values.len()).map_err(|_| WitIndexVecError)?;
+        let index = self.next_index()?;
         self.values.push(value);
+        Ok(index)
+    }
+
+    /// Returns the index that the next successful [`push`](Self::push) will use.
+    pub fn next_index(&self) -> Result<I, WitIndexVecError> {
+        let index = u32::try_from(self.values.len()).map_err(|_| WitIndexVecError)?;
         Ok(index_sealed::Sealed::from_raw(index))
     }
 
@@ -671,6 +677,27 @@ mod tests {
                 (WitIfaceIdx::from_raw(0), &"first"),
                 (WitIfaceIdx::from_raw(1), &"second"),
             ]
+        );
+    }
+
+    #[test]
+    fn index_vec_next_index_matches_the_next_push() {
+        let mut items = WitIndexVec::<WitItemIdx, u8>::new();
+        assert_eq!(
+            items.next_index().expect("first index is in range"),
+            WitItemIdx::from_raw(0)
+        );
+        assert_eq!(
+            items.push(1).expect("first value is in range"),
+            WitItemIdx::from_raw(0)
+        );
+        assert_eq!(
+            items.next_index().expect("second index is in range"),
+            WitItemIdx::from_raw(1)
+        );
+        assert_eq!(
+            items.push(2).expect("second value is in range"),
+            WitItemIdx::from_raw(1)
         );
     }
 
