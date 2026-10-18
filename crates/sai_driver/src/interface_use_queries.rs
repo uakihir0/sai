@@ -1739,7 +1739,7 @@ fn collect_interface_uses_input(
                 &mut owner_uses_complete,
                 inputs,
             )?;
-            let (has_incompatible_boundary, boundary_conversions) =
+            let (has_incompatible_boundary, boundary_conversions, _) =
                 append_interface_boundary_diagnostics(
                     &member_hir,
                     &resolution,
@@ -1995,7 +1995,7 @@ fn collect_interface_uses_input(
                     &mut owner_uses_complete,
                     inputs,
                 )?;
-                let (has_incompatible_boundary, boundary_conversions) =
+                let (has_incompatible_boundary, boundary_conversions, exact_resource_receiver) =
                     append_interface_boundary_diagnostics(
                         &method_hir,
                         &resolution,
@@ -2032,6 +2032,7 @@ fn collect_interface_uses_input(
                         member_owner.def_id.to_def_id(),
                         &boundary_conversions,
                         &resource_named_type_references,
+                        exact_resource_receiver,
                         inputs.validated_attrs.get(&method_entry.ast_id),
                         prepared.generated_package_version.as_ref(),
                         symbols,
@@ -2979,7 +2980,7 @@ fn append_interface_boundary_diagnostics(
     generated_use_aliases: &mut Vec<GeneratedUseAlias>,
     owner_dependencies: &mut HashMap<OwnerId, HashSet<DefId>>,
     diagnostics: &mut Vec<Diagnostic>,
-) -> Result<(bool, Vec<sai_ty::boundary::BoundaryTypeConversion>), InterfaceUsesQueryError> {
+) -> Result<(bool, Vec<sai_ty::boundary::BoundaryTypeConversion>, bool), InterfaceUsesQueryError> {
     let owner_id = owner.id;
     let self_resource = match owner.node {
         OwnerNode::InterfaceItem(item) => match item.kind {
@@ -3043,6 +3044,7 @@ fn append_interface_boundary_diagnostics(
     let owner_path_candidates = owner_test_only_path_candidates(owner);
     let mut has_incompatible_boundary = false;
     let mut conversions = Vec::new();
+    let mut exact_resource_receiver = false;
 
     // The receiver is not emitted as a boundary parameter, but its type must
     // still be the enclosing resource. The syntax-only interface check owns
@@ -3067,16 +3069,21 @@ fn append_interface_boundary_diagnostics(
     if let Some((expected_resource, receiver_ty)) = resource_receiver
         && matches!(receiver_ty.kind, TyKind::Borrow(_, _))
     {
-        let invalid_receiver = match boundary_type_with_references(
+        let receiver_outcome = boundary_type_with_references(
             &boundary_context,
             owner_id,
             receiver_ty,
             Position::Param,
         )
-        .outcome
-        {
+        .outcome;
+        exact_resource_receiver = matches!(
+            &receiver_outcome,
+            BoundaryTypeOutcome::Mapped(BoundaryType::Borrow(resource))
+                if *resource == expected_resource
+        );
+        let invalid_receiver = match &receiver_outcome {
             BoundaryTypeOutcome::Mapped(BoundaryType::Borrow(resource)) => {
-                resource != expected_resource
+                *resource != expected_resource
             }
             BoundaryTypeOutcome::Mapped(_) | BoundaryTypeOutcome::Incompatible(_) => true,
             BoundaryTypeOutcome::Suppressed | BoundaryTypeOutcome::Deferred => false,
@@ -3177,7 +3184,11 @@ fn append_interface_boundary_diagnostics(
         }
         diagnostics.push(diagnostic);
     }
-    Ok((has_incompatible_boundary, conversions))
+    Ok((
+        has_incompatible_boundary,
+        conversions,
+        exact_resource_receiver,
+    ))
 }
 
 fn collect_generated_use_aliases(
@@ -3579,6 +3590,7 @@ fn generated_resource_member(
     resource: DefId,
     conversions: &[sai_ty::boundary::BoundaryTypeConversion],
     references: &HashMap<DefId, WitTypeRef>,
+    exact_resource_receiver: bool,
     attrs: Option<&sai_hir::attrs::ValidatedAttrs>,
     selected: Option<&sai_package::mvs::MvsPackageVersion>,
     symbols: &Interner,
@@ -3610,7 +3622,17 @@ fn generated_resource_member(
             selected,
             symbols,
         ),
-        MemberRole::Method => Ok(None),
+        MemberRole::Method => generated_resource_method_member(
+            entry,
+            owner,
+            resource,
+            conversions,
+            references,
+            exact_resource_receiver,
+            attrs,
+            selected,
+            symbols,
+        ),
     }
 }
 
@@ -3801,6 +3823,137 @@ fn generated_resource_static_member(
     Ok(Some(WitMember {
         name,
         kind: WitMemberKind::Static,
+        func: WitFunc {
+            params,
+            result,
+            is_async: false,
+        },
+        docs: entry.docs.clone().map(Arc::from),
+        since,
+        deprecated,
+        unsupported: None,
+    }))
+}
+
+fn generated_resource_method_member(
+    entry: &ItemTreeEntry,
+    owner: &HirOwner<'_>,
+    resource: DefId,
+    conversions: &[sai_ty::boundary::BoundaryTypeConversion],
+    references: &HashMap<DefId, WitTypeRef>,
+    exact_resource_receiver: bool,
+    attrs: Option<&sai_hir::attrs::ValidatedAttrs>,
+    selected: Option<&sai_package::mvs::MvsPackageVersion>,
+    symbols: &Interner,
+) -> Result<Option<WitMember>, InterfaceUsesQueryError> {
+    let OwnerNode::InterfaceItem(item) = owner.node else {
+        return Ok(None);
+    };
+    let InterfaceItemKind::ResourceMember {
+        resource: owner_resource,
+        role: MemberRole::Method,
+        sig,
+        generics,
+    } = item.kind
+    else {
+        return Ok(None);
+    };
+    if owner_resource.to_def_id() != resource
+        || item.name.is_error()
+        || sig.safety != sai_hir::Safety::Safe
+        || sig.is_async
+        || sig.borrows.is_some()
+        || sig.effects.is_some()
+        || !generics.params.is_empty()
+        || !generics.where_preds.is_empty()
+        || attrs.is_some_and(|attrs| !attrs.diagnostics.is_empty())
+        || !exact_resource_receiver
+    {
+        return Ok(None);
+    }
+    let Some((receiver, parameters)) = sig.params.split_first() else {
+        return Ok(None);
+    };
+    if !receiver.is_self || receiver.mutable || parameters.iter().any(|parameter| parameter.is_self)
+    {
+        return Ok(None);
+    }
+    let Some(receiver_reference) = references.get(&resource) else {
+        return Ok(None);
+    };
+    let mut params = Vec::with_capacity(sig.params.len());
+    params.push((
+        "self".to_owned(),
+        WitType::Borrow(receiver_reference.clone()),
+    ));
+    let mut conversions = conversions.iter();
+    for parameter in parameters {
+        if parameter.mutable {
+            return Ok(None);
+        }
+        let Some(parameter_name) = parameter.name else {
+            return Ok(None);
+        };
+        if parameter_name.is_error() {
+            return Ok(None);
+        }
+        let parameter_source_name = symbols
+            .resolve(parameter_name.sym)
+            .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+            .map_err(InterfaceUsesQueryError::Collection)?;
+        let Some(parameter_name) = sai_identifier_to_wit_name(&parameter_source_name) else {
+            return Ok(None);
+        };
+        let Some(conversion) = conversions.next() else {
+            return Ok(None);
+        };
+        let BoundaryTypeOutcome::Mapped(boundary_type) = &conversion.outcome else {
+            return Ok(None);
+        };
+        let Ok(Some(parameter_type)) =
+            sai_ty::boundary::materialize_boundary_type(boundary_type, references, Position::Param)
+        else {
+            return Ok(None);
+        };
+        params.push((parameter_name, parameter_type));
+    }
+    let result = if sig.ret.is_some() {
+        let Some(conversion) = conversions.next() else {
+            return Ok(None);
+        };
+        let BoundaryTypeOutcome::Mapped(boundary_type) = &conversion.outcome else {
+            return Ok(None);
+        };
+        let Ok(result) = sai_ty::boundary::materialize_boundary_type(
+            boundary_type,
+            references,
+            Position::Result,
+        ) else {
+            return Ok(None);
+        };
+        result
+    } else {
+        None
+    };
+    if conversions.next().is_some() {
+        return Ok(None);
+    }
+    let Some(name_definition) = wit_name_definition(item.name, owner.id, symbols)? else {
+        return Ok(None);
+    };
+    let Some(name) = sai_identifier_to_wit_name(&name_definition.source_name) else {
+        return Ok(None);
+    };
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let Some((since, deprecated)) = generated_stability(attrs, Some(selected)) else {
+        return Ok(None);
+    };
+
+    Ok(Some(WitMember {
+        name,
+        kind: WitMemberKind::Method,
         func: WitFunc {
             params,
             result,

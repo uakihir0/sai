@@ -45668,7 +45668,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         let source = concat!(
             "interface api {\n",
             "  resource Handle {\n",
-            "    fn reset(self: borrow Self)\n",
+            "    fn reset(self: Self)\n",
             "  }\n",
             "  fn take(value: Handle)\n",
             "  fn independent(value: U32)\n",
@@ -46161,6 +46161,119 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
+    fn generated_wit_emits_single_resource_methods() {
+        let source = concat!(
+            "interface api {\n",
+            "  resource Handle {\n",
+            "    fn close(self: borrow Self)\n",
+            "  }\n",
+            "  resource Mutable {\n",
+            "    fn adjust(self: borrow mut Self, amount: U32) -> Bool\n",
+            "  }\n",
+            "  fn take(handle: Handle, mutable: Mutable)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("the generated method package loads");
+        assert!(
+            result.failure.is_none(),
+            "the generated methods parse and resolve: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "supported methods are fully representable: {}",
+            generated.text
+        );
+        assert!(generated.text.contains("close: func();"));
+        assert!(
+            generated
+                .text
+                .contains("adjust: func(amount: u32) -> bool;")
+        );
+        assert!(!generated.text.contains("self:"));
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        for (resource_position, expected_name) in [(0, "handle"), (1, "mutable")] {
+            let (resource_index, resource) = interface
+                .items
+                .iter_enumerated()
+                .nth(resource_position)
+                .unwrap();
+            assert_eq!(resource.name, expected_name);
+            let sai_wit::WitItemKind::Resource(members) = &resource.kind else {
+                panic!("the source resource is emitted");
+            };
+            assert_eq!(members.len(), 1);
+            assert_eq!(members[0].kind, sai_wit::WitMemberKind::Method);
+            let sai_wit::WitType::Borrow(receiver) = &members[0].func.params[0].1 else {
+                panic!("the method model retains its borrowed self parameter");
+            };
+            assert_eq!(members[0].func.params[0].0, "self");
+            assert_eq!(receiver.interface.unit, unit);
+            assert_eq!(receiver.interface.interface, interface_index);
+            assert_eq!(receiver.item, resource_index);
+            assert_eq!(receiver.item_name, expected_name);
+        }
+        let (mutable_index, mutable) = interface.items.iter_enumerated().nth(1).unwrap();
+        let sai_wit::WitItemKind::Resource(mutable_members) = &mutable.kind else {
+            panic!("the mutable resource is emitted");
+        };
+        assert_eq!(
+            mutable_members[0].func.params[1],
+            ("amount".to_owned(), sai_wit::WitType::U32)
+        );
+        assert_eq!(mutable_members[0].func.result, Some(sai_wit::WitType::Bool));
+        let sai_wit::WitItemKind::Func(take) = &interface.items.iter().nth(2).unwrap().kind else {
+            panic!("the resource handle consumer is emitted");
+        };
+        let sai_wit::WitType::Own(mutable_handle) = &take.params[1].1 else {
+            panic!("the consumer receives the mutable resource");
+        };
+        assert_eq!(mutable_handle.interface.unit, unit);
+        assert_eq!(mutable_handle.interface.interface, interface_index);
+        assert_eq!(mutable_handle.item, mutable_index);
+        assert_eq!(mutable_handle.item_name, "mutable");
+    }
+
+    #[test]
     fn generated_wit_omits_unsupported_resource_member_shapes() {
         let cases = [
             (
@@ -46188,6 +46301,23 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 "fn ping(var value: U32)\n",
             ),
             ("an unnamed static function parameter", "fn ping(_: U32)\n"),
+            (
+                "a method with a consuming receiver",
+                "fn close(self: Self)\n",
+            ),
+            (
+                "a method with a non-resource receiver",
+                "fn close(self: borrow U32)\n",
+            ),
+            (
+                "a method with an unresolved receiver",
+                "fn close(self: borrow Missing)\n",
+            ),
+            (
+                "a method precondition",
+                "fn close(self: borrow Self) requires true\n",
+            ),
+            ("a method body", "fn close(self: borrow Self) {}\n"),
             (
                 "a constructor precondition",
                 "fn new() -> Self requires true\n",
