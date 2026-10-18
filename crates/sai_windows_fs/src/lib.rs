@@ -15,6 +15,24 @@ pub struct FileIdentity {
     file: [u8; 16],
 }
 
+/// A verified directory handle opened for a handle-relative rename.
+///
+/// This type can only be created by
+/// [`open_child_directory_for_rename_without_following`], which opens a
+/// synchronous Windows handle suitable for the rename operation.
+#[derive(Debug)]
+pub struct RenameableDirectory {
+    file: File,
+}
+
+impl RenameableDirectory {
+    /// Returns the underlying directory handle for metadata and identity
+    /// queries. The handle remains owned by this wrapper.
+    pub fn as_file(&self) -> &File {
+        &self.file
+    }
+}
+
 /// Returns a filesystem identity for an already-open file or directory.
 pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
     #[cfg(unix)]
@@ -862,6 +880,83 @@ pub fn replace_file_in_directory(
     }
 }
 
+/// Open a direct child directory without following a reparse point while
+/// allowing the opened directory to be renamed through its handle.
+///
+/// `child_name` must be one normal path component. The returned Windows handle
+/// has delete access and permits delete sharing so a handle-relative rename can
+/// publish the directory without resolving its source path again.
+pub fn open_child_directory_for_rename_without_following(
+    parent: &File,
+    child_name: &OsStr,
+) -> io::Result<RenameableDirectory> {
+    validate_child_name(child_name)?;
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES};
+
+        let file = windows_handle::open_child_with_access(
+            parent,
+            child_name,
+            true,
+            DELETE | FILE_READ_ATTRIBUTES,
+            true,
+        )?;
+        if is_reparse_point(&file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path is a Windows reparse point",
+            ));
+        }
+        if !file.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not a directory",
+            ));
+        }
+        Ok(RenameableDirectory { file })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (parent, child_name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows directory handles are unavailable on this platform",
+        ))
+    }
+}
+
+/// Rename an already-open directory to a direct child of `parent` without
+/// replacing an existing entry.
+///
+/// The source handle must have been opened with delete access and must refer to
+/// a directory on the same volume as `parent`.
+pub fn move_directory_handle_to_child_without_replacing(
+    source: &RenameableDirectory,
+    parent: &File,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    validate_child_name(destination_name)?;
+    #[cfg(windows)]
+    {
+        if is_reparse_point(&source.file)? || !source.file.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source handle is not a directory",
+            ));
+        }
+        windows_handle::rename_open_child(parent, &source.file, destination_name, false)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (source, parent, destination_name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "handle-relative directory moves are available only on Windows",
+        ))
+    }
+}
+
 /// Replace one child file only when it still has the selected identity and
 /// contents.
 ///
@@ -1175,15 +1270,15 @@ mod windows_handle {
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
         FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile,
+        NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         GENERIC_READ, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_DISPOSITION_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_READ_ATTRIBUTES,
-        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FileDispositionInfo, FileRenameInfo, SYNCHRONIZE, SetFileInformationByHandle,
+        DELETE, FILE_DISPOSITION_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FileDispositionInfo, SYNCHRONIZE, SetFileInformationByHandle,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -1217,7 +1312,7 @@ mod windows_handle {
         Ok(file)
     }
 
-    fn open_child_with_access(
+    pub(super) fn open_child_with_access(
         parent: &File,
         name: &OsStr,
         directory: bool,
@@ -1296,6 +1391,15 @@ mod windows_handle {
             DELETE | FILE_READ_ATTRIBUTES,
             true,
         )?;
+        rename_open_child(parent, &source, destination_name, true)
+    }
+
+    pub(super) fn rename_open_child(
+        parent: &File,
+        source: &File,
+        destination_name: &OsStr,
+        replace_if_exists: bool,
+    ) -> io::Result<()> {
         let destination = destination_name.encode_wide().collect::<Vec<_>>();
         let file_name_bytes = destination
             .len()
@@ -1305,20 +1409,21 @@ mod windows_handle {
             })?;
         let file_name_bytes_u32 = u32::try_from(file_name_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "destination is too long"))?;
-        let file_name_offset = offset_of!(FILE_RENAME_INFO, FileName);
-        let information_length = file_name_offset
+        let file_name_offset = offset_of!(FILE_RENAME_INFORMATION, FileName);
+        let information_length = mem::size_of::<FILE_RENAME_INFORMATION>()
             .checked_add(file_name_bytes)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination is too long"))?
-            .max(mem::size_of::<FILE_RENAME_INFO>());
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "destination is too long")
+            })?;
         let information_length_u32 = u32::try_from(information_length)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "destination is too long"))?;
         let mut storage = vec![0usize; information_length.div_ceil(mem::size_of::<usize>())];
-        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
         // SAFETY: `storage` is pointer-aligned and sized for the fixed header
         // plus the UTF-16 filename bytes. The trailing name bytes are copied
-        // into the flexible-array tail expected by FILE_RENAME_INFO.
+        // into the flexible-array tail expected by FILE_RENAME_INFORMATION.
         unsafe {
-            (*information).Anonymous.ReplaceIfExists = true;
+            (*information).Anonymous.ReplaceIfExists = replace_if_exists;
             (*information).RootDirectory = parent.as_raw_handle().cast();
             (*information).FileNameLength = file_name_bytes_u32;
             ptr::copy_nonoverlapping(
@@ -1327,19 +1432,33 @@ mod windows_handle {
                 destination.len(),
             );
         }
-        let class: FILE_INFO_BY_HANDLE_CLASS = FileRenameInfo;
-        // SAFETY: `source` is an open file with DELETE access. The information
-        // buffer has the required native layout and remains alive for the call.
-        let succeeded = unsafe {
-            SetFileInformationByHandle(
+        let mut io_status = IO_STATUS_BLOCK::default();
+        // SAFETY: `source` is an open file or directory with DELETE access.
+        // `parent` is an open destination directory on the same volume. The
+        // information buffer has the native layout and both handles remain
+        // alive for the synchronous call.
+        let status = unsafe {
+            NtSetInformationFile(
                 source.as_raw_handle().cast(),
-                class,
+                &mut io_status,
                 information.cast(),
                 information_length_u32,
+                FileRenameInformation,
             )
         };
-        if succeeded == 0 {
-            return Err(io::Error::last_os_error());
+        // The rename API only accepts `RenameableDirectory`, whose handle is
+        // opened with FILE_SYNCHRONOUS_IO_NONALERT. A pending result would
+        // violate that contract and would leave the stack-backed I/O status
+        // block and rename buffer live for too short a period.
+        if status == windows_sys::Win32::Foundation::STATUS_PENDING {
+            return Err(io::Error::other(
+                "synchronous directory rename unexpectedly returned STATUS_PENDING",
+            ));
+        }
+        if status < 0 {
+            // SAFETY: this conversion accepts any NTSTATUS value.
+            let win32_error = unsafe { RtlNtStatusToDosError(status) };
+            return Err(io::Error::from_raw_os_error(win32_error as i32));
         }
         Ok(())
     }
@@ -1452,8 +1571,9 @@ mod windows_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        open_child_directory_without_following, open_directory_path_without_following,
-        remove_file_in_directory, replace_file_in_directory,
+        file_identity, move_directory_handle_to_child_without_replacing,
+        open_child_directory_for_rename_without_following, open_child_directory_without_following,
+        open_directory_path_without_following, remove_file_in_directory, replace_file_in_directory,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1519,5 +1639,65 @@ mod windows_tests {
         )
         .unwrap();
         assert!(child.metadata().unwrap().is_dir());
+    }
+
+    #[test]
+    fn handle_relative_directory_move_preserves_identity_and_never_replaces() {
+        let directory = TestDirectory::new();
+        let parent = directory.0.join("parent");
+        let source = parent.join("temporary");
+        let destination = parent.join("src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("marker"), b"source").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("marker"), b"destination").unwrap();
+
+        let parent_handle =
+            open_directory_path_without_following(&fs::canonicalize(&parent).unwrap()).unwrap();
+        let source_handle = open_child_directory_for_rename_without_following(
+            &parent_handle,
+            std::ffi::OsStr::new("temporary"),
+        )
+        .unwrap();
+        let source_identity = file_identity(source_handle.as_file()).unwrap();
+
+        let error = move_directory_handle_to_child_without_replacing(
+            &source_handle,
+            &parent_handle,
+            std::ffi::OsStr::new("src"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            file_identity(source_handle.as_file()).unwrap(),
+            source_identity
+        );
+        assert_eq!(fs::read(source.join("marker")).unwrap(), b"source");
+        assert_eq!(
+            fs::read(destination.join("marker")).unwrap(),
+            b"destination"
+        );
+        drop(source_handle);
+        fs::remove_dir_all(&destination).unwrap();
+
+        let source_handle = open_child_directory_for_rename_without_following(
+            &parent_handle,
+            std::ffi::OsStr::new("temporary"),
+        )
+        .unwrap();
+        move_directory_handle_to_child_without_replacing(
+            &source_handle,
+            &parent_handle,
+            std::ffi::OsStr::new("src"),
+        )
+        .unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination.join("marker")).unwrap(), b"source");
+        assert_eq!(
+            file_identity(source_handle.as_file()).unwrap(),
+            source_identity
+        );
     }
 }

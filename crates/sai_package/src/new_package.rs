@@ -178,7 +178,12 @@ pub fn create_new_package_with_cancel_check(
         &temporary_source_name,
         &temporary_source_path,
     ) {
-        Ok(file) if file_identity(&file).as_ref() == Some(&source_dir_identity) => file,
+        Ok(file)
+            if file_identity(publication_directory_file(&file)).as_ref()
+                == Some(&source_dir_identity) =>
+        {
+            file
+        }
         Ok(file) => {
             drop(file);
             remove_dir_if_unchanged(
@@ -206,9 +211,10 @@ pub fn create_new_package_with_cancel_check(
     };
     if let Err(source) = publish_source_directory(
         &prepared.root_dir,
-        &destination_for_io,
+        &prepared.root_file,
         &temporary_source_name,
-        &source_directory,
+        &publication_file,
+        OsStr::new("src"),
     ) {
         drop(publication_file);
         remove_dir_if_unchanged(
@@ -419,8 +425,8 @@ fn write_new_file_atomic_with_hook(
 ) -> io::Result<PublishedFile> {
     let (temporary_name, mut temporary_file) = create_temporary_file(directory)?;
     let identity_file = temporary_file.try_clone()?.into_std();
-    let identity = same_file::Handle::from_file(identity_file.try_clone()?)?;
-    let cleanup_identity = same_file::Handle::from_file(identity_file)?;
+    let identity = sai_windows_fs::file_identity(&identity_file)?;
+    let cleanup_identity = identity;
     let _cleanup = TemporaryFileCleanup {
         directory,
         name: temporary_name.clone(),
@@ -440,7 +446,13 @@ fn write_new_file_atomic_with_hook(
             "published file identity changed before verification",
         ));
     }
-    Ok(PublishedFile { identity })
+    let pinned_handle = same_file::Handle::from_file(identity_file.try_clone()?)?;
+    Ok(PublishedFile {
+        identity: PinnedFileIdentity {
+            _handle: pinned_handle,
+            value: identity,
+        },
+    })
 }
 
 fn create_temporary_directory(
@@ -467,7 +479,11 @@ fn create_temporary_directory_with_open(
         match directory.create_dir(&name) {
             Ok(()) => {
                 let path = directory_path.join(&name);
-                let identity = same_file::Handle::from_path(&path)?;
+                let Some(identity) = path_identity(directory, &name) else {
+                    return Err(io::Error::other(
+                        "could not identify the new temporary directory",
+                    ));
+                };
                 let source_directory = match open(directory_file, &name, &path) {
                     Ok(file) => file,
                     Err(error) => {
@@ -537,7 +553,7 @@ fn open_directory_for_publication(
     parent: &File,
     component: &OsStr,
     path: &Path,
-) -> io::Result<File> {
+) -> io::Result<PublicationDirectory> {
     #[cfg(unix)]
     {
         use rustix::fs::{Mode, OFlags, openat};
@@ -554,8 +570,8 @@ fn open_directory_for_publication(
     }
     #[cfg(windows)]
     {
-        let _ = (parent, component);
-        sai_windows_fs::open_directory_for_rename_without_following(path)
+        let _ = path;
+        sai_windows_fs::open_child_directory_for_rename_without_following(parent, component)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -563,11 +579,28 @@ fn open_directory_for_publication(
     }
 }
 
+#[cfg(windows)]
+type PublicationDirectory = sai_windows_fs::RenameableDirectory;
+
+#[cfg(not(windows))]
+type PublicationDirectory = File;
+
+#[cfg(windows)]
+fn publication_directory_file(directory: &PublicationDirectory) -> &File {
+    directory.as_file()
+}
+
+#[cfg(not(windows))]
+fn publication_directory_file(directory: &PublicationDirectory) -> &File {
+    directory
+}
+
 fn publish_source_directory(
     directory: &Dir,
-    directory_path: &Path,
+    parent_file: &File,
     temporary_name: &OsStr,
-    destination: &Path,
+    source_directory: &PublicationDirectory,
+    destination_name: &OsStr,
 ) -> io::Result<()> {
     #[cfg(any(
         target_os = "android",
@@ -579,7 +612,7 @@ fn publish_source_directory(
     {
         use rustix::fs::{RenameFlags, renameat_with};
 
-        let _ = (directory_path, destination);
+        let _ = (parent_file, source_directory, destination_name);
         renameat_with(
             directory,
             temporary_name,
@@ -591,9 +624,11 @@ fn publish_source_directory(
     }
     #[cfg(windows)]
     {
-        sai_windows_fs::move_directory_without_replacing(
-            &directory_path.join(temporary_name),
-            destination,
+        let _ = (directory, temporary_name);
+        sai_windows_fs::move_directory_handle_to_child_without_replacing(
+            source_directory,
+            parent_file,
+            destination_name,
         )
     }
     #[cfg(not(any(
@@ -605,7 +640,13 @@ fn publish_source_directory(
         target_os = "redox"
     )))]
     {
-        let _ = (directory, directory_path, temporary_name, destination);
+        let _ = (
+            directory,
+            parent_file,
+            temporary_name,
+            source_directory,
+            destination_name,
+        );
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "atomic no-replace directory publication is unsupported on this platform",
@@ -965,10 +1006,10 @@ fn rollback(
     if let Some(PublishedFile { identity }) = created_source_file
         && let Some(source_dir) = &source_dir
     {
-        remove_file_if_unchanged(source_dir, "lib.sai", &identity);
+        remove_file_if_unchanged(source_dir, "lib.sai", &identity.value);
     }
     for (file_name, published) in created_root_files.iter().rev() {
-        remove_file_if_unchanged(&prepared.root_dir, file_name, &published.identity);
+        remove_file_if_unchanged(&prepared.root_dir, file_name, &published.identity.value);
     }
     drop(source_dir);
     if let Some(identity) = source_dir_identity {
@@ -978,13 +1019,19 @@ fn rollback(
 
 #[derive(Debug)]
 struct PublishedFile {
-    identity: FileIdentity,
+    identity: PinnedFileIdentity,
 }
 
-type FileIdentity = same_file::Handle;
+#[derive(Debug)]
+struct PinnedFileIdentity {
+    _handle: same_file::Handle,
+    value: FileIdentity,
+}
+
+type FileIdentity = sai_windows_fs::FileIdentity;
 
 fn file_identity(file: &File) -> Option<FileIdentity> {
-    same_file::Handle::from_file(file.try_clone().ok()?).ok()
+    sai_windows_fs::file_identity(file).ok()
 }
 
 fn path_identity(directory: &Dir, name: &std::ffi::OsStr) -> Option<FileIdentity> {
@@ -1262,15 +1309,23 @@ mod tests {
         .unwrap();
         let source_dir_identity = super::file_identity(&source_file).unwrap();
         drop(source_file);
+        let temporary_path = destination.join(&temporary_name);
+        let publication_file = super::open_directory_for_publication(
+            &prepared.root_file,
+            &temporary_name,
+            &temporary_path,
+        )
+        .unwrap();
         let source_directory = destination.join("src");
         fs::create_dir(&source_directory).unwrap();
         fs::write(source_directory.join("competitor"), b"preserve").unwrap();
 
         let error = super::publish_source_directory(
             &prepared.root_dir,
-            &destination,
+            &prepared.root_file,
             &temporary_name,
-            &source_directory,
+            &publication_file,
+            std::ffi::OsStr::new("src"),
         )
         .unwrap_err();
 
@@ -1530,7 +1585,10 @@ mod tests {
         fs::write(&original_path, b"ours").unwrap();
         fs::write(&replacement_path, b"theirs").unwrap();
         let file = File::open(&original_path).unwrap();
-        let identity = super::file_identity(&file).unwrap();
+        let identity = super::PinnedFileIdentity {
+            _handle: same_file::Handle::from_file(file.try_clone().unwrap()).unwrap(),
+            value: super::file_identity(&file).unwrap(),
+        };
         fs::rename(&replacement_path, &original_path).unwrap();
 
         let parent_dir =
