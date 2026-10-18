@@ -35,7 +35,8 @@ use sai_resolve::package_scopes::{
 use sai_resolve::{InterfaceUse, PackageWitNames, WorldElaborationInterface};
 use sai_resolve::{
     InterfaceUseReference, InterfaceUses, InterfaceUsesInput, WitNameCollision, WitNameDefinition,
-    interface_uses, sai_identifier_to_wit_name, wit_name_collisions,
+    WorldIncludeReference, WorldIncludesInput, interface_uses, sai_identifier_to_wit_name,
+    wit_name_collisions, world_includes,
 };
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher};
 use sai_syntax::SyntaxKind;
@@ -52,8 +53,8 @@ use sai_wit::{
     GeneratedText, WitCase, WitField, WitFunc, WitIfaceIdx, WitIfaceRef, WitIndexVec, WitInterface,
     WitItem, WitItemIdx, WitItemKind, WitMember, WitMemberKind, WitPackage, WitPackageDeclaration,
     WitPackageName, WitStabilityVersion, WitType, WitTypeRef, WitUnit, WitViewDefKind,
-    WitViewEntity, WitWorld, WitWorldItem, WitWorldItemDirection, WitWorldItemOrder, print_wit,
-    wit_name_to_sai,
+    WitViewEntity, WitWorld, WitWorldIdx, WitWorldItem, WitWorldItemDirection, WitWorldItemOrder,
+    WitWorldRef, print_wit, wit_name_to_sai,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -186,8 +187,15 @@ struct GeneratedWitCandidate {
     identity: String,
     version: Version,
     interfaces: Vec<(LocalDefId, WitIfaceIdx, WitInterface)>,
-    worlds: Vec<WitWorld>,
+    worlds: Vec<GeneratedWitWorld>,
+    cyclic_worlds: HashSet<DefId>,
     complete: bool,
+}
+
+struct GeneratedWitWorld {
+    definition: DefId,
+    provisional_index: WitWorldIdx,
+    world: WitWorld,
 }
 
 impl GeneratedWitCandidate {
@@ -253,14 +261,34 @@ impl GeneratedWitCandidate {
                 .push(WitPackageDeclaration::Interface(index));
             origins.push((name, definition.to_def_id()));
         }
-        for world in self.worlds {
-            let (world, world_complete) =
-                remap_generated_world_interfaces(world, &package.unit, &interface_indices);
+        let cyclic_world_indices = self
+            .worlds
+            .iter()
+            .filter(|world| self.cyclic_worlds.contains(&world.definition))
+            .map(|world| world.provisional_index)
+            .collect::<HashSet<_>>();
+        let mut world_indices = HashMap::with_capacity(self.worlds.len());
+        let mut final_world_indices = WitIndexVec::<WitWorldIdx, ()>::new();
+        for world in &self.worlds {
+            let final_index = final_world_indices
+                .push(())
+                .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+            world_indices.insert(world.provisional_index, final_index);
+        }
+        for generated_world in self.worlds {
+            let (world, world_complete) = remap_generated_world_references(
+                generated_world.world,
+                &package.unit,
+                &interface_indices,
+                &world_indices,
+                &cyclic_world_indices,
+            );
             complete &= world_complete;
             let index = package
                 .worlds
                 .push(world)
                 .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+            debug_assert_eq!(index, world_indices[&generated_world.provisional_index]);
             package
                 .declaration_order
                 .push(WitPackageDeclaration::World(index));
@@ -366,10 +394,12 @@ fn prune_generated_item_references(
     Ok((item_indices, invalid_items.is_empty()))
 }
 
-fn remap_generated_world_interfaces(
+fn remap_generated_world_references(
     mut world: WitWorld,
     generated_unit: &WitUnit,
     interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+    world_indices: &HashMap<WitWorldIdx, WitWorldIdx>,
+    cyclic_world_indices: &HashSet<WitWorldIdx>,
 ) -> (WitWorld, bool) {
     fn remap_items(
         items: &mut Vec<WitWorldItem>,
@@ -415,6 +445,31 @@ fn remap_generated_world_interfaces(
         interface_indices,
         &mut complete,
     );
+    let mut includes = Vec::with_capacity(world.includes.len());
+    let mut include_indices = Vec::with_capacity(world.includes.len());
+    for mut include in std::mem::take(&mut world.includes) {
+        if include.unit == *generated_unit {
+            if cyclic_world_indices.contains(&include.world) {
+                complete = false;
+                include_indices.push(None);
+                continue;
+            }
+            let Some(index) = world_indices.get(&include.world).copied() else {
+                complete = false;
+                include_indices.push(None);
+                continue;
+            };
+            include.world = index;
+        }
+        let Ok(index) = u32::try_from(includes.len()) else {
+            complete = false;
+            include_indices.push(None);
+            continue;
+        };
+        include_indices.push(Some(index));
+        includes.push(include);
+    }
+    world.includes = includes;
     if !world.source_order.is_empty() {
         world.source_order = world
             .source_order
@@ -427,7 +482,9 @@ fn remap_generated_world_interfaces(
                     WitWorldItemDirection::Export => {
                         (export_indices.get(order.index as usize), order.direction)
                     }
-                    WitWorldItemDirection::Include => return Some(order),
+                    WitWorldItemDirection::Include => {
+                        (include_indices.get(order.index as usize), order.direction)
+                    }
                 };
                 match indices {
                     Some(Some(index)) => Some(WitWorldItemOrder {
@@ -836,6 +893,76 @@ fn generated_world_interface_item(
         deprecated,
         span: None,
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn generated_world_include_item(
+    entry: &ItemTreeEntry,
+    owner: &HirOwner<'_>,
+    item_owner: OwnerId,
+    inputs: &CurrentOwnerInputs,
+    module_scope: &Phase1ModuleScopes,
+    prepared: &PreparedPhase1PackageScopes,
+    module_members: &ModuleMemberIndex<'_>,
+    source_graph_packages: &HashSet<PackageId>,
+    primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
+    selected: Option<&sai_package::mvs::MvsPackageVersion>,
+    generated_worlds: &HashMap<DefId, WitWorldRef>,
+) -> Result<Option<(WitWorldRef, DefId, sai_hir::Span)>, InterfaceUsesQueryError> {
+    let kind = match owner.node {
+        OwnerNode::WorldItem(item) => item.kind,
+        _ => return Ok(None),
+    };
+    if !matches!(
+        kind,
+        WorldItemKind::Include(sai_hir::items::WorldRef::Mod(_))
+    ) {
+        return Ok(None);
+    }
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let attrs = inputs.validated_attrs.get(&entry.ast_id);
+    let Some((since, deprecated)) = generated_stability(attrs, Some(selected)) else {
+        return Ok(None);
+    };
+    let candidates = owner_test_only_path_candidates(owner)
+        .into_iter()
+        .filter(|candidate| candidate.kind == OwnerPathKind::Type)
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        return Ok(None);
+    }
+    let generic_resolutions = owner_type_generic_resolutions(owner);
+    let resolution = resolve_partial_type_owner_paths(
+        item_owner,
+        &candidates,
+        &generic_resolutions,
+        primitive_prelude,
+        module_scope,
+        prepared.module_tree.package,
+        Some(module_members),
+        Some(source_graph_packages),
+    )
+    .map_err(InterfaceUsesQueryError::Collection)?;
+    let candidate = &candidates[0];
+    let Some(PathRes {
+        base: Res::Def(DefKind::World, definition),
+        resolved_segments,
+        segment_count,
+    }) = resolution.paths().get(&candidate.hir_id)
+    else {
+        return Ok(None);
+    };
+    if resolved_segments != segment_count || *segment_count != candidate.segment_count {
+        return Ok(None);
+    }
+    let Some(mut reference) = generated_worlds.get(definition).cloned() else {
+        return Ok(None);
+    };
+    reference.since = since;
+    reference.deprecated = deprecated;
+    Ok(Some((reference, *definition, candidate.span)))
 }
 
 impl PartialEq for InterfaceUsesMemo {
@@ -2649,6 +2776,7 @@ fn collect_interface_uses_input(
     }
 
     let mut generated_worlds = Vec::new();
+    let mut cyclic_worlds = HashSet::new();
     if generated_unit.is_some() {
         let generated_interface_references = generated_unit
             .as_ref()
@@ -2679,7 +2807,41 @@ fn collect_interface_uses_input(
             symbols,
         )
         .map_err(InterfaceUsesQueryError::Collection)?;
-        for descriptor in world_descriptors {
+        let mut provisional_world_indices = WitIndexVec::<WitWorldIdx, ()>::new();
+        let mut world_index_by_definition = HashMap::with_capacity(world_descriptors.len());
+        for descriptor in &world_descriptors {
+            let index = provisional_world_indices
+                .push(())
+                .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+            world_index_by_definition.insert(descriptor.owner.def_id.to_def_id(), index);
+        }
+        let generated_world_references = generated_unit
+            .as_ref()
+            .map(|unit| {
+                world_descriptors
+                    .iter()
+                    .filter_map(|descriptor| {
+                        let definition = descriptor.owner.def_id.to_def_id();
+                        let name = package_wit_names.names.get(&descriptor.owner.def_id)?;
+                        let index = world_index_by_definition.get(&definition)?;
+                        Some((
+                            definition,
+                            WitWorldRef {
+                                unit: unit.clone(),
+                                world: *index,
+                                name: name.to_string(),
+                                names: Vec::new(),
+                                since: None,
+                                deprecated: None,
+                                span: None,
+                            },
+                        ))
+                    })
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let mut world_include_references = Vec::new();
+        for descriptor in world_descriptors.iter().copied() {
             let inputs = module_inputs.get(&descriptor.file).ok_or_else(|| {
                 InterfaceUsesQueryError::Collection(
                     OwnerControlFlowResolutionError::ModuleTreeMismatch,
@@ -2807,9 +2969,11 @@ fn collect_interface_uses_input(
                     .map_err(InterfaceUsesQueryError::Collection)?;
             let mut imports = Vec::new();
             let mut exports = Vec::new();
+            let mut includes = Vec::new();
             let mut source_order = Vec::with_capacity(child_entries.len());
             let mut import_names = HashSet::new();
             let mut export_names = HashSet::new();
+            let mut include_targets = HashSet::new();
             for (entry, item_owner) in child_entries.into_iter().zip(parent_items.iter().copied()) {
                 let expected_item_path = def_paths
                     .resolve_def_id(item_owner.def_id.to_def_id())
@@ -2838,10 +3002,57 @@ fn collect_interface_uses_input(
                     continue;
                 }
                 let is_import = match entry.kind {
-                    ItemTreeKind::WorldItem { import: true } => true,
-                    ItemTreeKind::WorldItem { import: false } => false,
+                    ItemTreeKind::WorldItem { import: true } => Some(true),
+                    ItemTreeKind::WorldItem { import: false } => Some(false),
                     ItemTreeKind::WorldInclude => {
-                        generated_complete = false;
+                        let Some((include, target, span)) = generated_world_include_item(
+                            entry,
+                            &item_hir,
+                            item_owner,
+                            inputs,
+                            module_scope,
+                            prepared,
+                            &module_members,
+                            &source_graph_packages,
+                            primitive_prelude,
+                            prepared.generated_package_version.as_ref(),
+                            &generated_world_references,
+                        )?
+                        else {
+                            generated_complete = false;
+                            continue;
+                        };
+                        let location = Location::from_decoded_source(
+                            inputs.source_ref.clone(),
+                            sai_diagnostics::Span::new(span.file, span.range),
+                            &inputs.source,
+                        )
+                        .ok_or_else(|| {
+                            InterfaceUsesQueryError::Collection(
+                                OwnerControlFlowResolutionError::InvalidSourceLocation(item_owner),
+                            )
+                        })?;
+                        world_include_references.push(WorldIncludeReference {
+                            from: descriptor.owner.def_id.to_def_id(),
+                            to: target,
+                            owner: item_owner,
+                            location,
+                        });
+                        if !include_targets.insert(target) {
+                            generated_complete = false;
+                            continue;
+                        }
+                        if entry.docs.is_some() {
+                            // WitWorldRef cannot retain include documentation yet.
+                            generated_complete = false;
+                            continue;
+                        }
+                        let Ok(index) = u32::try_from(includes.len()) else {
+                            generated_complete = false;
+                            continue;
+                        };
+                        includes.push(include);
+                        source_order.push(WitWorldItemOrder::include(index));
                         continue;
                     }
                     _ => {
@@ -2851,6 +3062,9 @@ fn collect_interface_uses_input(
                             ),
                         ));
                     }
+                };
+                let Some(is_import) = is_import else {
+                    unreachable!("world includes are handled above");
                 };
                 let item = generated_world_interface_item(
                     entry,
@@ -2914,19 +3128,39 @@ fn collect_interface_uses_input(
                     source_order.push(WitWorldItemOrder::export(index));
                 }
             }
-            generated_worlds.push(WitWorld {
-                name: world_name,
-                docs: parent_entry.docs.clone().map(Arc::from),
-                since,
-                deprecated,
-                imports,
-                exports,
-                includes: Vec::new(),
-                source_order,
-                unsupported: None,
-                span: None,
+            generated_worlds.push(GeneratedWitWorld {
+                definition: descriptor.owner.def_id.to_def_id(),
+                provisional_index: world_index_by_definition[&descriptor.owner.def_id.to_def_id()],
+                world: WitWorld {
+                    name: world_name,
+                    docs: parent_entry.docs.clone().map(Arc::from),
+                    since,
+                    deprecated,
+                    imports,
+                    exports,
+                    includes,
+                    source_order,
+                    unsupported: None,
+                    span: None,
+                },
             });
         }
+        let package = package_identity.clone().unwrap_or_else(|| {
+            package_key
+                .as_str()
+                .split_once('#')
+                .map_or(package_key.as_str(), |(identity, _)| identity)
+                .to_owned()
+        });
+        let world_include_analysis = world_includes(WorldIncludesInput {
+            package,
+            worlds: world_descriptors
+                .iter()
+                .map(|descriptor| descriptor.owner.def_id.to_def_id())
+                .collect(),
+            includes: world_include_references,
+        });
+        cyclic_worlds.extend(world_include_analysis.cyclic);
     }
 
     let package = package_identity.unwrap_or_else(|| {
@@ -3015,6 +3249,7 @@ fn collect_interface_uses_input(
             version: selected.version().clone(),
             interfaces: generated_interfaces,
             worlds: generated_worlds,
+            cyclic_worlds,
             complete: generated_complete && interface_check_diagnostics.is_empty(),
         })
     } else {
@@ -5528,8 +5763,8 @@ fn refresh_location_reference(
 #[cfg(test)]
 mod tests {
     use super::{
-        GeneratedWitCandidate, InterfaceUsesQueryError, LocalAliasReference,
-        WorldInterfaceUseGraph, expand_local_alias_interface_references,
+        GeneratedWitCandidate, GeneratedWitWorld, InterfaceUsesQueryError, LocalAliasReference,
+        WitWorldRef, WorldInterfaceUseGraph, expand_local_alias_interface_references,
         interface_uses_error_fingerprint, stable_world_interface_uses_fingerprint,
     };
     use crate::OwnerControlFlowResolutionError;
@@ -5543,7 +5778,7 @@ mod tests {
     use sai_vfs::FileId;
     use sai_wit::{
         WitIfaceRef, WitIndexVec, WitInterface, WitItem, WitItemIdx, WitItemKind, WitType,
-        WitTypeRef, WitUnit, WitWorld, WitWorldItem, WitWorldItemOrder,
+        WitTypeRef, WitUnit, WitWorld, WitWorldIdx, WitWorldItem, WitWorldItemOrder,
     };
     use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -5783,6 +6018,9 @@ mod tests {
             unsupported: None,
             span: None,
         };
+        let world_definition = ids.local_definition("server");
+        let mut world_indices = WitIndexVec::<WitWorldIdx, ()>::new();
+        let provisional_index = world_indices.push(()).expect("world index is valid");
         let generated = GeneratedWitCandidate {
             unit: unit.clone(),
             identity: "acme:generated-pruning".to_owned(),
@@ -5799,7 +6037,12 @@ mod tests {
                     interfaces[public_index].clone(),
                 ),
             ],
-            worlds: vec![world],
+            worlds: vec![GeneratedWitWorld {
+                definition: world_definition.to_def_id(),
+                provisional_index,
+                world,
+            }],
+            cyclic_worlds: HashSet::new(),
             complete: true,
         }
         .into_text(&BTreeSet::from([first_definition]), false)
@@ -5860,6 +6103,168 @@ mod tests {
             independent_reference.item.index(),
             0,
             "the retained alias is compacted to the first item index"
+        );
+    }
+
+    #[test]
+    fn generated_candidate_prunes_omitted_and_cyclic_world_includes() {
+        let ids = TestIds::new();
+        let selected = MvsPackageVersion::new(
+            "acme:generated-pruning",
+            Version::parse("1.0.0").expect("version is valid"),
+        )
+        .expect("selected package version is valid");
+        let unit = WitUnit::generated(ids.package, &ids.packages, &selected)
+            .expect("generated unit matches selected package");
+        let host_definition = ids.local_definition("host");
+        let target_definition = ids.local_definition("target");
+        let cyclic_definition = ids.local_definition("cyclic");
+        let mut provisional_indices = WitIndexVec::<WitWorldIdx, ()>::new();
+        let host_index = provisional_indices.push(()).expect("host index is valid");
+        let omitted_index = provisional_indices
+            .push(())
+            .expect("omitted index is valid");
+        let target_index = provisional_indices.push(()).expect("target index is valid");
+        let cyclic_index = provisional_indices.push(()).expect("cyclic index is valid");
+        let reference = |world, name: &str| WitWorldRef {
+            unit: unit.clone(),
+            world,
+            name: name.to_owned(),
+            names: Vec::new(),
+            since: None,
+            deprecated: None,
+            span: None,
+        };
+        let function = |name: &str| WitWorldItem::Func {
+            name: name.to_owned(),
+            docs: None,
+            func: sai_wit::WitFunc {
+                params: Vec::new(),
+                result: None,
+                is_async: false,
+            },
+            unsupported: None,
+            since: None,
+            deprecated: None,
+            span: None,
+        };
+        let host = WitWorld {
+            name: "host".to_owned(),
+            docs: None,
+            since: None,
+            deprecated: None,
+            imports: vec![function("before")],
+            exports: vec![function("after")],
+            includes: vec![
+                reference(omitted_index, "omitted"),
+                reference(target_index, "target"),
+                reference(cyclic_index, "cyclic"),
+            ],
+            source_order: vec![
+                WitWorldItemOrder::import(0),
+                WitWorldItemOrder::include(0),
+                WitWorldItemOrder::include(1),
+                WitWorldItemOrder::export(0),
+                WitWorldItemOrder::include(2),
+            ],
+            unsupported: None,
+            span: None,
+        };
+        let empty_world = |name: &str| WitWorld {
+            name: name.to_owned(),
+            docs: None,
+            since: None,
+            deprecated: None,
+            imports: Vec::new(),
+            exports: Vec::new(),
+            includes: Vec::new(),
+            source_order: Vec::new(),
+            unsupported: None,
+            span: None,
+        };
+        let generated = GeneratedWitCandidate {
+            unit: unit.clone(),
+            identity: "acme:generated-pruning".to_owned(),
+            version: Version::parse("1.0.0").expect("version is valid"),
+            interfaces: Vec::new(),
+            worlds: vec![
+                GeneratedWitWorld {
+                    definition: host_definition.to_def_id(),
+                    provisional_index: host_index,
+                    world: host,
+                },
+                GeneratedWitWorld {
+                    definition: target_definition.to_def_id(),
+                    provisional_index: target_index,
+                    world: empty_world("target"),
+                },
+                GeneratedWitWorld {
+                    definition: cyclic_definition.to_def_id(),
+                    provisional_index: cyclic_index,
+                    world: empty_world("cyclic"),
+                },
+            ],
+            cyclic_worlds: HashSet::from([cyclic_definition.to_def_id()]),
+            complete: true,
+        }
+        .into_text(&BTreeSet::new(), false)
+        .expect("candidate model remaps without dangling world references");
+
+        assert!(!generated.complete);
+        assert!(generated.text.contains("include target;"));
+        assert!(!generated.text.contains("include omitted"));
+        assert!(!generated.text.contains("include cyclic"));
+        assert!(
+            generated
+                .text
+                .find("import before:")
+                .expect("import prints")
+                < generated
+                    .text
+                    .find("include target;")
+                    .expect("surviving include prints")
+        );
+        assert!(
+            generated
+                .text
+                .find("include target;")
+                .expect("surviving include prints")
+                < generated.text.find("export after:").expect("export prints")
+        );
+
+        let parsed = sai_wit::parse_source_files(
+            unit,
+            [sai_wit::WitSourceFile::new(
+                "generated.wit",
+                generated.text.as_bytes().to_vec(),
+            )],
+        )
+        .expect("pruned candidate output parses");
+        let mut resolve = wit_parser::Resolve::default();
+        let package = sai_wit::WitResolveContext::default()
+            .push_package(&mut resolve, parsed)
+            .expect("pruned candidate output resolves");
+        let worlds = package.worlds.iter_enumerated().collect::<Vec<_>>();
+        let host = worlds
+            .iter()
+            .find(|(_, world)| world.name == "host")
+            .map(|(_, world)| *world)
+            .expect("host world remains");
+        let target_index = worlds
+            .iter()
+            .find_map(|(index, world)| (world.name == "target").then_some(*index))
+            .expect("target world remains");
+        assert_eq!(host.includes.len(), 1);
+        assert_eq!(host.includes[0].name, "target");
+        assert_eq!(host.includes[0].world, target_index);
+        assert_eq!(
+            host.source_order,
+            [
+                WitWorldItemOrder::import(0),
+                WitWorldItemOrder::include(0),
+                WitWorldItemOrder::export(0),
+            ],
+            "dropped include indices are removed without disturbing surviving items"
         );
     }
 

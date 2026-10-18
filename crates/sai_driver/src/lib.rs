@@ -22072,6 +22072,51 @@ mod tests {
         (database, module_tree.as_ref().clone(), snapshot, package)
     }
 
+    fn generated_wit_for_source(source: &[u8]) -> (WitUnit, WitPackageResult) {
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source, b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated WIT package query completes");
+        assert!(
+            result.failure.is_none(),
+            "generated source remains parseable: {:?}",
+            result.failure
+        );
+        (unit, result)
+    }
+
+    fn generated_text_for_unit(result: &WitPackageResult, unit: &WitUnit) -> Arc<GeneratedText> {
+        result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == unit)
+            .map(|(_, generated)| Arc::clone(generated))
+            .expect("the generated root text is retained")
+    }
+
     fn phase1_snapshot_from_vfs(
         database: &mut RootDatabase,
         module_tree: &ModuleTree,
@@ -48279,6 +48324,149 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         );
         assert_eq!(worlds[1].name, "empty");
         assert!(worlds[1].imports.is_empty() && worlds[1].exports.is_empty());
+    }
+
+    #[test]
+    fn generated_wit_emits_local_world_includes_with_forward_references() {
+        let source = concat!(
+            "world facade {\n",
+            "  import fn begin()\n",
+            "  include worker\n",
+            "  export fn finish()\n",
+            "}\n",
+            "world worker { import fn run() }\n",
+        );
+        let (unit, result) = generated_wit_for_source(source.as_bytes());
+        let generated = generated_text_for_unit(&result, &unit);
+        assert!(
+            generated.complete,
+            "a representable same-package include stays complete: {}",
+            generated.text
+        );
+        let begin = generated
+            .text
+            .find("import begin:")
+            .expect("the earlier world item is printed");
+        let include = generated
+            .text
+            .find("include worker;")
+            .expect("the forward include is printed");
+        let finish = generated
+            .text
+            .find("export finish:")
+            .expect("the later world item is printed");
+        assert!(begin < include && include < finish);
+
+        let package = result.package.expect("generated WIT model loads");
+        let worlds = package.root().worlds.iter_enumerated().collect::<Vec<_>>();
+        assert_eq!(worlds.len(), 2);
+        let (_, facade) = worlds
+            .iter()
+            .find(|(_, world)| world.name == "facade")
+            .copied()
+            .expect("facade world is generated");
+        let (worker_index, _) = worlds
+            .iter()
+            .find(|(_, world)| world.name == "worker")
+            .copied()
+            .expect("included forward world is generated");
+        assert_eq!(
+            facade.source_order,
+            [
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::include(0),
+                sai_wit::WitWorldItemOrder::export(0),
+            ],
+            "include ordering remains interleaved with direct items"
+        );
+        assert_eq!(facade.includes.len(), 1);
+        assert_eq!(facade.includes[0].unit, unit);
+        assert_eq!(facade.includes[0].name, "worker");
+        assert_eq!(
+            facade.includes[0].world, worker_index,
+            "the forward include targets the final generated world index"
+        );
+    }
+
+    #[test]
+    fn generated_wit_omits_world_includes_with_unrepresentable_documentation() {
+        let source = concat!(
+            "world facade {\n",
+            "  /// Included worker contract.\n",
+            "  include worker\n",
+            "}\n",
+            "world worker {}\n",
+        );
+        let (unit, result) = generated_wit_for_source(source.as_bytes());
+        let generated = generated_text_for_unit(&result, &unit);
+        assert!(
+            !generated.complete,
+            "an omitted include with docs keeps the generated package incomplete"
+        );
+        assert!(!generated.text.contains("include worker;"));
+        assert!(!generated.text.contains("Included worker contract."));
+
+        let package = result.package.expect("partial generated WIT model loads");
+        let facade = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "facade")
+            .expect("facade world remains");
+        assert!(facade.includes.is_empty());
+    }
+
+    #[test]
+    fn generated_wit_omits_cyclic_local_world_includes() {
+        let source = concat!(
+            "world first {\n",
+            "  import fn begin()\n",
+            "  include second\n",
+            "  export fn finish()\n",
+            "}\n",
+            "world second {\n",
+            "  include first\n",
+            "  import fn run()\n",
+            "}\n",
+            "world independent { import fn stay() }\n",
+        );
+        let (unit, result) = generated_wit_for_source(source.as_bytes());
+        let generated = generated_text_for_unit(&result, &unit);
+        assert!(
+            !generated.complete,
+            "cycle edges are omitted and reported through incomplete generation"
+        );
+        assert!(!generated.text.contains("include first;"));
+        assert!(!generated.text.contains("include second;"));
+        assert!(generated.text.contains("import begin: func();"));
+        assert!(generated.text.contains("export finish: func();"));
+        assert!(generated.text.contains("import run: func();"));
+        assert!(generated.text.contains("import stay: func();"));
+
+        let package = result.package.expect("partial generated WIT model loads");
+        let worlds = package.root().worlds.iter().collect::<Vec<_>>();
+        assert_eq!(worlds.len(), 3);
+        assert!(worlds.iter().all(|world| world.includes.is_empty()));
+        let world_named = |name: &str| {
+            worlds
+                .iter()
+                .find(|world| world.name == name)
+                .copied()
+                .unwrap_or_else(|| panic!("world `{name}` remains generated"))
+        };
+        assert_eq!(
+            world_named("first").source_order,
+            [
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::export(0),
+            ],
+            "removing a cyclic middle entry preserves surviving source order"
+        );
+        assert_eq!(
+            world_named("second").source_order,
+            [sai_wit::WitWorldItemOrder::import(0)],
+            "removing the leading cyclic entry compacts later items"
+        );
     }
 
     #[test]
