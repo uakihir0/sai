@@ -8538,6 +8538,11 @@ fn run_fmt_paths_for_inputs(
                     if cancellation.is_cancelled() {
                         return report_interrupted(parsed, stdout, stderr);
                     }
+                    // The atomic writer reopens the selected destination and
+                    // verifies its identity and bytes immediately before
+                    // replacement. Release the manifest's selection guard so
+                    // Windows can replace that destination.
+                    drop(file.identity_guard.take());
                     match write_file_atomically_in_directory(
                         file.parent
                             .as_deref()
