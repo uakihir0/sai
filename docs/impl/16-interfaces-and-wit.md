@@ -1224,6 +1224,8 @@ pub struct GeneratedWit {
 
 **Generated-WIT progress (IR-666):** A resource whose sole member is one safe synchronous nongeneric method is emitted when its first parameter is exactly one borrowed receiver of that resource and every following named, immutable parameter and optional result has a materializable boundary type. Both `borrow Self` and `borrow mut Self` map to the same WIT `borrow<resource>` receiver. The generated model retains the implicit `self` borrow with the exact resource item identity; the WIT printer omits it from method syntax. Unsupported or unresolved receivers and resources with other unsupported members remain omitted with their handle consumers, and output stays incomplete. The full §16.10.1 plan remains incomplete.
 
+**Generated-WIT progress (IR-667):** A resource may contain any source-ordered combination of supported constructors, statics, and methods, with at most one constructor. All members are staged and checked together; if any member is unsupported, more than one constructor is present, or member names collide after WIT normalization, the whole resource and its handle consumers are omitted and output is incomplete. Its exact resource reference is published only after the complete member list is accepted. The full §16.10.1 plan remains incomplete.
+
 ### 16.10.2 Clients
 
 1. **Bindgen.** `sai bindgen wit` ([13](13-cli.md) §13.6.19 item 1) checks the root, and writes `generated_wit_text(root).text` only when the root has no errors and the text is `complete`.
