@@ -965,6 +965,91 @@ fn generated_world_include_item(
     Ok(Some((reference, *definition, candidate.span)))
 }
 
+fn generated_external_world_include_item(
+    entry: &ItemTreeEntry,
+    owner: &HirOwner<'_>,
+    inputs: &CurrentOwnerInputs,
+    prepared: &PreparedPhase1PackageScopes,
+    symbols: &Interner,
+    selected: Option<&sai_package::mvs::MvsPackageVersion>,
+) -> Result<Option<(WitWorldRef, DefId, sai_hir::Span, bool)>, InterfaceUsesQueryError> {
+    let (path, span) = match owner.node {
+        OwnerNode::WorldItem(item) => match item.kind {
+            WorldItemKind::Include(sai_hir::items::WorldRef::Pkg { path, span, .. }) => {
+                (path, span)
+            }
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let attrs = inputs.validated_attrs.get(&entry.ast_id);
+    let Some((since, deprecated)) = generated_stability(attrs, Some(selected)) else {
+        return Ok(None);
+    };
+    let use_entry = sai_hir::item_tree::UseEntry {
+        ast_id: ast::ErasedAstId::new(0),
+        is_pub: false,
+        pkg_path: path.to_owned(),
+        alias: None,
+        has_items: false,
+        items: Vec::new(),
+        raw_attrs: Vec::new(),
+    };
+    let Ok(parsed) = sai_resolve::use_path::parse_use_path(&use_entry, symbols) else {
+        return Ok(None);
+    };
+    let [world_name] = parsed.segments.as_slice() else {
+        return Ok(None);
+    };
+    let requested_name = symbols
+        .resolve(*world_name)
+        .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+        .map_err(InterfaceUsesQueryError::Collection)?;
+    let requested_name = super::canonical_wit_path_name(&requested_name);
+
+    // Phase 1 already selected and validated these direct views from the
+    // active package graph. Resolving through this exact edge identity avoids
+    // selecting a transitive or same-spelled package view here.
+    let mut matches = prepared.foreign_wit_views.iter().filter(|foreign| {
+        foreign.directly_visible && foreign.visible_identity == parsed.package_identity
+    });
+    let Some(foreign) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Ok(None);
+    }
+    let view = foreign.view.as_ref();
+    let Some(target) = super::wit_view_world_by_name(view, &requested_name) else {
+        // A partial generated source view cannot prove that a missing world
+        // was intentionally omitted rather than unavailable.
+        return Ok(None);
+    };
+    let Some(target_world) = view.model.worlds.get(target.wit) else {
+        return Ok(None);
+    };
+    if target_world.unsupported.is_some() {
+        return Ok(None);
+    }
+    Ok(Some((
+        WitWorldRef {
+            unit: view.unit.clone(),
+            world: target.wit,
+            name: target_world.name.clone(),
+            names: Vec::new(),
+            since,
+            deprecated,
+            span: None,
+        },
+        target.def,
+        span,
+        view.complete,
+    )))
+}
+
 impl PartialEq for InterfaceUsesMemo {
     fn eq(&self, other: &Self) -> bool {
         self.graph.uses == other.graph.uses
@@ -3005,7 +3090,7 @@ fn collect_interface_uses_input(
                     ItemTreeKind::WorldItem { import: true } => Some(true),
                     ItemTreeKind::WorldItem { import: false } => Some(false),
                     ItemTreeKind::WorldInclude => {
-                        let Some((include, target, span)) = generated_world_include_item(
+                        let local_include = generated_world_include_item(
                             entry,
                             &item_hir,
                             item_owner,
@@ -3017,11 +3102,27 @@ fn collect_interface_uses_input(
                             primitive_prelude,
                             prepared.generated_package_version.as_ref(),
                             &generated_world_references,
-                        )?
+                        )?;
+                        let external_include = if local_include.is_none() {
+                            generated_external_world_include_item(
+                                entry,
+                                &item_hir,
+                                inputs,
+                                prepared,
+                                symbols,
+                                prepared.generated_package_version.as_ref(),
+                            )?
+                        } else {
+                            None
+                        };
+                        let Some((include, target, span, target_complete)) = local_include
+                            .map(|(include, target, span)| (include, target, span, true))
+                            .or(external_include)
                         else {
                             generated_complete = false;
                             continue;
                         };
+                        generated_complete &= target_complete;
                         let location = Location::from_decoded_source(
                             inputs.source_ref.clone(),
                             sai_diagnostics::Span::new(span.file, span.range),

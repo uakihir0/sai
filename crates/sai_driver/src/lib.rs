@@ -6399,6 +6399,18 @@ fn canonical_wit_path_name(name: &str) -> String {
         .join("-")
 }
 
+fn wit_view_world_by_name<'a>(
+    view: &'a WitView,
+    requested_name: &str,
+) -> Option<&'a sai_wit::ViewWorld> {
+    view.worlds.values().find(|world| {
+        view.model
+            .worlds
+            .get(world.wit)
+            .is_some_and(|model| canonical_wit_path_name(&model.name) == requested_name)
+    })
+}
+
 fn world_package_path_diagnostic(
     owner: OwnerId,
     span: sai_hir::Span,
@@ -18442,9 +18454,7 @@ impl RootDatabase {
                 Vec::new(),
             ));
         }
-        let found_world = view.worlds.values().find(|world| {
-            canonical_wit_path_name(&view.model.worlds[world.wit].name) == requested_name
-        });
+        let found_world = wit_view_world_by_name(view, &requested_name);
         if let Some(world) = found_world {
             if position == WorldReferencePosition::Include
                 && let Some(unsupported) = view.model.worlds[world.wit].unsupported
@@ -39335,10 +39345,13 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
 
     #[test]
     fn world_package_reference_resolves_when_generated_source_world_is_present() {
-        let root_source = b"world references { include acme:wit-facade/facade }\n\
+        let root_source = b"world references {\n\
+            include acme:wit-source/server\n\
+            include acme:wit-facade/facade\n\
+        }\n\
             fn use_omitted_import() { references.unsupported }\n";
         let mut database = RootDatabase::new().expect("driver initializes");
-        let (_, root_tree, mut snapshot_files) = multi_package_fixture(
+        let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
             &mut database,
             "acme:root#1",
             "acme:root@1.0.0",
@@ -39469,6 +39482,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
 
         let root_manifest: Arc<[u8]> = Arc::from(
             &b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
               requires {\n\
                 acme:wit-source @ ^1\n\
                 acme:wit-facade @ ^1\n\
@@ -39486,6 +39500,51 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 &partial_views,
             )
             .expect("root scopes capture the source package and partial WIT view");
+        let root_generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated-WIT query succeeds")
+            .expect("root source package publishes a generated snapshot");
+        assert!(!root_generated.complete);
+        assert!(
+            root_generated
+                .text
+                .contains("include acme:wit-source/server@1.0.0;")
+        );
+        let root_unit = WitUnit::generated(
+            root_package,
+            &database.packages,
+            &MvsPackageVersion::new(
+                "acme:root",
+                Version::parse("1.0.0").expect("root package version is valid"),
+            )
+            .expect("root package identity is valid"),
+        )
+        .expect("root WIT unit uses its selected version");
+        let root_wit = database
+            .wit_package(&root_unit)
+            .expect("root WIT package with the generated source include loads");
+        assert!(
+            root_wit.failure.is_none(),
+            "the generated source include remains parseable: {:?}",
+            root_wit.failure
+        );
+        let root_wit = root_wit.package.expect("root WIT model is available");
+        let root_world = root_wit
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "references")
+            .expect("root references world is generated");
+        let source_include = root_world
+            .includes
+            .iter()
+            .find(|include| include.unit.canonical_name() == "acme:wit-source@1.0.0")
+            .expect("the exact generated source unit is included");
+        assert_eq!(source_include.name, "server");
+        assert_eq!(
+            source_include.world, generated_view.view.worlds["server"].wit,
+            "the include keeps the world index from the selected generated view"
+        );
         let member_scopes = database
             .collect_active_source_member_scopes(
                 &root_collection,
@@ -48324,6 +48383,265 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         );
         assert_eq!(worlds[1].name, "empty");
         assert!(worlds[1].imports.is_empty() && worlds[1].exports.is_empty());
+    }
+
+    #[test]
+    fn generated_wit_emits_external_world_includes_from_the_selected_wit_view() {
+        let source = b"world facade {\n\
+            import fn before()\n\
+            include acme:dependency/base\n\
+            include acme:dependency/api\n\
+            include acme:dependency/missing\n\
+            include acme:dependency/unsupported\n\
+            include acme:unavailable/ghost\n\
+            export fn after()\n\
+        }\n";
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (root_package, root_tree, root_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", source)],
+        );
+        let (_, dependency_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:dependency",
+            "1.4.12",
+            b"package acme:dependency@1.4.12;\n\
+              interface api {}\n\
+              world base { import dependency-fn: func(); }\n\
+              world unsupported { type payload = u32; }",
+        );
+        let snapshot = WorkspaceSnapshot::new(root_files).expect("workspace snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge(
+                        dependency_node.key().as_str(),
+                        "acme:dependency",
+                    )],
+                ),
+                dependency_node,
+            ],
+        )
+        .expect("active package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target, &graph)
+            .expect("the selected dependency WIT view is available");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:dependency @ ^1.4 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root Phase 1 scopes collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:root",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = WitUnit::generated(root_package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated world package query completes");
+        assert!(
+            result.failure.is_none(),
+            "the external include and recoverable omissions keep WIT parseable: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &unit);
+        assert!(!generated.complete);
+        assert!(
+            generated
+                .text
+                .contains("include acme:dependency/base@1.4.12;")
+        );
+        assert!(!generated.text.contains("include acme:dependency/api"));
+        assert!(!generated.text.contains("include acme:dependency/missing"));
+        assert!(
+            !generated
+                .text
+                .contains("include acme:dependency/unsupported")
+        );
+        assert!(!generated.text.contains("include acme:unavailable/ghost"));
+        let before = generated
+            .text
+            .find("import before:")
+            .expect("the direct import remains");
+        let include = generated
+            .text
+            .find("include acme:dependency/base@1.4.12;")
+            .expect("the selected external world is included");
+        let after = generated
+            .text
+            .find("export after:")
+            .expect("the direct export remains");
+        assert!(before < include && include < after);
+
+        let package = result.package.expect("generated WIT model loads");
+        let world = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "facade")
+            .expect("facade world is generated");
+        assert_eq!(world.includes.len(), 1);
+        assert_eq!(
+            world.includes[0].unit.canonical_name(),
+            "acme:dependency@1.4.12",
+            "the exact selected external package unit is retained"
+        );
+        assert_eq!(world.includes[0].name, "base");
+        assert_eq!(world.includes[0].world.raw(), 0);
+        assert_eq!(
+            world.source_order,
+            [
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::include(0),
+                sai_wit::WitWorldItemOrder::export(0),
+            ],
+            "omitted wrong-kind and missing targets do not disturb direct-item order"
+        );
+    }
+
+    #[test]
+    fn generated_wit_omits_transitive_external_world_includes() {
+        let source = b"world facade {\n\
+            include acme:transitive/base\n\
+            include acme:direct/outer\n\
+        }\n";
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (root_package, root_tree, root_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", source)],
+        );
+        let (direct_package, direct_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:direct",
+            "1.0.0",
+            b"package acme:direct@1.0.0;\n\
+              world outer {}",
+        );
+        let direct_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:direct @ 1.0.0\n\
+              artifact component {}\n\
+              wit \"wit\"\n\
+              requires { acme:transitive @ ^1 }\n"[..],
+        );
+        database
+            .set_package_manifest(
+                direct_package,
+                direct_manifest,
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("direct package contract records its transitive dependency");
+        let direct_node = PackageGraphNode::new(
+            direct_node.key().clone(),
+            direct_node.identity(),
+            direct_node.version().clone(),
+            direct_node.form(),
+            direct_node.role(),
+            vec![graph_edge("acme:transitive#1", "acme:transitive")],
+        )
+        .expect("direct graph node includes its transitive package edge");
+        let (_, transitive_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:transitive",
+            "1.0.0",
+            b"package acme:transitive@1.0.0;\n\
+              world base {}",
+        );
+        let snapshot = WorkspaceSnapshot::new(root_files).expect("workspace snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:direct#1", "acme:direct")],
+                ),
+                direct_node,
+                transitive_node,
+            ],
+        )
+        .expect("active package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target, &graph)
+            .expect("the selected direct and transitive WIT views are available");
+        let available = wit_views.available_unit_names().collect::<Vec<_>>();
+        assert!(available.contains(&"acme:direct@1.0.0"));
+        assert!(available.contains(&"acme:transitive@1.0.0"));
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:direct @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root Phase 1 scopes collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:root",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = WitUnit::generated(root_package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated world package query completes");
+        assert!(
+            result.failure.is_none(),
+            "omitting the transitive include keeps generated WIT parseable: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &unit);
+        assert!(!generated.complete);
+        assert!(
+            !generated.text.contains("include acme:transitive/base"),
+            "a same-spelled world in a transitive package must not be captured"
+        );
+        assert!(
+            generated.text.contains("include acme:direct/outer@1.0.0;"),
+            "the exact direct package world remains representable"
+        );
     }
 
     #[test]
