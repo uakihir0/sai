@@ -18697,19 +18697,30 @@ mod tests {
 
     #[test]
     fn human_paths_are_relative_and_use_forward_slashes() {
-        assert_eq!(
-            relative_path(
-                Path::new("/workspace/project"),
-                Path::new("/workspace/project/a/b")
-            ),
-            Some(PathBuf::from("a/b"))
+        #[cfg(windows)]
+        let (project, external) = (
+            PathBuf::from(r"C:\workspace\project"),
+            PathBuf::from(r"C:\tmp\image\lib.sai"),
+        );
+        #[cfg(not(windows))]
+        let (project, external) = (
+            PathBuf::from("/workspace/project"),
+            PathBuf::from("/tmp/image/lib.sai"),
         );
         assert_eq!(
-            relative_path(
-                Path::new("/workspace/project/src"),
-                Path::new("/tmp/image/lib.sai")
-            ),
-            Some(PathBuf::from("../../../tmp/image/lib.sai"))
+            relative_path(&project, &project.join("a").join("b")),
+            Some(PathBuf::from("a").join("b"))
+        );
+        assert_eq!(
+            relative_path(&project.join("src"), &external),
+            Some(
+                PathBuf::from("..")
+                    .join("..")
+                    .join("..")
+                    .join("tmp")
+                    .join("image")
+                    .join("lib.sai")
+            )
         );
         assert_eq!(
             human_file_path("image/./src/../sai.package"),
