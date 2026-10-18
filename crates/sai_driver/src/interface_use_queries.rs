@@ -35,6 +35,8 @@ use sai_resolve::{
     interface_uses, sai_identifier_to_wit_name, wit_name_collisions,
 };
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher};
+use sai_syntax::SyntaxKind;
+use sai_syntax::ast::{self, AstNode};
 use sai_ty::boundary::{
     BoundaryAlias, BoundaryDefinition, BoundaryType, BoundaryTypeContext, BoundaryTypeOutcome,
     IncompatibleReason, Position, boundary_type_with_references,
@@ -45,9 +47,9 @@ use sai_ty::iface::{
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
 use sai_wit::{
     GeneratedText, WitCase, WitField, WitFunc, WitIfaceIdx, WitIndexVec, WitInterface, WitItem,
-    WitItemIdx, WitItemKind, WitPackage, WitPackageDeclaration, WitPackageName,
-    WitStabilityVersion, WitType, WitTypeRef, WitUnit, WitViewDefKind, WitViewEntity, print_wit,
-    wit_name_to_sai,
+    WitItemIdx, WitItemKind, WitMember, WitMemberKind, WitPackage, WitPackageDeclaration,
+    WitPackageName, WitStabilityVersion, WitType, WitTypeRef, WitUnit, WitViewDefKind,
+    WitViewEntity, print_wit, wit_name_to_sai,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
@@ -1762,6 +1764,7 @@ fn collect_interface_uses_input(
                 owner_uses_complete = false;
                 poisoned_owners.insert(member_owner);
             }
+            let mut staged_resource_item = None;
             if generated_interface_eligible {
                 let item = if member_hir.diagnostics.is_empty()
                     && !member_has_issues
@@ -1790,16 +1793,19 @@ fn collect_interface_uses_input(
                             prepared.generated_package_version.as_ref(),
                             symbols,
                         )?,
-                        super::InterfaceMemberKind::Resource => generated_interface_type_item(
-                            entry,
-                            &member_hir,
-                            &boundary_conversions,
-                            &generated_named_type_references,
-                            flags_marker_accepted,
-                            &inputs.validated_attrs,
-                            prepared.generated_package_version.as_ref(),
-                            symbols,
-                        )?,
+                        super::InterfaceMemberKind::Resource => {
+                            staged_resource_item = generated_interface_type_item(
+                                entry,
+                                &member_hir,
+                                &boundary_conversions,
+                                &generated_named_type_references,
+                                flags_marker_accepted,
+                                &inputs.validated_attrs,
+                                prepared.generated_package_version.as_ref(),
+                                symbols,
+                            )?;
+                            None
+                        }
                         super::InterfaceMemberKind::Function => generated_function_item(
                             entry,
                             &member_hir,
@@ -1853,7 +1859,9 @@ fn collect_interface_uses_input(
                         generated_complete = false;
                     }
                 } else {
-                    generated_complete = false;
+                    if kind != super::InterfaceMemberKind::Resource {
+                        generated_complete = false;
+                    }
                 }
             }
             if kind != super::InterfaceMemberKind::Resource {
@@ -1891,6 +1899,8 @@ fn collect_interface_uses_input(
                 ));
             }
             let mut resource_member_names = Vec::with_capacity(method_entries.len());
+            let mut generated_resource_members = Vec::with_capacity(1);
+            let mut resource_members_supported = resource_members.is_empty();
             for (method_entry, method_owner) in method_entries
                 .into_iter()
                 .zip(resource_members.iter().copied())
@@ -1920,11 +1930,13 @@ fn collect_interface_uses_input(
                 )
                 .map_err(OwnerControlFlowResolutionError::Lowering)
                 .map_err(InterfaceUsesQueryError::Collection)?;
-                if !method_hir.diagnostics.is_empty() {
+                let method_has_diagnostics = !method_hir.diagnostics.is_empty();
+                if method_has_diagnostics {
                     owner_uses_complete = false;
                 }
                 let method_issues = collect_interface_item_issues(&method_hir, false, symbols)?;
-                if !method_issues.is_empty() {
+                let method_has_issues = !method_issues.is_empty();
+                if method_has_issues {
                     owner_uses_complete = false;
                     poisoned_owners.insert(method_owner);
                 }
@@ -1960,7 +1972,7 @@ fn collect_interface_uses_input(
                     &mut owner_uses_complete,
                     inputs,
                 )?;
-                let (has_incompatible_boundary, _boundary_conversions) =
+                let (has_incompatible_boundary, boundary_conversions) =
                     append_interface_boundary_diagnostics(
                         &method_hir,
                         &resolution,
@@ -1985,6 +1997,54 @@ fn collect_interface_uses_input(
                     owner_uses_complete = false;
                     poisoned_owners.insert(method_owner);
                 }
+                if resource_members.len() == 1
+                    && !method_has_diagnostics
+                    && !method_has_issues
+                    && !has_incompatible_boundary
+                    && !generated_resource_constructor_has_unsupported_syntax(method_entry, inputs)
+                    && let Some(member) = generated_resource_constructor_member(
+                        method_entry,
+                        &method_hir,
+                        member_owner.def_id.to_def_id(),
+                        &boundary_conversions,
+                        inputs.validated_attrs.get(&method_entry.ast_id),
+                        prepared.generated_package_version.as_ref(),
+                    )
+                {
+                    generated_resource_members.push(member);
+                    resource_members_supported = true;
+                }
+            }
+            if resource_members_supported && let Some(mut item) = staged_resource_item {
+                item.kind = WitItemKind::Resource(generated_resource_members);
+                let item_name = item.name.clone();
+                if generated_item_names.insert(item_name.clone()) {
+                    let item_index = generated_items
+                        .push(item)
+                        .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+                    if let (Some(unit), Some(interface_index), Some(interface_name)) = (
+                        generated_unit.as_ref(),
+                        generated_interface_index,
+                        interface_wit_name.as_ref(),
+                    ) {
+                        generated_named_type_references.insert(
+                            member_owner.def_id.to_def_id(),
+                            WitTypeRef {
+                                interface: sai_wit::WitIfaceRef {
+                                    unit: unit.clone(),
+                                    interface: interface_index,
+                                    name: interface_name.clone(),
+                                },
+                                item: item_index,
+                                item_name,
+                            },
+                        );
+                    }
+                } else {
+                    generated_complete = false;
+                }
+            } else {
+                generated_complete = false;
             }
             if append_wit_name_collision_diagnostics(
                 resource_member_names,
@@ -3484,6 +3544,89 @@ fn generated_function_item(
     }))
 }
 
+fn generated_resource_constructor_member(
+    entry: &ItemTreeEntry,
+    owner: &HirOwner<'_>,
+    resource: DefId,
+    conversions: &[sai_ty::boundary::BoundaryTypeConversion],
+    attrs: Option<&sai_hir::attrs::ValidatedAttrs>,
+    selected: Option<&sai_package::mvs::MvsPackageVersion>,
+) -> Option<WitMember> {
+    let OwnerNode::InterfaceItem(item) = owner.node else {
+        return None;
+    };
+    let InterfaceItemKind::ResourceMember {
+        resource: owner_resource,
+        role: MemberRole::Constructor,
+        sig,
+        generics,
+    } = item.kind
+    else {
+        return None;
+    };
+    if owner_resource.to_def_id() != resource
+        || item.name.is_error()
+        || sig.safety != sai_hir::Safety::Safe
+        || sig.is_async
+        || !sig.params.is_empty()
+        || sig.borrows.is_some()
+        || sig.effects.is_some()
+        || !generics.params.is_empty()
+        || !generics.where_preds.is_empty()
+        || attrs.is_some_and(|attrs| !attrs.diagnostics.is_empty())
+    {
+        return None;
+    }
+    let [conversion] = conversions else {
+        return None;
+    };
+    if !matches!(
+        &conversion.outcome,
+        BoundaryTypeOutcome::Mapped(BoundaryType::Own(definition)) if *definition == resource
+    ) {
+        return None;
+    }
+    let selected = selected?;
+    let (since, deprecated) = generated_stability(attrs, Some(selected))?;
+
+    Some(WitMember {
+        name: "constructor".to_owned(),
+        kind: WitMemberKind::Constructor,
+        func: WitFunc {
+            params: Vec::new(),
+            result: None,
+            is_async: false,
+        },
+        docs: entry.docs.clone().map(Arc::from),
+        since,
+        deprecated,
+        unsupported: None,
+    })
+}
+
+fn generated_resource_constructor_has_unsupported_syntax(
+    entry: &ItemTreeEntry,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let Some(function) = inputs
+        .ast_ids
+        .pointer(entry.ast_id)
+        .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.root))
+        .and_then(ast::FnDecl::cast)
+    else {
+        // Constructor generation is intentionally fail-closed when its source syntax
+        // cannot be inspected. Signature-only lowering omits bodies and contracts.
+        return true;
+    };
+    function.body().is_some()
+        || function
+            .syntax()
+            .descendants()
+            .any(|node| node.kind() == SyntaxKind::ERROR)
+        || function.requires_clauses().next().is_some()
+        || function.ensures_clauses().next().is_some()
+}
+
 fn generated_interface_type_item(
     entry: &ItemTreeEntry,
     owner: &HirOwner<'_>,
@@ -3671,8 +3814,8 @@ fn generated_interface_type_item(
                 }
             }
         }
-        InterfaceItemKind::Resource { members } => {
-            if !members.is_empty() || !conversions.is_empty() {
+        InterfaceItemKind::Resource { .. } => {
+            if !conversions.is_empty() {
                 return Ok(None);
             }
             WitItemKind::Resource(Vec::new())
