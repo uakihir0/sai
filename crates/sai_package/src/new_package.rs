@@ -760,8 +760,11 @@ fn open_directory_nofollow(parent: &File, component: &OsStr, path: &Path) -> io:
     }
     #[cfg(windows)]
     {
-        let _ = (parent, component);
-        sai_windows_fs::open_directory_without_following(path)
+        sai_windows_fs::open_child_directory_for_child_updates_without_following(
+            parent,
+            path.parent().unwrap_or(path),
+            component,
+        )
     }
     #[cfg(not(any(unix, windows)))]
     {

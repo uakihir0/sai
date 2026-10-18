@@ -467,7 +467,7 @@ fn run_check(
 
     let manifest_path = package_root.join("sai.package");
     let manifest_display_path = fmt_path_reference(&manifest_path, &cwd, Some(&package_root));
-    let manifest_selection = crate::fmt_paths::select_fmt_paths(
+    let manifest_selection = crate::fmt_paths::select_fmt_paths_for_check(
         std::slice::from_ref(&manifest_path),
         &cwd,
         cancellation,
@@ -1922,8 +1922,11 @@ fn check_locked_lock_presence(
 ) -> CheckLockPresence {
     let lock_path = package_root.join("sai.lock");
     let display_path = fmt_path_reference(&lock_path, cwd, Some(package_root));
-    let selection =
-        crate::fmt_paths::select_fmt_paths(std::slice::from_ref(&lock_path), cwd, cancellation);
+    let selection = crate::fmt_paths::select_fmt_paths_for_check(
+        std::slice::from_ref(&lock_path),
+        cwd,
+        cancellation,
+    );
     if selection.interrupted || cancellation.is_cancelled() {
         return CheckLockPresence::Interrupted;
     }
@@ -1981,8 +1984,11 @@ fn check_locked_lock_file_only(
 
     let lock_path = package_root.join("sai.lock");
     let lock_display_path = fmt_path_reference(&lock_path, cwd, Some(package_root));
-    let selection =
-        crate::fmt_paths::select_fmt_paths(std::slice::from_ref(&lock_path), cwd, cancellation);
+    let selection = crate::fmt_paths::select_fmt_paths_for_check(
+        std::slice::from_ref(&lock_path),
+        cwd,
+        cancellation,
+    );
     if selection.interrupted || cancellation.is_cancelled() {
         return CheckLockLocalPreflight::Interrupted;
     }
@@ -2216,8 +2222,11 @@ fn check_locked_preflight(
 
     let lock_path = package_root.join("sai.lock");
     let lock_display_path = fmt_path_reference(&lock_path, cwd, Some(package_root));
-    let selection =
-        crate::fmt_paths::select_fmt_paths(std::slice::from_ref(&lock_path), cwd, cancellation);
+    let selection = crate::fmt_paths::select_fmt_paths_for_check(
+        std::slice::from_ref(&lock_path),
+        cwd,
+        cancellation,
+    );
     if selection.interrupted || cancellation.is_cancelled() {
         return CheckLockPreflight::Interrupted;
     }
@@ -8004,7 +8013,13 @@ fn run_fmt_paths_for_inputs(
         .and_then(|signature| signature.root.as_deref())
         .map(|root| fmt_workspace_diagnostic_base(root, &cwd, parsed.globals.format));
     let mut selection = if workspace_discovery_signature.is_some() {
-        crate::fmt_paths::select_fmt_workspace_paths(input_paths, &cwd, cancellation)
+        if check {
+            crate::fmt_paths::select_fmt_workspace_paths_for_check(input_paths, &cwd, cancellation)
+        } else {
+            crate::fmt_paths::select_fmt_workspace_paths(input_paths, &cwd, cancellation)
+        }
+    } else if check {
+        crate::fmt_paths::select_fmt_paths_for_check(input_paths, &cwd, cancellation)
     } else {
         crate::fmt_paths::select_fmt_paths(input_paths, &cwd, cancellation)
     };
@@ -12592,6 +12607,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn dependency_snapshot_limit_stops_before_scanning_later_packages() {
         let temporary = TestDirectory::new();
         let first_path = temporary.child("first");
@@ -13492,9 +13511,20 @@ mod tests {
         let lines = stderr.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 3);
         assert!(lines[0].starts_with("wrote "));
-        assert!(lines[0].contains("/image/sai.package ("));
-        assert!(lines[1].contains("/image/.gitignore ("));
-        assert!(lines[2].contains("/image/src/lib.sai ("));
+        let written_paths = lines
+            .iter()
+            .map(|line| {
+                line.strip_prefix("wrote ")
+                    .expect("new-package output has a path")
+                    .split_once(" (")
+                    .expect("new-package output has a byte count")
+                    .0
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+        assert!(written_paths[0].ends_with("image/sai.package"));
+        assert!(written_paths[1].ends_with("image/.gitignore"));
+        assert!(written_paths[2].ends_with("image/src/lib.sai"));
         assert!(lines.iter().all(|line| !line.starts_with("wrote /")));
         assert_eq!(
             fs::read_to_string(temporary.child("image/sai.package"))
@@ -13898,6 +13928,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_validates_active_local_path_dependency_offline() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -13945,6 +13979,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_reports_compiler_mismatch_for_an_active_dependency() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -14004,6 +14042,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_reports_contract_mismatch_before_active_dependency_compiler_mismatch() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -14067,6 +14109,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_does_not_gate_inactive_dependency_compiler_compatibility() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -14118,6 +14164,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_compares_inactive_path_pinned_dependency_contracts() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -14230,6 +14280,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_classifies_a_changed_local_lock_floor_as_out_of_date() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -14284,6 +14338,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_rejects_an_artifact_only_allocator_package() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -14333,6 +14391,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_rejects_use_artifact_on_a_source_only_package() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);

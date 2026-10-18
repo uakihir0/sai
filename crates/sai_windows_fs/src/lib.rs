@@ -762,6 +762,122 @@ pub fn open_directory_path_without_following(path: &Path) -> io::Result<File> {
     }
 }
 
+/// Open an absolute directory path without following links, granting rights
+/// to atomically update its direct child entries.
+///
+/// The handle remains anchored to the final directory while atomic file
+/// replacements are performed. Earlier path components are opened with the
+/// ordinary read-only directory access used for traversal.
+pub fn open_directory_path_for_child_updates_without_following(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        let root = path.ancestors().last().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path must be absolute",
+            )
+        })?;
+        let relative = path.strip_prefix(root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path must be normalized",
+            )
+        })?;
+        if relative.components().next().is_none() {
+            return windows_handle::open_directory_for_child_updates(root);
+        }
+        let mut current = open_directory_without_following(root)?;
+        let mut current_path = root.to_path_buf();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            match component {
+                Component::Normal(name) => {
+                    current = if components.peek().is_none() {
+                        open_child_directory_for_child_updates_without_following(
+                            &current,
+                            &current_path,
+                            name,
+                        )?
+                    } else {
+                        open_child_directory_without_following(&current, &current_path, name)?
+                    };
+                    current_path.push(name);
+                }
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "directory path must be normalized",
+                    ));
+                }
+            }
+        }
+        Ok(current)
+    }
+    #[cfg(not(windows))]
+    {
+        open_directory_path_without_following(path)
+    }
+}
+
+/// Open an absolute directory path without following links, granting rights to
+/// atomically update direct child files without creating child directories.
+///
+/// The handle remains anchored to the final directory while atomic file
+/// replacements are performed. Earlier path components are opened with the
+/// ordinary read-only directory access used for traversal.
+pub fn open_directory_path_for_file_updates_without_following(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        let root = path.ancestors().last().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path must be absolute",
+            )
+        })?;
+        let relative = path.strip_prefix(root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path must be normalized",
+            )
+        })?;
+        if relative.components().next().is_none() {
+            return windows_handle::open_directory_for_file_updates(root);
+        }
+        let mut current = open_directory_without_following(root)?;
+        let mut current_path = root.to_path_buf();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            match component {
+                Component::Normal(name) => {
+                    current = if components.peek().is_none() {
+                        open_child_directory_for_file_updates_without_following(
+                            &current,
+                            &current_path,
+                            name,
+                        )?
+                    } else {
+                        open_child_directory_without_following(&current, &current_path, name)?
+                    };
+                    current_path.push(name);
+                }
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "directory path must be normalized",
+                    ));
+                }
+            }
+        }
+        Ok(current)
+    }
+    #[cfg(not(windows))]
+    {
+        open_directory_path_without_following(path)
+    }
+}
+
 /// Open a direct child directory without following a symbolic link or junction.
 ///
 /// `child_name` must be one normal path component. Unix uses `openat`; Windows
@@ -791,6 +907,66 @@ pub fn open_child_directory_without_following(
         )
         .map(File::from)
         .map_err(Into::into)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, parent_path, child_name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "opening child directories without following links is unavailable on this platform",
+        ))
+    }
+}
+
+/// Open a direct child directory without following a link, granting rights to
+/// atomically update its direct child entries.
+///
+/// The opened directory denies delete sharing so it cannot be moved while its
+/// formatter capability remains alive.
+pub fn open_child_directory_for_child_updates_without_following(
+    parent: &File,
+    parent_path: &Path,
+    child_name: &OsStr,
+) -> io::Result<File> {
+    validate_child_name(child_name)?;
+    #[cfg(windows)]
+    {
+        let _ = parent_path;
+        windows_handle::open_child_for_child_updates(parent, child_name)
+    }
+    #[cfg(unix)]
+    {
+        open_child_directory_without_following(parent, parent_path, child_name)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, parent_path, child_name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "opening child directories without following links is unavailable on this platform",
+        ))
+    }
+}
+
+/// Open a direct child directory without following a link, granting rights to
+/// atomically update direct child files without creating child directories.
+///
+/// The opened directory denies delete sharing so it cannot be moved while its
+/// file-update capability remains alive.
+pub fn open_child_directory_for_file_updates_without_following(
+    parent: &File,
+    parent_path: &Path,
+    child_name: &OsStr,
+) -> io::Result<File> {
+    validate_child_name(child_name)?;
+    #[cfg(windows)]
+    {
+        let _ = parent_path;
+        windows_handle::open_child_for_file_updates(parent, child_name)
+    }
+    #[cfg(unix)]
+    {
+        open_child_directory_without_following(parent, parent_path, child_name)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -1265,6 +1441,7 @@ mod windows_handle {
     use std::mem::{self, offset_of};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::path::Path;
     use std::ptr;
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -1292,6 +1469,87 @@ mod windows_handle {
             GENERIC_READ | FILE_READ_ATTRIBUTES,
             !directory,
         )?;
+        validate_opened_child(file, directory)
+    }
+
+    pub(super) fn open_child_for_child_updates(parent: &File, name: &OsStr) -> io::Result<File> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD,
+        };
+
+        let file = open_child_with_access(
+            parent,
+            name,
+            true,
+            GENERIC_READ
+                | FILE_READ_ATTRIBUTES
+                | FILE_ADD_FILE
+                | FILE_ADD_SUBDIRECTORY
+                | FILE_DELETE_CHILD,
+            false,
+        )?;
+        validate_opened_child(file, true)
+    }
+
+    pub(super) fn open_child_for_file_updates(parent: &File, name: &OsStr) -> io::Result<File> {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ADD_FILE, FILE_DELETE_CHILD};
+
+        let file = open_child_with_access(
+            parent,
+            name,
+            true,
+            GENERIC_READ | FILE_READ_ATTRIBUTES | FILE_ADD_FILE | FILE_DELETE_CHILD,
+            false,
+        )?;
+        validate_opened_child(file, true)
+    }
+
+    pub(super) fn open_directory_for_child_updates(path: &Path) -> io::Result<File> {
+        open_directory_for_updates(path, true)
+    }
+
+    pub(super) fn open_directory_for_file_updates(path: &Path) -> io::Result<File> {
+        open_directory_for_updates(path, false)
+    }
+
+    fn open_directory_for_updates(path: &Path, allow_child_directories: bool) -> io::Result<File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let desired_access = GENERIC_READ
+            | FILE_READ_ATTRIBUTES
+            | FILE_ADD_FILE
+            | FILE_DELETE_CHILD
+            | if allow_child_directories {
+                FILE_ADD_SUBDIRECTORY
+            } else {
+                0
+            };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(desired_access)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        if is_reparse_point(&file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path is a Windows reparse point",
+            ));
+        }
+        if !file.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not a directory",
+            ));
+        }
+        Ok(file)
+    }
+
+    fn validate_opened_child(file: File, directory: bool) -> io::Result<File> {
         if is_reparse_point(&file)? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1573,6 +1831,8 @@ mod windows_tests {
     use super::{
         file_identity, move_directory_handle_to_child_without_replacing,
         open_child_directory_for_rename_without_following, open_child_directory_without_following,
+        open_directory_path_for_child_updates_without_following,
+        open_directory_path_for_file_updates_without_following,
         open_directory_path_without_following, remove_file_in_directory, replace_file_in_directory,
     };
 
@@ -1606,7 +1866,8 @@ mod windows_tests {
         fs::write(package.join("sai.package"), b"original").unwrap();
 
         let canonical = fs::canonicalize(&package).unwrap();
-        let package_handle = open_directory_path_without_following(&canonical).unwrap();
+        let package_handle =
+            open_directory_path_for_file_updates_without_following(&canonical).unwrap();
         assert!(fs::rename(&package, &moved).is_err());
 
         replace_file_in_directory(
@@ -1652,8 +1913,10 @@ mod windows_tests {
         fs::create_dir(&destination).unwrap();
         fs::write(destination.join("marker"), b"destination").unwrap();
 
-        let parent_handle =
-            open_directory_path_without_following(&fs::canonicalize(&parent).unwrap()).unwrap();
+        let parent_handle = open_directory_path_for_child_updates_without_following(
+            &fs::canonicalize(&parent).unwrap(),
+        )
+        .unwrap();
         let source_handle = open_child_directory_for_rename_without_following(
             &parent_handle,
             std::ffi::OsStr::new("temporary"),
