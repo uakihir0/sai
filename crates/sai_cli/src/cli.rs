@@ -1689,7 +1689,8 @@ fn run_check(
     });
     let profile = check_profile_override(command).unwrap_or_else(|| "dev".to_owned());
     let root_analysis_is_covered = root_coverage.empty_root_module_only_covered
-        || root_coverage.public_primitive_const_set_covered;
+        || root_coverage.public_primitive_const_set_covered
+        || root_coverage.single_public_function_body_covered;
     let check_slice_is_supported = root_analysis_is_covered
         && empty_root_manifest_supported
         && root_manifest_semantically_valid
@@ -1903,6 +1904,36 @@ fn check_source_is_unattributed_public_const_set(source: &[u8]) -> Option<usize>
     (const_count > 0).then_some(const_count)
 }
 
+fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
+    use sai_syntax::ast::AstNode as _;
+
+    let Some(parsed) = sai_fmt::parse_source(source).ok() else {
+        return false;
+    };
+    let Some(source_file) = sai_syntax::ast::SourceFile::cast(parsed.root().clone()) else {
+        return false;
+    };
+    if source_file.module_header().is_some()
+        || source_file.test_decls().next().is_some()
+        || source_file.property_decls().next().is_some()
+        || source_file
+            .syntax()
+            .children()
+            .any(|child| sai_syntax::ast::UseDecl::can_cast(child.kind()))
+    {
+        return false;
+    }
+    let mut items = source_file.items();
+    let Some(sai_syntax::ast::Item::Function(function)) = items.next() else {
+        return false;
+    };
+    items.next().is_none()
+        && function.attrs().next().is_none()
+        && function
+            .visibility()
+            .is_some_and(|visibility| visibility.pub_token().is_some())
+}
+
 fn check_public_primitive_const_set_coverage(
     source_count: usize,
     scopes: &sai_driver::Phase1PackageScopes,
@@ -1936,6 +1967,463 @@ fn check_public_primitive_const_set_coverage(
                 .literal_check()
                 .is_ok_and(sai_driver::ConstLiteralCheck::is_supported)
         })
+}
+
+fn check_public_function_body_coverage(
+    source_is_candidate: bool,
+    scopes: &sai_driver::Phase1PackageScopes,
+    function_resolutions: &sai_driver::FunctionOwnerResolutions,
+) -> bool {
+    if !source_is_candidate
+        || scopes.modules.len() != 1
+        || !scopes.modules[0].imports.is_empty()
+        || scopes.top_level_owners.len() != 1
+        || function_resolutions.owners().len() != 1
+        || scopes.top_level_owners[0].kind != sai_driver::TopLevelOwnerKind::Function
+    {
+        return false;
+    }
+    let owner = &function_resolutions.owners()[0];
+    if owner.owner() != scopes.top_level_owners[0].owner {
+        return false;
+    }
+    owner
+        .body_type_check()
+        .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
+        && owner
+            .local_resolution()
+            .is_ok_and(|locals| locals.is_some_and(|locals| locals.diagnostics.is_empty()))
+        && owner
+            .resolution()
+            .is_ok_and(|resolution| resolution.diagnostics.is_empty())
+        && owner.lowering_diagnostics().is_empty()
+}
+
+fn active_public_name_diagnostics(
+    database: &mut RootDatabase,
+    collection: &sai_driver::Phase1PackageScopesCollection,
+    snapshot: &WorkspaceSnapshot,
+    source_by_key: &HashMap<String, (String, Arc<[u8]>)>,
+    package_identity: &str,
+    include_source_lines: bool,
+) -> Result<Vec<CheckDiagnostic>, String> {
+    use sai_syntax::ast::AstNode as _;
+
+    let mut diagnostics = Vec::new();
+    let mut parsed_files = HashMap::new();
+    for descriptor in &collection.scopes().top_level_owners {
+        if !matches!(
+            descriptor.kind,
+            sai_driver::TopLevelOwnerKind::Function
+                | sai_driver::TopLevelOwnerKind::Struct
+                | sai_driver::TopLevelOwnerKind::Alias
+                | sai_driver::TopLevelOwnerKind::Refined
+                | sai_driver::TopLevelOwnerKind::Enum
+                | sai_driver::TopLevelOwnerKind::Distinct
+                | sai_driver::TopLevelOwnerKind::Resource
+                | sai_driver::TopLevelOwnerKind::Trait
+                | sai_driver::TopLevelOwnerKind::Impl
+                | sai_driver::TopLevelOwnerKind::Const
+                | sai_driver::TopLevelOwnerKind::Effect
+                | sai_driver::TopLevelOwnerKind::Interface
+                | sai_driver::TopLevelOwnerKind::World
+        ) {
+            continue;
+        }
+
+        let (parsed, ast_ids) = if let Some(parsed) = parsed_files.get(&descriptor.file) {
+            parsed
+        } else {
+            let parsed = database
+                .parse_file(snapshot, descriptor.file)
+                .map_err(|error| format!("public-name source parse failed: {error:?}"))?;
+            let ast_ids = database
+                .ast_id_map(snapshot, descriptor.file)
+                .map_err(|error| format!("public-name AST indexing failed: {error:?}"))?;
+            parsed_files.insert(descriptor.file, (parsed, ast_ids));
+            parsed_files
+                .get(&descriptor.file)
+                .expect("the parsed file was just inserted")
+        };
+        let Some(ast_id) = sai_syntax::ast::AstId::<sai_syntax::ast::Item>::from_erased(
+            ast_ids,
+            descriptor.item_id,
+        ) else {
+            return Err(format!(
+                "public-name owner {:?} has no matching syntax item",
+                descriptor.owner
+            ));
+        };
+        let Some(item) = ast_ids
+            .get(ast_id)
+            .and_then(|pointer| pointer.resolve(descriptor.file, &parsed.root))
+        else {
+            return Err(format!(
+                "public-name owner {:?} could not be resolved in its source file",
+                descriptor.owner
+            ));
+        };
+
+        let mut public_name_ranges = Vec::new();
+        match (descriptor.kind, item) {
+            (
+                sai_driver::TopLevelOwnerKind::Function,
+                sai_syntax::ast::Item::Function(function),
+            ) => {
+                if function.visibility().is_some_and(|visibility| {
+                    visibility.pub_token().is_some() || visibility.export_token().is_some()
+                }) {
+                    push_name_range(
+                        &mut public_name_ranges,
+                        function.name().and_then(|name| name.token()),
+                    );
+                }
+            }
+            (sai_driver::TopLevelOwnerKind::Trait, sai_syntax::ast::Item::Trait(trait_decl)) => {
+                if is_public_visibility(trait_decl.visibility()) {
+                    push_name_range(
+                        &mut public_name_ranges,
+                        trait_decl.name().and_then(|name| name.token()),
+                    );
+                    if let Some(items) = trait_decl.items() {
+                        for function in items.functions() {
+                            push_name_range(
+                                &mut public_name_ranges,
+                                function.name().and_then(|name| name.token()),
+                            );
+                        }
+                        for assoc_type in items.assoc_type_decls() {
+                            push_name_range(
+                                &mut public_name_ranges,
+                                assoc_type.name().and_then(|name| name.token()),
+                            );
+                        }
+                    }
+                }
+            }
+            (sai_driver::TopLevelOwnerKind::Impl, sai_syntax::ast::Item::Impl(impl_decl)) => {
+                if impl_decl.inherent_type().is_some() {
+                    if let Some(items) = impl_decl.items() {
+                        for function in items.functions().filter(|function| {
+                            function
+                                .visibility()
+                                .is_some_and(|visibility| visibility.pub_token().is_some())
+                        }) {
+                            push_name_range(
+                                &mut public_name_ranges,
+                                function.name().and_then(|name| name.token()),
+                            );
+                        }
+                    }
+                }
+            }
+            (sai_driver::TopLevelOwnerKind::Struct, sai_syntax::ast::Item::Type(type_decl))
+            | (sai_driver::TopLevelOwnerKind::Alias, sai_syntax::ast::Item::Type(type_decl))
+            | (sai_driver::TopLevelOwnerKind::Refined, sai_syntax::ast::Item::Type(type_decl)) => {
+                push_type_public_names(&mut public_name_ranges, &type_decl, false);
+            }
+            (sai_driver::TopLevelOwnerKind::Enum, sai_syntax::ast::Item::Enum(enumeration)) => {
+                if is_public_visibility(enumeration.visibility()) {
+                    push_enum_public_names(&mut public_name_ranges, &enumeration);
+                }
+            }
+            (
+                sai_driver::TopLevelOwnerKind::Distinct,
+                sai_syntax::ast::Item::Distinct(distinct),
+            ) => {
+                if is_public_visibility(distinct.visibility()) {
+                    push_name_range(
+                        &mut public_name_ranges,
+                        distinct.name().and_then(|name| name.token()),
+                    );
+                }
+            }
+            (
+                sai_driver::TopLevelOwnerKind::Resource,
+                sai_syntax::ast::Item::Resource(resource),
+            ) => {
+                if is_public_visibility(resource.visibility()) {
+                    push_name_range(
+                        &mut public_name_ranges,
+                        resource.name().and_then(|name| name.token()),
+                    );
+                }
+                if let Some(fields) = resource.fields() {
+                    for field in fields.fields().filter(|field| field.pub_token().is_some()) {
+                        push_name_range(
+                            &mut public_name_ranges,
+                            field.name().and_then(|name| name.token()),
+                        );
+                    }
+                }
+            }
+            (sai_driver::TopLevelOwnerKind::Const, sai_syntax::ast::Item::Const(constant)) => {
+                if is_public_visibility(constant.visibility()) {
+                    push_name_range(
+                        &mut public_name_ranges,
+                        constant.name().and_then(|name| name.token()),
+                    );
+                }
+            }
+            (sai_driver::TopLevelOwnerKind::Effect, sai_syntax::ast::Item::Effect(effect)) => {
+                if is_public_visibility(effect.visibility()) {
+                    push_name_range(
+                        &mut public_name_ranges,
+                        effect.name().and_then(|name| name.token()),
+                    );
+                }
+            }
+            (
+                sai_driver::TopLevelOwnerKind::Interface,
+                sai_syntax::ast::Item::Interface(interface),
+            ) => {
+                push_name_range(
+                    &mut public_name_ranges,
+                    interface.name().and_then(|name| name.token()),
+                );
+                if let Some(items) = interface.items() {
+                    for type_decl in items.types() {
+                        push_type_public_names(&mut public_name_ranges, &type_decl, true);
+                    }
+                    for enumeration in items.enums() {
+                        push_enum_public_names(&mut public_name_ranges, &enumeration);
+                    }
+                    for resource in items.iface_resources() {
+                        push_name_range(
+                            &mut public_name_ranges,
+                            resource.name().and_then(|name| name.token()),
+                        );
+                        if let Some(items) = resource.items() {
+                            for function in items.functions() {
+                                push_wit_function_public_names(&mut public_name_ranges, function);
+                            }
+                            for assoc_type in items.assoc_type_decls() {
+                                push_name_range(
+                                    &mut public_name_ranges,
+                                    assoc_type.name().and_then(|name| name.token()),
+                                );
+                            }
+                            for assoc_type in items.assoc_type_defs() {
+                                push_name_range(
+                                    &mut public_name_ranges,
+                                    assoc_type.name().and_then(|name| name.token()),
+                                );
+                            }
+                        }
+                    }
+                    for function in items
+                        .syntax()
+                        .children()
+                        .filter_map(sai_syntax::ast::FnDecl::cast)
+                    {
+                        push_wit_function_public_names(&mut public_name_ranges, function);
+                    }
+                }
+            }
+            (sai_driver::TopLevelOwnerKind::World, sai_syntax::ast::Item::World(world)) => {
+                push_name_range(
+                    &mut public_name_ranges,
+                    world.name().and_then(|name| name.token()),
+                );
+                if let Some(items) = world.items() {
+                    for type_decl in items.types() {
+                        push_type_public_names(&mut public_name_ranges, &type_decl, true);
+                    }
+                    for enumeration in items.enums() {
+                        push_enum_public_names(&mut public_name_ranges, &enumeration);
+                    }
+                    for world_item in items.world_imports() {
+                        push_world_item_public_names(
+                            &mut public_name_ranges,
+                            world_item.function(),
+                        );
+                    }
+                    for world_item in items.world_exports() {
+                        push_world_item_public_names(
+                            &mut public_name_ranges,
+                            world_item.function(),
+                        );
+                    }
+                }
+            }
+            (kind, _) => {
+                return Err(format!(
+                    "public-name owner {:?} has unexpected syntax for {kind:?}",
+                    descriptor.owner
+                ));
+            }
+        }
+
+        let Some(file_key) = database.file_key(descriptor.file) else {
+            return Err(format!(
+                "public-name owner {:?} has no source file key",
+                descriptor.owner
+            ));
+        };
+        let Some((display_path, source)) = source_by_key.get(file_key.path()) else {
+            return Err(format!(
+                "public-name source {} is missing from its package snapshot",
+                file_key.path()
+            ));
+        };
+        let decoded_source = SourceFile::decode(descriptor.file, source)
+            .map_err(|error| format!("public-name source decode failed: {error:?}"))?;
+        for range in public_name_ranges {
+            push_public_name_diagnostic(
+                &mut diagnostics,
+                source,
+                &decoded_source,
+                display_path,
+                package_identity,
+                include_source_lines,
+                range,
+            );
+        }
+    }
+
+    for module in &collection.scopes().modules {
+        for import in module.imports.iter().filter(|import| {
+            import.is_pub && import.item_index.is_some() && !import.inactive && !import.test_only
+        }) {
+            let Some(file_key) = database.file_key(import.name_span.file) else {
+                return Err("public re-export has no source file key".to_owned());
+            };
+            let Some((display_path, source)) = source_by_key.get(file_key.path()) else {
+                return Err(format!(
+                    "public re-export source {} is missing from its package snapshot",
+                    file_key.path()
+                ));
+            };
+            let decoded_source = SourceFile::decode(import.name_span.file, source)
+                .map_err(|error| format!("public re-export source decode failed: {error:?}"))?;
+            let range =
+                import.name_span.range.start().to_usize()..import.name_span.range.end().to_usize();
+            push_public_name_diagnostic(
+                &mut diagnostics,
+                source,
+                &decoded_source,
+                display_path,
+                package_identity,
+                include_source_lines,
+                range,
+            );
+        }
+    }
+
+    Ok(diagnostics)
+}
+
+fn is_public_visibility(visibility: Option<sai_syntax::ast::Visibility>) -> bool {
+    visibility.is_some_and(|visibility| {
+        visibility.pub_token().is_some() || visibility.export_token().is_some()
+    })
+}
+
+fn push_name_range(
+    ranges: &mut Vec<std::ops::Range<usize>>,
+    token: Option<sai_syntax::SyntaxToken>,
+) {
+    if let Some(token) = token {
+        ranges.push(token.text_range().start().to_usize()..token.text_range().end().to_usize());
+    }
+}
+
+fn push_type_public_names(
+    ranges: &mut Vec<std::ops::Range<usize>>,
+    type_decl: &sai_syntax::ast::TypeDecl,
+    include_all_fields: bool,
+) {
+    if include_all_fields || is_public_visibility(type_decl.visibility()) {
+        push_name_range(ranges, type_decl.name().and_then(|name| name.token()));
+    }
+    if let Some(fields) = type_decl
+        .struct_def()
+        .and_then(|definition| definition.fields())
+    {
+        for field in fields
+            .fields()
+            .filter(|field| include_all_fields || field.pub_token().is_some())
+        {
+            push_name_range(ranges, field.name().and_then(|name| name.token()));
+        }
+    }
+}
+
+fn push_enum_public_names(
+    ranges: &mut Vec<std::ops::Range<usize>>,
+    enumeration: &sai_syntax::ast::EnumDecl,
+) {
+    push_name_range(ranges, enumeration.name().and_then(|name| name.token()));
+    if let Some(variants) = enumeration.variants() {
+        for variant in variants.variants() {
+            push_name_range(ranges, variant.name().and_then(|name| name.token()));
+            if let Some(fields) = variant.record_shape() {
+                for field in fields.fields() {
+                    push_name_range(ranges, field.name().and_then(|name| name.token()));
+                }
+            }
+        }
+    }
+}
+
+fn push_world_item_public_names(
+    ranges: &mut Vec<std::ops::Range<usize>>,
+    function: Option<sai_syntax::ast::FnDecl>,
+) {
+    if let Some(function) = function {
+        push_wit_function_public_names(ranges, function);
+    }
+}
+
+fn push_wit_function_public_names(
+    ranges: &mut Vec<std::ops::Range<usize>>,
+    function: sai_syntax::ast::FnDecl,
+) {
+    push_name_range(ranges, function.name().and_then(|name| name.token()));
+    if let Some(params) = function.params() {
+        for param in params.params() {
+            push_name_range(ranges, param.name().and_then(|name| name.token()));
+        }
+    }
+}
+
+fn push_public_name_diagnostic(
+    diagnostics: &mut Vec<CheckDiagnostic>,
+    source: &Arc<[u8]>,
+    decoded_source: &SourceFile,
+    display_path: &str,
+    package_identity: &str,
+    include_source_lines: bool,
+    decoded_span: std::ops::Range<usize>,
+) {
+    if decoded_source
+        .text()
+        .get(decoded_span.clone())
+        .is_none_or(str::is_ascii)
+    {
+        return;
+    }
+    let source_span = decoded_source_range_to_original(Some(decoded_source), decoded_span);
+    let mut diagnostic = cli_source_diagnostic(
+        &mut CliSourceIndex::new(Arc::clone(source)),
+        FmtDiagnosticSource {
+            path: display_path,
+            include_source_line: include_source_lines,
+        },
+        "NON_ASCII_PUBLIC_NAME",
+        "non-ASCII character in a public name".to_owned(),
+        source_span,
+        None,
+        None,
+    );
+    diagnostic.primary_label = "public name must use ASCII characters".to_owned();
+    diagnostics.push(CheckDiagnostic {
+        diagnostic,
+        severity: sai_diagnostics::Severity::Error,
+        package: Some(package_identity.to_owned()),
+        related: Vec::new(),
+        children: Vec::new(),
+    });
 }
 
 fn check_target_override(command: &crate::args::ParsedCommand) -> Option<String> {
@@ -4823,6 +5311,7 @@ struct CheckWorkspaceDiagnostics {
 struct CheckRootCoverage {
     empty_root_module_only_covered: bool,
     public_primitive_const_set_covered: bool,
+    single_public_function_body_covered: bool,
 }
 
 struct CheckSuccessRecord {
@@ -5175,7 +5664,21 @@ fn module_tree_workspace_check_diagnostics(
     } else {
         None
     };
+    let root_single_function_source_candidate = root_const_input_shape
+        && inputs[0]
+            .source_inputs
+            .first()
+            .is_some_and(|(path, _, source)| {
+                let root_source_path = if inputs[0].source_directory == "." {
+                    "lib.sai".to_owned()
+                } else {
+                    format!("{}/lib.sai", inputs[0].source_directory)
+                };
+                path == &root_source_path
+                    && check_source_is_single_unattributed_public_function(source.as_ref())
+            });
     let mut public_primitive_const_set_covered = false;
+    let mut single_public_function_body_covered = false;
     let mut database = RootDatabase::new()
         .map_err(|error| format!("could not initialize query database: {error:?}"))?;
     let package_graph_for_scopes = package_graph.clone();
@@ -5676,6 +6179,18 @@ fn module_tree_workspace_check_diagnostics(
             warnings = warnings.saturating_add(phase1_warnings);
             infos = infos.saturating_add(phase1_infos);
 
+            let public_name_diagnostics = active_public_name_diagnostics(
+                &mut database,
+                &collection,
+                &workspace_snapshot,
+                source_by_key,
+                &input.package_identity,
+                include_source_lines,
+            )
+            .map_err(|error| format!("public-name analysis failed: {error}"))?;
+            errors = errors.saturating_add(public_name_diagnostics.len());
+            diagnostics.extend(public_name_diagnostics);
+
             let package_analysis_diagnostics = collection
                 .package_wit_names()
                 .diagnostics
@@ -5738,6 +6253,55 @@ fn module_tree_workspace_check_diagnostics(
                     )
                 }) {
                     public_primitive_const_set_covered = true;
+                }
+
+                if root_single_function_source_candidate {
+                    let function_resolutions = database
+                        .resolve_function_owner_analyses(
+                            &collection,
+                            module_tree,
+                            &workspace_snapshot,
+                        )
+                        .map_err(|error| format!("function owner analysis failed: {error:?}"))?;
+                    let mut body_diagnostics = Vec::new();
+                    for owner in function_resolutions.owners() {
+                        match owner.body_type_check() {
+                            Ok(body_check) => {
+                                body_diagnostics.extend(body_check.diagnostics().iter().cloned())
+                            }
+                            Err(error) => {
+                                diagnostics.push(check_diagnostic_with_package(
+                                    check_internal_diagnostic(
+                                        &format!("function body type check failed: {error:?}"),
+                                        None,
+                                    ),
+                                    Some(&input.package_identity),
+                                ));
+                                errors = errors.saturating_add(1);
+                            }
+                        }
+                    }
+                    let (body_diagnostics, body_errors, body_warnings, body_infos) =
+                        phase1_check_diagnostics(
+                            &body_diagnostics,
+                            &workspace_source_by_key,
+                            &input.package_identity,
+                            include_source_lines,
+                        );
+                    diagnostics.extend(body_diagnostics);
+                    errors = errors.saturating_add(body_errors);
+                    warnings = warnings.saturating_add(body_warnings);
+                    infos = infos.saturating_add(body_infos);
+
+                    if root_single_function_source_candidate
+                        && check_public_function_body_coverage(
+                            true,
+                            collection.scopes(),
+                            &function_resolutions,
+                        )
+                    {
+                        single_public_function_body_covered = true;
+                    }
                 }
             }
 
@@ -6321,6 +6885,7 @@ fn module_tree_workspace_check_diagnostics(
         root_coverage: CheckRootCoverage {
             empty_root_module_only_covered,
             public_primitive_const_set_covered,
+            single_public_function_body_covered,
         },
     })
 }
