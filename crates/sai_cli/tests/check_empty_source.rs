@@ -283,7 +283,7 @@ fn unsupported_bool_parameter_or_shapes_remain_gated() {
 }
 
 #[test]
-fn public_bool_parameter_comparison_if_functions_emit_check_results() {
+fn public_primitive_parameter_comparison_if_functions_emit_check_results() {
     for source in [
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if right != left { 1 } else { 2 } }\n",
@@ -291,15 +291,29 @@ fn public_bool_parameter_comparison_if_functions_emit_check_results() {
         "pub fn choose(left: Bool, right: Bool) -> I32 { if right <= left { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left > right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if right >= left { 1 } else { 2 } }\n",
+        "pub fn choose(left: I32, right: I32) -> I32 { if left < right { 1 } else { 2 } }\n",
+        "pub fn choose(left: U32, right: U32) -> I32 { if left <= right { 1 } else { 2 } }\n",
+        "pub fn choose(left: F32, right: F32) -> I32 { if left > right { 1 } else { 2 } }\n",
+        "pub fn choose(left: F64, right: F64) -> I32 { if left >= right { 1 } else { 2 } }\n",
+        "pub fn choose(left: Char, right: Char) -> I32 { if left == right { 1 } else { 2 } }\n",
+        "pub fn choose(left: Byte, right: Byte) -> I32 { if left != right { 1 } else { 2 } }\n",
+        "pub fn choose(left: ISize, right: ISize) -> I32 { if left < right { 1 } else { 2 } }\n",
+        "pub fn choose(left: USize, right: USize) -> I32 { if left >= right { 1 } else { 2 } }\n",
+        "pub fn choose(left: Int, right: Int) -> I32 { if left == right { 1 } else { 2 } }\n",
+        "pub fn choose(left: UInt, right: UInt) -> I32 { if left != right { 1 } else { 2 } }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
 }
 
 #[test]
-fn unsupported_bool_parameter_comparison_shapes_remain_gated() {
+fn unsupported_primitive_parameter_comparison_shapes_remain_gated() {
     for source in [
-        "pub fn choose(left: I32, right: I32) -> I32 { if left < right { 1 } else { 2 } }\n",
+        "pub fn choose(left: I32, right: U32) -> I32 { if left < right { 1 } else { 2 } }\n",
+        "pub fn choose(left: I32, right: I32) -> I32 { if left and right { 1 } else { 2 } }\n",
+        "pub fn choose(left: I32, right: I32) -> I32 { if left or right { 1 } else { 2 } }\n",
+        "type IntegerAlias = I32\npub fn choose(left: IntegerAlias, right: IntegerAlias) -> I32 { if left < right { 1 } else { 2 } }\n",
+        "pub fn choose(left: (), right: ()) -> I32 { if left == right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == left { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == true { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right and left { 1 } else { 2 } }\n",
