@@ -280,6 +280,7 @@ impl GeneratedWitCandidate {
                 generated_world.world,
                 &package.unit,
                 &interface_indices,
+                &item_indices,
                 &world_indices,
                 &cyclic_world_indices,
             );
@@ -398,27 +399,120 @@ fn remap_generated_world_references(
     mut world: WitWorld,
     generated_unit: &WitUnit,
     interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+    item_indices: &HashMap<WitIfaceIdx, HashMap<WitItemIdx, WitItemIdx>>,
     world_indices: &HashMap<WitWorldIdx, WitWorldIdx>,
     cyclic_world_indices: &HashSet<WitWorldIdx>,
 ) -> (WitWorld, bool) {
+    fn remap_reference(
+        reference: &mut WitTypeRef,
+        generated_unit: &WitUnit,
+        interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+        item_indices: &HashMap<WitIfaceIdx, HashMap<WitItemIdx, WitItemIdx>>,
+    ) -> bool {
+        if reference.interface.unit != *generated_unit {
+            return true;
+        }
+        let provisional_interface = reference.interface.interface;
+        let Some(interface) = interface_indices.get(&provisional_interface).copied() else {
+            return false;
+        };
+        let Some(item) = item_indices
+            .get(&provisional_interface)
+            .and_then(|indices| indices.get(&reference.item))
+            .copied()
+        else {
+            return false;
+        };
+        reference.interface.interface = interface;
+        reference.item = item;
+        true
+    }
+
+    fn remap_type(
+        ty: &mut WitType,
+        generated_unit: &WitUnit,
+        interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+        item_indices: &HashMap<WitIfaceIdx, HashMap<WitItemIdx, WitItemIdx>>,
+    ) -> bool {
+        match ty {
+            WitType::List(inner)
+            | WitType::Option(inner)
+            | WitType::Future(Some(inner))
+            | WitType::Stream(Some(inner)) => {
+                remap_type(inner, generated_unit, interface_indices, item_indices)
+            }
+            WitType::Result { ok, err } => ok
+                .iter_mut()
+                .chain(err.iter_mut())
+                .all(|inner| remap_type(inner, generated_unit, interface_indices, item_indices)),
+            WitType::Tuple(elements) => elements.iter_mut().all(|element| {
+                remap_type(element, generated_unit, interface_indices, item_indices)
+            }),
+            WitType::Named(reference) | WitType::Own(reference) | WitType::Borrow(reference) => {
+                remap_reference(reference, generated_unit, interface_indices, item_indices)
+            }
+            WitType::Future(None)
+            | WitType::Stream(None)
+            | WitType::Bool
+            | WitType::S8
+            | WitType::S16
+            | WitType::S32
+            | WitType::S64
+            | WitType::U8
+            | WitType::U16
+            | WitType::U32
+            | WitType::U64
+            | WitType::F32
+            | WitType::F64
+            | WitType::Char
+            | WitType::String
+            | WitType::Unsupported(_) => true,
+        }
+    }
+
+    fn remap_function(
+        function: &mut WitFunc,
+        generated_unit: &WitUnit,
+        interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+        item_indices: &HashMap<WitIfaceIdx, HashMap<WitItemIdx, WitItemIdx>>,
+    ) -> bool {
+        function
+            .params
+            .iter_mut()
+            .all(|(_, ty)| remap_type(ty, generated_unit, interface_indices, item_indices))
+            && function.result.as_mut().is_none_or(|result| {
+                remap_type(result, generated_unit, interface_indices, item_indices)
+            })
+    }
+
     fn remap_items(
         items: &mut Vec<WitWorldItem>,
         generated_unit: &WitUnit,
         interface_indices: &HashMap<WitIfaceIdx, WitIfaceIdx>,
+        item_indices: &HashMap<WitIfaceIdx, HashMap<WitItemIdx, WitItemIdx>>,
         complete: &mut bool,
     ) -> Vec<Option<u32>> {
         let mut remapped = Vec::with_capacity(items.len());
         let mut indices = Vec::with_capacity(items.len());
         for mut item in std::mem::take(items) {
-            if let WitWorldItem::Interface { reference, .. } = &mut item
-                && reference.unit == *generated_unit
-            {
-                let Some(index) = interface_indices.get(&reference.interface).copied() else {
-                    *complete = false;
-                    indices.push(None);
-                    continue;
-                };
-                reference.interface = index;
+            let supported = match &mut item {
+                WitWorldItem::Interface { reference, .. } if reference.unit == *generated_unit => {
+                    if let Some(index) = interface_indices.get(&reference.interface).copied() {
+                        reference.interface = index;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                WitWorldItem::Interface { .. } => true,
+                WitWorldItem::Func { func, .. } => {
+                    remap_function(func, generated_unit, interface_indices, item_indices)
+                }
+            };
+            if !supported {
+                *complete = false;
+                indices.push(None);
+                continue;
             }
             let Ok(index) = u32::try_from(remapped.len()) else {
                 *complete = false;
@@ -437,12 +531,14 @@ fn remap_generated_world_references(
         &mut world.imports,
         generated_unit,
         interface_indices,
+        item_indices,
         &mut complete,
     );
     let export_indices = remap_items(
         &mut world.exports,
         generated_unit,
         interface_indices,
+        item_indices,
         &mut complete,
     );
     let mut includes = Vec::with_capacity(world.includes.len());
@@ -637,6 +733,7 @@ fn generated_world_function_item(
     source_graph_packages: &HashSet<PackageId>,
     primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
     local_boundary_aliases: &LocalBoundaryAliases<'_>,
+    generated_local_type_references: &HashMap<DefId, WitTypeRef>,
     selected: Option<&sai_package::mvs::MvsPackageVersion>,
     packages: &PackageInterner,
     symbols: &Interner,
@@ -717,14 +814,21 @@ fn generated_world_function_item(
         let Res::Def(kind, def_id) = path_resolution.base else {
             continue;
         };
-        let definition = match kind {
-            DefKind::Alias => Some(BoundaryDefinition::ModuleAlias),
-            DefKind::Struct
-            | DefKind::Enum
-            | DefKind::Distinct
-            | DefKind::Refined
-            | DefKind::Resource => Some(BoundaryDefinition::OutsideInterfaceNominal),
-            _ => None,
+        let definition = if generated_local_type_references.contains_key(&def_id) {
+            match kind {
+                DefKind::Resource => Some(BoundaryDefinition::Resource),
+                _ => Some(BoundaryDefinition::InterfaceType),
+            }
+        } else {
+            match kind {
+                DefKind::Alias => Some(BoundaryDefinition::ModuleAlias),
+                DefKind::Struct
+                | DefKind::Enum
+                | DefKind::Distinct
+                | DefKind::Refined
+                | DefKind::Resource => Some(BoundaryDefinition::OutsideInterfaceNominal),
+                _ => None,
+            }
         };
         if let Some(definition) = definition {
             definitions.insert(def_id, definition);
@@ -775,7 +879,7 @@ fn generated_world_function_item(
         };
         let Ok(Some(parameter_type)) = sai_ty::boundary::materialize_boundary_type(
             &boundary_type,
-            &HashMap::new(),
+            generated_local_type_references,
             Position::Param,
         ) else {
             return Ok(None);
@@ -795,7 +899,7 @@ fn generated_world_function_item(
         };
         let Ok(result) = sai_ty::boundary::materialize_boundary_type(
             &boundary_type,
-            &HashMap::new(),
+            generated_local_type_references,
             Position::Result,
         ) else {
             return Ok(None);
@@ -2278,6 +2382,7 @@ fn collect_interface_uses_input(
         })
         .transpose()?;
     let mut generated_interfaces = Vec::new();
+    let mut generated_local_type_references = HashMap::<DefId, WitTypeRef>::new();
     let mut generated_interface_indices = WitIndexVec::<WitIfaceIdx, ()>::new();
     let mut interface_names_by_spelling = HashMap::<String, Vec<LocalDefId>>::new();
     for (definition, name) in &package_wit_names.names {
@@ -3007,10 +3112,19 @@ fn collect_interface_uses_input(
                 if let (Some(name), Some((since, deprecated))) =
                     (interface_wit_name, generated_interface_stability)
                 {
+                    let interface_index = generated_interface_index
+                        .expect("generated interface index exists for emitted interface");
+                    if let Some(unit) = generated_unit.as_ref() {
+                        generated_local_type_references.extend(
+                            generated_named_type_references
+                                .iter()
+                                .filter(|(_, reference)| &reference.interface.unit == unit)
+                                .map(|(definition, reference)| (*definition, reference.clone())),
+                        );
+                    }
                     generated_interfaces.push((
                         descriptor.owner.def_id,
-                        generated_interface_index
-                            .expect("generated interface index exists for emitted interface"),
+                        interface_index,
                         WitInterface {
                             name,
                             docs: parent_entry.docs.clone().map(Arc::from),
@@ -3239,8 +3353,10 @@ fn collect_interface_uses_input(
             let mut includes = Vec::new();
             let mut source_order = Vec::with_capacity(child_entries.len());
             let mut import_names = HashSet::new();
+            let mut import_function_names = HashSet::new();
             let mut export_names = HashSet::new();
             let mut include_targets = HashSet::new();
+            let mut world_type_aliases = HashMap::<String, WitTypeRef>::new();
             for (entry, item_owner) in child_entries.into_iter().zip(parent_items.iter().copied()) {
                 let expected_item_path = def_paths
                     .resolve_def_id(item_owner.def_id.to_def_id())
@@ -3382,6 +3498,7 @@ fn collect_interface_uses_input(
                             &source_graph_packages,
                             primitive_prelude,
                             &local_boundary_aliases,
+                            &generated_local_type_references,
                             prepared.generated_package_version.as_ref(),
                             packages,
                             symbols,
@@ -3398,16 +3515,54 @@ fn collect_interface_uses_input(
                     WitWorldItem::Func { name, .. } => name.clone(),
                     WitWorldItem::Interface { reference, .. } => reference.name.clone(),
                 };
+                let mut candidate_world_type_aliases = world_type_aliases.clone();
+                if let WitWorldItem::Func { func, .. } = &item {
+                    let mut references = Vec::new();
+                    let mut references_complete = true;
+                    collect_wit_func_interface_references(
+                        func,
+                        &mut references,
+                        &mut references_complete,
+                    );
+                    let has_alias_collision = references.into_iter().any(|reference| {
+                        if let Some(existing) =
+                            candidate_world_type_aliases.get(&reference.item_name)
+                        {
+                            existing != &reference
+                        } else {
+                            candidate_world_type_aliases
+                                .insert(reference.item_name.clone(), reference);
+                            false
+                        }
+                    });
+                    let aliases_conflict_with_import = candidate_world_type_aliases
+                        .keys()
+                        .any(|alias| import_function_names.contains(alias));
+                    let import_function_conflicts_with_alias =
+                        is_import && candidate_world_type_aliases.contains_key(&name);
+                    if !references_complete
+                        || has_alias_collision
+                        || aliases_conflict_with_import
+                        || import_function_conflicts_with_alias
+                    {
+                        generated_complete = false;
+                        continue;
+                    }
+                }
                 let names = if is_import {
                     &mut import_names
                 } else {
                     &mut export_names
                 };
-                if !names.insert(name) {
+                if !names.insert(name.clone()) {
                     generated_complete = false;
                     continue;
                 }
+                world_type_aliases = candidate_world_type_aliases;
                 if is_import {
+                    if matches!(&item, WitWorldItem::Func { .. }) {
+                        import_function_names.insert(name);
+                    }
                     let Ok(index) = u32::try_from(imports.len()) else {
                         generated_complete = false;
                         continue;
@@ -6072,8 +6227,9 @@ mod tests {
     use sai_resolve::WorldElaborationInterface;
     use sai_vfs::FileId;
     use sai_wit::{
-        WitIfaceRef, WitIndexVec, WitInterface, WitItem, WitItemIdx, WitItemKind, WitType,
-        WitTypeRef, WitUnit, WitWorld, WitWorldIdx, WitWorldItem, WitWorldItemOrder,
+        WitFunc, WitIfaceIdx, WitIfaceRef, WitIndexVec, WitInterface, WitItem, WitItemIdx,
+        WitItemKind, WitType, WitTypeRef, WitUnit, WitWorld, WitWorldIdx, WitWorldItem,
+        WitWorldItemOrder,
     };
     use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -6399,6 +6555,179 @@ mod tests {
             0,
             "the retained alias is compacted to the first item index"
         );
+    }
+
+    #[test]
+    fn generated_candidate_prunes_world_functions_after_interface_and_item_remapping() {
+        let ids = TestIds::new();
+        let selected = MvsPackageVersion::new(
+            "acme:generated-pruning",
+            Version::parse("1.0.0").expect("version is valid"),
+        )
+        .expect("selected package version is valid");
+        let unit = WitUnit::generated(ids.package, &ids.packages, &selected)
+            .expect("generated unit matches selected package");
+        let cyclic_definition = ids.local_definition("cyclic");
+        let api_definition = ids.local_definition("api");
+
+        let mut provisional_interfaces = WitIndexVec::<WitIfaceIdx, ()>::new();
+        let cyclic_index = provisional_interfaces
+            .push(())
+            .expect("cyclic interface index is valid");
+        let api_index = provisional_interfaces
+            .push(())
+            .expect("API interface index is valid");
+        let reference = |interface, interface_name: &str, item, item_name: &str| WitTypeRef {
+            interface: WitIfaceRef {
+                unit: unit.clone(),
+                interface,
+                name: interface_name.to_owned(),
+            },
+            item,
+            item_name: item_name.to_owned(),
+        };
+
+        let mut cyclic_items = WitIndexVec::new();
+        let cyclic_item = cyclic_items
+            .push(generated_item("request", WitItemKind::Alias(WitType::U32)))
+            .expect("cyclic interface item index is valid");
+        let cyclic_interface = generated_interface("cyclic", cyclic_items);
+
+        let mut api_items = WitIndexVec::new();
+        let api_bad_item = api_items
+            .push(generated_item(
+                "bad",
+                WitItemKind::Alias(WitType::Named(reference(
+                    cyclic_index,
+                    "cyclic",
+                    cyclic_item,
+                    "request",
+                ))),
+            ))
+            .expect("unsupported item index is valid");
+        let api_id_item = api_items
+            .push(generated_item("id", WitItemKind::Alias(WitType::U32)))
+            .expect("surviving item index is valid");
+        let api_interface = generated_interface("api", api_items);
+
+        let world_func = |name: &str, type_reference: WitTypeRef| WitWorldItem::Func {
+            name: name.to_owned(),
+            docs: None,
+            func: WitFunc {
+                params: vec![("value".to_owned(), WitType::Named(type_reference))],
+                result: None,
+                is_async: false,
+            },
+            unsupported: None,
+            since: None,
+            deprecated: None,
+            span: None,
+        };
+        let world = WitWorld {
+            name: "server".to_owned(),
+            docs: None,
+            since: None,
+            deprecated: None,
+            imports: vec![
+                world_func("typed", reference(api_index, "api", api_id_item, "id")),
+                world_func(
+                    "dropped-item",
+                    reference(api_index, "api", api_bad_item, "bad"),
+                ),
+            ],
+            exports: vec![world_func(
+                "dropped-interface",
+                reference(cyclic_index, "cyclic", cyclic_item, "request"),
+            )],
+            includes: Vec::new(),
+            source_order: vec![
+                WitWorldItemOrder::import(0),
+                WitWorldItemOrder::import(1),
+                WitWorldItemOrder::export(0),
+            ],
+            unsupported: None,
+            span: None,
+        };
+        let generated = GeneratedWitCandidate {
+            unit: unit.clone(),
+            identity: "acme:generated-pruning".to_owned(),
+            version: Version::parse("1.0.0").expect("version is valid"),
+            interfaces: vec![
+                (cyclic_definition, cyclic_index, cyclic_interface),
+                (api_definition, api_index, api_interface),
+            ],
+            worlds: vec![GeneratedWitWorld {
+                definition: ids.local_definition("server").to_def_id(),
+                provisional_index: WitIndexVec::<WitWorldIdx, ()>::new()
+                    .push(())
+                    .expect("world index is valid"),
+                world,
+            }],
+            cyclic_worlds: HashSet::new(),
+            complete: true,
+        }
+        .into_text(&BTreeSet::from([cyclic_definition]), false)
+        .expect("candidate pruning remaps without dangling references");
+
+        assert!(!generated.complete);
+        assert!(generated.text.contains("use api.{id};"));
+        assert!(generated.text.contains("typed: func(value: id)"));
+        assert!(!generated.text.contains("dropped-item"));
+        assert!(!generated.text.contains("dropped-interface"));
+        assert!(!generated.text.contains("use cyclic"));
+
+        let parsed = sai_wit::parse_source_files(
+            unit.clone(),
+            [sai_wit::WitSourceFile::new(
+                "generated.wit",
+                generated.text.as_bytes().to_vec(),
+            )],
+        )
+        .expect("candidate output with pruned world references parses");
+        let mut resolve = wit_parser::Resolve::default();
+        let package = sai_wit::WitResolveContext::default()
+            .push_package(&mut resolve, parsed)
+            .expect("candidate output with pruned world references resolves");
+        assert_eq!(package.interfaces.len(), 1);
+        let (interface_index, api) = package
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the API interface remains");
+        assert_eq!(api.name, "api");
+        assert_eq!(api.items.len(), 1);
+        let (item_index, item) = api
+            .items
+            .iter_enumerated()
+            .next()
+            .expect("the referenced type item remains");
+        assert_eq!(
+            item_index.index(),
+            0,
+            "the retained type item is compacted after the removed item"
+        );
+        assert_eq!(api_id_item.index(), 1);
+        assert_eq!(item.name, "id");
+        let world = package
+            .worlds
+            .iter()
+            .next()
+            .expect("the server world remains");
+        assert!(world.exports.is_empty());
+        let WitWorldItem::Func { func, .. } = world
+            .imports
+            .iter()
+            .find(|item| matches!(item, WitWorldItem::Func { name, .. } if name == "typed"))
+            .expect("the surviving import is a direct function")
+        else {
+            unreachable!("the selected world item is a function");
+        };
+        let WitType::Named(reference) = &func.params[0].1 else {
+            panic!("the surviving parameter is a named interface type");
+        };
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.item, item_index);
+        assert_eq!(reference.item_name, "id");
     }
 
     #[test]
