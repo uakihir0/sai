@@ -1694,7 +1694,7 @@ fn run_check(
     let check_slice_is_supported = root_analysis_is_covered
         && empty_root_manifest_supported
         && root_manifest_semantically_valid
-        && target.as_deref() == Some("wasm32-core")
+        && matches!(target.as_deref(), Some("wasm32-core" | "wasm64-core"))
         && profile == "dev"
         && !check_locked_mode(command)
         && !check_has_lint_overrides(command)
