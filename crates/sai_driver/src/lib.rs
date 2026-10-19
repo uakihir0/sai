@@ -45963,9 +45963,11 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             "  type HandleRecord { handle: api.Handle }\n",
             "  type BorrowedRecord { handle: borrow api.Handle }\n",
             "  enum HandleVariant { Wrapped(api.Handle) }\n",
+            "  enum BorrowedVariant { Wrapped(borrow api.Handle) }\n",
             "  fn record_consumer(value: HandleRecord)\n",
             "  fn borrowed_record_consumer(value: BorrowedRecord)\n",
             "  fn variant_consumer(value: HandleVariant)\n",
+            "  fn borrowed_variant_consumer(value: BorrowedVariant)\n",
             "  fn accepted(value: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
             "  resource Proxy {\n",
             "    fn new(handle: api.Handle) -> Self\n",
@@ -46056,8 +46058,14 @@ interface facade { use acme:base/types@1.0.0.{handle as forwarded-resource}; }"#
         );
         assert!(!generated.text.contains("record borrowed-record"));
         assert!(!generated.text.contains("borrowed-record-consumer:"));
-        assert!(!generated.text.contains("variant handle-variant"));
-        assert!(!generated.text.contains("variant-consumer:"));
+        assert!(generated.text.contains("variant handle-variant {"));
+        assert!(
+            generated
+                .text
+                .contains("variant-consumer: func(value: handle-variant);")
+        );
+        assert!(!generated.text.contains("variant borrowed-variant"));
+        assert!(!generated.text.contains("borrowed-variant-consumer:"));
         assert!(generated.text.contains("accepted: func("));
         assert!(generated.text.contains("inspect: func("));
         assert!(generated.text.contains("from-foreign: static func("));
@@ -46202,6 +46210,46 @@ interface facade { use acme:base/types@1.0.0.{handle as forwarded-resource}; }"#
                         && reference.item_name == "handle-record"
             ),
             "the consumer points to the exact generated local record"
+        );
+
+        let (handle_variant_index, handle_variant) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle-variant")
+            .expect("the variant with a direct foreign resource payload remains");
+        let sai_wit::WitItemKind::Variant(cases) = &handle_variant.kind else {
+            panic!("the direct-resource variant remains a WIT variant");
+        };
+        let wrapped = cases
+            .iter()
+            .find(|case| case.name == "wrapped")
+            .expect("the resource payload case remains");
+        assert_reference(
+            wrapped
+                .payload
+                .as_ref()
+                .expect("the resource payload remains owned"),
+            is_own,
+        );
+
+        let (_, variant_consumer) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "variant-consumer")
+            .expect("the function consuming the generated variant remains");
+        let sai_wit::WitItemKind::Func(variant_consumer) = &variant_consumer.kind else {
+            panic!("the generated variant consumer remains a WIT function");
+        };
+        assert!(
+            matches!(
+                &variant_consumer.params[0].1,
+                sai_wit::WitType::Named(reference)
+                    if reference.interface.unit == generated_unit
+                        && reference.interface.interface == client_index
+                        && reference.item == handle_variant_index
+                        && reference.item_name == "handle-variant"
+            ),
+            "the consumer points to the exact generated local variant"
         );
 
         let (_, accepted) = client
@@ -46429,6 +46477,57 @@ interface facade { use acme:base/types@1.0.0.{handle as forwarded-resource}; }"#
             generated
                 .text
                 .contains("consume: func(value: handle-record);")
+        );
+    }
+
+    #[test]
+    fn generated_interface_variants_remain_usable_from_partial_foreign_views() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  enum HandleVariant { Wrapped(api.Handle) }\n",
+            "  fn consume(value: HandleVariant)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3; interface api { resource handle; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        mark_authored_wit_view_incomplete(&mut wit_views, "acme:codec");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact partial foreign WIT view");
+        let generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated WIT query succeeds")
+            .expect("root source package publishes generated WIT");
+        assert!(
+            !generated.complete,
+            "a present foreign resource payload from a partial view keeps output incomplete"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{handle};")
+        );
+        assert!(generated.text.contains("variant handle-variant {"));
+        assert!(
+            generated
+                .text
+                .contains("consume: func(value: handle-variant);")
         );
     }
 
