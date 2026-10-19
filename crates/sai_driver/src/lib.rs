@@ -2395,6 +2395,7 @@ pub struct FunctionOwnerResolution {
     owner: OwnerId,
     resolution: Result<LabelResolution, FunctionOwnerResolutionError>,
     local_resolution: Result<Option<LocalResolution>, FunctionOwnerResolutionError>,
+    body_type_check: Result<FunctionBodyTypeCheck, FunctionOwnerResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, FunctionOwnerResolutionError>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, FunctionOwnerResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, FunctionOwnerResolutionError>,
@@ -2423,6 +2424,13 @@ impl FunctionOwnerResolution {
         self.local_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
+    }
+
+    /// Returns the result of the supported direct parameter-to-return check.
+    ///
+    /// `Unsupported` keeps the owner behind the caller's feature gate.
+    pub fn body_type_check(&self) -> Result<&FunctionBodyTypeCheck, &FunctionOwnerResolutionError> {
+        self.body_type_check.as_ref()
     }
 
     /// Returns module-scope path results for names not resolved as locals or
@@ -5616,6 +5624,29 @@ impl ConstOwnerResolution {
     }
 }
 
+/// Result of checking a function whose body is exactly one parameter path.
+///
+/// This is an initial Stage 0 body-checking slice, not a general expression
+/// type checker. Unsupported owner and expression shapes remain gated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FunctionBodyTypeCheck {
+    Unsupported,
+    Supported { diagnostics: Vec<Diagnostic> },
+}
+
+impl FunctionBodyTypeCheck {
+    pub const fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported { .. })
+    }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        match self {
+            Self::Unsupported => &[],
+            Self::Supported { diagnostics } => diagnostics,
+        }
+    }
+}
+
 /// Result of checking one public primitive, canonical `Str`, unit, or flat tuple constant.
 ///
 /// This deliberately covers only direct literals of supported primitive
@@ -5792,7 +5823,8 @@ fn resolve_const_literal_type(
         TyKind::Path(path)
             if path.root == PathRoot::Plain
                 && path.segments.len() == 1
-                && path.segments[0].args.is_none() =>
+                && path.segments[0].args.is_none()
+                && is_plain_ascii_identifier(path.segments[0].name, inputs) =>
         {
             let type_paths = type_paths?;
             match type_paths.paths().get(&path.hir_id) {
@@ -5810,6 +5842,162 @@ fn resolve_const_literal_type(
             }
         }
         _ => None,
+    }
+}
+
+fn check_function_body_type(
+    owner: &HirOwner<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<FunctionBodyTypeCheck, OwnerControlFlowResolutionError> {
+    if !owner.raw_attrs.is_empty() || !body.contracts.is_empty() || !body.invariant_preds.is_empty()
+    {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+    let OwnerNode::Item(item) = owner.node else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    if item.vis != Visibility::Pub {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+    let ItemKind::Fn {
+        sig,
+        generics,
+        has_body: true,
+    } = item.kind
+    else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    if sig.safety != sai_hir::Safety::Safe
+        || sig.is_async
+        || sig.params.len() != 1
+        || sig.params[0].mutable
+        || body.params.len() != 1
+        || body.params[0].mutable
+        || sig.borrows.is_some()
+        || sig.effects.is_some()
+        || !sig.requires.is_empty()
+        || !sig.ensures.is_empty()
+        || !generics.params.is_empty()
+        || !generics.where_preds.is_empty()
+        || !function_name_is_supported(item.name, symbols, inputs)
+        || !sig.params[0]
+            .name
+            .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
+        || sig.params[0].name != body.params[0].name
+    {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+
+    let tail = match body.value.kind {
+        ExprKind::Block(block)
+            if block.safety == sai_hir::Safety::Safe && block.stmts.is_empty() =>
+        {
+            block.tail
+        }
+        _ => None,
+    };
+    let Some(tail) = tail else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    let ExprKind::Path(path) = tail.kind else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    if path.root != PathRoot::Plain
+        || path.segments.len() != 1
+        || path.segments[0].args.is_some()
+        || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+    {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+    let binding = body.params[0].binding;
+    if !matches!(
+        locals.paths.get(&path.hir_id),
+        Some(PathRes {
+            base: Res::Local(resolved_binding),
+            resolved_segments: 1,
+            segment_count: 1,
+        }) if *resolved_binding == binding
+    ) {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+
+    let Some(found) = resolve_function_direct_type(*sig.params[0].ty, type_paths, symbols, inputs)
+    else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    let expected = match sig.ret {
+        Some(ty) => {
+            let Some(expected) = resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+            else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            expected
+        }
+        None => FunctionDirectType::Unit,
+    };
+    let diagnostics = if expected == found {
+        Vec::new()
+    } else {
+        vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            tail.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `{}`, found `{}`",
+                function_direct_type_name(expected),
+                function_direct_type_name(found)
+            ),
+            "type mismatch",
+        )?]
+    };
+    Ok(FunctionBodyTypeCheck::Supported { diagnostics })
+}
+
+fn function_name_is_supported(name: Name, symbols: &Interner, inputs: &CurrentOwnerInputs) -> bool {
+    is_plain_ascii_identifier(name, inputs)
+        && symbols
+            .resolve(name.sym)
+            .is_ok_and(|name| !name.chars().any(char::is_uppercase))
+}
+
+fn is_plain_ascii_identifier(name: Name, inputs: &CurrentOwnerInputs) -> bool {
+    inputs
+        .source
+        .text()
+        .get(name.span.range.start().to_usize()..name.span.range.end().to_usize())
+        .is_some_and(|written| written.is_ascii() && !written.starts_with("r#"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FunctionDirectType {
+    Primitive(sai_resolve::prelude::PrimTy),
+    Unit,
+}
+
+fn resolve_function_direct_type(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<FunctionDirectType> {
+    match resolve_const_literal_type(ty, type_paths, symbols, inputs)? {
+        ConstLiteralType::Primitive(primitive) => Some(FunctionDirectType::Primitive(primitive)),
+        ConstLiteralType::Unit => Some(FunctionDirectType::Unit),
+        ConstLiteralType::Str => None,
+    }
+}
+
+fn function_direct_type_name(ty: FunctionDirectType) -> &'static str {
+    match ty {
+        FunctionDirectType::Primitive(primitive) => const_primitive_name(primitive),
+        FunctionDirectType::Unit => "()",
     }
 }
 
@@ -12506,6 +12694,7 @@ impl RootDatabase {
                                 owner: descriptor.owner,
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
+                                body_type_check: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
                                 module_path_diagnostics: Err(error.clone()),
@@ -12529,6 +12718,7 @@ impl RootDatabase {
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
                 let mut local_resolution = None;
+                let mut body_type_check = None;
                 let mut module_resolution = None;
                 let mut type_path_resolution = None;
                 let mut module_path_diagnostics = None;
@@ -12669,6 +12859,19 @@ impl RootDatabase {
                             };
                             match locals {
                                 Ok(locals) => {
+                                    let resolved_type_paths = type_path_resolution
+                                        .as_ref()
+                                        .and_then(|result| result.as_ref().ok())
+                                        .and_then(Option::as_ref);
+                                    body_type_check = Some(check_function_body_type(
+                                        &hir_owner,
+                                        body,
+                                        &locals,
+                                        resolved_type_paths,
+                                        &self.symbols,
+                                        &inputs,
+                                        snapshot,
+                                    )?);
                                     let mut module_paths = match &module_scope {
                                         Ok(module_scope) => Ok(resolve_owner_module_paths(
                                             &locals,
@@ -12746,6 +12949,11 @@ impl RootDatabase {
                 })();
                 let local_resolution =
                     local_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let body_type_check = body_type_check.map(Ok).unwrap_or_else(|| {
+                    resolution
+                        .clone()
+                        .map(|_| FunctionBodyTypeCheck::Unsupported)
+                });
                 let module_resolution =
                     module_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let type_path_resolution =
@@ -12770,6 +12978,7 @@ impl RootDatabase {
                     owner: descriptor.owner,
                     resolution,
                     local_resolution,
+                    body_type_check,
                     module_resolution,
                     type_path_resolution,
                     module_path_diagnostics,
@@ -23612,6 +23821,84 @@ mod tests {
                 .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::ShadowsModule),
             "the root module's alias does not leak into the child module"
         );
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_only_a_direct_parameter_tail() {
+        let root = concat!(
+            "pub fn identity(value: I32) -> I32 { value }\n",
+            "pub fn mismatch(value: I32) -> Bool { value }\n",
+            "pub fn computed(value: I32) -> I32 { value + 1 }\n",
+            "pub fn string_identity(value: Str) -> Str { value }\n",
+            "pub fn mutable_identity(var value: I32) -> I32 { value }\n",
+            "pub fn identityValue(value: I32) -> I32 { value }\n",
+            "pub fn parameter_case(valueItem: I32) -> I32 { valueItem }\n",
+            "pub fn identité(value: I32) -> I32 { value }\n",
+            "pub fn non_ascii_param(valué: I32) -> I32 { valué }\n",
+            "pub fn r#raw_function(value: I32) -> I32 { value }\n",
+            "pub fn raw_parameter(r#value: I32) -> I32 { r#value }\n",
+            "pub fn raw_tail(value: I32) -> I32 { r#value }\n",
+            "pub fn raw_type(value: r#I32) -> r#I32 { value }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 13);
+        assert!(matches!(
+            resolved.owners()[0]
+                .body_type_check()
+                .expect("identity body check succeeds"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+
+        let mismatch = resolved.owners()[1]
+            .body_type_check()
+            .expect("mismatched body check succeeds");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = mismatch else {
+            panic!("primitive parameter tail is in the supported checking slice");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_eq!(diagnostics[0].message, "expected `Bool`, found `I32`");
+        let value_start = root
+            .find("pub fn mismatch(value: I32) -> Bool { ")
+            .expect("mismatched body exists") as u32
+            + "pub fn mismatch(value: I32) -> Bool { ".len() as u32;
+        assert_eq!(
+            diagnostics[0]
+                .primary()
+                .expect("type mismatch points at the body tail")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(value_start),
+                sai_diagnostics::TextSize::new(value_start + "value".len() as u32),
+            )
+            .expect("body tail range is ordered")
+        );
+
+        for owner in resolved.owners()[2..7]
+            .iter()
+            .chain(&resolved.owners()[7..])
+        {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("unsupported body check succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
     }
 
     #[test]
