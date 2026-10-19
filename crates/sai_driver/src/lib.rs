@@ -5914,57 +5914,113 @@ fn check_function_body_type(
         let Some(tail) = block.tail else {
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
-        let ExprKind::Path(path) = tail.kind else {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        };
-        if path.root != PathRoot::Plain
-            || path.segments.len() != 1
-            || path.segments[0].args.is_some()
-            || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+        if let ExprKind::If {
+            cond,
+            then,
+            els: Some(else_expr),
+        } = tail.kind
         {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        }
-        if !matches!(
-            locals.paths.get(&path.hir_id),
-            Some(PathRes {
-                base: Res::Local(resolved_binding),
-                resolved_segments: 1,
-                segment_count: 1,
-            }) if *resolved_binding == body_parameter.binding
-        ) {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        }
-
-        let Some(found) = resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
-        else {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        };
-        let expected = match sig.ret {
-            Some(ty) => {
-                let Some(expected) = resolve_function_direct_type(*ty, type_paths, symbols, inputs)
-                else {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                };
-                expected
+            let Some(return_ty) = sig.ret else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            if !matches!(
+                resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
+                Some(FunctionDirectType::Primitive(_))
+            ) {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
             }
-            None => FunctionDirectType::Unit,
-        };
-        if expected == found || expected == FunctionDirectType::Unit {
-            Vec::new()
-        } else {
-            vec![const_literal_diagnostic(
-                owner.id,
+            let condition_is_supported = matches!(
+                cond.kind,
+                ExprKind::Path(path)
+                    if path.root == PathRoot::Plain
+                        && path.segments.len() == 1
+                        && path.segments[0].args.is_none()
+                        && is_plain_ascii_identifier(path.segments[0].name, inputs)
+                        && matches!(
+                            locals.paths.get(&path.hir_id),
+                            Some(PathRes {
+                                base: Res::Local(resolved_binding),
+                                resolved_segments: 1,
+                                segment_count: 1,
+                            }) if *resolved_binding == body_parameter.binding
+                        )
+            ) && matches!(
+                resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs),
+                Some(FunctionDirectType::Primitive(
+                    sai_resolve::prelude::PrimTy::Bool
+                ))
+            );
+            let Some(diagnostics) = check_function_if_literal_branches(
+                owner,
+                *return_ty,
+                condition_is_supported,
+                then,
+                else_expr,
+                type_paths,
+                symbols,
                 inputs,
                 snapshot,
-                tail.span,
-                sai_diagnostics::Code::TypeMismatch,
-                format!(
-                    "expected `{}`, found `{}`",
-                    function_direct_type_name(expected),
-                    function_direct_type_name(found)
-                ),
-                "type mismatch",
-            )?]
+                target_cfg,
+            )?
+            else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            diagnostics
+        } else {
+            let ExprKind::Path(path) = tail.kind else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            if path.root != PathRoot::Plain
+                || path.segments.len() != 1
+                || path.segments[0].args.is_some()
+                || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+            {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
+            if !matches!(
+                locals.paths.get(&path.hir_id),
+                Some(PathRes {
+                    base: Res::Local(resolved_binding),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                }) if *resolved_binding == body_parameter.binding
+            ) {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
+
+            let Some(found) =
+                resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
+            else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            let expected = match sig.ret {
+                Some(ty) => {
+                    let Some(expected) =
+                        resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+                    else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    expected
+                }
+                None => FunctionDirectType::Unit,
+            };
+            if expected == found || expected == FunctionDirectType::Unit {
+                Vec::new()
+            } else {
+                vec![const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    tail.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `{}`, found `{}`",
+                        function_direct_type_name(expected),
+                        function_direct_type_name(found)
+                    ),
+                    "type mismatch",
+                )?]
+            }
         }
     } else {
         let Some(return_ty) = sig.ret else {
@@ -5998,8 +6054,16 @@ fn check_function_body_type(
                 } = tail.kind
                 {
                     let Some(diagnostics) = check_function_if_literal_branches(
-                        owner, *return_ty, cond, then, else_expr, type_paths, symbols, inputs,
-                        snapshot, target_cfg,
+                        owner,
+                        *return_ty,
+                        matches!(cond.kind, ExprKind::Lit(Lit::Bool(_))),
+                        then,
+                        else_expr,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
                     )?
                     else {
                         return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -6027,7 +6091,7 @@ fn check_function_body_type(
 fn check_function_if_literal_branches(
     owner: &HirOwner<'_>,
     return_ty: Ty<'_>,
-    condition: &HirExpr<'_>,
+    condition_is_supported: bool,
     then_block: &HirBlock<'_>,
     else_expr: &HirExpr<'_>,
     type_paths: Option<&TypeOwnerPathResolution>,
@@ -6036,7 +6100,7 @@ fn check_function_if_literal_branches(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    if !matches!(condition.kind, ExprKind::Lit(Lit::Bool(_)))
+    if !condition_is_supported
         || then_block.safety != sai_hir::Safety::Safe
         || !then_block.stmts.is_empty()
     {
@@ -24329,6 +24393,55 @@ mod tests {
                     .expect("unsupported if form check succeeds"),
                 FunctionBodyTypeCheck::Unsupported
             ));
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_only_the_bool_parameter_if_condition() {
+        let root = concat!(
+            "const OTHER: Bool = true\n",
+            "type BoolAlias = Bool\n",
+            "pub fn selected(flag: Bool) -> I32 { if flag { 1 } else { 2 } }\n",
+            "pub fn wrong_parameter_type(flag: I32) -> I32 { if flag { 1 } else { 2 } }\n",
+            "pub fn aliased_parameter_type(flag: BoolAlias) -> I32 { if flag { 1 } else { 2 } }\n",
+            "pub fn other_binding(flag: Bool) -> I32 { if OTHER { 1 } else { 2 } }\n",
+            "pub fn mutable_parameter(var flag: Bool) -> I32 { if flag { 1 } else { 2 } }\n",
+            "pub fn self_parameter(self: Bool) -> I32 { if self { 1 } else { 2 } }\n",
+            "pub fn multiple_parameters(flag: Bool, other: Bool) -> I32 { if flag { 1 } else { 2 } }\n",
+            "pub fn non_path_condition(flag: Bool) -> I32 { if 1 { 1 } else { 2 } }\n",
+            "pub fn direct_literal_condition(flag: Bool) -> I32 { if true { 1 } else { 2 } }\n",
+            "pub fn missing_else(flag: Bool) -> I32 { if flag { 1 } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 10);
+
+        assert!(matches!(
+            owners[0]
+                .body_type_check()
+                .expect("the bool parameter path is type-checked"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        for (index, owner) in owners.iter().enumerate().skip(1) {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported parameter condition is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
+            );
         }
     }
 
