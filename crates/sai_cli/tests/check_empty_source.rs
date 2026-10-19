@@ -252,6 +252,57 @@ fn public_char_and_byte_const_literals_emit_check_results() {
 }
 
 #[test]
+fn public_float_const_literals_emit_check_results() {
+    for source in [
+        "pub const POSITIVE: F32 = 1.25\n",
+        "pub const NEGATIVE: F32 = -1.25\n",
+        "pub const SEPARATORS: F32 = 1_234.5_0e+1_0\n",
+        "pub const TIE_EVEN: F32 = 1.000000059604644775390625\n",
+        "pub const UNDERFLOW: F32 = 1e-50\n",
+        "pub const POSITIVE: F64 = 1.25\n",
+        "pub const NEGATIVE: F64 = -1.25\n",
+        "pub const TIE_EVEN: F64 = 1.00000000000000011102230246251565404236316680908203125\n",
+        "pub const UNDERFLOW: F64 = 1e-400\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn public_float_const_errors_and_invalid_later_const_suppress_results() {
+    for (source, expected_code) in [
+        (
+            "pub const BAD: F32 = 3.4028236e38\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        (
+            "pub const BAD: F64 = 1.7976931348623159e308\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        ("pub const BAD: F32 = true\n", "TYPE_MISMATCH"),
+        ("pub const BAD: F64 = 1\n", "TYPE_MISMATCH"),
+        (
+            "pub const FIRST: F32 = 1.25\npub const SECOND: F32 = 3.4028236e38\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: float const error should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("\"code\":\"{expected_code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected supported float diagnostic `{expected_code}` without a result or feature gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn public_primitive_const_type_errors_do_not_emit_results() {
     let cases = [
         ("pub const BAD: Bool = 1\n", "TYPE_MISMATCH"),
@@ -376,7 +427,6 @@ fn const_forms_outside_literal_slice_remain_gated() {
         "const PRIVATE: I8 = 1\n",
         "pub const EXPRESSION: I8 = 1 + 2\n",
         "pub const ALIAS: MyInt = 1\n",
-        "pub const FLOAT: F64 = 1.5\n",
         "pub const TEXT: Str = \"text\"\n",
         "pub const BORROWED: &Bool = &true\n",
         "use missing;\npub const VALUE: I8 = 1\n",

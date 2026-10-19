@@ -5618,9 +5618,9 @@ impl ConstOwnerResolution {
 
 /// Result of checking one public primitive-typed constant literal.
 ///
-/// This deliberately covers only `Bool`, `Char`, `Byte`, and fixed-width
-/// integer primitive types. It does not imply that other constant expressions
-/// are evaluated.
+/// This deliberately covers only `Bool`, `Char`, `Byte`, fixed-width integer
+/// primitive types, and `F32`/`F64` literals. It does not imply that other
+/// constant expressions are evaluated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstLiteralCheck {
     /// The declaration or HIR shape is outside this checking slice.
@@ -5734,6 +5734,29 @@ fn check_const_literal_owner(
                 )?]
             }
         }
+        (primitive, Lit::Float { text, negated }) if is_fixed_width_float_primitive(primitive) => {
+            let text = symbols.resolve(text).ok();
+            if text
+                .as_deref()
+                .and_then(|text| round_const_float_literal(primitive, text, negated))
+                .is_some_and(ConstFloatValue::is_finite)
+            {
+                Vec::new()
+            } else {
+                vec![const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    body.value.span,
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    format!(
+                        "floating-point literal is out of range for `{}`",
+                        const_primitive_name(primitive)
+                    ),
+                    "literal out of range",
+                )?]
+            }
+        }
         (primitive, literal) => vec![const_literal_diagnostic(
             owner.id,
             inputs,
@@ -5769,7 +5792,49 @@ fn is_supported_const_literal_primitive(primitive: sai_resolve::prelude::PrimTy)
         sai_resolve::prelude::PrimTy::Bool
             | sai_resolve::prelude::PrimTy::Char
             | sai_resolve::prelude::PrimTy::Byte
+            | sai_resolve::prelude::PrimTy::F32
+            | sai_resolve::prelude::PrimTy::F64
     ) || is_fixed_width_integer_primitive(primitive)
+}
+
+fn is_fixed_width_float_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
+    matches!(
+        primitive,
+        sai_resolve::prelude::PrimTy::F32 | sai_resolve::prelude::PrimTy::F64
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ConstFloatValue {
+    F32(f32),
+    F64(f64),
+}
+
+impl ConstFloatValue {
+    fn is_finite(self) -> bool {
+        match self {
+            Self::F32(value) => value.is_finite(),
+            Self::F64(value) => value.is_finite(),
+        }
+    }
+}
+
+fn round_const_float_literal(
+    primitive: sai_resolve::prelude::PrimTy,
+    text: &str,
+    negated: bool,
+) -> Option<ConstFloatValue> {
+    match primitive {
+        sai_resolve::prelude::PrimTy::F32 => {
+            let value = text.parse::<f32>().ok()?;
+            Some(ConstFloatValue::F32(if negated { -value } else { value }))
+        }
+        sai_resolve::prelude::PrimTy::F64 => {
+            let value = text.parse::<f64>().ok()?;
+            Some(ConstFloatValue::F64(if negated { -value } else { value }))
+        }
+        _ => None,
+    }
 }
 
 fn is_fixed_width_integer_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
@@ -24901,7 +24966,6 @@ mod tests {
             "pub const BYTE_INT_MISMATCH: Byte = 255\n",
             "pub const CHAR_STRING_MISMATCH: Char = \"a\"\n",
             "pub const BYTE_STRING_MISMATCH: Byte = b\"a\"\n",
-            "pub const FLOAT: F64 = 1.5\n",
             "pub const TEXT: Str = \"text\"\n",
             "pub const BORROWED: &Bool = &true\n",
         );
@@ -24928,7 +24992,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(checks.len(), 15);
+        assert_eq!(checks.len(), 14);
         for (index, primitive) in [
             (0, PrimTy::Char),
             (1, PrimTy::Char),
@@ -24972,13 +25036,174 @@ mod tests {
             assert!(diagnostics[0].has_workspace_snapshot());
             assert!(diagnostics[0].primary().is_some());
         }
-        for index in [12, 13, 14] {
+        for index in [12, 13] {
             assert_eq!(
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
-                "floats, strings, and references remain outside the literal slice"
+                "strings and references remain outside the literal slice"
             );
         }
+    }
+
+    #[test]
+    fn const_float_literals_round_at_the_declared_width_and_report_failures() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub const F32_POSITIVE: F32 = 1.25\n",
+            "pub const F32_NEGATIVE: F32 = -1.25\n",
+            "pub const F32_SEPARATORS: F32 = 1_234.5_0e+1_0\n",
+            "pub const F32_TIE_EVEN: F32 = 1.000000059604644775390625\n",
+            "pub const F32_DOUBLE_ROUNDING: F32 = 1.000000059604644775390626\n",
+            "pub const F32_UNDERFLOW: F32 = 1e-50\n",
+            "pub const F32_MAX: F32 = 3.4028235e38\n",
+            "pub const F64_POSITIVE: F64 = 1.25\n",
+            "pub const F64_NEGATIVE: F64 = -1.25\n",
+            "pub const F64_TIE_EVEN: F64 = 1.00000000000000011102230246251565404236316680908203125\n",
+            "pub const F64_UNDERFLOW: F64 = 1e-400\n",
+            "pub const F64_MAX: F64 = 1.7976931348623157e308\n",
+            "pub const F32_OVERFLOW: F32 = 3.4028236e38\n",
+            "pub const F64_OVERFLOW: F64 = 1.7976931348623159e308\n",
+            "pub const F32_MISMATCH: F32 = true\n",
+            "pub const F64_MISMATCH: F64 = 1\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(checks.len(), 16);
+        for (index, primitive) in [
+            (0, PrimTy::F32),
+            (1, PrimTy::F32),
+            (2, PrimTy::F32),
+            (3, PrimTy::F32),
+            (4, PrimTy::F32),
+            (5, PrimTy::F32),
+            (6, PrimTy::F32),
+            (7, PrimTy::F64),
+            (8, PrimTy::F64),
+            (9, PrimTy::F64),
+            (10, PrimTy::F64),
+            (11, PrimTy::F64),
+        ] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Supported {
+                    primitive,
+                    diagnostics: Vec::new(),
+                },
+                "valid float at owner index {index} should be checked"
+            );
+        }
+        for index in [12, 13] {
+            let ConstLiteralCheck::Supported {
+                primitive,
+                diagnostics,
+            } = checks[index]
+            else {
+                panic!("overflowing float at owner index {index} should be checked");
+            };
+            assert_eq!(
+                *primitive,
+                if index == 12 {
+                    PrimTy::F32
+                } else {
+                    PrimTy::F64
+                }
+            );
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                "owner index {index}"
+            );
+            assert!(diagnostics[0].has_workspace_snapshot());
+            assert!(diagnostics[0].primary().is_some());
+        }
+        for index in [14, 15] {
+            let ConstLiteralCheck::Supported { diagnostics, .. } = checks[index] else {
+                panic!("mismatched float at owner index {index} should be checked");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::TypeMismatch,
+                "owner index {index}"
+            );
+            assert!(diagnostics[0].has_workspace_snapshot());
+            assert!(diagnostics[0].primary().is_some());
+        }
+    }
+
+    #[test]
+    fn const_float_literal_rounding_is_ties_to_even_and_never_double_rounds_f32() {
+        use sai_resolve::prelude::PrimTy;
+
+        assert_eq!(
+            round_const_float_literal(PrimTy::F32, "1.000000059604644775390625", false),
+            Some(ConstFloatValue::F32(1.0)),
+            "the exact f32 midpoint rounds to the even lower significand"
+        );
+        assert_eq!(
+            round_const_float_literal(PrimTy::F32, "1.000000059604644775390626", false),
+            Some(ConstFloatValue::F32(f32::from_bits(1.0f32.to_bits() + 1))),
+            "direct f32 parsing retains the decimal value above the midpoint"
+        );
+        assert_eq!(
+            round_const_float_literal(
+                PrimTy::F64,
+                "1.00000000000000011102230246251565404236316680908203125",
+                false
+            ),
+            Some(ConstFloatValue::F64(1.0)),
+            "the exact f64 midpoint rounds to the even lower significand"
+        );
+        assert_eq!(
+            round_const_float_literal(PrimTy::F32, "1.25", true),
+            Some(ConstFloatValue::F32(-1.25)),
+            "the direct negative sign is retained"
+        );
+        assert_eq!(
+            round_const_float_literal(PrimTy::F32, "1e-50", false),
+            Some(ConstFloatValue::F32(0.0)),
+            "a nonzero value may round to positive zero"
+        );
+        assert_eq!(
+            round_const_float_literal(PrimTy::F64, "1e-400", false),
+            Some(ConstFloatValue::F64(0.0)),
+            "a nonzero value may round to positive zero"
+        );
+        assert!(
+            !round_const_float_literal(PrimTy::F32, "3.4028236e38", false)
+                .expect("valid F32 decimal parses")
+                .is_finite(),
+            "rounding a finite decimal to infinity is diagnosed"
+        );
+        assert!(
+            !round_const_float_literal(PrimTy::F64, "1.7976931348623159e308", false)
+                .expect("valid F64 decimal parses")
+                .is_finite(),
+            "rounding a finite decimal to infinity is diagnosed"
+        );
     }
 
     #[test]
