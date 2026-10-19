@@ -50908,6 +50908,174 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
+    fn generated_wit_interface_functions_reference_prior_local_interfaces_only() {
+        let source = concat!(
+            "interface early {\n",
+            "  fn future(value: types.Id)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+            "interface types {\n",
+            "  type Hidden = USize\n",
+            "  type Id = U32\n",
+            "}\n",
+            "interface consumer {\n",
+            "  fn round_trip(value: types.Id) -> types.Id\n",
+            "  fn missing(value: types.Hidden)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("cross-interface function references remain queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning unsupported cross-interface references leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "later-interface and omitted-type targets remain incomplete"
+        );
+        assert!(
+            generated.text.contains("independent: func(value: u32);"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("round-trip: func(value: id) -> id;"),
+            "{}",
+            generated.text
+        );
+        assert!(generated.text.contains("use types.{id};"));
+        assert!(!generated.text.contains("future:"));
+        assert!(!generated.text.contains("missing:"));
+        assert!(!generated.text.contains("type hidden ="));
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let root = package_model.root();
+        let (types_index, types) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "types")
+            .expect("the prior interface with the supported type remains");
+        assert_eq!(
+            types
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id"],
+            "the unsupported earlier item is removed"
+        );
+        let (id_index, _) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the supported earlier alias remains");
+        let early = root
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "early")
+            .expect("the earlier interface remains");
+        assert_eq!(
+            early
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["independent"],
+            "a function cannot reference a later interface"
+        );
+        let consumer = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "consumer")
+            .expect("the later consumer interface remains");
+        let (consumer_index, consumer) = consumer;
+        assert_eq!(
+            consumer
+                .items
+                .iter()
+                .filter_map(|item| {
+                    matches!(&item.kind, sai_wit::WitItemKind::Func(_))
+                        .then_some(item.name.as_str())
+                })
+                .collect::<Vec<_>>(),
+            ["round-trip"],
+            "a function targeting an omitted type is pruned"
+        );
+        let (consumer_id_index, consumer_id) = consumer
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the parsed local use alias remains in the consumer interface");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(imported_id)) = &consumer_id.kind
+        else {
+            panic!("the parsed local use alias retains the referenced named type");
+        };
+        assert_eq!(&imported_id.interface.unit, &unit);
+        assert_eq!(imported_id.interface.interface, types_index);
+        assert_eq!(imported_id.item, id_index);
+        assert_eq!(imported_id.item_name, "id");
+
+        let round_trip_item = consumer
+            .items
+            .iter()
+            .find(|item| item.name == "round-trip")
+            .expect("round-trip remains the sole consumer function");
+        let sai_wit::WitItemKind::Func(round_trip) = &round_trip_item.kind else {
+            panic!("round-trip remains a function");
+        };
+        let sai_wit::WitType::Named(parameter) = &round_trip.params[0].1 else {
+            panic!("the parameter retains the prior interface type reference");
+        };
+        let sai_wit::WitType::Named(result) = round_trip
+            .result
+            .as_ref()
+            .expect("the function result is retained")
+        else {
+            panic!("the result retains the prior interface type reference");
+        };
+        for reference in [parameter, result] {
+            assert_eq!(&reference.interface.unit, &unit);
+            assert_eq!(reference.interface.interface, consumer_index);
+            assert_eq!(reference.item, consumer_id_index);
+            assert_eq!(reference.item_name, "id");
+        }
+    }
+
+    #[test]
     fn generated_wit_omits_world_functions_with_colliding_local_type_aliases() {
         let source = concat!(
             "interface left {\n",

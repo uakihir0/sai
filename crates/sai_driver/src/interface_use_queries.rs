@@ -2794,6 +2794,11 @@ fn collect_interface_uses_input(
         }
         let mut generated_variant_type_references = generated_record_type_references.clone();
         let mut generated_function_type_references = generated_variant_type_references.clone();
+        generated_function_type_references.extend(
+            generated_local_type_references
+                .iter()
+                .map(|(definition, reference)| (*definition, reference.clone())),
+        );
         let mut generated_alias_definition_type_references =
             generated_record_type_references.clone();
         if let (Some(unit), Some(interface_index), Some(interface_name)) = (
