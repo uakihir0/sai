@@ -382,6 +382,49 @@ fn str_const_forms_outside_the_literal_slice_remain_gated() {
 }
 
 #[test]
+fn public_unit_const_literals_emit_check_results() {
+    let source = "pub const UNIT: () = ()\npub const OTHER_UNIT: () = ()\n";
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn public_unit_const_type_errors_suppress_the_check_result() {
+    for source in [
+        "pub const BAD_BOOL: () = true\n",
+        "pub const BAD_INTEGER: () = 0\n",
+        "pub const BAD_STRING: () = \"text\"\n",
+        "pub const FIRST: () = ()\npub const SECOND: () = 0\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: unit type mismatch should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a supported unit type mismatch without a result or feature gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn unit_const_forms_outside_the_literal_slice_remain_gated() {
+    for source in [
+        "pub const NON_EMPTY_TUPLE: () = (1,)\n",
+        "pub const BLOCK: () = { () }\n",
+        "pub const ALIAS: Unit = ()\n",
+        "pub type Unit = ()\npub const ALIAS: Unit = ()\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated(&output, source);
+    }
+}
+
+#[test]
 fn public_float_const_errors_and_invalid_later_const_suppress_results() {
     for (source, expected_code) in [
         (

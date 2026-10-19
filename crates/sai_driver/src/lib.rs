@@ -5616,11 +5616,12 @@ impl ConstOwnerResolution {
     }
 }
 
-/// Result of checking one public primitive-typed or canonical `Str` constant literal.
+/// Result of checking one public primitive-typed, canonical `Str`, or unit constant.
 ///
 /// This deliberately covers only `Bool`, `Char`, `Byte`, fixed-width integer
-/// primitive types, `F32`/`F64`, and direct `Str` literals. It does not imply
-/// that other constant expressions are evaluated.
+/// primitive types, `F32`/`F64`, direct `Str` literals, and the direct unit
+/// literal `()`. It does not imply that other constant expressions are
+/// evaluated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstLiteralCheck {
     /// The declaration or HIR shape is outside this checking slice.
@@ -5636,18 +5637,24 @@ pub enum ConstLiteralCheck {
     /// A direct string literal checked against the canonical `Str` prelude
     /// item whose early name resolution is intentionally deferred.
     SupportedStr { diagnostics: Vec<Diagnostic> },
+    /// The empty tuple type and direct unit literal, checked without general
+    /// type resolution.
+    SupportedUnit { diagnostics: Vec<Diagnostic> },
 }
 
 impl ConstLiteralCheck {
     pub const fn is_supported(&self) -> bool {
-        matches!(self, Self::Supported { .. } | Self::SupportedStr { .. })
+        matches!(
+            self,
+            Self::Supported { .. } | Self::SupportedStr { .. } | Self::SupportedUnit { .. }
+        )
     }
 
     pub fn is_valid(&self) -> bool {
         match self {
-            Self::Supported { diagnostics, .. } | Self::SupportedStr { diagnostics } => {
-                diagnostics.is_empty()
-            }
+            Self::Supported { diagnostics, .. }
+            | Self::SupportedStr { diagnostics }
+            | Self::SupportedUnit { diagnostics } => diagnostics.is_empty(),
             Self::Unsupported => false,
         }
     }
@@ -5655,7 +5662,9 @@ impl ConstLiteralCheck {
     pub fn diagnostics(&self) -> &[Diagnostic] {
         match self {
             Self::Unsupported => &[],
-            Self::Supported { diagnostics, .. } | Self::SupportedStr { diagnostics } => diagnostics,
+            Self::Supported { diagnostics, .. }
+            | Self::SupportedStr { diagnostics }
+            | Self::SupportedUnit { diagnostics } => diagnostics,
         }
     }
 }
@@ -5692,6 +5701,27 @@ fn check_const_literal_owner(
     };
     if !is_supported_const_name_convention(&name, written_name) {
         return Ok(ConstLiteralCheck::Unsupported);
+    }
+    if let TyKind::Tuple(elements) = ty.kind
+        && elements.is_empty()
+    {
+        let Some(body) = owner.body else {
+            return Ok(ConstLiteralCheck::Unsupported);
+        };
+        let diagnostics = match body.value.kind {
+            ExprKind::Tuple(elements) if elements.is_empty() => Vec::new(),
+            ExprKind::Lit(literal) => vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                body.value.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!("expected `()`, found {}", const_literal_found_type(literal)),
+                "type mismatch",
+            )?],
+            _ => return Ok(ConstLiteralCheck::Unsupported),
+        };
+        return Ok(ConstLiteralCheck::SupportedUnit { diagnostics });
     }
     let TyKind::Path(path) = ty.kind else {
         return Ok(ConstLiteralCheck::Unsupported);
@@ -25381,6 +25411,73 @@ mod tests {
             &ConstLiteralCheck::Unsupported,
             "a source type binding named Str must not use the canonical prelude fallback"
         );
+    }
+
+    #[test]
+    fn const_unit_literal_check_accepts_only_empty_tuple_type_and_literal() {
+        let root = concat!(
+            "pub const UNIT: () = ()\n",
+            "pub const OTHER_UNIT: () = ()\n",
+            "pub const BOOL_MISMATCH: () = true\n",
+            "pub const INTEGER_MISMATCH: () = 0\n",
+            "pub const STRING_MISMATCH: () = \"text\"\n",
+            "pub const NON_EMPTY_TUPLE: () = (1,)\n",
+            "pub const BLOCK: () = { () }\n",
+            "pub const ALIAS: Unit = ()\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(checks.len(), 8);
+        for index in [0, 1] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::SupportedUnit {
+                    diagnostics: Vec::new(),
+                },
+                "direct unit literal at owner index {index} is supported"
+            );
+        }
+        for index in [2, 3, 4] {
+            let ConstLiteralCheck::SupportedUnit { diagnostics } = checks[index] else {
+                panic!("unit type mismatch at owner index {index} should be diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::TypeMismatch,
+                "owner index {index}"
+            );
+            assert!(diagnostics[0].has_workspace_snapshot());
+            assert!(diagnostics[0].primary().is_some());
+        }
+        for index in [5, 6, 7] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Unsupported,
+                "nonliteral unit form or alias at owner index {index} remains unsupported"
+            );
+        }
     }
 
     #[test]
