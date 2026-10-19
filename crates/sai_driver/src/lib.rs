@@ -6107,7 +6107,26 @@ fn check_function_body_type(
             ),
             _ => false,
         };
-        let condition_is_supported = (!condition_is_negated || condition_is_supported_when_negated)
+        let mixed_condition_diagnostics = if condition_is_negated {
+            None
+        } else {
+            check_function_if_mixed_and_comparison_condition(
+                owner,
+                cond,
+                *first.ty,
+                first_body,
+                *second.ty,
+                second_body,
+                locals,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+        };
+        let direct_condition_is_supported = (!condition_is_negated
+            || condition_is_supported_when_negated)
             && function_if_binary_condition_uses_parameter_bindings(
                 comparison_condition,
                 first_body,
@@ -6116,7 +6135,9 @@ fn check_function_body_type(
                 inputs,
             )
             && parameter_types_are_supported;
-        let Some(diagnostics) = check_function_if_literal_branches(
+        let condition_is_supported =
+            direct_condition_is_supported || mixed_condition_diagnostics.is_some();
+        let Some(mut diagnostics) = check_function_if_literal_branches(
             owner,
             *return_ty,
             condition_is_supported,
@@ -6131,7 +6152,12 @@ fn check_function_body_type(
         else {
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
-        diagnostics
+        if let Some(mut condition_diagnostics) = mixed_condition_diagnostics {
+            condition_diagnostics.append(&mut diagnostics);
+            condition_diagnostics
+        } else {
+            diagnostics
+        }
     } else {
         let Some(return_ty) = sig.ret else {
             return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -6342,6 +6368,82 @@ fn check_function_if_parameter_comparison_condition(
         owner,
         parameter_ty,
         literal,
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )
+}
+
+fn check_function_if_mixed_and_comparison_condition(
+    owner: &HirOwner<'_>,
+    condition: &HirExpr<'_>,
+    first_parameter_ty: Ty<'_>,
+    first_body_parameter: &sai_hir::body::BodyParam,
+    second_parameter_ty: Ty<'_>,
+    second_body_parameter: &sai_hir::body::BodyParam,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let ExprKind::Binary(BinOp::And, left, right) = condition.kind else {
+        return Ok(None);
+    };
+    let (bool_path, comparison) = if matches!(left.kind, ExprKind::Path(_)) {
+        (left, right)
+    } else if matches!(right.kind, ExprKind::Path(_)) {
+        (right, left)
+    } else {
+        return Ok(None);
+    };
+    if !matches!(
+        comparison.kind,
+        ExprKind::Binary(
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+            _,
+            _
+        )
+    ) {
+        return Ok(None);
+    }
+
+    let bool_type = Some(FunctionDirectType::Primitive(
+        sai_resolve::prelude::PrimTy::Bool,
+    ));
+    let (comparison_parameter, comparison_parameter_ty) =
+        if resolve_function_direct_type(first_parameter_ty, type_paths, symbols, inputs)
+            == bool_type
+            && function_if_path_uses_parameter_binding(
+                bool_path,
+                first_body_parameter,
+                locals,
+                inputs,
+            )
+        {
+            (second_body_parameter, second_parameter_ty)
+        } else if resolve_function_direct_type(second_parameter_ty, type_paths, symbols, inputs)
+            == bool_type
+            && function_if_path_uses_parameter_binding(
+                bool_path,
+                second_body_parameter,
+                locals,
+                inputs,
+            )
+        {
+            (first_body_parameter, first_parameter_ty)
+        } else {
+            return Ok(None);
+        };
+    check_function_if_parameter_comparison_condition(
+        owner,
+        comparison,
+        comparison_parameter_ty,
+        comparison_parameter,
+        locals,
         type_paths,
         symbols,
         inputs,
@@ -25127,6 +25229,59 @@ mod tests {
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Unsupported),
                 "function owner {index} unexpectedly passed the bounded slice: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_and_of_bool_parameter_and_comparison_literal() {
+        let root = concat!(
+            "type BoolAlias = Bool\n",
+            "pub fn bool_first(enabled: Bool, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+            "pub fn bool_second(value: I32, enabled: Bool) -> I32 { if value < 20 and enabled { 1 } else { 2 } }\n",
+            "pub fn literal_left(enabled: Bool, value: U8) -> I32 { if enabled and 18 <= value { 1 } else { 2 } }\n",
+            "pub fn literal_right(value: I32, enabled: Bool) -> I32 { if 10 < value and enabled { 1 } else { 2 } }\n",
+            "pub fn disjunction(enabled: Bool, value: I32) -> I32 { if enabled or value >= 18 { 1 } else { 2 } }\n",
+            "pub fn negated_condition(enabled: Bool, value: I32) -> I32 { if not (enabled and value >= 18) { 1 } else { 2 } }\n",
+            "pub fn negated_comparison(enabled: Bool, value: I32) -> I32 { if enabled and not (value >= 18) { 1 } else { 2 } }\n",
+            "pub fn nested_condition(enabled: Bool, value: I32) -> I32 { if enabled and (value > 0 and value < 10) { 1 } else { 2 } }\n",
+            "pub fn repeated_parameter(enabled: Bool, value: I32) -> I32 { if enabled and enabled >= 18 { 1 } else { 2 } }\n",
+            "pub fn aliased_bool(enabled: BoolAlias, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+            "pub fn wrong_bool_type(enabled: I32, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+            "pub fn extra_parameter(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 12);
+
+        for index in 0..4 {
+            let check = owners[index]
+                .body_type_check()
+                .expect("both logical and comparison operand orders are checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the mixed condition slice: {check:?}"
+            );
+        }
+        for (index, owner) in owners.iter().enumerate().skip(4) {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported mixed condition shape is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the mixed condition slice: {check:?}"
             );
         }
     }
