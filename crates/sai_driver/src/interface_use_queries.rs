@@ -2608,6 +2608,8 @@ fn collect_interface_uses_input(
         interface_boundary_type_definitions(&interface_type_members, scopes, prepared);
     let foreign_named_type_references = generated_foreign_named_type_references(prepared);
     let foreign_resource_references = generated_foreign_resource_references(prepared);
+    let foreign_interface_used_type_references =
+        generated_foreign_interface_used_type_references(&prepared.foreign_wit_views);
     let foreign_world_used_type_references =
         generated_foreign_world_used_type_references(&prepared.foreign_wit_views);
     let mut generated_foreign_type_references_by_definition =
@@ -2618,9 +2620,21 @@ fn collect_interface_uses_input(
             .iter()
             .map(|(definition, reference)| (*definition, reference.clone())),
     );
+    generated_foreign_type_references_by_definition.extend(
+        foreign_interface_used_type_references
+            .by_definition
+            .iter()
+            .map(|(definition, reference)| (*definition, reference.clone())),
+    );
     let mut generated_foreign_type_view_completeness =
         foreign_named_type_references.view_completeness.clone();
     for (reference, complete) in &foreign_resource_references.view_completeness {
+        generated_foreign_type_view_completeness
+            .entry(reference.clone())
+            .and_modify(|existing| *existing &= complete)
+            .or_insert(*complete);
+    }
+    for (reference, complete) in &foreign_interface_used_type_references.view_completeness {
         generated_foreign_type_view_completeness
             .entry(reference.clone())
             .and_modify(|existing| *existing &= complete)
@@ -3060,6 +3074,14 @@ fn collect_interface_uses_input(
         }
         let mut generated_resource_member_type_references =
             generated_function_type_references.clone();
+        // Used facade references are limited to ordinary generated functions. The
+        // resource-member, alias, record, and variant maps were cloned above.
+        generated_function_type_references.extend(
+            foreign_interface_used_type_references
+                .by_definition
+                .iter()
+                .map(|(definition, reference)| (*definition, reference.clone())),
+        );
         generated_function_type_references.extend(
             generated_all_local_type_references
                 .iter()
@@ -3181,12 +3203,23 @@ fn collect_interface_uses_input(
                 &mut owner_uses_complete,
                 inputs,
             )?;
+            let item_type_references = match kind {
+                super::InterfaceMemberKind::Alias => &generated_alias_definition_type_references,
+                super::InterfaceMemberKind::Function => &generated_function_type_references,
+                super::InterfaceMemberKind::Struct => &generated_record_type_references,
+                super::InterfaceMemberKind::Enum => &generated_variant_type_references,
+                _ => &generated_named_type_references,
+            };
+            let mut member_generated_used_aliases = Vec::new();
+            let mut resource_member_generated_used_aliases = Vec::new();
             let (has_incompatible_boundary, boundary_conversions, _) =
                 append_interface_boundary_diagnostics(
                     &member_hir,
                     &resolution,
                     &interface_boundary_types,
                     &boundary_use_alias_names,
+                    item_type_references,
+                    &foreign_interface_used_type_references.used_definitions,
                     &mut local_boundary_aliases,
                     descriptor.owner.def_id,
                     &interface_type_members,
@@ -3202,6 +3235,7 @@ fn collect_interface_uses_input(
                     &inputs.source,
                     &prepared.snapshot,
                     &mut generated_use_aliases,
+                    &mut member_generated_used_aliases,
                     &mut owner_dependencies,
                     &mut interface_check_diagnostics,
                 )?;
@@ -3209,13 +3243,6 @@ fn collect_interface_uses_input(
                 owner_uses_complete = false;
                 poisoned_owners.insert(member_owner);
             }
-            let item_type_references = match kind {
-                super::InterfaceMemberKind::Alias => &generated_alias_definition_type_references,
-                super::InterfaceMemberKind::Function => &generated_function_type_references,
-                super::InterfaceMemberKind::Struct => &generated_record_type_references,
-                super::InterfaceMemberKind::Enum => &generated_variant_type_references,
-                _ => &generated_named_type_references,
-            };
             let mut staged_resource_item = None;
             if generated_interface_eligible {
                 let item = if member_hir.diagnostics.is_empty()
@@ -3274,6 +3301,8 @@ fn collect_interface_uses_input(
                 };
                 if let Some(item) = item {
                     if generated_item_names.insert(item.name.clone()) {
+                        generated_use_aliases.append(&mut member_generated_used_aliases);
+                        generated_use_aliases.append(&mut resource_member_generated_used_aliases);
                         if !generated_interface_boundary_view_is_complete(
                             &boundary_conversions,
                             &generated_foreign_type_references_by_definition,
@@ -3493,6 +3522,8 @@ fn collect_interface_uses_input(
                         &resolution,
                         &interface_boundary_types,
                         &boundary_use_alias_names,
+                        &resource_named_type_references,
+                        &foreign_interface_used_type_references.used_definitions,
                         &mut local_boundary_aliases,
                         descriptor.owner.def_id,
                         &interface_type_members,
@@ -3508,6 +3539,7 @@ fn collect_interface_uses_input(
                         &inputs.source,
                         &prepared.snapshot,
                         &mut generated_use_aliases,
+                        &mut resource_member_generated_used_aliases,
                         &mut owner_dependencies,
                         &mut interface_check_diagnostics,
                     )?;
@@ -3573,6 +3605,8 @@ fn collect_interface_uses_input(
                 item.kind = WitItemKind::Resource(generated_resource_members);
                 let item_name = item.name.clone();
                 if generated_item_names.insert(item_name.clone()) {
+                    generated_use_aliases.append(&mut member_generated_used_aliases);
+                    generated_use_aliases.append(&mut resource_member_generated_used_aliases);
                     if !generated_interface_boundary_view_is_complete(
                         &generated_resource_member_conversions,
                         &generated_foreign_type_references_by_definition,
@@ -5017,6 +5051,8 @@ fn append_interface_boundary_diagnostics(
     resolution: &TypeOwnerPathResolution,
     interface_boundary_types: &HashMap<DefId, BoundaryDefinition>,
     boundary_use_alias_names: &HashMap<DefId, BoundaryUseAliasName>,
+    generated_type_references: &HashMap<DefId, WitTypeRef>,
+    foreign_used_type_definitions: &HashSet<DefId>,
     local_boundary_aliases: &mut LocalBoundaryAliases<'_>,
     interface: LocalDefId,
     interface_type_members: &HashMap<DefId, LocalDefId>,
@@ -5032,6 +5068,7 @@ fn append_interface_boundary_diagnostics(
     source: &sai_vfs::SourceFile,
     snapshot: &WorkspaceSnapshot,
     generated_use_aliases: &mut Vec<GeneratedUseAlias>,
+    staged_used_use_aliases: &mut Vec<GeneratedUseAlias>,
     owner_dependencies: &mut HashMap<OwnerId, HashSet<DefId>>,
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Result<(bool, Vec<sai_ty::boundary::BoundaryTypeConversion>, bool), InterfaceUsesQueryError> {
@@ -5187,7 +5224,10 @@ fn append_interface_boundary_diagnostics(
                     &owner_path_candidates,
                     resolution,
                     boundary_use_alias_names,
+                    generated_type_references,
+                    foreign_used_type_definitions,
                     generated_use_aliases,
+                    staged_used_use_aliases,
                 );
                 continue;
             }
@@ -5259,7 +5299,10 @@ fn collect_generated_use_aliases(
     owner_path_candidates: &[super::OwnerPathHead<'_>],
     resolution: &TypeOwnerPathResolution,
     alias_names: &HashMap<DefId, BoundaryUseAliasName>,
+    generated_type_references: &HashMap<DefId, WitTypeRef>,
+    foreign_used_type_definitions: &HashSet<DefId>,
     generated_use_aliases: &mut Vec<GeneratedUseAlias>,
+    staged_used_use_aliases: &mut Vec<GeneratedUseAlias>,
 ) {
     let mut references = Vec::<(DefId, sai_hir::Span)>::new();
     let mut path_spans = HashMap::new();
@@ -5299,14 +5342,23 @@ fn collect_generated_use_aliases(
         if alias_name.local_interface == Some(current_interface) {
             continue;
         }
-        generated_use_aliases.push(GeneratedUseAlias {
+        let generated_use_alias = GeneratedUseAlias {
             target: alias_name.target.clone(),
             emitted_name: alias_name.emitted_name.clone(),
             collision_name: alias_name.collision_name.clone(),
             definition,
             owner,
             span,
-        });
+        };
+        if foreign_used_type_definitions.contains(&definition) {
+            // Used facade names are eligible only when the selected consumer map
+            // can print them, and they are committed only if that consumer emits.
+            if generated_type_references.contains_key(&definition) {
+                staged_used_use_aliases.push(generated_use_alias);
+            }
+        } else {
+            generated_use_aliases.push(generated_use_alias);
+        }
     }
 }
 
@@ -5648,14 +5700,109 @@ pub(super) fn generated_foreign_world_used_type_references(
     references
 }
 
+#[derive(Default)]
+struct GeneratedForeignInterfaceUsedTypeReferences {
+    by_definition: HashMap<DefId, WitTypeRef>,
+    view_completeness: HashMap<WitTypeRef, bool>,
+    used_definitions: HashSet<DefId>,
+}
+
+fn generated_foreign_interface_used_type_references(
+    foreign_wit_views: &[super::OwnedPhase1ForeignWitView],
+) -> GeneratedForeignInterfaceUsedTypeReferences {
+    let mut references = GeneratedForeignInterfaceUsedTypeReferences::default();
+    for foreign in foreign_wit_views {
+        let view = foreign.view.as_ref();
+        for (interface_name, interface) in &view.interfaces {
+            let Some(wit_interface) = view.model.interfaces.get(interface.wit) else {
+                continue;
+            };
+            if wit_interface.name != *interface_name {
+                continue;
+            }
+            for member in interface.members.values() {
+                let Some(wit_item) = wit_interface.items.get(member.item) else {
+                    continue;
+                };
+                if matches!(wit_item.kind, WitItemKind::Used(_)) {
+                    references.used_definitions.insert(member.def);
+                }
+                if member.kind != WitViewDefKind::Alias || member.unsupported.is_some() {
+                    continue;
+                }
+                let Some(definition) = view.definition(member.def) else {
+                    continue;
+                };
+                if definition.kind != WitViewDefKind::Alias
+                    || definition.entity
+                        != (WitViewEntity::Item {
+                            interface: interface.wit,
+                            item: member.item,
+                        })
+                {
+                    continue;
+                }
+                if !foreign.directly_visible {
+                    continue;
+                }
+                if wit_item.unsupported.is_some() {
+                    continue;
+                }
+                let WitItemKind::Used(target) = &wit_item.kind else {
+                    continue;
+                };
+                let facade = (interface.wit, member.item);
+                let mut visited = HashSet::new();
+                visited.insert(facade);
+                let Some(terminal) =
+                    generated_world_used_type_terminal(view, target.clone(), &mut visited)
+                else {
+                    continue;
+                };
+                if !generated_world_used_type_item_is_supported_data(view, &terminal, &visited) {
+                    continue;
+                }
+
+                // Keep the facade identity so the generated use name and the
+                // collision analysis both describe the same public WIT path.
+                let reference = WitTypeRef {
+                    interface: sai_wit::WitIfaceRef {
+                        unit: view.unit.clone(),
+                        interface: interface.wit,
+                        name: wit_interface.name.clone(),
+                    },
+                    item: member.item,
+                    item_name: wit_item.name.clone(),
+                };
+                references
+                    .by_definition
+                    .insert(member.def, reference.clone());
+                references
+                    .view_completeness
+                    .entry(reference)
+                    .and_modify(|complete| *complete &= view.complete)
+                    .or_insert(view.complete);
+            }
+        }
+    }
+    references
+}
+
 fn generated_world_used_type_target(
     view: &sai_wit::WitView,
-    mut target: WitTypeRef,
+    target: WitTypeRef,
     starting_item: (WitIfaceIdx, WitItemIdx),
 ) -> Option<WitTypeRef> {
     let mut visited = HashSet::new();
     visited.insert(starting_item);
+    generated_world_used_type_terminal(view, target, &mut visited)
+}
 
+fn generated_world_used_type_terminal(
+    view: &sai_wit::WitView,
+    mut target: WitTypeRef,
+    visited: &mut HashSet<(WitIfaceIdx, WitItemIdx)>,
+) -> Option<WitTypeRef> {
     loop {
         if target.interface.unit != view.unit
             || !visited.insert((target.interface.interface, target.item))
@@ -5705,6 +5852,82 @@ fn generated_world_used_type_target(
         } else {
             return Some(target);
         }
+    }
+}
+
+fn generated_world_used_type_item_is_supported_data(
+    view: &sai_wit::WitView,
+    reference: &WitTypeRef,
+    visited: &HashSet<(WitIfaceIdx, WitItemIdx)>,
+) -> bool {
+    let Some(interface) = view.model.interfaces.get(reference.interface.interface) else {
+        return false;
+    };
+    if interface.name != reference.interface.name {
+        return false;
+    }
+    let Some(item) = interface.items.get(reference.item) else {
+        return false;
+    };
+    if item.name != reference.item_name || item.unsupported.is_some() {
+        return false;
+    }
+    match &item.kind {
+        WitItemKind::Alias(ty) => generated_world_used_type_is_supported_data(view, ty, visited),
+        WitItemKind::Record(_)
+        | WitItemKind::Variant(_)
+        | WitItemKind::Enum(_)
+        | WitItemKind::Flags(_) => true,
+        WitItemKind::Used(_) | WitItemKind::Resource(_) | WitItemKind::Func(_) => false,
+    }
+}
+
+fn generated_world_used_type_is_supported_data(
+    view: &sai_wit::WitView,
+    ty: &WitType,
+    visited: &HashSet<(WitIfaceIdx, WitItemIdx)>,
+) -> bool {
+    match ty {
+        WitType::List(inner)
+        | WitType::Option(inner)
+        | WitType::Future(Some(inner))
+        | WitType::Stream(Some(inner)) => {
+            generated_world_used_type_is_supported_data(view, inner, visited)
+        }
+        WitType::Result { ok, err } => ok
+            .iter()
+            .chain(err)
+            .all(|inner| generated_world_used_type_is_supported_data(view, inner, visited)),
+        WitType::Tuple(elements) => elements
+            .iter()
+            .all(|element| generated_world_used_type_is_supported_data(view, element, visited)),
+        WitType::Named(reference) => {
+            let mut nested_visited = visited.clone();
+            generated_world_used_type_terminal(view, reference.clone(), &mut nested_visited)
+                .is_some_and(|terminal| {
+                    generated_world_used_type_item_is_supported_data(
+                        view,
+                        &terminal,
+                        &nested_visited,
+                    )
+                })
+        }
+        WitType::Own(_) | WitType::Borrow(_) | WitType::Unsupported(_) => false,
+        WitType::Future(None)
+        | WitType::Stream(None)
+        | WitType::Bool
+        | WitType::S8
+        | WitType::S16
+        | WitType::S32
+        | WitType::S64
+        | WitType::U8
+        | WitType::U16
+        | WitType::U32
+        | WitType::U64
+        | WitType::F32
+        | WitType::F64
+        | WitType::Char
+        | WitType::String => true,
     }
 }
 

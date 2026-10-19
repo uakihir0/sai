@@ -46331,6 +46331,338 @@ interface facade { use acme:base/types@1.0.0.{handle as forwarded-resource}; }"#
     }
 
     #[test]
+    fn generated_interface_functions_preserve_direct_and_chained_used_facades() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "use acme:codec/chain as chain\n",
+            "interface client {\n",
+            "  type Payload = U32\n",
+            "  type DirectHandle = U32\n",
+            "  type Ignored = U32\n",
+            "  fn direct(value: api.Request) -> api.Request\n",
+            "  fn consume_chain(value: chain.Chained) -> chain.Chained\n",
+            "  unsafe fn unsafe_consumer(value: api.Ignored)\n",
+            "  fn owned_alias(value: api.NestedHandle)\n",
+            "  fn resource_alias(value: api.DirectHandle)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types {
+  record payload { value: u32 }
+  resource handle;
+  type owned-handle = own<handle>;
+}
+interface api {
+  use types.{payload as request, payload as ignored, owned-handle as nested-handle, handle as direct-handle};
+}
+interface middle { use types.{payload as intermediate}; }
+interface chain { use middle.{intermediate as chained}; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let (payload, owned_handle, handle, middle_facade) = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            assert!(codec_view.directly_visible);
+            let item_reference = |interface_name: &str, member_name: &str| {
+                let interface = codec_view
+                    .view
+                    .interfaces
+                    .get(interface_name)
+                    .expect("the WIT interface exists");
+                let member = interface
+                    .members
+                    .get(member_name)
+                    .expect("the WIT member exists");
+                let item = &codec_view.view.model.interfaces[interface.wit].items[member.item];
+                sai_wit::WitTypeRef {
+                    interface: sai_wit::WitIfaceRef {
+                        unit: codec_view.view.unit.clone(),
+                        interface: interface.wit,
+                        name: interface_name.to_owned(),
+                    },
+                    item: member.item,
+                    item_name: item.name.clone(),
+                }
+            };
+            (
+                item_reference("types", "Payload"),
+                item_reference("types", "OwnedHandle"),
+                item_reference("types", "Handle"),
+                item_reference("middle", "Intermediate"),
+            )
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "Request",
+            payload.clone(),
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "Ignored",
+            payload.clone(),
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "NestedHandle",
+            owned_handle,
+        );
+        set_authored_wit_item_as_used(&mut wit_views, "acme:codec", "api", "DirectHandle", handle);
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "middle",
+            "Intermediate",
+            payload,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "chain",
+            "Chained",
+            middle_facade,
+        );
+
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact selected authored WIT view");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "unsupported Used aliases leave parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            !generated.complete,
+            "resource and resource-handle alias facades remain unsupported"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{request};"),
+            "the selected facade spelling is retained: {}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/chain@1.2.3.{chained};"),
+            "multi-hop Used chains retain their public facade identity: {}",
+            generated.text
+        );
+        assert!(
+            generated.text.contains("type payload = u32;"),
+            "the local payload name does not collide with the renamed facade"
+        );
+        assert!(
+            generated.text.contains("type direct-handle = u32;"),
+            "an omitted resource facade must not leave a phantom imported name that poisons a local type"
+        );
+        assert!(
+            generated.text.contains("type ignored = u32;"),
+            "an omitted unsafe function must not leave a phantom imported name that poisons a local type"
+        );
+        assert!(
+            generated
+                .text
+                .contains("direct: func(value: request) -> request;")
+        );
+        assert!(
+            generated
+                .text
+                .contains("consume-chain: func(value: chained) -> chained;")
+        );
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("unsafe-consumer:"));
+        assert!(
+            !generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{ignored};")
+        );
+        assert!(!generated.text.contains("owned-alias:"));
+        assert!(!generated.text.contains("resource-alias:"));
+
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated WIT remains parseable");
+        let (client_index, client) = package
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "client")
+            .expect("the client interface remains generated");
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the selected codec view remains available");
+        let expected_facade_reference = |interface_name: &str, member_name: &str| {
+            let interface = codec_view.view.interfaces.get(interface_name).unwrap();
+            let member = interface.members.get(member_name).unwrap();
+            let item = &codec_view.view.model.interfaces[interface.wit].items[member.item];
+            sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: interface.wit,
+                    name: interface_name.to_owned(),
+                },
+                item: member.item,
+                item_name: item.name.clone(),
+            }
+        };
+        let assert_function_uses_facade =
+            |function_name: &str, local_name: &str, expected_facade: &sai_wit::WitTypeRef| {
+                let function = client
+                    .items
+                    .iter()
+                    .find(|item| item.name == function_name)
+                    .expect("the supported facade function remains");
+                let sai_wit::WitItemKind::Func(function) = &function.kind else {
+                    panic!("the facade consumer remains a WIT function");
+                };
+                let local_reference = match &function.params[0].1 {
+                    sai_wit::WitType::Named(reference) => reference,
+                    other => panic!("the function uses a local named facade: {other:?}"),
+                };
+                assert_eq!(local_reference.interface.unit, generated_unit);
+                assert_eq!(local_reference.interface.interface, client_index);
+                assert_eq!(local_reference.interface.name, "client");
+                assert_eq!(local_reference.item_name, local_name);
+                let local_alias = &client.items[local_reference.item];
+                assert_eq!(local_alias.name, local_name);
+                let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(foreign_reference)) =
+                    &local_alias.kind
+                else {
+                    panic!("the generated local import preserves a named foreign facade");
+                };
+                assert_eq!(foreign_reference, expected_facade);
+                let result_reference = match function.result.as_ref() {
+                    Some(sai_wit::WitType::Named(reference)) => reference,
+                    other => panic!("the function result uses the same local facade: {other:?}"),
+                };
+                assert_eq!(result_reference, local_reference);
+            };
+        assert_function_uses_facade(
+            "direct",
+            "request",
+            &expected_facade_reference("api", "Request"),
+        );
+        assert_function_uses_facade(
+            "consume-chain",
+            "chained",
+            &expected_facade_reference("chain", "Chained"),
+        );
+    }
+
+    #[test]
+    fn generated_interface_used_facades_propagate_partial_view_incompleteness() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  fn consume(value: api.Request)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types { record payload { value: u32 } }
+interface api { use types.{payload as request}; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let target_reference = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            let types = codec_view.view.interfaces.get("types").unwrap();
+            let payload = types.members.get("Payload").unwrap();
+            let item = &codec_view.view.model.interfaces[types.wit].items[payload.item];
+            sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: types.wit,
+                    name: "types".to_owned(),
+                },
+                item: payload.item,
+                item_name: item.name.clone(),
+            }
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "Request",
+            target_reference,
+        );
+        mark_authored_wit_view_incomplete(&mut wit_views, "acme:codec");
+
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact partial authored WIT view");
+        let generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated WIT query succeeds")
+            .expect("the root source package publishes generated WIT");
+        assert!(
+            !generated.complete,
+            "the Used facade's selected partial view makes output incomplete"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{request};")
+        );
+        assert!(generated.text.contains("consume: func(value: request);"));
+        assert!(generated.text.contains("independent: func(value: u32);"));
+    }
+
+    #[test]
     fn generated_interface_resources_remain_usable_from_partial_foreign_views() {
         let root_source = concat!(
             "use acme:codec/api as api\n",
