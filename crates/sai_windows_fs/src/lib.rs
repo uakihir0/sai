@@ -1031,9 +1031,11 @@ pub fn open_file_without_following(
 ///
 /// `file_name` must be one normal path component. The returned handle can
 /// update attributes such as the Windows read-only flag without granting
-/// access to modify the file's contents. It denies all sharing while open, so
-/// no other handle can open, rename, replace, or link the checked file while
-/// its metadata is being validated and updated.
+/// access to modify the file's contents. It denies sharing with other file
+/// opens while open, including the source open needed by path-based hard-link
+/// creation. Windows sharing modes do not lock the parent directory's
+/// namespace: an operation authorized by the parent directory, such as a
+/// rename using `FILE_DELETE_CHILD`, can still move the entry.
 #[cfg(windows)]
 pub fn open_file_for_attribute_updates_without_following(
     parent: &File,
@@ -1962,6 +1964,7 @@ mod unix_tests {
 #[cfg(all(test, windows))]
 mod windows_tests {
     use std::fs;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2116,25 +2119,20 @@ mod windows_tests {
         let directory = TestDirectory::new();
         let file_path = directory.0.join("readonly");
         let moved_path = directory.0.join("moved");
-        let linked_path = directory.0.join("linked");
         fs::write(&file_path, b"unchanged").unwrap();
 
         let directory_handle =
             open_directory_path_without_following(&fs::canonicalize(&directory.0).unwrap())
                 .unwrap();
-        let update_guard = open_file_for_attribute_updates_without_following(
+        let mut update_guard = open_file_for_attribute_updates_without_following(
             &directory_handle,
             &directory.0,
             std::ffi::OsStr::new("readonly"),
         )
         .unwrap();
         assert!(
-            fs::rename(&file_path, &moved_path).is_err(),
-            "the verified file cannot be moved while its attribute handle is open"
-        );
-        assert!(
-            fs::hard_link(&file_path, &linked_path).is_err(),
-            "the verified file cannot gain a link while its attribute handle is open"
+            update_guard.write_all(b"changed").is_err(),
+            "the attribute handle cannot write file contents"
         );
         drop(update_guard);
 
@@ -2142,7 +2140,7 @@ mod windows_tests {
         permissions.set_readonly(true);
         fs::set_permissions(&file_path, permissions).unwrap();
 
-        let file = open_file_for_attribute_updates_without_following(
+        let mut file = open_file_for_attribute_updates_without_following(
             &directory_handle,
             &directory.0,
             std::ffi::OsStr::new("readonly"),
@@ -2152,11 +2150,43 @@ mod windows_tests {
         assert!(permissions.readonly());
         permissions.set_readonly(false);
         file.set_permissions(permissions).unwrap();
+        assert!(
+            file.write_all(b"changed").is_err(),
+            "clearing the read-only flag does not grant content write access"
+        );
         drop(file);
 
         assert!(!fs::metadata(&file_path).unwrap().permissions().readonly());
         assert_eq!(fs::read(&file_path).unwrap(), b"unchanged");
         fs::rename(&file_path, &moved_path).unwrap();
+    }
+
+    #[test]
+    fn attribute_update_handle_denies_new_file_opens_and_hard_links() {
+        let directory = TestDirectory::new();
+        let file_path = directory.0.join("readonly");
+        let linked_path = directory.0.join("linked");
+        fs::write(&file_path, b"unchanged").unwrap();
+
+        let directory_handle =
+            open_directory_path_without_following(&fs::canonicalize(&directory.0).unwrap())
+                .unwrap();
+        let _update_guard = open_file_for_attribute_updates_without_following(
+            &directory_handle,
+            &directory.0,
+            std::ffi::OsStr::new("readonly"),
+        )
+        .unwrap();
+
+        assert!(
+            fs::File::open(&file_path).is_err(),
+            "the attribute handle denies another file open"
+        );
+        assert!(
+            fs::hard_link(&file_path, &linked_path).is_err(),
+            "the attribute handle denies a hard link that must open its source"
+        );
+        assert!(!linked_path.exists());
     }
 
     #[test]
