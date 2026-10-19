@@ -47407,8 +47407,10 @@ interface facade { use middle.{payload}; }"#;
     fn generated_wit_emits_owned_resource_handles_in_nested_types() {
         let source = concat!(
             "interface api {\n",
-            "  resource Handle {}\n",
             "  type HandleAlias = Handle\n",
+            "  resource Handle {\n",
+            "    fn identity(value: HandleAlias) -> HandleAlias\n",
+            "  }\n",
             "  type Payload {\n",
             "    handle: Handle\n",
             "  }\n",
@@ -47481,6 +47483,11 @@ interface facade { use middle.{payload}; }"#;
             ["handle", "handle-alias", "payload", "outcome", "echo"]
         );
         let resource_index = interface.items.iter_enumerated().next().unwrap().0;
+        let alias_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "handle-alias").then_some(index))
+            .expect("the resource alias is emitted");
         let assert_handle = |ty: &sai_wit::WitType| {
             let sai_wit::WitType::Own(reference) = ty else {
                 panic!("nested resource leaves use owned handles");
@@ -47490,11 +47497,35 @@ interface facade { use middle.{payload}; }"#;
             assert_eq!(reference.item, resource_index);
             assert_eq!(reference.item_name, "handle");
         };
+        let assert_alias_handle = |ty: &sai_wit::WitType| {
+            let sai_wit::WitType::Own(reference) = ty else {
+                panic!("the resource member uses an owned alias handle");
+            };
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.item, alias_index);
+            assert_eq!(reference.item_name, "handle-alias");
+        };
 
         let sai_wit::WitItemKind::Alias(alias) = &items[1].kind else {
             panic!("the resource handle alias is emitted");
         };
         assert_handle(alias);
+
+        let sai_wit::WitItemKind::Resource(members) = &items[0].kind else {
+            panic!("the resource static function is emitted");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, "identity");
+        assert_eq!(members[0].kind, sai_wit::WitMemberKind::Static);
+        assert_alias_handle(&members[0].func.params[0].1);
+        assert_alias_handle(
+            members[0]
+                .func
+                .result
+                .as_ref()
+                .expect("identity retains its resource result"),
+        );
 
         let sai_wit::WitItemKind::Record(fields) = &items[2].kind else {
             panic!("the handle payload is emitted as a record");
@@ -51830,6 +51861,8 @@ interface facade { use middle.{payload}; }"#;
             "  type AliasToRejectedLaterVariant = RejectedLaterVariant\n",
             "  fn use_rejected_later_variant_alias(value: AliasToRejectedLaterVariant)\n",
             "  type AliasToFutureResource = LaterResource\n",
+            "  type AliasToRejectedFutureResource = RejectedLaterResource\n",
+            "  fn use_rejected_future_resource_alias(value: AliasToRejectedFutureResource)\n",
             "  type RecordUsesRejectedLaterVariant { value: RejectedLaterVariant }\n",
             "  enum VariantUsesRejectedLaterVariant { Value(RejectedLaterVariant) }\n",
             "  type RecordUsesFutureResource { value: LaterResource }\n",
@@ -51856,6 +51889,9 @@ interface facade { use middle.{payload}; }"#;
             "  fn use_rejected_later_variant(value: RejectedLaterVariant)\n",
             "  fn use_resource(value: LaterResource)\n",
             "  resource LaterResource {}\n",
+            "  resource RejectedLaterResource {\n",
+            "    fn reset(self: Self)\n",
+            "  }\n",
             "  enum RejectedLaterVariant { Value(USize) }\n",
             "  type CycleA = CycleB\n",
             "  fn use_cycle(value: CycleA) -> CycleA\n",
@@ -51936,11 +51972,12 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(emitted_items.len(), 9);
+        assert_eq!(emitted_items.len(), 10);
         assert!(emitted_items.contains(&"before"));
         assert!(emitted_items.contains(&"use-later"));
         assert!(emitted_items.contains(&"before-record"));
         assert!(emitted_items.contains(&"before-variant"));
+        assert!(emitted_items.contains(&"alias-to-future-resource"));
         assert!(emitted_items.contains(&"use-resource"));
         assert!(emitted_items.contains(&"after"));
         assert!(emitted_items.contains(&"later-record"));
@@ -51952,7 +51989,7 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5, 6, 7, 8],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
             "surviving item indices compact after pruning cycles and unsupported targets"
         );
         assert!(!generated.text.contains("use-rejected"));
@@ -51966,6 +52003,13 @@ interface facade { use middle.{payload}; }"#;
                 .text
                 .contains("variant-uses-rejected-later-variant")
         );
+        assert!(!generated.text.contains("alias-to-rejected-future-resource"));
+        assert!(
+            !generated
+                .text
+                .contains("use-rejected-future-resource-alias")
+        );
+        assert!(!generated.text.contains("rejected-later-resource"));
         assert!(!generated.text.contains("record-uses-future-resource"));
         assert!(!generated.text.contains("record-variant-forward-cycle"));
         assert!(!generated.text.contains("later-variant-record-cycle"));
@@ -51996,6 +52040,11 @@ interface facade { use middle.{payload}; }"#;
             generated
                 .text
                 .contains("use-resource: func(value: later-resource);")
+        );
+        assert!(
+            generated
+                .text
+                .contains("type alias-to-future-resource = later-resource;")
         );
         assert!(!generated.text.contains("use-cycle"));
         assert!(!generated.text.contains("record-cycle"));
@@ -52037,6 +52086,19 @@ interface facade { use middle.{payload}; }"#;
         };
         let sai_wit::WitType::Own(reference) = &use_resource.params[0].1 else {
             panic!("the function receives the later resource as an owned handle");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.item, later_resource_index);
+        assert_eq!(reference.item_name, "later-resource");
+        let alias_to_resource = interface
+            .items
+            .iter()
+            .find(|item| item.name == "alias-to-future-resource")
+            .expect("the alias to the later supported resource remains emitted");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(reference)) = &alias_to_resource.kind
+        else {
+            panic!("the alias targets the later resource as an owned handle");
         };
         assert_eq!(reference.interface.unit, unit);
         assert_eq!(reference.interface.interface, interface_index);
