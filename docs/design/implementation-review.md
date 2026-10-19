@@ -5431,6 +5431,14 @@
 - **Review:** Hostile review confirmed that the tests depend on a root path package and that the target gate exactly matches the implementation's supported-host condition. It found no actionable P0–P2 issues.
 - **Human review:** **Review required:** Confirm that locked local-path dependency resolution should remain Unix-only until the implementation has secure Windows and other-host path handling; if that support boundary changes, these integration tests should run there again.
 
+### CI follow-up: gate locked local-source CLI fixtures by platform support
+
+- **Decision:** Run the `locked_dependency_sources` integration target only on the same Unix targets supported by `LocalPackageDirectory::resolve_dependency`, source snapshots, and WIT directory snapshots: `all(unix, not(any(target_os = "espidf", target_os = "horizon", target_os = "redox")))`.
+- **Reason:** Windows Actions failed all 20 runnable tests in this target because they exercise root or dependency `from path` resolution and local source/WIT snapshots. Those APIs deliberately return `PlatformNotSupported` on Windows and the excluded Unix targets. Supporting these tests there requires the separate secure handle-relative traversal implementation; the current integration assertions cannot succeed before that feature exists.
+- **Verification:** The Windows run `39179752835` confirmed all 20 failures were caused by the documented unsupported-platform results. The existing macOS run for the same commit passed the full workspace suite. The target gate mirrors the implementation's exact supported-target predicate; a new Windows Actions run is pending.
+- **Review:** A read-only platform audit confirmed each runnable test in this integration target depends on local path resolution or source/WIT snapshots, and the file-level predicate matches the production cfg. Hostile review of the final target gate is pending.
+- **Human review:** **Review required:** Confirm that the whole `locked_dependency_sources` integration target should remain Unix-only while its fixture APIs are unsupported on other hosts, and re-enable cross-platform cases individually when those APIs gain safe platform implementations. Keep the Windows Actions job enabled.
+
 ### CI follow-up: classify wrapped missing Git objects
 
 - **Decision:** When a locked commit fetch fails, continue recognizing missing objects only from a typed Git packet-line read error whose message matches the existing missing-object allowlist. Search the standard error source chain and the inner error of wrapped `std::io::Error` values so this classification works across gix error wrapping. Leave generic I/O, authentication, and other transport failures as `FetchFailed`.
