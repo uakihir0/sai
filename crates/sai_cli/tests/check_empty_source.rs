@@ -425,6 +425,82 @@ fn unit_const_forms_outside_the_literal_slice_remain_gated() {
 }
 
 #[test]
+fn public_flat_tuple_const_literals_emit_check_results() {
+    let source = concat!(
+        "pub const PAIR: (I32, Bool) = (1, true)\n",
+        "pub const SINGLE: (U8,) = (255,)\n",
+        "pub const MIXED: (F32, Str, ()) = (1.25, \"text\", ())\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn public_flat_tuple_type_errors_suppress_the_check_result() {
+    for (source, expected_code) in [
+        (
+            "pub const FIELD_MISMATCH: (I32, Bool) = (1, 2)\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub const FIELD_RANGE: (I8,) = (128,)\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        (
+            "pub const ARITY_SHORT: (I32, Bool) = (1,)\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub const ARITY_LONG: (I32,) = (1, true)\n",
+            "TYPE_MISMATCH",
+        ),
+        ("pub const ARITY_ZERO: (I32,) = ()\n", "TYPE_MISMATCH"),
+        ("pub const GROUPED_SCALAR: (I32,) = (1)\n", "TYPE_MISMATCH"),
+        (
+            "pub const SCALAR_MISMATCH: (I32, Bool) = false\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub const UNIT_FIELD_MISMATCH: (I32, ()) = (1, true)\n",
+            "TYPE_MISMATCH",
+        ),
+        (
+            "pub const FIRST: (I32,) = (1,)\npub const SECOND: (I32,) = (true,)\n",
+            "TYPE_MISMATCH",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: tuple const error should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("\"code\":\"{expected_code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected {expected_code} without a result or feature gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn tuple_const_forms_outside_the_flat_literal_slice_remain_gated() {
+    for source in [
+        "pub const NESTED: ((I32,),) = ((1,),)\n",
+        "pub const ARRAY: Array<I32, 1> = [1]\n",
+        "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
+        "pub const EXPRESSION_FIELD: (I32,) = (1 + 2,)\n",
+        "pub const UNIT_NONEMPTY_MISMATCH: () = (1,)\n",
+        "pub const SCALAR_TUPLE_MISMATCH: I32 = (1,)\n",
+        "pub type Number = I32\npub const ALIAS_FIELD: (Number,) = (1,)\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated(&output, source);
+    }
+}
+
+#[test]
 fn public_float_const_errors_and_invalid_later_const_suppress_results() {
     for (source, expected_code) in [
         (

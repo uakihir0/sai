@@ -5579,7 +5579,7 @@ impl ConstOwnerResolution {
             .map(|resolution| resolution.as_ref())
     }
 
-    /// Checks the narrow primitive-literal subset handled by the driver.
+    /// Checks the narrow direct-literal subset handled by the driver.
     ///
     /// `Unsupported` means the caller must keep the feature gate in place.
     /// `Supported` carries any hard type or range diagnostics produced by
@@ -5616,12 +5616,12 @@ impl ConstOwnerResolution {
     }
 }
 
-/// Result of checking one public primitive-typed, canonical `Str`, or unit constant.
+/// Result of checking one public primitive, canonical `Str`, unit, or flat tuple constant.
 ///
-/// This deliberately covers only `Bool`, `Char`, `Byte`, fixed-width integer
-/// primitive types, `F32`/`F64`, direct `Str` literals, and the direct unit
-/// literal `()`. It does not imply that other constant expressions are
-/// evaluated.
+/// This deliberately covers only direct literals of supported primitive
+/// types, canonical `Str`, the unit literal `()`, and flat tuple literals
+/// whose fields are supported direct scalar or unit literals. It does not
+/// imply that other constant expressions are evaluated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstLiteralCheck {
     /// The declaration or HIR shape is outside this checking slice.
@@ -5640,13 +5640,18 @@ pub enum ConstLiteralCheck {
     /// The empty tuple type and direct unit literal, checked without general
     /// type resolution.
     SupportedUnit { diagnostics: Vec<Diagnostic> },
+    /// A flat tuple whose fields each have a supported direct scalar or unit literal.
+    SupportedTuple { diagnostics: Vec<Diagnostic> },
 }
 
 impl ConstLiteralCheck {
     pub const fn is_supported(&self) -> bool {
         matches!(
             self,
-            Self::Supported { .. } | Self::SupportedStr { .. } | Self::SupportedUnit { .. }
+            Self::Supported { .. }
+                | Self::SupportedStr { .. }
+                | Self::SupportedUnit { .. }
+                | Self::SupportedTuple { .. }
         )
     }
 
@@ -5654,7 +5659,8 @@ impl ConstLiteralCheck {
         match self {
             Self::Supported { diagnostics, .. }
             | Self::SupportedStr { diagnostics }
-            | Self::SupportedUnit { diagnostics } => diagnostics.is_empty(),
+            | Self::SupportedUnit { diagnostics }
+            | Self::SupportedTuple { diagnostics } => diagnostics.is_empty(),
             Self::Unsupported => false,
         }
     }
@@ -5664,7 +5670,8 @@ impl ConstLiteralCheck {
             Self::Unsupported => &[],
             Self::Supported { diagnostics, .. }
             | Self::SupportedStr { diagnostics }
-            | Self::SupportedUnit { diagnostics } => diagnostics,
+            | Self::SupportedUnit { diagnostics }
+            | Self::SupportedTuple { diagnostics } => diagnostics,
         }
     }
 }
@@ -5702,144 +5709,317 @@ fn check_const_literal_owner(
     if !is_supported_const_name_convention(&name, written_name) {
         return Ok(ConstLiteralCheck::Unsupported);
     }
-    if let TyKind::Tuple(elements) = ty.kind
-        && elements.is_empty()
-    {
-        let Some(body) = owner.body else {
-            return Ok(ConstLiteralCheck::Unsupported);
-        };
-        let diagnostics = match body.value.kind {
-            ExprKind::Tuple(elements) if elements.is_empty() => Vec::new(),
-            ExprKind::Lit(literal) => vec![const_literal_diagnostic(
-                owner.id,
-                inputs,
-                snapshot,
-                body.value.span,
-                sai_diagnostics::Code::TypeMismatch,
-                format!("expected `()`, found {}", const_literal_found_type(literal)),
-                "type mismatch",
-            )?],
-            _ => return Ok(ConstLiteralCheck::Unsupported),
-        };
-        return Ok(ConstLiteralCheck::SupportedUnit { diagnostics });
-    }
-    let TyKind::Path(path) = ty.kind else {
-        return Ok(ConstLiteralCheck::Unsupported);
-    };
-    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
-        return Ok(ConstLiteralCheck::Unsupported);
-    }
-    let Some(type_paths) = type_paths else {
-        return Ok(ConstLiteralCheck::Unsupported);
-    };
-    let primitive = match type_paths.paths().get(&path.hir_id) {
-        Some(PathRes {
-            base: Res::PrimTy(primitive),
-            resolved_segments: 1,
-            segment_count: 1,
-        }) => *primitive,
-        None if is_deferred_canonical_str_path(path, type_paths, symbols, inputs) => {
-            let Some(body) = owner.body else {
-                return Ok(ConstLiteralCheck::Unsupported);
-            };
-            let ExprKind::Lit(literal) = body.value.kind else {
-                return Ok(ConstLiteralCheck::Unsupported);
-            };
-            let diagnostics = match literal {
-                Lit::Str(_) => Vec::new(),
-                literal => vec![const_literal_diagnostic(
-                    owner.id,
-                    inputs,
-                    snapshot,
-                    body.value.span,
-                    sai_diagnostics::Code::TypeMismatch,
-                    format!(
-                        "expected `Str`, found {}",
-                        const_literal_found_type(literal)
-                    ),
-                    "type mismatch",
-                )?],
-            };
-            return Ok(ConstLiteralCheck::SupportedStr { diagnostics });
-        }
-        _ => {
-            return Ok(ConstLiteralCheck::Unsupported);
-        }
-    };
-    if !is_supported_const_literal_primitive(primitive) {
-        return Ok(ConstLiteralCheck::Unsupported);
-    }
     let Some(body) = owner.body else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
-    let ExprKind::Lit(literal) = body.value.kind else {
+    if let TyKind::Tuple(elements) = ty.kind {
+        if elements.is_empty() {
+            let Some(diagnostics) = check_const_literal_leaf(
+                owner,
+                *ty,
+                &body.value,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(ConstLiteralCheck::Unsupported);
+            };
+            return Ok(ConstLiteralCheck::SupportedUnit { diagnostics });
+        }
+
+        let Some(diagnostics) = check_const_tuple_literal(
+            owner,
+            elements,
+            &body.value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(ConstLiteralCheck::Unsupported);
+        };
+        return Ok(ConstLiteralCheck::SupportedTuple { diagnostics });
+    }
+
+    let Some(literal_type) = resolve_const_literal_type(*ty, type_paths, symbols, inputs) else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    let Some(diagnostics) = check_const_literal_leaf(
+        owner,
+        *ty,
+        &body.value,
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )?
+    else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
 
-    let diagnostics = match (primitive, literal) {
-        (sai_resolve::prelude::PrimTy::Bool, Lit::Bool(_)) => Vec::new(),
-        (sai_resolve::prelude::PrimTy::Char, Lit::Char(_))
-        | (sai_resolve::prelude::PrimTy::Byte, Lit::Byte(_)) => Vec::new(),
-        (primitive, Lit::Int { value, negated }) if is_integer_primitive(primitive) => {
-            if const_integer_literal_fits(primitive, value, negated, target_cfg.pointer_width()) {
-                Vec::new()
-            } else {
-                vec![const_literal_diagnostic(
-                    owner.id,
-                    inputs,
-                    snapshot,
-                    body.value.span,
-                    sai_diagnostics::Code::LiteralOutOfRange,
-                    format!(
-                        "integer literal is out of range for `{}`",
-                        const_primitive_name(primitive)
-                    ),
-                    "literal out of range",
-                )?]
+    Ok(match literal_type {
+        ConstLiteralType::Primitive(primitive) => ConstLiteralCheck::Supported {
+            primitive,
+            diagnostics,
+        },
+        ConstLiteralType::Str => ConstLiteralCheck::SupportedStr { diagnostics },
+        ConstLiteralType::Unit => ConstLiteralCheck::SupportedUnit { diagnostics },
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConstLiteralType {
+    Primitive(sai_resolve::prelude::PrimTy),
+    Str,
+    Unit,
+}
+
+fn resolve_const_literal_type(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<ConstLiteralType> {
+    match ty.kind {
+        TyKind::Tuple(elements) if elements.is_empty() => Some(ConstLiteralType::Unit),
+        TyKind::Tuple(_) => None,
+        TyKind::Path(path)
+            if path.root == PathRoot::Plain
+                && path.segments.len() == 1
+                && path.segments[0].args.is_none() =>
+        {
+            let type_paths = type_paths?;
+            match type_paths.paths().get(&path.hir_id) {
+                Some(PathRes {
+                    base: Res::PrimTy(primitive),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                }) if is_supported_const_literal_primitive(*primitive) => {
+                    Some(ConstLiteralType::Primitive(*primitive))
+                }
+                None if is_deferred_canonical_str_path(path, type_paths, symbols, inputs) => {
+                    Some(ConstLiteralType::Str)
+                }
+                _ => None,
             }
         }
-        (primitive, Lit::Float { text, negated }) if is_fixed_width_float_primitive(primitive) => {
-            let text = symbols.resolve(text).ok();
-            if text
-                .as_deref()
-                .and_then(|text| round_const_float_literal(primitive, text, negated))
-                .is_some_and(ConstFloatValue::is_finite)
-            {
-                Vec::new()
-            } else {
-                vec![const_literal_diagnostic(
-                    owner.id,
-                    inputs,
-                    snapshot,
-                    body.value.span,
-                    sai_diagnostics::Code::LiteralOutOfRange,
-                    format!(
-                        "floating-point literal is out of range for `{}`",
-                        const_primitive_name(primitive)
-                    ),
-                    "literal out of range",
-                )?]
-            }
-        }
-        (primitive, literal) => vec![const_literal_diagnostic(
+        _ => None,
+    }
+}
+
+fn check_const_tuple_literal(
+    owner: &HirOwner<'_>,
+    expected_elements: &[Ty<'_>],
+    value: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let Some(_expected_types) = expected_elements
+        .iter()
+        .map(|ty| resolve_const_literal_type(*ty, type_paths, symbols, inputs))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+
+    let ExprKind::Tuple(values) = value.kind else {
+        let ExprKind::Lit(literal) = value.kind else {
+            return Ok(None);
+        };
+        return Ok(Some(vec![const_literal_diagnostic(
             owner.id,
             inputs,
             snapshot,
-            body.value.span,
+            value.span,
             sai_diagnostics::Code::TypeMismatch,
             format!(
-                "expected `{}`, found {}",
-                const_primitive_name(primitive),
+                "expected a tuple, found {}",
                 const_literal_found_type(literal)
             ),
             "type mismatch",
-        )?],
+        )?]));
     };
 
-    Ok(ConstLiteralCheck::Supported {
-        primitive,
-        diagnostics,
-    })
+    if values
+        .iter()
+        .any(|value| !is_direct_const_literal_or_unit(value))
+    {
+        return Ok(None);
+    }
+    if values.len() != expected_elements.len() {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected a tuple with {} elements, found {}",
+                expected_elements.len(),
+                values.len()
+            ),
+            "type mismatch",
+        )?]));
+    }
+
+    let mut diagnostics = Vec::new();
+    for (expected_ty, value) in expected_elements.iter().zip(values) {
+        let Some(mut field_diagnostics) = check_const_literal_leaf(
+            owner,
+            *expected_ty,
+            value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(None);
+        };
+        diagnostics.append(&mut field_diagnostics);
+    }
+    Ok(Some(diagnostics))
+}
+
+fn is_direct_const_literal_or_unit(value: &HirExpr<'_>) -> bool {
+    match value.kind {
+        ExprKind::Lit(_) => true,
+        ExprKind::Tuple(elements) => elements.is_empty(),
+        _ => false,
+    }
+}
+
+fn check_const_literal_leaf(
+    owner: &HirOwner<'_>,
+    ty: Ty<'_>,
+    value: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let Some(literal_type) = resolve_const_literal_type(ty, type_paths, symbols, inputs) else {
+        return Ok(None);
+    };
+    let literal = match value.kind {
+        ExprKind::Lit(literal) => Some(literal),
+        ExprKind::Tuple(elements) if elements.is_empty() => None,
+        _ => return Ok(None),
+    };
+
+    let mismatch = |expected: &str, found: &str| {
+        const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected `{expected}`, found {found}"),
+            "type mismatch",
+        )
+    };
+
+    let Some(literal) = literal else {
+        let diagnostic = match literal_type {
+            ConstLiteralType::Unit => None,
+            ConstLiteralType::Primitive(primitive) => {
+                Some(mismatch(const_primitive_name(primitive), "unit")?)
+            }
+            ConstLiteralType::Str => Some(mismatch("Str", "unit")?),
+        };
+        return Ok(Some(diagnostic.into_iter().collect()));
+    };
+
+    let diagnostics = match literal_type {
+        ConstLiteralType::Unit => vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected `()`, found {}", const_literal_found_type(literal)),
+            "type mismatch",
+        )?],
+        ConstLiteralType::Str => match literal {
+            Lit::Str(_) => Vec::new(),
+            literal => vec![mismatch("Str", const_literal_found_type(literal))?],
+        },
+        ConstLiteralType::Primitive(primitive) => match (primitive, literal) {
+            (sai_resolve::prelude::PrimTy::Bool, Lit::Bool(_)) => Vec::new(),
+            (sai_resolve::prelude::PrimTy::Char, Lit::Char(_))
+            | (sai_resolve::prelude::PrimTy::Byte, Lit::Byte(_)) => Vec::new(),
+            (
+                primitive,
+                Lit::Int {
+                    value: number,
+                    negated,
+                },
+            ) if is_integer_primitive(primitive) => {
+                if const_integer_literal_fits(
+                    primitive,
+                    number,
+                    negated,
+                    target_cfg.pointer_width(),
+                ) {
+                    Vec::new()
+                } else {
+                    vec![const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        value.span,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        format!(
+                            "integer literal is out of range for `{}`",
+                            const_primitive_name(primitive)
+                        ),
+                        "literal out of range",
+                    )?]
+                }
+            }
+            (primitive, Lit::Float { text, negated })
+                if is_fixed_width_float_primitive(primitive) =>
+            {
+                let text = symbols.resolve(text).ok();
+                if text
+                    .as_deref()
+                    .and_then(|text| round_const_float_literal(primitive, text, negated))
+                    .is_some_and(ConstFloatValue::is_finite)
+                {
+                    Vec::new()
+                } else {
+                    vec![const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        value.span,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        format!(
+                            "floating-point literal is out of range for `{}`",
+                            const_primitive_name(primitive)
+                        ),
+                        "literal out of range",
+                    )?]
+                }
+            }
+            (primitive, literal) => vec![mismatch(
+                const_primitive_name(primitive),
+                const_literal_found_type(literal),
+            )?],
+        },
+    };
+    Ok(Some(diagnostics))
 }
 
 fn is_deferred_canonical_str_path(
@@ -25476,6 +25656,152 @@ mod tests {
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
                 "nonliteral unit form or alias at owner index {index} remains unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn const_flat_tuple_literal_check_accepts_only_supported_direct_fields() {
+        let root = concat!(
+            "pub const PAIR: (I32, Bool) = (1, true)\n",
+            "pub const SINGLE: (U8,) = (255,)\n",
+            "pub const MIXED: (F32, Str, ()) = (1.25, \"text\", ())\n",
+            "pub const FIELD_MISMATCH: (I32, Bool) = (1, 2)\n",
+            "pub const FIELD_RANGE: (I8,) = (128,)\n",
+            "pub const ARITY_SHORT: (I32, Bool) = (1,)\n",
+            "pub const ARITY_LONG: (I32,) = (1, true)\n",
+            "pub const SCALAR_MISMATCH: (I32, Bool) = false\n",
+            "pub const NESTED: ((I32,),) = ((1,),)\n",
+            "pub const ARRAY: Array<I32, 1> = [1]\n",
+            "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
+            "pub type Number = I32\n",
+            "pub const ALIAS_FIELD: (Number,) = (1,)\n",
+            "pub const GROUPING: (I32,) = (1)\n",
+            "pub const UNIT_NONEMPTY_MISMATCH: () = (1,)\n",
+            "pub const SCALAR_TUPLE_MISMATCH: I32 = (1,)\n",
+            "pub const MULTIPLE_FIELD_ERRORS: (I8, Bool) = (128, 1)\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(checks.len(), 16);
+        let assert_primary_literal_span =
+            |diagnostic: &Diagnostic, declaration: &str, literal: &str| {
+                let declaration_start = root
+                    .find(declaration)
+                    .unwrap_or_else(|| panic!("test source contains {declaration:?}"));
+                let value_start = root[declaration_start..]
+                    .find(" = ")
+                    .expect("const declaration has an initializer")
+                    + declaration_start
+                    + " = ".len();
+                let value_end = root[value_start..]
+                    .find('\n')
+                    .map_or(root.len(), |relative_end| value_start + relative_end);
+                let literal_start = root[value_start..value_end]
+                    .rfind(literal)
+                    .unwrap_or_else(|| panic!("initializer contains {literal:?}"))
+                    + value_start;
+                let expected_range = sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(literal_start as u32),
+                    sai_diagnostics::TextSize::new((literal_start + literal.len()) as u32),
+                )
+                .expect("literal span is ordered");
+                assert_eq!(
+                    diagnostic.primary().map(|location| location.span.range),
+                    Some(expected_range),
+                    "primary diagnostic span should cover literal {literal:?}"
+                );
+            };
+        for index in 0..3 {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::SupportedTuple {
+                    diagnostics: Vec::new(),
+                },
+                "direct flat tuple at owner index {index} is supported"
+            );
+        }
+        for index in [3, 5, 6, 7] {
+            let ConstLiteralCheck::SupportedTuple { diagnostics } = checks[index] else {
+                panic!("supported tuple mismatch at owner index {index} should be diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::TypeMismatch,
+                "owner index {index}"
+            );
+            assert!(diagnostics[0].has_workspace_snapshot());
+            assert!(diagnostics[0].primary().is_some());
+        }
+        let ConstLiteralCheck::SupportedTuple { diagnostics } = checks[3] else {
+            panic!("field mismatch at owner index 3 should be diagnosed");
+        };
+        assert_primary_literal_span(&diagnostics[0], "pub const FIELD_MISMATCH:", "2");
+        let ConstLiteralCheck::SupportedTuple { diagnostics } = checks[4] else {
+            panic!("out-of-range tuple field at owner index 4 should be diagnosed");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::LiteralOutOfRange
+        );
+        let ConstLiteralCheck::SupportedTuple { diagnostics } = checks[12] else {
+            panic!("grouped scalar at tuple owner index 12 should be diagnosed");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_eq!(
+            checks[13],
+            &ConstLiteralCheck::Unsupported,
+            "nonempty tuple values against unit remain gated without tuple inference"
+        );
+        assert_eq!(
+            checks[14],
+            &ConstLiteralCheck::Unsupported,
+            "nonempty tuple values against scalar types remain gated"
+        );
+        let ConstLiteralCheck::SupportedTuple { diagnostics } = checks[15] else {
+            panic!("multiple supported tuple field errors should be collected");
+        };
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            vec![
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::TypeMismatch
+            ]
+        );
+        assert_primary_literal_span(&diagnostics[0], "pub const MULTIPLE_FIELD_ERRORS:", "128");
+        assert_primary_literal_span(&diagnostics[1], "pub const MULTIPLE_FIELD_ERRORS:", "1");
+        for index in [8, 9, 10, 11] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Unsupported,
+                "nested, array, expression, or alias form at owner index {index} stays gated"
             );
         }
     }
