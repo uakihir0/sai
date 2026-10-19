@@ -2794,6 +2794,8 @@ fn collect_interface_uses_input(
         }
         let mut generated_variant_type_references = generated_record_type_references.clone();
         let mut generated_function_type_references = generated_variant_type_references.clone();
+        let mut generated_alias_definition_type_references =
+            generated_record_type_references.clone();
         if let (Some(unit), Some(interface_index), Some(interface_name)) = (
             generated_unit.as_ref(),
             generated_interface_index,
@@ -2814,18 +2816,19 @@ fn collect_interface_uses_input(
                 let Some(item_name) = sai_identifier_to_wit_name(&source_name) else {
                     continue;
                 };
-                generated_function_type_references.insert(
-                    member_owner.def_id.to_def_id(),
-                    WitTypeRef {
-                        interface: sai_wit::WitIfaceRef {
-                            unit: unit.clone(),
-                            interface: interface_index,
-                            name: interface_name.clone(),
-                        },
-                        item: provisional_item_indices[member_index],
-                        item_name,
+                let reference = WitTypeRef {
+                    interface: sai_wit::WitIfaceRef {
+                        unit: unit.clone(),
+                        interface: interface_index,
+                        name: interface_name.clone(),
                     },
-                );
+                    item: provisional_item_indices[member_index],
+                    item_name,
+                };
+                generated_function_type_references
+                    .insert(member_owner.def_id.to_def_id(), reference.clone());
+                generated_alias_definition_type_references
+                    .insert(member_owner.def_id.to_def_id(), reference);
             }
         }
         for (member_index, (entry, member_owner)) in member_entries
@@ -2947,7 +2950,7 @@ fn collect_interface_uses_input(
                 poisoned_owners.insert(member_owner);
             }
             let item_type_references = match kind {
-                super::InterfaceMemberKind::Alias => &generated_record_type_references,
+                super::InterfaceMemberKind::Alias => &generated_alias_definition_type_references,
                 super::InterfaceMemberKind::Function => &generated_function_type_references,
                 super::InterfaceMemberKind::Struct => &generated_record_type_references,
                 super::InterfaceMemberKind::Enum => &generated_variant_type_references,
@@ -3058,6 +3061,11 @@ fn collect_interface_uses_input(
                                     .clone(),
                             );
                             generated_function_type_references.insert(
+                                member_owner.def_id.to_def_id(),
+                                generated_named_type_references[&member_owner.def_id.to_def_id()]
+                                    .clone(),
+                            );
+                            generated_alias_definition_type_references.insert(
                                 member_owner.def_id.to_def_id(),
                                 generated_named_type_references[&member_owner.def_id.to_def_id()]
                                     .clone(),
@@ -3328,6 +3336,11 @@ fn collect_interface_uses_input(
                                 .clone(),
                         );
                         generated_function_type_references.insert(
+                            member_owner.def_id.to_def_id(),
+                            generated_named_type_references[&member_owner.def_id.to_def_id()]
+                                .clone(),
+                        );
+                        generated_alias_definition_type_references.insert(
                             member_owner.def_id.to_def_id(),
                             generated_named_type_references[&member_owner.def_id.to_def_id()]
                                 .clone(),
