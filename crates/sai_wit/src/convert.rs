@@ -219,14 +219,16 @@ impl WitResolveContext {
 
         model_package(
             resolve,
-            parser_package,
-            unit,
-            &self.package_units,
-            &self.source_mappings,
-            &self.named_result_function_spans,
-            &package_name,
-            &source_world_includes,
-            &source_world_items,
+            PackageModelInput {
+                package_id: parser_package,
+                unit,
+                package_units: &self.package_units,
+                source_mappings: &self.source_mappings,
+                named_result_function_spans: &self.named_result_function_spans,
+                package_name: &package_name,
+                source_world_includes: &source_world_includes,
+                source_world_items: &source_world_items,
+            },
         )
     }
 }
@@ -456,16 +458,29 @@ fn package_unit_for_foreign_reference<'a>(
     (matches.len() == 1).then(|| matches[0])
 }
 
-fn model_package(
-    resolve: &Resolve,
+struct PackageModelInput<'a> {
     package_id: ParserPackageId,
     unit: WitUnit,
-    package_units: &HashMap<ParserPackageId, WitUnit>,
-    source_mappings: &[(u32, crate::WitSourceMapping)],
-    named_result_function_spans: &HashSet<(u32, u32)>,
-    package_name: &wit_parser::PackageName,
-    source_world_includes: &[SourceWorldInclude],
-    source_world_items: &HashMap<String, SourceWorldItems>,
+    package_units: &'a HashMap<ParserPackageId, WitUnit>,
+    source_mappings: &'a [(u32, crate::WitSourceMapping)],
+    named_result_function_spans: &'a HashSet<(u32, u32)>,
+    package_name: &'a wit_parser::PackageName,
+    source_world_includes: &'a [SourceWorldInclude],
+    source_world_items: &'a HashMap<String, SourceWorldItems>,
+}
+
+fn model_package(
+    resolve: &Resolve,
+    PackageModelInput {
+        package_id,
+        unit,
+        package_units,
+        source_mappings,
+        named_result_function_spans,
+        package_name,
+        source_world_includes,
+        source_world_items,
+    }: PackageModelInput<'_>,
 ) -> Result<WitPackage, WitModelError> {
     let version = package_name
         .version
@@ -494,8 +509,13 @@ fn model_package(
     }
 
     let type_references = build_type_references(resolve, package_units)?;
-    let generated_world_type_aliases =
-        build_generated_world_type_aliases(resolve, package_id, &unit, &type_references)?;
+    let generated_world_type_aliases = build_generated_world_type_aliases(
+        resolve,
+        package_id,
+        &unit,
+        package_units,
+        &type_references,
+    )?;
     let mut world_type_references = type_references.clone();
     world_type_references.extend(generated_world_type_aliases.clone());
     let unsupported_types = build_unsupported_types(resolve);
@@ -1207,6 +1227,14 @@ fn convert_handle(
         Handle::Own(type_id) => (type_id, true),
         Handle::Borrow(type_id) => (type_id, false),
     };
+    if matches!(resolve.types[type_id].owner, TypeOwner::World(_))
+        && !type_references.contains_key(&type_id)
+    {
+        return Ok((
+            WitType::Unsupported(Unsupported::WorldType),
+            Some(Unsupported::WorldType),
+        ));
+    }
     let reference = type_reference(type_id, resolve, unit, interface_indexes, type_references)?;
     Ok((
         if owned {
@@ -1297,6 +1325,7 @@ fn build_generated_world_type_aliases(
     resolve: &Resolve,
     package_id: ParserPackageId,
     unit: &WitUnit,
+    package_units: &HashMap<ParserPackageId, WitUnit>,
     type_references: &HashMap<TypeId, WitTypeRef>,
 ) -> Result<HashMap<TypeId, WitTypeRef>, WitModelError> {
     if !matches!(unit.kind(), WitUnitKind::Generated { .. }) {
@@ -1331,15 +1360,93 @@ fn build_generated_world_type_aliases(
             let TypeOwner::Interface(target_interface) = target.owner else {
                 continue;
             };
-            if resolve.interfaces[target_interface].package != Some(package_id) {
+            let Some(target_package_id) = resolve.interfaces[target_interface].package else {
+                continue;
+            };
+            let Some(reference) = type_references.get(target_id) else {
+                continue;
+            };
+            if target_package_id == package_id {
+                aliases.entry(*id).or_insert_with(|| reference.clone());
                 continue;
             }
-            if let Some(reference) = type_references.get(target_id) {
-                aliases.entry(*id).or_insert_with(|| reference.clone());
+            let Some(selected_unit) = package_units.get(&target_package_id) else {
+                continue;
+            };
+            if !matches!(
+                &target.kind,
+                TypeDefKind::Type(_)
+                    | TypeDefKind::Record(_)
+                    | TypeDefKind::Variant(_)
+                    | TypeDefKind::Enum(_)
+                    | TypeDefKind::Flags(_)
+            ) || !type_reference_matches_interface_item(
+                resolve,
+                target_package_id,
+                target_interface,
+                *target_id,
+                selected_unit,
+                reference,
+            ) {
+                continue;
             }
+            aliases.entry(*id).or_insert_with(|| reference.clone());
         }
     }
     Ok(aliases)
+}
+
+fn type_reference_matches_interface_item(
+    resolve: &Resolve,
+    package_id: ParserPackageId,
+    interface_id: InterfaceId,
+    type_id: TypeId,
+    unit: &WitUnit,
+    reference: &WitTypeRef,
+) -> bool {
+    if &reference.interface.unit != unit {
+        return false;
+    }
+    let Some(package) = resolve.packages.get(package_id) else {
+        return false;
+    };
+    let Some((interface_position, interface_name)) = package
+        .interfaces
+        .iter()
+        .enumerate()
+        .find(|(_, (_, found_interface))| **found_interface == interface_id)
+        .map(|(index, (name, _))| (index, name))
+    else {
+        return false;
+    };
+    let Some(expected_interface_index) = u32::try_from(interface_position)
+        .ok()
+        .map(WitIfaceIdx::from_raw)
+    else {
+        return false;
+    };
+    if reference.interface.interface != expected_interface_index
+        || reference.interface.name != interface_name.as_str()
+    {
+        return false;
+    }
+    let Some(interface) = resolve.interfaces.get(interface_id) else {
+        return false;
+    };
+    let Some((item_position, item_name)) = interface
+        .types
+        .iter()
+        .enumerate()
+        .find(|(_, (_, found_type))| **found_type == type_id)
+        .map(|(index, (name, _))| (index, name))
+    else {
+        return false;
+    };
+    let Some(expected_item_index) = u32::try_from(item_position).ok().map(WitItemIdx::from_raw)
+    else {
+        return false;
+    };
+    reference.item == expected_item_index && reference.item_name == item_name.as_str()
 }
 
 #[derive(Clone, Copy)]
@@ -2091,6 +2198,190 @@ mod tests {
     }
 
     #[test]
+    fn generated_world_use_aliases_resolve_to_selected_external_types() {
+        let generated = generated_unit();
+        let dependency = dir_unit_for("acme:dependency", "acme:dependency#1", "1.4.12");
+        let dependency_source =
+            "package acme:dependency@1.4.12;\ninterface api { type data = u32; }";
+        let generated_source = concat!(
+            "package acme:generated@1.2.3;\n",
+            "world w {\n",
+            "  use acme:dependency/api@1.4.12.{data};\n",
+            "  import f: func(x: data) -> data;\n",
+            "}\n",
+        );
+
+        let mut context = WitResolveContext::default();
+        let mut resolve = Resolve::default();
+        context
+            .push_package(
+                &mut resolve,
+                parse_source_files(
+                    dependency.clone(),
+                    [WitSourceFile::new("dependency.wit", dependency_source)],
+                )
+                .expect("selected dependency WIT parses"),
+            )
+            .expect("selected dependency package resolves");
+        let package = context
+            .push_package(
+                &mut resolve,
+                parse_source_files(
+                    generated.clone(),
+                    [WitSourceFile::new("generated.wit", generated_source)],
+                )
+                .expect("generated WIT parses"),
+            )
+            .expect("generated package resolves through its selected dependency");
+
+        let generated_package_id = context
+            .package_units
+            .iter()
+            .find_map(|(package_id, candidate)| (candidate == &generated).then_some(*package_id))
+            .expect("generated parser package retains its exact unit");
+        let dependency_package_id = context
+            .package_units
+            .iter()
+            .find_map(|(package_id, candidate)| (candidate == &dependency).then_some(*package_id))
+            .expect("dependency parser package retains its exact unit");
+        let dependency_interface_id = *resolve.packages[dependency_package_id]
+            .interfaces
+            .get("api")
+            .expect("dependency interface is resolved");
+        let dependency_type_id = *resolve.interfaces[dependency_interface_id]
+            .types
+            .get("data")
+            .expect("dependency named type is resolved");
+        let mut mismatched_references =
+            build_type_references(&resolve, &context.package_units).expect("references build");
+        mismatched_references
+            .get_mut(&dependency_type_id)
+            .expect("selected dependency type has a reference")
+            .interface
+            .unit = generated.clone();
+        assert!(
+            build_generated_world_type_aliases(
+                &resolve,
+                generated_package_id,
+                &generated,
+                &context.package_units,
+                &mismatched_references,
+            )
+            .expect("mismatched external target is rejected")
+            .is_empty(),
+            "the alias must not accept a reference from a different selected unit"
+        );
+
+        let world = &package.worlds[WitWorldIdx::from_raw(0)];
+        assert_eq!(world.unsupported, None);
+        let WitWorldItem::Func {
+            func, unsupported, ..
+        } = world
+            .imports
+            .iter()
+            .find(|item| matches!(item, WitWorldItem::Func { .. }))
+            .expect("the world function is retained")
+        else {
+            unreachable!("the selected world item is a function");
+        };
+        assert_eq!(*unsupported, None);
+        let expected = crate::WitTypeRef {
+            interface: crate::WitIfaceRef {
+                unit: dependency.clone(),
+                interface: WitIfaceIdx::from_raw(0),
+                name: "api".to_owned(),
+            },
+            item: WitItemIdx::from_raw(0),
+            item_name: "data".to_owned(),
+        };
+        assert_eq!(
+            func.params,
+            [("x".to_owned(), WitType::Named(expected.clone()))]
+        );
+        assert_eq!(func.result, Some(WitType::Named(expected)));
+
+        let printed = print_wit(&package);
+        assert!(printed.contains(
+            "use acme:dependency/api@1.4.12.{data};\n\n  import f: func(x: data) -> data;"
+        ));
+        let mut roundtrip_context = WitResolveContext::default();
+        let mut roundtrip_resolve = Resolve::default();
+        roundtrip_context
+            .push_package(
+                &mut roundtrip_resolve,
+                parse_source_files(
+                    dependency,
+                    [WitSourceFile::new("dependency.wit", dependency_source)],
+                )
+                .expect("selected dependency WIT reparses"),
+            )
+            .expect("selected dependency package resolves again");
+        let roundtrip = roundtrip_context
+            .push_package(
+                &mut roundtrip_resolve,
+                parse_source_files(
+                    generated,
+                    [WitSourceFile::new("generated.wit", printed.as_str())],
+                )
+                .expect("printed generated WIT reparses"),
+            )
+            .expect("round-trip generated package resolves");
+        assert_eq!(print_wit(&roundtrip), printed);
+    }
+
+    #[test]
+    fn generated_world_use_aliases_do_not_enable_external_resources() {
+        let generated = generated_unit();
+        let dependency = dir_unit_for("acme:dependency", "acme:dependency#1", "1.4.12");
+        let mut context = WitResolveContext::default();
+        let mut resolve = Resolve::default();
+        context
+            .push_package(
+                &mut resolve,
+                parse_source_files(
+                    dependency.clone(),
+                    [WitSourceFile::new(
+                        "dependency.wit",
+                        "package acme:dependency@1.4.12;\ninterface api { resource widget; }",
+                    )],
+                )
+                .expect("selected resource dependency WIT parses"),
+            )
+            .expect("selected resource dependency resolves");
+        let package = context
+            .push_package(
+                &mut resolve,
+                parse_source_files(
+                    generated,
+                    [WitSourceFile::new(
+                        "generated.wit",
+                        "package acme:generated@1.2.3;\nworld w { use acme:dependency/api@1.4.12.{widget}; import f: func(x: own<widget>); }",
+                    )],
+                )
+                .expect("generated resource use parses"),
+            )
+            .expect("generated world with an external resource resolves");
+
+        let world = &package.worlds[WitWorldIdx::from_raw(0)];
+        assert_eq!(world.unsupported, Some(Unsupported::WorldType));
+        let WitWorldItem::Func {
+            func, unsupported, ..
+        } = world
+            .imports
+            .iter()
+            .find(|item| matches!(item, WitWorldItem::Func { .. }))
+            .expect("the function remains available for unsupported reporting")
+        else {
+            unreachable!("the selected world item is a function");
+        };
+        assert_eq!(*unsupported, Some(Unsupported::WorldType));
+        assert_eq!(
+            func.params[0].1,
+            WitType::Unsupported(Unsupported::WorldType)
+        );
+    }
+
+    #[test]
     fn authored_world_use_aliases_remain_unsupported() {
         let unit = dir_unit_for("acme:generated", "acme:generated#1", "1.2.3");
         let parsed = parse_source_files(
@@ -2170,9 +2461,15 @@ mod tests {
             build_type_references(&resolve, &package_units).expect("type references build");
         type_references.remove(&target_id);
         assert!(
-            build_generated_world_type_aliases(&resolve, package_id, &unit, &type_references)
-                .expect("alias mapping remains defensive")
-                .is_empty(),
+            build_generated_world_type_aliases(
+                &resolve,
+                package_id,
+                &unit,
+                &package_units,
+                &type_references,
+            )
+            .expect("alias mapping remains defensive")
+            .is_empty(),
             "an alias whose target is unmapped must not be accepted"
         );
         let interface_indexes = package

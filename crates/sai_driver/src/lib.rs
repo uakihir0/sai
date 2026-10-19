@@ -45192,6 +45192,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             "  type LocalAlias = api.Data\n",
             "  fn local_member(value: api.Data)\n",
             "}\n",
+            "world client { import fn consume(value: api.Data) -> api.Data }\n",
         );
         let mut database = RootDatabase::new().expect("driver initializes");
         let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
@@ -45345,6 +45346,11 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         assert!(generated.text.contains("use acme:codec/api@1.2.3.{data};"));
         assert!(generated.text.contains("type local-alias = data;"));
         assert!(generated.text.contains("local-member: func(value: data);"));
+        assert!(
+            generated
+                .text
+                .contains("import consume: func(value: data) -> data;")
+        );
 
         let root_model = generated_result
             .package
@@ -45391,6 +45397,195 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                     && reference.interface.interface == root_interface_index
                     && reference.item_name == "data"
         ));
+        let client = root_model
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "client")
+            .expect("the direct world is generated");
+        let sai_wit::WitWorldItem::Func { func, .. } = client
+            .imports
+            .iter()
+            .find(|item| matches!(item, sai_wit::WitWorldItem::Func { .. }))
+            .expect("the world import remains a function")
+        else {
+            unreachable!("the matched world import is a function");
+        };
+        for ty in [
+            &func.params[0].1,
+            func.result.as_ref().expect("result type is present"),
+        ] {
+            let sai_wit::WitType::Named(reference) = ty else {
+                panic!("the external world function keeps a named type reference");
+            };
+            assert_eq!(reference.interface.unit, codec_view.view.unit);
+            assert_eq!(reference.interface.interface, codec_interface.wit);
+            assert_eq!(reference.item, codec_item.item);
+            assert_eq!(reference.item_name, "data");
+        }
+    }
+
+    #[test]
+    fn generated_world_function_keeps_types_from_partial_foreign_views_incomplete() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "world client {\n",
+            "  import fn consume(value: api.Data)\n",
+            "  export fn missing(value: api.Missing)\n",
+            "}\n",
+        );
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", root_source.as_bytes())],
+        );
+        let (codec_package, codec_tree, codec_files) = multi_package_fixture(
+            &mut database,
+            "acme:codec#1",
+            "acme:codec@1.2.3",
+            &[(
+                "lib.sai",
+                b"pub interface api { type Data = U32; type Hidden = USize }\n",
+            )],
+        );
+        snapshot_files.extend(codec_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:codec#1", "acme:codec")],
+                ),
+                graph_node(
+                    "acme:codec#1",
+                    "acme:codec",
+                    "1.2.3",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("generated-source dependency graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let codec_manifest: Arc<[u8]> =
+            Arc::from(&b"package acme:codec @ 1.2.3\nsource \"src\"\n"[..]);
+        let codec_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &codec_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                codec_manifest,
+                PackageRole::Dependency,
+                &[],
+            )
+            .expect("generated-source dependency scopes collect");
+        let codec_member_package = codec_collection.module_member_scope_package();
+        let codec_generated = database
+            .generated_wit_text(codec_package)
+            .expect("dependency generated WIT query succeeds")
+            .expect("source dependency publishes a generated WIT snapshot");
+        assert!(!codec_generated.complete);
+
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target, &graph)
+            .expect("active generated-source WIT view loads");
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the direct source dependency has a generated WIT view");
+        assert!(!codec_view.view.complete);
+        let codec_interface = codec_view
+            .view
+            .interfaces
+            .get("api")
+            .expect("the partial view retains the api interface");
+        let codec_item = codec_interface
+            .members
+            .get("Data")
+            .expect("the partial view retains the supported Data type");
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &[codec_member_package.as_foreign_package_scopes("acme:codec")],
+                &wit_views,
+            )
+            .expect("root scopes use the exact selected partial source view");
+
+        let selected = MvsPackageVersion::new(
+            "acme:root",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query completes");
+        assert!(
+            result.failure.is_none(),
+            "a present type in a partial dependency remains parseable: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(!generated.complete);
+        assert!(generated.text.contains("use acme:codec/api@1.2.3.{data};"));
+        assert!(
+            generated
+                .text
+                .contains("import consume: func(value: data);")
+        );
+        assert!(!generated.text.contains("missing:"));
+        let package = result
+            .package
+            .expect("generated root WIT model is available");
+        let world = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "client")
+            .expect("the direct world is generated");
+        let sai_wit::WitWorldItem::Func { func, .. } = world
+            .imports
+            .iter()
+            .find(|item| matches!(item, sai_wit::WitWorldItem::Func { .. }))
+            .expect("the supported world import remains a function")
+        else {
+            unreachable!("the matched world import is a function");
+        };
+        assert!(world.exports.is_empty());
+        let sai_wit::WitType::Named(reference) = &func.params[0].1 else {
+            panic!("the world signature retains its external named type");
+        };
+        assert_eq!(reference.interface.unit, codec_view.view.unit);
+        assert_eq!(reference.interface.interface, codec_interface.wit);
+        assert_eq!(reference.item, codec_item.item);
+        assert_eq!(reference.item_name, "data");
     }
 
     #[test]

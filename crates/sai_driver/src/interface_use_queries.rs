@@ -733,7 +733,7 @@ fn generated_world_function_item(
     source_graph_packages: &HashSet<PackageId>,
     primitive_prelude: &Result<Prelude, PrimitivePreludeBuildError>,
     local_boundary_aliases: &LocalBoundaryAliases<'_>,
-    generated_local_type_references: &HashMap<DefId, WitTypeRef>,
+    generated_world_type_references: &HashMap<DefId, WitTypeRef>,
     selected: Option<&sai_package::mvs::MvsPackageVersion>,
     packages: &PackageInterner,
     symbols: &Interner,
@@ -814,7 +814,7 @@ fn generated_world_function_item(
         let Res::Def(kind, def_id) = path_resolution.base else {
             continue;
         };
-        let definition = if generated_local_type_references.contains_key(&def_id) {
+        let definition = if generated_world_type_references.contains_key(&def_id) {
             match kind {
                 DefKind::Resource => Some(BoundaryDefinition::Resource),
                 _ => Some(BoundaryDefinition::InterfaceType),
@@ -879,7 +879,7 @@ fn generated_world_function_item(
         };
         let Ok(Some(parameter_type)) = sai_ty::boundary::materialize_boundary_type(
             &boundary_type,
-            generated_local_type_references,
+            generated_world_type_references,
             Position::Param,
         ) else {
             return Ok(None);
@@ -899,7 +899,7 @@ fn generated_world_function_item(
         };
         let Ok(result) = sai_ty::boundary::materialize_boundary_type(
             &boundary_type,
-            generated_local_type_references,
+            generated_world_type_references,
             Position::Result,
         ) else {
             return Ok(None);
@@ -2634,7 +2634,8 @@ fn collect_interface_uses_input(
         }
         let mut interface_item_names = Vec::with_capacity(member_entries.len());
         let mut generated_use_aliases = Vec::<GeneratedUseAlias>::new();
-        let mut generated_named_type_references = foreign_named_type_references.clone();
+        let mut generated_named_type_references =
+            foreign_named_type_references.by_definition.clone();
         for (entry, member_owner) in member_entries
             .into_iter()
             .zip(parent_members.iter().copied())
@@ -3158,6 +3159,13 @@ fn collect_interface_uses_input(
     let mut generated_worlds = Vec::new();
     let mut cyclic_worlds = HashSet::new();
     if generated_unit.is_some() {
+        let mut generated_world_type_references = generated_local_type_references.clone();
+        generated_world_type_references.extend(
+            foreign_named_type_references
+                .by_definition
+                .iter()
+                .map(|(definition, reference)| (*definition, reference.clone())),
+        );
         let generated_interface_references = generated_unit
             .as_ref()
             .map(|unit| {
@@ -3485,26 +3493,30 @@ fn collect_interface_uses_input(
                 )? {
                     (Some(item), complete)
                 } else {
-                    (
-                        generated_world_function_item(
-                            entry,
-                            &item_hir,
-                            descriptor.owner.def_id,
-                            item_owner,
-                            inputs,
-                            module_scope,
-                            prepared,
-                            &module_members,
-                            &source_graph_packages,
-                            primitive_prelude,
-                            &local_boundary_aliases,
-                            &generated_local_type_references,
-                            prepared.generated_package_version.as_ref(),
-                            packages,
-                            symbols,
-                        )?,
-                        true,
-                    )
+                    let item = generated_world_function_item(
+                        entry,
+                        &item_hir,
+                        descriptor.owner.def_id,
+                        item_owner,
+                        inputs,
+                        module_scope,
+                        prepared,
+                        &module_members,
+                        &source_graph_packages,
+                        primitive_prelude,
+                        &local_boundary_aliases,
+                        &generated_world_type_references,
+                        prepared.generated_package_version.as_ref(),
+                        packages,
+                        symbols,
+                    )?;
+                    let complete = item.as_ref().is_none_or(|item| {
+                        generated_world_function_view_is_complete(
+                            item,
+                            &foreign_named_type_references.view_completeness,
+                        )
+                    });
+                    (item, complete)
                 };
                 let Some(item) = item else {
                     generated_complete = false;
@@ -4875,10 +4887,16 @@ fn interface_boundary_type_definitions(
     definitions
 }
 
+#[derive(Default)]
+struct GeneratedForeignNamedTypeReferences {
+    by_definition: HashMap<DefId, WitTypeRef>,
+    view_completeness: HashMap<WitTypeRef, bool>,
+}
+
 fn generated_foreign_named_type_references(
     prepared: &PreparedPhase1PackageScopes,
-) -> HashMap<DefId, WitTypeRef> {
-    let mut references = HashMap::new();
+) -> GeneratedForeignNamedTypeReferences {
+    let mut references = GeneratedForeignNamedTypeReferences::default();
     for foreign in &prepared.foreign_wit_views {
         if !foreign.directly_visible {
             continue;
@@ -4919,22 +4937,46 @@ fn generated_foreign_named_type_references(
                 {
                     continue;
                 }
-                references.insert(
-                    member.def,
-                    WitTypeRef {
-                        interface: sai_wit::WitIfaceRef {
-                            unit: view.unit.clone(),
-                            interface: interface.wit,
-                            name: wit_interface.name.clone(),
-                        },
-                        item: member.item,
-                        item_name: wit_item.name.clone(),
+                let reference = WitTypeRef {
+                    interface: sai_wit::WitIfaceRef {
+                        unit: view.unit.clone(),
+                        interface: interface.wit,
+                        name: wit_interface.name.clone(),
                     },
-                );
+                    item: member.item,
+                    item_name: wit_item.name.clone(),
+                };
+                references
+                    .by_definition
+                    .insert(member.def, reference.clone());
+                references
+                    .view_completeness
+                    .entry(reference)
+                    .and_modify(|complete| *complete &= view.complete)
+                    .or_insert(view.complete);
             }
         }
     }
     references
+}
+
+fn generated_world_function_view_is_complete(
+    item: &WitWorldItem,
+    external_type_completeness: &HashMap<WitTypeRef, bool>,
+) -> bool {
+    let WitWorldItem::Func { func, .. } = item else {
+        return true;
+    };
+    let mut references = Vec::new();
+    let mut references_complete = true;
+    collect_wit_func_interface_references(func, &mut references, &mut references_complete);
+    references_complete
+        && references.into_iter().all(|reference| {
+            external_type_completeness
+                .get(&reference)
+                .copied()
+                .unwrap_or(true)
+        })
 }
 
 fn interface_boundary_roots<'hir>(owner: &HirOwner<'hir>) -> Vec<(&'hir Ty<'hir>, Position)> {
