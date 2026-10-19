@@ -45958,6 +45958,12 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             "use acme:codec/api as api\n",
             "use acme:codec/facade as facade\n",
             "interface client {\n",
+            "  type HandleAlias = api.Handle\n",
+            "  fn alias_consumer(value: HandleAlias)\n",
+            "  type HandleRecord { handle: api.Handle }\n",
+            "  enum HandleVariant { Wrapped(api.Handle) }\n",
+            "  fn record_consumer(value: HandleRecord)\n",
+            "  fn variant_consumer(value: HandleVariant)\n",
             "  fn accepted(value: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
             "  resource Proxy {\n",
             "    fn new(handle: api.Handle) -> Self\n",
@@ -46030,6 +46036,20 @@ interface facade { use acme:base/types@1.0.0.{handle as forwarded-resource}; }"#
                 .contains("use acme:codec/api@1.2.3.{handle};")
         );
         assert!(generated.text.contains("resource proxy {"));
+        assert!(
+            generated.text.contains("type handle-alias = handle;"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("alias-consumer: func(value: handle-alias);")
+        );
+        assert!(!generated.text.contains("record handle-record"));
+        assert!(!generated.text.contains("variant handle-variant"));
+        assert!(!generated.text.contains("record-consumer:"));
+        assert!(!generated.text.contains("variant-consumer:"));
         assert!(generated.text.contains("accepted: func("));
         assert!(generated.text.contains("inspect: func("));
         assert!(generated.text.contains("from-foreign: static func("));
@@ -46086,12 +46106,12 @@ interface facade { use acme:base/types@1.0.0.{handle as forwarded-resource}; }"#
             |ty: &sai_wit::WitType, expected_kind: fn(&sai_wit::WitType) -> bool| {
                 assert!(
                     expected_kind(ty),
-                    "the foreign handle keeps its ownership form"
+                    "the foreign handle keeps its ownership form: {ty:?}"
                 );
                 let reference = match ty {
-                    sai_wit::WitType::Own(reference) | sai_wit::WitType::Borrow(reference) => {
-                        reference
-                    }
+                    sai_wit::WitType::Named(reference)
+                    | sai_wit::WitType::Own(reference)
+                    | sai_wit::WitType::Borrow(reference) => reference,
                     _ => panic!("the reference targets an exact foreign resource"),
                 };
                 assert_eq!(reference.interface.unit, generated_unit);
@@ -46113,6 +46133,37 @@ interface facade { use acme:base/types@1.0.0.{handle as forwarded-resource}; }"#
             };
         let is_own = |ty: &sai_wit::WitType| matches!(ty, sai_wit::WitType::Own(_));
         let is_borrow = |ty: &sai_wit::WitType| matches!(ty, sai_wit::WitType::Borrow(_));
+        let is_named = |ty: &sai_wit::WitType| matches!(ty, sai_wit::WitType::Named(_));
+
+        let (handle_alias_index, handle_alias) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle-alias")
+            .expect("the alias of the exact direct foreign resource remains");
+        let sai_wit::WitItemKind::Alias(alias_target) = &handle_alias.kind else {
+            panic!("the generated foreign-resource alias remains a type alias");
+        };
+        assert_reference(alias_target, is_named);
+
+        let (_, alias_consumer) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "alias-consumer")
+            .expect("the function consuming the generated alias remains");
+        let sai_wit::WitItemKind::Func(alias_consumer) = &alias_consumer.kind else {
+            panic!("the generated alias consumer remains a WIT function");
+        };
+        assert!(
+            matches!(
+                &alias_consumer.params[0].1,
+                sai_wit::WitType::Own(reference)
+                    if reference.interface.unit == generated_unit
+                        && reference.interface.interface == client_index
+                        && reference.item == handle_alias_index
+                        && reference.item_name == "handle-alias"
+            ),
+            "the consumer points to the exact generated local alias"
+        );
 
         let (_, accepted) = client
             .items
@@ -46238,6 +46289,57 @@ interface facade { use acme:base/types@1.0.0.{handle as forwarded-resource}; }"#
         );
         assert!(generated.text.contains("resource proxy {"));
         assert!(generated.text.contains("inspect: func("));
+    }
+
+    #[test]
+    fn generated_interface_aliases_remain_usable_from_partial_foreign_views() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  type HandleAlias = api.Handle\n",
+            "  fn consume(value: HandleAlias)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3; interface api { resource handle; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        mark_authored_wit_view_incomplete(&mut wit_views, "acme:codec");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact partial foreign WIT view");
+        let generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated WIT query succeeds")
+            .expect("root source package publishes generated WIT");
+        assert!(
+            !generated.complete,
+            "a present resource alias from a partial view keeps output incomplete"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{handle};")
+        );
+        assert!(generated.text.contains("type handle-alias = handle;"));
+        assert!(
+            generated
+                .text
+                .contains("consume: func(value: handle-alias);")
+        );
     }
 
     fn authored_wit_world_fixture(
