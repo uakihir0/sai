@@ -4725,6 +4725,10 @@ mod tests {
         .expect("valid package identity")
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn mixed_source_resolver_loads_local_git_and_git_sibling_path_packages() {
         let directory = TestDirectory::new("mixed-source");
@@ -5261,6 +5265,10 @@ mod tests {
         assert!(audit.is_equivalent());
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn mixed_source_final_audit_reloads_late_path_pins_and_compares_contracts() {
         const TARGET_URL: &str = "https://example.test/acme/target.git";

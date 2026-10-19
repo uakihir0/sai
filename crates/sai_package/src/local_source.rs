@@ -4386,6 +4386,10 @@ mod tests {
         assert!(std::error::Error::source(&error).is_some());
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn resolves_paths_after_lexical_normalization_and_symlink_canonicalization() {
         let tree = TempTree::new();
@@ -4422,7 +4426,10 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn parent_components_after_symlinks_follow_filesystem_resolution() {
         use std::os::unix::fs::symlink;
@@ -4469,6 +4476,10 @@ mod tests {
         );
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn local_directory_index_resolves_path_pins_from_the_recorded_requirer() {
         let tree = TempTree::new();
