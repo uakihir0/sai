@@ -6110,7 +6110,7 @@ fn check_function_body_type(
         let mixed_condition_diagnostics = if condition_is_negated {
             None
         } else {
-            check_function_if_mixed_and_comparison_condition(
+            check_function_if_mixed_logical_comparison_condition(
                 owner,
                 cond,
                 *first.ty,
@@ -6376,7 +6376,7 @@ fn check_function_if_parameter_comparison_condition(
     )
 }
 
-fn check_function_if_mixed_and_comparison_condition(
+fn check_function_if_mixed_logical_comparison_condition(
     owner: &HirOwner<'_>,
     condition: &HirExpr<'_>,
     first_parameter_ty: Ty<'_>,
@@ -6390,7 +6390,7 @@ fn check_function_if_mixed_and_comparison_condition(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    let ExprKind::Binary(BinOp::And, left, right) = condition.kind else {
+    let ExprKind::Binary(BinOp::And | BinOp::Or, left, right) = condition.kind else {
         return Ok(None);
     };
     let (bool_path, comparison) = if matches!(left.kind, ExprKind::Path(_)) {
@@ -25234,7 +25234,7 @@ mod tests {
     }
 
     #[test]
-    fn function_body_type_check_accepts_and_of_bool_parameter_and_comparison_literal() {
+    fn function_body_type_check_accepts_mixed_logical_parameter_and_comparison_conditions() {
         let root = concat!(
             "type BoolAlias = Bool\n",
             "pub fn bool_first(enabled: Bool, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
@@ -25242,10 +25242,13 @@ mod tests {
             "pub fn literal_left(enabled: Bool, value: U8) -> I32 { if enabled and 18 <= value { 1 } else { 2 } }\n",
             "pub fn literal_right(value: I32, enabled: Bool) -> I32 { if 10 < value and enabled { 1 } else { 2 } }\n",
             "pub fn disjunction(enabled: Bool, value: I32) -> I32 { if enabled or value >= 18 { 1 } else { 2 } }\n",
+            "pub fn disjunction_reversed(value: I32, enabled: Bool) -> I32 { if value < 20 or enabled { 1 } else { 2 } }\n",
+            "pub fn disjunction_literal_left(enabled: Bool, value: U8) -> I32 { if 18 <= value or enabled { 1 } else { 2 } }\n",
             "pub fn negated_condition(enabled: Bool, value: I32) -> I32 { if not (enabled and value >= 18) { 1 } else { 2 } }\n",
             "pub fn negated_comparison(enabled: Bool, value: I32) -> I32 { if enabled and not (value >= 18) { 1 } else { 2 } }\n",
             "pub fn nested_condition(enabled: Bool, value: I32) -> I32 { if enabled and (value > 0 and value < 10) { 1 } else { 2 } }\n",
             "pub fn repeated_parameter(enabled: Bool, value: I32) -> I32 { if enabled and enabled >= 18 { 1 } else { 2 } }\n",
+            "pub fn disjunction_repeated_parameter(enabled: Bool, value: I32) -> I32 { if enabled or enabled >= 18 { 1 } else { 2 } }\n",
             "pub fn aliased_bool(enabled: BoolAlias, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
             "pub fn wrong_bool_type(enabled: I32, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
             "pub fn extra_parameter(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
@@ -25264,9 +25267,9 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 12);
+        assert_eq!(owners.len(), 15);
 
-        for index in 0..4 {
+        for index in 0..7 {
             let check = owners[index]
                 .body_type_check()
                 .expect("both logical and comparison operand orders are checked");
@@ -25275,7 +25278,7 @@ mod tests {
                 "function owner {index} unexpectedly failed the mixed condition slice: {check:?}"
             );
         }
-        for (index, owner) in owners.iter().enumerate().skip(4) {
+        for (index, owner) in owners.iter().enumerate().skip(7) {
             let check = owner
                 .body_type_check()
                 .expect("unsupported mixed condition shape is gated");
