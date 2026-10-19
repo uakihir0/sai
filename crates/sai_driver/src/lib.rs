@@ -50,6 +50,7 @@ use sai_hir::items::{
     HirOwner, ImplItemKind, ImplKind, InterfaceItemKind as HirInterfaceItemKind, ItemKind,
     OwnerNode, TraitItemKind, VariantShape, WorldItemKind, WorldRef,
 };
+use sai_hir::literals::Lit;
 use sai_hir::lower::{
     ExternItemIds, HirLoweringContext, HirLoweringError, InterfaceResourceMemberIds, WorldItemIds,
     lower_alias_owner, lower_const_owner, lower_distinct_owner, lower_effect_owner,
@@ -66,7 +67,7 @@ use sai_hir::types::{
     Bound, BoundKind, EffectRef as HirEffectRef, GenericArg, GenericArgs, GenericParamKind, Name,
     Path as HirPath, PathRoot, PathSegment, Ty, TyKind,
 };
-use sai_hir::{DefId, DefPath, DefPathData, DefPathInterner, DefPathInternerError};
+use sai_hir::{DefId, DefPath, DefPathData, DefPathInterner, DefPathInternerError, Visibility};
 use sai_hir::{HirId, OwnerId};
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
 use sai_intern::{Interner, LookupError, PackageId, PackageIdError, PackageInterner, Symbol};
@@ -5538,6 +5539,7 @@ pub struct ConstOwnerResolution {
     local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
+    literal_check: Result<ConstLiteralCheck, OwnerControlFlowResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution:
         Result<Option<OwnerTestOnlyPathResolution>, OwnerControlFlowResolutionError>,
@@ -5577,6 +5579,15 @@ impl ConstOwnerResolution {
             .map(|resolution| resolution.as_ref())
     }
 
+    /// Checks the narrow primitive-literal subset handled by the driver.
+    ///
+    /// `Unsupported` means the caller must keep the feature gate in place.
+    /// `Supported` carries any hard type or range diagnostics produced by
+    /// this subset; an empty diagnostic list means the literal is valid.
+    pub fn literal_check(&self) -> Result<&ConstLiteralCheck, &OwnerControlFlowResolutionError> {
+        self.literal_check.as_ref()
+    }
+
     /// Returns snapshot-bound diagnostics for typed member failures when this
     /// owner was resolved with a validated active-source closure. Package-local
     /// calls leave diagnostic mapping to their caller.
@@ -5603,6 +5614,265 @@ impl ConstOwnerResolution {
     pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
         &self.lowering_diagnostics
     }
+}
+
+/// Result of checking one public primitive-typed constant literal.
+///
+/// This deliberately covers only `Bool` and fixed-width integer primitive
+/// types. It does not imply that other constant expressions are evaluated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConstLiteralCheck {
+    /// The declaration or HIR shape is outside this checking slice.
+    Unsupported,
+    /// The primitive type and literal form are in scope for this checker.
+    ///
+    /// A nonempty diagnostic list represents a supported but invalid
+    /// initializer. An empty list means the initializer passed this check.
+    Supported {
+        primitive: sai_resolve::prelude::PrimTy,
+        diagnostics: Vec<Diagnostic>,
+    },
+}
+
+impl ConstLiteralCheck {
+    pub const fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported { .. })
+    }
+
+    pub fn is_valid(&self) -> bool {
+        matches!(self, Self::Supported { diagnostics, .. } if diagnostics.is_empty())
+    }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        match self {
+            Self::Unsupported => &[],
+            Self::Supported { diagnostics, .. } => diagnostics,
+        }
+    }
+}
+
+fn check_const_literal_owner(
+    owner: &HirOwner<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<ConstLiteralCheck, OwnerControlFlowResolutionError> {
+    if !owner.raw_attrs.is_empty() {
+        return Ok(ConstLiteralCheck::Unsupported);
+    }
+    let OwnerNode::Item(item) = owner.node else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    if item.vis != Visibility::Pub {
+        return Ok(ConstLiteralCheck::Unsupported);
+    }
+    let ItemKind::Const { ty } = item.kind else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    let Ok(name) = symbols.resolve(item.name.sym) else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    let Some(written_name) = inputs
+        .source
+        .text()
+        .get(item.name.span.range.start().to_usize()..item.name.span.range.end().to_usize())
+    else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    if !is_supported_const_name_convention(&name, written_name) {
+        return Ok(ConstLiteralCheck::Unsupported);
+    }
+    let TyKind::Path(path) = ty.kind else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return Ok(ConstLiteralCheck::Unsupported);
+    }
+    let Some(type_paths) = type_paths else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    let Some(PathRes {
+        base: Res::PrimTy(primitive),
+        resolved_segments: 1,
+        segment_count: 1,
+    }) = type_paths.paths().get(&path.hir_id)
+    else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    let primitive = *primitive;
+    if !is_supported_const_literal_primitive(primitive) {
+        return Ok(ConstLiteralCheck::Unsupported);
+    }
+    let Some(body) = owner.body else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    let ExprKind::Lit(literal) = body.value.kind else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+
+    let diagnostics = match (primitive, literal) {
+        (sai_resolve::prelude::PrimTy::Bool, Lit::Bool(_)) => Vec::new(),
+        (primitive, Lit::Int { value, negated }) if is_fixed_width_integer_primitive(primitive) => {
+            if const_integer_literal_fits(primitive, value, negated) {
+                Vec::new()
+            } else {
+                vec![const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    body.value.span,
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    format!(
+                        "integer literal is out of range for `{}`",
+                        const_primitive_name(primitive)
+                    ),
+                    "literal out of range",
+                )?]
+            }
+        }
+        (primitive, literal) => vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            body.value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected `{}`, found {}",
+                const_primitive_name(primitive),
+                const_literal_found_type(literal)
+            ),
+            "type mismatch",
+        )?],
+    };
+
+    Ok(ConstLiteralCheck::Supported {
+        primitive,
+        diagnostics,
+    })
+}
+
+fn is_supported_const_name_convention(name: &str, written_name: &str) -> bool {
+    !written_name.starts_with("r#")
+        && !name.is_empty()
+        && name.chars().all(|character| {
+            character == '_' || character.is_ascii_uppercase() || character.is_ascii_digit()
+        })
+}
+
+fn is_supported_const_literal_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
+    primitive == sai_resolve::prelude::PrimTy::Bool || is_fixed_width_integer_primitive(primitive)
+}
+
+fn is_fixed_width_integer_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
+    matches!(
+        primitive,
+        sai_resolve::prelude::PrimTy::I8
+            | sai_resolve::prelude::PrimTy::I16
+            | sai_resolve::prelude::PrimTy::I32
+            | sai_resolve::prelude::PrimTy::I64
+            | sai_resolve::prelude::PrimTy::U8
+            | sai_resolve::prelude::PrimTy::U16
+            | sai_resolve::prelude::PrimTy::U32
+            | sai_resolve::prelude::PrimTy::U64
+    )
+}
+
+fn const_integer_literal_fits(
+    primitive: sai_resolve::prelude::PrimTy,
+    value: Option<u128>,
+    negated: bool,
+) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let (signed, width) = match primitive {
+        sai_resolve::prelude::PrimTy::I8 => (true, 8),
+        sai_resolve::prelude::PrimTy::I16 => (true, 16),
+        sai_resolve::prelude::PrimTy::I32 => (true, 32),
+        sai_resolve::prelude::PrimTy::I64 => (true, 64),
+        sai_resolve::prelude::PrimTy::U8 => (false, 8),
+        sai_resolve::prelude::PrimTy::U16 => (false, 16),
+        sai_resolve::prelude::PrimTy::U32 => (false, 32),
+        sai_resolve::prelude::PrimTy::U64 => (false, 64),
+        _ => return false,
+    };
+    if signed {
+        let negative_limit = 1u128 << (width - 1);
+        if negated {
+            value <= negative_limit
+        } else {
+            value < negative_limit
+        }
+    } else if negated {
+        value == 0
+    } else {
+        value <= (1u128 << width) - 1
+    }
+}
+
+fn const_primitive_name(primitive: sai_resolve::prelude::PrimTy) -> &'static str {
+    match primitive {
+        sai_resolve::prelude::PrimTy::I8 => "I8",
+        sai_resolve::prelude::PrimTy::I16 => "I16",
+        sai_resolve::prelude::PrimTy::I32 => "I32",
+        sai_resolve::prelude::PrimTy::I64 => "I64",
+        sai_resolve::prelude::PrimTy::U8 => "U8",
+        sai_resolve::prelude::PrimTy::U16 => "U16",
+        sai_resolve::prelude::PrimTy::U32 => "U32",
+        sai_resolve::prelude::PrimTy::U64 => "U64",
+        sai_resolve::prelude::PrimTy::ISize => "ISize",
+        sai_resolve::prelude::PrimTy::USize => "USize",
+        sai_resolve::prelude::PrimTy::F32 => "F32",
+        sai_resolve::prelude::PrimTy::F64 => "F64",
+        sai_resolve::prelude::PrimTy::Bool => "Bool",
+        sai_resolve::prelude::PrimTy::Byte => "Byte",
+        sai_resolve::prelude::PrimTy::Char => "Char",
+        sai_resolve::prelude::PrimTy::Never => "Never",
+        sai_resolve::prelude::PrimTy::Array => "Array",
+    }
+}
+
+fn const_literal_found_type(literal: Lit<'_>) -> &'static str {
+    match literal {
+        Lit::Int { .. } => "an integer literal",
+        Lit::Float { .. } => "a floating-point literal",
+        Lit::Str(_) => "a string literal",
+        Lit::ByteStr(_) => "a byte string literal",
+        Lit::Char(_) => "a character literal",
+        Lit::Byte(_) => "a byte literal",
+        Lit::Bool(_) => "a Bool literal",
+    }
+}
+
+fn const_literal_diagnostic(
+    owner: OwnerId,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    span: sai_hir::Span,
+    code: sai_diagnostics::Code,
+    message: String,
+    primary_label: &str,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    let location = sai_diagnostics::Location::from_decoded_source(
+        inputs.source_ref.clone(),
+        sai_diagnostics::Span::new(span.file, span.range),
+        &inputs.source,
+    )
+    .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        owner,
+    ))?;
+    let mut diagnostic = Diagnostic::new(
+        code,
+        sai_diagnostics::Severity::Error,
+        message,
+        Some(location),
+    );
+    diagnostic.primary_label = primary_label.to_owned();
+    diagnostic.package = inputs.source_ref.package.clone();
+    diagnostic
+        .with_workspace_snapshot(snapshot)
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))
 }
 
 /// Per-owner path results tagged with their package-collection provenance.
@@ -12287,6 +12557,7 @@ impl RootDatabase {
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
+                                literal_check: Err(error.clone()),
                                 module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
@@ -12316,6 +12587,7 @@ impl RootDatabase {
                             OwnerControlFlowResolutionError,
                         >,
                         Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+                        Result<ConstLiteralCheck, OwnerControlFlowResolutionError>,
                     ),
                     OwnerControlFlowResolutionError,
                 > = (|| {
@@ -12406,6 +12678,16 @@ impl RootDatabase {
                             ),
                             (_, _, Err(error)) => Err(error),
                         };
+                    let literal_check = check_const_literal_owner(
+                        &hir_owner,
+                        type_path_resolution
+                            .as_ref()
+                            .ok()
+                            .and_then(|resolution| resolution.as_ref()),
+                        &self.symbols,
+                        &inputs,
+                        snapshot,
+                    );
                     module_path_diagnostics = match (member_scopes, type_path_resolution.as_ref()) {
                         (Some(member_scopes), Ok(Some(path_resolution))) => Some(
                             self.type_owner_module_path_diagnostics(
@@ -12434,6 +12716,7 @@ impl RootDatabase {
                             type_path_resolution,
                             path_resolution,
                             non_expression_diagnostics,
+                            literal_check,
                         ));
                     };
                     let locals = match &module_aliases {
@@ -12489,6 +12772,7 @@ impl RootDatabase {
                                 type_path_resolution,
                                 path_resolution,
                                 test_only_diagnostics,
+                                literal_check,
                             ))
                         }
                         Err(error) => Ok((
@@ -12497,6 +12781,7 @@ impl RootDatabase {
                             type_path_resolution,
                             path_resolution,
                             non_expression_diagnostics,
+                            literal_check,
                         )),
                     }
                 })();
@@ -12506,8 +12791,10 @@ impl RootDatabase {
                     type_path_resolution,
                     test_only_path_resolution,
                     test_only_diagnostics,
+                    literal_check,
                 ) = analysis.unwrap_or_else(|error| {
                     (
+                        Err(error.clone()),
                         Err(error.clone()),
                         Err(error.clone()),
                         Err(error.clone()),
@@ -12525,6 +12812,7 @@ impl RootDatabase {
                     local_resolution,
                     module_resolution,
                     type_path_resolution,
+                    literal_check,
                     module_path_diagnostics,
                     test_only_path_resolution,
                     test_only_diagnostics,
@@ -24415,6 +24703,177 @@ mod tests {
                 .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
             "initializer body annotations participate in type-head resolution"
         );
+    }
+
+    #[test]
+    fn const_primitive_literal_check_uses_resolved_types_and_hir_literals() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub type Alias = U8\n",
+            "pub const BOOL_TRUE: Bool = true\n",
+            "pub const BOOL_FALSE: Bool = false\n",
+            "pub const I8_MIN: I8 = -128\n",
+            "pub const I8_MAX: I8 = 127\n",
+            "pub const I8_LOW: I8 = -129\n",
+            "pub const I8_HIGH: I8 = 128\n",
+            "pub const U8_MAX: U8 = 255\n",
+            "pub const U8_HIGH: U8 = 256\n",
+            "pub const U8_NEG_ZERO: U8 = -0\n",
+            "pub const U8_NEG_ONE: U8 = -1\n",
+            "pub const BOOL_MISMATCH: Bool = 1\n",
+            "pub const INT_MISMATCH: I16 = false\n",
+            "pub const INT64_HIGH: I64 = 9223372036854775808\n",
+            "pub const UINT64_MAX: U64 = 18446744073709551615\n",
+            "pub const UINT64_HIGH: U64 = 18446744073709551616\n",
+            "pub const TOO_WIDE: I64 = 340282366920938463463374607431768211456\n",
+            "pub const ALIAS_TYPE: Alias = 1\n",
+            "pub const BLOCK: Bool = { true }\n",
+            "const PRIVATE: Bool = true\n",
+            "pub const INT_MIN: Int = -9223372036854775808\n",
+            "pub const UINT_MAX: UInt = 18446744073709551615\n",
+            "pub const INT_HIGH: Int = 9223372036854775808\n",
+            "pub const UINT_HIGH: UInt = 18446744073709551616\n",
+            "pub const Max_size: I8 = 1\n",
+            "pub const r#READY: Bool = true\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(checks.len(), 25);
+        for index in [0, 1, 2, 3, 6, 8, 13, 19, 20] {
+            assert!(
+                checks[index].is_valid(),
+                "const at owner index {index} is a supported valid literal: {:?}",
+                checks[index]
+            );
+        }
+        assert_eq!(
+            checks[0],
+            &ConstLiteralCheck::Supported {
+                primitive: PrimTy::Bool,
+                diagnostics: Vec::new(),
+            }
+        );
+        assert_eq!(
+            checks[2],
+            &ConstLiteralCheck::Supported {
+                primitive: PrimTy::I8,
+                diagnostics: Vec::new(),
+            },
+            "the direct negative literal `-128` lowers to a signed literal value"
+        );
+        assert_eq!(
+            checks[8],
+            &ConstLiteralCheck::Supported {
+                primitive: PrimTy::U8,
+                diagnostics: Vec::new(),
+            },
+            "negative zero is the mathematical value zero"
+        );
+
+        for (index, code) in [
+            (4, sai_diagnostics::Code::LiteralOutOfRange),
+            (5, sai_diagnostics::Code::LiteralOutOfRange),
+            (7, sai_diagnostics::Code::LiteralOutOfRange),
+            (9, sai_diagnostics::Code::LiteralOutOfRange),
+            (10, sai_diagnostics::Code::TypeMismatch),
+            (11, sai_diagnostics::Code::TypeMismatch),
+            (12, sai_diagnostics::Code::LiteralOutOfRange),
+            (14, sai_diagnostics::Code::LiteralOutOfRange),
+            (15, sai_diagnostics::Code::LiteralOutOfRange),
+            (21, sai_diagnostics::Code::LiteralOutOfRange),
+            (22, sai_diagnostics::Code::LiteralOutOfRange),
+        ] {
+            let ConstLiteralCheck::Supported { diagnostics, .. } = checks[index] else {
+                panic!("owner index {index} should be supported");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(diagnostics[0].code, code, "owner index {index}");
+            assert!(
+                diagnostics[0].has_workspace_snapshot(),
+                "owner index {index} diagnostic is bound to the current snapshot"
+            );
+            assert!(
+                diagnostics[0].primary().is_some(),
+                "owner index {index} diagnostic points to the literal"
+            );
+        }
+        for index in [16, 17, 18, 23, 24] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Unsupported,
+                "aliases, non-literal expressions, private consts, raw identifiers and names outside the supported ASCII UPPER_SNAKE_CASE convention remain gated"
+            );
+        }
+    }
+
+    #[test]
+    fn const_integer_literal_range_covers_every_fixed_width_integer_primitive() {
+        use sai_resolve::prelude::PrimTy;
+
+        for (primitive, sign_bit) in [
+            (PrimTy::I8, 7),
+            (PrimTy::I16, 15),
+            (PrimTy::I32, 31),
+            (PrimTy::I64, 63),
+        ] {
+            let boundary = 1u128 << sign_bit;
+            assert!(const_integer_literal_fits(primitive, Some(boundary), true));
+            assert!(!const_integer_literal_fits(
+                primitive,
+                Some(boundary + 1),
+                true
+            ));
+            assert!(const_integer_literal_fits(
+                primitive,
+                Some(boundary - 1),
+                false
+            ));
+            assert!(!const_integer_literal_fits(
+                primitive,
+                Some(boundary),
+                false
+            ));
+        }
+        for (primitive, width) in [
+            (PrimTy::U8, 8),
+            (PrimTy::U16, 16),
+            (PrimTy::U32, 32),
+            (PrimTy::U64, 64),
+        ] {
+            let maximum = (1u128 << width) - 1;
+            assert!(const_integer_literal_fits(primitive, Some(maximum), false));
+            assert!(!const_integer_literal_fits(
+                primitive,
+                Some(maximum + 1),
+                false
+            ));
+            assert!(const_integer_literal_fits(primitive, Some(0), true));
+            assert!(!const_integer_literal_fits(primitive, Some(1), true));
+        }
+        assert!(!const_integer_literal_fits(PrimTy::I64, None, false));
+        assert!(!const_integer_literal_fits(PrimTy::U64, None, false));
     }
 
     #[test]
