@@ -6187,7 +6187,17 @@ fn function_if_binary_condition_uses_parameter_bindings(
     let ExprKind::Binary(operator, left, right) = condition.kind else {
         return false;
     };
-    if !matches!(operator, BinOp::And | BinOp::Or | BinOp::Eq | BinOp::Ne) {
+    if !matches!(
+        operator,
+        BinOp::And
+            | BinOp::Or
+            | BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+    ) {
         return false;
     }
     let path_binding = |expression: &HirExpr<'_>| {
@@ -24723,7 +24733,7 @@ mod tests {
     }
 
     #[test]
-    fn function_body_type_check_accepts_only_eq_ne_of_two_bool_parameters() {
+    fn function_body_type_check_accepts_all_bool_comparisons_of_two_bool_parameters() {
         let root = concat!(
             "const OTHER: Bool = true\n",
             "type BoolAlias = Bool\n",
@@ -24731,7 +24741,14 @@ mod tests {
             "pub fn reversed_equal(right: Bool, left: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
             "pub fn not_equal(left: Bool, right: Bool) -> I32 { if left != right { 1 } else { 2 } }\n",
             "pub fn reversed_not_equal(right: Bool, left: Bool) -> I32 { if left != right { 1 } else { 2 } }\n",
-            "pub fn ordering(left: Bool, right: Bool) -> I32 { if left < right { 1 } else { 2 } }\n",
+            "pub fn less(left: Bool, right: Bool) -> I32 { if left < right { 1 } else { 2 } }\n",
+            "pub fn reversed_less(left: Bool, right: Bool) -> I32 { if right < left { 1 } else { 2 } }\n",
+            "pub fn less_equal(left: Bool, right: Bool) -> I32 { if left <= right { 1 } else { 2 } }\n",
+            "pub fn reversed_less_equal(left: Bool, right: Bool) -> I32 { if right <= left { 1 } else { 2 } }\n",
+            "pub fn greater(left: Bool, right: Bool) -> I32 { if left > right { 1 } else { 2 } }\n",
+            "pub fn reversed_greater(left: Bool, right: Bool) -> I32 { if right > left { 1 } else { 2 } }\n",
+            "pub fn greater_equal(left: Bool, right: Bool) -> I32 { if left >= right { 1 } else { 2 } }\n",
+            "pub fn reversed_greater_equal(left: Bool, right: Bool) -> I32 { if right >= left { 1 } else { 2 } }\n",
             "pub fn repeated_operand(left: Bool, right: Bool) -> I32 { if left == left { 1 } else { 2 } }\n",
             "pub fn other_binding(left: Bool, right: Bool) -> I32 { if left == OTHER { 1 } else { 2 } }\n",
             "pub fn non_path_operand(left: Bool, right: Bool) -> I32 { if left == true { 1 } else { 2 } }\n",
@@ -24756,17 +24773,17 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 14);
+        assert_eq!(owners.len(), 21);
 
-        for index in [0, 1, 2, 3] {
+        for index in 0..12 {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
-                    .expect("both operators and operand orders of the bool comparison are checked"),
+                    .expect("all bool comparisons and operand orders are checked"),
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for (index, owner) in owners.iter().enumerate().skip(4) {
+        for (index, owner) in owners.iter().enumerate().skip(12) {
             let check = owner
                 .body_type_check()
                 .expect("unsupported comparison or operand form is gated");
