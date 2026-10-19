@@ -5540,14 +5540,6 @@
 - **Review:** Independent read-only reviews agree that the prior failure came from the legacy rename information class and that Ex/POSIX replacement matches the intended atomic-reader contract. Review caught that an added test denying `FILE_SHARE_DELETE` asserted an unsupported operation; it was removed before commit. Re-review confirms the default-sharing reader test and focused concurrent-reader Actions step are sound, the stated OS/filesystem baseline is explicit, and there are no remaining actionable P0–P2 findings.
 - **Human review:** **Review required:** Confirm that Windows 10 version 1709 or newer and a filesystem supporting POSIX rename are acceptable cache requirements, and retain Windows Actions as a required check until the hosted run passes.
 
-### CI follow-up: run checks on feature-branch pushes
-
-- **Decision:** Add `f/**` to the existing push branch filter while retaining `main` pushes and pull requests.
-- **Reason:** The branch uses the repository's `f/` feature prefix and had no open pull request, so its push did not match the workflow. The connected GitHub integration denied draft PR creation with 403. Running the existing matrix directly on feature-branch pushes allows hosted verification without disabling CI or changing its jobs.
-- **Verification:** The workflow configuration is committed and will be checked by the first hosted run on this branch; the push has not yet occurred.
-- **Review:** Hostile review found no actionable P0–P2 issue; the `f/**` glob covers the intended feature-branch namespace and preserves the existing `main` and pull-request triggers.
-- **Human review:** **Review required:** Confirm that automatic CI on every `f/**` push is an appropriate repository default in addition to pull-request and `main` checks.
-
 ### IR-679: generate direct selected foreign resource handles in world functions
 
 - **Decision:** Add a separate resource-reference map for exact `Resource` items in directly visible, selected foreign WIT views. Use it only while generating world-function boundary types; keep the existing foreign named-data map unchanged. Permit owned handles in parameter and result positions and borrowed handles in parameter position. Keep authored `Dir` aliases, transitive-only references, and `Used` resource facades unsupported.
