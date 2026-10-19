@@ -182,14 +182,21 @@ fn nonempty_or_extended_checks_remain_gated() {
 }
 
 #[test]
-fn empty_root_rejects_incompatible_compiler_and_unknown_declared_targets() {
-    let compiler = run_check("", "compiler ^99.0\n", &[], &[]);
-    assert_check_stays_gated(&compiler, "incompatible compiler");
-    let compiler_stdout = String::from_utf8(compiler.stdout).expect("CLI stdout is UTF-8");
-    assert!(compiler_stdout.contains("\"code\":\"COMPILER_VERSION_MISMATCH\""));
+fn unlocked_checks_validate_compiler_and_declared_targets() {
+    for source in ["", "fn empty() {}\n"] {
+        let compiler = run_check(source, "compiler ^99.0\n", &[], &[]);
+        assert_check_stays_gated(&compiler, "incompatible compiler");
+        let compiler_stdout = String::from_utf8(compiler.stdout).expect("CLI stdout is UTF-8");
+        assert!(compiler_stdout.contains("\"code\":\"COMPILER_VERSION_MISMATCH\""));
 
-    let target = run_check("", "targets { wasm32-core, imaginary-target }\n", &[], &[]);
-    assert_check_stays_gated(&target, "unknown declared target");
-    let target_stdout = String::from_utf8(target.stdout).expect("CLI stdout is UTF-8");
-    assert!(target_stdout.contains("\"code\":\"UNKNOWN_TARGET\""));
+        let target = run_check(
+            source,
+            "targets { wasm32-core, imaginary-target }\n",
+            &[],
+            &[],
+        );
+        assert_check_stays_gated(&target, "unknown declared target");
+        let target_stdout = String::from_utf8(target.stdout).expect("CLI stdout is UTF-8");
+        assert!(target_stdout.contains("\"code\":\"UNKNOWN_TARGET\""));
+    }
 }

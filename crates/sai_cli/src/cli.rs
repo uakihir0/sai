@@ -696,6 +696,31 @@ fn run_check(
             }
         }
     }
+    let mut root_manifest_semantically_valid = false;
+    if !check_locked_mode(command)
+        && let (Some(manifest), Some(source)) = (parsed_manifest.as_ref(), manifest_source.as_ref())
+    {
+        let toolchain_version = sai_package::version::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("the CLI package version is a valid language version");
+        let validation = sai_package::validation::validate(
+            manifest,
+            sai_package::validation::PackageValidationContext {
+                compiler_version: Some(&toolchain_version),
+            },
+        );
+        root_manifest_semantically_valid =
+            validation.errors.is_empty() && validation.warnings.is_empty();
+        let (semantic_diagnostics, errors, warnings) = package_validation_check_diagnostics(
+            source,
+            &manifest_display_path,
+            &validation,
+            root_identity.as_deref(),
+            include_source_lines,
+        );
+        diagnostics.extend(semantic_diagnostics);
+        total_errors = total_errors.saturating_add(errors);
+        total_warnings = total_warnings.saturating_add(warnings);
+    }
     let dependency_target_cfg = parsed_manifest.as_ref().and_then(|manifest| {
         let target = check_target_override(command)
             .or_else(|| manifest_target_names(manifest).first().cloned())?;
@@ -1663,35 +1688,9 @@ fn run_check(
             .and_then(|manifest| manifest_target_names(manifest).into_iter().next())
     });
     let profile = check_profile_override(command).unwrap_or_else(|| "dev".to_owned());
-    let mut empty_root_manifest_semantically_valid = false;
-    if empty_root_module_only_covered
-        && empty_root_manifest_supported
-        && let (Some(manifest), Some(source)) = (parsed_manifest.as_ref(), manifest_source.as_ref())
-    {
-        let toolchain_version = sai_package::version::Version::parse(env!("CARGO_PKG_VERSION"))
-            .expect("the CLI package version is a valid language version");
-        let validation = sai_package::validation::validate(
-            manifest,
-            sai_package::validation::PackageValidationContext {
-                compiler_version: Some(&toolchain_version),
-            },
-        );
-        empty_root_manifest_semantically_valid =
-            validation.errors.is_empty() && validation.warnings.is_empty();
-        let (semantic_diagnostics, errors, warnings) = package_validation_check_diagnostics(
-            source,
-            &manifest_display_path,
-            &validation,
-            root_identity.as_deref(),
-            include_source_lines,
-        );
-        diagnostics.extend(semantic_diagnostics);
-        total_errors = total_errors.saturating_add(errors);
-        total_warnings = total_warnings.saturating_add(warnings);
-    }
     let supports_empty_root_success = empty_root_module_only_covered
         && empty_root_manifest_supported
-        && empty_root_manifest_semantically_valid
+        && root_manifest_semantically_valid
         && target.as_deref() == Some("wasm32-core")
         && profile == "dev"
         && !check_locked_mode(command)
