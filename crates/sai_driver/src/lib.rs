@@ -47411,10 +47411,10 @@ interface facade { use middle.{payload}; }"#;
             "  type Payload {\n",
             "    handle: Handle\n",
             "  }\n",
+            "  enum Outcome { Empty, Returned(Handle) }\n",
             "  resource Handle {\n",
             "    fn identity(value: HandleAlias) -> HandleAlias\n",
             "  }\n",
-            "  enum Outcome { Empty, Returned(Handle) }\n",
             "  fn echo(payload: Payload) -> Outcome\n",
             "}\n",
         );
@@ -47556,6 +47556,10 @@ interface facade { use middle.{payload}; }"#;
             panic!("the handle outcome is emitted as a variant");
         };
         assert_handle(cases[1].payload.as_ref().expect("handle payload"));
+        let resource_text_position = generated
+            .text
+            .find("resource handle {")
+            .expect("resource text");
         assert!(generated.text.contains("type handle-alias = handle;"));
         assert!(generated.text.contains("handle: handle,"));
         assert!(generated.text.contains("returned(handle)"));
@@ -47564,11 +47568,16 @@ interface facade { use middle.{payload}; }"#;
                 .text
                 .find("record payload {")
                 .expect("record text")
-                < generated
-                    .text
-                    .find("resource handle {")
-                    .expect("resource text"),
+                < resource_text_position,
             "the record declaration precedes its resource target in generated source"
+        );
+        assert!(
+            generated
+                .text
+                .find("variant outcome {")
+                .expect("variant text")
+                < resource_text_position,
+            "the variant declaration precedes its resource target in generated source"
         );
     }
 
@@ -51919,6 +51928,10 @@ interface facade { use middle.{payload}; }"#;
             "  type UsesRejectedVariantRecord { value: RejectedVariantRecord }\n",
             "  enum RejectedResourceVariant { Value(LaterResource) }\n",
             "  fn use_rejected_resource_variant(value: RejectedResourceVariant)\n",
+            "  enum RejectedFutureResourceVariant { Value(RejectedLaterResource) }\n",
+            "  fn use_rejected_future_resource_variant(value: RejectedFutureResourceVariant)\n",
+            "  enum BorrowedFutureResourceVariant { Value(borrow LaterResource) }\n",
+            "  fn use_borrowed_future_resource_variant(value: BorrowedFutureResourceVariant)\n",
             "  fn use_rejected_later_variant(value: RejectedLaterVariant)\n",
             "  fn use_resource(value: LaterResource)\n",
             "  resource LaterResource {}\n",
@@ -52005,7 +52018,7 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(emitted_items.len(), 11);
+        assert_eq!(emitted_items.len(), 13);
         assert!(emitted_items.contains(&"before"));
         assert!(emitted_items.contains(&"use-later"));
         assert!(emitted_items.contains(&"before-record"));
@@ -52013,6 +52026,8 @@ interface facade { use middle.{payload}; }"#;
         assert!(emitted_items.contains(&"alias-to-future-resource"));
         assert!(emitted_items.contains(&"record-uses-future-resource"));
         assert!(emitted_items.contains(&"use-resource"));
+        assert!(emitted_items.contains(&"rejected-resource-variant"));
+        assert!(emitted_items.contains(&"use-rejected-resource-variant"));
         assert!(emitted_items.contains(&"after"));
         assert!(emitted_items.contains(&"later-record"));
         assert!(emitted_items.contains(&"later-resource"));
@@ -52023,10 +52038,10 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             "surviving item indices compact after pruning cycles and unsupported targets"
         );
-        assert!(!generated.text.contains("use-rejected"));
+        assert!(!generated.text.contains("use-rejected: func"));
         assert!(
             !generated
                 .text
@@ -52080,8 +52095,28 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("rejected-record-variant"));
         assert!(!generated.text.contains("rejected-variant-record"));
         assert!(!generated.text.contains("uses-rejected-variant-record"));
-        assert!(!generated.text.contains("rejected-resource-variant"));
-        assert!(!generated.text.contains("use-rejected-resource-variant"));
+        assert!(
+            generated
+                .text
+                .contains("variant rejected-resource-variant {")
+        );
+        assert!(
+            generated
+                .text
+                .contains("use-rejected-resource-variant: func(value: rejected-resource-variant);")
+        );
+        assert!(!generated.text.contains("rejected-future-resource-variant"));
+        assert!(
+            !generated
+                .text
+                .contains("use-rejected-future-resource-variant")
+        );
+        assert!(!generated.text.contains("borrowed-future-resource-variant"));
+        assert!(
+            !generated
+                .text
+                .contains("use-borrowed-future-resource-variant")
+        );
         assert!(!generated.text.contains("rejected-later-variant"));
         assert!(!generated.text.contains("use-rejected-later-variant"));
         assert!(
@@ -52108,7 +52143,7 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("use-later-alias"));
         assert!(!generated.text.contains("cycle"));
         assert!(!generated.text.contains("uses-cycle"));
-        assert!(!generated.text.contains("rejected"));
+        assert!(!generated.text.contains("type rejected ="));
         assert!(!generated.text.contains("uses-rejected"));
         assert!(!generated.text.contains("uses-uses-rejected"));
         assert!(!generated.text.contains("cross-interface"));
@@ -52147,6 +52182,22 @@ interface facade { use middle.{payload}; }"#;
         let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(reference)) = &alias_to_resource.kind
         else {
             panic!("the alias targets the later resource as an owned handle");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.item, later_resource_index);
+        assert_eq!(reference.item_name, "later-resource");
+        let variant_uses_resource = interface
+            .items
+            .iter()
+            .find(|item| item.name == "rejected-resource-variant")
+            .expect("the variant that targets the later supported resource remains emitted");
+        let sai_wit::WitItemKind::Variant(cases) = &variant_uses_resource.kind else {
+            panic!("the future-resource consumer remains a variant");
+        };
+        let sai_wit::WitType::Own(reference) = cases[0].payload.as_ref().expect("resource case")
+        else {
+            panic!("the variant case owns the later resource handle");
         };
         assert_eq!(reference.interface.unit, unit);
         assert_eq!(reference.interface.interface, interface_index);
