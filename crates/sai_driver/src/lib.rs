@@ -48177,10 +48177,12 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
-    fn generated_wit_omits_forward_resource_handle_references() {
+    fn generated_wit_emits_forward_resource_handle_references() {
         let source = concat!(
             "interface api {\n",
             "  fn take(value: Handle)\n",
+            "  fn inspect(value: borrow Handle)\n",
+            "  fn create() -> Handle\n",
             "  resource Handle {}\n",
             "}\n",
         );
@@ -48210,10 +48212,10 @@ interface facade { use middle.{payload}; }"#;
             .expect("generated WIT unit uses the active package version");
         let result = database
             .wit_package(&unit)
-            .expect("the incomplete generated resource package loads");
+            .expect("the generated resource package loads");
         assert!(
             result.failure.is_none(),
-            "omitting a forward handle reference leaves parseable WIT: {:?}",
+            "forward resource handle references parse and resolve: {:?}",
             result.failure
         );
         let generated = result
@@ -48223,17 +48225,24 @@ interface facade { use middle.{payload}; }"#;
             .map(|(_, generated)| generated.as_ref())
             .expect("the generated root text is retained");
         assert!(
-            !generated.complete,
-            "an unsupported forward resource reference keeps generated WIT incomplete"
+            generated.complete,
+            "a valid later resource remains available to function handles: {}",
+            generated.text
         );
+        assert!(generated.text.contains("take: func(value: handle);"));
+        assert!(
+            generated
+                .text
+                .contains("inspect: func(value: borrow<handle>);")
+        );
+        assert!(generated.text.contains("create: func() -> handle;"));
         assert!(generated.text.contains("resource handle;"));
-        assert!(!generated.text.contains("take:"));
 
-        let package_model = result.package.expect("partial WIT model loads");
-        let interface = package_model
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
             .root()
             .interfaces
-            .iter()
+            .iter_enumerated()
             .next()
             .expect("the local interface remains available");
         assert_eq!(
@@ -48242,19 +48251,70 @@ interface facade { use middle.{payload}; }"#;
                 .iter()
                 .map(|item| item.name.as_str())
                 .collect::<Vec<_>>(),
-            ["handle"],
-            "the later resource is emitted without a dangling forward reference"
+            ["handle", "take", "inspect", "create"],
+            "the later resource and its function consumers survive print/parse"
         );
+        assert_eq!(
+            interface
+                .items
+                .iter_enumerated()
+                .map(|(index, _)| index.index())
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3],
+            "surviving references remain compact"
+        );
+        let resource_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "handle").then_some(index))
+            .expect("the later resource remains in the parsed model");
+        let resource = &interface.items[resource_index];
+        assert!(matches!(resource.kind, sai_wit::WitItemKind::Resource(_)));
+        for (function_name, borrowed) in [("take", false), ("inspect", true)] {
+            let item = interface
+                .items
+                .iter()
+                .find(|item| item.name == function_name)
+                .expect("the function with the forward resource parameter survives");
+            let sai_wit::WitItemKind::Func(function) = &item.kind else {
+                panic!("{function_name} remains a function");
+            };
+            let reference = match (&function.params[0].1, borrowed) {
+                (sai_wit::WitType::Own(reference), false)
+                | (sai_wit::WitType::Borrow(reference), true) => reference,
+                _ => panic!("{function_name} retains the expected owned or borrowed handle"),
+            };
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.item, resource_index);
+            assert_eq!(reference.item_name, "handle");
+        }
+        let create = interface
+            .items
+            .iter()
+            .find(|item| item.name == "create")
+            .expect("the function returning the forward resource survives");
+        let sai_wit::WitItemKind::Func(create) = &create.kind else {
+            panic!("create remains a function");
+        };
+        let Some(sai_wit::WitType::Own(reference)) = &create.result else {
+            panic!("the later resource can be returned as an owned handle");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.item, resource_index);
+        assert_eq!(reference.item_name, "handle");
     }
 
     #[test]
     fn generated_wit_omits_nonempty_resources_and_handle_consumers() {
         let source = concat!(
             "interface api {\n",
+            "  fn take(value: Handle)\n",
+            "  fn borrowed_result() -> borrow Handle\n",
             "  resource Handle {\n",
             "    fn reset(self: Self)\n",
             "  }\n",
-            "  fn take(value: Handle)\n",
             "  fn independent(value: U32)\n",
             "}\n",
         );
@@ -48302,6 +48362,7 @@ interface facade { use middle.{payload}; }"#;
         );
         assert!(!generated.text.contains("resource handle"));
         assert!(!generated.text.contains("take:"));
+        assert!(!generated.text.contains("borrowed-result:"));
         assert!(generated.text.contains("independent: func(value: u32);"));
 
         let package_model = result.package.expect("partial WIT model loads");
@@ -51864,10 +51925,10 @@ interface facade { use middle.{payload}; }"#;
             .expect("the generated root text is retained");
         assert!(!generated.complete);
         let package_model = result.package.expect("partial WIT model loads");
-        let interface = package_model
+        let (interface_index, interface) = package_model
             .root()
             .interfaces
-            .iter()
+            .iter_enumerated()
             .next()
             .expect("the interface remains");
         let emitted_items = interface
@@ -51875,11 +51936,12 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(emitted_items.len(), 8);
+        assert_eq!(emitted_items.len(), 9);
         assert!(emitted_items.contains(&"before"));
         assert!(emitted_items.contains(&"use-later"));
         assert!(emitted_items.contains(&"before-record"));
         assert!(emitted_items.contains(&"before-variant"));
+        assert!(emitted_items.contains(&"use-resource"));
         assert!(emitted_items.contains(&"after"));
         assert!(emitted_items.contains(&"later-record"));
         assert!(emitted_items.contains(&"later-resource"));
@@ -51890,7 +51952,7 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5, 6, 7],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8],
             "surviving item indices compact after pruning cycles and unsupported targets"
         );
         assert!(!generated.text.contains("use-rejected"));
@@ -51930,7 +51992,11 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("use-rejected-resource-variant"));
         assert!(!generated.text.contains("rejected-later-variant"));
         assert!(!generated.text.contains("use-rejected-later-variant"));
-        assert!(!generated.text.contains("use-resource"));
+        assert!(
+            generated
+                .text
+                .contains("use-resource: func(value: later-resource);")
+        );
         assert!(!generated.text.contains("use-cycle"));
         assert!(!generated.text.contains("record-cycle"));
         assert!(!generated.text.contains("record-cycle-a"));
@@ -51956,6 +52022,26 @@ interface facade { use middle.{payload}; }"#;
                 .text
                 .contains("use-later: func(value: after) -> after;")
         );
+        let later_resource_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "later-resource").then_some(index))
+            .expect("the later empty resource remains emitted");
+        let use_resource = interface
+            .items
+            .iter()
+            .find(|item| item.name == "use-resource")
+            .expect("the function using the later resource remains emitted");
+        let sai_wit::WitItemKind::Func(use_resource) = &use_resource.kind else {
+            panic!("use-resource remains a function");
+        };
+        let sai_wit::WitType::Own(reference) = &use_resource.params[0].1 else {
+            panic!("the function receives the later resource as an owned handle");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.item, later_resource_index);
+        assert_eq!(reference.item_name, "later-resource");
         assert!(generated.text.contains("independent: func(value: u64)"));
         let before = interface
             .items
