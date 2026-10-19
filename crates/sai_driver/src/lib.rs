@@ -5627,7 +5627,8 @@ impl ConstOwnerResolution {
 /// Result of checking one supported direct function-body form.
 ///
 /// This is an initial Stage 0 body-checking slice, not a general expression
-/// type checker. Unsupported owner and expression shapes remain gated.
+/// type checker. It also accepts an explicit unit return with an empty body or
+/// a direct unit tail. Unsupported owner and expression shapes remain gated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FunctionBodyTypeCheck {
     Unsupported,
@@ -5901,18 +5902,18 @@ fn check_function_body_type(
         _ => return Ok(FunctionBodyTypeCheck::Unsupported),
     };
 
-    let tail = match body.value.kind {
+    let block = match body.value.kind {
         ExprKind::Block(block)
             if block.safety == sai_hir::Safety::Safe && block.stmts.is_empty() =>
         {
-            block.tail
+            block
         }
-        _ => None,
-    };
-    let Some(tail) = tail else {
-        return Ok(FunctionBodyTypeCheck::Unsupported);
+        _ => return Ok(FunctionBodyTypeCheck::Unsupported),
     };
     let diagnostics = if let Some((parameter, body_parameter)) = parameter {
+        let Some(tail) = block.tail else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
         let ExprKind::Path(path) = tail.kind else {
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
@@ -5969,24 +5970,49 @@ fn check_function_body_type(
         let Some(return_ty) = sig.ret else {
             return Ok(FunctionBodyTypeCheck::Unsupported);
         };
-        if !matches!(
-            resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
-            Some(FunctionDirectType::Primitive(_))
-        ) || !matches!(
-            tail.kind,
-            ExprKind::Lit(
-                Lit::Bool(_) | Lit::Char(_) | Lit::Byte(_) | Lit::Int { .. } | Lit::Float { .. }
-            )
-        ) {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
+        match resolve_function_direct_type(*return_ty, type_paths, symbols, inputs) {
+            Some(FunctionDirectType::Unit) if block.tail.is_none() => Vec::new(),
+            Some(FunctionDirectType::Unit) => {
+                let Some(tail) = block.tail else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                if !matches!(tail.kind, ExprKind::Tuple(elements) if elements.is_empty()) {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+                let Some(diagnostics) = check_const_literal_leaf(
+                    owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+                )?
+                else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                diagnostics
+            }
+            Some(FunctionDirectType::Primitive(_)) => {
+                let Some(tail) = block.tail else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                if !matches!(
+                    tail.kind,
+                    ExprKind::Lit(
+                        Lit::Bool(_)
+                            | Lit::Char(_)
+                            | Lit::Byte(_)
+                            | Lit::Int { .. }
+                            | Lit::Float { .. }
+                    )
+                ) {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+                let Some(diagnostics) = check_const_literal_leaf(
+                    owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+                )?
+                else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                diagnostics
+            }
+            None => return Ok(FunctionBodyTypeCheck::Unsupported),
         }
-        let Some(diagnostics) = check_const_literal_leaf(
-            owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
-        )?
-        else {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        };
-        diagnostics
     };
     Ok(FunctionBodyTypeCheck::Supported { diagnostics })
 }
@@ -23964,6 +23990,11 @@ mod tests {
             "pub fn expression() -> I32 { 40 + 2 }\n",
             "type Number = I32\n",
             "pub fn user_alias_return() -> Number { 42 }\n",
+            "pub fn unit_empty_body() -> () {}\n",
+            "pub fn unit_non_unit_tail() -> () { 42 }\n",
+            "pub fn omitted_unit_return() { () }\n",
+            "pub fn unit_with_statement() -> () { let value = (); () }\n",
+            "pub fn primitive_unit_tail() -> I32 { () }\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -23980,12 +24011,20 @@ mod tests {
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 18);
+        assert_eq!(owners.len(), 23);
         for owner in &owners[..9] {
             assert!(matches!(
                 owner
                     .body_type_check()
                     .expect("direct function body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        for index in [13, 18] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("explicit unit body check succeeds"),
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
@@ -24043,7 +24082,11 @@ mod tests {
             );
         }
 
-        for owner in &owners[12..] {
+        for owner in owners[12..13]
+            .iter()
+            .chain(owners[14..18].iter())
+            .chain(owners[19..].iter())
+        {
             assert!(matches!(
                 owner
                     .body_type_check()
