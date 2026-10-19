@@ -51303,6 +51303,207 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
+    fn generated_wit_record_fields_reference_prior_local_interfaces_only() {
+        let source = concat!(
+            "interface early {\n",
+            "  type Future { id: types.Id }\n",
+            "  type Keep { id: U32 }\n",
+            "}\n",
+            "interface types {\n",
+            "  type Hidden = USize\n",
+            "  type Id = U32\n",
+            "  resource Handle {}\n",
+            "}\n",
+            "interface records {\n",
+            "  type CrossRecord { id: types.Id, handle: types.Handle }\n",
+            "  type Missing { hidden: types.Hidden }\n",
+            "  fn use_cross(value: CrossRecord)\n",
+            "  fn use_missing(value: Missing)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("cross-interface record references remain queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning unsupported record targets leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "later-interface and omitted-type record targets remain incomplete"
+        );
+        assert!(generated.text.contains("record keep {"));
+        assert!(generated.text.contains("type id = u32;"));
+        assert!(generated.text.contains("resource handle;"));
+        assert!(generated.text.contains("use types.{handle, id};"));
+        assert!(generated.text.contains("record cross-record {"));
+        assert!(generated.text.contains("id: id,"));
+        assert!(generated.text.contains("handle: handle,"));
+        assert!(
+            generated
+                .text
+                .contains("use-cross: func(value: cross-record);")
+        );
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("record future {"));
+        assert!(!generated.text.contains("type hidden ="));
+        assert!(!generated.text.contains("record missing {"));
+        assert!(!generated.text.contains("use-missing:"));
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let root = package_model.root();
+        let (types_index, types) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "types")
+            .expect("the prior interface with supported items remains");
+        let (id_index, _) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the supported earlier alias remains");
+        let (handle_index, _) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the earlier resource remains");
+        assert_eq!(
+            types
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "handle"],
+            "the unsupported earlier item is removed"
+        );
+
+        let early = root
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "early")
+            .expect("the earlier interface remains");
+        assert_eq!(
+            early
+                .items
+                .iter()
+                .filter(|item| matches!(&item.kind, sai_wit::WitItemKind::Record(_)))
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["keep"],
+            "a record cannot reference a later interface"
+        );
+
+        let (records_index, records) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "records")
+            .expect("the later record interface remains");
+        let (id_import_index, id_import) = records
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the parsed local type use alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(imported_id)) = &id_import.kind
+        else {
+            panic!("the parsed type use alias retains the named target");
+        };
+        assert_eq!(&imported_id.interface.unit, &unit);
+        assert_eq!(imported_id.interface.interface, types_index);
+        assert_eq!(imported_id.item, id_index);
+        assert_eq!(imported_id.item_name, "id");
+
+        let (handle_import_index, handle_import) = records
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the parsed local resource use alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(imported_handle)) =
+            &handle_import.kind
+        else {
+            panic!("the parsed resource use alias retains the owned target");
+        };
+        assert_eq!(&imported_handle.interface.unit, &unit);
+        assert_eq!(imported_handle.interface.interface, types_index);
+        assert_eq!(imported_handle.item, handle_index);
+        assert_eq!(imported_handle.item_name, "handle");
+
+        let (cross_record_index, cross_record) = records
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "cross-record")
+            .expect("the record using prior-interface items remains");
+        let sai_wit::WitItemKind::Record(fields) = &cross_record.kind else {
+            panic!("cross-record remains a record");
+        };
+        assert_eq!(fields.len(), 2);
+        assert!(matches!(
+            fields[0].ty,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == records_index
+                    && reference.item == id_import_index
+                    && reference.item_name == "id"
+        ));
+        assert!(matches!(
+            fields[1].ty,
+            sai_wit::WitType::Own(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == records_index
+                    && reference.item == handle_import_index
+                    && reference.item_name == "handle"
+        ));
+
+        let use_cross = records
+            .items
+            .iter()
+            .find(|item| item.name == "use-cross")
+            .expect("the function consuming the cross-interface record remains");
+        let sai_wit::WitItemKind::Func(use_cross) = &use_cross.kind else {
+            panic!("use-cross remains a function");
+        };
+        assert!(matches!(
+            use_cross.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == records_index
+                    && reference.item == cross_record_index
+                    && reference.item_name == "cross-record"
+        ));
+    }
+
+    #[test]
     fn generated_wit_omits_world_functions_with_colliding_local_type_aliases() {
         let source = concat!(
             "interface left {\n",
@@ -52800,6 +53001,8 @@ interface facade { use middle.{payload}; }"#;
             "interface public {\n",
             "  type Handle = first.Request\n",
             "  fn read(value: Handle)\n",
+            "  type RecordHandle { value: first.Request }\n",
+            "  fn read_record(value: RecordHandle)\n",
             "  fn independent(value: U32)\n",
             "}\n",
             "world server {\n",
@@ -52850,6 +53053,8 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("interface second"));
         assert!(!generated.text.contains("type handle"));
         assert!(!generated.text.contains("read:"));
+        assert!(!generated.text.contains("record record-handle"));
+        assert!(!generated.text.contains("read-record:"));
         assert!(generated.text.contains("interface public"));
         assert!(generated.text.contains("independent: func(value: u32)"));
         assert!(!generated.text.contains("import first;"));
