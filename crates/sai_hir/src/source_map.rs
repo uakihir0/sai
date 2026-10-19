@@ -23,12 +23,21 @@ pub struct HirSourceId(u64);
 
 impl HirSourceId {
     pub(crate) fn fresh() -> Self {
-        let id = NEXT_HIR_SOURCE_ID
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .expect("HIR source identity space exhausted");
-        Self(id)
+        let mut current = NEXT_HIR_SOURCE_ID.load(Ordering::Relaxed);
+        loop {
+            let next = current
+                .checked_add(1)
+                .expect("HIR source identity space exhausted");
+            match NEXT_HIR_SOURCE_ID.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Self(current),
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 
@@ -146,11 +155,13 @@ impl HirSourceMap {
             .map(|diagnostic| {
                 let diagnostic = match diagnostic {
                     SourceMapDiagnostic::Template(template) => template
+                        .as_ref()
                         .bind(self.file, self.source_ref.clone())
                         .with_workspace_snapshot(snapshot),
-                    SourceMapDiagnostic::SnapshotBound(diagnostic) => {
-                        diagnostic.clone().with_workspace_snapshot(snapshot)
-                    }
+                    SourceMapDiagnostic::SnapshotBound(diagnostic) => diagnostic
+                        .as_ref()
+                        .clone()
+                        .with_workspace_snapshot(snapshot),
                 };
                 diagnostic.map_err(|_| HirSourceMapError::DiagnosticNotValidForSnapshot)
             })
@@ -177,8 +188,8 @@ impl HirSourceMap {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SourceMapDiagnostic {
-    Template(DiagnosticTemplate),
-    SnapshotBound(Diagnostic),
+    Template(Box<DiagnosticTemplate>),
+    SnapshotBound(Box<Diagnostic>),
 }
 
 fn same_pointer_index_vec<I: sai_intern::Idx>(
@@ -501,8 +512,8 @@ impl<'root> HirSourceMapBuilder<'root> {
             .map_err(|_| HirSourceMapError::DiagnosticNotValidForSnapshot)?;
         let stored =
             match diagnostic.to_template_for_file(&self.snapshot, self.file, &self.source_ref) {
-                Ok(template) => SourceMapDiagnostic::Template(template),
-                Err(_) => SourceMapDiagnostic::SnapshotBound(diagnostic),
+                Ok(template) => SourceMapDiagnostic::Template(Box::new(template)),
+                Err(_) => SourceMapDiagnostic::SnapshotBound(Box::new(diagnostic)),
             };
         self.diagnostics.push(stored);
         Ok(())
