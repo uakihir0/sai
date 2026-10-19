@@ -287,6 +287,10 @@ fn public_bool_parameter_comparison_if_functions_emit_check_results() {
     for source in [
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if right != left { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left < right { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if right <= left { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left > right { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if right >= left { 1 } else { 2 } }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -295,7 +299,6 @@ fn public_bool_parameter_comparison_if_functions_emit_check_results() {
 #[test]
 fn unsupported_bool_parameter_comparison_shapes_remain_gated() {
     for source in [
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if left < right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == left { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == true { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right and left { 1 } else { 2 } }\n",
