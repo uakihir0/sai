@@ -242,6 +242,28 @@ fn unsupported_bool_parameter_negation_shapes_remain_gated() {
 }
 
 #[test]
+fn public_bool_parameters_and_if_function_emits_check_result() {
+    let source =
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right { 1 } else { 2 } }\n";
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn unsupported_bool_parameter_and_shapes_remain_gated() {
+    for source in [
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left or right { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left and left { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left and true { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: I32) -> I32 { if left and right { 1 } else { 2 } }\n",
+        "pub fn choose(var left: Bool, right: Bool) -> I32 { if left and right { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right { 1 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        let value = 1\n        value\n    } else {\n        2\n    }\n}\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn literal_if_checks_both_branches_and_reports_source_spans() {
     for (source, expected_code, literal) in [
         (
