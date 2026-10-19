@@ -51361,6 +51361,7 @@ interface facade { use middle.{payload}; }"#;
             "  type RejectedLaterRecord { value: USize }\n",
             "  type BeforeRecord { value: LaterRecord }\n",
             "  type AliasBeforeRecord = LaterRecord\n",
+            "  type AliasBeforeVariant = LaterPayloadVariant\n",
             "  fn use_later_record(value: LaterRecord) -> LaterRecord\n",
             "  fn use_later_variant(value: LaterVariant) -> LaterVariant\n",
             "  fn use_later_payload_variant(value: LaterPayloadVariant) -> LaterPayloadVariant\n",
@@ -51423,9 +51424,20 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("uses-rejected-later-record"));
         assert!(!generated.text.contains("use-rejected-later-record"));
         assert!(!generated.text.contains("rejected-later-record"));
+        assert!(!generated.text.contains("alias-to-rejected-later-record"));
+        assert!(!generated.text.contains("use-rejected-later-record-alias"));
+        assert!(!generated.text.contains("alias-future-record-cycle"));
+        assert!(!generated.text.contains("future-record-cycle"));
+        assert!(!generated.text.contains("uses-future-record-cycle"));
+        assert!(!generated.text.contains("use-future-record-cycle"));
         assert!(generated.text.contains("record before-record {"));
         assert!(generated.text.contains("value: later-record"));
-        assert!(!generated.text.contains("alias-before-record"));
+        assert!(
+            generated
+                .text
+                .contains("type alias-before-record = later-record;")
+        );
+        assert!(!generated.text.contains("alias-before-variant"));
         assert!(
             generated
                 .text
@@ -51456,10 +51468,11 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(item_names.len(), 12);
+        assert_eq!(item_names.len(), 13);
         for name in [
             "envelope",
             "before-record",
+            "alias-before-record",
             "before-variant",
             "variant-before-record",
             "use-later-record",
@@ -51482,7 +51495,7 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
             "surviving item references compact after omitted forward targets"
         );
         let later_index = interface
@@ -51512,6 +51525,21 @@ interface facade { use middle.{payload}; }"#;
             .iter_enumerated()
             .find_map(|(index, item)| (item.name == "later-record").then_some(index))
             .expect("the target record remains in the parsed model");
+        let alias_before_record = interface
+            .items
+            .iter()
+            .find(|item| item.name == "alias-before-record")
+            .expect("the alias referencing the later record remains in the model");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(reference)) =
+            &alias_before_record.kind
+        else {
+            panic!("alias-before-record remains an alias to a named target");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.interface.name, "api");
+        assert_eq!(reference.item, later_record_index);
+        assert_eq!(reference.item_name, "later-record");
         let use_later_record = interface
             .items
             .iter()
@@ -51633,6 +51661,12 @@ interface facade { use middle.{payload}; }"#;
             "  fn use_later(value: After) -> After\n",
             "  fn use_rejected(value: Rejected) -> Rejected\n",
             "  type BeforeRecord { value: LaterRecord }\n",
+            "  type AliasFutureRecordCycle = FutureRecordCycle\n",
+            "  type FutureRecordCycle { value: AliasFutureRecordCycle }\n",
+            "  type UsesFutureRecordCycle { value: FutureRecordCycle }\n",
+            "  fn use_future_record_cycle(value: AliasFutureRecordCycle)\n",
+            "  type AliasToRejectedLaterRecord = RejectedLaterRecord\n",
+            "  fn use_rejected_later_record_alias(value: AliasToRejectedLaterRecord)\n",
             "  enum BeforeVariant { Value(After) }\n",
             "  enum RejectedVariant { Value(RejectedVariantAlias) }\n",
             "  fn use_rejected_variant(value: RejectedVariantAlias)\n",
