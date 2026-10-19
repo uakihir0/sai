@@ -2757,6 +2757,41 @@ fn collect_interface_uses_input(
                 );
             }
         }
+        let mut generated_record_type_references = generated_alias_type_references.clone();
+        if let (Some(unit), Some(interface_index), Some(interface_name)) = (
+            generated_unit.as_ref(),
+            generated_interface_index,
+            interface_wit_name.as_ref(),
+        ) {
+            for (member_index, (entry, member_owner)) in member_entries
+                .iter()
+                .zip(parent_members.iter().copied())
+                .enumerate()
+            {
+                if entry.kind != ItemTreeKind::Struct || entry.name.is_error() {
+                    continue;
+                }
+                let source_name = symbols
+                    .resolve(entry.name)
+                    .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+                    .map_err(InterfaceUsesQueryError::Collection)?;
+                let Some(item_name) = sai_identifier_to_wit_name(&source_name) else {
+                    continue;
+                };
+                generated_record_type_references.insert(
+                    member_owner.def_id.to_def_id(),
+                    WitTypeRef {
+                        interface: sai_wit::WitIfaceRef {
+                            unit: unit.clone(),
+                            interface: interface_index,
+                            name: interface_name.clone(),
+                        },
+                        item: provisional_item_indices[member_index],
+                        item_name,
+                    },
+                );
+            }
+        }
         for (member_index, (entry, member_owner)) in member_entries
             .into_iter()
             .zip(parent_members.iter().copied())
@@ -2875,15 +2910,12 @@ fn collect_interface_uses_input(
                 owner_uses_complete = false;
                 poisoned_owners.insert(member_owner);
             }
-            let item_type_references = if matches!(
-                kind,
-                super::InterfaceMemberKind::Alias
-                    | super::InterfaceMemberKind::Function
-                    | super::InterfaceMemberKind::Struct
-            ) {
-                &generated_alias_type_references
-            } else {
-                &generated_named_type_references
+            let item_type_references = match kind {
+                super::InterfaceMemberKind::Alias | super::InterfaceMemberKind::Function => {
+                    &generated_alias_type_references
+                }
+                super::InterfaceMemberKind::Struct => &generated_record_type_references,
+                _ => &generated_named_type_references,
             };
             let mut staged_resource_item = None;
             if generated_interface_eligible {
@@ -2975,6 +3007,11 @@ fn collect_interface_uses_input(
                                 },
                             );
                             generated_alias_type_references.insert(
+                                member_owner.def_id.to_def_id(),
+                                generated_named_type_references[&member_owner.def_id.to_def_id()]
+                                    .clone(),
+                            );
+                            generated_record_type_references.insert(
                                 member_owner.def_id.to_def_id(),
                                 generated_named_type_references[&member_owner.def_id.to_def_id()]
                                     .clone(),
@@ -3230,6 +3267,11 @@ fn collect_interface_uses_input(
                             },
                         );
                         generated_alias_type_references.insert(
+                            member_owner.def_id.to_def_id(),
+                            generated_named_type_references[&member_owner.def_id.to_def_id()]
+                                .clone(),
+                        );
+                        generated_record_type_references.insert(
                             member_owner.def_id.to_def_id(),
                             generated_named_type_references[&member_owner.def_id.to_def_id()]
                                 .clone(),

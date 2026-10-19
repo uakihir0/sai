@@ -51351,12 +51351,16 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
-    fn generated_wit_emits_record_fields_that_reference_later_aliases() {
+    fn generated_wit_emits_record_fields_that_reference_later_aliases_and_records() {
         let source = concat!(
             "interface api {\n",
             "  type Envelope { value: Later }\n",
             "  type RejectedRecord { value: Rejected }\n",
+            "  type UsesRejectedLaterRecord { value: RejectedLaterRecord }\n",
+            "  type RejectedLaterRecord { value: USize }\n",
             "  type BeforeRecord { value: LaterRecord }\n",
+            "  type AliasBeforeRecord = LaterRecord\n",
+            "  fn use_later_record(value: LaterRecord)\n",
             "  enum BeforeVariant { Value(Later) }\n",
             "  type LaterRecord { value: U64 }\n",
             "  type Rejected = USize\n",
@@ -51410,7 +51414,12 @@ interface facade { use middle.{payload}; }"#;
         );
         assert!(generated.text.contains("value: later"));
         assert!(!generated.text.contains("rejected-record"));
-        assert!(!generated.text.contains("before-record"));
+        assert!(!generated.text.contains("uses-rejected-later-record"));
+        assert!(!generated.text.contains("rejected-later-record"));
+        assert!(generated.text.contains("record before-record {"));
+        assert!(generated.text.contains("value: later-record"));
+        assert!(!generated.text.contains("alias-before-record"));
+        assert!(!generated.text.contains("use-later-record"));
         assert!(!generated.text.contains("before-variant"));
 
         let package_model = result.package.expect("partial generated WIT model loads");
@@ -51425,8 +51434,14 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(item_names.len(), 4);
-        for name in ["envelope", "later-record", "later", "independent"] {
+        assert_eq!(item_names.len(), 5);
+        for name in [
+            "envelope",
+            "before-record",
+            "later-record",
+            "later",
+            "independent",
+        ] {
             assert!(
                 item_names.contains(&name),
                 "the valid declaration {name} survives pruning"
@@ -51438,7 +51453,7 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3],
+            [0, 1, 2, 3, 4],
             "surviving item references compact after omitted forward targets"
         );
         let later_index = interface
@@ -51462,10 +51477,32 @@ interface facade { use middle.{payload}; }"#;
         assert_eq!(reference.interface.name, "api");
         assert_eq!(reference.item, later_index);
         assert_eq!(reference.item_name, "later");
+
+        let later_record_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "later-record").then_some(index))
+            .expect("the target record remains in the parsed model");
+        let before_record = interface
+            .items
+            .iter()
+            .find(|item| item.name == "before-record")
+            .expect("the valid forward record remains in the parsed model");
+        let sai_wit::WitItemKind::Record(fields) = &before_record.kind else {
+            panic!("before-record remains a record after parsing");
+        };
+        let sai_wit::WitType::Named(reference) = &fields[0].ty else {
+            panic!("the record field refers to a named later record");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.interface.name, "api");
+        assert_eq!(reference.item, later_record_index);
+        assert_eq!(reference.item_name, "later-record");
     }
 
     #[test]
-    fn generated_wit_prunes_forward_alias_cycles_and_omitted_targets() {
+    fn generated_wit_prunes_local_type_cycles_and_omitted_targets() {
         let source = concat!(
             "interface api {\n",
             "  type Before = After\n",
@@ -51480,6 +51517,9 @@ interface facade { use middle.{payload}; }"#;
             "  type RecordCycle { value: CycleA }\n",
             "  type CycleB = CycleA\n",
             "  type UsesCycle = CycleA\n",
+            "  type RecordCycleA { value: RecordCycleB }\n",
+            "  type RecordCycleB { value: RecordCycleA }\n",
+            "  fn use_record_cycle(value: RecordCycleA)\n",
             "  type RecordAliasCycle { value: AliasRecordCycle }\n",
             "  type AliasRecordCycle = RecordAliasCycle\n",
             "  fn use_record_alias_cycle(value: RecordAliasCycle)\n",
@@ -51549,9 +51589,10 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(emitted_items.len(), 6);
+        assert_eq!(emitted_items.len(), 7);
         assert!(emitted_items.contains(&"before"));
         assert!(emitted_items.contains(&"use-later"));
+        assert!(emitted_items.contains(&"before-record"));
         assert!(emitted_items.contains(&"after"));
         assert!(emitted_items.contains(&"later-record"));
         assert!(emitted_items.contains(&"later-resource"));
@@ -51562,15 +51603,18 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5],
+            [0, 1, 2, 3, 4, 5, 6],
             "surviving item indices compact after pruning cycles and unsupported targets"
         );
         assert!(!generated.text.contains("use-rejected"));
-        assert!(!generated.text.contains("before-record"));
+        assert!(generated.text.contains("record before-record {"));
         assert!(!generated.text.contains("before-variant"));
         assert!(!generated.text.contains("use-resource"));
         assert!(!generated.text.contains("use-cycle"));
         assert!(!generated.text.contains("record-cycle"));
+        assert!(!generated.text.contains("record-cycle-a"));
+        assert!(!generated.text.contains("record-cycle-b"));
+        assert!(!generated.text.contains("use-record-cycle"));
         assert!(!generated.text.contains("record-alias-cycle"));
         assert!(!generated.text.contains("alias-record-cycle"));
         assert!(!generated.text.contains("use-record-alias-cycle"));
