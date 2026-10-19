@@ -1026,6 +1026,25 @@ pub fn open_file_without_following(
     }
 }
 
+/// Open a direct child regular file without following a reparse point, with
+/// rights to update its file attributes.
+///
+/// `file_name` must be one normal path component. The returned handle can
+/// update attributes such as the Windows read-only flag without granting
+/// access to modify the file's contents. It denies all sharing while open, so
+/// no other handle can open, rename, replace, or link the checked file while
+/// its metadata is being validated and updated.
+#[cfg(windows)]
+pub fn open_file_for_attribute_updates_without_following(
+    parent: &File,
+    parent_path: &Path,
+    file_name: &OsStr,
+) -> io::Result<File> {
+    validate_child_name(file_name)?;
+    let _ = parent_path;
+    windows_handle::open_child_for_attribute_updates(parent, file_name)
+}
+
 /// Atomically replace one child file with another, relative to `parent`.
 ///
 /// Both names must be one normal path component.
@@ -1459,8 +1478,8 @@ mod windows_handle {
         GENERIC_READ, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_DISPOSITION_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileDispositionInfo, SYNCHRONIZE, SetFileInformationByHandle,
+        DELETE, FILE_DISPOSITION_INFO, FILE_READ_ATTRIBUTES, FileDispositionInfo, SYNCHRONIZE,
+        SetFileInformationByHandle,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -1507,6 +1526,24 @@ mod windows_handle {
             false,
         )?;
         validate_opened_child(file, true)
+    }
+
+    pub(super) fn open_child_for_attribute_updates(
+        parent: &File,
+        name: &OsStr,
+    ) -> io::Result<File> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
+        };
+
+        let file = open_child_with_access_and_share(
+            parent,
+            name,
+            false,
+            FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+            0,
+        )?;
+        validate_opened_child(file, false)
     }
 
     pub(super) fn open_directory_for_child_updates(path: &Path) -> io::Result<File> {
@@ -1582,6 +1619,22 @@ mod windows_handle {
         desired_access: u32,
         share_delete: bool,
     ) -> io::Result<File> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let share_access =
+            FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
+        open_child_with_access_and_share(parent, name, directory, desired_access, share_access)
+    }
+
+    pub(super) fn open_child_with_access_and_share(
+        parent: &File,
+        name: &OsStr,
+        directory: bool,
+        desired_access: u32,
+        share_access: u32,
+    ) -> io::Result<File> {
         super::validate_child_name(name)?;
         let wide = name.encode_wide().collect::<Vec<_>>();
         let byte_length = wide
@@ -1603,8 +1656,6 @@ mod windows_handle {
         };
         let mut io_status = IO_STATUS_BLOCK::default();
         let mut handle = ptr::null_mut();
-        let share_access =
-            FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
         let create_options = FILE_OPEN_REPARSE_POINT
             | FILE_SYNCHRONOUS_IO_NONALERT
             | if directory {
@@ -1838,7 +1889,8 @@ mod windows_tests {
         open_child_directory_for_rename_without_following, open_child_directory_without_following,
         open_directory_path_for_child_updates_without_following,
         open_directory_path_for_file_updates_without_following,
-        open_directory_path_without_following, remove_file_in_directory, replace_file_in_directory,
+        open_directory_path_without_following, open_file_for_attribute_updates_without_following,
+        remove_file_in_directory, replace_file_in_directory,
         replace_file_in_directory_if_unchanged,
     };
 
@@ -1938,6 +1990,54 @@ mod windows_tests {
         )
         .unwrap();
         assert!(child.metadata().unwrap().is_dir());
+    }
+
+    #[test]
+    fn attribute_update_handle_can_clear_readonly_without_content_write_access() {
+        let directory = TestDirectory::new();
+        let file_path = directory.0.join("readonly");
+        let moved_path = directory.0.join("moved");
+        let linked_path = directory.0.join("linked");
+        fs::write(&file_path, b"unchanged").unwrap();
+
+        let directory_handle =
+            open_directory_path_without_following(&fs::canonicalize(&directory.0).unwrap())
+                .unwrap();
+        let update_guard = open_file_for_attribute_updates_without_following(
+            &directory_handle,
+            &directory.0,
+            std::ffi::OsStr::new("readonly"),
+        )
+        .unwrap();
+        assert!(
+            fs::rename(&file_path, &moved_path).is_err(),
+            "the verified file cannot be moved while its attribute handle is open"
+        );
+        assert!(
+            fs::hard_link(&file_path, &linked_path).is_err(),
+            "the verified file cannot gain a link while its attribute handle is open"
+        );
+        drop(update_guard);
+
+        let mut permissions = fs::metadata(&file_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&file_path, permissions).unwrap();
+
+        let file = open_file_for_attribute_updates_without_following(
+            &directory_handle,
+            &directory.0,
+            std::ffi::OsStr::new("readonly"),
+        )
+        .unwrap();
+        let mut permissions = file.metadata().unwrap().permissions();
+        assert!(permissions.readonly());
+        permissions.set_readonly(false);
+        file.set_permissions(permissions).unwrap();
+        drop(file);
+
+        assert!(!fs::metadata(&file_path).unwrap().permissions().readonly());
+        assert_eq!(fs::read(&file_path).unwrap(), b"unchanged");
+        fs::rename(&file_path, &moved_path).unwrap();
     }
 
     #[test]

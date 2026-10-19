@@ -2682,7 +2682,13 @@ fn remove_cache_entry_once(path: &Path) -> Result<(), PackageCacheError> {
                 if cached_file_entry_matches(&parent_directory, &name, &file)?
                     && is_single_link_file(Some(&file), &opened_metadata)
                 {
-                    set_writable_file_handle(&file, &opened_metadata, path)?;
+                    set_writable_file_for_removal(
+                        &parent_directory,
+                        &name,
+                        file,
+                        &opened_metadata,
+                        path,
+                    )?;
                 }
             }
         }
@@ -2797,7 +2803,13 @@ fn make_capability_tree_removable(
             if cached_file_entry_matches(&directory, &child_name, &file)?
                 && is_single_link_file(Some(&file), &metadata)
             {
-                set_writable_file_handle(&file, &metadata, &child_path)?;
+                set_writable_file_for_removal(
+                    &directory,
+                    &child_name,
+                    file,
+                    &metadata,
+                    &child_path,
+                )?;
             }
         }
     }
@@ -2851,6 +2863,79 @@ fn set_writable_file_handle(
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn set_writable_file_for_removal(
+    directory: &CapabilityDir,
+    name: &OsStr,
+    file: File,
+    metadata: &fs::Metadata,
+    path: &Path,
+) -> Result<(), PackageCacheError> {
+    #[cfg(windows)]
+    {
+        if !metadata.permissions().readonly() {
+            return Ok(());
+        }
+
+        // The scan handle is intentionally read-only and does not grant
+        // FILE_WRITE_ATTRIBUTES. Save only its stable file identity before
+        // opening the second handle, so it cannot block that open.
+        let expected_identity =
+            sai_windows_fs::file_identity(&file).map_err(|source| PackageCacheError::Io {
+                operation: "identify inconsistent package cache file before attribute update",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        drop(file);
+        let parent = CapabilityDir::reopen_dir(directory)
+            .map_err(|source| PackageCacheError::Io {
+                operation: "retain package cache parent for attribute update",
+                path: path.to_path_buf(),
+                source,
+            })?
+            .into_std_file();
+        let update_file =
+            sai_windows_fs::open_file_for_attribute_updates_without_following(&parent, path, name)
+                .map_err(|source| PackageCacheError::Io {
+                    operation: "open inconsistent package cache file for attribute update",
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        let update_identity = sai_windows_fs::file_identity(&update_file).map_err(|source| {
+            PackageCacheError::Io {
+                operation: "identify inconsistent package cache file for attribute update",
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
+        let update_metadata = update_file
+            .metadata()
+            .map_err(|source| PackageCacheError::Io {
+                operation: "inspect inconsistent package cache file for attribute update",
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if expected_identity != update_identity
+            || !update_metadata.is_file()
+            || !is_single_link_file(Some(&update_file), &update_metadata)
+        {
+            return Err(PackageCacheError::Io {
+                operation: "recheck inconsistent package cache file for attribute update",
+                path: path.to_path_buf(),
+                source: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cache entry changed or is not a single-link regular file",
+                ),
+            });
+        }
+        set_writable_file_handle(&update_file, &update_metadata, path)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (directory, name);
+        set_writable_file_handle(&file, metadata, path)
+    }
 }
 
 fn set_capability_directory_writable(
@@ -3214,7 +3299,7 @@ pub(crate) fn remove_tree_at_path(root: &Path, boundary: &Path) -> bool {
                 && cached_file_entry_matches(&parent, &name, &file).unwrap_or(false)
                 && is_single_link_file(Some(&file), &opened_metadata)
             {
-                let _ = set_writable_file_handle(&file, &opened_metadata, root);
+                let _ = set_writable_file_for_removal(&parent, &name, file, &opened_metadata, root);
             }
         }
         if metadata.is_dir() {
@@ -4567,7 +4652,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn corrupt_source_removal_handles_already_writable_files() {
+    fn corrupt_source_removal_clears_readonly_nested_files() {
         let temp = TestDirectory::new("verify-source-windows-writable-removal");
         let cache = PackageCache::open(temp.path().join("cache")).unwrap();
         let source = TestRepository::new().verified_source();
@@ -4577,14 +4662,38 @@ mod tests {
             .unwrap()
             .path()
             .to_path_buf();
+        let nested_source = source_path.join("src").join("lib.sai");
+        fs::create_dir_all(nested_source.parent().unwrap()).unwrap();
+        fs::write(&nested_source, b"pub fn nested() {}\n").unwrap();
+        let mut nested_file_permissions = fs::metadata(&nested_source).unwrap().permissions();
+        nested_file_permissions.set_readonly(true);
+        fs::set_permissions(&nested_source, nested_file_permissions).unwrap();
+        let mut nested_directory_permissions = fs::metadata(nested_source.parent().unwrap())
+            .unwrap()
+            .permissions();
+        nested_directory_permissions.set_readonly(true);
+        fs::set_permissions(
+            nested_source.parent().unwrap(),
+            nested_directory_permissions,
+        )
+        .unwrap();
         let source_file = source_path.join("sai.package");
         let mut permissions = fs::metadata(&source_file).unwrap().permissions();
         permissions.set_readonly(false);
         fs::set_permissions(&source_file, permissions).unwrap();
         fs::write(&source_file, b"corrupt package content").unwrap();
 
+        assert!(
+            matches!(
+                cache.verify_source(&checksum).unwrap(),
+                CachedSourceVerification::Corrupt { .. }
+            ),
+            "the changed nested source and manifest are reported as corrupt"
+        );
         assert_eq!(
-            cache.remove_corrupt_source(&checksum).unwrap(),
+            cache
+                .remove_corrupt_source(&checksum)
+                .unwrap_or_else(|error| panic!("remove_corrupt_source: {error:#?}")),
             SourceCacheRemoval::Removed
         );
         assert!(!source_path.exists());

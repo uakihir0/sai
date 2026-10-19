@@ -31,5 +31,8 @@ jobs:
           components: rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Test Windows package cache recovery
+        if: runner.os == 'Windows'
+        run: cargo test -p sai_package package_cache::tests::corrupt_source_removal_clears_readonly_nested_files --locked -- --nocapture
       - name: Test workspace
         run: cargo test --workspace --locked
