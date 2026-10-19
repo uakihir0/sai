@@ -45869,6 +45869,653 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         );
     }
 
+    fn authored_wit_world_fixture(
+        root_source: &[u8],
+        codec_wit: &[u8],
+        base_wit: Option<&[u8]>,
+    ) -> (
+        RootDatabase,
+        ModuleTree,
+        WorkspaceSnapshot,
+        PackageId,
+        Phase1ActiveWitViewScopes,
+    ) {
+        let (mut database, module_tree, snapshot, root_package) = phase1_fixture(root_source, b"");
+        let (codec, codec_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:codec",
+            "1.2.3",
+            codec_wit,
+        );
+        let base_node = base_wit.map(|source| {
+            let (_, base_node) = install_external_artifact_world_package(
+                &mut database,
+                "acme:base",
+                "1.0.0",
+                source,
+            );
+            database
+                .set_package_manifest(
+                    codec,
+                    Arc::from(
+                        &b"package acme:codec @ 1.2.3\n\
+                          artifact component {}\n\
+                          wit \"wit\"\n\
+                          requires { acme:base @ ^1 }\n"[..],
+                    ),
+                    PackageRole::Dependency,
+                    Durability::Low,
+                )
+                .expect("codec's transitive WIT dependency is recorded");
+            let codec_node = PackageGraphNode::new(
+                codec_node.key().clone(),
+                codec_node.identity(),
+                codec_node.version().clone(),
+                codec_node.form(),
+                codec_node.role(),
+                vec![graph_edge(base_node.key().as_str(), "acme:base")],
+            )
+            .expect("codec graph node includes the base package");
+            (codec_node, base_node)
+        });
+        let codec_node = base_node
+            .as_ref()
+            .map_or(codec_node, |(codec_node, _)| codec_node.clone());
+        let root_key = PackageKey::new("acme:phase1#1").expect("root package key is valid");
+        let mut graph_nodes = vec![
+            graph_node(
+                root_key.as_str(),
+                "acme:phase1",
+                "1.0.0",
+                PackageGraphRole::Root,
+                vec![graph_edge(codec_node.key().as_str(), "acme:codec")],
+            ),
+            codec_node,
+        ];
+        if let Some((_, base_node)) = base_node {
+            graph_nodes.push(base_node);
+        }
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            graph_nodes,
+        )
+        .expect("authored WIT package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target, &graph)
+            .expect("selected authored WIT views load");
+        (database, module_tree, snapshot, root_package, wit_views)
+    }
+
+    fn set_authored_wit_item_as_used(
+        wit_views: &mut Phase1ActiveWitViewScopes,
+        visible_identity: &str,
+        interface_name: &str,
+        item_name: &str,
+        target: sai_wit::WitTypeRef,
+    ) {
+        // The authored WIT source converter normalizes `use` declarations to
+        // Alias. Keep the loaded view identity and item address, but exercise
+        // the separate Used model shape consumed at this driver boundary.
+        let entry = wit_views
+            .entries
+            .iter_mut()
+            .find(|entry| entry.identity.package_identity == visible_identity)
+            .expect("the selected authored WIT view exists");
+        let foreign = entry
+            .available
+            .as_mut()
+            .expect("the selected authored WIT view is available");
+        let view = Arc::make_mut(&mut foreign.view);
+        let interface = view
+            .interfaces
+            .get(interface_name)
+            .expect("the authored interface exists");
+        let interface_index = interface.wit;
+        let item_index = interface
+            .members
+            .get(item_name)
+            .expect("the authored member exists")
+            .item;
+        view.model.interfaces[interface_index].items[item_index].kind =
+            sai_wit::WitItemKind::Used(target);
+    }
+
+    fn mark_authored_wit_view_incomplete(
+        wit_views: &mut Phase1ActiveWitViewScopes,
+        visible_identity: &str,
+    ) {
+        let entry = wit_views
+            .entries
+            .iter_mut()
+            .find(|entry| entry.identity.package_identity == visible_identity)
+            .expect("the selected authored WIT view exists");
+        let foreign = entry
+            .available
+            .as_mut()
+            .expect("the selected authored WIT view is available");
+        Arc::make_mut(&mut foreign.view).complete = false;
+    }
+
+    #[test]
+    fn generated_world_function_propagates_incompleteness_for_one_hop_used_type() {
+        let root_source = concat!(
+            "use acme:codec/direct as direct\n",
+            "world client {\n",
+            "  import fn consume(value: direct.Payload) -> direct.Payload\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types { record payload { value: u32 } }
+interface direct { use types.{payload}; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let target = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            assert!(codec_view.directly_visible);
+            assert!(codec_view.view.complete);
+            let direct = codec_view
+                .view
+                .interfaces
+                .get("direct")
+                .expect("the authored direct facade interface is loaded");
+            let member = direct
+                .members
+                .get("Payload")
+                .expect("the direct facade exposes Payload");
+            let item = &codec_view.view.model.interfaces[direct.wit].items[member.item];
+            let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(target)) = &item.kind else {
+                panic!("the loaded use retains its exact target: {:?}", item.kind);
+            };
+            target.clone()
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "direct",
+            "Payload",
+            target.clone(),
+        );
+        mark_authored_wit_view_incomplete(&mut wit_views, "acme:codec");
+        let (foreign_view, facade_definition) = {
+            let entry = wit_views
+                .entries
+                .iter()
+                .find(|entry| entry.identity.package_identity == "acme:codec")
+                .expect("the selected authored WIT view exists");
+            let foreign = entry
+                .available
+                .as_ref()
+                .expect("the selected authored WIT view is available");
+            let view = foreign.view.as_ref();
+            let direct = view
+                .interfaces
+                .get("direct")
+                .expect("the direct facade remains in the loaded view");
+            let facade = direct
+                .members
+                .get("Payload")
+                .expect("the direct facade member remains addressable");
+            let item = &view.model.interfaces[direct.wit].items[facade.item];
+            assert!(matches!(item.kind, sai_wit::WitItemKind::Used(_)));
+            (
+                OwnedPhase1ForeignWitView {
+                    visible_identity: foreign.visible_identity.clone(),
+                    view: Arc::clone(&foreign.view),
+                    source_def_paths: foreign.source_def_paths.clone(),
+                    directly_visible: foreign.directly_visible,
+                },
+                facade.def,
+            )
+        };
+        let used_type_references =
+            interface_use_queries::generated_foreign_world_used_type_references(&[foreign_view]);
+        assert_eq!(
+            used_type_references.by_definition.get(&facade_definition),
+            Some(&target),
+            "the Used-specific map records the facade's exact target"
+        );
+        assert_eq!(
+            used_type_references.view_completeness.get(&target),
+            Some(&false),
+            "the Used-specific map carries incompleteness from the selected view"
+        );
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").expect("target config is valid"),
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root scopes use the exact selected authored WIT view");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "root generated WIT parses: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            !generated.complete,
+            "the sole supported world function inherits incompleteness from its selected view"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/types@1.2.3.{payload};"),
+            "the one-hop Used target keeps its exact selected version: {}",
+            generated.text
+        );
+        assert_eq!(generated.text.matches("import consume:").count(), 1);
+        assert!(
+            generated
+                .text
+                .contains("import consume: func(value: payload) -> payload;"),
+            "the function remains emitted even though its view is incomplete: {}",
+            generated.text
+        );
+
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated WIT model is available after text parsing");
+        let client = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "client")
+            .expect("the client world is generated");
+        let world_functions = client
+            .imports
+            .iter()
+            .filter_map(|item| match item {
+                sai_wit::WitWorldItem::Func { name, func, .. } => Some((name, func)),
+                sai_wit::WitWorldItem::Interface { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(world_functions.len(), 1);
+        let (name, consume) = world_functions[0];
+        assert_eq!(name, "consume");
+        let expected = sai_wit::WitType::Named(target);
+        assert_eq!(consume.params[0].1, expected.clone());
+        assert_eq!(
+            consume.result,
+            Some(expected),
+            "reparsed parameter and result preserve the exact Used target"
+        );
+    }
+
+    #[test]
+    fn generated_world_function_resolves_one_hop_used_types_from_direct_selected_view() {
+        let root_source = concat!(
+            "use acme:codec/direct as direct\n",
+            "use acme:codec/chain as chain\n",
+            "world client {\n",
+            "  import fn consume(value: direct.Payload) -> direct.Payload\n",
+            "  import fn reject_chain(value: chain.Payload)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types { record payload { value: u32 } }
+interface direct { use types.{payload}; }
+interface middle { use types.{payload}; }
+interface chain { use middle.{payload}; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let (direct_target, middle_target, middle_reference) = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            assert!(codec_view.directly_visible);
+            assert_eq!(codec_view.view.unit.canonical_name(), "acme:codec@1.2.3");
+
+            let direct = codec_view
+                .view
+                .interfaces
+                .get("direct")
+                .expect("the authored direct facade interface is loaded");
+            let direct_member = direct
+                .members
+                .get("Payload")
+                .expect("the direct facade exposes Payload");
+            let direct_item =
+                &codec_view.view.model.interfaces[direct.wit].items[direct_member.item];
+            let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(direct_target)) =
+                &direct_item.kind
+            else {
+                panic!(
+                    "the loaded authored use contains its exact target: {:?}",
+                    direct_item.kind
+                );
+            };
+
+            let middle = codec_view
+                .view
+                .interfaces
+                .get("middle")
+                .expect("the authored middle facade interface is loaded");
+            let middle_member = middle
+                .members
+                .get("Payload")
+                .expect("the middle facade exposes Payload");
+            let middle_item =
+                &codec_view.view.model.interfaces[middle.wit].items[middle_member.item];
+            let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(middle_target)) =
+                &middle_item.kind
+            else {
+                panic!(
+                    "the loaded middle use contains its exact target: {:?}",
+                    middle_item.kind
+                );
+            };
+            let middle_reference = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: middle.wit,
+                    name: "middle".to_owned(),
+                },
+                item: middle_member.item,
+                item_name: "payload".to_owned(),
+            };
+            (
+                direct_target.clone(),
+                middle_target.clone(),
+                middle_reference,
+            )
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "direct",
+            "Payload",
+            direct_target.clone(),
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "middle",
+            "Payload",
+            middle_target,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "chain",
+            "Payload",
+            middle_reference,
+        );
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the authored model remains in the selected direct WIT view");
+        let direct = codec_view.view.interfaces.get("direct").unwrap();
+        let direct_member = direct.members.get("Payload").unwrap();
+        let direct_item = &codec_view.view.model.interfaces[direct.wit].items[direct_member.item];
+        let sai_wit::WitItemKind::Used(direct_target) = &direct_item.kind else {
+            panic!("the fixture has an exact Used facade item");
+        };
+        assert_eq!(direct_target.interface.unit, codec_view.view.unit);
+        assert_eq!(direct_target.interface.name, "types");
+        let target_interface = &codec_view.view.model.interfaces[direct_target.interface.interface];
+        let target_item = &target_interface.items[direct_target.item];
+        assert_eq!(target_item.name, "payload");
+        assert!(matches!(target_item.kind, sai_wit::WitItemKind::Record(_)));
+
+        let chain_interface = codec_view.view.interfaces.get("chain").unwrap();
+        let chain_member = chain_interface.members.get("Payload").unwrap();
+        let chain_item =
+            &codec_view.view.model.interfaces[chain_interface.wit].items[chain_member.item];
+        let sai_wit::WitItemKind::Used(chain_target) = &chain_item.kind else {
+            panic!("the fixture has a chained Used item");
+        };
+        let chain_target_interface =
+            &codec_view.view.model.interfaces[chain_target.interface.interface];
+        assert_eq!(chain_target_interface.name, "middle");
+        assert!(
+            matches!(
+                chain_target_interface.items[chain_target.item].kind,
+                sai_wit::WitItemKind::Used(_)
+            ),
+            "the second hop is itself Used and must fail closed"
+        );
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").expect("target config is valid"),
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root scopes use the exact selected authored WIT view");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "the root WIT package parses: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            !generated.complete,
+            "the unsupported second Used hop marks the generated output incomplete"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/types@1.2.3.{payload};"),
+            "the one-hop facade emits its exact selected target and version: {}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("import consume: func(value: payload) -> payload;"),
+            "the directly selected one-hop facade remains usable: {}",
+            generated.text
+        );
+        assert!(!generated.text.contains("reject-chain:"));
+
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated root WIT model is available after parsing");
+        let client = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "client")
+            .expect("the client world is generated from the parsed text");
+        let consume = client
+            .imports
+            .iter()
+            .find_map(|item| match item {
+                sai_wit::WitWorldItem::Func { name, func, .. } if name == "consume" => Some(func),
+                _ => None,
+            })
+            .expect("the direct facade function survives text parsing");
+        let expected_reference = direct_target.clone();
+        assert_eq!(
+            consume.params[0].1,
+            sai_wit::WitType::Named(expected_reference.clone())
+        );
+        assert_eq!(
+            consume.result,
+            Some(sai_wit::WitType::Named(expected_reference)),
+            "the parsed world signature preserves exact target identity"
+        );
+    }
+
+    #[test]
+    fn generated_world_function_rejects_used_types_targeting_transitive_units() {
+        let root_source = concat!(
+            "use acme:codec/facade as facade\n",
+            "world client {\n",
+            "  import fn consume(value: facade.Payload)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface facade { use acme:base/types@1.0.0.{payload}; }"#;
+        let base_wit =
+            br#"package acme:base@1.0.0; interface types { record payload { value: u32 } }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, Some(base_wit));
+        let transitive_target = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            assert!(codec_view.directly_visible);
+            let facade = codec_view
+                .view
+                .interfaces
+                .get("facade")
+                .expect("the authored facade interface is loaded");
+            let member = facade
+                .members
+                .get("Payload")
+                .expect("the facade exposes its imported Payload");
+            let item = &codec_view.view.model.interfaces[facade.wit].items[member.item];
+            let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(target)) = &item.kind else {
+                panic!(
+                    "the loaded authored use retains its transitive target: {:?}",
+                    item.kind
+                );
+            };
+            target.clone()
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "facade",
+            "Payload",
+            transitive_target.clone(),
+        );
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the selected codec view retains the Used facade");
+        let facade = codec_view.view.interfaces.get("facade").unwrap();
+        let member = facade.members.get("Payload").unwrap();
+        let item = &codec_view.view.model.interfaces[facade.wit].items[member.item];
+        assert!(matches!(item.kind, sai_wit::WitItemKind::Used(_)));
+        let base_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:base")
+            .expect("base is available only through codec");
+        assert!(!base_view.directly_visible);
+        assert_eq!(transitive_target.interface.unit, base_view.view.unit);
+        assert_eq!(transitive_target.interface.name, "types");
+        assert!(matches!(
+            base_view.view.model.interfaces[transitive_target.interface.interface].items
+                [transitive_target.item]
+                .kind,
+            sai_wit::WitItemKind::Record(_)
+        ));
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").expect("target config is valid"),
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root scopes use the exact selected authored WIT view");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "unsupported transitive type use fails closed without breaking package parsing: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            !generated.complete,
+            "a Used target outside the selected direct WIT unit makes output incomplete"
+        );
+        assert!(!generated.text.contains("consume:"));
+        assert!(
+            !generated.text.contains("acme:base/types"),
+            "a transitive-unit target must not leak into generated WIT"
+        );
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated root WIT model is available");
+        let client = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "client")
+            .expect("the client world is generated");
+        assert!(
+            client.imports.is_empty(),
+            "the world function with a transitive Used target is omitted"
+        );
+    }
+
     #[test]
     fn generated_wit_references_named_types_from_embedded_wasi_views() {
         let source = concat!(

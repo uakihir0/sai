@@ -2436,6 +2436,8 @@ fn collect_interface_uses_input(
         interface_boundary_type_definitions(&interface_type_members, scopes, prepared);
     let foreign_named_type_references = generated_foreign_named_type_references(prepared);
     let foreign_world_resource_references = generated_foreign_world_resource_references(prepared);
+    let foreign_world_used_type_references =
+        generated_foreign_world_used_type_references(&prepared.foreign_wit_views);
     let mut ineligible_interfaces = HashSet::new();
     let boundary_use_alias_names = interface_boundary_use_alias_names(
         &interface_type_members,
@@ -3173,9 +3175,19 @@ fn collect_interface_uses_input(
                 .iter()
                 .map(|(definition, reference)| (*definition, reference.clone())),
         );
+        generated_world_type_references.extend(
+            foreign_world_used_type_references
+                .by_definition
+                .iter()
+                .map(|(definition, reference)| (*definition, reference.clone())),
+        );
         let mut generated_world_view_completeness =
             foreign_named_type_references.view_completeness.clone();
-        for (reference, complete) in &foreign_world_resource_references.view_completeness {
+        for (reference, complete) in foreign_world_resource_references
+            .view_completeness
+            .iter()
+            .chain(&foreign_world_used_type_references.view_completeness)
+        {
             generated_world_view_completeness
                 .entry(reference.clone())
                 .and_modify(|existing| *existing &= complete)
@@ -5033,6 +5045,109 @@ fn generated_foreign_world_resource_references(
                 references
                     .view_completeness
                     .entry(reference)
+                    .and_modify(|complete| *complete &= view.complete)
+                    .or_insert(view.complete);
+            }
+        }
+    }
+    references
+}
+
+#[derive(Default)]
+pub(super) struct GeneratedForeignWorldUsedTypeReferences {
+    pub(super) by_definition: HashMap<DefId, WitTypeRef>,
+    pub(super) view_completeness: HashMap<WitTypeRef, bool>,
+}
+
+pub(super) fn generated_foreign_world_used_type_references(
+    foreign_wit_views: &[super::OwnedPhase1ForeignWitView],
+) -> GeneratedForeignWorldUsedTypeReferences {
+    let mut references = GeneratedForeignWorldUsedTypeReferences::default();
+    for foreign in foreign_wit_views {
+        if !foreign.directly_visible {
+            continue;
+        }
+        let view = foreign.view.as_ref();
+        for interface in view.interfaces.values() {
+            let Some(wit_interface) = view.model.interfaces.get(interface.wit) else {
+                continue;
+            };
+            for member in interface.members.values() {
+                if member.kind != WitViewDefKind::Alias || member.unsupported.is_some() {
+                    continue;
+                }
+                let Some(definition) = view.definition(member.def) else {
+                    continue;
+                };
+                if definition.kind != WitViewDefKind::Alias
+                    || definition.entity
+                        != (WitViewEntity::Item {
+                            interface: interface.wit,
+                            item: member.item,
+                        })
+                {
+                    continue;
+                }
+                let Some(wit_item) = wit_interface.items.get(member.item) else {
+                    continue;
+                };
+                if wit_item.unsupported.is_some() {
+                    continue;
+                }
+                let WitItemKind::Used(target) = &wit_item.kind else {
+                    continue;
+                };
+                if target.interface.unit != view.unit
+                    || view
+                        .model
+                        .interfaces
+                        .get(target.interface.interface)
+                        .is_none_or(|target_interface| {
+                            target_interface.name != target.interface.name
+                        })
+                {
+                    continue;
+                }
+                let Some(target_interface) = view.model.interfaces.get(target.interface.interface)
+                else {
+                    continue;
+                };
+                let Some(target_item) = target_interface.items.get(target.item) else {
+                    continue;
+                };
+                if target_item.name != target.item_name || target_item.unsupported.is_some() {
+                    continue;
+                }
+                let expected_view_kind = match &target_item.kind {
+                    WitItemKind::Alias(_) => WitViewDefKind::Alias,
+                    WitItemKind::Record(_) => WitViewDefKind::Struct,
+                    WitItemKind::Variant(_) | WitItemKind::Enum(_) | WitItemKind::Flags(_) => {
+                        WitViewDefKind::Enum
+                    }
+                    WitItemKind::Resource(_) | WitItemKind::Used(_) | WitItemKind::Func(_) => {
+                        continue;
+                    }
+                };
+                let target_entity = WitViewEntity::Item {
+                    interface: target.interface.interface,
+                    item: target.item,
+                };
+                let Some(target_definition_id) = view.definition_for_entity(target_entity) else {
+                    continue;
+                };
+                let Some(target_definition) = view.definition(target_definition_id) else {
+                    continue;
+                };
+                if target_definition.entity != target_entity
+                    || target_definition.kind != expected_view_kind
+                {
+                    continue;
+                }
+
+                references.by_definition.insert(member.def, target.clone());
+                references
+                    .view_completeness
+                    .entry(target.clone())
                     .and_modify(|complete| *complete &= view.complete)
                     .or_insert(view.complete);
             }
