@@ -553,31 +553,31 @@ impl PackageCache {
         #[cfg(any(unix, windows))]
         {
             let (staging_parent, staging_name) =
-                open_parent_at_boundary(&staged_record, &self.root).ok_or_else(|| {
-                    PackageCacheError::Io {
+                open_parent_for_file_updates_at_boundary(&staged_record, &self.root).ok_or_else(
+                    || PackageCacheError::Io {
                         operation: "open staged package cache record directory",
                         path: staged_record.clone(),
                         source: io::Error::new(
                             io::ErrorKind::InvalidInput,
                             "staged cache record is outside the verified cache root",
                         ),
-                    }
-                })?;
+                    },
+                )?;
             let (destination_parent, destination_name) =
-                open_parent_at_boundary(&destination, &self.root).ok_or_else(|| {
-                    PackageCacheError::Io {
+                open_parent_for_file_updates_at_boundary(&destination, &self.root).ok_or_else(
+                    || PackageCacheError::Io {
                         operation: "open package cache record directory",
                         path: destination.clone(),
                         source: io::Error::new(
                             io::ErrorKind::InvalidInput,
                             "cache record is outside the verified cache root",
                         ),
-                    }
-                })?;
+                    },
+                )?;
             sai_windows_fs::replace_file_between_directories(
-                &staging_parent.into_std_file(),
+                &staging_parent,
                 &staging_name,
-                &destination_parent.into_std_file(),
+                &destination_parent,
                 &destination_name,
             )
             .map_err(|source| PackageCacheError::Io {
@@ -3358,6 +3358,51 @@ fn open_parent_at_boundary(root: &Path, boundary: &Path) -> Option<(CapabilityDi
     }
 
     Some((parent, name.to_os_string()))
+}
+
+fn open_parent_for_file_updates_at_boundary(
+    path: &Path,
+    boundary: &Path,
+) -> Option<(File, OsString)> {
+    let relative = path.strip_prefix(boundary).ok()?;
+    let names = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Some(name),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let (name, directories) = names.split_last()?;
+    let (final_directory, intermediate_directories) = directories.split_last()?;
+
+    let mut parent = CapabilityDir::open_ambient_dir(boundary, ambient_authority()).ok()?;
+    let mut parent_path = boundary.to_path_buf();
+    for directory_name in intermediate_directories {
+        let next_path = parent_path.join(directory_name);
+        parent = open_cache_layout_directory(&parent, directory_name, &next_path).ok()?;
+        parent_path = next_path;
+    }
+
+    let final_path = parent_path.join(final_directory);
+    let verified_directory =
+        open_cache_layout_directory(&parent, final_directory, &final_path).ok()?;
+    let parent_file = CapabilityDir::reopen_dir(&parent).ok()?.into_std_file();
+    let update_directory = sai_windows_fs::open_child_directory_for_file_updates_without_following(
+        &parent_file,
+        &parent_path,
+        final_directory,
+    )
+    .ok()?;
+    let verified_file = CapabilityDir::reopen_dir(&verified_directory)
+        .ok()?
+        .into_std_file();
+    if sai_windows_fs::file_identity(&update_directory).ok()?
+        != sai_windows_fs::file_identity(&verified_file).ok()?
+    {
+        return None;
+    }
+
+    Some((update_directory, name.to_os_string()))
 }
 
 fn remove_file_at_path(path: &Path, boundary: &Path) -> bool {
