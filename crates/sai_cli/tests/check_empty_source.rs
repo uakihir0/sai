@@ -169,6 +169,24 @@ fn public_zero_parameter_direct_scalar_function_emits_check_result() {
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
+
+    for source in [
+        "pub fn signed_minimum() -> ISize { -9223372036854775808 }\n",
+        "pub fn signed_maximum() -> ISize { 9223372036854775807 }\n",
+        "pub fn above_wasm32() -> USize { 4294967296 }\n",
+        "pub fn unsigned_maximum() -> USize { 18446744073709551615 }\n",
+    ] {
+        assert_success_result(
+            run_check(
+                source,
+                "targets { wasm32-core, wasm64-core }\n",
+                &[],
+                &["--target", "wasm64-core"],
+            ),
+            "wasm64-core",
+            "dev",
+        );
+    }
 }
 
 #[test]
@@ -512,6 +530,16 @@ fn empty_root_source_emits_check_result_for_default_and_selected_target() {
         "wasm32-core",
         "dev",
     );
+    assert_success_result(
+        run_check(
+            "",
+            "targets { wasm32-core, wasm64-core }\n",
+            &[],
+            &["--target", "wasm64-core"],
+        ),
+        "wasm64-core",
+        "dev",
+    );
 }
 
 #[test]
@@ -621,6 +649,20 @@ fn multiple_public_primitive_const_literals_emit_one_check_result() {
 }
 
 #[test]
+fn wasm64_wasi_remains_outside_the_narrow_success_slice() {
+    let output = run_check(
+        "",
+        "targets { wasm64-wasi }\n",
+        &[],
+        &["--target", "wasm64-wasi"],
+    );
+    assert_check_stays_gated(
+        &output,
+        "wasm64-wasi is outside the core-target success slice",
+    );
+}
+
+#[test]
 fn pointer_sized_integer_const_literals_follow_the_selected_target_width() {
     let manifest = "targets { wasm32-core, wasm64-core }\n";
     assert_success_result(
@@ -660,24 +702,43 @@ fn pointer_sized_integer_const_literals_follow_the_selected_target_width() {
         );
     }
 
-    let output = run_check(
-        "pub const ABOVE_WASM32: USize = 4294967296\n",
-        manifest,
-        &[],
-        &["--target", "wasm64-core"],
+    assert_success_result(
+        run_check(
+            concat!(
+                "pub const ISIZE_MIN: ISize = -9223372036854775808\n",
+                "pub const ISIZE_MAX: ISize = 9223372036854775807\n",
+                "pub const USIZE_MAX: USize = 18446744073709551615\n",
+                "pub const ABOVE_WASM32: USize = 4294967296\n",
+                "pub const USIZE_NEG_ZERO: USize = -0\n",
+            ),
+            manifest,
+            &[],
+            &["--target", "wasm64-core"],
+        ),
+        "wasm64-core",
+        "dev",
     );
-    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "wasm64 remains outside the CLI success slice:\n{stdout}"
-    );
-    assert!(
-        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
-            && !stdout.contains("\"type\":\"result\"")
-            && !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""),
-        "wasm64 must use its 64-bit USize range while retaining the success gate:\n{stdout}"
-    );
+
+    for source in [
+        "pub const TOO_SMALL: ISize = -9223372036854775809\n",
+        "pub const TOO_LARGE: ISize = 9223372036854775808\n",
+        "pub const TOO_LARGE: USize = 18446744073709551616\n",
+        "pub const NEGATIVE: USize = -1\n",
+    ] {
+        let output = run_check(source, manifest, &[], &["--target", "wasm64-core"]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: out-of-range pointer-sized const should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a range error without a result or feature gate:\n{stdout}"
+        );
+    }
 }
 
 #[test]
