@@ -6238,19 +6238,85 @@ fn check_function_if_parameter_comparison_condition(
     if !matches!(
         operator,
         BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
-    ) || !function_if_path_uses_parameter_binding(left, body_parameter, locals, inputs)
-        || !is_direct_function_scalar_literal(right)
-        || !matches!(
-            resolve_function_direct_type(parameter_ty, type_paths, symbols, inputs),
-            Some(FunctionDirectType::Primitive(_))
-        )
-    {
+    ) {
         return Ok(None);
+    }
+    let (literal, parameter_path, literal_is_left) =
+        if function_if_path_uses_parameter_binding(left, body_parameter, locals, inputs)
+            && is_direct_function_scalar_literal(right)
+        {
+            (right, left, false)
+        } else if is_direct_function_scalar_literal(left)
+            && function_if_path_uses_parameter_binding(right, body_parameter, locals, inputs)
+        {
+            (left, right, true)
+        } else {
+            return Ok(None);
+        };
+    let Some(FunctionDirectType::Primitive(parameter_primitive)) =
+        resolve_function_direct_type(parameter_ty, type_paths, symbols, inputs)
+    else {
+        return Ok(None);
+    };
+    if literal_is_left {
+        let literal_primitive = match literal.kind {
+            ExprKind::Lit(Lit::Bool(_)) => Some(sai_resolve::prelude::PrimTy::Bool),
+            ExprKind::Lit(Lit::Char(_)) => Some(sai_resolve::prelude::PrimTy::Char),
+            ExprKind::Lit(Lit::Byte(_)) => Some(sai_resolve::prelude::PrimTy::Byte),
+            _ => None,
+        };
+        if let Some(literal_primitive) = literal_primitive {
+            if literal_primitive == parameter_primitive {
+                return Ok(Some(Vec::new()));
+            }
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                parameter_path.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!(
+                    "expected `{}`, found `{}`",
+                    const_primitive_name(literal_primitive),
+                    const_primitive_name(parameter_primitive)
+                ),
+                "type mismatch",
+            )?]));
+        }
+        let default_primitive = match literal.kind {
+            ExprKind::Lit(Lit::Int { .. }) if !is_integer_primitive(parameter_primitive) => {
+                Some(sai_resolve::prelude::PrimTy::I64)
+            }
+            ExprKind::Lit(Lit::Float { .. })
+                if !matches!(
+                    parameter_primitive,
+                    sai_resolve::prelude::PrimTy::F32 | sai_resolve::prelude::PrimTy::F64
+                ) =>
+            {
+                Some(sai_resolve::prelude::PrimTy::F64)
+            }
+            _ => None,
+        };
+        if let Some(default_primitive) = default_primitive {
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                parameter_path.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!(
+                    "expected `{}`, found `{}`",
+                    const_primitive_name(default_primitive),
+                    const_primitive_name(parameter_primitive)
+                ),
+                "type mismatch",
+            )?]));
+        }
     }
     check_const_literal_leaf(
         owner,
         parameter_ty,
-        right,
+        literal,
         type_paths,
         symbols,
         inputs,
@@ -24681,10 +24747,16 @@ mod tests {
             "pub fn character_less(value: Char) -> I32 { if value < 'z' { 1 } else { 2 } }\n",
             "pub fn byte_equal(value: Byte) -> I32 { if value == b'Z' { 1 } else { 2 } }\n",
             "pub fn pointer_sized(value: ISize) -> I32 { if value >= 0 { 1 } else { 2 } }\n",
+            "pub fn literal_on_left(value: I8) -> I32 { if 10 < value { 1 } else { 2 } }\n",
+            "pub fn bool_literal_on_left(value: Bool) -> I32 { if false < value { 1 } else { 2 } }\n",
+            "pub fn char_literal_on_left(value: Char) -> I32 { if 'a' < value { 1 } else { 2 } }\n",
+            "pub fn byte_literal_on_left(value: Byte) -> I32 { if b'A' < value { 1 } else { 2 } }\n",
             "pub fn wrong_literal_type(value: I8) -> I32 { if value < true { 1 } else { 2 } }\n",
+            "pub fn wrong_fixed_literal_type_on_left(value: I8) -> I32 { if true < value { 1 } else { 2 } }\n",
+            "pub fn integer_literal_left_wrong_type(value: F32) -> I32 { if 10 < value { 1 } else { 2 } }\n",
+            "pub fn float_literal_left_wrong_type(value: I8) -> I32 { if 1.5 < value { 1 } else { 2 } }\n",
             "pub fn integer_out_of_range(value: I8) -> I32 { if value < 128 { 1 } else { 2 } }\n",
             "pub fn condition_and_branch_errors(value: I8) -> I8 { if value < 128 { true } else { 128 } }\n",
-            "pub fn literal_on_left(value: I8) -> I32 { if 10 < value { 1 } else { 2 } }\n",
             "pub fn constant_on_right(value: I8) -> I32 { if value < OTHER { 1 } else { 2 } }\n",
             "pub fn nested_right_operand(value: I8) -> I32 { if value < 1 + 2 { 1 } else { 2 } }\n",
             "pub fn mixed_condition(value: I8) -> I32 { if value < 1 and true { 1 } else { 2 } }\n",
@@ -24709,9 +24781,9 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 19);
+        assert_eq!(owners.len(), 25);
 
-        for index in 0..6 {
+        for index in 0..10 {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -24720,7 +24792,7 @@ mod tests {
             ));
         }
         assert!(matches!(
-            owners[6]
+            owners[10]
                 .body_type_check()
                 .expect("literal type mismatch is diagnosed"),
             FunctionBodyTypeCheck::Supported { diagnostics }
@@ -24728,7 +24800,31 @@ mod tests {
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
         assert!(matches!(
-            owners[7]
+            owners[11]
+                .body_type_check()
+                .expect("fixed-type left literal mismatch is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        assert!(matches!(
+            owners[12]
+                .body_type_check()
+                .expect("integer left literal type mismatch is diagnosed at the parameter"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        assert!(matches!(
+            owners[13]
+                .body_type_check()
+                .expect("float left literal type mismatch is diagnosed at the parameter"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        assert!(matches!(
+            owners[14]
                 .body_type_check()
                 .expect("literal range error is diagnosed"),
             FunctionBodyTypeCheck::Supported { diagnostics }
@@ -24736,7 +24832,7 @@ mod tests {
                     && diagnostics[0].code == sai_diagnostics::Code::LiteralOutOfRange
         ));
         assert!(matches!(
-            owners[8]
+            owners[15]
                 .body_type_check()
                 .expect("condition and both branches are checked in source order"),
             FunctionBodyTypeCheck::Supported { diagnostics }
@@ -24747,7 +24843,7 @@ mod tests {
                         sai_diagnostics::Code::LiteralOutOfRange,
                     ]
         ));
-        for (index, owner) in owners.iter().enumerate().skip(9) {
+        for (index, owner) in owners.iter().enumerate().skip(16) {
             let check = owner
                 .body_type_check()
                 .expect("unsupported parameter-literal comparison shape is gated");
