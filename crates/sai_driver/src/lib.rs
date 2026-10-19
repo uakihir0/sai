@@ -54392,6 +54392,124 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
+    fn generated_wit_transitively_prunes_later_interface_dependents() {
+        let source = concat!(
+            "interface early {\n",
+            "  resource Worker {\n",
+            "    fn read(self: borrow Self, request: middle.Request)\n",
+            "  }\n",
+            "  fn take_worker(value: Worker)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+            "interface middle {\n",
+            "  type Request = late.Hidden\n",
+            "  fn take_request(value: Request)\n",
+            "  type MiddleKeep = U32\n",
+            "  fn keep_middle(value: MiddleKeep)\n",
+            "}\n",
+            "interface late {\n",
+            "  type Hidden = USize\n",
+            "  type LateKeep = U64\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("transitively pruned generated WIT remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning transitive dependents leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        assert!(!generated.text.contains("resource worker"));
+        assert!(!generated.text.contains("take-worker:"));
+        assert!(!generated.text.contains("type request ="));
+        assert!(!generated.text.contains("take-request:"));
+        assert!(!generated.text.contains("type hidden ="));
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(generated.text.contains("type middle-keep = u32;"));
+        assert!(
+            generated
+                .text
+                .contains("keep-middle: func(value: middle-keep);")
+        );
+        assert!(generated.text.contains("type late-keep = u64;"));
+
+        let package_model = result
+            .package
+            .expect("the partial generated WIT model loads");
+        let root = package_model.root();
+        let interface = |name: &str| {
+            root.interfaces
+                .iter()
+                .find(|interface| interface.name == name)
+                .unwrap_or_else(|| panic!("the independent `{name}` interface remains"))
+        };
+        let item_names = |name: &str| {
+            interface(name)
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(item_names("early"), ["independent"]);
+        assert_eq!(item_names("middle"), ["middle-keep", "keep-middle"]);
+        assert_eq!(item_names("late"), ["late-keep"]);
+        assert_eq!(
+            interface("middle")
+                .items
+                .iter_enumerated()
+                .find(|(_, item)| item.name == "middle-keep")
+                .expect("the supported middle type remains")
+                .0
+                .index(),
+            0,
+            "the surviving middle item index compacts after the omitted alias"
+        );
+        assert_eq!(
+            interface("late")
+                .items
+                .iter_enumerated()
+                .find(|(_, item)| item.name == "late-keep")
+                .expect("the supported later type remains")
+                .0
+                .index(),
+            0,
+            "the surviving later item index compacts after the omitted target"
+        );
+    }
+
+    #[test]
     fn generated_wit_aliases_reference_prior_and_later_local_interfaces() {
         let source = concat!(
             "interface early {\n",
