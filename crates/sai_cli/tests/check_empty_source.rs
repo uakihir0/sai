@@ -307,17 +307,33 @@ fn public_bool_parameter_and_primitive_comparison_if_functions_emit_check_result
 }
 
 #[test]
-fn unsupported_mixed_bool_and_primitive_comparison_conditions_remain_gated() {
+fn public_bool_parameter_or_primitive_comparison_if_functions_emit_check_results() {
     for source in [
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or value >= 18 { 1 } else { 2 } }\n",
+        "pub fn choose(value: I32, enabled: Bool) -> I32 { if value < 20 or enabled { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: U8) -> I32 { if enabled or 18 <= value { 1 } else { 2 } }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn unsupported_mixed_bool_logical_comparison_conditions_remain_gated() {
+    for source in [
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and value >= 18) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and not (value >= 18) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and (value > 0 and value < 10) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and enabled >= 18 { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or enabled >= 18 { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled or value >= 18) { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or not (value >= 18) { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or (value > 0 or value < 10) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: I32, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled or value >= 18 { 1 } else { 2 } }\n",
         "type BoolAlias = Bool\npub fn choose(enabled: BoolAlias, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and value >= 18 { 1 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or value >= 18 { 1 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
