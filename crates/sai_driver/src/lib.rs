@@ -51576,6 +51576,232 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
+    fn generated_wit_resource_members_reference_later_local_items_only() {
+        fn find_item<'a>(
+            interface: &'a sai_wit::WitInterface,
+            name: &str,
+        ) -> (sai_wit::WitItemIdx, &'a sai_wit::WitItem) {
+            interface
+                .items
+                .iter_enumerated()
+                .find(|(_, item)| item.name == name)
+                .unwrap_or_else(|| panic!("the parsed `{name}` item remains"))
+        }
+
+        let source = concat!(
+            "interface api {\n",
+            "  resource Worker {\n",
+            "    fn round_trip(self: borrow Self, value: api.LaterRecord, owned_handle: api.LaterResource, borrowed: borrow api.LaterResource) -> api.LaterAlias\n",
+            "    fn new(value: api.LaterAlias) -> Self\n",
+            "    fn from_later(owned_handle: api.LaterResource) -> api.LaterEnum\n",
+            "    fn state(self: borrow Self) -> api.LaterVariant\n",
+            "  }\n",
+            "  resource Broken {\n",
+            "    fn fail(self: borrow Self, value: Unsupported)\n",
+            "  }\n",
+            "  resource CycleBroken {\n",
+            "    fn fail(self: borrow Self, value: CycleAlias)\n",
+            "  }\n",
+            "  fn take_worker(value: Worker)\n",
+            "  fn take_broken(value: Broken)\n",
+            "  fn take_cycle_broken(value: CycleBroken)\n",
+            "  fn independent(value: U32)\n",
+            "  type LaterAlias = U64\n",
+            "  type LaterRecord { value: U32 }\n",
+            "  enum LaterEnum { Ready }\n",
+            "  enum LaterVariant { Ready, Count(U32) }\n",
+            "  resource LaterResource {}\n",
+            "  type Unsupported = USize\n",
+            "  type CycleAlias = CycleRecord\n",
+            "  type CycleRecord { value: CycleAlias }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("same-interface forward resource references remain queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning unsupported forward resource targets leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "unsupported and cyclic forward targets keep output incomplete"
+        );
+        assert!(
+            generated.text.contains("resource worker {"),
+            "generated WIT should retain the resource members:\n{}",
+            generated.text
+        );
+        assert!(generated.text.contains("constructor(value: later-alias);"));
+        assert!(generated.text.contains("round-trip: func("));
+        assert!(
+            generated
+                .text
+                .contains("from-later: static func(owned-handle: later-resource) -> later-enum;")
+        );
+        assert!(generated.text.contains("take-worker: func(value: worker);"));
+        assert!(generated.text.contains("type later-alias = u64;"));
+        assert!(generated.text.contains("record later-record {"));
+        assert!(generated.text.contains("resource later-resource;"));
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("resource broken"));
+        assert!(!generated.text.contains("take-broken:"));
+        assert!(!generated.text.contains("resource cycle-broken"));
+        assert!(!generated.text.contains("take-cycle-broken:"));
+        assert!(!generated.text.contains("type unsupported ="));
+        assert!(!generated.text.contains("type cycle-alias ="));
+        assert!(!generated.text.contains("record cycle-record"));
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let (api_index, api) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "api")
+            .expect("the generated interface remains");
+        let (worker_index, worker) = find_item(api, "worker");
+        let (alias_index, _) = find_item(api, "later-alias");
+        let (record_index, _) = find_item(api, "later-record");
+        let (enum_index, _) = find_item(api, "later-enum");
+        let (variant_index, variant) = find_item(api, "later-variant");
+        let (resource_index, resource) = find_item(api, "later-resource");
+        assert!(matches!(resource.kind, sai_wit::WitItemKind::Resource(_)));
+        assert!(matches!(variant.kind, sai_wit::WitItemKind::Variant(_)));
+        let sai_wit::WitItemKind::Resource(members) = &worker.kind else {
+            panic!("the resource with supported forward signatures remains");
+        };
+        let assert_reference =
+            |ty: &sai_wit::WitType, expected_index: sai_wit::WitItemIdx, expected_name: &str| {
+                let reference = match ty {
+                    sai_wit::WitType::Named(reference)
+                    | sai_wit::WitType::Own(reference)
+                    | sai_wit::WitType::Borrow(reference) => reference,
+                    _ => panic!("the type refers to the later `{expected_name}` item"),
+                };
+                assert_eq!(reference.interface.unit, unit);
+                assert_eq!(reference.interface.interface, api_index);
+                assert_eq!(reference.interface.name, "api");
+                assert_eq!(reference.item, expected_index);
+                assert_eq!(reference.item_name, expected_name);
+            };
+
+        let method = members
+            .iter()
+            .find(|member| member.name == "round-trip")
+            .expect("the forward-referencing method remains");
+        assert_eq!(method.kind, sai_wit::WitMemberKind::Method);
+        assert!(matches!(
+            method.func.params[0].1,
+            sai_wit::WitType::Borrow(_)
+        ));
+        assert_reference(&method.func.params[0].1, worker_index, "worker");
+        assert_reference(&method.func.params[1].1, record_index, "later-record");
+        assert_reference(&method.func.params[2].1, resource_index, "later-resource");
+        assert_reference(&method.func.params[3].1, resource_index, "later-resource");
+        assert!(matches!(method.func.params[2].1, sai_wit::WitType::Own(_)));
+        assert!(matches!(
+            method.func.params[3].1,
+            sai_wit::WitType::Borrow(_)
+        ));
+        assert_reference(
+            method
+                .func
+                .result
+                .as_ref()
+                .expect("the method result remains"),
+            alias_index,
+            "later-alias",
+        );
+
+        let constructor = members
+            .iter()
+            .find(|member| member.kind == sai_wit::WitMemberKind::Constructor)
+            .expect("the forward-referencing constructor remains");
+        assert_reference(&constructor.func.params[0].1, alias_index, "later-alias");
+        assert_reference(
+            constructor
+                .func
+                .result
+                .as_ref()
+                .expect("the constructor has its implicit owned result"),
+            worker_index,
+            "worker",
+        );
+
+        let static_member = members
+            .iter()
+            .find(|member| member.name == "from-later")
+            .expect("the forward-referencing static member remains");
+        assert_eq!(static_member.kind, sai_wit::WitMemberKind::Static);
+        assert_reference(
+            &static_member.func.params[0].1,
+            resource_index,
+            "later-resource",
+        );
+        assert_reference(
+            static_member
+                .func
+                .result
+                .as_ref()
+                .expect("the static result remains"),
+            enum_index,
+            "later-enum",
+        );
+
+        let variant_method = members
+            .iter()
+            .find(|member| member.name == "state")
+            .expect("the forward-referencing variant method remains");
+        assert_eq!(variant_method.kind, sai_wit::WitMemberKind::Method);
+        assert_reference(
+            variant_method
+                .func
+                .result
+                .as_ref()
+                .expect("the variant method result remains"),
+            variant_index,
+            "later-variant",
+        );
+
+        let (_, take_worker) = find_item(api, "take-worker");
+        let sai_wit::WitItemKind::Func(take_worker) = &take_worker.kind else {
+            panic!("the function consuming the forward-referencing resource remains");
+        };
+        assert_reference(&take_worker.params[0].1, worker_index, "worker");
+    }
+
+    #[test]
     fn generated_wit_aliases_reference_prior_local_interfaces_only() {
         let source = concat!(
             "interface early {\n",
