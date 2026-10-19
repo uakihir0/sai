@@ -2792,6 +2792,7 @@ fn collect_interface_uses_input(
                 );
             }
         }
+        let mut generated_variant_type_references = generated_record_type_references.clone();
         for (member_index, (entry, member_owner)) in member_entries
             .into_iter()
             .zip(parent_members.iter().copied())
@@ -2915,7 +2916,7 @@ fn collect_interface_uses_input(
                     &generated_alias_type_references
                 }
                 super::InterfaceMemberKind::Struct => &generated_record_type_references,
-                super::InterfaceMemberKind::Enum => &generated_alias_type_references,
+                super::InterfaceMemberKind::Enum => &generated_variant_type_references,
                 _ => &generated_named_type_references,
             };
             let mut staged_resource_item = None;
@@ -3013,6 +3014,11 @@ fn collect_interface_uses_input(
                                     .clone(),
                             );
                             generated_record_type_references.insert(
+                                member_owner.def_id.to_def_id(),
+                                generated_named_type_references[&member_owner.def_id.to_def_id()]
+                                    .clone(),
+                            );
+                            generated_variant_type_references.insert(
                                 member_owner.def_id.to_def_id(),
                                 generated_named_type_references[&member_owner.def_id.to_def_id()]
                                     .clone(),
@@ -3273,6 +3279,11 @@ fn collect_interface_uses_input(
                                 .clone(),
                         );
                         generated_record_type_references.insert(
+                            member_owner.def_id.to_def_id(),
+                            generated_named_type_references[&member_owner.def_id.to_def_id()]
+                                .clone(),
+                        );
+                        generated_variant_type_references.insert(
                             member_owner.def_id.to_def_id(),
                             generated_named_type_references[&member_owner.def_id.to_def_id()]
                                 .clone(),

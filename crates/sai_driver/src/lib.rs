@@ -51422,7 +51422,7 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("alias-before-record"));
         assert!(!generated.text.contains("use-later-record"));
         assert!(generated.text.contains("variant before-variant {"));
-        assert!(!generated.text.contains("variant-before-record"));
+        assert!(generated.text.contains("variant variant-before-record {"));
 
         let package_model = result.package.expect("partial generated WIT model loads");
         let (interface_index, interface) = package_model
@@ -51436,11 +51436,12 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(item_names.len(), 6);
+        assert_eq!(item_names.len(), 7);
         for name in [
             "envelope",
             "before-record",
             "before-variant",
+            "variant-before-record",
             "later-record",
             "later",
             "independent",
@@ -51456,7 +51457,7 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5],
+            [0, 1, 2, 3, 4, 5, 6],
             "surviving item references compact after omitted forward targets"
         );
         let later_index = interface
@@ -51486,6 +51487,27 @@ interface facade { use middle.{payload}; }"#;
             .iter_enumerated()
             .find_map(|(index, item)| (item.name == "later-record").then_some(index))
             .expect("the target record remains in the parsed model");
+        let variant_before_record = interface
+            .items
+            .iter()
+            .find(|item| item.name == "variant-before-record")
+            .expect("the valid forward variant remains in the parsed model");
+        let sai_wit::WitItemKind::Variant(cases) = &variant_before_record.kind else {
+            panic!("variant-before-record remains a variant after parsing");
+        };
+        let sai_wit::WitType::Named(reference) = cases[0]
+            .payload
+            .as_ref()
+            .expect("the variant case retains its record payload")
+        else {
+            panic!("the variant payload refers to a named later record");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.interface.name, "api");
+        assert_eq!(reference.item, later_record_index);
+        assert_eq!(reference.item_name, "later-record");
+
         let before_record = interface
             .items
             .iter()
@@ -51539,6 +51561,14 @@ interface facade { use middle.{payload}; }"#;
             "  enum VariantAliasCycle { Value(VariantCycleAlias) }\n",
             "  type VariantCycleAlias = VariantAliasCycle\n",
             "  fn use_variant_alias_cycle(value: VariantCycleAlias)\n",
+            "  enum VariantRecordCycle { Value(VariantCycleRecord) }\n",
+            "  type VariantCycleRecord { value: VariantRecordCycle }\n",
+            "  type UsesVariantRecordCycle { value: VariantCycleRecord }\n",
+            "  fn use_variant_record_cycle(value: VariantRecordCycle)\n",
+            "  enum RejectedRecordVariant { Value(RejectedVariantRecord) }\n",
+            "  type UsesRejectedVariantRecord { value: RejectedVariantRecord }\n",
+            "  enum RejectedResourceVariant { Value(LaterResource) }\n",
+            "  fn use_rejected_resource_variant(value: RejectedResourceVariant)\n",
             "  fn use_resource(value: LaterResource)\n",
             "  resource LaterResource {}\n",
             "  type CycleA = CycleB\n",
@@ -51552,12 +51582,13 @@ interface facade { use middle.{payload}; }"#;
             "  type RecordAliasCycle { value: AliasRecordCycle }\n",
             "  type AliasRecordCycle = RecordAliasCycle\n",
             "  fn use_record_alias_cycle(value: RecordAliasCycle)\n",
-            "  type VariantRecordCycle { next: LaterAlias }\n",
-            "  enum AliasVariantCycle { Value(VariantRecordCycle) }\n",
+            "  type RecordVariantCycle { next: LaterAlias }\n",
+            "  enum AliasVariantCycle { Value(RecordVariantCycle) }\n",
             "  type LaterAlias = AliasVariantCycle\n",
             "  fn use_later_alias(value: LaterAlias)\n",
             "  type UsesRejected = Rejected\n",
             "  type RejectedVariantAlias = USize\n",
+            "  type RejectedVariantRecord { value: USize }\n",
             "  type Rejected = USize\n",
             "  type UsesUsesRejected = UsesRejected\n",
             "  type After = U32\n",
@@ -51645,6 +51676,15 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("variant-alias-cycle"));
         assert!(!generated.text.contains("variant-cycle-alias"));
         assert!(!generated.text.contains("use-variant-alias-cycle"));
+        assert!(!generated.text.contains("variant-record-cycle"));
+        assert!(!generated.text.contains("variant-cycle-record"));
+        assert!(!generated.text.contains("uses-variant-record-cycle"));
+        assert!(!generated.text.contains("use-variant-record-cycle"));
+        assert!(!generated.text.contains("rejected-record-variant"));
+        assert!(!generated.text.contains("rejected-variant-record"));
+        assert!(!generated.text.contains("uses-rejected-variant-record"));
+        assert!(!generated.text.contains("rejected-resource-variant"));
+        assert!(!generated.text.contains("use-rejected-resource-variant"));
         assert!(!generated.text.contains("use-resource"));
         assert!(!generated.text.contains("use-cycle"));
         assert!(!generated.text.contains("record-cycle"));
@@ -51654,7 +51694,7 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("record-alias-cycle"));
         assert!(!generated.text.contains("alias-record-cycle"));
         assert!(!generated.text.contains("use-record-alias-cycle"));
-        assert!(!generated.text.contains("variant-record-cycle"));
+        assert!(!generated.text.contains("record-variant-cycle"));
         assert!(!generated.text.contains("alias-variant-cycle"));
         assert!(!generated.text.contains("later-alias"));
         assert!(!generated.text.contains("use-later-alias"));
