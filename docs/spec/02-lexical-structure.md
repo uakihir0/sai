@@ -15,7 +15,7 @@ This chapter defines how a SAI source file (`.sai`) is turned into a sequence of
 3. The line terminator is LF (U+000A). CR LF is treated as a single LF. A lone CR is the error `INVALID_LINE_ENDING`. The formatter normalizes line endings to LF.
 4. The following characters are the error `FORBIDDEN_CHARACTER` when they appear outside comments and string literals:
    - C0 control characters other than TAB, and DEL
-   - bidirectional control characters (U+202A–U+202E, U+2066–U+2069). As a defense against Trojan Source attacks, these are an error **inside comments and string literals as well**.
+   - bidirectional control characters (U+202A–U+202E, U+2066–U+2069). As a defense against Trojan Source attacks, these are an error **inside comments and literal contents as well**, including when a valid escape decodes to one.
    - non-ASCII whitespace outside string literals (U+00A0, U+2000–U+200B, U+3000, and so on)
 5. Whitespace consists of SPACE (U+0020) and TAB (U+0009). TAB is accepted, but the formatter replaces it with four spaces.
 6. A source position (span) is a half-open range `[start, end)` of **UTF-8 byte offsets** from the start of the file. Diagnostics also report the line (1-based) and the column (in UTF-8 bytes, 1-based). Conversion to UTF-16 columns is provided for LSP clients ([impl/11-diagnostics.md](../impl/11-diagnostics.md)).
