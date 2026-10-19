@@ -5991,30 +5991,100 @@ fn check_function_body_type(
                 let Some(tail) = block.tail else {
                     return Ok(FunctionBodyTypeCheck::Unsupported);
                 };
-                if !matches!(
-                    tail.kind,
-                    ExprKind::Lit(
-                        Lit::Bool(_)
-                            | Lit::Char(_)
-                            | Lit::Byte(_)
-                            | Lit::Int { .. }
-                            | Lit::Float { .. }
-                    )
-                ) {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                if let ExprKind::If {
+                    cond,
+                    then,
+                    els: Some(else_expr),
+                } = tail.kind
+                {
+                    let Some(diagnostics) = check_function_if_literal_branches(
+                        owner, *return_ty, cond, then, else_expr, type_paths, symbols, inputs,
+                        snapshot, target_cfg,
+                    )?
+                    else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    diagnostics
+                } else {
+                    if !is_direct_function_scalar_literal(tail) {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    }
+                    let Some(diagnostics) = check_const_literal_leaf(
+                        owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+                    )?
+                    else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    diagnostics
                 }
-                let Some(diagnostics) = check_const_literal_leaf(
-                    owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
-                )?
-                else {
-                    return Ok(FunctionBodyTypeCheck::Unsupported);
-                };
-                diagnostics
             }
             None => return Ok(FunctionBodyTypeCheck::Unsupported),
         }
     };
     Ok(FunctionBodyTypeCheck::Supported { diagnostics })
+}
+
+fn check_function_if_literal_branches(
+    owner: &HirOwner<'_>,
+    return_ty: Ty<'_>,
+    condition: &HirExpr<'_>,
+    then_block: &HirBlock<'_>,
+    else_expr: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    if !matches!(condition.kind, ExprKind::Lit(Lit::Bool(_)))
+        || then_block.safety != sai_hir::Safety::Safe
+        || !then_block.stmts.is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(then_tail) = then_block.tail else {
+        return Ok(None);
+    };
+    if !is_direct_function_scalar_literal(then_tail) {
+        return Ok(None);
+    }
+
+    let ExprKind::Block(else_block) = else_expr.kind else {
+        return Ok(None);
+    };
+    if else_block.safety != sai_hir::Safety::Safe || !else_block.stmts.is_empty() {
+        return Ok(None);
+    }
+    let Some(else_tail) = else_block.tail else {
+        return Ok(None);
+    };
+    if !is_direct_function_scalar_literal(else_tail) {
+        return Ok(None);
+    }
+
+    let Some(mut diagnostics) = check_const_literal_leaf(
+        owner, return_ty, then_tail, type_paths, symbols, inputs, snapshot, target_cfg,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(mut else_diagnostics) = check_const_literal_leaf(
+        owner, return_ty, else_tail, type_paths, symbols, inputs, snapshot, target_cfg,
+    )?
+    else {
+        return Ok(None);
+    };
+    diagnostics.append(&mut else_diagnostics);
+    Ok(Some(diagnostics))
+}
+
+fn is_direct_function_scalar_literal(expression: &HirExpr<'_>) -> bool {
+    matches!(
+        expression.kind,
+        ExprKind::Lit(
+            Lit::Bool(_) | Lit::Char(_) | Lit::Byte(_) | Lit::Int { .. } | Lit::Float { .. }
+        )
+    )
 }
 
 fn function_name_is_supported(name: Name, symbols: &Interner, inputs: &CurrentOwnerInputs) -> bool {
@@ -24104,6 +24174,162 @@ mod tests {
                 .any(|path| matches!(path.base, Res::Def(DefKind::Alias, _))),
             "the gated return type must resolve to a user-defined alias"
         );
+    }
+
+    #[test]
+    fn function_body_type_check_checks_both_direct_if_literal_branches() {
+        let root = concat!(
+            "pub fn selected_then() -> I32 { if true { 1 } else { 2 } }\n",
+            "pub fn selected_else() -> I32 { if false { 3 } else { 4 } }\n",
+            "pub fn unselected_else_mismatch() -> I32 { if true { 5 } else { false } }\n",
+            "pub fn unselected_then_mismatch() -> I32 { if false { false } else { 6 } }\n",
+            "pub fn both_branches_overflow() -> I8 { if true { 128 } else { -129 } }\n",
+            "pub fn missing_else() -> I32 { if true { 1 } }\n",
+            "pub fn nonliteral_condition() -> I32 { if 1 { 1 } else { 2 } }\n",
+            "pub fn nested_else_if() -> I32 { if true { 1 } else if false { 2 } else { 3 } }\n",
+            "pub fn branch_statement() -> I32 { if true { let value = 1\nvalue } else { 2 } }\n",
+            "pub fn unit_branch() -> I32 { if true { () } else { () } }\n",
+            "pub fn expression_branch() -> I32 { if true { 1 + 2 } else { 3 } }\n",
+            "pub fn string_branch() -> I32 { if true { \"text\" } else { \"other\" } }\n",
+            "pub fn tuple_branch() -> I32 { if true { (1, 2) } else { (3, 4) } }\n",
+            "pub fn unit_result() -> () { if true { () } else { () } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 14);
+
+        for index in [0, 1] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("both valid if branches are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+
+        for (index, expected_code, expected_message, function, literal) in [
+            (
+                2,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `I32`, found a Bool literal",
+                "unselected_else_mismatch",
+                "false",
+            ),
+            (
+                3,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `I32`, found a Bool literal",
+                "unselected_then_mismatch",
+                "false",
+            ),
+        ] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
+                .body_type_check()
+                .expect("unselected branch mismatch is checked")
+            else {
+                panic!("direct if literal branches stay in the supported slice");
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, expected_code);
+            assert_eq!(diagnostics[0].message, expected_message);
+
+            let function_start = root
+                .find(&format!("pub fn {function}"))
+                .expect("function exists");
+            let function_end = root[function_start..]
+                .find('\n')
+                .map_or(root.len(), |offset| function_start + offset);
+            let function_source = &root[function_start..function_end];
+            let start = (function_start
+                + function_source
+                    .rfind(literal)
+                    .expect("mismatched unselected branch literal exists"))
+                as u32;
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("branch mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + literal.len() as u32),
+                )
+                .expect("branch literal range is ordered")
+            );
+        }
+
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: both_branch_diagnostics,
+        } = owners[4]
+            .body_type_check()
+            .expect("both branches are checked even when one is unselected")
+        else {
+            panic!("direct if literal branches stay in the supported slice");
+        };
+        assert_eq!(both_branch_diagnostics.len(), 2);
+        assert!(
+            both_branch_diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::LiteralOutOfRange)
+        );
+        let branch_starts = both_branch_diagnostics
+            .iter()
+            .map(|diagnostic| {
+                diagnostic
+                    .primary()
+                    .expect("range diagnostic has a primary span")
+                    .span
+                    .range
+                    .start()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            branch_starts[0] < branch_starts[1],
+            "both-branch diagnostics must retain then/else source order"
+        );
+        let both_function_start = root
+            .find("pub fn both_branches_overflow")
+            .expect("overflow function exists");
+        for (diagnostic, literal) in both_branch_diagnostics.iter().zip(["128", "-129"]) {
+            let start = (both_function_start
+                + root[both_function_start..]
+                    .find(literal)
+                    .expect("overflow branch literal exists")) as u32;
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("range diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + literal.len() as u32),
+                )
+                .expect("overflow branch range is ordered")
+            );
+        }
+
+        for owner in &owners[5..] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("unsupported if form check succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
     }
 
     #[test]
