@@ -6050,7 +6050,7 @@ fn check_function_body_type(
         ) {
             return Ok(FunctionBodyTypeCheck::Unsupported);
         }
-        let condition_is_supported = function_if_logical_condition_uses_parameter_bindings(
+        let condition_is_supported = function_if_binary_condition_uses_parameter_bindings(
             cond,
             first_body,
             second_body,
@@ -6177,7 +6177,7 @@ fn function_if_condition_uses_parameter_binding(
         )
 }
 
-fn function_if_logical_condition_uses_parameter_bindings(
+fn function_if_binary_condition_uses_parameter_bindings(
     condition: &HirExpr<'_>,
     first_body_parameter: &sai_hir::body::BodyParam,
     second_body_parameter: &sai_hir::body::BodyParam,
@@ -6187,7 +6187,7 @@ fn function_if_logical_condition_uses_parameter_bindings(
     let ExprKind::Binary(operator, left, right) = condition.kind else {
         return false;
     };
-    if !matches!(operator, BinOp::And | BinOp::Or) {
+    if !matches!(operator, BinOp::And | BinOp::Or | BinOp::Eq | BinOp::Ne) {
         return false;
     }
     let path_binding = |expression: &HirExpr<'_>| {
@@ -24715,6 +24715,61 @@ mod tests {
             let check = owner
                 .body_type_check()
                 .expect("mixed or nested boolean operator is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_only_eq_ne_of_two_bool_parameters() {
+        let root = concat!(
+            "const OTHER: Bool = true\n",
+            "type BoolAlias = Bool\n",
+            "pub fn equal(left: Bool, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn reversed_equal(right: Bool, left: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn not_equal(left: Bool, right: Bool) -> I32 { if left != right { 1 } else { 2 } }\n",
+            "pub fn reversed_not_equal(right: Bool, left: Bool) -> I32 { if left != right { 1 } else { 2 } }\n",
+            "pub fn ordering(left: Bool, right: Bool) -> I32 { if left < right { 1 } else { 2 } }\n",
+            "pub fn repeated_operand(left: Bool, right: Bool) -> I32 { if left == left { 1 } else { 2 } }\n",
+            "pub fn other_binding(left: Bool, right: Bool) -> I32 { if left == OTHER { 1 } else { 2 } }\n",
+            "pub fn non_path_operand(left: Bool, right: Bool) -> I32 { if left == true { 1 } else { 2 } }\n",
+            "pub fn mixed_expression(left: Bool, right: Bool) -> I32 { if left == right and left { 1 } else { 2 } }\n",
+            "pub fn nested_expression(left: Bool, right: Bool) -> I32 { if (left == right) == true { 1 } else { 2 } }\n",
+            "pub fn wrong_parameter_type(left: I32, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn aliased_parameter_type(left: BoolAlias, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn mutable_parameter(var left: Bool, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn self_parameter(self: Bool, right: Bool) -> I32 { if self == right { 1 } else { 2 } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 14);
+
+        for index in [0, 1, 2, 3] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("both operators and operand orders of the bool comparison are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        for (index, owner) in owners.iter().enumerate().skip(4) {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported comparison or operand form is gated");
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Unsupported),
                 "function owner {index} unexpectedly passed the bounded slice: {check:?}"
