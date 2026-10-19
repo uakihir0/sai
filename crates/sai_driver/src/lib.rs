@@ -51573,12 +51573,15 @@ interface facade { use middle.{payload}; }"#;
     fn generated_wit_interface_functions_reference_prior_local_interfaces_only() {
         let source = concat!(
             "interface early {\n",
-            "  fn future(value: types.Id)\n",
+            "  fn future(value: types.Id) -> types.Id\n",
+            "  fn future_resource(value: types.Handle, borrowed: borrow types.Handle) -> types.Handle\n",
             "  fn independent(value: U32)\n",
             "}\n",
             "interface types {\n",
             "  type Hidden = USize\n",
             "  type Id = U32\n",
+            "  type Id = U64\n",
+            "  resource Handle {}\n",
             "}\n",
             "interface consumer {\n",
             "  fn round_trip(value: types.Id) -> types.Id\n",
@@ -51625,10 +51628,22 @@ interface facade { use middle.{payload}; }"#;
             .expect("the generated root text is retained");
         assert!(
             !generated.complete,
-            "later-interface and omitted-type targets remain incomplete"
+            "pruning the omitted-type target keeps output incomplete"
         );
         assert!(
             generated.text.contains("independent: func(value: u32);"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated.text.contains("future: func(value: id) -> id;"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated.text.contains(
+                "future-resource: func(value: handle, borrowed: borrow<handle>) -> handle;"
+            ),
             "{}",
             generated.text
         );
@@ -51639,13 +51654,8 @@ interface facade { use middle.{payload}; }"#;
             "{}",
             generated.text
         );
-        assert!(
-            generated.text.contains("use types.{id};"),
-            "{}",
-            generated.text
-        );
-        assert!(!generated.text.contains("future:"));
-        assert!(!generated.text.contains("missing:"));
+        assert!(generated.text.contains("use types.{handle, id};"));
+        assert!(!generated.text.contains("missing:"), "{}", generated.text);
         assert!(!generated.text.contains("type hidden ="));
 
         let package_model = result.package.expect("partial generated WIT model loads");
@@ -51654,14 +51664,14 @@ interface facade { use middle.{payload}; }"#;
             .interfaces
             .iter_enumerated()
             .find(|(_, interface)| interface.name == "types")
-            .expect("the prior interface with the supported type remains");
+            .expect("the later interface with supported targets remains");
         assert_eq!(
             types
                 .items
                 .iter()
                 .map(|item| item.name.as_str())
                 .collect::<Vec<_>>(),
-            ["id"],
+            ["id", "handle"],
             "the unsupported earlier item is removed"
         );
         let (id_index, _) = types
@@ -51669,20 +51679,106 @@ interface facade { use middle.{payload}; }"#;
             .iter_enumerated()
             .find(|(_, item)| item.name == "id")
             .expect("the supported earlier alias remains");
+        let (handle_index, handle) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the supported later resource remains");
+        assert!(matches!(handle.kind, sai_wit::WitItemKind::Resource(_)));
         let early = root
             .interfaces
-            .iter()
-            .find(|interface| interface.name == "early")
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "early")
             .expect("the earlier interface remains");
-        assert_eq!(
-            early
-                .items
-                .iter()
-                .map(|item| item.name.as_str())
-                .collect::<Vec<_>>(),
-            ["independent"],
-            "a function cannot reference a later interface"
-        );
+        let (early_index, early) = early;
+        assert!(early.items.iter().any(|item| item.name == "id"));
+        assert!(early.items.iter().any(|item| item.name == "handle"));
+        for expected_name in ["future", "future-resource", "independent"] {
+            assert!(
+                early
+                    .items
+                    .iter()
+                    .any(|item| matches!(&item.kind, sai_wit::WitItemKind::Func(_))
+                        && item.name == expected_name),
+                "the earlier interface retains `{expected_name}`"
+            );
+        }
+        let (early_id_index, early_id) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the earlier interface has a local type import");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(early_id_target)) = &early_id.kind
+        else {
+            panic!("the earlier local id import retains a named target");
+        };
+        assert_eq!(&early_id_target.interface.unit, &unit);
+        assert_eq!(early_id_target.interface.interface, types_index);
+        assert_eq!(early_id_target.item, id_index);
+        assert_eq!(early_id_target.item_name, "id");
+        let (early_handle_index, early_handle) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the earlier interface has a local resource import");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(early_handle_target)) =
+            &early_handle.kind
+        else {
+            panic!("the earlier local handle import retains its owned target");
+        };
+        assert_eq!(&early_handle_target.interface.unit, &unit);
+        assert_eq!(early_handle_target.interface.interface, types_index);
+        assert_eq!(early_handle_target.item, handle_index);
+        assert_eq!(early_handle_target.item_name, "handle");
+        let future_item = early
+            .items
+            .iter()
+            .find(|item| item.name == "future")
+            .expect("the later-alias function survives");
+        let sai_wit::WitItemKind::Func(future) = &future_item.kind else {
+            panic!("future remains a function");
+        };
+        let sai_wit::WitType::Named(future_parameter) = &future.params[0].1 else {
+            panic!("the parameter retains the local id reference");
+        };
+        let sai_wit::WitType::Named(future_result) = future
+            .result
+            .as_ref()
+            .expect("the future function result remains")
+        else {
+            panic!("the result retains the local id reference");
+        };
+        for reference in [future_parameter, future_result] {
+            assert_eq!(&reference.interface.unit, &unit);
+            assert_eq!(reference.interface.interface, early_index);
+            assert_eq!(reference.item, early_id_index);
+            assert_eq!(reference.item_name, "id");
+        }
+        let future_resource_item = early
+            .items
+            .iter()
+            .find(|item| item.name == "future-resource")
+            .expect("the later-resource function survives");
+        let sai_wit::WitItemKind::Func(future_resource) = &future_resource_item.kind else {
+            panic!("future-resource remains a function");
+        };
+        let [
+            (_, sai_wit::WitType::Own(future_owned)),
+            (_, sai_wit::WitType::Borrow(future_borrowed)),
+        ] = future_resource.params.as_slice()
+        else {
+            panic!("the future resource function keeps owned and borrowed params");
+        };
+        let Some(sai_wit::WitType::Own(future_resource_result)) = future_resource.result.as_ref()
+        else {
+            panic!("the future resource function keeps its owned result");
+        };
+        for reference in [future_owned, future_borrowed, future_resource_result] {
+            assert_eq!(&reference.interface.unit, &unit);
+            assert_eq!(reference.interface.interface, early_index);
+            assert_eq!(reference.item, early_handle_index);
+            assert_eq!(reference.item_name, "handle");
+        }
         let consumer = root
             .interfaces
             .iter_enumerated()
@@ -54273,10 +54369,15 @@ interface facade { use middle.{payload}; }"#;
     #[test]
     fn generated_wit_omits_cyclic_interfaces_and_keeps_parseable_text() {
         let source = concat!(
+            "interface early {\n",
+            "  fn omitted(value: second.Safe)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
             "interface first {\n",
             "  type Request = second.Response\n",
             "}\n",
             "interface second {\n",
+            "  type Safe = U32\n",
             "  type Response = first.Request\n",
             "}\n",
             "interface stable {\n",
@@ -54333,24 +54434,31 @@ interface facade { use middle.{payload}; }"#;
                 .iter()
                 .map(|(name, _)| name.as_str())
                 .collect::<Vec<_>>(),
-            ["stable"],
-            "the independent interface survives after both cyclic interfaces"
+            ["early", "stable"],
+            "independent interfaces survive after both cyclic interfaces"
         );
         assert!(!generated.text.contains("interface first"));
         assert!(!generated.text.contains("interface second"));
+        assert!(!generated.text.contains("omitted:"));
+        assert!(generated.text.contains("independent: func(value: u32);"));
         assert!(generated.text.contains("interface stable"));
         let package_model = result.package.expect("the package model loads");
-        let (interface_index, interface) = package_model
-            .root()
+        let root = package_model.root();
+        let (early_index, early) = root
             .interfaces
             .iter_enumerated()
             .next()
-            .expect("the independent interface remains");
-        assert_eq!(
-            interface_index.raw(),
-            0,
-            "filtered cyclic interfaces do not leave index gaps"
-        );
+            .expect("the earlier independent interface remains");
+        assert_eq!(early.name, "early");
+        assert_eq!(early.items.len(), 1);
+        assert_eq!(early.items.iter().next().unwrap().name, "independent");
+        let (interface_index, interface) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "stable")
+            .expect("the later independent interface remains");
+        assert_eq!(interface_index.raw(), early_index.raw() + 1);
+        assert_eq!(interface_index.raw(), 1);
         let items = interface.items.iter().collect::<Vec<_>>();
         assert_eq!(
             items.len(),

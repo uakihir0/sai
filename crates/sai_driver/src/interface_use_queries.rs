@@ -2409,6 +2409,115 @@ fn collect_interface_item_issues(
         .map_err(InterfaceUsesQueryError::Collection)
 }
 
+fn reserve_generated_local_interface_references(
+    descriptors: &[super::TopLevelOwnerDescriptor],
+    unit: &WitUnit,
+    package_wit_names: &PackageWitNames,
+    module_inputs: &HashMap<FileId, CurrentOwnerInputs>,
+    scopes: &Phase1PackageScopes,
+    symbols: &Interner,
+) -> Result<(HashMap<LocalDefId, WitIfaceIdx>, HashMap<DefId, WitTypeRef>), InterfaceUsesQueryError>
+{
+    let mut provisional_interfaces = WitIndexVec::<WitIfaceIdx, ()>::new();
+    let mut interface_indices = HashMap::with_capacity(descriptors.len());
+    let mut type_references = HashMap::new();
+
+    for descriptor in descriptors {
+        let interface_index = provisional_interfaces
+            .push(())
+            .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+        interface_indices.insert(descriptor.owner.def_id, interface_index);
+
+        let inputs = module_inputs.get(&descriptor.file).ok_or_else(|| {
+            InterfaceUsesQueryError::Collection(OwnerControlFlowResolutionError::ModuleTreeMismatch)
+        })?;
+        if inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&ItemTreeKind::Interface) {
+            return Err(InterfaceUsesQueryError::Collection(
+                OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                    owner: descriptor.owner,
+                    file: descriptor.file,
+                },
+            ));
+        }
+        let parent_entry = inputs
+            .filtered_item_tree
+            .items
+            .iter()
+            .find(|entry| {
+                entry.ast_id == descriptor.item_id && entry.kind == ItemTreeKind::Interface
+            })
+            .ok_or_else(|| {
+                InterfaceUsesQueryError::Collection(
+                    OwnerControlFlowResolutionError::DescriptorNotInCurrentTarget {
+                        owner: descriptor.owner,
+                        file: descriptor.file,
+                    },
+                )
+            })?;
+        let interface_name = package_wit_names
+            .names
+            .get(&descriptor.owner.def_id)
+            .map(ToString::to_string);
+        let interface_scope = scopes.interfaces.get(&descriptor.owner.def_id.to_def_id());
+        let mut provisional_items = WitIndexVec::<WitItemIdx, ()>::new();
+
+        for entry in parent_entry
+            .children
+            .iter()
+            .filter(|entry| interface_member_kind(entry.kind).is_some())
+        {
+            let item_index = provisional_items
+                .push(())
+                .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+            let Some(interface_name) = interface_name.as_ref() else {
+                continue;
+            };
+            let Some(expected_kind) = (match entry.kind {
+                ItemTreeKind::Alias => Some(DefKind::Alias),
+                ItemTreeKind::Struct => Some(DefKind::Struct),
+                ItemTreeKind::Enum => Some(DefKind::Enum),
+                ItemTreeKind::Resource => Some(DefKind::Resource),
+                _ => None,
+            }) else {
+                continue;
+            };
+            if entry.name.is_error() {
+                continue;
+            }
+            let source_name = symbols
+                .resolve(entry.name)
+                .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+                .map_err(InterfaceUsesQueryError::Collection)?;
+            let Some(item_name) = sai_identifier_to_wit_name(&source_name) else {
+                continue;
+            };
+            let Some(binding) = interface_scope.and_then(|scope| scope.members.get(&entry.name))
+            else {
+                continue;
+            };
+            let Res::Def(kind, definition) = binding.res else {
+                continue;
+            };
+            if kind != expected_kind {
+                continue;
+            }
+            type_references
+                .entry(definition)
+                .or_insert_with(|| WitTypeRef {
+                    interface: WitIfaceRef {
+                        unit: unit.clone(),
+                        interface: interface_index,
+                        name: interface_name.clone(),
+                    },
+                    item: item_index,
+                    item_name,
+                });
+        }
+    }
+
+    Ok((interface_indices, type_references))
+}
+
 fn collect_interface_uses_input(
     package_key: &PackageKey,
     prepared: &PreparedPhase1PackageScopes,
@@ -2447,7 +2556,6 @@ fn collect_interface_uses_input(
         .transpose()?;
     let mut generated_interfaces = Vec::new();
     let mut generated_local_type_references = HashMap::<DefId, WitTypeRef>::new();
-    let mut generated_interface_indices = WitIndexVec::<WitIfaceIdx, ()>::new();
     let mut interface_names_by_spelling = HashMap::<String, Vec<LocalDefId>>::new();
     for (definition, name) in &package_wit_names.names {
         interface_names_by_spelling
@@ -2546,6 +2654,19 @@ fn collect_interface_uses_input(
             OwnerControlFlowResolutionError::ModuleTreeMismatch,
         ));
     }
+    let (generated_interface_indices, generated_all_local_type_references) =
+        if let Some(unit) = generated_unit.as_ref() {
+            reserve_generated_local_interface_references(
+                &descriptors,
+                unit,
+                package_wit_names,
+                &module_inputs,
+                scopes,
+                symbols,
+            )?
+        } else {
+            (HashMap::new(), HashMap::new())
+        };
     let alias_arena = HirArena::new();
     let mut local_boundary_aliases = collect_local_boundary_aliases(
         prepared,
@@ -2725,8 +2846,9 @@ fn collect_interface_uses_input(
             if generated_interface_eligible && generated_interface_stability.is_some() {
                 Some(
                     generated_interface_indices
-                        .push(())
-                        .map_err(InterfaceUsesQueryError::WitIndexVec)?,
+                        .get(&descriptor.owner.def_id)
+                        .copied()
+                        .expect("every local interface identity was reserved before generation"),
                 )
             } else {
                 None
@@ -2936,6 +3058,13 @@ fn collect_interface_uses_input(
                     .insert(member_owner.def_id.to_def_id(), reference);
             }
         }
+        let mut generated_resource_member_type_references =
+            generated_function_type_references.clone();
+        generated_function_type_references.extend(
+            generated_all_local_type_references
+                .iter()
+                .map(|(definition, reference)| (*definition, reference.clone())),
+        );
         for (member_index, (entry, member_owner)) in member_entries
             .into_iter()
             .zip(parent_members.iter().copied())
@@ -3226,9 +3355,10 @@ fn collect_interface_uses_input(
                     ),
                 ));
             }
-            // Each resource gets the same local type targets as a function signature so pruning
-            // can still omit the resource atomically when one of its member targets is removed.
-            let mut resource_named_type_references = generated_function_type_references.clone();
+            // Resource members retain the pre-forward-reference map: only ordinary function
+            // signatures may use types from later generated interfaces.
+            let mut resource_named_type_references =
+                generated_resource_member_type_references.clone();
             if let Some(resource_item) = staged_resource_item.as_ref()
                 && !generated_item_names.contains(&resource_item.name)
                 && let (Some(unit), Some(interface_index), Some(interface_name)) = (
@@ -3459,6 +3589,11 @@ fn collect_interface_uses_input(
                                 .clone(),
                         );
                         generated_function_type_references.insert(
+                            member_owner.def_id.to_def_id(),
+                            generated_named_type_references[&member_owner.def_id.to_def_id()]
+                                .clone(),
+                        );
+                        generated_resource_member_type_references.insert(
                             member_owner.def_id.to_def_id(),
                             generated_named_type_references[&member_owner.def_id.to_def_id()]
                                 .clone(),
