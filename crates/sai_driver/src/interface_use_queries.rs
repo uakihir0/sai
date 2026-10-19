@@ -3074,8 +3074,8 @@ fn collect_interface_uses_input(
         }
         let mut generated_resource_member_type_references =
             generated_function_type_references.clone();
-        // Used facade references are limited to ordinary generated functions. The
-        // resource-member, alias, record, and variant maps were cloned above.
+        // Clone resource members before extending ordinary functions with Used
+        // facades so resource members retain their independent consumer scope.
         generated_function_type_references.extend(
             foreign_interface_used_type_references
                 .by_definition
@@ -3113,24 +3113,23 @@ fn collect_interface_uses_input(
                     .map(|(definition, reference)| (*definition, reference.clone())),
             );
         }
-        // Add Used facades only after sibling maps have been cloned so this extension
-        // remains alias-definition-only (ordinary functions have their own map).
+        // Extend only the alias-definition map here; record fields and variants get
+        // their own map extensions below, while ordinary functions have their own map.
         generated_alias_definition_type_references.extend(
             foreign_interface_used_type_references
                 .by_definition
                 .iter()
                 .map(|(definition, reference)| (*definition, reference.clone())),
         );
-        // Keep this extension record-only: variant and resource-member maps retain
-        // their earlier scope, while ordinary functions have their own Used map.
+        // Extend the record-field map only here; variants get a separate extension next.
         generated_record_type_references.extend(
             foreign_interface_used_type_references
                 .by_definition
                 .iter()
                 .map(|(definition, reference)| (*definition, reference.clone())),
         );
-        // Keep this extension variant-only: resource members retain their prior
-        // scope, while ordinary functions and record fields have separate Used maps.
+        // Extend the variant-payload map only here; resource members retain their
+        // independent scope, while ordinary functions and record fields have separate maps.
         generated_variant_type_references.extend(
             foreign_interface_used_type_references
                 .by_definition
