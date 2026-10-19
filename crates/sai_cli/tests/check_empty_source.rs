@@ -197,6 +197,76 @@ fn public_zero_parameter_explicit_unit_function_emits_check_result() {
 }
 
 #[test]
+fn public_zero_parameter_direct_literal_if_function_emits_check_result() {
+    for source in [
+        "pub fn choose() -> I32 { if true { 1 } else { 2 } }\n",
+        "pub fn choose() -> I32 { if false { 1 } else { -2 } }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn literal_if_checks_both_branches_and_reports_source_spans() {
+    for (source, expected_code, literal) in [
+        (
+            "pub fn choose() -> I32 { if true { 1 } else { true } }\n",
+            "TYPE_MISMATCH",
+            "true",
+        ),
+        (
+            "pub fn choose() -> I8 { if false { 128 } else { 1 } }\n",
+            "LITERAL_OUT_OF_RANGE",
+            "128",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{expected_code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: both branches must be checked without a result or feature gate:\n{stdout}"
+        );
+        let literal_start = source.rfind(literal).expect("unselected literal exists");
+        let literal_end = literal_start + literal.len();
+        assert!(
+            stdout.contains(&format!("\"start\":{{\"byte\":{literal_start},"))
+                && stdout.contains(&format!("\"end\":{{\"byte\":{literal_end},")),
+            "{source:?}: the error in the unselected branch must retain its span:\n{stdout}"
+        );
+    }
+
+    let source = "pub fn choose() -> I8 { if true { 128 } else { true } }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "both literal branches must be checked in source order:\n{stdout}"
+    );
+}
+
+#[test]
+fn unsupported_zero_parameter_if_shapes_remain_gated() {
+    for source in [
+        "pub fn choose() -> I32 { if 1 == 1 { 1 } else { 2 } }\n",
+        "pub fn choose() -> I32 { if true { 1 } }\n",
+        "pub fn choose() -> I32 { if true { let value = 1; value } else { 2 } }\n",
+        "pub fn choose() -> I32 { if true { 1 + 2 } else { 2 } }\n",
+        "pub fn choose() -> I32 { if true { 1 } else if false { 2 } else { 3 } }\n",
+        "pub fn choose() -> I32 { if true { if false { 1 } else { 2 } } else { 3 } }\n",
+        "pub fn choose() -> () { if true { () } else { () } }\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn zero_parameter_direct_scalar_type_errors_suppress_check_result() {
     for (source, expected_code, expected_message, literal) in [
         (
