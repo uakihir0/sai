@@ -1380,6 +1380,7 @@ fn build_generated_world_type_aliases(
                     | TypeDefKind::Variant(_)
                     | TypeDefKind::Enum(_)
                     | TypeDefKind::Flags(_)
+                    | TypeDefKind::Resource
             ) || !type_reference_matches_interface_item(
                 resolve,
                 target_package_id,
@@ -2330,7 +2331,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_world_use_aliases_do_not_enable_external_resources() {
+    fn generated_world_use_aliases_resolve_to_selected_external_resources() {
         let generated = generated_unit();
         let dependency = dir_unit_for("acme:dependency", "acme:dependency#1", "1.4.12");
         let mut context = WitResolveContext::default();
@@ -2352,10 +2353,16 @@ mod tests {
             .push_package(
                 &mut resolve,
                 parse_source_files(
-                    generated,
+                    generated.clone(),
                     [WitSourceFile::new(
                         "generated.wit",
-                        "package acme:generated@1.2.3;\nworld w { use acme:dependency/api@1.4.12.{widget}; import f: func(x: own<widget>); }",
+                        concat!(
+                            "package acme:generated@1.2.3;\n",
+                            "world w {\n",
+                            "  use acme:dependency/api@1.4.12.{widget};\n",
+                            "  import f: func(owned: own<widget>, borrowed: borrow<widget>) -> own<widget>;\n",
+                            "}\n",
+                        ),
                     )],
                 )
                 .expect("generated resource use parses"),
@@ -2363,22 +2370,89 @@ mod tests {
             .expect("generated world with an external resource resolves");
 
         let world = &package.worlds[WitWorldIdx::from_raw(0)];
-        assert_eq!(world.unsupported, Some(Unsupported::WorldType));
+        assert_eq!(world.unsupported, None);
         let WitWorldItem::Func {
             func, unsupported, ..
         } = world
             .imports
             .iter()
             .find(|item| matches!(item, WitWorldItem::Func { .. }))
-            .expect("the function remains available for unsupported reporting")
+            .expect("the generated function resolves its external resource aliases")
         else {
             unreachable!("the selected world item is a function");
         };
-        assert_eq!(*unsupported, Some(Unsupported::WorldType));
+        assert_eq!(*unsupported, None);
+        let expected = crate::WitTypeRef {
+            interface: crate::WitIfaceRef {
+                unit: dependency.clone(),
+                interface: WitIfaceIdx::from_raw(0),
+                name: "api".to_owned(),
+            },
+            item: WitItemIdx::from_raw(0),
+            item_name: "widget".to_owned(),
+        };
         assert_eq!(
-            func.params[0].1,
-            WitType::Unsupported(Unsupported::WorldType)
+            func.params,
+            [
+                ("owned".to_owned(), WitType::Own(expected.clone())),
+                ("borrowed".to_owned(), WitType::Borrow(expected.clone())),
+            ]
         );
+        assert_eq!(func.result, Some(WitType::Own(expected.clone())));
+        let printed = print_wit(&package);
+        assert!(
+            printed.contains(
+                "use acme:dependency/api@1.4.12.{widget};\n\n  import f: func(owned: widget, borrowed: borrow<widget>) -> widget;"
+            ),
+            "{printed}"
+        );
+
+        let mut roundtrip_context = WitResolveContext::default();
+        let mut roundtrip_resolve = Resolve::default();
+        roundtrip_context
+            .push_package(
+                &mut roundtrip_resolve,
+                parse_source_files(
+                    dependency,
+                    [WitSourceFile::new(
+                        "dependency.wit",
+                        "package acme:dependency@1.4.12;\ninterface api { resource widget; }",
+                    )],
+                )
+                .expect("selected resource dependency reparses"),
+            )
+            .expect("selected resource dependency resolves again");
+        let roundtrip = roundtrip_context
+            .push_package(
+                &mut roundtrip_resolve,
+                parse_source_files(
+                    generated,
+                    [WitSourceFile::new("generated.wit", printed.as_str())],
+                )
+                .expect("printed generated world reparses"),
+            )
+            .expect("round-trip generated world resolves");
+        assert_eq!(print_wit(&roundtrip), printed);
+        let roundtrip_world = &roundtrip.worlds[WitWorldIdx::from_raw(0)];
+        let WitWorldItem::Func {
+            func, unsupported, ..
+        } = roundtrip_world
+            .imports
+            .iter()
+            .find(|item| matches!(item, WitWorldItem::Func { .. }))
+            .expect("the round-trip resource function remains present")
+        else {
+            unreachable!("the selected round-trip item is a function");
+        };
+        assert_eq!(*unsupported, None);
+        assert_eq!(
+            func.params,
+            [
+                ("owned".to_owned(), WitType::Own(expected.clone())),
+                ("borrowed".to_owned(), WitType::Borrow(expected.clone())),
+            ]
+        );
+        assert_eq!(func.result, Some(WitType::Own(expected)));
     }
 
     #[test]

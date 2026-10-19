@@ -45431,6 +45431,9 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             "use acme:codec/api as api\n",
             "world client {\n",
             "  import fn consume(value: api.Data)\n",
+            "  import fn consume_handle(value: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
+            "  import fn wrong_kind(value: borrow api.Data)\n",
+            "  export fn borrowed_result() -> borrow api.Handle\n",
             "  export fn missing(value: api.Missing)\n",
             "}\n",
         );
@@ -45447,7 +45450,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             "acme:codec@1.2.3",
             &[(
                 "lib.sai",
-                b"pub interface api { type Data = U32; type Hidden = USize }\n",
+                b"pub interface api { resource Handle {} type Data = U32; type Hidden = USize }\n",
             )],
         );
         snapshot_files.extend(codec_files);
@@ -45554,12 +45557,25 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         );
         let generated = generated_text_for_unit(&result, &generated_unit);
         assert!(!generated.complete);
-        assert!(generated.text.contains("use acme:codec/api@1.2.3.{data};"));
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{data, handle};")
+        );
         assert!(
             generated
                 .text
                 .contains("import consume: func(value: data);")
         );
+        assert!(
+            generated.text.contains(
+                "import consume-handle: func(value: handle, borrowed: borrow<handle>) -> handle;"
+            ),
+            "a present resource in a partial selected view remains usable: {}",
+            generated.text
+        );
+        assert!(!generated.text.contains("wrong-kind:"));
+        assert!(!generated.text.contains("borrowed-result:"));
         assert!(!generated.text.contains("missing:"));
         let package = result
             .package
@@ -45586,6 +45602,271 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         assert_eq!(reference.interface.interface, codec_interface.wit);
         assert_eq!(reference.item, codec_item.item);
         assert_eq!(reference.item_name, "data");
+    }
+
+    #[test]
+    fn generated_world_resource_function_propagates_only_partial_view_incompleteness() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "world client {\n",
+            "  import fn consume_handle(value: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
+            "}\n",
+        );
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", root_source.as_bytes())],
+        );
+        let (codec_package, codec_tree, codec_files) = multi_package_fixture(
+            &mut database,
+            "acme:codec#1",
+            "acme:codec@1.2.3",
+            &[(
+                "lib.sai",
+                b"pub interface api { resource Handle {} type Hidden = USize }\n",
+            )],
+        );
+        snapshot_files.extend(codec_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:codec#1", "acme:codec")],
+                ),
+                graph_node(
+                    "acme:codec#1",
+                    "acme:codec",
+                    "1.2.3",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("generated-source dependency graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let codec_manifest: Arc<[u8]> =
+            Arc::from(&b"package acme:codec @ 1.2.3\nsource \"src\"\n"[..]);
+        let codec_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &codec_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                codec_manifest,
+                PackageRole::Dependency,
+                &[],
+            )
+            .expect("generated-source dependency scopes collect");
+        let codec_member_package = codec_collection.module_member_scope_package();
+        let codec_generated = database
+            .generated_wit_text(codec_package)
+            .expect("dependency generated WIT query succeeds")
+            .expect("source dependency publishes a generated WIT snapshot");
+        assert!(
+            !codec_generated.complete,
+            "the unsupported foreign item makes only the dependency view partial"
+        );
+        assert!(codec_generated.text.contains("resource handle;"));
+        assert!(!codec_generated.text.contains("type hidden"));
+
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target, &graph)
+            .expect("active generated-source WIT view loads");
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the direct source dependency has a generated WIT view");
+        assert!(!codec_view.view.complete);
+        assert!(
+            codec_view.view.interfaces["api"]
+                .members
+                .contains_key("Handle")
+        );
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        let root_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &[codec_member_package.as_foreign_package_scopes("acme:codec")],
+                &wit_views,
+            )
+            .expect("root scopes use the exact selected partial source view");
+        assert!(root_collection.interface_check_diagnostics().is_empty());
+
+        let generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated WIT query succeeds")
+            .expect("root source package publishes generated WIT");
+        assert!(
+            !generated.complete,
+            "the sole supported world function inherits incompleteness from its resource view"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{handle};")
+        );
+        assert!(
+            generated.text.contains(
+                "import consume-handle: func(value: handle, borrowed: borrow<handle>) -> handle;"
+            ),
+            "the function remains emitted while its selected view is partial: {}",
+            generated.text
+        );
+        assert_eq!(generated.text.matches("import consume-handle:").count(), 1);
+    }
+
+    #[test]
+    fn generated_world_function_uses_only_exact_direct_foreign_resources() {
+        let source = concat!(
+            "use acme:codec/api as api\n",
+            "use acme:codec/facade as facade\n",
+            "world client {\n",
+            "  import fn accepted(value: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
+            "  import fn unselected(value: facade.Handle)\n",
+            "  import fn wrong_kind(value: borrow api.Data)\n",
+            "  export fn borrowed_result() -> borrow api.Handle\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, root_package) =
+            phase1_fixture(source.as_bytes(), b"");
+        let root_key = PackageKey::new("acme:phase1#1").expect("root package key is valid");
+        let (codec, codec_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:codec",
+            "1.2.3",
+            b"package acme:codec@1.2.3; \
+              interface api { resource handle; record data { value: u32, } } \
+              interface facade { use acme:base/types@1.0.0.{handle}; }",
+        );
+        let (_base, base_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:base",
+            "1.0.0",
+            b"package acme:base@1.0.0; interface types { resource handle; }",
+        );
+        database
+            .set_package_manifest(
+                codec,
+                Arc::from(
+                    &b"package acme:codec @ 1.2.3\n\
+                      artifact component {}\n\
+                      wit \"wit\"\n\
+                      requires { acme:base @ ^1 }\n"[..],
+                ),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("codec's transitive WIT dependency is recorded");
+        let codec_node = PackageGraphNode::new(
+            codec_node.key().clone(),
+            codec_node.identity(),
+            codec_node.version().clone(),
+            codec_node.form(),
+            codec_node.role(),
+            vec![graph_edge(base_node.key().as_str(), "acme:base")],
+        )
+        .expect("codec graph node includes the base package");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    root_key.as_str(),
+                    "acme:phase1",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge(codec_node.key().as_str(), "acme:codec")],
+                ),
+                codec_node,
+                base_node,
+            ],
+        )
+        .expect("direct and transitive package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target, &graph)
+            .expect("direct and transitive WIT views load");
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the codec view is selected for the direct edge");
+        assert!(codec_view.directly_visible);
+        let base_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:base")
+            .expect("the base view is available transitively");
+        assert!(!base_view.directly_visible);
+        assert_eq!(codec_view.view.unit.canonical_name(), "acme:codec@1.2.3");
+
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root collection uses the active selected WIT views");
+        let generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated WIT query succeeds")
+            .expect("the root source package publishes generated WIT");
+        assert!(
+            !generated.complete,
+            "omitted unselected and wrong-kind resource references keep output incomplete"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{handle};")
+        );
+        assert!(
+            generated.text.contains(
+                "import accepted: func(value: handle, borrowed: borrow<handle>) -> handle;"
+            ),
+            "the selected external resource supports own params/results and borrow params: {}",
+            generated.text
+        );
+        assert!(!generated.text.contains("unselected:"));
+        assert!(!generated.text.contains("wrong-kind:"));
+        assert!(!generated.text.contains("borrowed-result:"));
+        assert!(
+            !generated.text.contains("acme:base/types"),
+            "the transitive same-named resource must not leak into the generated world"
+        );
     }
 
     #[test]

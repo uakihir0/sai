@@ -2435,6 +2435,7 @@ fn collect_interface_uses_input(
     let interface_boundary_types =
         interface_boundary_type_definitions(&interface_type_members, scopes, prepared);
     let foreign_named_type_references = generated_foreign_named_type_references(prepared);
+    let foreign_world_resource_references = generated_foreign_world_resource_references(prepared);
     let mut ineligible_interfaces = HashSet::new();
     let boundary_use_alias_names = interface_boundary_use_alias_names(
         &interface_type_members,
@@ -3166,6 +3167,20 @@ fn collect_interface_uses_input(
                 .iter()
                 .map(|(definition, reference)| (*definition, reference.clone())),
         );
+        generated_world_type_references.extend(
+            foreign_world_resource_references
+                .by_definition
+                .iter()
+                .map(|(definition, reference)| (*definition, reference.clone())),
+        );
+        let mut generated_world_view_completeness =
+            foreign_named_type_references.view_completeness.clone();
+        for (reference, complete) in &foreign_world_resource_references.view_completeness {
+            generated_world_view_completeness
+                .entry(reference.clone())
+                .and_modify(|existing| *existing &= complete)
+                .or_insert(*complete);
+        }
         let generated_interface_references = generated_unit
             .as_ref()
             .map(|unit| {
@@ -3513,7 +3528,7 @@ fn collect_interface_uses_input(
                     let complete = item.as_ref().is_none_or(|item| {
                         generated_world_function_view_is_complete(
                             item,
-                            &foreign_named_type_references.view_completeness,
+                            &generated_world_view_completeness,
                         )
                     });
                     (item, complete)
@@ -4934,6 +4949,72 @@ fn generated_foreign_named_type_references(
                             | WitItemKind::Enum(_)
                             | WitItemKind::Flags(_)
                     )
+                {
+                    continue;
+                }
+                let reference = WitTypeRef {
+                    interface: sai_wit::WitIfaceRef {
+                        unit: view.unit.clone(),
+                        interface: interface.wit,
+                        name: wit_interface.name.clone(),
+                    },
+                    item: member.item,
+                    item_name: wit_item.name.clone(),
+                };
+                references
+                    .by_definition
+                    .insert(member.def, reference.clone());
+                references
+                    .view_completeness
+                    .entry(reference)
+                    .and_modify(|complete| *complete &= view.complete)
+                    .or_insert(view.complete);
+            }
+        }
+    }
+    references
+}
+
+#[derive(Default)]
+struct GeneratedForeignWorldResourceReferences {
+    by_definition: HashMap<DefId, WitTypeRef>,
+    view_completeness: HashMap<WitTypeRef, bool>,
+}
+
+fn generated_foreign_world_resource_references(
+    prepared: &PreparedPhase1PackageScopes,
+) -> GeneratedForeignWorldResourceReferences {
+    let mut references = GeneratedForeignWorldResourceReferences::default();
+    for foreign in &prepared.foreign_wit_views {
+        if !foreign.directly_visible {
+            continue;
+        }
+        let view = foreign.view.as_ref();
+        for interface in view.interfaces.values() {
+            let Some(wit_interface) = view.model.interfaces.get(interface.wit) else {
+                continue;
+            };
+            for member in interface.members.values() {
+                if member.kind != WitViewDefKind::Resource || member.unsupported.is_some() {
+                    continue;
+                }
+                let Some(definition) = view.definition(member.def) else {
+                    continue;
+                };
+                if definition.kind != WitViewDefKind::Resource
+                    || definition.entity
+                        != (WitViewEntity::Item {
+                            interface: interface.wit,
+                            item: member.item,
+                        })
+                {
+                    continue;
+                }
+                let Some(wit_item) = wit_interface.items.get(member.item) else {
+                    continue;
+                };
+                if wit_item.unsupported.is_some()
+                    || !matches!(wit_item.kind, WitItemKind::Resource(_))
                 {
                     continue;
                 }
