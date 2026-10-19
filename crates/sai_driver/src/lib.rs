@@ -51251,18 +51251,124 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
+    fn generated_wit_emits_forward_alias_references_in_function_signatures_after_round_trip() {
+        let source = concat!(
+            "interface api {\n",
+            "  fn round_trip(value: Later) -> Later\n",
+            "  type Later = U32\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated forward function reference loads");
+        assert!(
+            result.failure.is_none(),
+            "forward function reference text parses and resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "a function may refer to a supported later same-interface alias"
+        );
+        assert!(
+            generated
+                .text
+                .contains("round-trip: func(value: later) -> later;")
+        );
+        assert!(generated.text.contains("type later = u32;"));
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        let later_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "later").then_some(index))
+            .expect("the target alias remains in the parsed model");
+        let round_trip = interface
+            .items
+            .iter()
+            .find(|item| item.name == "round-trip")
+            .expect("the function remains in the parsed model");
+        let sai_wit::WitItemKind::Func(round_trip) = &round_trip.kind else {
+            panic!("round-trip remains a function after parsing");
+        };
+        let sai_wit::WitType::Named(parameter) = &round_trip.params[0].1 else {
+            panic!("the function parameter refers to a named later alias");
+        };
+        let sai_wit::WitType::Named(result) = round_trip
+            .result
+            .as_ref()
+            .expect("the function result is retained")
+        else {
+            panic!("the function result refers to a named later alias");
+        };
+        for reference in [parameter, result] {
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.interface.name, "api");
+            assert_eq!(reference.item, later_index);
+            assert_eq!(reference.item_name, "later");
+        }
+        assert_eq!(
+            interface.items[later_index].kind,
+            sai_wit::WitItemKind::Alias(sai_wit::WitType::U32)
+        );
+    }
+
+    #[test]
     fn generated_wit_prunes_forward_alias_cycles_and_omitted_targets() {
         let source = concat!(
             "interface api {\n",
             "  type Before = After\n",
-            "  fn use_later(value: After)\n",
+            "  fn use_later(value: After) -> After\n",
+            "  fn use_rejected(value: Rejected) -> Rejected\n",
+            "  type BeforeRecord { value: After }\n",
+            "  fn use_resource(value: LaterResource)\n",
+            "  resource LaterResource {}\n",
             "  type CycleA = CycleB\n",
+            "  fn use_cycle(value: CycleA) -> CycleA\n",
             "  type CycleB = CycleA\n",
             "  type UsesCycle = CycleA\n",
             "  type UsesRejected = Rejected\n",
             "  type Rejected = USize\n",
             "  type UsesUsesRejected = UsesRejected\n",
             "  type After = U32\n",
+            "  type LaterRecord = U64\n",
             "  fn independent(value: U64)\n",
             "}\n",
             "interface other {\n",
@@ -51320,9 +51426,12 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(emitted_items.len(), 3);
+        assert_eq!(emitted_items.len(), 6);
         assert!(emitted_items.contains(&"before"));
+        assert!(emitted_items.contains(&"use-later"));
         assert!(emitted_items.contains(&"after"));
+        assert!(emitted_items.contains(&"later-record"));
+        assert!(emitted_items.contains(&"later-resource"));
         assert!(emitted_items.contains(&"independent"));
         assert_eq!(
             interface
@@ -51330,10 +51439,13 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2],
+            [0, 1, 2, 3, 4, 5],
             "surviving item indices compact after pruning cycles and unsupported targets"
         );
-        assert!(!generated.text.contains("use-later"));
+        assert!(!generated.text.contains("use-rejected"));
+        assert!(!generated.text.contains("before-record"));
+        assert!(!generated.text.contains("use-resource"));
+        assert!(!generated.text.contains("use-cycle"));
         assert!(!generated.text.contains("cycle"));
         assert!(!generated.text.contains("uses-cycle"));
         assert!(!generated.text.contains("rejected"));
@@ -51342,6 +51454,11 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("cross-interface"));
         assert!(generated.text.contains("type after = u32;"));
         assert!(generated.text.contains("type before = after;"));
+        assert!(
+            generated
+                .text
+                .contains("use-later: func(value: after) -> after;")
+        );
         assert!(generated.text.contains("independent: func(value: u64)"));
         let before = interface
             .items
@@ -51353,6 +51470,26 @@ interface facade { use middle.{payload}; }"#;
         };
         assert_eq!(interface.items[reference.item].name, "after");
         assert_eq!(reference.item_name, "after");
+        let use_later = interface
+            .items
+            .iter()
+            .find(|item| item.name == "use-later")
+            .expect("the supported forward function remains emitted");
+        let sai_wit::WitItemKind::Func(use_later) = &use_later.kind else {
+            panic!("use-later remains a function after parsing");
+        };
+        let sai_wit::WitType::Named(parameter) = &use_later.params[0].1 else {
+            panic!("the function parameter refers to the later alias");
+        };
+        let sai_wit::WitType::Named(result) = use_later
+            .result
+            .as_ref()
+            .expect("the forward function result remains emitted")
+        else {
+            panic!("the function result refers to the later alias");
+        };
+        assert_eq!(interface.items[parameter.item].name, "after");
+        assert_eq!(interface.items[result.item].name, "after");
     }
 
     #[test]

@@ -2861,7 +2861,10 @@ fn collect_interface_uses_input(
                 owner_uses_complete = false;
                 poisoned_owners.insert(member_owner);
             }
-            let item_type_references = if kind == super::InterfaceMemberKind::Alias {
+            let item_type_references = if matches!(
+                kind,
+                super::InterfaceMemberKind::Alias | super::InterfaceMemberKind::Function
+            ) {
                 &generated_alias_type_references
             } else {
                 &generated_named_type_references
