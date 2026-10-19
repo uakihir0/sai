@@ -121,6 +121,315 @@ fn assert_success_result(output: Output, target: &str, profile: &str) {
 }
 
 #[test]
+fn public_direct_parameter_function_emits_check_result() {
+    assert_success_result(
+        run_check(
+            "pub fn identity(value: I32) -> I32 { value }\n",
+            "",
+            &[],
+            &[],
+        ),
+        "wasm32-core",
+        "dev",
+    );
+}
+
+#[test]
+fn direct_parameter_return_type_mismatch_suppresses_check_result() {
+    let output = run_check(
+        "pub fn identity(value: I32) -> Bool { value }\n",
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("expected `Bool`, found `I32`")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "type mismatch must be reported without a result or feature gate:\n{stdout}"
+    );
+}
+
+#[test]
+fn non_ascii_public_function_name_reports_its_hard_diagnostic() {
+    let source = "pub fn identité(value: I32) -> I32 { value }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"NON_ASCII_PUBLIC_NAME\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "public non-ASCII names must produce their hard diagnostic:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"NON_ASCII_PUBLIC_NAME\"").count(),
+        1,
+        "a public name must be diagnosed exactly once:\n{stdout}"
+    );
+    let name_start = source.find("identité").expect("function name exists");
+    let name_end = name_start + "identité".len();
+    assert!(
+        stdout.contains(&format!("\"byte\":{name_start}"))
+            && stdout.contains(&format!("\"byte\":{name_end}")),
+        "the diagnostic must point at the complete written public name:\n{stdout}"
+    );
+
+    let attributed = run_check(
+        "@inline\npub fn identité(value: I32) -> I32 { value }\n",
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(attributed.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(attributed.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"NON_ASCII_PUBLIC_NAME\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a function attribute must not hide the public-name diagnostic:\n{stdout}"
+    );
+
+    for source in [
+        concat!(
+            "pub fn identité(value: I32) -> I32 { value }\n",
+            "pub fn identity(value: I32) -> I32 { value }\n",
+        ),
+        "use acme:missing\npub fn identité(value: I32) -> I32 { value }\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"NON_ASCII_PUBLIC_NAME\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "unsupported source shapes must not hide the public-name diagnostic:\n{stdout}"
+        );
+    }
+
+    let output = run_check(
+        "",
+        "",
+        &[(
+            "src/extra.sai",
+            "pub fn identité(value: I32) -> I32 { value }\n",
+        )],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"NON_ASCII_PUBLIC_NAME\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a public name in an additional source module must be diagnosed:\n{stdout}"
+    );
+}
+
+#[test]
+fn exported_function_name_reports_its_hard_diagnostic() {
+    let output = run_check(
+        "export fn identité(value: I32) -> I32 { value }\n",
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"NON_ASCII_PUBLIC_NAME\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "exported non-ASCII names must produce their hard diagnostic:\n{stdout}"
+    );
+}
+
+#[test]
+fn non_function_export_still_checks_its_public_name() {
+    let output = run_check("export const CAFÉ: I32 = 1\n", "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"INVALID_EXPORT_TARGET\"")
+            && stdout.contains("\"code\":\"NON_ASCII_PUBLIC_NAME\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "an invalid export modifier must not hide its non-ASCII public name:\n{stdout}"
+    );
+}
+
+#[test]
+fn non_function_export_trait_recovery_checks_trait_members() {
+    let output = run_check(
+        concat!("export trait Élement {\n", "fn identité() -> I32\n", "}\n",),
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"INVALID_EXPORT_TARGET\"")
+            && stdout.matches("\"code\":\"NON_ASCII_PUBLIC_NAME\"").count() == 2,
+        "export recovery must retain public visibility for the trait and its members:\n{stdout}"
+    );
+}
+
+#[test]
+fn public_trait_member_names_report_their_hard_diagnostics() {
+    let output = run_check(
+        concat!(
+            "pub trait Names {\n",
+            "type Élement\n",
+            "fn identité(value: I32) -> I32\n",
+            "}\n",
+            "impl Names for I32 {\n",
+            "pub fn identité(value: I32) -> I32 { value }\n",
+            "}\n",
+        ),
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"NON_ASCII_PUBLIC_NAME\"").count(),
+        2,
+        "each non-ASCII member of a public trait must be diagnosed once:\n{stdout}"
+    );
+    assert!(!stdout.contains("\"type\":\"result\""), "{stdout}");
+}
+
+#[test]
+fn public_type_fields_and_enum_variants_report_their_hard_diagnostics() {
+    let output = run_check(
+        concat!(
+            "pub type Café = I32\n",
+            "pub type Record {\n",
+            "pub façade: I32\n",
+            "}\n",
+            "type Hidden {\n",
+            "pub caché: I32\n",
+            "}\n",
+            "pub enum Colors {\n",
+            "Élément\n",
+            "}\n",
+            "pub const CAFÉ: I32 = 1\n",
+            "pub distinct Élement = I32\n",
+            "pub resource Rêsource {\n",
+            "pub châmp: I32\n",
+            "}\n",
+        ),
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"NON_ASCII_PUBLIC_NAME\"").count(),
+        8,
+        "public types, fields, enum variants, constants, and resources must be diagnosed:\n{stdout}"
+    );
+    assert!(!stdout.contains("\"type\":\"result\""), "{stdout}");
+}
+
+#[test]
+fn interface_and_world_names_report_their_hard_diagnostics() {
+    let output = run_check(
+        concat!(
+            "interface api {\n",
+            "fn identité(prénom: I32) -> I32\n",
+            "}\n",
+            "world café {\n",
+            "import fn entrée(pâramètre: I32)\n",
+            "export fn sortie(résultat: I32)\n",
+            "import api\n",
+            "}\n",
+        ),
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"NON_ASCII_PUBLIC_NAME\"").count(),
+        6,
+        "interface, world, and WIT function parameter names must be diagnosed:\n{stdout}"
+    );
+    assert!(!stdout.contains("\"type\":\"result\""), "{stdout}");
+}
+
+#[test]
+fn public_reexport_alias_reports_its_hard_diagnostic() {
+    let output = run_check(
+        "pub use acme:empty/child.{identity as identíté}\n",
+        "",
+        &[("src/child.sai", "pub fn identity() {}\n")],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"NON_ASCII_PUBLIC_NAME\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a public re-export alias must be diagnosed:\n{stdout}"
+    );
+}
+
+#[test]
+fn target_filtered_public_name_does_not_report_a_name_error() {
+    let output = run_check(
+        concat!(
+            "@target(\"wasm64-core\")\n",
+            "pub fn identité(value: I32) -> I32 { value }\n",
+        ),
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        !stdout.contains("\"code\":\"NON_ASCII_PUBLIC_NAME\""),
+        "an item filtered out for the selected target must not be diagnosed:\n{stdout}"
+    );
+}
+
+#[test]
+fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
+    for source in [
+        "pub fn add(value: I32) -> I32 { value + 1 }\n",
+        "pub fn local(value: I32) -> I32 { let next = value; next }\n",
+        "pub fn generic<T>(value: T) -> T { value }\n",
+        "fn private(value: I32) -> I32 { value }\n",
+        "pub fn identityValue(value: I32) -> I32 { value }\n",
+        "pub fn identity(valueItem: I32) -> I32 { valueItem }\n",
+        "pub fn non_ascii_param(valué: I32) -> I32 { valué }\n",
+        "pub fn r#raw_function(value: I32) -> I32 { value }\n",
+        "pub fn raw_parameter(r#value: I32) -> I32 { r#value }\n",
+        "pub fn raw_tail(value: I32) -> I32 { r#value }\n",
+        "pub fn raw_type(value: r#I32) -> r#I32 { value }\n",
+        "pub fn identity(var value: I32) -> I32 { value }\n",
+        "pub fn identity(value: Str) -> Str { value }\n",
+        concat!(
+            "pub fn first(value: I32) -> I32 { value }\n",
+            "pub fn second(value: I32) -> I32 { value }\n",
+        ),
+        concat!(
+            "@target(\"wasm64-core\")\n",
+            "pub fn filtered(value: I32) -> I32 { value }\n",
+            "pub fn identity(value: I32) -> I32 { value }\n",
+        ),
+    ] {
+        assert_check_stays_gated(
+            &run_check(source, "", &[], &[]),
+            "function body outside the direct parameter slice",
+        );
+    }
+}
+
+#[test]
 fn empty_root_source_emits_check_result_for_default_and_selected_target() {
     assert_success_result(run_check("", "", &[], &[]), "wasm32-core", "dev");
     assert_success_result(
@@ -666,6 +975,7 @@ fn const_forms_outside_literal_slice_remain_gated() {
         "@doc(hidden)\npub const ATTRIBUTED: I8 = 1\n",
         "pub const Max_size: I8 = 1\n",
         "pub const r#READY: Bool = true\n",
+        "pub const RAW_TYPE: r#I32 = 1\n",
         "@target(\"wasm64-core\")\npub const OTHER: I8 = 1\npub const VALUE: I8 = 2\n",
         "test \"unselected\" {}\npub const VALUE: I8 = 2\n",
     ] {
