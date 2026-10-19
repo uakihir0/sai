@@ -299,6 +299,7 @@ fn public_bool_parameter_comparison_if_functions_emit_check_results() {
 #[test]
 fn unsupported_bool_parameter_comparison_shapes_remain_gated() {
     for source in [
+        "pub fn choose(left: I32, right: I32) -> I32 { if left < right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == left { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == true { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right and left { 1 } else { 2 } }\n",
