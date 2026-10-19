@@ -3082,6 +3082,14 @@ fn collect_interface_uses_input(
                     .filter(|(_, reference)| reference.interface.interface > interface_index)
                     .map(|(definition, reference)| (*definition, reference.clone())),
             );
+            // Variant payloads may use future local types after all sibling consumer maps
+            // have been prepared, so this capability stays variant-only.
+            generated_variant_type_references.extend(
+                generated_all_local_type_references
+                    .iter()
+                    .filter(|(_, reference)| reference.interface.interface > interface_index)
+                    .map(|(definition, reference)| (*definition, reference.clone())),
+            );
         }
         for (member_index, (entry, member_owner)) in member_entries
             .into_iter()

@@ -51838,10 +51838,17 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
-    fn generated_wit_variants_reference_prior_local_interfaces_only() {
+    fn generated_wit_variants_reference_prior_and_later_local_interfaces() {
         let source = concat!(
             "interface early {\n",
             "  enum FuturePayload { Value(types.Id) }\n",
+            "  enum FutureHandlePayload { Value(types.Handle) }\n",
+            "  enum BorrowedFuturePayload { Value(borrow types.Handle) }\n",
+            "  enum Missing { Value(types.Hidden) }\n",
+            "  fn use_future_payload(value: FuturePayload)\n",
+            "  fn use_future_handle_payload(value: FutureHandlePayload)\n",
+            "  fn use_borrowed_future_payload(value: BorrowedFuturePayload)\n",
+            "  fn use_missing(value: Missing)\n",
             "  enum Keep { Ready }\n",
             "}\n",
             "interface types {\n",
@@ -51899,11 +51906,31 @@ interface facade { use middle.{payload}; }"#;
             .expect("the generated root text is retained");
         assert!(
             !generated.complete,
-            "later-interface and omitted-type variant targets remain incomplete"
+            "unsupported borrowed and omitted-type variant targets remain incomplete"
         );
         assert!(generated.text.contains("enum keep {"), "{}", generated.text);
         assert!(generated.text.contains("type id = u32;"));
         assert!(generated.text.contains("use types.{handle, id};"));
+        assert!(
+            generated.text.contains("variant future-payload {"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated.text.contains("variant future-handle-payload {"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("use-future-payload: func(value: future-payload);")
+        );
+        assert!(
+            generated
+                .text
+                .contains("use-future-handle-payload: func(value: future-handle-payload);")
+        );
         assert!(
             generated.text.contains("variant wrapped {"),
             "{}",
@@ -51926,10 +51953,40 @@ interface facade { use middle.{payload}; }"#;
         );
         assert!(generated.text.contains("resource handle;"));
         assert!(generated.text.contains("independent: func(value: u32);"));
-        assert!(!generated.text.contains("future-payload"));
         assert!(!generated.text.contains("type hidden ="));
         assert!(!generated.text.contains("variant missing"));
         assert!(!generated.text.contains("use-missing:"));
+        assert!(!generated.text.contains("variant borrowed-future-payload"));
+        assert!(!generated.text.contains("use-borrowed-future-payload:"));
+        let retained_source_order = [
+            generated
+                .text
+                .find("variant future-payload {")
+                .expect("the supported data payload variant remains"),
+            generated
+                .text
+                .find("variant future-handle-payload {")
+                .expect("the supported resource payload variant remains"),
+            generated
+                .text
+                .find("use-future-payload:")
+                .expect("the data variant consumer remains"),
+            generated
+                .text
+                .find("use-future-handle-payload:")
+                .expect("the resource variant consumer remains"),
+            generated
+                .text
+                .find("enum keep {")
+                .expect("the independent unit enum remains"),
+        ];
+        assert!(
+            retained_source_order
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "retained declaration kinds keep source order: {}",
+            generated.text
+        );
 
         let package_model = result.package.expect("partial generated WIT model loads");
         let root = package_model.root();
@@ -51959,20 +52016,104 @@ interface facade { use middle.{payload}; }"#;
             "the unsupported earlier item is removed while the resource remains"
         );
 
-        let early = root
+        let (early_index, early) = root
             .interfaces
-            .iter()
-            .find(|interface| interface.name == "early")
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "early")
             .expect("the earlier interface with an independent enum remains");
         assert_eq!(
             early
                 .items
                 .iter()
+                .filter(|item| matches!(&item.kind, sai_wit::WitItemKind::Variant(_)))
                 .map(|item| item.name.as_str())
                 .collect::<Vec<_>>(),
-            ["keep"],
-            "a variant cannot reference a later interface"
+            ["future-payload", "future-handle-payload"],
+            "supported future variants remain while unsupported variants are pruned"
         );
+        assert_eq!(
+            early
+                .items
+                .iter()
+                .filter(|item| matches!(&item.kind, sai_wit::WitItemKind::Func(_)))
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["use-future-payload", "use-future-handle-payload"],
+            "only supported future-variant consumers remain"
+        );
+        let (future_id_index, future_id) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the later data item is represented by a local use alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(imported_id)) = &future_id.kind
+        else {
+            panic!("the local future data alias retains its named target");
+        };
+        assert_eq!(imported_id.interface.unit, unit);
+        assert_eq!(imported_id.interface.interface, types_index);
+        assert_eq!(imported_id.item, id_index);
+        assert_eq!(imported_id.item_name, "id");
+        let (future_handle_index, future_handle) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the later resource is represented by a local use alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(imported_handle)) =
+            &future_handle.kind
+        else {
+            panic!("the local future resource alias retains its owned target");
+        };
+        assert_eq!(imported_handle.interface.unit, unit);
+        assert_eq!(imported_handle.interface.interface, types_index);
+        assert_eq!(imported_handle.item, handle_index);
+        assert_eq!(imported_handle.item_name, "handle");
+        for (variant_name, import_index, import_name, is_resource) in [
+            ("future-payload", future_id_index, "id", false),
+            ("future-handle-payload", future_handle_index, "handle", true),
+        ] {
+            let (variant_index, variant) = early
+                .items
+                .iter_enumerated()
+                .find(|(_, item)| item.name == variant_name)
+                .expect("the supported future payload variant remains");
+            let sai_wit::WitItemKind::Variant(cases) = &variant.kind else {
+                panic!("{variant_name} remains a payload variant");
+            };
+            let payload = cases[0]
+                .payload
+                .as_ref()
+                .expect("the payload type is retained");
+            let payload_reference = match (is_resource, payload) {
+                (false, sai_wit::WitType::Named(reference))
+                | (true, sai_wit::WitType::Own(reference)) => reference,
+                _ => panic!("{variant_name} retains the expected payload kind"),
+            };
+            assert_eq!(payload_reference.interface.unit, unit);
+            assert_eq!(payload_reference.interface.interface, early_index);
+            assert_eq!(payload_reference.item, import_index);
+            assert_eq!(payload_reference.item_name, import_name);
+            let consumer_name = match variant_name {
+                "future-payload" => "use-future-payload",
+                "future-handle-payload" => "use-future-handle-payload",
+                _ => unreachable!(),
+            };
+            let consumer = early
+                .items
+                .iter()
+                .find(|item| item.name == consumer_name)
+                .expect("the future variant consumer remains");
+            let sai_wit::WitItemKind::Func(consumer) = &consumer.kind else {
+                panic!("{consumer_name} remains a function");
+            };
+            let sai_wit::WitType::Named(consumer_reference) = &consumer.params[0].1 else {
+                panic!("the consumer refers to its local variant");
+            };
+            assert_eq!(consumer_reference.interface.unit, unit);
+            assert_eq!(consumer_reference.interface.interface, early_index);
+            assert_eq!(consumer_reference.item, variant_index);
+            assert_eq!(consumer_reference.item_name, variant_name);
+        }
 
         let (variants_index, variants) = root
             .interfaces
@@ -54556,6 +54697,8 @@ interface facade { use middle.{payload}; }"#;
         let source = concat!(
             "interface early {\n",
             "  fn omitted(value: second.Safe)\n",
+            "  enum OmittedVariant { Value(second.Safe) }\n",
+            "  fn omitted_variant(value: OmittedVariant)\n",
             "  type OmittedRecord { value: second.Safe }\n",
             "  fn omitted_record(value: OmittedRecord)\n",
             "  fn independent(value: U32)\n",
@@ -54627,6 +54770,8 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("interface first"));
         assert!(!generated.text.contains("interface second"));
         assert!(!generated.text.contains("omitted:"));
+        assert!(!generated.text.contains("variant omitted-variant"));
+        assert!(!generated.text.contains("omitted-variant:"));
         assert!(!generated.text.contains("record omitted-record"));
         assert!(!generated.text.contains("omitted-record:"));
         assert!(generated.text.contains("independent: func(value: u32);"));

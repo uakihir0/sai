@@ -5841,6 +5841,15 @@
 - **Human review:** **Review required:** Confirm that record fields may refer forward to exact named types and owned resources, while borrowed fields, variant payloads, and resource-member signatures remain outside this extension; confirm that records and consumers should be pruned when targets are omitted or cyclic.
 - **Remaining scope:** Later-interface references from variant payloads and resource-member signatures remain unsupported, along with the broader §16.10.1 forward-reference and transitive-poisoning plan.
 
+### IR-710: allow variant payloads to reference later local interfaces
+
+- **Decision:** Extend only the generated variant-payload reference map with exact references to named types and resources in later local interfaces. Keep function, alias-definition, record-field, and resource-member maps unchanged; allow owned resource payloads and continue to reject borrowed payloads.
+- **Reason:** Supported one-payload variants already materialize named types and owned resource handles. Adding future references after the sibling maps are cloned, and after the IR-709 record-only extension, preserves consumer isolation. Exact reserved identities flow through existing pruning and index compaction when a target item or interface is omitted.
+- **Verification:** `generated_wit_variants_reference_prior_and_later_local_interfaces` checks later data and resource payloads, exact parsed target identity through local `use` aliases, preserved consumers, and pruning of borrowed and unsupported targets with their consumers. `generated_wit_omits_cyclic_interfaces_and_keeps_parseable_text` checks that a future variant targeting a cyclic interface is pruned while independent items remain and interface indices compact. The variant and cycle regressions pass; the full locked workspace suite passes, including all 340 `sai_driver` and 722 `sai_package` tests. `cargo fmt --all -- --check` and `git diff --check` pass.
+- **Review:** A hostile design review confirmed the extension must be placed after sibling maps are cloned and filtered to interfaces with greater provisional indices. Hostile implementation review found no actionable P0–P2 issues. Its non-blocking cross-kind source-order coverage note is covered by a retained-order assertion. The current tests retain the resource-member forward-reference guard and cover borrowed-payload rejection.
+- **Human review:** **Review required:** Confirm that variant payloads may refer forward to exact named types and owned resources without extending the function, alias, record, or resource-member maps; confirm borrowed payloads and variants targeting omitted or cyclic interfaces remain pruned.
+- **Remaining scope:** Later-interface references from resource-member signatures remain unsupported, along with the broader §16.10.1 forward-reference and transitive-poisoning plan.
+
 ### CI follow-up (2026-10-19)
 
 - **Decision:** Keep GitHub Actions CI enabled and leave the current concurrency policy unchanged.
