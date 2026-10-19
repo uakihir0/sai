@@ -207,6 +207,24 @@ fn public_zero_parameter_direct_literal_if_function_emits_check_result() {
 }
 
 #[test]
+fn public_bool_parameter_literal_if_function_emits_check_result() {
+    let source = "pub fn choose(flag: Bool) -> I32 { if flag { 1 } else { 2 } }\n";
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn unsupported_bool_parameter_if_shapes_remain_gated() {
+    for source in [
+        "pub fn choose(flag: I32) -> I32 { if flag { 1 } else { 2 } }\n",
+        "pub fn choose(var flag: Bool) -> I32 { if flag { 1 } else { 2 } }\n",
+        "pub fn choose(flag: Bool) -> I32 { if flag { 1 } }\n",
+        "pub fn choose(flag: Bool, other: Bool) -> I32 { if flag { 1 } else { 2 } }\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn literal_if_checks_both_branches_and_reports_source_spans() {
     for (source, expected_code, literal) in [
         (
