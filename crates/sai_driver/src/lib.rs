@@ -41,7 +41,7 @@ use sai_hir::arena::HirArena;
 use sai_hir::attrs::ValidatedAttrs;
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::expressions::{
-    Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind, UnOp,
+    BinOp, Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind, UnOp,
 };
 use sai_hir::item_tree::{
     ItemTree, ItemTreeEntry, ItemTreeKind, TargetFilterError, TargetFilterResult,
@@ -5886,8 +5886,8 @@ fn check_function_body_type(
     {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     }
-    let parameter = match (sig.params, body.params) {
-        ([], []) => None,
+    let (parameter, parameter_pair) = match (sig.params, body.params) {
+        ([], []) => (None, None),
         ([parameter], [body_parameter])
             if !parameter.is_self
                 && !parameter.mutable
@@ -5897,7 +5897,27 @@ fn check_function_body_type(
                     .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
                 && parameter.name == body_parameter.name =>
         {
-            Some((parameter, body_parameter))
+            (Some((parameter, body_parameter)), None)
+        }
+        ([first, second], [first_body, second_body])
+            if !first.is_self
+                && !second.is_self
+                && !first.mutable
+                && !second.mutable
+                && !first_body.mutable
+                && !second_body.mutable
+                && first
+                    .name
+                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
+                && second
+                    .name
+                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
+                && first.name == first_body.name
+                && second.name == second_body.name
+                && first.name != second.name
+                && first_body.binding != second_body.binding =>
+        {
+            (None, Some((first, first_body, second, second_body)))
         }
         _ => return Ok(FunctionBodyTypeCheck::Unsupported),
     };
@@ -6009,6 +6029,57 @@ fn check_function_body_type(
                 )?]
             }
         }
+    } else if let Some((first, first_body, second, second_body)) = parameter_pair {
+        let Some(tail) = block.tail else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        let ExprKind::If {
+            cond,
+            then,
+            els: Some(else_expr),
+        } = tail.kind
+        else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        let Some(return_ty) = sig.ret else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        if !matches!(
+            resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
+            Some(FunctionDirectType::Primitive(_))
+        ) {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        }
+        let condition_is_supported = function_if_and_condition_uses_parameter_bindings(
+            cond,
+            first_body,
+            second_body,
+            locals,
+            inputs,
+        ) && [first.ty, second.ty].into_iter().all(|ty| {
+            matches!(
+                resolve_function_direct_type(*ty, type_paths, symbols, inputs),
+                Some(FunctionDirectType::Primitive(
+                    sai_resolve::prelude::PrimTy::Bool
+                ))
+            )
+        });
+        let Some(diagnostics) = check_function_if_literal_branches(
+            owner,
+            *return_ty,
+            condition_is_supported,
+            then,
+            else_expr,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        diagnostics
     } else {
         let Some(return_ty) = sig.ret else {
             return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -6104,6 +6175,47 @@ fn function_if_condition_uses_parameter_binding(
                 segment_count: 1,
             }) if *resolved_binding == body_parameter.binding
         )
+}
+
+fn function_if_and_condition_uses_parameter_bindings(
+    condition: &HirExpr<'_>,
+    first_body_parameter: &sai_hir::body::BodyParam,
+    second_body_parameter: &sai_hir::body::BodyParam,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let ExprKind::Binary(BinOp::And, left, right) = condition.kind else {
+        return false;
+    };
+    let path_binding = |expression: &HirExpr<'_>| {
+        let ExprKind::Path(path) = expression.kind else {
+            return None;
+        };
+        if path.root != PathRoot::Plain
+            || path.segments.len() != 1
+            || path.segments[0].args.is_some()
+            || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+        {
+            return None;
+        }
+        match locals.paths.get(&path.hir_id) {
+            Some(PathRes {
+                base: Res::Local(binding),
+                resolved_segments: 1,
+                segment_count: 1,
+            }) => Some(*binding),
+            _ => None,
+        }
+    };
+    let (Some(left_binding), Some(right_binding)) = (path_binding(left), path_binding(right))
+    else {
+        return false;
+    };
+    left_binding != right_binding
+        && ((left_binding == first_body_parameter.binding
+            && right_binding == second_body_parameter.binding)
+            || (left_binding == second_body_parameter.binding
+                && right_binding == first_body_parameter.binding))
 }
 
 fn check_function_if_literal_branches(
@@ -24502,6 +24614,61 @@ mod tests {
             let check = owner
                 .body_type_check()
                 .expect("unsupported negated condition is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_and_of_two_bool_parameters() {
+        let root = concat!(
+            "const OTHER: Bool = true\n",
+            "type BoolAlias = Bool\n",
+            "pub fn conjunction(flag: Bool, other: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
+            "pub fn reversed_conjunction(other: Bool, flag: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
+            "pub fn repeated_operand(flag: Bool, other: Bool) -> I32 { if flag and flag { 1 } else { 2 } }\n",
+            "pub fn other_binding(flag: Bool, other: Bool) -> I32 { if flag and OTHER { 1 } else { 2 } }\n",
+            "pub fn wrong_parameter_type(flag: I32, other: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
+            "pub fn aliased_parameter_type(flag: BoolAlias, other: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
+            "pub fn mutable_parameter(var flag: Bool, other: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
+            "pub fn self_parameter(self: Bool, other: Bool) -> I32 { if self and other { 1 } else { 2 } }\n",
+            "pub fn or_operator(flag: Bool, other: Bool) -> I32 { if flag or other { 1 } else { 2 } }\n",
+            "pub fn unary_operand(flag: Bool, other: Bool) -> I32 { if not flag and other { 1 } else { 2 } }\n",
+            "pub fn one_parameter(flag: Bool) -> I32 { if flag and true { 1 } else { 2 } }\n",
+            "pub fn three_parameters(flag: Bool, other: Bool, extra: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
+            "pub fn nonconditional_body(flag: Bool, other: Bool) -> I32 { flag }\n",
+            "pub fn missing_else(flag: Bool, other: Bool) -> I32 { if flag and other { 1 } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 14);
+
+        for index in [0, 1] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("both distinct bool parameter paths are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        for (index, owner) in owners.iter().enumerate().skip(2) {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported two-parameter form is gated");
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Unsupported),
                 "function owner {index} unexpectedly passed the bounded slice: {check:?}"
