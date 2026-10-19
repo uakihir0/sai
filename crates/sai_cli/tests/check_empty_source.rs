@@ -234,7 +234,6 @@ fn public_bool_parameter_not_if_function_emits_check_result() {
 fn unsupported_bool_parameter_negation_shapes_remain_gated() {
     for source in [
         "pub fn choose(flag: Bool) -> I32 { if not not flag { 1 } else { 2 } }\n",
-        "pub fn choose(flag: Bool) -> I32 { if flag == true { 1 } else { 2 } }\n",
         "pub fn choose(flag: Bool) -> I32 { if not flag { 1 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -321,6 +320,87 @@ fn unsupported_primitive_parameter_comparison_shapes_remain_gated() {
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
+}
+
+#[test]
+fn public_single_primitive_parameter_comparison_with_literal_emits_check_results() {
+    for source in [
+        "pub fn choose(value: Bool) -> I32 { if value == true { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8) -> I32 { if value < -128 { 1 } else { 2 } }\n",
+        "pub fn choose(value: U64) -> I32 { if value >= 10 { 1 } else { 2 } }\n",
+        "pub fn choose(value: F32) -> I32 { if value > 1.5 { 1 } else { 2 } }\n",
+        "pub fn choose(value: F64) -> I32 { if value <= 1.5 { 1 } else { 2 } }\n",
+        "pub fn choose(value: Char) -> I32 { if value < 'z' { 1 } else { 2 } }\n",
+        "pub fn choose(value: Byte) -> I32 { if value == b'Z' { 1 } else { 2 } }\n",
+        "pub fn choose(value: ISize) -> I32 { if value >= 0 { 1 } else { 2 } }\n",
+        "pub fn choose(value: USize) -> I32 { if value != 0 { 1 } else { 2 } }\n",
+        "pub fn choose(value: Int) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+        "pub fn choose(value: UInt) -> I32 { if value > 10 { 1 } else { 2 } }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn unsupported_single_parameter_comparison_literal_shapes_remain_gated() {
+    for source in [
+        "pub fn choose(value: I8) -> I32 { if 10 < value { 1 } else { 2 } }\n",
+        "const LIMIT: I8 = 10\npub fn choose(value: I8) -> I32 { if value < LIMIT { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8) -> I32 { if value < 1 + 2 { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8) -> I32 { if value < 1 and true { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8, other: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+        "type I8Alias = I8\npub fn choose(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+        "pub fn choose(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
+        "pub fn choose(value: ()) -> I32 { if value == () { 1 } else { 2 } }\n",
+        "pub fn choose(var value: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8) -> I32 { if value < 10 { 1 } }\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn comparison_literal_errors_report_condition_spans_before_branch_errors() {
+    let source = "pub fn choose(value: I8) -> I32 { if value < true { 1 } else { 2 } }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let condition_start = source.find("true").expect("condition literal exists");
+    let condition_end = condition_start + "true".len();
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && stdout.contains(&format!("\"start\":{{\"byte\":{condition_start},"))
+            && stdout.contains(&format!("\"end\":{{\"byte\":{condition_end},")),
+        "condition type mismatch must be reported at the literal without a feature gate:\n{stdout}"
+    );
+
+    let source = "pub fn choose(value: I8) -> I8 { if value < 128 { true } else { 128 } }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let condition_start = source.find("128").expect("condition integer exists");
+    let then_start = source.find("true").expect("then-branch literal exists");
+    let else_start = source.rfind("128").expect("else-branch integer exists");
+    let condition_position = stdout
+        .find(&format!("\"start\":{{\"byte\":{condition_start},"))
+        .expect("condition diagnostic span exists");
+    let then_position = stdout
+        .find(&format!("\"start\":{{\"byte\":{then_start},"))
+        .expect("then-branch diagnostic span exists");
+    let else_position = stdout
+        .find(&format!("\"start\":{{\"byte\":{else_start},"))
+        .expect("else-branch diagnostic span exists");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count() == 2
+            && stdout.matches("\"code\":\"TYPE_MISMATCH\"").count() == 1
+            && condition_position < then_position
+            && then_position < else_position
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "condition and then/else errors must retain source order without a feature gate:\n{stdout}"
+    );
 }
 
 #[test]
