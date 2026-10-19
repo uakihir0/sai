@@ -190,6 +190,13 @@ fn public_zero_parameter_direct_scalar_function_emits_check_result() {
 }
 
 #[test]
+fn public_zero_parameter_explicit_unit_function_emits_check_result() {
+    for source in ["pub fn empty() -> () {}\n", "pub fn unit() -> () { () }\n"] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
 fn zero_parameter_direct_scalar_type_errors_suppress_check_result() {
     for (source, expected_code, expected_message, literal) in [
         (
@@ -235,11 +242,13 @@ fn zero_parameter_direct_scalar_type_errors_suppress_check_result() {
 fn unsupported_zero_parameter_function_shapes_remain_gated() {
     for source in [
         "pub fn answer() { 42 }\n",
-        "pub fn answer() -> () { () }\n",
         "pub fn answer() -> Str { \"text\" }\n",
         "pub fn answer() -> Byte { b\"text\" }\n",
         "pub fn answer() -> I32 { 40 + 2 }\n",
         "pub fn answer() -> I32 { let value = 42; value }\n",
+        "pub fn answer() -> () { 42 }\n",
+        "pub fn answer() -> () { let value = (); }\n",
+        "pub fn answer() {}\n",
         "pub type Number = I32\npub fn answer() -> Number { 42 }\n",
         "@inline\npub fn answer() -> I32 { 42 }\n",
     ] {
