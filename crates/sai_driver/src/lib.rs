@@ -6068,7 +6068,19 @@ fn check_function_body_type(
             resolve_function_direct_type(*first.ty, type_paths, symbols, inputs);
         let second_parameter_type =
             resolve_function_direct_type(*second.ty, type_paths, symbols, inputs);
-        let parameter_types_are_supported = match cond.kind {
+        let (comparison_condition, condition_is_negated) = match cond.kind {
+            ExprKind::Unary(UnOp::Not, operand) => (operand, true),
+            _ => (cond, false),
+        };
+        let condition_is_comparison = matches!(
+            comparison_condition.kind,
+            ExprKind::Binary(
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+                _,
+                _
+            )
+        );
+        let parameter_types_are_supported = match comparison_condition.kind {
             ExprKind::Binary(BinOp::And | BinOp::Or, _, _) => {
                 let bool_type = Some(FunctionDirectType::Primitive(
                     sai_resolve::prelude::PrimTy::Bool,
@@ -6088,13 +6100,15 @@ fn check_function_body_type(
             ),
             _ => false,
         };
-        let condition_is_supported = function_if_binary_condition_uses_parameter_bindings(
-            cond,
-            first_body,
-            second_body,
-            locals,
-            inputs,
-        ) && parameter_types_are_supported;
+        let condition_is_supported = (!condition_is_negated || condition_is_comparison)
+            && function_if_binary_condition_uses_parameter_bindings(
+                comparison_condition,
+                first_body,
+                second_body,
+                locals,
+                inputs,
+            )
+            && parameter_types_are_supported;
         let Some(diagnostics) = check_function_if_literal_branches(
             owner,
             *return_ty,
@@ -25048,9 +25062,15 @@ mod tests {
             "pub fn unsigned_pointer(left: USize, right: USize) -> I32 { if left >= right { 1 } else { 2 } }\n",
             "pub fn builtin_int_alias(left: Int, right: Int) -> I32 { if left == right { 1 } else { 2 } }\n",
             "pub fn builtin_uint_alias(left: UInt, right: UInt) -> I32 { if left != right { 1 } else { 2 } }\n",
+            "pub fn negated_bool_comparison(left: Bool, right: Bool) -> I32 { if not (left < right) { 1 } else { 2 } }\n",
+            "pub fn negated_float_comparison(left: F32, right: F32) -> I32 { if not (right <= left) { 1 } else { 2 } }\n",
             "pub fn other_primitive_type(left: I32, right: U32) -> I32 { if left < right { 1 } else { 2 } }\n",
             "pub fn aliased_primitive_type(left: IntegerAlias, right: IntegerAlias) -> I32 { if left < right { 1 } else { 2 } }\n",
             "pub fn string_type(left: Str, right: Str) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn double_negated_comparison(left: Bool, right: Bool) -> I32 { if not not (left < right) { 1 } else { 2 } }\n",
+            "pub fn negated_and(left: Bool, right: Bool) -> I32 { if not (left and right) { 1 } else { 2 } }\n",
+            "pub fn negated_or(left: Bool, right: Bool) -> I32 { if not (left or right) { 1 } else { 2 } }\n",
+            "pub fn negated_mixed_comparison(left: Bool, right: Bool) -> I32 { if not (left < right and left) { 1 } else { 2 } }\n",
             "pub fn integer_and(left: I32, right: I32) -> I32 { if left and right { 1 } else { 2 } }\n",
             "pub fn integer_or(left: I32, right: I32) -> I32 { if left or right { 1 } else { 2 } }\n",
             "pub fn repeated_operand(left: Bool, right: Bool) -> I32 { if left == left { 1 } else { 2 } }\n",
@@ -25077,9 +25097,9 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 36);
+        assert_eq!(owners.len(), 42);
 
-        for index in 0..22 {
+        for index in 0..24 {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -25087,7 +25107,7 @@ mod tests {
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for (index, owner) in owners.iter().enumerate().skip(22) {
+        for (index, owner) in owners.iter().enumerate().skip(24) {
             let check = owner
                 .body_type_check()
                 .expect("unsupported comparison or operand form is gated");
