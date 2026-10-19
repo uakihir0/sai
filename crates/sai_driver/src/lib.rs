@@ -24749,6 +24749,7 @@ mod tests {
             "pub fn reversed_greater(left: Bool, right: Bool) -> I32 { if right > left { 1 } else { 2 } }\n",
             "pub fn greater_equal(left: Bool, right: Bool) -> I32 { if left >= right { 1 } else { 2 } }\n",
             "pub fn reversed_greater_equal(left: Bool, right: Bool) -> I32 { if right >= left { 1 } else { 2 } }\n",
+            "pub fn other_primitive_type(left: I32, right: I32) -> I32 { if left < right { 1 } else { 2 } }\n",
             "pub fn repeated_operand(left: Bool, right: Bool) -> I32 { if left == left { 1 } else { 2 } }\n",
             "pub fn other_binding(left: Bool, right: Bool) -> I32 { if left == OTHER { 1 } else { 2 } }\n",
             "pub fn non_path_operand(left: Bool, right: Bool) -> I32 { if left == true { 1 } else { 2 } }\n",
@@ -24773,7 +24774,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 21);
+        assert_eq!(owners.len(), 22);
 
         for index in 0..12 {
             assert!(matches!(
