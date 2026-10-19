@@ -6072,10 +6072,17 @@ fn check_function_body_type(
             ExprKind::Unary(UnOp::Not, operand) => (operand, true),
             _ => (cond, false),
         };
-        let condition_is_comparison = matches!(
+        let condition_is_supported_when_negated = matches!(
             comparison_condition.kind,
             ExprKind::Binary(
-                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+                BinOp::And
+                    | BinOp::Or
+                    | BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge,
                 _,
                 _
             )
@@ -6100,7 +6107,7 @@ fn check_function_body_type(
             ),
             _ => false,
         };
-        let condition_is_supported = (!condition_is_negated || condition_is_comparison)
+        let condition_is_supported = (!condition_is_negated || condition_is_supported_when_negated)
             && function_if_binary_condition_uses_parameter_bindings(
                 comparison_condition,
                 first_body,
@@ -25064,13 +25071,18 @@ mod tests {
             "pub fn builtin_uint_alias(left: UInt, right: UInt) -> I32 { if left != right { 1 } else { 2 } }\n",
             "pub fn negated_bool_comparison(left: Bool, right: Bool) -> I32 { if not (left < right) { 1 } else { 2 } }\n",
             "pub fn negated_float_comparison(left: F32, right: F32) -> I32 { if not (right <= left) { 1 } else { 2 } }\n",
+            "pub fn negated_and(left: Bool, right: Bool) -> I32 { if not (left and right) { 1 } else { 2 } }\n",
+            "pub fn negated_or(left: Bool, right: Bool) -> I32 { if not (right or left) { 1 } else { 2 } }\n",
             "pub fn other_primitive_type(left: I32, right: U32) -> I32 { if left < right { 1 } else { 2 } }\n",
             "pub fn aliased_primitive_type(left: IntegerAlias, right: IntegerAlias) -> I32 { if left < right { 1 } else { 2 } }\n",
             "pub fn string_type(left: Str, right: Str) -> I32 { if left == right { 1 } else { 2 } }\n",
             "pub fn double_negated_comparison(left: Bool, right: Bool) -> I32 { if not not (left < right) { 1 } else { 2 } }\n",
-            "pub fn negated_and(left: Bool, right: Bool) -> I32 { if not (left and right) { 1 } else { 2 } }\n",
-            "pub fn negated_or(left: Bool, right: Bool) -> I32 { if not (left or right) { 1 } else { 2 } }\n",
             "pub fn negated_mixed_comparison(left: Bool, right: Bool) -> I32 { if not (left < right and left) { 1 } else { 2 } }\n",
+            "pub fn double_negated_and(left: Bool, right: Bool) -> I32 { if not not (left and right) { 1 } else { 2 } }\n",
+            "pub fn double_negated_or(left: Bool, right: Bool) -> I32 { if not not (left or right) { 1 } else { 2 } }\n",
+            "pub fn chained_negated_and(left: Bool, right: Bool) -> I32 { if not (left and right and left) { 1 } else { 2 } }\n",
+            "pub fn chained_negated_or(left: Bool, right: Bool) -> I32 { if not (left or right or left) { 1 } else { 2 } }\n",
+            "pub fn negated_repeated_operand(left: Bool, right: Bool) -> I32 { if not (left and left) { 1 } else { 2 } }\n",
             "pub fn integer_and(left: I32, right: I32) -> I32 { if left and right { 1 } else { 2 } }\n",
             "pub fn integer_or(left: I32, right: I32) -> I32 { if left or right { 1 } else { 2 } }\n",
             "pub fn repeated_operand(left: Bool, right: Bool) -> I32 { if left == left { 1 } else { 2 } }\n",
@@ -25097,17 +25109,18 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 42);
+        assert_eq!(owners.len(), 47);
 
-        for index in 0..24 {
-            assert!(matches!(
-                owners[index]
-                    .body_type_check()
-                    .expect("all same-primitive comparisons and operand orders are checked"),
-                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
-            ));
+        for index in 0..26 {
+            let check = owners[index]
+                .body_type_check()
+                .expect("all same-primitive comparisons and operand orders are checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the supported comparison slice: {check:?}"
+            );
         }
-        for (index, owner) in owners.iter().enumerate().skip(24) {
+        for (index, owner) in owners.iter().enumerate().skip(26) {
             let check = owner
                 .body_type_check()
                 .expect("unsupported comparison or operand form is gated");
