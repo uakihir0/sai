@@ -329,6 +329,8 @@ fn public_single_primitive_parameter_comparison_with_literal_emits_check_results
         "pub fn choose(value: Bool) -> I32 { if false < value { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if value < -128 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < value { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8) -> I32 { if not (value < 10) { 1 } else { 2 } }\n",
+        "pub fn choose(value: F32) -> I32 { if not (1.5 < value) { 1 } else { 2 } }\n",
         "pub fn choose(value: U64) -> I32 { if value >= 10 { 1 } else { 2 } }\n",
         "pub fn choose(value: F32) -> I32 { if value > 1.5 { 1 } else { 2 } }\n",
         "pub fn choose(value: F32) -> I32 { if 1.5 < value { 1 } else { 2 } }\n",
@@ -356,7 +358,10 @@ fn unsupported_single_parameter_comparison_literal_shapes_remain_gated() {
         "pub fn choose(value: I8) -> I32 { if value < 1 and true { 1 } else { 2 } }\n",
         "pub fn choose(value: I8, other: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
         "pub fn choose(value: I8, other: I8) -> I32 { if 10 < value { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8, other: I8) -> I32 { if not (10 < value) { 1 } else { 2 } }\n",
         "pub fn choose(value: I8) -> I32 { if 10 < other { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8) -> I32 { if not not (value < 10) { 1 } else { 2 } }\n",
+        "pub fn choose(value: I8) -> I32 { if not (value < 1 and true) { 1 } else { 2 } }\n",
         "type I8Alias = I8\npub fn choose(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
         "pub fn choose(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
         "pub fn choose(value: ()) -> I32 { if value == () { 1 } else { 2 } }\n",
@@ -411,7 +416,7 @@ fn comparison_literal_errors_report_condition_spans_before_branch_errors() {
         );
     }
 
-    let source = "pub fn choose(value: I8) -> I8 { if 128 > value { true } else { 128 } }\n";
+    let source = "pub fn choose(value: I8) -> I8 { if not (128 < value) { true } else { 128 } }\n";
     let output = run_check(source, "", &[], &[]);
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     let condition_start = source.find("128").expect("condition integer exists");
