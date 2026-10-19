@@ -2726,19 +2726,38 @@ fn fetch_locked_commit(
                     }
                 }
             } else {
+                #[cfg(test)]
+                eprintln!(
+                    "unclassified locked package commit fetch error for {commit_id}: {error:#?}"
+                );
                 map_transport_error_for_fetch(error)
             }
         })
 }
 
 fn is_locked_commit_unavailable(error: &gix::remote::fetch::Error) -> bool {
-    let gix::remote::fetch::Error::Fetch(gix::protocol::fetch::Error::FetchResponse(
+    if let gix::remote::fetch::Error::Fetch(gix::protocol::fetch::Error::FetchResponse(
         gix::protocol::fetch::response::Error::UploadPack(packetline_error),
     )) = error
-    else {
-        return false;
-    };
-    is_missing_object_message(packetline_error.message.as_bstr())
+    {
+        return is_missing_object_message(packetline_error.message.as_bstr());
+    }
+
+    let mut source: Option<&(dyn StdError + 'static)> = Some(error);
+    while let Some(error) = source {
+        if let Some(packetline_error) =
+            error.downcast_ref::<gix_transport::packetline::read::Error>()
+        {
+            return is_missing_object_message(packetline_error.message.as_bstr());
+        }
+        source = error.source().or_else(|| {
+            error
+                .downcast_ref::<std::io::Error>()
+                .and_then(|io_error| io_error.get_ref())
+                .map(|source| source as &(dyn StdError + 'static))
+        });
+    }
+    false
 }
 
 fn is_missing_object_message(message: &BStr) -> bool {
@@ -3326,6 +3345,43 @@ mod tests {
                 "unexpected missing-object classification for {message:?}"
             );
         }
+    }
+
+    #[test]
+    fn missing_object_classification_follows_wrapped_packetline_errors() {
+        let packetline_error = gix_transport::packetline::read::Error {
+            message: "upload-pack: not our ref ffffffffffffffffffffffffffffffffffffffff".into(),
+        };
+        let error = gix::remote::fetch::Error::Fetch(gix::protocol::fetch::Error::FetchResponse(
+            gix::protocol::fetch::response::Error::Io(std::io::Error::other(packetline_error)),
+        ));
+
+        assert!(super::is_locked_commit_unavailable(&error));
+    }
+
+    #[test]
+    fn missing_object_classification_accepts_upload_pack_error_variant() {
+        let error = gix::remote::fetch::Error::Fetch(gix::protocol::fetch::Error::FetchResponse(
+            gix::protocol::fetch::response::Error::UploadPack(
+                gix_transport::packetline::read::Error {
+                    message: "upload-pack: not our ref ffffffffffffffffffffffffffffffffffffffff"
+                        .into(),
+                },
+            ),
+        ));
+
+        assert!(super::is_locked_commit_unavailable(&error));
+    }
+
+    #[test]
+    fn missing_object_classification_rejects_generic_fetch_io_errors() {
+        let error = gix::remote::fetch::Error::Fetch(gix::protocol::fetch::Error::FetchResponse(
+            gix::protocol::fetch::response::Error::Io(std::io::Error::other(
+                "authentication failed",
+            )),
+        ));
+
+        assert!(!super::is_locked_commit_unavailable(&error));
     }
 
     fn source_byte_span(source: &[u8], text: &[u8]) -> Range<usize> {
