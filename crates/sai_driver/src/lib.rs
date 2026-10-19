@@ -51289,6 +51289,293 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
+    fn generated_wit_resource_members_reference_prior_local_interfaces_only() {
+        fn find_item<'a>(
+            interface: &'a sai_wit::WitInterface,
+            name: &str,
+        ) -> (sai_wit::WitItemIdx, &'a sai_wit::WitItem) {
+            interface
+                .items
+                .iter_enumerated()
+                .find(|(_, item)| item.name == name)
+                .unwrap_or_else(|| panic!("the parsed `{name}` item remains"))
+        }
+
+        let source = concat!(
+            "interface early {\n",
+            "  resource Future {\n",
+            "    fn fail(self: borrow Self, value: types.Id)\n",
+            "  }\n",
+            "  fn take_future(value: Future)\n",
+            "  resource Keep {}\n",
+            "}\n",
+            "interface types {\n",
+            "  type Hidden = USize\n",
+            "  type Id = U64\n",
+            "  type Payload { value: U32 }\n",
+            "  resource Other {}\n",
+            "}\n",
+            "interface api {\n",
+            "  resource Handle {\n",
+            "    fn round_trip(self: borrow Self, value: types.Payload, handle_value: types.Other, borrowed: borrow types.Other) -> types.Id\n",
+            "    fn new(value: types.Payload) -> Self\n",
+            "    fn from_prior(handle_value: types.Other) -> types.Id\n",
+            "  }\n",
+            "  resource Missing {\n",
+            "    fn fail(self: borrow Self, value: types.Hidden)\n",
+            "  }\n",
+            "  fn take_handle(value: Handle)\n",
+            "  fn take_missing(value: Missing)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("cross-interface resource members remain queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning unsupported resource members leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "later-interface and omitted-type resource targets remain incomplete"
+        );
+        assert!(generated.text.contains("resource keep;"));
+        assert!(generated.text.contains("type id = u64;"));
+        assert!(generated.text.contains("record payload {"));
+        assert!(generated.text.contains("resource other;"));
+        assert!(generated.text.contains("use types.{id, other, payload};"));
+        assert!(generated.text.contains("resource handle {"));
+        assert!(generated.text.contains("round-trip: func("));
+        assert!(generated.text.contains("constructor(value: payload);"));
+        assert!(
+            generated
+                .text
+                .contains("from-prior: static func(handle-value: other) -> id;"),
+            "{}",
+            generated.text
+        );
+        assert!(generated.text.contains("take-handle: func(value: handle);"));
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("resource future"));
+        assert!(!generated.text.contains("take-future:"));
+        assert!(!generated.text.contains("type hidden ="));
+        assert!(!generated.text.contains("resource missing"));
+        assert!(!generated.text.contains("take-missing:"));
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let root = package_model.root();
+        let (types_index, types) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "types")
+            .expect("the earlier interface with supported targets remains");
+        let (id_index, _) = find_item(types, "id");
+        let (payload_index, _) = find_item(types, "payload");
+        let (other_index, other) = find_item(types, "other");
+        assert!(matches!(other.kind, sai_wit::WitItemKind::Resource(_)));
+        assert_eq!(
+            types
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "payload", "other"],
+            "the unsupported prior item is removed and target indices compact"
+        );
+
+        let early = root
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "early")
+            .expect("the earlier interface with its independent resource remains");
+        assert_eq!(
+            early
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["keep"],
+            "a resource member cannot reference a later interface"
+        );
+
+        let (api_index, api) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "api")
+            .expect("the consuming interface remains");
+        let (handle_index, handle) = find_item(api, "handle");
+        let sai_wit::WitItemKind::Resource(members) = &handle.kind else {
+            panic!("the resource with supported cross-interface members remains");
+        };
+        let member_reference = |ty: &sai_wit::WitType, expected_name: &str| match ty {
+            sai_wit::WitType::Named(reference)
+            | sai_wit::WitType::Own(reference)
+            | sai_wit::WitType::Borrow(reference) => {
+                assert_eq!(reference.interface.unit, unit);
+                assert_eq!(reference.interface.interface, api_index);
+                assert_eq!(reference.interface.name, "api");
+                assert_eq!(reference.item_name, expected_name);
+                reference.item
+            }
+            _ => panic!("the member type refers to its local `{expected_name}` import"),
+        };
+        let (id_import_index, id_import) = find_item(api, "id");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(id_target)) = &id_import.kind
+        else {
+            panic!("the local id import retains a named type target");
+        };
+        assert_eq!(id_target.interface.unit, unit);
+        assert_eq!(id_target.interface.interface, types_index);
+        assert_eq!(id_target.item, id_index);
+        assert_eq!(id_target.item_name, "id");
+        let (payload_import_index, payload_import) = find_item(api, "payload");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(payload_target)) =
+            &payload_import.kind
+        else {
+            panic!("the local payload import retains a named type target");
+        };
+        assert_eq!(payload_target.interface.unit, unit);
+        assert_eq!(payload_target.interface.interface, types_index);
+        assert_eq!(payload_target.item, payload_index);
+        assert_eq!(payload_target.item_name, "payload");
+        let (other_import_index, other_import) = find_item(api, "other");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(other_target)) = &other_import.kind
+        else {
+            panic!("the local resource import retains its owned target");
+        };
+        assert_eq!(other_target.interface.unit, unit);
+        assert_eq!(other_target.interface.interface, types_index);
+        assert_eq!(other_target.item, other_index);
+        assert_eq!(other_target.item_name, "other");
+
+        let method = members
+            .iter()
+            .find(|member| member.name == "round-trip")
+            .expect("the resource method with external types remains");
+        assert_eq!(method.kind, sai_wit::WitMemberKind::Method);
+        assert_eq!(
+            member_reference(&method.func.params[0].1, "handle"),
+            handle_index,
+            "the method keeps the current resource receiver"
+        );
+        assert_eq!(
+            member_reference(&method.func.params[1].1, "payload"),
+            payload_import_index
+        );
+        assert_eq!(
+            member_reference(&method.func.params[2].1, "other"),
+            other_import_index
+        );
+        assert_eq!(
+            member_reference(&method.func.params[3].1, "other"),
+            other_import_index
+        );
+        assert_eq!(
+            member_reference(
+                method
+                    .func
+                    .result
+                    .as_ref()
+                    .expect("the method result remains"),
+                "id"
+            ),
+            id_import_index
+        );
+        assert!(matches!(
+            method.func.params[0].1,
+            sai_wit::WitType::Borrow(_)
+        ));
+        assert!(matches!(method.func.params[2].1, sai_wit::WitType::Own(_)));
+        assert!(matches!(
+            method.func.params[3].1,
+            sai_wit::WitType::Borrow(_)
+        ));
+
+        let constructor = members
+            .iter()
+            .find(|member| member.kind == sai_wit::WitMemberKind::Constructor)
+            .expect("the constructor remains");
+        assert_eq!(
+            member_reference(&constructor.func.params[0].1, "payload"),
+            payload_import_index
+        );
+        let sai_wit::WitType::Own(constructor_result) = constructor
+            .func
+            .result
+            .as_ref()
+            .expect("the constructor has its implicit owned result")
+        else {
+            panic!("the constructor still returns the current resource");
+        };
+        assert_eq!(constructor_result.interface.unit, unit);
+        assert_eq!(constructor_result.interface.interface, api_index);
+        assert_eq!(constructor_result.item, handle_index);
+        assert_eq!(constructor_result.item_name, "handle");
+
+        let static_member = members
+            .iter()
+            .find(|member| member.name == "from-prior")
+            .expect("the static member with earlier-interface types remains");
+        assert_eq!(static_member.kind, sai_wit::WitMemberKind::Static);
+        assert_eq!(
+            member_reference(&static_member.func.params[0].1, "other"),
+            other_import_index
+        );
+        assert_eq!(
+            member_reference(
+                static_member
+                    .func
+                    .result
+                    .as_ref()
+                    .expect("the static result remains"),
+                "id"
+            ),
+            id_import_index
+        );
+
+        let (_, take_handle) = find_item(api, "take-handle");
+        let sai_wit::WitItemKind::Func(take_handle) = &take_handle.kind else {
+            panic!("the handle consumer function remains");
+        };
+        assert_eq!(
+            member_reference(&take_handle.params[0].1, "handle"),
+            handle_index
+        );
+    }
+
+    #[test]
     fn generated_wit_aliases_reference_prior_local_interfaces_only() {
         let source = concat!(
             "interface early {\n",
@@ -53215,6 +53502,10 @@ interface facade { use middle.{payload}; }"#;
             "  fn read_record(value: RecordHandle)\n",
             "  enum VariantHandle { Wrapped(first.Safe) }\n",
             "  fn read_variant(value: VariantHandle)\n",
+            "  resource ResourceHandle {\n",
+            "    fn lookup(self: borrow Self, value: first.Safe)\n",
+            "  }\n",
+            "  fn read_resource(value: ResourceHandle)\n",
             "  fn independent(value: U32)\n",
             "}\n",
             "world server {\n",
@@ -53269,6 +53560,8 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("read-record:"));
         assert!(!generated.text.contains("variant variant-handle"));
         assert!(!generated.text.contains("read-variant:"));
+        assert!(!generated.text.contains("resource resource-handle"));
+        assert!(!generated.text.contains("read-resource:"));
         assert!(generated.text.contains("interface public"));
         assert!(generated.text.contains("independent: func(value: u32)"));
         assert!(!generated.text.contains("import first;"));

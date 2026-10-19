@@ -3180,6 +3180,12 @@ fn collect_interface_uses_input(
                 ));
             }
             let mut resource_named_type_references = generated_named_type_references.clone();
+            // Keep prior-interface references local to resource-member signatures.
+            resource_named_type_references.extend(
+                generated_local_type_references
+                    .iter()
+                    .map(|(definition, reference)| (*definition, reference.clone())),
+            );
             if let Some(resource_item) = staged_resource_item.as_ref()
                 && !generated_item_names.contains(&resource_item.name)
                 && let (Some(unit), Some(interface_index), Some(interface_name)) = (
