@@ -155,6 +155,81 @@ fn direct_parameter_return_type_mismatch_suppresses_check_result() {
 }
 
 #[test]
+fn public_zero_parameter_direct_scalar_function_emits_check_result() {
+    for source in [
+        "pub fn answer() -> I32 { 42 }\n",
+        "pub fn ready() -> Bool { true }\n",
+        "pub fn letter() -> Char { 'z' }\n",
+        "pub fn marker() -> Byte { b'z' }\n",
+        "pub fn ratio() -> F32 { -1.25 }\n",
+        "pub fn minimum() -> I8 { -128 }\n",
+        "pub fn builtin_int_alias() -> Int { 42 }\n",
+        "pub fn builtin_uint_alias() -> UInt { 42 }\n",
+        "pub fn pointer_size() -> USize { 4294967295 }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn zero_parameter_direct_scalar_type_errors_suppress_check_result() {
+    for (source, expected_code, expected_message, literal) in [
+        (
+            "pub fn answer() -> Bool { 42 }\n",
+            "TYPE_MISMATCH",
+            "expected `Bool`, found an integer literal",
+            "42",
+        ),
+        (
+            "pub fn answer() -> I8 { 128 }\n",
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `I8`",
+            "128",
+        ),
+        (
+            "pub fn answer() -> USize { 4294967296 }\n",
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `USize`",
+            "4294967296",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{expected_code}\""))
+                && stdout.contains(expected_message)
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected {expected_code} without a result or feature gate:\n{stdout}"
+        );
+        let literal_start = source.find(literal).expect("literal exists");
+        let literal_end = literal_start + literal.len();
+        assert!(
+            stdout.contains(&format!("\"start\":{{\"byte\":{literal_start},"))
+                && stdout.contains(&format!("\"end\":{{\"byte\":{literal_end},")),
+            "{source:?}: the diagnostic must cover the direct literal:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn unsupported_zero_parameter_function_shapes_remain_gated() {
+    for source in [
+        "pub fn answer() { 42 }\n",
+        "pub fn answer() -> () { () }\n",
+        "pub fn answer() -> Str { \"text\" }\n",
+        "pub fn answer() -> Byte { b\"text\" }\n",
+        "pub fn answer() -> I32 { 40 + 2 }\n",
+        "pub fn answer() -> I32 { let value = 42; value }\n",
+        "pub type Number = I32\npub fn answer() -> Number { 42 }\n",
+        "@inline\npub fn answer() -> I32 { 42 }\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn non_ascii_public_function_name_reports_its_hard_diagnostic() {
     let source = "pub fn identité(value: I32) -> I32 { value }\n";
     let output = run_check(source, "", &[], &[]);
