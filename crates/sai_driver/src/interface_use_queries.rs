@@ -3113,6 +3113,14 @@ fn collect_interface_uses_input(
                     .map(|(definition, reference)| (*definition, reference.clone())),
             );
         }
+        // Add Used facades only after sibling maps have been cloned so this extension
+        // remains alias-definition-only (ordinary functions have their own map).
+        generated_alias_definition_type_references.extend(
+            foreign_interface_used_type_references
+                .by_definition
+                .iter()
+                .map(|(definition, reference)| (*definition, reference.clone())),
+        );
         for (member_index, (entry, member_owner)) in member_entries
             .into_iter()
             .zip(parent_members.iter().copied())
