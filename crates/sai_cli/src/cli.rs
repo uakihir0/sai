@@ -463,6 +463,7 @@ fn run_check(
     let mut root_package_key = None;
     let mut package_header_span = None;
     let mut manifest_source = None;
+    let mut empty_root_module_only_covered = false;
     let include_source_lines = parsed.globals.format == OutputFormat::Human;
 
     let manifest_path = package_root.join("sai.package");
@@ -823,7 +824,7 @@ fn run_check(
     let mut dependency_sources_parsed = false;
     let mut missing_root_module_tree_input = None;
 
-    if let Some(manifest) = parsed_manifest {
+    if let Some(manifest) = parsed_manifest.as_ref() {
         let declared_source = manifest.file().declarations.iter().find_map(|declaration| {
             if let sai_package::manifest::PackageDeclaration::Source(source) = &declaration.value {
                 Some(source.as_ref())
@@ -1265,7 +1266,7 @@ fn run_check(
                                         target_cfg.as_ref(),
                                         package_graph.take(),
                                     );
-                                    push_module_tree_check_result(
+                                    empty_root_module_only_covered = push_module_tree_check_result(
                                         &mut diagnostics,
                                         &mut total_errors,
                                         &mut total_warnings,
@@ -1562,7 +1563,7 @@ fn run_check(
             dependency_target_cfg.as_ref(),
             package_graph.take(),
         );
-        push_module_tree_check_result(
+        empty_root_module_only_covered = push_module_tree_check_result(
             &mut diagnostics,
             &mut total_errors,
             &mut total_warnings,
@@ -1585,7 +1586,7 @@ fn run_check(
             dependency_target_cfg.as_ref(),
             package_graph.take(),
         );
-        push_module_tree_check_result(
+        empty_root_module_only_covered = push_module_tree_check_result(
             &mut diagnostics,
             &mut total_errors,
             &mut total_warnings,
@@ -1649,6 +1650,92 @@ fn run_check(
     if cancellation.is_cancelled() {
         return report_interrupted(parsed, stdout, stderr);
     }
+
+    let tail = command_tail(command);
+    let analyzes_tests = tail.iter().any(|(argument, _)| argument == "--tests");
+    let applies_fixes = tail.iter().any(|(argument, _)| argument == "--fix");
+    let empty_root_manifest_supported = parsed_manifest
+        .as_ref()
+        .is_some_and(check_manifest_supports_empty_root_success);
+    let target = check_target_override(command).or_else(|| {
+        parsed_manifest
+            .as_ref()
+            .and_then(|manifest| manifest_target_names(manifest).into_iter().next())
+    });
+    let profile = check_profile_override(command).unwrap_or_else(|| "dev".to_owned());
+    let mut empty_root_manifest_semantically_valid = false;
+    if empty_root_module_only_covered
+        && empty_root_manifest_supported
+        && let (Some(manifest), Some(source)) = (parsed_manifest.as_ref(), manifest_source.as_ref())
+    {
+        let toolchain_version = sai_package::version::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("the CLI package version is a valid language version");
+        let validation = sai_package::validation::validate(
+            manifest,
+            sai_package::validation::PackageValidationContext {
+                compiler_version: Some(&toolchain_version),
+            },
+        );
+        empty_root_manifest_semantically_valid =
+            validation.errors.is_empty() && validation.warnings.is_empty();
+        let (semantic_diagnostics, errors, warnings) = package_validation_check_diagnostics(
+            source,
+            &manifest_display_path,
+            &validation,
+            root_identity.as_deref(),
+            include_source_lines,
+        );
+        diagnostics.extend(semantic_diagnostics);
+        total_errors = total_errors.saturating_add(errors);
+        total_warnings = total_warnings.saturating_add(warnings);
+    }
+    let supports_empty_root_success = empty_root_module_only_covered
+        && empty_root_manifest_supported
+        && empty_root_manifest_semantically_valid
+        && target.as_deref() == Some("wasm32-core")
+        && profile == "dev"
+        && !check_locked_mode(command)
+        && !analyzes_tests
+        && !applies_fixes
+        && total_errors == 0
+        && diagnostics.is_empty();
+
+    if supports_empty_root_success {
+        let Some(target) = target else {
+            diagnostics.push(check_incomplete_diagnostic(command));
+            total_errors = total_errors.saturating_add(1);
+            return report_check_diagnostics(
+                parsed,
+                diagnostics,
+                total_errors,
+                total_warnings,
+                total_infos,
+                root_identity.as_deref(),
+                stdout,
+                stderr,
+            );
+        };
+        let result = CheckSuccessRecord {
+            target,
+            profile,
+            tests: false,
+            packages: 1,
+            fixes_applied: 0,
+            changed_files: Vec::new(),
+        };
+        return report_check_outcome(
+            parsed,
+            diagnostics,
+            total_errors,
+            total_warnings,
+            total_infos,
+            root_identity.as_deref(),
+            Some(&result),
+            stdout,
+            stderr,
+        );
+    }
+
     diagnostics.push(check_incomplete_diagnostic(command));
     total_errors = total_errors.saturating_add(1);
     report_check_diagnostics(
@@ -1753,6 +1840,23 @@ fn manifest_target_names(manifest: &sai_package::manifest::PackageParseOutput) -
             }
         })
         .unwrap_or_default()
+}
+
+fn check_manifest_supports_empty_root_success(
+    manifest: &sai_package::manifest::PackageParseOutput,
+) -> bool {
+    manifest.file().declarations.iter().all(|declaration| {
+        matches!(
+            &declaration.value,
+            sai_package::manifest::PackageDeclaration::Compiler(_)
+                | sai_package::manifest::PackageDeclaration::Source(_)
+                | sai_package::manifest::PackageDeclaration::Targets(_)
+                | sai_package::manifest::PackageDeclaration::Description(_)
+                | sai_package::manifest::PackageDeclaration::License(_)
+                | sai_package::manifest::PackageDeclaration::Repository(_)
+                | sai_package::manifest::PackageDeclaration::Authors(_)
+        )
+    })
 }
 
 fn check_target_override(command: &crate::args::ParsedCommand) -> Option<String> {
@@ -4607,6 +4711,23 @@ struct CheckModuleTreePackageInput {
     analyzes_tests: bool,
 }
 
+struct CheckWorkspaceDiagnostics {
+    diagnostics: Vec<CheckDiagnostic>,
+    errors: usize,
+    warnings: usize,
+    infos: usize,
+    empty_root_module_only_covered: bool,
+}
+
+struct CheckSuccessRecord {
+    target: String,
+    profile: String,
+    tests: bool,
+    packages: usize,
+    fixes_applied: usize,
+    changed_files: Vec<String>,
+}
+
 struct MissingSourceModuleTreeInput<'a> {
     package_key: &'a str,
     source_directory: &'a str,
@@ -4881,22 +5002,45 @@ fn module_tree_workspace_check_diagnostics(
     include_source_lines: bool,
     target_cfg: Option<&TargetCfg>,
     package_graph: Option<sai_driver::package_graph::PackageGraph>,
-) -> Result<(Vec<CheckDiagnostic>, usize, usize, usize), String> {
+) -> Result<CheckWorkspaceDiagnostics, String> {
     let workspace_limits = CheckWorkspaceSourceBudget::default().snapshot_limits();
     if check_module_tree_workspace_exceeds_limits(inputs, workspace_limits)
         && let Some(input) = inputs.first()
     {
-        return Ok((
-            vec![check_dependency_source_error(
+        return Ok(CheckWorkspaceDiagnostics {
+            diagnostics: vec![check_dependency_source_error(
                 "IMPLEMENTATION_LIMIT_EXCEEDED",
                 "combined root and active dependency sources exceed the supported workspace snapshot limits",
                 &input.package_identity,
             )],
-            1,
-            0,
-            0,
-        ));
+            errors: 1,
+            warnings: 0,
+            infos: 0,
+            empty_root_module_only_covered: false,
+        });
     }
+    let mut empty_root_module_only_covered = inputs.len() == 1
+        && inputs[0].is_root_package
+        && !inputs[0].analyzes_tests
+        && !inputs[0].inspection_incomplete
+        && inputs[0].source_directory_exists
+        && inputs[0].source_inputs.len() == 1
+        && package_manifests.len() == 1
+        && package_manifests[0].role == sai_package::manifest::PackageRole::Root
+        && wit_packages.is_empty()
+        && package_graph.is_none()
+        && target_cfg.is_some()
+        && inputs[0]
+            .source_inputs
+            .first()
+            .is_some_and(|(path, _, source)| {
+                let root_source_path = if inputs[0].source_directory == "." {
+                    "lib.sai".to_owned()
+                } else {
+                    format!("{}/lib.sai", inputs[0].source_directory)
+                };
+                path == &root_source_path && source.is_empty()
+            });
     let mut database = RootDatabase::new()
         .map_err(|error| format!("could not initialize query database: {error:?}"))?;
     let package_graph_for_scopes = package_graph.clone();
@@ -5009,6 +5153,11 @@ fn module_tree_workspace_check_diagnostics(
         let module_tree = database
             .module_tree(*package_id, source_directory.clone(), Some(package_field))
             .map_err(|error| format!("module-tree query failed: {error:?}"))?;
+        if input.is_root_package
+            && (module_tree.modules.len() != 1 || !module_tree.diagnostics.is_empty())
+        {
+            empty_root_module_only_covered = false;
+        }
 
         let mut source_by_key = HashMap::new();
         source_by_key.insert(
@@ -5099,6 +5248,9 @@ fn module_tree_workspace_check_diagnostics(
         }
     }
     let has_source_files = !workspace_files.is_empty();
+    if complete_packages.len() != 1 || !complete_packages.first().copied().unwrap_or(false) {
+        empty_root_module_only_covered = false;
+    }
     workspace_files.extend(manifest_snapshot_files);
     let workspace_snapshot = if workspace_files.is_empty() {
         None
@@ -5368,6 +5520,15 @@ fn module_tree_workspace_check_diagnostics(
             }
             .map_err(|error| format!("Phase 1 collection failed: {error:?}"))?;
             let phase1 = collection.scopes();
+            if input.is_root_package
+                && (!phase1.top_level_owners.is_empty()
+                    || phase1
+                        .modules
+                        .iter()
+                        .any(|module| !module.imports.is_empty()))
+            {
+                empty_root_module_only_covered = false;
+            }
             let (phase1_diagnostics, phase1_errors, phase1_warnings, phase1_infos) =
                 phase1_check_diagnostics(
                     &phase1.diagnostics,
@@ -5957,7 +6118,13 @@ fn module_tree_workspace_check_diagnostics(
             }
         }
     }
-    Ok((diagnostics, errors, warnings, infos))
+    Ok(CheckWorkspaceDiagnostics {
+        diagnostics,
+        errors,
+        warnings,
+        infos,
+        empty_root_module_only_covered,
+    })
 }
 
 fn active_source_member_packages_for(
@@ -6195,15 +6362,16 @@ fn push_module_tree_check_result(
     total_error_count: &mut usize,
     total_warning_count: &mut usize,
     total_info_count: &mut usize,
-    result: Result<(Vec<CheckDiagnostic>, usize, usize, usize), String>,
+    result: Result<CheckWorkspaceDiagnostics, String>,
     package_identity: Option<&str>,
-) {
+) -> bool {
     match result {
-        Ok((tree_diagnostics, errors, warnings, infos)) => {
-            diagnostics.extend(tree_diagnostics);
-            *total_error_count = total_error_count.saturating_add(errors);
-            *total_warning_count = total_warning_count.saturating_add(warnings);
-            *total_info_count = total_info_count.saturating_add(infos);
+        Ok(result) => {
+            diagnostics.extend(result.diagnostics);
+            *total_error_count = total_error_count.saturating_add(result.errors);
+            *total_warning_count = total_warning_count.saturating_add(result.warnings);
+            *total_info_count = total_info_count.saturating_add(result.infos);
+            result.empty_root_module_only_covered
         }
         Err(error) => {
             diagnostics.push(check_diagnostic_with_package(
@@ -6214,6 +6382,7 @@ fn push_module_tree_check_result(
                 package_identity,
             ));
             *total_error_count = total_error_count.saturating_add(1);
+            false
         }
     }
 }
@@ -6332,6 +6501,75 @@ fn package_manifest_check_diagnostics(
             .saturating_add(parsed.error_count()),
         parsed.warnings().len(),
     )
+}
+
+fn package_validation_check_diagnostics(
+    source: &Arc<[u8]>,
+    source_path: &str,
+    validation: &sai_package::validation::PackageValidationOutput,
+    package_identity: Option<&str>,
+    include_source_lines: bool,
+) -> (Vec<CheckDiagnostic>, usize, usize) {
+    let mut source_index = CliSourceIndex::new(Arc::clone(source));
+    let mut diagnostics = Vec::with_capacity(validation.errors.len() + validation.warnings.len());
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    for error in &validation.errors {
+        let (code, message) = check_package_validation_fields(&error.kind);
+        diagnostics.push(CheckDiagnostic {
+            diagnostic: cli_source_diagnostic(
+                &mut source_index,
+                FmtDiagnosticSource {
+                    path: source_path,
+                    include_source_line: include_source_lines,
+                },
+                code,
+                message,
+                error.span.clone(),
+                None,
+                None,
+            ),
+            severity: sai_diagnostics::Severity::Error,
+            package: package_identity.map(str::to_owned),
+            related: Vec::new(),
+            children: Vec::new(),
+        });
+        errors = errors.saturating_add(1);
+    }
+    for warning in &validation.warnings {
+        let (code, message) = match warning.kind {
+            sai_package::validation::PackageValidationWarningKind::VersionRequirementSpansLines => {
+                (
+                    "VERSION_REQ_SPANS_LINES",
+                    "package version requirement admits stable versions outside its compatibility line",
+                )
+            }
+            sai_package::validation::PackageValidationWarningKind::InvalidLicenseExpression => (
+                "INVALID_LICENSE_EXPRESSION",
+                "`license` is not a valid SPDX expression",
+            ),
+        };
+        diagnostics.push(CheckDiagnostic {
+            diagnostic: cli_source_diagnostic(
+                &mut source_index,
+                FmtDiagnosticSource {
+                    path: source_path,
+                    include_source_line: include_source_lines,
+                },
+                code,
+                message.to_owned(),
+                warning.span.clone(),
+                None,
+                None,
+            ),
+            severity: sai_diagnostics::Severity::Warning,
+            package: package_identity.map(str::to_owned),
+            related: Vec::new(),
+            children: Vec::new(),
+        });
+        warnings = warnings.saturating_add(1);
+    }
+    (diagnostics, errors, warnings)
 }
 
 fn check_source_diagnostics(
@@ -6493,11 +6731,35 @@ fn check_incomplete_diagnostic(command: &crate::args::ParsedCommand) -> CheckDia
 
 fn report_check_diagnostics(
     parsed: &ParsedArgs,
+    diagnostics: Vec<CheckDiagnostic>,
+    total_error_count: usize,
+    total_warning_count: usize,
+    total_info_count: usize,
+    root_identity: Option<&str>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    report_check_outcome(
+        parsed,
+        diagnostics,
+        total_error_count,
+        total_warning_count,
+        total_info_count,
+        root_identity,
+        None,
+        stdout,
+        stderr,
+    )
+}
+
+fn report_check_outcome(
+    parsed: &ParsedArgs,
     mut diagnostics: Vec<CheckDiagnostic>,
     total_error_count: usize,
     total_warning_count: usize,
     total_info_count: usize,
     root_identity: Option<&str>,
+    result_record: Option<&CheckSuccessRecord>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -6526,6 +6788,8 @@ fn report_check_diagnostics(
         .any(|diagnostic| diagnostic.diagnostic.code == "NO_PACKAGE_FOUND")
     {
         2
+    } else if result_record.is_some() && total_error_count == 0 {
+        0
     } else {
         1
     };
@@ -6581,6 +6845,9 @@ fn report_check_diagnostics(
             let result = (|| -> io::Result<()> {
                 write_json_check_header(stdout, root_identity)?;
                 write_json_check_diagnostic_records(stdout, &diagnostics)?;
+                if let Some(result_record) = result_record {
+                    write_json_check_success(stdout, result_record)?;
+                }
                 writeln!(
                     stdout,
                     "{{\"type\":\"summary\",\"errors\":{},\"warnings\":{},\"infos\":{},\"shown_errors\":{},\"suppressed\":{{\"cascade\":0,\"duplicate\":0,\"dependency\":0}},\"exit_code\":{exit_code}}}",
@@ -6744,6 +7011,22 @@ fn write_json_check_diagnostic_records(
         )?;
     }
     Ok(())
+}
+
+fn write_json_check_success(
+    writer: &mut impl Write,
+    result: &CheckSuccessRecord,
+) -> io::Result<()> {
+    writeln!(
+        writer,
+        "{{\"type\":\"result\",\"kind\":\"check\",\"data\":{{\"target\":\"{}\",\"profile\":\"{}\",\"tests\":{},\"packages\":{},\"fixes_applied\":{},\"changed_files\":{}}}}}",
+        escape_json(&result.target),
+        escape_json(&result.profile),
+        result.tests,
+        result.packages,
+        result.fixes_applied,
+        json_string_array(&result.changed_files)
+    )
 }
 
 fn run_fmt(
@@ -15783,6 +16066,8 @@ mod tests {
         assert_eq!(exit_code, 1);
         assert!(stderr.is_empty());
         assert!(stdout.contains("\"code\":\"MISSING_ROOT_MODULE\""));
+        assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+        assert!(!stdout.contains("\"type\":\"result\""));
         assert_eq!(
             stdout.matches("\"code\":\"MISSING_ROOT_MODULE\"").count(),
             1
