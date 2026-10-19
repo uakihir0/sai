@@ -51362,11 +51362,13 @@ interface facade { use middle.{payload}; }"#;
             "  type BeforeRecord { value: LaterRecord }\n",
             "  type AliasBeforeRecord = LaterRecord\n",
             "  fn use_later_record(value: LaterRecord) -> LaterRecord\n",
-            "  fn use_later_variant(value: LaterVariant)\n",
+            "  fn use_later_variant(value: LaterVariant) -> LaterVariant\n",
+            "  fn use_later_payload_variant(value: LaterPayloadVariant) -> LaterPayloadVariant\n",
             "  enum BeforeVariant { Value(Later) }\n",
             "  enum VariantBeforeRecord { Value(LaterRecord) }\n",
             "  type LaterRecord { value: U64 }\n",
             "  enum LaterVariant { Ready }\n",
+            "  enum LaterPayloadVariant { Wrapped(U32) }\n",
             "  type Rejected = USize\n",
             "  type Later = U32\n",
             "  type Independent = U64\n",
@@ -51429,7 +51431,16 @@ interface facade { use middle.{payload}; }"#;
                 .text
                 .contains("use-later-record: func(value: later-record) -> later-record;")
         );
-        assert!(!generated.text.contains("use-later-variant"));
+        assert!(
+            generated
+                .text
+                .contains("use-later-variant: func(value: later-variant) -> later-variant;")
+        );
+        assert!(
+            generated.text.contains(
+                "use-later-payload-variant: func(value: later-payload-variant) -> later-payload-variant;"
+            )
+        );
         assert!(generated.text.contains("variant before-variant {"));
         assert!(generated.text.contains("variant variant-before-record {"));
 
@@ -51445,15 +51456,18 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(item_names.len(), 9);
+        assert_eq!(item_names.len(), 12);
         for name in [
             "envelope",
             "before-record",
             "before-variant",
             "variant-before-record",
             "use-later-record",
+            "use-later-variant",
+            "use-later-payload-variant",
             "later-record",
             "later-variant",
+            "later-payload-variant",
             "later",
             "independent",
         ] {
@@ -51468,7 +51482,7 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5, 6, 7, 8],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
             "surviving item references compact after omitted forward targets"
         );
         let later_index = interface
@@ -51522,6 +51536,34 @@ interface facade { use middle.{payload}; }"#;
             assert_eq!(reference.interface.name, "api");
             assert_eq!(reference.item, later_record_index);
             assert_eq!(reference.item_name, "later-record");
+        }
+        for (function_name, target_name) in [
+            ("use-later-variant", "later-variant"),
+            ("use-later-payload-variant", "later-payload-variant"),
+        ] {
+            let target_index = interface
+                .items
+                .iter_enumerated()
+                .find_map(|(index, item)| (item.name == target_name).then_some(index))
+                .expect("the target variant remains in the parsed model");
+            let function_item = interface
+                .items
+                .iter()
+                .find(|item| item.name == function_name)
+                .expect("the function using the later variant remains in the model");
+            let sai_wit::WitItemKind::Func(function) = &function_item.kind else {
+                panic!("{function_name} remains a function after parsing");
+            };
+            for ty in [Some(&function.params[0].1), function.result.as_ref()] {
+                let Some(sai_wit::WitType::Named(reference)) = ty else {
+                    panic!("{function_name} retains a named parameter and result");
+                };
+                assert_eq!(reference.interface.unit, unit);
+                assert_eq!(reference.interface.interface, interface_index);
+                assert_eq!(reference.interface.name, "api");
+                assert_eq!(reference.item, target_index);
+                assert_eq!(reference.item_name, target_name);
+            }
         }
         let variant_before_record = interface
             .items
@@ -51605,8 +51647,10 @@ interface facade { use middle.{payload}; }"#;
             "  type UsesRejectedVariantRecord { value: RejectedVariantRecord }\n",
             "  enum RejectedResourceVariant { Value(LaterResource) }\n",
             "  fn use_rejected_resource_variant(value: RejectedResourceVariant)\n",
+            "  fn use_rejected_later_variant(value: RejectedLaterVariant)\n",
             "  fn use_resource(value: LaterResource)\n",
             "  resource LaterResource {}\n",
+            "  enum RejectedLaterVariant { Value(USize) }\n",
             "  type CycleA = CycleB\n",
             "  fn use_cycle(value: CycleA) -> CycleA\n",
             "  type RecordCycle { value: CycleA }\n",
@@ -51721,6 +51765,8 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("uses-rejected-variant-record"));
         assert!(!generated.text.contains("rejected-resource-variant"));
         assert!(!generated.text.contains("use-rejected-resource-variant"));
+        assert!(!generated.text.contains("rejected-later-variant"));
+        assert!(!generated.text.contains("use-rejected-later-variant"));
         assert!(!generated.text.contains("use-resource"));
         assert!(!generated.text.contains("use-cycle"));
         assert!(!generated.text.contains("record-cycle"));
