@@ -5658,6 +5658,7 @@ fn check_const_literal_owner(
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
 ) -> Result<ConstLiteralCheck, OwnerControlFlowResolutionError> {
     if !owner.raw_attrs.is_empty() {
         return Ok(ConstLiteralCheck::Unsupported);
@@ -5716,8 +5717,8 @@ fn check_const_literal_owner(
         (sai_resolve::prelude::PrimTy::Bool, Lit::Bool(_)) => Vec::new(),
         (sai_resolve::prelude::PrimTy::Char, Lit::Char(_))
         | (sai_resolve::prelude::PrimTy::Byte, Lit::Byte(_)) => Vec::new(),
-        (primitive, Lit::Int { value, negated }) if is_fixed_width_integer_primitive(primitive) => {
-            if const_integer_literal_fits(primitive, value, negated) {
+        (primitive, Lit::Int { value, negated }) if is_integer_primitive(primitive) => {
+            if const_integer_literal_fits(primitive, value, negated, target_cfg.pointer_width()) {
                 Vec::new()
             } else {
                 vec![const_literal_diagnostic(
@@ -5794,7 +5795,7 @@ fn is_supported_const_literal_primitive(primitive: sai_resolve::prelude::PrimTy)
             | sai_resolve::prelude::PrimTy::Byte
             | sai_resolve::prelude::PrimTy::F32
             | sai_resolve::prelude::PrimTy::F64
-    ) || is_fixed_width_integer_primitive(primitive)
+    ) || is_integer_primitive(primitive)
 }
 
 fn is_fixed_width_float_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
@@ -5851,10 +5852,19 @@ fn is_fixed_width_integer_primitive(primitive: sai_resolve::prelude::PrimTy) -> 
     )
 }
 
+fn is_integer_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
+    is_fixed_width_integer_primitive(primitive)
+        || matches!(
+            primitive,
+            sai_resolve::prelude::PrimTy::ISize | sai_resolve::prelude::PrimTy::USize
+        )
+}
+
 fn const_integer_literal_fits(
     primitive: sai_resolve::prelude::PrimTy,
     value: Option<u128>,
     negated: bool,
+    pointer_width: u8,
 ) -> bool {
     let Some(value) = value else {
         return false;
@@ -5868,8 +5878,13 @@ fn const_integer_literal_fits(
         sai_resolve::prelude::PrimTy::U16 => (false, 16),
         sai_resolve::prelude::PrimTy::U32 => (false, 32),
         sai_resolve::prelude::PrimTy::U64 => (false, 64),
+        sai_resolve::prelude::PrimTy::ISize => (true, pointer_width),
+        sai_resolve::prelude::PrimTy::USize => (false, pointer_width),
         _ => return false,
     };
+    if !matches!(width, 8 | 16 | 32 | 64) {
+        return false;
+    }
     if signed {
         let negative_limit = 1u128 << (width - 1);
         if negated {
@@ -12760,6 +12775,7 @@ impl RootDatabase {
                         &self.symbols,
                         &inputs,
                         snapshot,
+                        &collection.target_cfg,
                     );
                     module_path_diagnostics = match (member_scopes, type_path_resolution.as_ref()) {
                         (Some(member_scopes), Ok(Some(path_resolution))) => Some(
@@ -24912,21 +24928,29 @@ mod tests {
             (PrimTy::I64, 63),
         ] {
             let boundary = 1u128 << sign_bit;
-            assert!(const_integer_literal_fits(primitive, Some(boundary), true));
+            assert!(const_integer_literal_fits(
+                primitive,
+                Some(boundary),
+                true,
+                64
+            ));
             assert!(!const_integer_literal_fits(
                 primitive,
                 Some(boundary + 1),
-                true
+                true,
+                64
             ));
             assert!(const_integer_literal_fits(
                 primitive,
                 Some(boundary - 1),
-                false
+                false,
+                64
             ));
             assert!(!const_integer_literal_fits(
                 primitive,
                 Some(boundary),
-                false
+                false,
+                64
             ));
         }
         for (primitive, width) in [
@@ -24936,17 +24960,140 @@ mod tests {
             (PrimTy::U64, 64),
         ] {
             let maximum = (1u128 << width) - 1;
-            assert!(const_integer_literal_fits(primitive, Some(maximum), false));
+            assert!(const_integer_literal_fits(
+                primitive,
+                Some(maximum),
+                false,
+                64
+            ));
             assert!(!const_integer_literal_fits(
                 primitive,
                 Some(maximum + 1),
-                false
+                false,
+                64
             ));
-            assert!(const_integer_literal_fits(primitive, Some(0), true));
-            assert!(!const_integer_literal_fits(primitive, Some(1), true));
+            assert!(const_integer_literal_fits(primitive, Some(0), true, 64));
+            assert!(!const_integer_literal_fits(primitive, Some(1), true, 64));
         }
-        assert!(!const_integer_literal_fits(PrimTy::I64, None, false));
-        assert!(!const_integer_literal_fits(PrimTy::U64, None, false));
+        assert!(!const_integer_literal_fits(PrimTy::I64, None, false, 64));
+        assert!(!const_integer_literal_fits(PrimTy::U64, None, false, 64));
+    }
+
+    #[test]
+    fn const_pointer_sized_integer_literals_use_the_selected_target_width() {
+        use sai_resolve::prelude::PrimTy;
+
+        for (
+            target,
+            signed_min,
+            signed_max,
+            unsigned_max,
+            signed_below,
+            signed_above,
+            unsigned_above,
+        ) in [
+            (
+                "wasm32-core",
+                "-2147483648",
+                "2147483647",
+                "4294967295",
+                "-2147483649",
+                "2147483648",
+                "4294967296",
+            ),
+            (
+                "wasm64-core",
+                "-9223372036854775808",
+                "9223372036854775807",
+                "18446744073709551615",
+                "-9223372036854775809",
+                "9223372036854775808",
+                "18446744073709551616",
+            ),
+        ] {
+            let root = format!(
+                concat!(
+                    "pub const SIGNED_MIN: ISize = {}\n",
+                    "pub const SIGNED_MAX: ISize = {}\n",
+                    "pub const UNSIGNED_MAX: USize = {}\n",
+                    "pub const SIGNED_BELOW: ISize = {}\n",
+                    "pub const SIGNED_ABOVE: ISize = {}\n",
+                    "pub const UNSIGNED_ABOVE: USize = {}\n",
+                    "pub const UNSIGNED_NEG_ZERO: USize = -0\n",
+                    "pub const UNSIGNED_NEG_ONE: USize = -1\n",
+                    "pub const SIGNED_TOO_WIDE: ISize = 340282366920938463463374607431768211456\n",
+                    "pub const UNSIGNED_TOO_WIDE: USize = 340282366920938463463374607431768211456\n",
+                ),
+                signed_min, signed_max, unsigned_max, signed_below, signed_above, unsigned_above,
+            );
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let expected_width = if target == "wasm32-core" { 32 } else { 64 };
+            assert_eq!(target_cfg.pointer_width(), expected_width, "{target}");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+            let checks = resolved
+                .owners()
+                .iter()
+                .map(|owner| {
+                    owner
+                        .literal_check()
+                        .expect("literal checks use the current owner snapshot")
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(checks.len(), 10, "{target}");
+            for (index, primitive) in [
+                (0, PrimTy::ISize),
+                (1, PrimTy::ISize),
+                (2, PrimTy::USize),
+                (6, PrimTy::USize),
+            ] {
+                assert_eq!(
+                    checks[index],
+                    &ConstLiteralCheck::Supported {
+                        primitive,
+                        diagnostics: Vec::new(),
+                    },
+                    "pointer-sized boundary at owner index {index} should fit on {target}"
+                );
+            }
+            for index in [3, 4, 5, 7, 8, 9] {
+                let ConstLiteralCheck::Supported {
+                    primitive,
+                    diagnostics,
+                } = checks[index]
+                else {
+                    panic!("out-of-range pointer literal at {index} should be checked on {target}");
+                };
+                assert_eq!(
+                    *primitive,
+                    if matches!(index, 3 | 4 | 8) {
+                        PrimTy::ISize
+                    } else {
+                        PrimTy::USize
+                    },
+                    "owner index {index} on {target}"
+                );
+                assert_eq!(diagnostics.len(), 1, "owner index {index} on {target}");
+                assert_eq!(
+                    diagnostics[0].code,
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    "owner index {index} on {target}"
+                );
+                assert!(diagnostics[0].has_workspace_snapshot());
+                assert!(diagnostics[0].primary().is_some());
+            }
+        }
     }
 
     #[test]

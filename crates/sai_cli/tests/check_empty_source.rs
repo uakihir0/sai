@@ -237,6 +237,66 @@ fn multiple_public_primitive_const_literals_emit_one_check_result() {
 }
 
 #[test]
+fn pointer_sized_integer_const_literals_follow_the_selected_target_width() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    assert_success_result(
+        run_check(
+            concat!(
+                "pub const ISIZE_MIN: ISize = -2147483648\n",
+                "pub const ISIZE_MAX: ISize = 2147483647\n",
+                "pub const USIZE_MAX: USize = 4294967295\n",
+                "pub const USIZE_NEG_ZERO: USize = -0\n",
+            ),
+            manifest,
+            &[],
+            &["--target", "wasm32-core"],
+        ),
+        "wasm32-core",
+        "dev",
+    );
+
+    for source in [
+        "pub const TOO_SMALL: ISize = -2147483649\n",
+        "pub const TOO_LARGE: ISize = 2147483648\n",
+        "pub const TOO_LARGE: USize = 4294967296\n",
+        "pub const NEGATIVE: USize = -1\n",
+    ] {
+        let output = run_check(source, manifest, &[], &["--target", "wasm32-core"]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: out-of-range pointer-sized const should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a range error without a result or feature gate:\n{stdout}"
+        );
+    }
+
+    let output = run_check(
+        "pub const ABOVE_WASM32: USize = 4294967296\n",
+        manifest,
+        &[],
+        &["--target", "wasm64-core"],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "wasm64 remains outside the CLI success slice:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\""),
+        "wasm64 must use its 64-bit USize range while retaining the success gate:\n{stdout}"
+    );
+}
+
+#[test]
 fn public_char_and_byte_const_literals_emit_check_results() {
     for source in [
         "pub const ASCII: Char = 'a'\n",
