@@ -295,6 +295,35 @@ fn unsupported_bool_parameter_or_shapes_remain_gated() {
 }
 
 #[test]
+fn public_bool_parameter_and_primitive_comparison_if_functions_emit_check_results() {
+    for source in [
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+        "pub fn choose(value: I32, enabled: Bool) -> I32 { if value < 20 and enabled { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: U8) -> I32 { if enabled and 18 <= value { 1 } else { 2 } }\n",
+        "pub fn choose(value: I32, enabled: Bool) -> I32 { if 10 < value and enabled { 1 } else { 2 } }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn unsupported_mixed_bool_and_primitive_comparison_conditions_remain_gated() {
+    for source in [
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or value >= 18 { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and value >= 18) { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and not (value >= 18) { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and (value > 0 and value < 10) { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and enabled >= 18 { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: I32, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+        "type BoolAlias = Bool\npub fn choose(enabled: BoolAlias, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and value >= 18 { 1 } }\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn public_primitive_parameter_comparison_if_functions_emit_check_results() {
     for source in [
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
@@ -483,6 +512,34 @@ fn comparison_literal_errors_report_condition_spans_before_branch_errors() {
             && !stdout.contains("\"type\":\"result\"")
             && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
         "condition and then/else errors must retain source order without a feature gate:\n{stdout}"
+    );
+
+    let source = "pub fn choose(enabled: Bool, value: I8) -> I8 { if enabled and value < 128 { 128 } else { 129 } }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let condition_start = source.find("128").expect("condition integer exists");
+    let then_start = source[condition_start + "128".len()..]
+        .find("128")
+        .map(|offset| condition_start + "128".len() + offset)
+        .expect("then-branch integer exists");
+    let else_start = source.find("129").expect("else-branch integer exists");
+    let condition_position = stdout
+        .find(&format!("\"start\":{{\"byte\":{condition_start},"))
+        .expect("condition diagnostic span exists");
+    let then_position = stdout
+        .find(&format!("\"start\":{{\"byte\":{then_start},"))
+        .expect("then-branch diagnostic span exists");
+    let else_position = stdout
+        .find(&format!("\"start\":{{\"byte\":{else_start},"))
+        .expect("else-branch diagnostic span exists");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count() == 3
+            && condition_position < then_position
+            && then_position < else_position
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "mixed condition and then/else errors must retain source order without a feature gate:\n{stdout}"
     );
 }
 
