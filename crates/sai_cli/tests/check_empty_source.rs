@@ -200,3 +200,96 @@ fn unlocked_checks_validate_compiler_and_declared_targets() {
         assert!(target_stdout.contains("\"code\":\"UNKNOWN_TARGET\""));
     }
 }
+
+#[test]
+fn public_primitive_const_literals_emit_check_results() {
+    for source in [
+        "pub const READY: Bool = true\n",
+        "pub const LOW: I8 = -128\n",
+        "pub const HIGH: I8 = 127\n",
+        "pub const MAX: U8 = 255\n",
+        "pub const ZERO: U8 = -0\n",
+        "pub const MIN: Int = -9223372036854775808\n",
+        "pub const MAX: UInt = 18446744073709551615\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn public_primitive_const_type_errors_do_not_emit_results() {
+    let cases = [
+        ("pub const BAD: Bool = 1\n", "TYPE_MISMATCH"),
+        ("pub const BAD: I8 = true\n", "TYPE_MISMATCH"),
+        ("pub const BAD: I8 = -129\n", "LITERAL_OUT_OF_RANGE"),
+        ("pub const BAD: I8 = 128\n", "LITERAL_OUT_OF_RANGE"),
+        ("pub const BAD: U8 = 256\n", "LITERAL_OUT_OF_RANGE"),
+        (
+            "pub const BAD: Int = 9223372036854775808\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+        (
+            "pub const BAD: UInt = 18446744073709551616\n",
+            "LITERAL_OUT_OF_RANGE",
+        ),
+    ];
+
+    for (source, code) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: type-check failure should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\""))
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected supported {code} without a result or feature gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn const_forms_outside_literal_slice_remain_gated() {
+    for source in [
+        "const PRIVATE: I8 = 1\n",
+        "pub const EXPRESSION: I8 = 1 + 2\n",
+        "pub const ALIAS: MyInt = 1\n",
+        "pub const FIRST: I8 = 1\npub const SECOND: I8 = 2\n",
+        "@doc(hidden)\npub const ATTRIBUTED: I8 = 1\n",
+        "pub const Max_size: I8 = 1\n",
+        "pub const r#READY: Bool = true\n",
+        "@target(\"wasm64-core\")\npub const OTHER: I8 = 1\npub const VALUE: I8 = 2\n",
+        "test \"unselected\" {}\npub const VALUE: I8 = 2\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated(&output, source);
+    }
+}
+
+#[test]
+fn primitive_const_success_stays_limited_to_the_default_unlocked_check() {
+    let source = "pub const VALUE: I8 = 1\n";
+    let cases: &[(&str, &[&str])] = &[
+        ("non-core target", &["--target", "wasm32-wasi"]),
+        ("non-default profile", &["--profile", "tiny"]),
+        ("test analysis", &["--tests"]),
+        ("fix mode", &["--fix"]),
+        ("locked mode", &["--locked", "--offline"]),
+        ("frozen mode", &["--frozen"]),
+        ("allow lint override", &["--allow", "MISSING_DOCS"]),
+        ("custom lint levels", &["--warn", "MISSING_DOCS"]),
+        ("deny lint override", &["--deny", "MISSING_DOCS"]),
+        ("equals-form allow override", &["--allow=MISSING_DOCS"]),
+        ("equals-form lint override", &["--warn=MISSING_DOCS"]),
+        ("equals-form deny override", &["--deny=MISSING_DOCS"]),
+        ("deny warnings", &["--deny-warnings"]),
+    ];
+
+    for (context, options) in cases {
+        let output = run_check(source, "", &[], options);
+        assert_check_stays_gated(&output, context);
+    }
+}

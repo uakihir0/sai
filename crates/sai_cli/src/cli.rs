@@ -463,7 +463,7 @@ fn run_check(
     let mut root_package_key = None;
     let mut package_header_span = None;
     let mut manifest_source = None;
-    let mut empty_root_module_only_covered = false;
+    let mut root_coverage = CheckRootCoverage::default();
     let include_source_lines = parsed.globals.format == OutputFormat::Human;
 
     let manifest_path = package_root.join("sai.package");
@@ -1291,7 +1291,7 @@ fn run_check(
                                         target_cfg.as_ref(),
                                         package_graph.take(),
                                     );
-                                    empty_root_module_only_covered = push_module_tree_check_result(
+                                    root_coverage = push_module_tree_check_result(
                                         &mut diagnostics,
                                         &mut total_errors,
                                         &mut total_warnings,
@@ -1588,7 +1588,7 @@ fn run_check(
             dependency_target_cfg.as_ref(),
             package_graph.take(),
         );
-        empty_root_module_only_covered = push_module_tree_check_result(
+        root_coverage = push_module_tree_check_result(
             &mut diagnostics,
             &mut total_errors,
             &mut total_warnings,
@@ -1611,7 +1611,7 @@ fn run_check(
             dependency_target_cfg.as_ref(),
             package_graph.take(),
         );
-        empty_root_module_only_covered = push_module_tree_check_result(
+        root_coverage = push_module_tree_check_result(
             &mut diagnostics,
             &mut total_errors,
             &mut total_warnings,
@@ -1688,18 +1688,19 @@ fn run_check(
             .and_then(|manifest| manifest_target_names(manifest).into_iter().next())
     });
     let profile = check_profile_override(command).unwrap_or_else(|| "dev".to_owned());
-    let supports_empty_root_success = empty_root_module_only_covered
+    let root_analysis_is_covered = root_coverage.empty_root_module_only_covered
+        || root_coverage.single_public_primitive_const_covered;
+    let check_slice_is_supported = root_analysis_is_covered
         && empty_root_manifest_supported
         && root_manifest_semantically_valid
         && target.as_deref() == Some("wasm32-core")
         && profile == "dev"
         && !check_locked_mode(command)
+        && !check_has_lint_overrides(command)
         && !analyzes_tests
-        && !applies_fixes
-        && total_errors == 0
-        && diagnostics.is_empty();
+        && !applies_fixes;
 
-    if supports_empty_root_success {
+    if check_slice_is_supported && total_errors == 0 {
         let Some(target) = target else {
             diagnostics.push(check_incomplete_diagnostic(command));
             total_errors = total_errors.saturating_add(1);
@@ -1735,8 +1736,10 @@ fn run_check(
         );
     }
 
-    diagnostics.push(check_incomplete_diagnostic(command));
-    total_errors = total_errors.saturating_add(1);
+    if !check_slice_is_supported {
+        diagnostics.push(check_incomplete_diagnostic(command));
+        total_errors = total_errors.saturating_add(1);
+    }
     report_check_diagnostics(
         parsed,
         diagnostics,
@@ -1856,6 +1859,28 @@ fn check_manifest_supports_empty_root_success(
                 | sai_package::manifest::PackageDeclaration::Authors(_)
         )
     })
+}
+
+fn check_source_is_single_unattributed_const(source: &[u8]) -> bool {
+    use sai_syntax::ast::AstNode as _;
+
+    let Ok(parsed) = sai_fmt::parse_source(source) else {
+        return false;
+    };
+    let Some(source_file) = sai_syntax::ast::SourceFile::cast(parsed.root().clone()) else {
+        return false;
+    };
+    if source_file.module_header().is_some()
+        || source_file.test_decls().next().is_some()
+        || source_file.property_decls().next().is_some()
+    {
+        return false;
+    }
+    let items = source_file.items().collect::<Vec<_>>();
+    matches!(
+        items.as_slice(),
+        [sai_syntax::ast::Item::Const(constant)] if constant.attrs().next().is_none()
+    )
 }
 
 fn check_target_override(command: &crate::args::ParsedCommand) -> Option<String> {
@@ -2015,6 +2040,27 @@ fn check_locked_mode(command: &crate::args::ParsedCommand) -> bool {
     command_tail(command)
         .iter()
         .any(|(argument, _)| matches!(argument.to_str(), Some("--locked" | "--frozen")))
+}
+
+fn check_has_lint_overrides(command: &crate::args::ParsedCommand) -> bool {
+    for (argument, _) in command_tail(command) {
+        if argument == "--" {
+            break;
+        }
+        let Some(argument) = argument.to_str() else {
+            continue;
+        };
+        if matches!(
+            argument,
+            "--allow" | "--warn" | "--deny" | "--deny-warnings"
+        ) || ["--allow=", "--warn=", "--deny="]
+            .iter()
+            .any(|prefix| argument.starts_with(prefix))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn check_locked_lock_presence(
@@ -4715,7 +4761,13 @@ struct CheckWorkspaceDiagnostics {
     errors: usize,
     warnings: usize,
     infos: usize,
+    root_coverage: CheckRootCoverage,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CheckRootCoverage {
     empty_root_module_only_covered: bool,
+    single_public_primitive_const_covered: bool,
 }
 
 struct CheckSuccessRecord {
@@ -5015,7 +5067,7 @@ fn module_tree_workspace_check_diagnostics(
             errors: 1,
             warnings: 0,
             infos: 0,
-            empty_root_module_only_covered: false,
+            root_coverage: CheckRootCoverage::default(),
         });
     }
     let mut empty_root_module_only_covered = inputs.len() == 1
@@ -5039,6 +5091,31 @@ fn module_tree_workspace_check_diagnostics(
                     format!("{}/lib.sai", inputs[0].source_directory)
                 };
                 path == &root_source_path && source.is_empty()
+            });
+    let mut single_public_primitive_const_covered = false;
+    let single_root_const_input_shape = inputs.len() == 1
+        && inputs[0].is_root_package
+        && !inputs[0].analyzes_tests
+        && !inputs[0].inspection_incomplete
+        && inputs[0].source_directory_exists
+        && inputs[0].source_inputs.len() == 1
+        && package_manifests.len() == 1
+        && package_manifests[0].role == sai_package::manifest::PackageRole::Root
+        && wit_packages.is_empty()
+        && package_graph.is_none()
+        && target_cfg.is_some()
+        && inputs[0]
+            .source_inputs
+            .first()
+            .is_some_and(|(path, _, source)| {
+                let root_source_path = if inputs[0].source_directory == "." {
+                    "lib.sai".to_owned()
+                } else {
+                    format!("{}/lib.sai", inputs[0].source_directory)
+                };
+                path == &root_source_path
+                    && !source.is_empty()
+                    && check_source_is_single_unattributed_const(source.as_ref())
             });
     let mut database = RootDatabase::new()
         .map_err(|error| format!("could not initialize query database: {error:?}"))?;
@@ -5560,6 +5637,55 @@ fn module_tree_workspace_check_diagnostics(
             warnings = warnings.saturating_add(package_warnings);
             infos = infos.saturating_add(package_infos);
 
+            if package_graph_for_scopes.is_none() && input.is_root_package {
+                let const_resolutions = database
+                    .resolve_const_owner_paths(&collection, module_tree, &workspace_snapshot)
+                    .map_err(|error| format!("const owner analysis failed: {error:?}"))?;
+                let mut literal_diagnostics = Vec::new();
+                for owner in const_resolutions.owners() {
+                    match owner.literal_check() {
+                        Ok(literal_check) => {
+                            literal_diagnostics.extend(literal_check.diagnostics().iter().cloned())
+                        }
+                        Err(error) => {
+                            diagnostics.push(check_diagnostic_with_package(
+                                check_internal_diagnostic(
+                                    &format!("const literal check failed: {error:?}"),
+                                    None,
+                                ),
+                                Some(&input.package_identity),
+                            ));
+                            errors = errors.saturating_add(1);
+                        }
+                    }
+                }
+                let (literal_diagnostics, literal_errors, literal_warnings, literal_infos) =
+                    phase1_check_diagnostics(
+                        &literal_diagnostics,
+                        &workspace_source_by_key,
+                        &input.package_identity,
+                        include_source_lines,
+                    );
+                diagnostics.extend(literal_diagnostics);
+                errors = errors.saturating_add(literal_errors);
+                warnings = warnings.saturating_add(literal_warnings);
+                infos = infos.saturating_add(literal_infos);
+
+                if single_root_const_input_shape
+                    && collection.scopes().modules.len() == 1
+                    && collection.scopes().modules[0].imports.is_empty()
+                    && collection.scopes().top_level_owners.len() == 1
+                    && collection.scopes().top_level_owners[0].kind
+                        == sai_driver::TopLevelOwnerKind::Const
+                    && const_resolutions.owners().len() == 1
+                    && const_resolutions.owners()[0]
+                        .literal_check()
+                        .is_ok_and(sai_driver::ConstLiteralCheck::is_supported)
+                {
+                    single_public_primitive_const_covered = true;
+                }
+            }
+
             if let Some(graph) = package_graph_for_scopes.as_ref()
                 && graph.node(&package_key).is_some()
             {
@@ -5837,6 +5963,21 @@ fn module_tree_workspace_check_diagnostics(
                             diagnostics.push(check_diagnostic_with_package(
                                 check_internal_diagnostic(
                                     &format!("const type path processing failed: {error:?}"),
+                                    None,
+                                ),
+                                Some(&input.package_identity),
+                            ));
+                            errors = errors.saturating_add(1);
+                        }
+                    }
+                    match owner.literal_check() {
+                        Ok(literal_check) => {
+                            owner_diagnostics.extend(literal_check.diagnostics().iter().cloned())
+                        }
+                        Err(error) => {
+                            diagnostics.push(check_diagnostic_with_package(
+                                check_internal_diagnostic(
+                                    &format!("const literal check failed: {error:?}"),
                                     None,
                                 ),
                                 Some(&input.package_identity),
@@ -6122,7 +6263,10 @@ fn module_tree_workspace_check_diagnostics(
         errors,
         warnings,
         infos,
-        empty_root_module_only_covered,
+        root_coverage: CheckRootCoverage {
+            empty_root_module_only_covered,
+            single_public_primitive_const_covered,
+        },
     })
 }
 
@@ -6363,14 +6507,14 @@ fn push_module_tree_check_result(
     total_info_count: &mut usize,
     result: Result<CheckWorkspaceDiagnostics, String>,
     package_identity: Option<&str>,
-) -> bool {
+) -> CheckRootCoverage {
     match result {
         Ok(result) => {
             diagnostics.extend(result.diagnostics);
             *total_error_count = total_error_count.saturating_add(result.errors);
             *total_warning_count = total_warning_count.saturating_add(result.warnings);
             *total_info_count = total_info_count.saturating_add(result.infos);
-            result.empty_root_module_only_covered
+            result.root_coverage
         }
         Err(error) => {
             diagnostics.push(check_diagnostic_with_package(
@@ -6381,7 +6525,7 @@ fn push_module_tree_check_result(
                 package_identity,
             ));
             *total_error_count = total_error_count.saturating_add(1);
-            false
+            CheckRootCoverage::default()
         }
     }
 }
