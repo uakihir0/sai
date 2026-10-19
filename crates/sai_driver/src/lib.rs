@@ -51351,7 +51351,7 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
-    fn generated_wit_emits_record_fields_that_reference_later_aliases_and_records() {
+    fn generated_wit_emits_record_and_variant_references_to_later_items() {
         let source = concat!(
             "interface api {\n",
             "  type Envelope { value: Later }\n",
@@ -51362,6 +51362,7 @@ interface facade { use middle.{payload}; }"#;
             "  type AliasBeforeRecord = LaterRecord\n",
             "  fn use_later_record(value: LaterRecord)\n",
             "  enum BeforeVariant { Value(Later) }\n",
+            "  enum VariantBeforeRecord { Value(LaterRecord) }\n",
             "  type LaterRecord { value: U64 }\n",
             "  type Rejected = USize\n",
             "  type Later = U32\n",
@@ -51420,7 +51421,8 @@ interface facade { use middle.{payload}; }"#;
         assert!(generated.text.contains("value: later-record"));
         assert!(!generated.text.contains("alias-before-record"));
         assert!(!generated.text.contains("use-later-record"));
-        assert!(!generated.text.contains("before-variant"));
+        assert!(generated.text.contains("variant before-variant {"));
+        assert!(!generated.text.contains("variant-before-record"));
 
         let package_model = result.package.expect("partial generated WIT model loads");
         let (interface_index, interface) = package_model
@@ -51434,10 +51436,11 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(item_names.len(), 5);
+        assert_eq!(item_names.len(), 6);
         for name in [
             "envelope",
             "before-record",
+            "before-variant",
             "later-record",
             "later",
             "independent",
@@ -51453,7 +51456,7 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4],
+            [0, 1, 2, 3, 4, 5],
             "surviving item references compact after omitted forward targets"
         );
         let later_index = interface
@@ -51499,6 +51502,27 @@ interface facade { use middle.{payload}; }"#;
         assert_eq!(reference.interface.name, "api");
         assert_eq!(reference.item, later_record_index);
         assert_eq!(reference.item_name, "later-record");
+
+        let before_variant = interface
+            .items
+            .iter()
+            .find(|item| item.name == "before-variant")
+            .expect("the valid forward variant remains in the parsed model");
+        let sai_wit::WitItemKind::Variant(cases) = &before_variant.kind else {
+            panic!("before-variant remains a variant after parsing");
+        };
+        let sai_wit::WitType::Named(reference) = cases[0]
+            .payload
+            .as_ref()
+            .expect("the variant case retains its alias payload")
+        else {
+            panic!("the variant payload refers to a named later alias");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.interface.name, "api");
+        assert_eq!(reference.item, later_index);
+        assert_eq!(reference.item_name, "later");
     }
 
     #[test]
@@ -51510,6 +51534,11 @@ interface facade { use middle.{payload}; }"#;
             "  fn use_rejected(value: Rejected) -> Rejected\n",
             "  type BeforeRecord { value: LaterRecord }\n",
             "  enum BeforeVariant { Value(After) }\n",
+            "  enum RejectedVariant { Value(RejectedVariantAlias) }\n",
+            "  fn use_rejected_variant(value: RejectedVariantAlias)\n",
+            "  enum VariantAliasCycle { Value(VariantCycleAlias) }\n",
+            "  type VariantCycleAlias = VariantAliasCycle\n",
+            "  fn use_variant_alias_cycle(value: VariantCycleAlias)\n",
             "  fn use_resource(value: LaterResource)\n",
             "  resource LaterResource {}\n",
             "  type CycleA = CycleB\n",
@@ -51528,6 +51557,7 @@ interface facade { use middle.{payload}; }"#;
             "  type LaterAlias = AliasVariantCycle\n",
             "  fn use_later_alias(value: LaterAlias)\n",
             "  type UsesRejected = Rejected\n",
+            "  type RejectedVariantAlias = USize\n",
             "  type Rejected = USize\n",
             "  type UsesUsesRejected = UsesRejected\n",
             "  type After = U32\n",
@@ -51589,10 +51619,11 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(emitted_items.len(), 7);
+        assert_eq!(emitted_items.len(), 8);
         assert!(emitted_items.contains(&"before"));
         assert!(emitted_items.contains(&"use-later"));
         assert!(emitted_items.contains(&"before-record"));
+        assert!(emitted_items.contains(&"before-variant"));
         assert!(emitted_items.contains(&"after"));
         assert!(emitted_items.contains(&"later-record"));
         assert!(emitted_items.contains(&"later-resource"));
@@ -51603,12 +51634,17 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5, 6],
+            [0, 1, 2, 3, 4, 5, 6, 7],
             "surviving item indices compact after pruning cycles and unsupported targets"
         );
         assert!(!generated.text.contains("use-rejected"));
         assert!(generated.text.contains("record before-record {"));
-        assert!(!generated.text.contains("before-variant"));
+        assert!(generated.text.contains("variant before-variant {"));
+        assert!(!generated.text.contains("rejected-variant"));
+        assert!(!generated.text.contains("use-rejected-variant"));
+        assert!(!generated.text.contains("variant-alias-cycle"));
+        assert!(!generated.text.contains("variant-cycle-alias"));
+        assert!(!generated.text.contains("use-variant-alias-cycle"));
         assert!(!generated.text.contains("use-resource"));
         assert!(!generated.text.contains("use-cycle"));
         assert!(!generated.text.contains("record-cycle"));

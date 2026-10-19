@@ -2915,6 +2915,7 @@ fn collect_interface_uses_input(
                     &generated_alias_type_references
                 }
                 super::InterfaceMemberKind::Struct => &generated_record_type_references,
+                super::InterfaceMemberKind::Enum => &generated_alias_type_references,
                 _ => &generated_named_type_references,
             };
             let mut staged_resource_item = None;
