@@ -35,8 +35,6 @@ const RECORD_DIGEST_BYTES: usize = 32;
 #[cfg(windows)]
 const WINDOWS_ERROR_LOCK_VIOLATION: i32 = 33;
 #[cfg(windows)]
-const WINDOWS_ERROR_SHARING_VIOLATION: i32 = 32;
-#[cfg(windows)]
 const CACHE_ENTRY_REMOVE_RETRY_LIMIT: usize = 500;
 #[cfg(windows)]
 const WINDOWS_FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -550,24 +548,50 @@ impl PackageCache {
         drop(file);
         staging.refresh_activity_age()?;
 
-        if path_exists_without_following(&destination)? {
-            #[cfg(windows)]
-            if !remove_file_at_path(&destination, &self.root) {
-                return Err(PackageCacheError::Io {
-                    operation: "replace inactive package cache record slot",
-                    path: destination.clone(),
-                    source: io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "cache record could not be removed through its verified parent",
-                    ),
-                });
-            }
+        #[cfg(any(unix, windows))]
+        {
+            let (staging_parent, staging_name) =
+                open_parent_at_boundary(&staged_record, &self.root).ok_or_else(|| {
+                    PackageCacheError::Io {
+                        operation: "open staged package cache record directory",
+                        path: staged_record.clone(),
+                        source: io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "staged cache record is outside the verified cache root",
+                        ),
+                    }
+                })?;
+            let (destination_parent, destination_name) =
+                open_parent_at_boundary(&destination, &self.root).ok_or_else(|| {
+                    PackageCacheError::Io {
+                        operation: "open package cache record directory",
+                        path: destination.clone(),
+                        source: io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "cache record is outside the verified cache root",
+                        ),
+                    }
+                })?;
+            sai_windows_fs::replace_file_between_directories(
+                &staging_parent.into_std_file(),
+                &staging_name,
+                &destination_parent.into_std_file(),
+                &destination_name,
+            )
+            .map_err(|source| PackageCacheError::Io {
+                operation: "publish package cache record",
+                path: destination,
+                source,
+            })
         }
-        fs::rename(&staged_record, &destination).map_err(|source| PackageCacheError::Io {
-            operation: "publish package cache record",
-            path: destination,
-            source,
-        })
+        #[cfg(not(any(unix, windows)))]
+        {
+            fs::rename(&staged_record, &destination).map_err(|source| PackageCacheError::Io {
+                operation: "publish package cache record",
+                path: destination,
+                source,
+            })
+        }
     }
 
     /// Install a verified source snapshot and return its immutable cache path.

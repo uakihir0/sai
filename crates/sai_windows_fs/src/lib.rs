@@ -1053,21 +1053,50 @@ pub fn replace_file_in_directory(
     source_name: &OsStr,
     destination_name: &OsStr,
 ) -> io::Result<()> {
+    replace_file_between_directories(parent, source_name, parent, destination_name)
+}
+
+/// Atomically replace one child file with another, relative to open directories.
+///
+/// Both names must be one normal path component. The source and destination
+/// directories must be on the same volume.
+pub fn replace_file_between_directories(
+    source_parent: &File,
+    source_name: &OsStr,
+    destination_parent: &File,
+    destination_name: &OsStr,
+) -> io::Result<()> {
     validate_child_name(source_name)?;
     validate_child_name(destination_name)?;
     #[cfg(windows)]
     {
-        windows_handle::replace_child(parent, source_name, destination_name)
+        windows_handle::replace_child(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )
     }
     #[cfg(unix)]
     {
         use rustix::fs::renameat;
 
-        renameat(parent, source_name, parent, destination_name).map_err(Into::into)
+        renameat(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )
+        .map_err(Into::into)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (parent, source_name, destination_name);
+        let _ = (
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        );
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "handle-relative file replacement is unavailable on this platform",
@@ -1694,18 +1723,19 @@ mod windows_handle {
     }
 
     pub(super) fn replace_child(
-        parent: &File,
+        source_parent: &File,
         source_name: &OsStr,
+        destination_parent: &File,
         destination_name: &OsStr,
     ) -> io::Result<()> {
         let source = open_child_with_access(
-            parent,
+            source_parent,
             source_name,
             false,
             DELETE | FILE_READ_ATTRIBUTES,
             true,
         )?;
-        rename_open_child(parent, &source, destination_name, true)
+        rename_open_child(destination_parent, &source, destination_name, true)
     }
 
     pub(super) fn rename_open_child(
@@ -1806,7 +1836,7 @@ mod unix_tests {
 
     use super::{
         open_child_directory_without_following, open_directory_without_following,
-        open_file_without_following, remove_file_in_directory,
+        open_file_without_following, remove_file_in_directory, replace_file_between_directories,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1876,6 +1906,42 @@ mod unix_tests {
         assert_eq!(fs::read(sibling).unwrap(), b"keep");
         assert_eq!(fs::read(root.join("temporary")).unwrap(), b"safe");
     }
+
+    #[test]
+    fn replaces_a_file_across_open_directories_without_a_delete_gap() {
+        let directory = TestDirectory::new();
+        let source_directory = directory.0.join("source");
+        let destination_directory = directory.0.join("destination");
+        fs::create_dir(&source_directory).unwrap();
+        fs::create_dir(&destination_directory).unwrap();
+        fs::write(source_directory.join("staged"), b"new record").unwrap();
+        let destination_path = destination_directory.join("record");
+        fs::write(&destination_path, b"old record").unwrap();
+        let old_reader = fs::File::open(&destination_path).unwrap();
+
+        let source_parent = open_directory_without_following(&source_directory).unwrap();
+        let destination_parent = open_directory_without_following(&destination_directory).unwrap();
+        replace_file_between_directories(
+            &source_parent,
+            std::ffi::OsStr::new("staged"),
+            &destination_parent,
+            std::ffi::OsStr::new("record"),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&destination_path).unwrap(), b"new record");
+        assert_eq!(
+            fs::read(source_directory.join("staged"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let mut old_bytes = Vec::new();
+        use std::io::Read;
+        let mut old_reader = old_reader;
+        old_reader.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, b"old record");
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -1890,7 +1956,7 @@ mod windows_tests {
         open_directory_path_for_child_updates_without_following,
         open_directory_path_for_file_updates_without_following,
         open_directory_path_without_following, open_file_for_attribute_updates_without_following,
-        remove_file_in_directory, replace_file_in_directory,
+        remove_file_in_directory, replace_file_between_directories, replace_file_in_directory,
         replace_file_in_directory_if_unchanged,
     };
 
@@ -1939,6 +2005,44 @@ mod windows_tests {
 
         remove_file_in_directory(&package_handle, std::ffi::OsStr::new("sai.package")).unwrap();
         assert!(!package.join("sai.package").exists());
+    }
+
+    #[test]
+    fn cross_directory_replace_keeps_existing_reader_handles_valid() {
+        let directory = TestDirectory::new();
+        let source_directory = directory.0.join("source");
+        let destination_directory = directory.0.join("destination");
+        fs::create_dir(&source_directory).unwrap();
+        fs::create_dir(&destination_directory).unwrap();
+        fs::write(source_directory.join("staged"), b"new record").unwrap();
+        let destination_path = destination_directory.join("record");
+        fs::write(&destination_path, b"old record").unwrap();
+        let old_reader = fs::File::open(&destination_path).unwrap();
+
+        let source_parent =
+            open_directory_path_for_file_updates_without_following(&source_directory).unwrap();
+        let destination_parent =
+            open_directory_path_for_file_updates_without_following(&destination_directory).unwrap();
+        replace_file_between_directories(
+            &source_parent,
+            std::ffi::OsStr::new("staged"),
+            &destination_parent,
+            std::ffi::OsStr::new("record"),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&destination_path).unwrap(), b"new record");
+        assert_eq!(
+            fs::read(source_directory.join("staged"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let mut old_bytes = Vec::new();
+        use std::io::Read;
+        let mut old_reader = old_reader;
+        old_reader.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, b"old record");
     }
 
     #[test]
