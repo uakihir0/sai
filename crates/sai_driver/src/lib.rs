@@ -51480,6 +51480,13 @@ interface facade { use middle.{payload}; }"#;
             "  type RecordCycle { value: CycleA }\n",
             "  type CycleB = CycleA\n",
             "  type UsesCycle = CycleA\n",
+            "  type RecordAliasCycle { value: AliasRecordCycle }\n",
+            "  type AliasRecordCycle = RecordAliasCycle\n",
+            "  fn use_record_alias_cycle(value: RecordAliasCycle)\n",
+            "  type VariantRecordCycle { next: LaterAlias }\n",
+            "  enum AliasVariantCycle { Value(VariantRecordCycle) }\n",
+            "  type LaterAlias = AliasVariantCycle\n",
+            "  fn use_later_alias(value: LaterAlias)\n",
             "  type UsesRejected = Rejected\n",
             "  type Rejected = USize\n",
             "  type UsesUsesRejected = UsesRejected\n",
@@ -51564,6 +51571,13 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("use-resource"));
         assert!(!generated.text.contains("use-cycle"));
         assert!(!generated.text.contains("record-cycle"));
+        assert!(!generated.text.contains("record-alias-cycle"));
+        assert!(!generated.text.contains("alias-record-cycle"));
+        assert!(!generated.text.contains("use-record-alias-cycle"));
+        assert!(!generated.text.contains("variant-record-cycle"));
+        assert!(!generated.text.contains("alias-variant-cycle"));
+        assert!(!generated.text.contains("later-alias"));
+        assert!(!generated.text.contains("use-later-alias"));
         assert!(!generated.text.contains("cycle"));
         assert!(!generated.text.contains("uses-cycle"));
         assert!(!generated.text.contains("rejected"));

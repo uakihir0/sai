@@ -327,14 +327,19 @@ fn prune_generated_item_references(
         .collect::<HashMap<_, _>>();
     let mut dependents =
         HashMap::<(WitIfaceIdx, WitItemIdx), Vec<(WitIfaceIdx, WitItemIdx)>>::new();
-    let mut alias_indegrees = HashMap::<(WitIfaceIdx, WitItemIdx), usize>::new();
-    let mut alias_dependents =
+    let mut local_type_indegrees = HashMap::<(WitIfaceIdx, WitItemIdx), usize>::new();
+    let mut local_type_dependents =
         HashMap::<(WitIfaceIdx, WitItemIdx), Vec<(WitIfaceIdx, WitItemIdx)>>::new();
     let mut invalid_queue = VecDeque::new();
     for (_, source_interface, interface) in interfaces.iter() {
         for (source_item, item) in interface.items.iter_enumerated() {
-            if item.unsupported.is_none() && matches!(item.kind, WitItemKind::Alias(_)) {
-                alias_indegrees.insert((*source_interface, source_item), 0);
+            if item.unsupported.is_none()
+                && matches!(
+                    item.kind,
+                    WitItemKind::Alias(_) | WitItemKind::Record(_) | WitItemKind::Variant(_)
+                )
+            {
+                local_type_indegrees.insert((*source_interface, source_item), 0);
             }
         }
     }
@@ -367,17 +372,26 @@ fn prune_generated_item_references(
                     .or_default()
                     .push(source);
                 if item.unsupported.is_none()
-                    && matches!(item.kind, WitItemKind::Alias(_))
+                    && matches!(
+                        item.kind,
+                        WitItemKind::Alias(_) | WitItemKind::Record(_) | WitItemKind::Variant(_)
+                    )
                     && target_interface == *source_interface
                     && target.name == reference.interface.name
                     && target.items.get(reference.item).is_some_and(|target| {
-                        target.unsupported.is_none() && matches!(target.kind, WitItemKind::Alias(_))
+                        target.unsupported.is_none()
+                            && matches!(
+                                target.kind,
+                                WitItemKind::Alias(_)
+                                    | WitItemKind::Record(_)
+                                    | WitItemKind::Variant(_)
+                            )
                     })
                 {
-                    *alias_indegrees
+                    *local_type_indegrees
                         .get_mut(&source)
-                        .expect("supported alias is indexed before its references") += 1;
-                    alias_dependents
+                        .expect("supported local type is indexed before its references") += 1;
+                    local_type_dependents
                         .entry((target_interface, reference.item))
                         .or_default()
                         .push(source);
@@ -386,28 +400,28 @@ fn prune_generated_item_references(
         }
     }
 
-    let mut acyclic_aliases = VecDeque::from_iter(
-        alias_indegrees
+    let mut acyclic_local_types = VecDeque::from_iter(
+        local_type_indegrees
             .iter()
-            .filter_map(|(alias, indegree)| (*indegree == 0).then_some(*alias)),
+            .filter_map(|(local_type, indegree)| (*indegree == 0).then_some(*local_type)),
     );
-    while let Some(alias) = acyclic_aliases.pop_front() {
-        if let Some(alias_consumers) = alias_dependents.get(&alias) {
-            for consumer in alias_consumers {
-                let indegree = alias_indegrees
+    while let Some(local_type) = acyclic_local_types.pop_front() {
+        if let Some(type_consumers) = local_type_dependents.get(&local_type) {
+            for consumer in type_consumers {
+                let indegree = local_type_indegrees
                     .get_mut(consumer)
-                    .expect("alias dependency target belongs to the same interface");
+                    .expect("local type dependency belongs to the same interface");
                 *indegree -= 1;
                 if *indegree == 0 {
-                    acyclic_aliases.push_back(*consumer);
+                    acyclic_local_types.push_back(*consumer);
                 }
             }
         }
     }
     invalid_queue.extend(
-        alias_indegrees
+        local_type_indegrees
             .into_iter()
-            .filter_map(|(alias, indegree)| (indegree != 0).then_some(alias)),
+            .filter_map(|(local_type, indegree)| (indegree != 0).then_some(local_type)),
     );
 
     let mut invalid_items = HashSet::new();
