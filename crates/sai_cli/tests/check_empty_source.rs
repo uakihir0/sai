@@ -290,6 +290,8 @@ fn public_primitive_parameter_comparison_if_functions_emit_check_results() {
         "pub fn choose(left: Bool, right: Bool) -> I32 { if right <= left { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left > right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if right >= left { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left < right) { 1 } else { 2 } }\n",
+        "pub fn choose(left: F32, right: F32) -> I32 { if not (right <= left) { 1 } else { 2 } }\n",
         "pub fn choose(left: I32, right: I32) -> I32 { if left < right { 1 } else { 2 } }\n",
         "pub fn choose(left: U32, right: U32) -> I32 { if left <= right { 1 } else { 2 } }\n",
         "pub fn choose(left: F32, right: F32) -> I32 { if left > right { 1 } else { 2 } }\n",
@@ -317,6 +319,10 @@ fn unsupported_primitive_parameter_comparison_shapes_remain_gated() {
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == true { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right and left { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right { 1 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not not (left < right) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left and right) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left or right) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left < right and left) { 1 } else { 2 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
