@@ -217,6 +217,26 @@ fn public_primitive_const_literals_emit_check_results() {
 }
 
 #[test]
+fn multiple_public_primitive_const_literals_emit_one_check_result() {
+    assert_success_result(
+        run_check(
+            concat!(
+                "pub const READY: Bool = true\n",
+                "pub const I8_MIN: I8 = -128\n",
+                "pub const U8_MAX: U8 = 255\n",
+                "pub const INT_MAX: Int = 9223372036854775807\n",
+                "pub const UINT_MAX: UInt = 18446744073709551615\n",
+            ),
+            "",
+            &[],
+            &[],
+        ),
+        "wasm32-core",
+        "dev",
+    );
+}
+
+#[test]
 fn public_primitive_const_type_errors_do_not_emit_results() {
     let cases = [
         ("pub const BAD: Bool = 1\n", "TYPE_MISMATCH"),
@@ -252,12 +272,58 @@ fn public_primitive_const_type_errors_do_not_emit_results() {
 }
 
 #[test]
+fn invalid_second_public_primitive_const_suppresses_the_check_result() {
+    let output = run_check(
+        "pub const FIRST: I8 = 1\npub const SECOND: U8 = 256\n",
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an invalid later const should fail the package check:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "supported literal errors should suppress the result without gating the feature:\n{stdout}"
+    );
+}
+
+#[test]
+fn duplicate_public_primitive_const_names_report_a_duplicate_without_a_result() {
+    let output = run_check(
+        "pub const SAME: I8 = 1\npub const SAME: I8 = 2\n",
+        "",
+        &[],
+        &[],
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "duplicate const declarations should fail the package check:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"DUPLICATE_BINDING\"")
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "duplicate names are a supported declaration error, not a feature gate:\n{stdout}"
+    );
+}
+
+#[test]
 fn const_forms_outside_literal_slice_remain_gated() {
     for source in [
         "const PRIVATE: I8 = 1\n",
         "pub const EXPRESSION: I8 = 1 + 2\n",
         "pub const ALIAS: MyInt = 1\n",
-        "pub const FIRST: I8 = 1\npub const SECOND: I8 = 2\n",
+        "use missing;\npub const VALUE: I8 = 1\n",
+        "unsafe module\npub const VALUE: I8 = 1\n",
+        "property \"coverage\" () {}\npub const VALUE: I8 = 1\n",
         "@doc(hidden)\npub const ATTRIBUTED: I8 = 1\n",
         "pub const Max_size: I8 = 1\n",
         "pub const r#READY: Bool = true\n",

@@ -1689,7 +1689,7 @@ fn run_check(
     });
     let profile = check_profile_override(command).unwrap_or_else(|| "dev".to_owned());
     let root_analysis_is_covered = root_coverage.empty_root_module_only_covered
-        || root_coverage.single_public_primitive_const_covered;
+        || root_coverage.public_primitive_const_set_covered;
     let check_slice_is_supported = root_analysis_is_covered
         && empty_root_manifest_supported
         && root_manifest_semantically_valid
@@ -1861,26 +1861,81 @@ fn check_manifest_supports_empty_root_success(
     })
 }
 
-fn check_source_is_single_unattributed_const(source: &[u8]) -> bool {
+fn check_source_is_unattributed_public_const_set(source: &[u8]) -> Option<usize> {
     use sai_syntax::ast::AstNode as _;
 
-    let Ok(parsed) = sai_fmt::parse_source(source) else {
-        return false;
-    };
-    let Some(source_file) = sai_syntax::ast::SourceFile::cast(parsed.root().clone()) else {
-        return false;
-    };
+    let parsed = sai_fmt::parse_source(source).ok()?;
+    let source_file = sai_syntax::ast::SourceFile::cast(parsed.root().clone())?;
     if source_file.module_header().is_some()
         || source_file.test_decls().next().is_some()
         || source_file.property_decls().next().is_some()
+        || source_file
+            .syntax()
+            .children()
+            .any(|child| sai_syntax::ast::UseDecl::can_cast(child.kind()))
+    {
+        return None;
+    }
+    let mut const_count = 0usize;
+    for item in source_file.items() {
+        let sai_syntax::ast::Item::Const(constant) = item else {
+            return None;
+        };
+        if constant.attrs().next().is_some()
+            || !constant
+                .visibility()
+                .is_some_and(|visibility| visibility.pub_token().is_some())
+        {
+            return None;
+        }
+        let name = constant.name()?;
+        let name_token = name.token()?;
+        let written_name = name_token.text();
+        if written_name.starts_with("r#")
+            || !written_name
+                .bytes()
+                .all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            return None;
+        }
+        const_count = const_count.checked_add(1)?;
+    }
+    (const_count > 0).then_some(const_count)
+}
+
+fn check_public_primitive_const_set_coverage(
+    source_count: usize,
+    scopes: &sai_driver::Phase1PackageScopes,
+    const_resolutions: &sai_driver::ConstOwnerResolutions,
+) -> bool {
+    if scopes.modules.len() != 1
+        || !scopes.modules[0].imports.is_empty()
+        || scopes.top_level_owners.len() != source_count
+        || const_resolutions.owners().len() != source_count
     {
         return false;
     }
-    let items = source_file.items().collect::<Vec<_>>();
-    matches!(
-        items.as_slice(),
-        [sai_syntax::ast::Item::Const(constant)] if constant.attrs().next().is_none()
-    )
+
+    let active_owner_ids = scopes
+        .top_level_owners
+        .iter()
+        .filter(|descriptor| descriptor.kind == sai_driver::TopLevelOwnerKind::Const)
+        .map(|descriptor| descriptor.owner)
+        .collect::<HashSet<_>>();
+    let resolved_owner_ids = const_resolutions
+        .owners()
+        .iter()
+        .map(sai_driver::ConstOwnerResolution::owner)
+        .collect::<HashSet<_>>();
+
+    active_owner_ids.len() == source_count
+        && resolved_owner_ids.len() == source_count
+        && active_owner_ids == resolved_owner_ids
+        && const_resolutions.owners().iter().all(|owner| {
+            owner
+                .literal_check()
+                .is_ok_and(sai_driver::ConstLiteralCheck::is_supported)
+        })
 }
 
 fn check_target_override(command: &crate::args::ParsedCommand) -> Option<String> {
@@ -4767,7 +4822,7 @@ struct CheckWorkspaceDiagnostics {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CheckRootCoverage {
     empty_root_module_only_covered: bool,
-    single_public_primitive_const_covered: bool,
+    public_primitive_const_set_covered: bool,
 }
 
 struct CheckSuccessRecord {
@@ -5092,8 +5147,7 @@ fn module_tree_workspace_check_diagnostics(
                 };
                 path == &root_source_path && source.is_empty()
             });
-    let mut single_public_primitive_const_covered = false;
-    let single_root_const_input_shape = inputs.len() == 1
+    let root_const_input_shape = inputs.len() == 1
         && inputs[0].is_root_package
         && !inputs[0].analyzes_tests
         && !inputs[0].inspection_incomplete
@@ -5103,20 +5157,25 @@ fn module_tree_workspace_check_diagnostics(
         && package_manifests[0].role == sai_package::manifest::PackageRole::Root
         && wit_packages.is_empty()
         && package_graph.is_none()
-        && target_cfg.is_some()
-        && inputs[0]
+        && target_cfg.is_some();
+    let root_const_source_count = if root_const_input_shape {
+        let root_source_path = if inputs[0].source_directory == "." {
+            "lib.sai".to_owned()
+        } else {
+            format!("{}/lib.sai", inputs[0].source_directory)
+        };
+        inputs[0]
             .source_inputs
             .first()
-            .is_some_and(|(path, _, source)| {
-                let root_source_path = if inputs[0].source_directory == "." {
-                    "lib.sai".to_owned()
-                } else {
-                    format!("{}/lib.sai", inputs[0].source_directory)
-                };
-                path == &root_source_path
-                    && !source.is_empty()
-                    && check_source_is_single_unattributed_const(source.as_ref())
-            });
+            .and_then(|(path, _, source)| {
+                (path == &root_source_path)
+                    .then(|| check_source_is_unattributed_public_const_set(source.as_ref()))
+                    .flatten()
+            })
+    } else {
+        None
+    };
+    let mut public_primitive_const_set_covered = false;
     let mut database = RootDatabase::new()
         .map_err(|error| format!("could not initialize query database: {error:?}"))?;
     let package_graph_for_scopes = package_graph.clone();
@@ -5671,18 +5730,14 @@ fn module_tree_workspace_check_diagnostics(
                 warnings = warnings.saturating_add(literal_warnings);
                 infos = infos.saturating_add(literal_infos);
 
-                if single_root_const_input_shape
-                    && collection.scopes().modules.len() == 1
-                    && collection.scopes().modules[0].imports.is_empty()
-                    && collection.scopes().top_level_owners.len() == 1
-                    && collection.scopes().top_level_owners[0].kind
-                        == sai_driver::TopLevelOwnerKind::Const
-                    && const_resolutions.owners().len() == 1
-                    && const_resolutions.owners()[0]
-                        .literal_check()
-                        .is_ok_and(sai_driver::ConstLiteralCheck::is_supported)
-                {
-                    single_public_primitive_const_covered = true;
+                if root_const_source_count.is_some_and(|source_count| {
+                    check_public_primitive_const_set_coverage(
+                        source_count,
+                        collection.scopes(),
+                        &const_resolutions,
+                    )
+                }) {
+                    public_primitive_const_set_covered = true;
                 }
             }
 
@@ -6265,7 +6320,7 @@ fn module_tree_workspace_check_diagnostics(
         infos,
         root_coverage: CheckRootCoverage {
             empty_root_module_only_covered,
-            single_public_primitive_const_covered,
+            public_primitive_const_set_covered,
         },
     })
 }
