@@ -2426,7 +2426,7 @@ impl FunctionOwnerResolution {
             .map(|resolution| resolution.as_ref())
     }
 
-    /// Returns the result of the supported direct parameter-to-return check.
+    /// Returns the result of the supported direct function-body type checks.
     ///
     /// `Unsupported` keeps the owner behind the caller's feature gate.
     pub fn body_type_check(&self) -> Result<&FunctionBodyTypeCheck, &FunctionOwnerResolutionError> {
@@ -5624,7 +5624,7 @@ impl ConstOwnerResolution {
     }
 }
 
-/// Result of checking a function whose body is exactly one parameter path.
+/// Result of checking one supported direct function-body form.
 ///
 /// This is an initial Stage 0 body-checking slice, not a general expression
 /// type checker. Unsupported owner and expression shapes remain gated.
@@ -5853,6 +5853,7 @@ fn check_function_body_type(
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
 ) -> Result<FunctionBodyTypeCheck, OwnerControlFlowResolutionError> {
     if !owner.raw_attrs.is_empty() || !body.contracts.is_empty() || !body.invariant_preds.is_empty()
     {
@@ -5874,11 +5875,6 @@ fn check_function_body_type(
     };
     if sig.safety != sai_hir::Safety::Safe
         || sig.is_async
-        || sig.params.len() != 1
-        || sig.params[0].is_self
-        || sig.params[0].mutable
-        || body.params.len() != 1
-        || body.params[0].mutable
         || sig.borrows.is_some()
         || sig.effects.is_some()
         || !sig.requires.is_empty()
@@ -5886,13 +5882,24 @@ fn check_function_body_type(
         || !generics.params.is_empty()
         || !generics.where_preds.is_empty()
         || !function_name_is_supported(item.name, symbols, inputs)
-        || !sig.params[0]
-            .name
-            .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
-        || sig.params[0].name != body.params[0].name
     {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     }
+    let parameter = match (sig.params, body.params) {
+        ([], []) => None,
+        ([parameter], [body_parameter])
+            if !parameter.is_self
+                && !parameter.mutable
+                && !body_parameter.mutable
+                && parameter
+                    .name
+                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
+                && parameter.name == body_parameter.name =>
+        {
+            Some((parameter, body_parameter))
+        }
+        _ => return Ok(FunctionBodyTypeCheck::Unsupported),
+    };
 
     let tail = match body.value.kind {
         ExprKind::Block(block)
@@ -5905,58 +5912,81 @@ fn check_function_body_type(
     let Some(tail) = tail else {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     };
-    let ExprKind::Path(path) = tail.kind else {
-        return Ok(FunctionBodyTypeCheck::Unsupported);
-    };
-    if path.root != PathRoot::Plain
-        || path.segments.len() != 1
-        || path.segments[0].args.is_some()
-        || !is_plain_ascii_identifier(path.segments[0].name, inputs)
-    {
-        return Ok(FunctionBodyTypeCheck::Unsupported);
-    }
-    let binding = body.params[0].binding;
-    if !matches!(
-        locals.paths.get(&path.hir_id),
-        Some(PathRes {
-            base: Res::Local(resolved_binding),
-            resolved_segments: 1,
-            segment_count: 1,
-        }) if *resolved_binding == binding
-    ) {
-        return Ok(FunctionBodyTypeCheck::Unsupported);
-    }
-
-    let Some(found) = resolve_function_direct_type(*sig.params[0].ty, type_paths, symbols, inputs)
-    else {
-        return Ok(FunctionBodyTypeCheck::Unsupported);
-    };
-    let expected = match sig.ret {
-        Some(ty) => {
-            let Some(expected) = resolve_function_direct_type(*ty, type_paths, symbols, inputs)
-            else {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            };
-            expected
+    let diagnostics = if let Some((parameter, body_parameter)) = parameter {
+        let ExprKind::Path(path) = tail.kind else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        if path.root != PathRoot::Plain
+            || path.segments.len() != 1
+            || path.segments[0].args.is_some()
+            || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+        {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
         }
-        None => FunctionDirectType::Unit,
-    };
-    let diagnostics = if expected == found || expected == FunctionDirectType::Unit {
-        Vec::new()
+        if !matches!(
+            locals.paths.get(&path.hir_id),
+            Some(PathRes {
+                base: Res::Local(resolved_binding),
+                resolved_segments: 1,
+                segment_count: 1,
+            }) if *resolved_binding == body_parameter.binding
+        ) {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        }
+
+        let Some(found) = resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
+        else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        let expected = match sig.ret {
+            Some(ty) => {
+                let Some(expected) = resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+                else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                expected
+            }
+            None => FunctionDirectType::Unit,
+        };
+        if expected == found || expected == FunctionDirectType::Unit {
+            Vec::new()
+        } else {
+            vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                tail.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!(
+                    "expected `{}`, found `{}`",
+                    function_direct_type_name(expected),
+                    function_direct_type_name(found)
+                ),
+                "type mismatch",
+            )?]
+        }
     } else {
-        vec![const_literal_diagnostic(
-            owner.id,
-            inputs,
-            snapshot,
-            tail.span,
-            sai_diagnostics::Code::TypeMismatch,
-            format!(
-                "expected `{}`, found `{}`",
-                function_direct_type_name(expected),
-                function_direct_type_name(found)
-            ),
-            "type mismatch",
-        )?]
+        let Some(return_ty) = sig.ret else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        if !matches!(
+            resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
+            Some(FunctionDirectType::Primitive(_))
+        ) || !matches!(
+            tail.kind,
+            ExprKind::Lit(
+                Lit::Bool(_) | Lit::Char(_) | Lit::Byte(_) | Lit::Int { .. } | Lit::Float { .. }
+            )
+        ) {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        }
+        let Some(diagnostics) = check_const_literal_leaf(
+            owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+        )?
+        else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        diagnostics
     };
     Ok(FunctionBodyTypeCheck::Supported { diagnostics })
 }
@@ -12872,6 +12902,7 @@ impl RootDatabase {
                                         &self.symbols,
                                         &inputs,
                                         snapshot,
+                                        &collection.target_cfg,
                                     )?);
                                     let mut module_paths = match &module_scope {
                                         Ok(module_scope) => Ok(resolve_owner_module_paths(
@@ -23909,6 +23940,127 @@ mod tests {
                 FunctionBodyTypeCheck::Unsupported
             ));
         }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_direct_scalar_literal_tails_without_parameters() {
+        let root = concat!(
+            "pub fn identity(value: I32) -> I32 { value }\n",
+            "pub fn integer() -> I32 { 42 }\n",
+            "pub fn boolean() -> Bool { true }\n",
+            "pub fn byte() -> Byte { b'z' }\n",
+            "pub fn character() -> Char { 'z' }\n",
+            "pub fn float() -> F32 { 1.25 }\n",
+            "pub fn signed_minimum() -> I8 { -128 }\n",
+            "pub fn builtin_int_alias() -> Int { 42 }\n",
+            "pub fn builtin_uint_alias() -> UInt { 42 }\n",
+            "pub fn mismatch() -> Bool { 42 }\n",
+            "pub fn integer_overflow() -> I8 { 128 }\n",
+            "pub fn pointer_overflow() -> USize { 4294967296 }\n",
+            "pub fn omitted_return() { 1 }\n",
+            "pub fn unit_return() -> () { () }\n",
+            "pub fn string_return() -> Str { \"text\" }\n",
+            "pub fn byte_string_return() -> Byte { b\"text\" }\n",
+            "pub fn expression() -> I32 { 40 + 2 }\n",
+            "type Number = I32\n",
+            "pub fn user_alias_return() -> Number { 42 }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 18);
+        for owner in &owners[..9] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("direct function body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+
+        for (index, expected_code, expected_message, function, literal) in [
+            (
+                9,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `Bool`, found an integer literal",
+                "mismatch",
+                "42",
+            ),
+            (
+                10,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                "integer literal is out of range for `I8`",
+                "integer_overflow",
+                "128",
+            ),
+            (
+                11,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                "integer literal is out of range for `USize`",
+                "pointer_overflow",
+                "4294967296",
+            ),
+        ] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
+                .body_type_check()
+                .expect("supported direct literal mismatch is diagnosed")
+            else {
+                panic!("direct primitive literal mismatch remains in the supported slice");
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, expected_code);
+            assert_eq!(diagnostics[0].message, expected_message);
+            let function_start = root
+                .find(&format!("pub fn {function}"))
+                .expect("function exists");
+            let start = (function_start
+                + root[function_start..]
+                    .find(literal)
+                    .expect("literal exists in function")) as u32;
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("direct literal diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + literal.len() as u32),
+                )
+                .expect("literal range is ordered")
+            );
+        }
+
+        for owner in &owners[12..] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("unsupported function body check succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
+        assert!(
+            owners[17]
+                .type_path_resolution()
+                .expect("user-defined alias path resolution succeeds")
+                .expect("user-defined alias owner has type-path results")
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::Alias, _))),
+            "the gated return type must resolve to a user-defined alias"
+        );
     }
 
     #[test]
