@@ -2801,6 +2801,11 @@ fn collect_interface_uses_input(
         );
         let mut generated_alias_definition_type_references =
             generated_record_type_references.clone();
+        generated_alias_definition_type_references.extend(
+            generated_local_type_references
+                .iter()
+                .map(|(definition, reference)| (*definition, reference.clone())),
+        );
         if let (Some(unit), Some(interface_index), Some(interface_name)) = (
             generated_unit.as_ref(),
             generated_interface_index,

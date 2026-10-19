@@ -50977,7 +50977,11 @@ interface facade { use middle.{payload}; }"#;
             "{}",
             generated.text
         );
-        assert!(generated.text.contains("use types.{id};"));
+        assert!(
+            generated.text.contains("use types.{id};"),
+            "{}",
+            generated.text
+        );
         assert!(!generated.text.contains("future:"));
         assert!(!generated.text.contains("missing:"));
         assert!(!generated.text.contains("type hidden ="));
@@ -51073,6 +51077,229 @@ interface facade { use middle.{payload}; }"#;
             assert_eq!(reference.item, consumer_id_index);
             assert_eq!(reference.item_name, "id");
         }
+    }
+
+    #[test]
+    fn generated_wit_aliases_reference_prior_local_interfaces_only() {
+        let source = concat!(
+            "interface early {\n",
+            "  type Future = types.Id\n",
+            "  type Keep = U32\n",
+            "}\n",
+            "interface types {\n",
+            "  type Hidden = USize\n",
+            "  type Id = U32\n",
+            "  resource Handle {}\n",
+            "}\n",
+            "interface aliases {\n",
+            "  type Wrapped = types.Id\n",
+            "  type ResourceAlias = types.Handle\n",
+            "  type Missing = types.Hidden\n",
+            "  fn use_wrapped(value: Wrapped)\n",
+            "  fn use_resource(value: ResourceAlias)\n",
+            "  fn use_missing(value: Missing)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("cross-interface alias references remain queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning unsupported alias targets leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "later-interface and omitted-type alias targets remain incomplete"
+        );
+        assert!(generated.text.contains("type keep = u32;"));
+        assert!(generated.text.contains("type id = u32;"));
+        assert!(generated.text.contains("use types.{handle, id};"));
+        assert!(generated.text.contains("type wrapped = id;"));
+        assert!(
+            generated
+                .text
+                .contains("use-wrapped: func(value: wrapped);")
+        );
+        assert!(generated.text.contains("resource handle;"));
+        assert!(generated.text.contains("type resource-alias = handle;"));
+        assert!(
+            generated
+                .text
+                .contains("use-resource: func(value: resource-alias);")
+        );
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("type future ="));
+        assert!(!generated.text.contains("type hidden ="));
+        assert!(!generated.text.contains("type missing ="));
+        assert!(!generated.text.contains("use-missing:"));
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let root = package_model.root();
+        let (types_index, types) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "types")
+            .expect("the prior interface with the supported type remains");
+        let (id_index, _) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the supported earlier alias remains");
+        let (handle_index, handle) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the earlier resource remains");
+        assert!(matches!(handle.kind, sai_wit::WitItemKind::Resource(_)));
+        assert_eq!(
+            types
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "handle"],
+            "the unsupported earlier item is removed while the resource remains"
+        );
+
+        let early = root
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "early")
+            .expect("the earlier interface remains");
+        assert_eq!(
+            early
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["keep"],
+            "an alias cannot reference a later interface"
+        );
+
+        let (aliases_index, aliases) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "aliases")
+            .expect("the later aliases interface remains");
+        let (import_index, import) = aliases
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the parsed local use alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(imported_id)) = &import.kind else {
+            panic!("the parsed local use alias retains the referenced named type");
+        };
+        assert_eq!(&imported_id.interface.unit, &unit);
+        assert_eq!(imported_id.interface.interface, types_index);
+        assert_eq!(imported_id.item, id_index);
+        assert_eq!(imported_id.item_name, "id");
+        let (handle_import_index, handle_import) = aliases
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the parsed local resource use alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(imported_handle)) =
+            &handle_import.kind
+        else {
+            panic!("the parsed local resource use alias retains its owned handle");
+        };
+        assert_eq!(&imported_handle.interface.unit, &unit);
+        assert_eq!(imported_handle.interface.interface, types_index);
+        assert_eq!(imported_handle.item, handle_index);
+        assert_eq!(imported_handle.item_name, "handle");
+
+        let (wrapped_index, wrapped) = aliases
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "wrapped")
+            .expect("the cross-interface alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(wrapped_target)) = &wrapped.kind
+        else {
+            panic!("the alias retains its parsed named target");
+        };
+        assert_eq!(&wrapped_target.interface.unit, &unit);
+        assert_eq!(wrapped_target.interface.interface, aliases_index);
+        assert_eq!(wrapped_target.item, import_index);
+        assert_eq!(wrapped_target.item_name, "id");
+
+        let (resource_alias_index, resource_alias) = aliases
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "resource-alias")
+            .expect("the alias to the prior resource remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(resource_alias_target)) =
+            &resource_alias.kind
+        else {
+            panic!("the cross-interface resource alias retains its named use target");
+        };
+        assert_eq!(&resource_alias_target.interface.unit, &unit);
+        assert_eq!(resource_alias_target.interface.interface, aliases_index);
+        assert_eq!(resource_alias_target.item, handle_import_index);
+        assert_eq!(resource_alias_target.item_name, "handle");
+
+        let use_wrapped = aliases
+            .items
+            .iter()
+            .find(|item| item.name == "use-wrapped")
+            .expect("the function using the cross-interface alias remains");
+        let sai_wit::WitItemKind::Func(use_wrapped) = &use_wrapped.kind else {
+            panic!("use-wrapped remains a function");
+        };
+        let sai_wit::WitType::Named(function_target) = &use_wrapped.params[0].1 else {
+            panic!("the function parameter retains its local named alias");
+        };
+        assert_eq!(&function_target.interface.unit, &unit);
+        assert_eq!(function_target.interface.interface, aliases_index);
+        assert_eq!(function_target.item, wrapped_index);
+        assert_eq!(function_target.item_name, "wrapped");
+        let use_resource = aliases
+            .items
+            .iter()
+            .find(|item| item.name == "use-resource")
+            .expect("the function using the cross-interface resource alias remains");
+        let sai_wit::WitItemKind::Func(use_resource) = &use_resource.kind else {
+            panic!("use-resource remains a function");
+        };
+        assert!(matches!(
+            use_resource.params[0].1,
+            sai_wit::WitType::Own(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == aliases_index
+                    && reference.item == resource_alias_index
+                    && reference.item_name == "resource-alias"
+        ));
     }
 
     #[test]
@@ -52175,8 +52402,8 @@ interface facade { use middle.{payload}; }"#;
             .expect("the generated root text is retained");
         assert!(!generated.complete);
         let package_model = result.package.expect("partial WIT model loads");
-        let (interface_index, interface) = package_model
-            .root()
+        let root = package_model.root();
+        let (interface_index, interface) = root
             .interfaces
             .iter_enumerated()
             .next()
@@ -52314,7 +52541,8 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("type rejected ="));
         assert!(!generated.text.contains("uses-rejected"));
         assert!(!generated.text.contains("uses-uses-rejected"));
-        assert!(!generated.text.contains("cross-interface"));
+        assert!(generated.text.contains("use api.{after};"));
+        assert!(generated.text.contains("type cross-interface = after;"));
         assert!(generated.text.contains("type after = u32;"));
         assert!(generated.text.contains("type before = after;"));
         assert!(
@@ -52322,6 +52550,44 @@ interface facade { use middle.{payload}; }"#;
                 .text
                 .contains("use-later: func(value: after) -> after;")
         );
+        let (other_index, other) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "other")
+            .expect("the later interface with a cross-interface alias remains");
+        let (after_index, _) = interface
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "after")
+            .expect("the target alias remains in the earlier interface");
+        let (other_after_index, other_after) = other
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "after")
+            .expect("the later interface's use alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(other_after_target)) =
+            &other_after.kind
+        else {
+            panic!("the parsed use alias points to the exact earlier interface type");
+        };
+        assert_eq!(&other_after_target.interface.unit, &unit);
+        assert_eq!(other_after_target.interface.interface, interface_index);
+        assert_eq!(other_after_target.item, after_index);
+        assert_eq!(other_after_target.item_name, "after");
+        let cross_interface = other
+            .items
+            .iter()
+            .find(|item| item.name == "cross-interface")
+            .expect("the alias targeting the earlier interface remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(cross_target)) =
+            &cross_interface.kind
+        else {
+            panic!("cross-interface remains an alias");
+        };
+        assert_eq!(&cross_target.interface.unit, &unit);
+        assert_eq!(cross_target.interface.interface, other_index);
+        assert_eq!(cross_target.item, other_after_index);
+        assert_eq!(cross_target.item_name, "after");
         let later_resource_index = interface
             .items
             .iter_enumerated()
