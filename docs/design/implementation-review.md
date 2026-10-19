@@ -5823,6 +5823,15 @@
 - **Human review:** **Review required:** Confirm that only ordinary function signatures may refer forward across generated local interfaces, that the exact target identity must survive print/parse, and that references into omitted or cyclic target interfaces should prune only dependent functions while preserving unrelated declarations.
 - **Remaining scope:** Later-interface references from aliases, record fields, variant payloads, and resource-member signatures remain unsupported; the broader §16.10.1 forward-reference and transitive-poisoning plan remains incomplete.
 
+### IR-708: allow aliases to reference later local interfaces
+
+- **Decision:** Extend only the alias-definition map with exact references to named types and resources in later generated local interfaces. Keep alias use maps for functions, records, variants, and resource members within their existing scope.
+- **Reason:** Alias definitions already materialize named data items and owned resource handles. Their dedicated map can accept forward targets without granting the same target to record fields, variant payloads, or resource-member signatures. Pre-reserved `DefId`-based references preserve identity, while existing pruning handles omitted targets and cross-interface cycles.
+- **Verification:** `generated_wit_aliases_reference_prior_and_later_local_interfaces` checks later type and resource aliases, local `use` target identity, alias consumers, and pruning of a missing target and its consumer. The four remaining `prior_local_interfaces_only` regressions and the cyclic-interface regression pass, preserving function/record/variant/resource-member boundaries. `cargo test --workspace --locked --quiet` passes all suites, including 340 `sai_driver` and 722 `sai_package` tests; `cargo fmt --all -- --check` and `git diff --check` pass.
+- **Review:** Two hostile passes found no actionable P0–P2 issues. They confirmed that only the alias-definition map receives later-interface references, target indices are strictly later than the current provisional interface, and sibling maps stay isolated. The tests verify parsed identity, omitted-target pruning, and first-binding behavior for duplicate names.
+- **Human review:** **Review required:** Confirm that alias definitions may target exact named types and resources in later generated local interfaces, while record fields, variant payloads, and resource-member signatures remain prior-interface-only; confirm that omitted or cyclic targets prune their aliases and dependents.
+- **Remaining scope:** Later-interface references from record fields, variant payloads, and resource-member signatures remain unsupported, along with the broader §16.10.1 forward-reference and transitive-poisoning plan.
+
 ### CI follow-up (2026-10-19)
 
 - **Decision:** Keep GitHub Actions CI enabled and leave the current concurrency policy unchanged.

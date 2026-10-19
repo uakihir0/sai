@@ -3065,6 +3065,16 @@ fn collect_interface_uses_input(
                 .iter()
                 .map(|(definition, reference)| (*definition, reference.clone())),
         );
+        // Alias definitions may point forward across generated interfaces, but resource
+        // members and the other consumer maps keep their existing visibility boundary.
+        if let Some(interface_index) = generated_interface_index {
+            generated_alias_definition_type_references.extend(
+                generated_all_local_type_references
+                    .iter()
+                    .filter(|(_, reference)| reference.interface.interface > interface_index)
+                    .map(|(definition, reference)| (*definition, reference.clone())),
+            );
+        }
         for (member_index, (entry, member_owner)) in member_entries
             .into_iter()
             .zip(parent_members.iter().copied())

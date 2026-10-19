@@ -52560,11 +52560,16 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
-    fn generated_wit_aliases_reference_prior_local_interfaces_only() {
+    fn generated_wit_aliases_reference_prior_and_later_local_interfaces() {
         let source = concat!(
             "interface early {\n",
             "  type Future = types.Id\n",
+            "  type FutureResource = types.Handle\n",
+            "  type Missing = types.Hidden\n",
             "  type Keep = U32\n",
+            "  fn use_future(value: Future)\n",
+            "  fn use_future_resource(value: FutureResource)\n",
+            "  fn use_missing(value: Missing)\n",
             "}\n",
             "interface types {\n",
             "  type Hidden = USize\n",
@@ -52621,9 +52626,11 @@ interface facade { use middle.{payload}; }"#;
             .expect("the generated root text is retained");
         assert!(
             !generated.complete,
-            "later-interface and omitted-type alias targets remain incomplete"
+            "the omitted-type alias target remains incomplete"
         );
         assert!(generated.text.contains("type keep = u32;"));
+        assert!(generated.text.contains("type %future = id;"));
+        assert!(generated.text.contains("type future-resource = handle;"));
         assert!(generated.text.contains("type id = u32;"));
         assert!(generated.text.contains("use types.{handle, id};"));
         assert!(generated.text.contains("type wrapped = id;"));
@@ -52634,15 +52641,20 @@ interface facade { use middle.{payload}; }"#;
         );
         assert!(generated.text.contains("resource handle;"));
         assert!(generated.text.contains("type resource-alias = handle;"));
+        assert!(generated.text.contains("use-future: func(value: %future);"));
+        assert!(
+            generated
+                .text
+                .contains("use-future-resource: func(value: future-resource);")
+        );
         assert!(
             generated
                 .text
                 .contains("use-resource: func(value: resource-alias);")
         );
         assert!(generated.text.contains("independent: func(value: u32);"));
-        assert!(!generated.text.contains("type future ="));
-        assert!(!generated.text.contains("type hidden ="));
         assert!(!generated.text.contains("type missing ="));
+        assert!(!generated.text.contains("type hidden ="));
         assert!(!generated.text.contains("use-missing:"));
 
         let package_model = result.package.expect("partial generated WIT model loads");
@@ -52673,10 +52685,10 @@ interface facade { use middle.{payload}; }"#;
             "the unsupported earlier item is removed while the resource remains"
         );
 
-        let early = root
+        let (early_index, early) = root
             .interfaces
-            .iter()
-            .find(|interface| interface.name == "early")
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "early")
             .expect("the earlier interface remains");
         assert_eq!(
             early
@@ -52684,9 +52696,104 @@ interface facade { use middle.{payload}; }"#;
                 .iter()
                 .map(|item| item.name.as_str())
                 .collect::<Vec<_>>(),
-            ["keep"],
-            "an alias cannot reference a later interface"
+            [
+                "handle",
+                "id",
+                "future",
+                "future-resource",
+                "keep",
+                "use-future",
+                "use-future-resource"
+            ],
+            "supported future aliases survive while the omitted target and consumer are pruned"
         );
+
+        let (early_id_index, early_id) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the future type is available through a local use alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(early_id_target)) = &early_id.kind
+        else {
+            panic!("the local id import retains a named target");
+        };
+        assert_eq!(&early_id_target.interface.unit, &unit);
+        assert_eq!(early_id_target.interface.interface, types_index);
+        assert_eq!(early_id_target.item, id_index);
+        assert_eq!(early_id_target.item_name, "id");
+        let (early_handle_index, early_handle) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the future resource is available through a local use alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(early_handle_target)) =
+            &early_handle.kind
+        else {
+            panic!("the local handle import retains an owned target");
+        };
+        assert_eq!(&early_handle_target.interface.unit, &unit);
+        assert_eq!(early_handle_target.interface.interface, types_index);
+        assert_eq!(early_handle_target.item, handle_index);
+        assert_eq!(early_handle_target.item_name, "handle");
+        let (future_index, future) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "future")
+            .expect("the future alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(future_target)) = &future.kind
+        else {
+            panic!("the future alias retains its parsed named target");
+        };
+        assert_eq!(&future_target.interface.unit, &unit);
+        assert_eq!(future_target.interface.interface, early_index);
+        assert_eq!(future_target.item, early_id_index);
+        assert_eq!(future_target.item_name, "id");
+        let (future_resource_index, future_resource) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "future-resource")
+            .expect("the future resource alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(future_resource_target)) =
+            &future_resource.kind
+        else {
+            panic!("the future resource alias retains its parsed named target");
+        };
+        assert_eq!(&future_resource_target.interface.unit, &unit);
+        assert_eq!(future_resource_target.interface.interface, early_index);
+        assert_eq!(future_resource_target.item, early_handle_index);
+        assert_eq!(future_resource_target.item_name, "handle");
+        let use_future = early
+            .items
+            .iter()
+            .find(|item| item.name == "use-future")
+            .expect("the future alias consumer survives");
+        let sai_wit::WitItemKind::Func(use_future) = &use_future.kind else {
+            panic!("use-future remains a function");
+        };
+        assert!(matches!(
+            use_future.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == early_index
+                    && reference.item == future_index
+                    && reference.item_name == "future"
+        ));
+        let use_future_resource = early
+            .items
+            .iter()
+            .find(|item| item.name == "use-future-resource")
+            .expect("the future resource alias consumer survives");
+        let sai_wit::WitItemKind::Func(use_future_resource) = &use_future_resource.kind else {
+            panic!("use-future-resource remains a function");
+        };
+        assert!(matches!(
+            use_future_resource.params[0].1,
+            sai_wit::WitType::Own(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == early_index
+                    && reference.item == future_resource_index
+                    && reference.item_name == "future-resource"
+        ));
 
         let (aliases_index, aliases) = root
             .interfaces
