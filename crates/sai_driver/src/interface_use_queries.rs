@@ -3080,8 +3080,8 @@ fn collect_interface_uses_input(
                 .iter()
                 .map(|(definition, reference)| (*definition, reference.clone())),
         );
-        // Copy foreign Used facades before ordinary functions gain later-local
-        // references, keeping resource members within their own visibility boundary.
+        // Copy foreign Used facades before the consumer maps gain later-local
+        // references, so resource members receive their forward references separately.
         generated_function_type_references.extend(
             foreign_interface_used_type_references
                 .by_definition
@@ -3093,9 +3093,15 @@ fn collect_interface_uses_input(
                 .iter()
                 .map(|(definition, reference)| (*definition, reference.clone())),
         );
-        // Alias definitions may point forward across generated interfaces, but resource
-        // members and the other consumer maps keep their existing visibility boundary.
+        // Alias definitions, record fields, variants, and resource members may point
+        // forward across generated interfaces through their separate consumer maps.
         if let Some(interface_index) = generated_interface_index {
+            generated_resource_member_type_references.extend(
+                generated_all_local_type_references
+                    .iter()
+                    .filter(|(_, reference)| reference.interface.interface > interface_index)
+                    .map(|(definition, reference)| (*definition, reference.clone())),
+            );
             generated_alias_definition_type_references.extend(
                 generated_all_local_type_references
                     .iter()
@@ -3120,7 +3126,7 @@ fn collect_interface_uses_input(
             );
         }
         // Extend only the alias-definition map here; record fields and variants get
-        // their own map extensions below, while ordinary functions have their own map.
+        // their own map extensions below, and resource members have a separate map.
         generated_alias_definition_type_references.extend(
             foreign_interface_used_type_references
                 .by_definition
@@ -3439,8 +3445,8 @@ fn collect_interface_uses_input(
                     ),
                 ));
             }
-            // Resource members retain the pre-forward-reference map: only ordinary function
-            // signatures may use types from later generated interfaces.
+            // Resource members use their own map with exact later-interface references,
+            // keeping the ordinary-function and resource-member scopes independent.
             let mut resource_named_type_references =
                 generated_resource_member_type_references.clone();
             if let Some(resource_item) = staged_resource_item.as_ref()

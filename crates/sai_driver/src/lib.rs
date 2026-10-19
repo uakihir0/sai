@@ -53747,7 +53747,7 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
-    fn generated_wit_resource_members_reference_prior_local_interfaces_only() {
+    fn generated_wit_resource_members_reference_prior_and_later_local_interfaces() {
         fn find_item<'a>(
             interface: &'a sai_wit::WitInterface,
             name: &str,
@@ -53761,10 +53761,16 @@ interface facade { use middle.{payload}; }"#;
 
         let source = concat!(
             "interface early {\n",
-            "  resource Future {\n",
-            "    fn fail(self: borrow Self, value: types.Id)\n",
+            "  resource Worker {\n",
+            "    fn round_trip(self: borrow Self, value: types.Id, borrowed: borrow types.Other) -> types.Payload\n",
+            "    fn new(value: types.Payload) -> Self\n",
+            "    fn from_later(handle_value: types.Other) -> types.Id\n",
             "  }\n",
-            "  fn take_future(value: Future)\n",
+            "  resource Broken {\n",
+            "    fn fail(self: borrow Self, value: types.Hidden)\n",
+            "  }\n",
+            "  fn take_worker(value: Worker)\n",
+            "  fn take_broken(value: Broken)\n",
             "  resource Keep {}\n",
             "}\n",
             "interface types {\n",
@@ -53829,6 +53835,25 @@ interface facade { use middle.{payload}; }"#;
             !generated.complete,
             "later-interface and omitted-type resource targets remain incomplete"
         );
+        assert!(
+            generated.text.contains("resource worker {"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("round-trip: func(value: id, borrowed: borrow<other>) -> payload;")
+        );
+        assert!(generated.text.contains("constructor(value: payload);"));
+        assert!(
+            generated
+                .text
+                .contains("from-later: static func(handle-value: other) -> id;")
+        );
+        assert!(generated.text.contains("take-worker: func(value: worker);"));
+        assert!(!generated.text.contains("resource broken"));
+        assert!(!generated.text.contains("take-broken:"));
         assert!(generated.text.contains("resource keep;"));
         assert!(generated.text.contains("type id = u64;"));
         assert!(generated.text.contains("record payload {"));
@@ -53846,8 +53871,6 @@ interface facade { use middle.{payload}; }"#;
         );
         assert!(generated.text.contains("take-handle: func(value: handle);"));
         assert!(generated.text.contains("independent: func(value: u32);"));
-        assert!(!generated.text.contains("resource future"));
-        assert!(!generated.text.contains("take-future:"));
         assert!(!generated.text.contains("type hidden ="));
         assert!(!generated.text.contains("resource missing"));
         assert!(!generated.text.contains("take-missing:"));
@@ -53873,19 +53896,128 @@ interface facade { use middle.{payload}; }"#;
             "the unsupported prior item is removed and target indices compact"
         );
 
-        let early = root
+        let (early_index, early) = root
             .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "early")
+            .expect("the earlier interface with its forward-referencing resource remains");
+        let early_position = generated
+            .text
+            .find("interface early {")
+            .expect("the resource interface appears in generated source order");
+        let types_position = generated
+            .text
+            .find("interface types {")
+            .expect("the referenced types interface appears in generated source order");
+        assert!(
+            early_position < types_position,
+            "the referenced types interface follows the resource interface in generated source order"
+        );
+        let (early_id_index, early_id) = find_item(early, "id");
+        let (early_payload_index, early_payload) = find_item(early, "payload");
+        let (early_other_index, early_other) = find_item(early, "other");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(early_id_target)) = &early_id.kind
+        else {
+            panic!("the early interface imports the later data alias");
+        };
+        assert_eq!(early_id_target.interface.interface, types_index);
+        assert_eq!(early_id_target.item, id_index);
+        assert_eq!(early_id_target.item_name, "id");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(early_payload_target)) =
+            &early_payload.kind
+        else {
+            panic!("the early interface imports the later record");
+        };
+        assert_eq!(early_payload_target.interface.interface, types_index);
+        assert_eq!(early_payload_target.item, payload_index);
+        assert_eq!(early_payload_target.item_name, "payload");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(early_other_target)) =
+            &early_other.kind
+        else {
+            panic!("the early interface imports the later resource");
+        };
+        assert_eq!(early_other_target.interface.interface, types_index);
+        assert_eq!(early_other_target.item, other_index);
+        assert_eq!(early_other_target.item_name, "other");
+        let (worker_index, worker) = find_item(early, "worker");
+        let sai_wit::WitItemKind::Resource(worker_members) = &worker.kind else {
+            panic!("the forward-referencing resource remains");
+        };
+        let early_member_reference = |ty: &sai_wit::WitType, expected_name: &str| match ty {
+            sai_wit::WitType::Named(reference)
+            | sai_wit::WitType::Own(reference)
+            | sai_wit::WitType::Borrow(reference) => {
+                assert_eq!(reference.interface.unit, unit);
+                assert_eq!(reference.interface.interface, early_index);
+                assert_eq!(reference.interface.name, "early");
+                assert_eq!(reference.item_name, expected_name);
+                reference.item
+            }
+            _ => panic!("the member type refers to its local `{expected_name}` import"),
+        };
+        let future_method = worker_members
             .iter()
-            .find(|interface| interface.name == "early")
-            .expect("the earlier interface with its independent resource remains");
+            .find(|member| member.name == "round-trip")
+            .expect("the forward-referencing method remains");
+        assert_eq!(future_method.kind, sai_wit::WitMemberKind::Method);
         assert_eq!(
-            early
-                .items
-                .iter()
-                .map(|item| item.name.as_str())
-                .collect::<Vec<_>>(),
-            ["keep"],
-            "a resource member cannot reference a later interface"
+            early_member_reference(&future_method.func.params[1].1, "id"),
+            early_id_index
+        );
+        assert_eq!(
+            early_member_reference(&future_method.func.params[2].1, "other"),
+            early_other_index
+        );
+        assert!(matches!(
+            future_method.func.params[2].1,
+            sai_wit::WitType::Borrow(_)
+        ));
+        assert_eq!(
+            early_member_reference(
+                future_method
+                    .func
+                    .result
+                    .as_ref()
+                    .expect("the method result remains"),
+                "payload"
+            ),
+            early_payload_index
+        );
+        let future_constructor = worker_members
+            .iter()
+            .find(|member| member.kind == sai_wit::WitMemberKind::Constructor)
+            .expect("the forward-referencing constructor remains");
+        assert_eq!(
+            early_member_reference(&future_constructor.func.params[0].1, "payload"),
+            early_payload_index
+        );
+        let future_static = worker_members
+            .iter()
+            .find(|member| member.name == "from-later")
+            .expect("the forward-referencing static member remains");
+        assert_eq!(future_static.kind, sai_wit::WitMemberKind::Static);
+        assert_eq!(
+            early_member_reference(&future_static.func.params[0].1, "other"),
+            early_other_index
+        );
+        assert_eq!(
+            early_member_reference(
+                future_static
+                    .func
+                    .result
+                    .as_ref()
+                    .expect("the static result remains"),
+                "id"
+            ),
+            early_id_index
+        );
+        let (_, take_worker) = find_item(early, "take-worker");
+        let sai_wit::WitItemKind::Func(take_worker) = &take_worker.kind else {
+            panic!("the forward-referencing resource consumer remains");
+        };
+        assert_eq!(
+            early_member_reference(&take_worker.params[0].1, "worker"),
+            worker_index
         );
 
         let (api_index, api) = root
@@ -56377,6 +56509,13 @@ interface facade { use middle.{payload}; }"#;
     #[test]
     fn generated_wit_prunes_items_that_depend_on_cyclic_interfaces() {
         let source = concat!(
+            "interface early {\n",
+            "  resource LaterWorker {\n",
+            "    fn lookup(self: borrow Self, value: first.Safe)\n",
+            "  }\n",
+            "  fn take_later_worker(value: LaterWorker)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
             "interface first {\n",
             "  type Safe = U32\n",
             "  type Request = second.Response\n",
@@ -56443,6 +56582,8 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.complete);
         assert!(!generated.text.contains("interface first"));
         assert!(!generated.text.contains("interface second"));
+        assert!(!generated.text.contains("resource later-worker"));
+        assert!(!generated.text.contains("take-later-worker:"));
         assert!(!generated.text.contains("type handle"));
         assert!(!generated.text.contains("read:"));
         assert!(!generated.text.contains("record record-handle"));
@@ -56472,6 +56613,21 @@ interface facade { use middle.{payload}; }"#;
             ["independent"],
             "the omitted cross-interface type also removes its consumer"
         );
+        let early = package_model
+            .root()
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "early")
+            .expect("the independent interface with the pruned resource remains");
+        assert_eq!(
+            early
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["independent"],
+            "a resource referencing a later cyclic interface and its consumer are pruned"
+        );
         let world = package_model
             .root()
             .worlds
@@ -56488,7 +56644,11 @@ interface facade { use middle.{payload}; }"#;
             panic!("the surviving import remains an interface");
         };
         assert_eq!(reference.name, "public");
-        assert_eq!(reference.interface.index(), 0);
+        assert_eq!(
+            reference.interface.index(),
+            1,
+            "the surviving world reference is remapped after cyclic interfaces are removed"
+        );
     }
 
     #[test]
