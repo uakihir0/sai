@@ -5068,10 +5068,13 @@ pub(super) fn generated_foreign_world_used_type_references(
             continue;
         }
         let view = foreign.view.as_ref();
-        for interface in view.interfaces.values() {
+        for (interface_name, interface) in &view.interfaces {
             let Some(wit_interface) = view.model.interfaces.get(interface.wit) else {
                 continue;
             };
+            if wit_interface.name != *interface_name {
+                continue;
+            }
             for member in interface.members.values() {
                 if member.kind != WitViewDefKind::Alias || member.unsupported.is_some() {
                     continue;
@@ -5097,63 +5100,84 @@ pub(super) fn generated_foreign_world_used_type_references(
                 let WitItemKind::Used(target) = &wit_item.kind else {
                     continue;
                 };
-                if target.interface.unit != view.unit
-                    || view
-                        .model
-                        .interfaces
-                        .get(target.interface.interface)
-                        .is_none_or(|target_interface| {
-                            target_interface.name != target.interface.name
-                        })
-                {
-                    continue;
-                }
-                let Some(target_interface) = view.model.interfaces.get(target.interface.interface)
-                else {
+                let Some(target) = generated_world_used_type_target(
+                    view,
+                    target.clone(),
+                    (interface.wit, member.item),
+                ) else {
                     continue;
                 };
-                let Some(target_item) = target_interface.items.get(target.item) else {
-                    continue;
-                };
-                if target_item.name != target.item_name || target_item.unsupported.is_some() {
-                    continue;
-                }
-                let expected_view_kind = match &target_item.kind {
-                    WitItemKind::Alias(_) => WitViewDefKind::Alias,
-                    WitItemKind::Record(_) => WitViewDefKind::Struct,
-                    WitItemKind::Variant(_) | WitItemKind::Enum(_) | WitItemKind::Flags(_) => {
-                        WitViewDefKind::Enum
-                    }
-                    WitItemKind::Resource(_) | WitItemKind::Used(_) | WitItemKind::Func(_) => {
-                        continue;
-                    }
-                };
-                let target_entity = WitViewEntity::Item {
-                    interface: target.interface.interface,
-                    item: target.item,
-                };
-                let Some(target_definition_id) = view.definition_for_entity(target_entity) else {
-                    continue;
-                };
-                let Some(target_definition) = view.definition(target_definition_id) else {
-                    continue;
-                };
-                if target_definition.entity != target_entity
-                    || target_definition.kind != expected_view_kind
-                {
-                    continue;
-                }
 
                 references.by_definition.insert(member.def, target.clone());
                 references
                     .view_completeness
-                    .entry(target.clone())
+                    .entry(target)
                     .and_modify(|complete| *complete &= view.complete)
                     .or_insert(view.complete);
             }
         }
     }
     references
+}
+
+fn generated_world_used_type_target(
+    view: &sai_wit::WitView,
+    mut target: WitTypeRef,
+    starting_item: (WitIfaceIdx, WitItemIdx),
+) -> Option<WitTypeRef> {
+    let mut visited = HashSet::new();
+    visited.insert(starting_item);
+
+    loop {
+        if target.interface.unit != view.unit
+            || !visited.insert((target.interface.interface, target.item))
+        {
+            return None;
+        }
+        let interface = view.model.interfaces.get(target.interface.interface)?;
+        if interface.name != target.interface.name {
+            return None;
+        }
+        let item = interface.items.get(target.item)?;
+        if item.name != target.item_name || item.unsupported.is_some() {
+            return None;
+        }
+        let expected_view_kind = match &item.kind {
+            WitItemKind::Alias(_) | WitItemKind::Used(_) => WitViewDefKind::Alias,
+            WitItemKind::Record(_) => WitViewDefKind::Struct,
+            WitItemKind::Variant(_) | WitItemKind::Enum(_) | WitItemKind::Flags(_) => {
+                WitViewDefKind::Enum
+            }
+            WitItemKind::Resource(_) | WitItemKind::Func(_) => return None,
+        };
+        let target_entity = WitViewEntity::Item {
+            interface: target.interface.interface,
+            item: target.item,
+        };
+        let target_definition_id = view.definition_for_entity(target_entity)?;
+        let target_definition = view.definition(target_definition_id)?;
+        if target_definition.entity != target_entity || target_definition.kind != expected_view_kind
+        {
+            return None;
+        }
+        let target_view_interface = view.interfaces.get(&target.interface.name)?;
+        if target_view_interface.wit != target.interface.interface
+            || !target_view_interface.members.values().any(|member| {
+                member.def == target_definition_id
+                    && member.item == target.item
+                    && member.kind == expected_view_kind
+                    && member.unsupported.is_none()
+            })
+        {
+            return None;
+        }
+
+        if let WitItemKind::Used(next_target) = &item.kind {
+            target = next_target.clone();
+        } else {
+            return Some(target);
+        }
+    }
 }
 
 fn generated_world_function_view_is_complete(
