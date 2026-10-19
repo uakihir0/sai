@@ -47408,11 +47408,11 @@ interface facade { use middle.{payload}; }"#;
         let source = concat!(
             "interface api {\n",
             "  type HandleAlias = Handle\n",
-            "  resource Handle {\n",
-            "    fn identity(value: HandleAlias) -> HandleAlias\n",
-            "  }\n",
             "  type Payload {\n",
             "    handle: Handle\n",
+            "  }\n",
+            "  resource Handle {\n",
+            "    fn identity(value: HandleAlias) -> HandleAlias\n",
             "  }\n",
             "  enum Outcome { Empty, Returned(Handle) }\n",
             "  fn echo(payload: Payload) -> Outcome\n",
@@ -47482,7 +47482,11 @@ interface facade { use middle.{payload}; }"#;
                 .collect::<Vec<_>>(),
             ["handle", "handle-alias", "payload", "outcome", "echo"]
         );
-        let resource_index = interface.items.iter_enumerated().next().unwrap().0;
+        let resource_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "handle").then_some(index))
+            .expect("the future resource is emitted");
         let alias_index = interface
             .items
             .iter_enumerated()
@@ -47507,12 +47511,20 @@ interface facade { use middle.{payload}; }"#;
             assert_eq!(reference.item_name, "handle-alias");
         };
 
-        let sai_wit::WitItemKind::Alias(alias) = &items[1].kind else {
+        let alias_item = items
+            .iter()
+            .find(|item| item.name == "handle-alias")
+            .expect("the resource handle alias is emitted");
+        let sai_wit::WitItemKind::Alias(alias) = &alias_item.kind else {
             panic!("the resource handle alias is emitted");
         };
         assert_handle(alias);
 
-        let sai_wit::WitItemKind::Resource(members) = &items[0].kind else {
+        let resource_item = items
+            .iter()
+            .find(|item| item.name == "handle")
+            .expect("the resource declaration is emitted");
+        let sai_wit::WitItemKind::Resource(members) = &resource_item.kind else {
             panic!("the resource static function is emitted");
         };
         assert_eq!(members.len(), 1);
@@ -47527,18 +47539,37 @@ interface facade { use middle.{payload}; }"#;
                 .expect("identity retains its resource result"),
         );
 
-        let sai_wit::WitItemKind::Record(fields) = &items[2].kind else {
+        let payload_item = items
+            .iter()
+            .find(|item| item.name == "payload")
+            .expect("the record is emitted before its resource");
+        let sai_wit::WitItemKind::Record(fields) = &payload_item.kind else {
             panic!("the handle payload is emitted as a record");
         };
         assert_handle(&fields[0].ty);
 
-        let sai_wit::WitItemKind::Variant(cases) = &items[3].kind else {
+        let outcome_item = items
+            .iter()
+            .find(|item| item.name == "outcome")
+            .expect("the outcome variant is emitted");
+        let sai_wit::WitItemKind::Variant(cases) = &outcome_item.kind else {
             panic!("the handle outcome is emitted as a variant");
         };
         assert_handle(cases[1].payload.as_ref().expect("handle payload"));
         assert!(generated.text.contains("type handle-alias = handle;"));
         assert!(generated.text.contains("handle: handle,"));
         assert!(generated.text.contains("returned(handle)"));
+        assert!(
+            generated
+                .text
+                .find("record payload {")
+                .expect("record text")
+                < generated
+                    .text
+                    .find("resource handle {")
+                    .expect("resource text"),
+            "the record declaration precedes its resource target in generated source"
+        );
     }
 
     #[test]
@@ -51866,6 +51897,8 @@ interface facade { use middle.{payload}; }"#;
             "  type RecordUsesRejectedLaterVariant { value: RejectedLaterVariant }\n",
             "  enum VariantUsesRejectedLaterVariant { Value(RejectedLaterVariant) }\n",
             "  type RecordUsesFutureResource { value: LaterResource }\n",
+            "  type RecordUsesRejectedFutureResource { value: RejectedLaterResource }\n",
+            "  fn use_rejected_future_resource_record(value: RecordUsesRejectedFutureResource)\n",
             "  type AliasFutureRecordCycle = FutureRecordCycle\n",
             "  type FutureRecordCycle { value: AliasFutureRecordCycle }\n",
             "  type UsesFutureRecordCycle { value: FutureRecordCycle }\n",
@@ -51972,12 +52005,13 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(emitted_items.len(), 10);
+        assert_eq!(emitted_items.len(), 11);
         assert!(emitted_items.contains(&"before"));
         assert!(emitted_items.contains(&"use-later"));
         assert!(emitted_items.contains(&"before-record"));
         assert!(emitted_items.contains(&"before-variant"));
         assert!(emitted_items.contains(&"alias-to-future-resource"));
+        assert!(emitted_items.contains(&"record-uses-future-resource"));
         assert!(emitted_items.contains(&"use-resource"));
         assert!(emitted_items.contains(&"after"));
         assert!(emitted_items.contains(&"later-record"));
@@ -51989,7 +52023,7 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
             "surviving item indices compact after pruning cycles and unsupported targets"
         );
         assert!(!generated.text.contains("use-rejected"));
@@ -52009,8 +52043,22 @@ interface facade { use middle.{payload}; }"#;
                 .text
                 .contains("use-rejected-future-resource-alias")
         );
+        assert!(
+            !generated
+                .text
+                .contains("record-uses-rejected-future-resource")
+        );
+        assert!(
+            !generated
+                .text
+                .contains("use-rejected-future-resource-record")
+        );
         assert!(!generated.text.contains("rejected-later-resource"));
-        assert!(!generated.text.contains("record-uses-future-resource"));
+        assert!(
+            generated
+                .text
+                .contains("record record-uses-future-resource {")
+        );
         assert!(!generated.text.contains("record-variant-forward-cycle"));
         assert!(!generated.text.contains("later-variant-record-cycle"));
         assert!(!generated.text.contains("uses-record-variant-forward-cycle"));
@@ -52099,6 +52147,21 @@ interface facade { use middle.{payload}; }"#;
         let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(reference)) = &alias_to_resource.kind
         else {
             panic!("the alias targets the later resource as an owned handle");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.item, later_resource_index);
+        assert_eq!(reference.item_name, "later-resource");
+        let record_uses_resource = interface
+            .items
+            .iter()
+            .find(|item| item.name == "record-uses-future-resource")
+            .expect("the record that targets the later supported resource remains emitted");
+        let sai_wit::WitItemKind::Record(fields) = &record_uses_resource.kind else {
+            panic!("the future-resource consumer remains a record");
+        };
+        let sai_wit::WitType::Own(reference) = &fields[0].ty else {
+            panic!("the record field owns the later resource handle");
         };
         assert_eq!(reference.interface.unit, unit);
         assert_eq!(reference.interface.interface, interface_index);

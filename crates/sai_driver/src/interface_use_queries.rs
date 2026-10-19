@@ -2864,6 +2864,8 @@ fn collect_interface_uses_input(
                     item: provisional_item_indices[member_index],
                     item_name,
                 };
+                generated_record_type_references
+                    .insert(member_owner.def_id.to_def_id(), reference.clone());
                 generated_function_type_references
                     .insert(member_owner.def_id.to_def_id(), reference.clone());
                 generated_alias_definition_type_references
