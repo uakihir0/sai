@@ -50,11 +50,11 @@ use sai_ty::iface::{
 };
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
 use sai_wit::{
-    GeneratedText, WitCase, WitField, WitFunc, WitIfaceIdx, WitIfaceRef, WitIndexVec, WitInterface,
-    WitItem, WitItemIdx, WitItemKind, WitMember, WitMemberKind, WitPackage, WitPackageDeclaration,
-    WitPackageName, WitStabilityVersion, WitType, WitTypeRef, WitUnit, WitUnitKind, WitViewDefKind,
-    WitViewEntity, WitWorld, WitWorldIdx, WitWorldItem, WitWorldItemDirection, WitWorldItemOrder,
-    WitWorldRef, print_wit, wit_name_to_sai,
+    GeneratedText, Unsupported, WitCase, WitField, WitFunc, WitIfaceIdx, WitIfaceRef, WitIndexVec,
+    WitInterface, WitItem, WitItemIdx, WitItemKind, WitMember, WitMemberKind, WitPackage,
+    WitPackageDeclaration, WitPackageName, WitStabilityVersion, WitType, WitTypeRef, WitUnit,
+    WitUnitKind, WitViewDefKind, WitViewEntity, WitWorld, WitWorldIdx, WitWorldItem,
+    WitWorldItemDirection, WitWorldItemOrder, WitWorldRef, print_wit, wit_name_to_sai,
 };
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -327,7 +327,17 @@ fn prune_generated_item_references(
         .collect::<HashMap<_, _>>();
     let mut dependents =
         HashMap::<(WitIfaceIdx, WitItemIdx), Vec<(WitIfaceIdx, WitItemIdx)>>::new();
+    let mut alias_indegrees = HashMap::<(WitIfaceIdx, WitItemIdx), usize>::new();
+    let mut alias_dependents =
+        HashMap::<(WitIfaceIdx, WitItemIdx), Vec<(WitIfaceIdx, WitItemIdx)>>::new();
     let mut invalid_queue = VecDeque::new();
+    for (_, source_interface, interface) in interfaces.iter() {
+        for (source_item, item) in interface.items.iter_enumerated() {
+            if item.unsupported.is_none() && matches!(item.kind, WitItemKind::Alias(_)) {
+                alias_indegrees.insert((*source_interface, source_item), 0);
+            }
+        }
+    }
     for (_, source_interface, interface) in interfaces.iter() {
         for (source_item, item) in interface.items.iter_enumerated() {
             let source = (*source_interface, source_item);
@@ -356,9 +366,49 @@ fn prune_generated_item_references(
                     .entry((target_interface, reference.item))
                     .or_default()
                     .push(source);
+                if item.unsupported.is_none()
+                    && matches!(item.kind, WitItemKind::Alias(_))
+                    && target_interface == *source_interface
+                    && target.name == reference.interface.name
+                    && target.items.get(reference.item).is_some_and(|target| {
+                        target.unsupported.is_none() && matches!(target.kind, WitItemKind::Alias(_))
+                    })
+                {
+                    *alias_indegrees
+                        .get_mut(&source)
+                        .expect("supported alias is indexed before its references") += 1;
+                    alias_dependents
+                        .entry((target_interface, reference.item))
+                        .or_default()
+                        .push(source);
+                }
             }
         }
     }
+
+    let mut acyclic_aliases = VecDeque::from_iter(
+        alias_indegrees
+            .iter()
+            .filter_map(|(alias, indegree)| (*indegree == 0).then_some(*alias)),
+    );
+    while let Some(alias) = acyclic_aliases.pop_front() {
+        if let Some(alias_consumers) = alias_dependents.get(&alias) {
+            for consumer in alias_consumers {
+                let indegree = alias_indegrees
+                    .get_mut(consumer)
+                    .expect("alias dependency target belongs to the same interface");
+                *indegree -= 1;
+                if *indegree == 0 {
+                    acyclic_aliases.push_back(*consumer);
+                }
+            }
+        }
+    }
+    invalid_queue.extend(
+        alias_indegrees
+            .into_iter()
+            .filter_map(|(alias, indegree)| (indegree != 0).then_some(alias)),
+    );
 
     let mut invalid_items = HashSet::new();
     while let Some(invalid) = invalid_queue.pop_front() {
@@ -2614,6 +2664,25 @@ fn collect_interface_uses_input(
             && parent_hir.diagnostics.is_empty()
             && interface_attrs_complete;
         let mut generated_items = WitIndexVec::<WitItemIdx, WitItem>::new();
+        let mut provisional_item_indices = Vec::with_capacity(member_entries.len());
+        for _ in &member_entries {
+            let item_index = generated_items
+                .push(WitItem {
+                    name: String::new(),
+                    docs: None,
+                    since: None,
+                    deprecated: None,
+                    kind: WitItemKind::Func(WitFunc {
+                        params: Vec::new(),
+                        result: None,
+                        is_async: false,
+                    }),
+                    unsupported: Some(Unsupported::WorldType),
+                    span: None,
+                })
+                .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+            provisional_item_indices.push(item_index);
+        }
         let mut generated_item_names = HashSet::new();
         let generated_interface_eligible = generated_unit.is_some()
             && interface_wit_name.is_some()
@@ -2639,10 +2708,47 @@ fn collect_interface_uses_input(
         let mut generated_use_aliases = Vec::<GeneratedUseAlias>::new();
         let mut generated_named_type_references =
             foreign_named_type_references.by_definition.clone();
-        for (entry, member_owner) in member_entries
+        let mut generated_alias_type_references = generated_named_type_references.clone();
+        if let (Some(unit), Some(interface_index), Some(interface_name)) = (
+            generated_unit.as_ref(),
+            generated_interface_index,
+            interface_wit_name.as_ref(),
+        ) {
+            for (member_index, (entry, member_owner)) in member_entries
+                .iter()
+                .zip(parent_members.iter().copied())
+                .enumerate()
+            {
+                if entry.kind != ItemTreeKind::Alias || entry.name.is_error() {
+                    continue;
+                }
+                let source_name = symbols
+                    .resolve(entry.name)
+                    .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+                    .map_err(InterfaceUsesQueryError::Collection)?;
+                let Some(item_name) = sai_identifier_to_wit_name(&source_name) else {
+                    continue;
+                };
+                generated_alias_type_references.insert(
+                    member_owner.def_id.to_def_id(),
+                    WitTypeRef {
+                        interface: sai_wit::WitIfaceRef {
+                            unit: unit.clone(),
+                            interface: interface_index,
+                            name: interface_name.clone(),
+                        },
+                        item: provisional_item_indices[member_index],
+                        item_name,
+                    },
+                );
+            }
+        }
+        for (member_index, (entry, member_owner)) in member_entries
             .into_iter()
             .zip(parent_members.iter().copied())
+            .enumerate()
         {
+            let provisional_item_index = provisional_item_indices[member_index];
             let expected_member_path = def_paths
                 .resolve_def_id(member_owner.def_id.to_def_id())
                 .map_err(OwnerControlFlowResolutionError::DefPathInterner)
@@ -2755,6 +2861,11 @@ fn collect_interface_uses_input(
                 owner_uses_complete = false;
                 poisoned_owners.insert(member_owner);
             }
+            let item_type_references = if kind == super::InterfaceMemberKind::Alias {
+                &generated_alias_type_references
+            } else {
+                &generated_named_type_references
+            };
             let mut staged_resource_item = None;
             if generated_interface_eligible {
                 let item = if member_hir.diagnostics.is_empty()
@@ -2767,7 +2878,7 @@ fn collect_interface_uses_input(
                                 entry,
                                 &member_hir,
                                 &boundary_conversions,
-                                &generated_named_type_references,
+                                item_type_references,
                                 flags_marker_accepted,
                                 &inputs.validated_attrs,
                                 prepared.generated_package_version.as_ref(),
@@ -2778,7 +2889,7 @@ fn collect_interface_uses_input(
                             entry,
                             &member_hir,
                             &boundary_conversions,
-                            &generated_named_type_references,
+                            item_type_references,
                             flags_marker_accepted,
                             &inputs.validated_attrs,
                             prepared.generated_package_version.as_ref(),
@@ -2789,7 +2900,7 @@ fn collect_interface_uses_input(
                                 entry,
                                 &member_hir,
                                 &boundary_conversions,
-                                &generated_named_type_references,
+                                item_type_references,
                                 flags_marker_accepted,
                                 &inputs.validated_attrs,
                                 prepared.generated_package_version.as_ref(),
@@ -2801,7 +2912,7 @@ fn collect_interface_uses_input(
                             entry,
                             &member_hir,
                             &boundary_conversions,
-                            &generated_named_type_references,
+                            item_type_references,
                             inputs.validated_attrs.get(&entry.ast_id),
                             prepared.generated_package_version.as_ref(),
                             symbols,
@@ -2823,9 +2934,8 @@ fn collect_interface_uses_input(
                                 | WitItemKind::Flags(_)
                                 | WitItemKind::Resource(_)
                         );
-                        let item_index = generated_items
-                            .push(item)
-                            .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+                        let item_index = provisional_item_index;
+                        generated_items[item_index] = item;
                         if is_named_type
                             && let (Some(unit), Some(interface_index), Some(interface_name)) = (
                                 generated_unit.as_ref(),
@@ -2844,6 +2954,11 @@ fn collect_interface_uses_input(
                                     item: item_index,
                                     item_name,
                                 },
+                            );
+                            generated_alias_type_references.insert(
+                                member_owner.def_id.to_def_id(),
+                                generated_named_type_references[&member_owner.def_id.to_def_id()]
+                                    .clone(),
                             );
                         }
                     } else {
@@ -2897,7 +3012,6 @@ fn collect_interface_uses_input(
                     generated_interface_index,
                     interface_wit_name.as_ref(),
                 )
-                && let Ok(item_index) = generated_items.next_index()
             {
                 resource_named_type_references.insert(
                     member_owner.def_id.to_def_id(),
@@ -2907,7 +3021,7 @@ fn collect_interface_uses_input(
                             interface: interface_index,
                             name: interface_name.clone(),
                         },
-                        item: item_index,
+                        item: provisional_item_index,
                         item_name: resource_item.name.clone(),
                     },
                 );
@@ -3077,9 +3191,8 @@ fn collect_interface_uses_input(
                 item.kind = WitItemKind::Resource(generated_resource_members);
                 let item_name = item.name.clone();
                 if generated_item_names.insert(item_name.clone()) {
-                    let item_index = generated_items
-                        .push(item)
-                        .map_err(InterfaceUsesQueryError::WitIndexVec)?;
+                    let item_index = provisional_item_index;
+                    generated_items[item_index] = item;
                     if let (Some(unit), Some(interface_index), Some(interface_name)) = (
                         generated_unit.as_ref(),
                         generated_interface_index,
@@ -3096,6 +3209,11 @@ fn collect_interface_uses_input(
                                 item: item_index,
                                 item_name,
                             },
+                        );
+                        generated_alias_type_references.insert(
+                            member_owner.def_id.to_def_id(),
+                            generated_named_type_references[&member_owner.def_id.to_def_id()]
+                                .clone(),
                         );
                     }
                 } else {

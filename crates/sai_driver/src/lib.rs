@@ -51153,14 +51153,120 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
-    fn generated_wit_omits_forward_named_references_and_alias_cycles() {
+    fn generated_wit_emits_acyclic_forward_alias_references_after_round_trip() {
         let source = concat!(
             "interface api {\n",
             "  type Before = After\n",
+            "  type After = U32\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated forward alias reference loads");
+        assert!(
+            result.failure.is_none(),
+            "forward alias text parses and resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "a supported same-interface alias reference to a later alias is complete"
+        );
+        assert!(generated.text.contains("type before = after;"));
+        assert!(generated.text.contains("type after = u32;"));
+        assert!(
+            generated
+                .text
+                .find("type before = after;")
+                .expect("before is printed")
+                < generated
+                    .text
+                    .find("type after = u32;")
+                    .expect("after is printed"),
+            "the generated text keeps the source declaration order"
+        );
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        let after_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "after").then_some(index))
+            .expect("the target alias remains in the parsed model");
+        let before = interface
+            .items
+            .iter()
+            .find(|item| item.name == "before")
+            .expect("the forward alias remains in the parsed model");
+        let sai_wit::WitItemKind::Alias(before) = &before.kind else {
+            panic!("before remains an alias after parsing");
+        };
+        let sai_wit::WitType::Named(reference) = before else {
+            panic!("before refers to the named later alias");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.interface.name, "api");
+        assert_eq!(reference.item, after_index);
+        assert_eq!(reference.item_name, "after");
+        assert_eq!(
+            interface.items[after_index].kind,
+            sai_wit::WitItemKind::Alias(sai_wit::WitType::U32)
+        );
+    }
+
+    #[test]
+    fn generated_wit_prunes_forward_alias_cycles_and_omitted_targets() {
+        let source = concat!(
+            "interface api {\n",
+            "  type Before = After\n",
+            "  fn use_later(value: After)\n",
             "  type CycleA = CycleB\n",
             "  type CycleB = CycleA\n",
+            "  type UsesCycle = CycleA\n",
+            "  type UsesRejected = Rejected\n",
+            "  type Rejected = USize\n",
+            "  type UsesUsesRejected = UsesRejected\n",
             "  type After = U32\n",
             "  fn independent(value: U64)\n",
+            "}\n",
+            "interface other {\n",
+            "  type CrossInterface = api.After\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
@@ -51192,7 +51298,7 @@ interface facade { use middle.{payload}; }"#;
             .expect("partial generated WIT remains queryable");
         assert!(
             result.failure.is_none(),
-            "omitting forward and cyclic references leaves parseable WIT: {:?}",
+            "pruning cyclic and unsupported alias targets leaves parseable WIT: {:?}",
             result.failure
         );
         let generated = result
@@ -51214,15 +51320,39 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
+        assert_eq!(emitted_items.len(), 3);
+        assert!(emitted_items.contains(&"before"));
+        assert!(emitted_items.contains(&"after"));
+        assert!(emitted_items.contains(&"independent"));
         assert_eq!(
-            emitted_items,
-            ["after", "independent"],
-            "forward targets are unavailable until emitted; cyclic aliases never acquire a reference"
+            interface
+                .items
+                .iter_enumerated()
+                .map(|(index, _)| index.index())
+                .collect::<Vec<_>>(),
+            [0, 1, 2],
+            "surviving item indices compact after pruning cycles and unsupported targets"
         );
-        assert!(!generated.text.contains("before"));
+        assert!(!generated.text.contains("use-later"));
         assert!(!generated.text.contains("cycle"));
+        assert!(!generated.text.contains("uses-cycle"));
+        assert!(!generated.text.contains("rejected"));
+        assert!(!generated.text.contains("uses-rejected"));
+        assert!(!generated.text.contains("uses-uses-rejected"));
+        assert!(!generated.text.contains("cross-interface"));
         assert!(generated.text.contains("type after = u32;"));
+        assert!(generated.text.contains("type before = after;"));
         assert!(generated.text.contains("independent: func(value: u64)"));
+        let before = interface
+            .items
+            .iter()
+            .find(|item| item.name == "before")
+            .expect("the supported forward alias remains emitted");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(reference)) = &before.kind else {
+            panic!("the supported forward alias remains emitted");
+        };
+        assert_eq!(interface.items[reference.item].name, "after");
+        assert_eq!(reference.item_name, "after");
     }
 
     #[test]
