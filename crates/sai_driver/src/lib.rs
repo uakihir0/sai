@@ -47350,12 +47350,17 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
-    fn generated_wit_references_named_types_from_embedded_wasi_views() {
+    fn generated_wit_references_named_types_and_resources_from_embedded_wasi_views() {
         let source = concat!(
             "use wasi:clocks/wall-clock as wall_clock\n",
+            "use wasi:io/streams as streams\n",
             "interface local {\n",
             "  type Timestamp = wall_clock.Datetime\n",
+            "  type StreamHandle = streams.InputStream\n",
+            "  enum StreamFailure { Wrapped(streams.StreamError) }\n",
             "  fn now() -> wall_clock.Datetime\n",
+            "  fn transfer(stream: borrow streams.InputStream) -> streams.InputStream\n",
+            "  fn wrap_stream_error(error: streams.StreamError) -> StreamFailure\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, root_package) =
@@ -47382,6 +47387,24 @@ interface facade { use middle.{payload}; }"#;
             .members
             .get("Datetime")
             .expect("the embedded wall-clock interface contains datetime");
+        let io_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "wasi:io")
+            .expect("the embedded I/O package is in the active view closure");
+        assert_eq!(io_view.view.unit.canonical_name(), "wasi:io@0.2.3");
+        let streams_interface = io_view
+            .view
+            .interfaces
+            .get("streams")
+            .expect("the embedded I/O view contains streams");
+        let input_stream = streams_interface
+            .members
+            .get("InputStream")
+            .expect("the embedded streams interface contains InputStream");
+        let stream_error = streams_interface
+            .members
+            .get("StreamError")
+            .expect("the embedded streams interface contains StreamError");
 
         let manifest: Arc<[u8]> = Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]);
         let collection = database
@@ -47427,8 +47450,32 @@ interface facade { use middle.{payload}; }"#;
                 .text
                 .contains("use wasi:clocks/wall-clock@0.2.3.{datetime};")
         );
+        assert!(
+            generated
+                .text
+                .contains("use wasi:io/streams@0.2.3.{input-stream, stream-error};")
+        );
         assert!(generated.text.contains("type timestamp = datetime;"));
+        assert!(
+            generated
+                .text
+                .contains("type stream-handle = input-stream;")
+        );
+        assert!(generated.text.contains("variant stream-failure {"));
+        assert!(generated.text.contains("wrapped(stream-error)"));
         assert!(generated.text.contains("now: func() -> datetime;"));
+        assert!(
+            generated
+                .text
+                .contains("transfer: func(%stream: borrow<input-stream>) -> input-stream;"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("wrap-stream-error: func(error: stream-error) -> stream-failure;")
+        );
 
         let root_model = generated_result
             .package
@@ -47441,22 +47488,14 @@ interface facade { use middle.{payload}; }"#;
             .next()
             .expect("root source interface is generated");
         assert_eq!(root_interface.name, "local");
-        let items = root_interface.items.iter().collect::<Vec<_>>();
-        assert_eq!(
-            items
-                .iter()
-                .map(|item| item.name.as_str())
-                .collect::<Vec<_>>(),
-            ["datetime", "timestamp", "now"]
-        );
         let (generated_import_index, generated_import) = root_interface
             .items
             .iter_enumerated()
-            .next()
-            .expect("the generated interface contains its foreign import alias");
+            .find(|(_, item)| item.name == "datetime")
+            .expect("the generated interface contains its clocks import alias");
         assert_eq!(generated_import.name, "datetime");
         let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(foreign_reference)) =
-            &items[0].kind
+            &generated_import.kind
         else {
             panic!("the generated foreign import retains its exact embedded WASI reference");
         };
@@ -47464,7 +47503,12 @@ interface facade { use middle.{payload}; }"#;
         assert_eq!(foreign_reference.interface.interface, clocks_interface.wit);
         assert_eq!(foreign_reference.item, datetime.item);
         assert_eq!(foreign_reference.item_name, "datetime");
-        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(local_reference)) = &items[1].kind
+        let timestamp = root_interface
+            .items
+            .iter()
+            .find(|item| item.name == "timestamp")
+            .expect("the source alias remains in the generated interface");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(local_reference)) = &timestamp.kind
         else {
             panic!("the source alias refers to the generated WASI import alias");
         };
@@ -47472,7 +47516,12 @@ interface facade { use middle.{payload}; }"#;
         assert_eq!(local_reference.interface.interface, root_interface_index);
         assert_eq!(local_reference.item, generated_import_index);
         assert_eq!(local_reference.item_name, "datetime");
-        let sai_wit::WitItemKind::Func(now) = &items[2].kind else {
+        let now_item = root_interface
+            .items
+            .iter()
+            .find(|item| item.name == "now")
+            .expect("the wall-clock function remains");
+        let sai_wit::WitItemKind::Func(now) = &now_item.kind else {
             panic!("the generated function retains its embedded WASI result reference");
         };
         assert!(matches!(
@@ -47483,6 +47532,131 @@ interface facade { use middle.{payload}; }"#;
                     && reference.item == generated_import_index
                     && reference.item_name == "datetime"
         ));
+        let (input_stream_import_index, input_stream_import) = root_interface
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "input-stream")
+            .expect("the generated interface contains its resource import alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(input_stream_reference)) =
+            &input_stream_import.kind
+        else {
+            panic!("the imported input stream retains an owned resource target");
+        };
+        assert_eq!(input_stream_reference.interface.unit, io_view.view.unit);
+        assert_eq!(
+            input_stream_reference.interface.interface,
+            streams_interface.wit
+        );
+        assert_eq!(input_stream_reference.item, input_stream.item);
+        assert_eq!(input_stream_reference.item_name, "input-stream");
+        let (stream_error_import_index, stream_error_import) = root_interface
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "stream-error")
+            .expect("the generated interface contains its named variant import alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(stream_error_reference)) =
+            &stream_error_import.kind
+        else {
+            panic!("the imported stream error retains its named variant target");
+        };
+        assert_eq!(stream_error_reference.interface.unit, io_view.view.unit);
+        assert_eq!(
+            stream_error_reference.interface.interface,
+            streams_interface.wit
+        );
+        assert_eq!(stream_error_reference.item, stream_error.item);
+        assert_eq!(stream_error_reference.item_name, "stream-error");
+        let (stream_handle_index, stream_handle) = root_interface
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "stream-handle")
+            .expect("the source resource alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(stream_handle_reference)) =
+            &stream_handle.kind
+        else {
+            panic!("the source alias retains its named input-stream target");
+        };
+        assert_eq!(stream_handle_reference.interface.unit, generated_unit);
+        assert_eq!(
+            stream_handle_reference.interface.interface,
+            root_interface_index
+        );
+        assert_eq!(stream_handle_reference.item, input_stream_import_index);
+        assert_eq!(stream_handle_reference.item_name, "input-stream");
+        let (stream_failure_index, stream_failure) = root_interface
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "stream-failure")
+            .expect("the source variant remains");
+        let sai_wit::WitItemKind::Variant(stream_failure_cases) = &stream_failure.kind else {
+            panic!("the source wrapper remains a payload variant");
+        };
+        let sai_wit::WitType::Named(stream_failure_payload) = stream_failure_cases[0]
+            .payload
+            .as_ref()
+            .expect("the named stream-error payload remains")
+        else {
+            panic!("the variant payload refers to the local named import alias");
+        };
+        assert_eq!(stream_failure_payload.interface.unit, generated_unit);
+        assert_eq!(
+            stream_failure_payload.interface.interface,
+            root_interface_index
+        );
+        assert_eq!(stream_failure_payload.item, stream_error_import_index);
+        assert_eq!(stream_failure_payload.item_name, "stream-error");
+        let transfer_item = root_interface
+            .items
+            .iter()
+            .find(|item| item.name == "transfer")
+            .expect("the resource function remains");
+        let sai_wit::WitItemKind::Func(transfer) = &transfer_item.kind else {
+            panic!("transfer remains a function");
+        };
+        assert!(matches!(
+            transfer.params[0].1,
+            sai_wit::WitType::Borrow(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == root_interface_index
+                    && reference.item == input_stream_import_index
+                    && reference.item_name == "input-stream"
+        ));
+        assert!(matches!(
+            transfer.result,
+            Some(sai_wit::WitType::Own(ref reference))
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == root_interface_index
+                    && reference.item == input_stream_import_index
+                    && reference.item_name == "input-stream"
+        ));
+        let failure_function = root_interface
+            .items
+            .iter()
+            .find(|item| item.name == "wrap-stream-error")
+            .expect("the stream-error consumer function remains");
+        let sai_wit::WitItemKind::Func(failure_function) = &failure_function.kind else {
+            panic!("wrap-stream-error remains a function");
+        };
+        assert!(matches!(
+            failure_function.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == root_interface_index
+                    && reference.item == stream_error_import_index
+                    && reference.item_name == "stream-error"
+        ));
+        assert!(matches!(
+            failure_function.result,
+            Some(sai_wit::WitType::Named(ref reference))
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == root_interface_index
+                    && reference.item == stream_failure_index
+                    && reference.item_name == "stream-failure"
+        ));
+        assert!(
+            stream_handle_index < stream_failure_index,
+            "generated aliases remain before the variant in source order"
+        );
         assert_eq!(
             collection.package_key().as_str(),
             "acme:phase1#1",

@@ -5850,6 +5850,15 @@
 - **Human review:** **Review required:** Confirm that variant payloads may refer forward to exact named types and owned resources without extending the function, alias, record, or resource-member maps; confirm borrowed payloads and variants targeting omitted or cyclic interfaces remain pruned.
 - **Remaining scope:** Later-interface references from resource-member signatures remain unsupported, along with the broader §16.10.1 forward-reference and transitive-poisoning plan.
 
+### IR-711: cover embedded wasi:io streams resources and named variants
+
+- **Decision:** Extend the embedded-WASI generated-WIT regression to cover exact `wasi:io@0.2.3` `streams.input-stream` and `streams.stream-error` references alongside the existing `wasi:clocks` case. Keep implementation behavior unchanged.
+- **Reason:** Existing end-to-end embedded-view coverage only exercised a named clock record. The vendored streams interface exercises resource imports and owned/borrowed function positions as well as a named variant import used by a local payload variant. The regression checks active-view selection and exact identity through printing and parsing without broadening reference rules.
+- **Verification:** `generated_wit_references_named_types_and_resources_from_embedded_wasi_views` confirms complete output and versioned imports, exact selected unit/interface/item identity for the external resource and variant aliases, and local alias identity in the source alias, variant payload, and owned/borrowed function signature. The focused test passes. The full locked workspace suite passes, including all 340 `sai_driver` and 722 `sai_package` tests; `cargo fmt --all -- --check` and `git diff --check` pass.
+- **Review:** Hostile review found no actionable P0–P2 issues. It confirmed that the external `Own`/`Borrow` resource forms and named `StreamError` references match the embedded WIT definitions, and that exact external targets are asserted through both imported aliases and parsed local references.
+- **Human review:** **Review required:** Confirm that direct resource and named-variant references from the embedded WASI view should follow the same exact selected-view rules as other active WIT dependencies and that the generated local aliases preserve selected identity.
+- **Remaining scope:** Additional embedded WASI shapes beyond the streams resource and variant exercised here, further alias-chain cases, and the broader §16.10.1 plan remain incomplete.
+
 ### CI follow-up (2026-10-19)
 
 - **Decision:** Keep GitHub Actions CI enabled and leave the current concurrency policy unchanged.
@@ -5862,3 +5871,4 @@
 - **Decision:** Keep GitHub Actions enabled; no workflow change is needed.
 - **Verification:** Hosted run #46 (`39213129914`) for commit `064ad3fc2b3af811808fb8e71d5a79425a51aef9` completed successfully on Ubuntu, Windows, and macOS, including the Windows package-cache concurrency and recovery checks. This confirms the earlier cancellation was caused by `cancel-in-progress` after a newer push, not a failing test.
 - **Human review:** **Review required:** Confirm that cancelling superseded runs remains preferable to spending runner time on every intermediate commit.
+- **Verification:** Hosted run #47 (`39214458366`) for commit `62bdcd93ce24a1b25d8cd33333c73383e2fa11ed` completed successfully on Ubuntu, Windows, and macOS, including the Windows package-cache concurrency and recovery checks. CI remains enabled.
