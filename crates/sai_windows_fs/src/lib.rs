@@ -1032,11 +1032,12 @@ pub fn open_file_without_following(
 /// `file_name` must be one normal path component. The returned handle can
 /// update attributes such as the Windows read-only flag without granting
 /// access to modify the file's contents. It is opened with a zero Windows
-/// share-access mask, preventing a second attribute-update open and
-/// path-based hard-link creation while it is held. This does not lock the
-/// parent directory's namespace: an operation authorized by the parent
-/// directory, such as a rename using `FILE_DELETE_CHILD`, can still move the
-/// entry.
+/// share-access mask, preventing path-based hard-link creation while it is
+/// held. Windows does not apply sharing checks to attribute-only access
+/// requests, so this handle does not exclude another attribute-only open.
+/// This does not lock the parent directory's namespace: an operation
+/// authorized by the parent directory, such as a rename using
+/// `FILE_DELETE_CHILD`, can still move the entry.
 #[cfg(windows)]
 pub fn open_file_for_attribute_updates_without_following(
     parent: &File,
@@ -2163,7 +2164,7 @@ mod windows_tests {
     }
 
     #[test]
-    fn attribute_update_handle_excludes_parallel_attribute_updates_and_hard_links() {
+    fn attribute_update_handle_excludes_path_based_hard_links() {
         let directory = TestDirectory::new();
         let file_path = directory.0.join("readonly");
         let linked_path = directory.0.join("linked");
@@ -2179,15 +2180,6 @@ mod windows_tests {
         )
         .unwrap();
 
-        assert!(
-            open_file_for_attribute_updates_without_following(
-                &directory_handle,
-                &directory.0,
-                std::ffi::OsStr::new("readonly"),
-            )
-            .is_err(),
-            "the attribute handle excludes a second attribute-update open"
-        );
         assert!(
             fs::hard_link(&file_path, &linked_path).is_err(),
             "the attribute handle's sharing mode denies path-based hard-link creation"
