@@ -242,9 +242,12 @@ fn unsupported_bool_parameter_negation_shapes_remain_gated() {
 
 #[test]
 fn public_bool_parameters_and_if_function_emits_check_result() {
-    let source =
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right { 1 } else { 2 } }\n";
-    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    for source in [
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left and right) { 1 } else { 2 } }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
 }
 
 #[test]
@@ -255,6 +258,10 @@ fn unsupported_bool_parameter_and_shapes_remain_gated() {
         "pub fn choose(left: Bool, right: I32) -> I32 { if left and right { 1 } else { 2 } }\n",
         "pub fn choose(var left: Bool, right: Bool) -> I32 { if left and right { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right { 1 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not not (left and right) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left and left) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left and right and left) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left == right and left) { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 {\n    if left and right {\n        let value = 1\n        value\n    } else {\n        2\n    }\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
@@ -263,9 +270,12 @@ fn unsupported_bool_parameter_and_shapes_remain_gated() {
 
 #[test]
 fn public_bool_parameters_or_if_function_emits_check_result() {
-    let source =
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if left or right { 1 } else { 2 } }\n";
-    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    for source in [
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if left or right { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (right or left) { 1 } else { 2 } }\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
 }
 
 #[test]
@@ -276,6 +286,9 @@ fn unsupported_bool_parameter_or_shapes_remain_gated() {
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left and right or left { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left or right and left { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left or right { 1 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not not (left or right) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left or right or left) { 1 } else { 2 } }\n",
+        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left == right or left) { 1 } else { 2 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -320,8 +333,6 @@ fn unsupported_primitive_parameter_comparison_shapes_remain_gated() {
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right and left { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if left == right { 1 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if not not (left < right) { 1 } else { 2 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left and right) { 1 } else { 2 } }\n",
-        "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left or right) { 1 } else { 2 } }\n",
         "pub fn choose(left: Bool, right: Bool) -> I32 { if not (left < right and left) { 1 } else { 2 } }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
