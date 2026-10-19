@@ -1032,12 +1032,12 @@ pub fn open_file_without_following(
 /// `file_name` must be one normal path component. The returned handle can
 /// update attributes such as the Windows read-only flag without granting
 /// access to modify the file's contents. It is opened with a zero Windows
-/// share-access mask, preventing path-based hard-link creation while it is
-/// held. Windows does not apply sharing checks to attribute-only access
-/// requests, so this handle does not exclude another attribute-only open.
-/// This does not lock the parent directory's namespace: an operation
-/// authorized by the parent directory, such as a rename using
-/// `FILE_DELETE_CHILD`, can still move the entry.
+/// share-access mask. Windows does not apply share checks to attribute-only
+/// accesses, so this handle is not an exclusive lock against another
+/// attribute-only open or path-based hard-link creation. This also does not
+/// lock the parent directory's namespace: an operation authorized by the
+/// parent directory, such as a rename using `FILE_DELETE_CHILD`, can still
+/// move the entry.
 #[cfg(windows)]
 pub fn open_file_for_attribute_updates_without_following(
     parent: &File,
@@ -2164,10 +2164,9 @@ mod windows_tests {
     }
 
     #[test]
-    fn attribute_update_handle_excludes_path_based_hard_links() {
+    fn attribute_only_update_handles_do_not_exclude_each_other() {
         let directory = TestDirectory::new();
         let file_path = directory.0.join("readonly");
-        let linked_path = directory.0.join("linked");
         fs::write(&file_path, b"unchanged").unwrap();
 
         let directory_handle =
@@ -2180,11 +2179,13 @@ mod windows_tests {
         )
         .unwrap();
 
-        assert!(
-            fs::hard_link(&file_path, &linked_path).is_err(),
-            "the attribute handle's sharing mode denies path-based hard-link creation"
-        );
-        assert!(!linked_path.exists());
+        let second_update_guard = open_file_for_attribute_updates_without_following(
+            &directory_handle,
+            &directory.0,
+            std::ffi::OsStr::new("readonly"),
+        )
+        .expect("Windows does not apply share checks to attribute-only opens");
+        drop(second_update_guard);
         drop(update_guard);
     }
 
