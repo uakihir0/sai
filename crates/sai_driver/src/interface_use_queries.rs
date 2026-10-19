@@ -3074,6 +3074,14 @@ fn collect_interface_uses_input(
                     .filter(|(_, reference)| reference.interface.interface > interface_index)
                     .map(|(definition, reference)| (*definition, reference.clone())),
             );
+            // Record fields may use future local types after all sibling consumer maps
+            // have been prepared, so this capability stays record-only.
+            generated_record_type_references.extend(
+                generated_all_local_type_references
+                    .iter()
+                    .filter(|(_, reference)| reference.interface.interface > interface_index)
+                    .map(|(definition, reference)| (*definition, reference.clone())),
+            );
         }
         for (member_index, (entry, member_owner)) in member_entries
             .into_iter()

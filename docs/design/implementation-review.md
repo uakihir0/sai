@@ -5832,8 +5832,24 @@
 - **Human review:** **Review required:** Confirm that alias definitions may target exact named types and resources in later generated local interfaces, while record fields, variant payloads, and resource-member signatures remain prior-interface-only; confirm that omitted or cyclic targets prune their aliases and dependents.
 - **Remaining scope:** Later-interface references from record fields, variant payloads, and resource-member signatures remain unsupported, along with the broader §16.10.1 forward-reference and transitive-poisoning plan.
 
+### IR-709: allow record fields to reference later local interfaces
+
+- **Decision:** Extend only the generated record-field reference map with exact references to named types and resources in later local interfaces. Keep the function, alias-definition, variant-payload, and resource-member maps unchanged; require owned resource fields and continue to reject nested borrows.
+- **Reason:** Record fields already materialize named types and owned resource handles. Adding future references after the sibling maps have been prepared preserves consumer isolation. The interface and item reservations retain exact `DefId` identity, and the existing pruning/remapping pass removes records and consumers whose target is unsupported, omitted, or cyclic.
+- **Verification:** `generated_wit_record_fields_reference_prior_and_later_local_interfaces` verifies exact parsed local-use identities for later data and resource fields, the future record's function consumer, the rejected nested borrowed field, and pruning of a missing target and its consumer. The cyclic-interface regression verifies pruning of a record and its consumer when their later target interface is cyclic. The focused record regression passes. The full locked workspace suite passes, including all 340 `sai_driver` and 722 `sai_package` tests; `cargo fmt --all -- --check` and `git diff --check` pass.
+- **Review:** Two hostile reviews found no actionable P0–P2 findings. They confirmed that only the record-field map receives future references, exact identities are retained, and omitted/cyclic targets are pruned. The follow-up borrowed-field assertion closes the reviewer's noted coverage gap for nested borrows in the new forward-reference fixture.
+- **Human review:** **Review required:** Confirm that record fields may refer forward to exact named types and owned resources, while borrowed fields, variant payloads, and resource-member signatures remain outside this extension; confirm that records and consumers should be pruned when targets are omitted or cyclic.
+- **Remaining scope:** Later-interface references from variant payloads and resource-member signatures remain unsupported, along with the broader §16.10.1 forward-reference and transitive-poisoning plan.
+
 ### CI follow-up (2026-10-19)
 
 - **Decision:** Keep GitHub Actions CI enabled and leave the current concurrency policy unchanged.
 - **Reason:** The latest hosted run for `6f1ccfb66cae55991a0047fb50090959a9d70456` (run #45, `39210897733`) completed successfully on Ubuntu, macOS, and Windows. Run #44's Windows workspace job was cancelled after a newer push superseded it under `cancel-in-progress: true`; its Windows cache stress and recovery tests had passed. No failing test or runner issue was observed.
 - **Review:** **Review required:** Confirm that cancelling an older run after a newer push is acceptable; set `cancel-in-progress: false` only if preserving every commit's full CI result is preferred over faster feedback and lower runner use.
+
+
+### CI verification update (2026-10-19)
+
+- **Decision:** Keep GitHub Actions enabled; no workflow change is needed.
+- **Verification:** Hosted run #46 (`39213129914`) for commit `064ad3fc2b3af811808fb8e71d5a79425a51aef9` completed successfully on Ubuntu, Windows, and macOS, including the Windows package-cache concurrency and recovery checks. This confirms the earlier cancellation was caused by `cancel-in-progress` after a newer push, not a failing test.
+- **Human review:** **Review required:** Confirm that cancelling superseded runs remains preferable to spending runner time on every intermediate commit.

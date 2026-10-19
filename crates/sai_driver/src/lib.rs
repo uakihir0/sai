@@ -52890,11 +52890,16 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
-    fn generated_wit_record_fields_reference_prior_local_interfaces_only() {
+    fn generated_wit_record_fields_reference_prior_and_later_local_interfaces() {
         let source = concat!(
             "interface early {\n",
-            "  type Future { id: types.Id }\n",
+            "  type Future { id: types.Id, handle: types.Handle }\n",
+            "  type BorrowedFuture { handle: borrow types.Handle }\n",
+            "  type Missing { hidden: types.Hidden }\n",
             "  type Keep { id: U32 }\n",
+            "  fn use_future(value: Future)\n",
+            "  fn use_borrowed_future(value: BorrowedFuture)\n",
+            "  fn use_missing(value: Missing)\n",
             "}\n",
             "interface types {\n",
             "  type Hidden = USize\n",
@@ -52949,9 +52954,12 @@ interface facade { use middle.{payload}; }"#;
             .expect("the generated root text is retained");
         assert!(
             !generated.complete,
-            "later-interface and omitted-type record targets remain incomplete"
+            "the omitted-type record target remains incomplete"
         );
         assert!(generated.text.contains("record keep {"));
+        assert!(generated.text.contains("record %future {"));
+        assert!(generated.text.contains("id: id,"));
+        assert!(generated.text.contains("handle: handle,"));
         assert!(generated.text.contains("type id = u32;"));
         assert!(generated.text.contains("resource handle;"));
         assert!(generated.text.contains("use types.{handle, id};"));
@@ -52963,10 +52971,12 @@ interface facade { use middle.{payload}; }"#;
                 .text
                 .contains("use-cross: func(value: cross-record);")
         );
+        assert!(generated.text.contains("use-future: func(value: %future);"));
         assert!(generated.text.contains("independent: func(value: u32);"));
-        assert!(!generated.text.contains("record future {"));
         assert!(!generated.text.contains("type hidden ="));
         assert!(!generated.text.contains("record missing {"));
+        assert!(!generated.text.contains("record borrowed-future {"));
+        assert!(!generated.text.contains("use-borrowed-future:"));
         assert!(!generated.text.contains("use-missing:"));
 
         let package_model = result.package.expect("partial generated WIT model loads");
@@ -52996,10 +53006,10 @@ interface facade { use middle.{payload}; }"#;
             "the unsupported earlier item is removed"
         );
 
-        let early = root
+        let (early_index, early) = root
             .interfaces
-            .iter()
-            .find(|interface| interface.name == "early")
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "early")
             .expect("the earlier interface remains");
         assert_eq!(
             early
@@ -53008,9 +53018,77 @@ interface facade { use middle.{payload}; }"#;
                 .filter(|item| matches!(&item.kind, sai_wit::WitItemKind::Record(_)))
                 .map(|item| item.name.as_str())
                 .collect::<Vec<_>>(),
-            ["keep"],
-            "a record cannot reference a later interface"
+            ["future", "keep"],
+            "a supported future record survives while its omitted target is pruned"
         );
+        let (early_id_index, early_id) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the later type is available through a local use alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(early_id_target)) = &early_id.kind
+        else {
+            panic!("the local id import retains a named target");
+        };
+        assert_eq!(&early_id_target.interface.unit, &unit);
+        assert_eq!(early_id_target.interface.interface, types_index);
+        assert_eq!(early_id_target.item, id_index);
+        assert_eq!(early_id_target.item_name, "id");
+        let (early_handle_index, early_handle) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the later resource is available through a local use alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(early_handle_target)) =
+            &early_handle.kind
+        else {
+            panic!("the local handle import retains an owned target");
+        };
+        assert_eq!(&early_handle_target.interface.unit, &unit);
+        assert_eq!(early_handle_target.interface.interface, types_index);
+        assert_eq!(early_handle_target.item, handle_index);
+        assert_eq!(early_handle_target.item_name, "handle");
+        let (future_index, future) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "future")
+            .expect("the future record remains");
+        let sai_wit::WitItemKind::Record(future_fields) = &future.kind else {
+            panic!("future remains a record");
+        };
+        assert_eq!(future_fields.len(), 2);
+        assert!(matches!(
+            future_fields[0].ty,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == early_index
+                    && reference.item == early_id_index
+                    && reference.item_name == "id"
+        ));
+        assert!(matches!(
+            future_fields[1].ty,
+            sai_wit::WitType::Own(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == early_index
+                    && reference.item == early_handle_index
+                    && reference.item_name == "handle"
+        ));
+        let use_future = early
+            .items
+            .iter()
+            .find(|item| item.name == "use-future")
+            .expect("the function consuming the future record remains");
+        let sai_wit::WitItemKind::Func(use_future) = &use_future.kind else {
+            panic!("use-future remains a function");
+        };
+        assert!(matches!(
+            use_future.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == early_index
+                    && reference.item == future_index
+                    && reference.item_name == "future"
+        ));
 
         let (records_index, records) = root
             .interfaces
@@ -54478,6 +54556,8 @@ interface facade { use middle.{payload}; }"#;
         let source = concat!(
             "interface early {\n",
             "  fn omitted(value: second.Safe)\n",
+            "  type OmittedRecord { value: second.Safe }\n",
+            "  fn omitted_record(value: OmittedRecord)\n",
             "  fn independent(value: U32)\n",
             "}\n",
             "interface first {\n",
@@ -54547,6 +54627,8 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("interface first"));
         assert!(!generated.text.contains("interface second"));
         assert!(!generated.text.contains("omitted:"));
+        assert!(!generated.text.contains("record omitted-record"));
+        assert!(!generated.text.contains("omitted-record:"));
         assert!(generated.text.contains("independent: func(value: u32);"));
         assert!(generated.text.contains("interface stable"));
         let package_model = result.package.expect("the package model loads");
