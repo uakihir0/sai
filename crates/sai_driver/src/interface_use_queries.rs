@@ -2499,9 +2499,25 @@ fn collect_interface_uses_input(
     let interface_boundary_types =
         interface_boundary_type_definitions(&interface_type_members, scopes, prepared);
     let foreign_named_type_references = generated_foreign_named_type_references(prepared);
-    let foreign_world_resource_references = generated_foreign_world_resource_references(prepared);
+    let foreign_resource_references = generated_foreign_resource_references(prepared);
     let foreign_world_used_type_references =
         generated_foreign_world_used_type_references(&prepared.foreign_wit_views);
+    let mut generated_foreign_type_references_by_definition =
+        foreign_named_type_references.by_definition.clone();
+    generated_foreign_type_references_by_definition.extend(
+        foreign_resource_references
+            .by_definition
+            .iter()
+            .map(|(definition, reference)| (*definition, reference.clone())),
+    );
+    let mut generated_foreign_type_view_completeness =
+        foreign_named_type_references.view_completeness.clone();
+    for (reference, complete) in &foreign_resource_references.view_completeness {
+        generated_foreign_type_view_completeness
+            .entry(reference.clone())
+            .and_modify(|existing| *existing &= complete)
+            .or_insert(*complete);
+    }
     let mut ineligible_interfaces = HashSet::new();
     let boundary_use_alias_names = interface_boundary_use_alias_names(
         &interface_type_members,
@@ -2799,6 +2815,12 @@ fn collect_interface_uses_input(
                 .iter()
                 .map(|(definition, reference)| (*definition, reference.clone())),
         );
+        generated_function_type_references.extend(
+            foreign_resource_references
+                .by_definition
+                .iter()
+                .map(|(definition, reference)| (*definition, reference.clone())),
+        );
         let mut generated_alias_definition_type_references =
             generated_record_type_references.clone();
         generated_alias_definition_type_references.extend(
@@ -3079,6 +3101,13 @@ fn collect_interface_uses_input(
                 };
                 if let Some(item) = item {
                     if generated_item_names.insert(item.name.clone()) {
+                        if !generated_interface_boundary_view_is_complete(
+                            &boundary_conversions,
+                            &generated_foreign_type_references_by_definition,
+                            &generated_foreign_type_view_completeness,
+                        ) {
+                            generated_complete = false;
+                        }
                         let item_name = item.name.clone();
                         let is_named_type = matches!(
                             item.kind,
@@ -3206,6 +3235,7 @@ fn collect_interface_uses_input(
             let mut resource_member_names = Vec::with_capacity(method_entries.len());
             let mut resource_constructor_names = Vec::new();
             let mut generated_resource_members = Vec::with_capacity(resource_members.len());
+            let mut generated_resource_member_conversions = Vec::new();
             let mut resource_members_supported = true;
             let mut resource_constructor_count = 0;
             for (method_entry, method_owner) in method_entries
@@ -3307,6 +3337,7 @@ fn collect_interface_uses_input(
                         &mut owner_dependencies,
                         &mut interface_check_diagnostics,
                     )?;
+                generated_resource_member_conversions.extend(boundary_conversions.iter().cloned());
                 if has_incompatible_boundary {
                     owner_uses_complete = false;
                     poisoned_owners.insert(method_owner);
@@ -3368,6 +3399,13 @@ fn collect_interface_uses_input(
                 item.kind = WitItemKind::Resource(generated_resource_members);
                 let item_name = item.name.clone();
                 if generated_item_names.insert(item_name.clone()) {
+                    if !generated_interface_boundary_view_is_complete(
+                        &generated_resource_member_conversions,
+                        &generated_foreign_type_references_by_definition,
+                        &generated_foreign_type_view_completeness,
+                    ) {
+                        generated_complete = false;
+                    }
                     let item_index = provisional_item_index;
                     generated_items[item_index] = item;
                     if let (Some(unit), Some(interface_index), Some(interface_name)) = (
@@ -3485,7 +3523,7 @@ fn collect_interface_uses_input(
                 .map(|(definition, reference)| (*definition, reference.clone())),
         );
         generated_world_type_references.extend(
-            foreign_world_resource_references
+            foreign_resource_references
                 .by_definition
                 .iter()
                 .map(|(definition, reference)| (*definition, reference.clone())),
@@ -3497,12 +3535,8 @@ fn collect_interface_uses_input(
                 .map(|(definition, reference)| (*definition, reference.clone())),
         );
         let mut generated_world_view_completeness =
-            foreign_named_type_references.view_completeness.clone();
-        for (reference, complete) in foreign_world_resource_references
-            .view_completeness
-            .iter()
-            .chain(&foreign_world_used_type_references.view_completeness)
-        {
+            generated_foreign_type_view_completeness.clone();
+        for (reference, complete) in &foreign_world_used_type_references.view_completeness {
             generated_world_view_completeness
                 .entry(reference.clone())
                 .and_modify(|existing| *existing &= complete)
@@ -5303,15 +5337,15 @@ fn generated_foreign_named_type_references(
 }
 
 #[derive(Default)]
-struct GeneratedForeignWorldResourceReferences {
+struct GeneratedForeignResourceReferences {
     by_definition: HashMap<DefId, WitTypeRef>,
     view_completeness: HashMap<WitTypeRef, bool>,
 }
 
-fn generated_foreign_world_resource_references(
+fn generated_foreign_resource_references(
     prepared: &PreparedPhase1PackageScopes,
-) -> GeneratedForeignWorldResourceReferences {
-    let mut references = GeneratedForeignWorldResourceReferences::default();
+) -> GeneratedForeignResourceReferences {
+    let mut references = GeneratedForeignResourceReferences::default();
     for foreign in &prepared.foreign_wit_views {
         if !foreign.directly_visible {
             continue;
@@ -5502,6 +5536,42 @@ fn generated_world_function_view_is_complete(
     let WitWorldItem::Func { func, .. } = item else {
         return true;
     };
+    generated_wit_func_view_is_complete(func, external_type_completeness)
+}
+
+fn generated_interface_boundary_view_is_complete(
+    conversions: &[sai_ty::boundary::BoundaryTypeConversion],
+    foreign_references: &HashMap<DefId, WitTypeRef>,
+    external_type_completeness: &HashMap<WitTypeRef, bool>,
+) -> bool {
+    for conversion in conversions {
+        let BoundaryTypeOutcome::Mapped(boundary_type) = &conversion.outcome else {
+            continue;
+        };
+        let mut definitions = HashSet::new();
+        collect_boundary_type_definitions(boundary_type, &mut definitions);
+        definitions.extend(
+            conversion
+                .references
+                .iter()
+                .map(|reference| reference.definition),
+        );
+        if definitions.into_iter().any(|definition| {
+            foreign_references
+                .get(&definition)
+                .and_then(|reference| external_type_completeness.get(reference))
+                .is_some_and(|complete| !complete)
+        }) {
+            return false;
+        }
+    }
+    true
+}
+
+fn generated_wit_func_view_is_complete(
+    func: &WitFunc,
+    external_type_completeness: &HashMap<WitTypeRef, bool>,
+) -> bool {
     let mut references = Vec::new();
     let mut references_complete = true;
     collect_wit_func_interface_references(func, &mut references, &mut references_complete);

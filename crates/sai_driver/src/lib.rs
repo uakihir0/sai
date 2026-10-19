@@ -45611,6 +45611,12 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             "world client {\n",
             "  import fn consume_handle(value: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
             "}\n",
+            "interface local {\n",
+            "  fn consume_interface(value: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
+            "  resource Proxy {\n",
+            "    fn inspect(self: borrow Self, value: borrow api.Handle) -> api.Handle\n",
+            "  }\n",
+            "}\n",
         );
         let mut database = RootDatabase::new().expect("driver initializes");
         let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
@@ -45696,6 +45702,15 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 .members
                 .contains_key("Handle")
         );
+        let codec_interface = codec_view
+            .view
+            .interfaces
+            .get("api")
+            .expect("the partial generated view retains api");
+        let codec_item = codec_interface
+            .members
+            .get("Handle")
+            .expect("the partial generated view retains the resource");
 
         let root_manifest: Arc<[u8]> = Arc::from(
             &b"package acme:root @ 1.0.0\n\
@@ -45736,7 +45751,75 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             "the function remains emitted while its selected view is partial: {}",
             generated.text
         );
+        assert!(generated.text.contains("consume-interface: func("));
+        assert!(generated.text.contains("resource proxy {"));
+        assert!(generated.text.contains("inspect: func("));
         assert_eq!(generated.text.matches("import consume-handle:").count(), 1);
+
+        let selected = MvsPackageVersion::new(
+            "acme:root",
+            Version::parse("1.0.0").expect("root version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let parsed = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT still parses with local resource signatures");
+        let package = parsed
+            .package
+            .as_ref()
+            .expect("root generated WIT model remains available");
+        let (local_index, local) = package
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "local")
+            .expect("the local interface is generated");
+        let (_, handle_alias) = local
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the interface imports the selected resource");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(foreign_reference)) =
+            &handle_alias.kind
+        else {
+            panic!("the generated resource alias retains its selected source origin");
+        };
+        assert_eq!(foreign_reference.interface.unit, codec_view.view.unit);
+        assert_eq!(foreign_reference.interface.interface, codec_interface.wit);
+        assert_eq!(foreign_reference.item, codec_item.item);
+        assert_eq!(foreign_reference.item_name, "handle");
+        let (_, consume_interface) = local
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "consume-interface")
+            .expect("the local interface function remains");
+        let sai_wit::WitItemKind::Func(consume_interface) = &consume_interface.kind else {
+            panic!("the local interface function remains a WIT function");
+        };
+        assert!(matches!(
+            consume_interface.params[0].1,
+            sai_wit::WitType::Own(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == local_index
+                    && reference.item_name == "handle"
+        ));
+        assert!(matches!(
+            consume_interface.params[1].1,
+            sai_wit::WitType::Borrow(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == local_index
+                    && reference.item_name == "handle"
+        ));
+        assert!(matches!(
+            consume_interface.result,
+            Some(sai_wit::WitType::Own(ref reference))
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == local_index
+                    && reference.item_name == "handle"
+        ));
     }
 
     #[test]
@@ -45867,6 +45950,294 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             !generated.text.contains("acme:base/types"),
             "the transitive same-named resource must not leak into the generated world"
         );
+    }
+
+    #[test]
+    fn generated_interface_functions_use_only_exact_direct_foreign_resources() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "use acme:codec/facade as facade\n",
+            "interface client {\n",
+            "  fn accepted(value: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
+            "  resource Proxy {\n",
+            "    fn new(handle: api.Handle) -> Self\n",
+            "    fn inspect(self: borrow Self, owned_handle: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
+            "    fn from_foreign(handle: api.Handle) -> api.Handle\n",
+            "  }\n",
+            "  resource Broken {\n",
+            "    fn fail(self: borrow Self, value: borrow api.Data)\n",
+            "  }\n",
+            "  resource BadResult {\n",
+            "    fn leak(self: borrow Self) -> borrow api.Handle\n",
+            "  }\n",
+            "  fn take_proxy(value: Proxy)\n",
+            "  fn take_broken(value: Broken)\n",
+            "  fn take_bad_result(value: BadResult)\n",
+            "  fn transitive(value: facade.ForwardedResource)\n",
+            "  fn wrong_kind(value: borrow api.Data)\n",
+            "  fn borrowed_result() -> borrow api.Handle\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface api {
+  resource handle;
+  record data { value: u32, }
+}
+interface facade { use acme:base/types@1.0.0.{handle as forwarded-resource}; }"#;
+        let base_wit = br#"package acme:base@1.0.0; interface types { resource handle; }"#;
+        let (mut database, module_tree, snapshot, root_package, wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, Some(base_wit));
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact selected authored WIT view");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query supports selected foreign resources");
+        assert!(
+            result.failure.is_none(),
+            "omitted unsupported resource references leave parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(!generated.complete);
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{handle};")
+        );
+        assert!(generated.text.contains("resource proxy {"));
+        assert!(generated.text.contains("accepted: func("));
+        assert!(generated.text.contains("inspect: func("));
+        assert!(generated.text.contains("from-foreign: static func("));
+        assert!(generated.text.contains("take-proxy: func(value: proxy);"));
+        assert!(
+            generated
+                .text
+                .contains("transitive: func(value: forwarded-resource);")
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/facade@1.2.3.{forwarded-resource};")
+        );
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("resource broken"));
+        assert!(!generated.text.contains("take-broken:"));
+        assert!(!generated.text.contains("resource bad-result"));
+        assert!(!generated.text.contains("take-bad-result:"));
+        assert!(!generated.text.contains("wrong-kind:"));
+        assert!(!generated.text.contains("borrowed-result:"));
+        assert!(
+            !generated.text.contains("acme:base/types"),
+            "a transitive resource target must not leak into generated WIT"
+        );
+
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the direct codec dependency is in the selected WIT closure");
+        assert!(codec_view.directly_visible);
+        let api = codec_view
+            .view
+            .interfaces
+            .get("api")
+            .expect("the exact direct interface is present");
+        let handle = api
+            .members
+            .get("Handle")
+            .expect("the direct resource is present");
+        let api_item = &codec_view.view.model.interfaces[api.wit].items[handle.item];
+        assert!(matches!(api_item.kind, sai_wit::WitItemKind::Resource(_)));
+        let package = result
+            .package
+            .as_ref()
+            .expect("the partial generated package model remains available");
+        let (client_index, client) = package
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "client")
+            .expect("the generated interface remains");
+        let assert_reference =
+            |ty: &sai_wit::WitType, expected_kind: fn(&sai_wit::WitType) -> bool| {
+                assert!(
+                    expected_kind(ty),
+                    "the foreign handle keeps its ownership form"
+                );
+                let reference = match ty {
+                    sai_wit::WitType::Own(reference) | sai_wit::WitType::Borrow(reference) => {
+                        reference
+                    }
+                    _ => panic!("the reference targets an exact foreign resource"),
+                };
+                assert_eq!(reference.interface.unit, generated_unit);
+                assert_eq!(reference.interface.interface, client_index);
+                assert_eq!(reference.interface.name, "client");
+                assert_eq!(reference.item_name, "handle");
+                let local_import = &client.items[reference.item];
+                assert_eq!(local_import.name, "handle");
+                let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(foreign_reference)) =
+                    &local_import.kind
+                else {
+                    panic!("the generated use alias targets the exact foreign resource");
+                };
+                assert_eq!(foreign_reference.interface.unit, codec_view.view.unit);
+                assert_eq!(foreign_reference.interface.interface, api.wit);
+                assert_eq!(foreign_reference.interface.name, "api");
+                assert_eq!(foreign_reference.item, handle.item);
+                assert_eq!(foreign_reference.item_name, api_item.name);
+            };
+        let is_own = |ty: &sai_wit::WitType| matches!(ty, sai_wit::WitType::Own(_));
+        let is_borrow = |ty: &sai_wit::WitType| matches!(ty, sai_wit::WitType::Borrow(_));
+
+        let (_, accepted) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "accepted")
+            .expect("the function with exact direct resource types remains");
+        let sai_wit::WitItemKind::Func(accepted) = &accepted.kind else {
+            panic!("the selected-resource function remains a WIT function");
+        };
+        assert_reference(&accepted.params[0].1, is_own);
+        assert_reference(&accepted.params[1].1, is_borrow);
+        assert_reference(
+            accepted
+                .result
+                .as_ref()
+                .expect("owned resource result remains"),
+            is_own,
+        );
+
+        let (_, proxy) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "proxy")
+            .expect("the resource with exact direct foreign member types remains");
+        let sai_wit::WitItemKind::Resource(members) = &proxy.kind else {
+            panic!("the direct-resource members remain inside the proxy resource");
+        };
+        let constructor = members
+            .iter()
+            .find(|member| member.kind == sai_wit::WitMemberKind::Constructor)
+            .expect("the resource constructor remains");
+        assert_reference(&constructor.func.params[0].1, is_own);
+        let inspect = members
+            .iter()
+            .find(|member| member.name == "inspect")
+            .expect("the resource method remains");
+        assert_eq!(inspect.kind, sai_wit::WitMemberKind::Method);
+        assert_reference(&inspect.func.params[1].1, is_own);
+        assert_reference(&inspect.func.params[2].1, is_borrow);
+        assert_reference(
+            inspect
+                .func
+                .result
+                .as_ref()
+                .expect("the method's owned foreign resource result remains"),
+            is_own,
+        );
+        let static_member = members
+            .iter()
+            .find(|member| member.name == "from-foreign")
+            .expect("the resource static remains");
+        assert_eq!(static_member.kind, sai_wit::WitMemberKind::Static);
+        assert_reference(&static_member.func.params[0].1, is_own);
+        assert_reference(
+            static_member
+                .func
+                .result
+                .as_ref()
+                .expect("the static's owned foreign resource result remains"),
+            is_own,
+        );
+
+        let (_, take_proxy) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "take-proxy")
+            .expect("the exact local resource consumer remains");
+        let sai_wit::WitItemKind::Func(take_proxy) = &take_proxy.kind else {
+            panic!("the proxy consumer remains a WIT function");
+        };
+        assert!(matches!(
+            take_proxy.params[0].1,
+            sai_wit::WitType::Own(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == client_index
+                    && reference.item_name == "proxy"
+        ));
+    }
+
+    #[test]
+    fn generated_interface_resources_remain_usable_from_partial_foreign_views() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  resource Proxy {\n",
+            "    fn inspect(self: borrow Self, value: borrow api.Handle) -> api.Handle\n",
+            "  }\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3; interface api { resource handle; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        mark_authored_wit_view_incomplete(&mut wit_views, "acme:codec");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact partial foreign WIT view");
+        let generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated WIT query succeeds")
+            .expect("root source package publishes generated WIT");
+        assert!(
+            !generated.complete,
+            "using a present foreign resource from a partial view keeps output incomplete"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{handle};")
+        );
+        assert!(generated.text.contains("resource proxy {"));
+        assert!(generated.text.contains("inspect: func("));
     }
 
     fn authored_wit_world_fixture(
