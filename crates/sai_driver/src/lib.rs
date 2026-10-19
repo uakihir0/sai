@@ -6232,7 +6232,11 @@ fn check_function_if_parameter_comparison_condition(
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    let ExprKind::Binary(operator, left, right) = condition.kind else {
+    let comparison_condition = match condition.kind {
+        ExprKind::Unary(UnOp::Not, operand) => operand,
+        _ => condition,
+    };
+    let ExprKind::Binary(operator, left, right) = comparison_condition.kind else {
         return Ok(None);
     };
     if !matches!(
@@ -24751,16 +24755,22 @@ mod tests {
             "pub fn bool_literal_on_left(value: Bool) -> I32 { if false < value { 1 } else { 2 } }\n",
             "pub fn char_literal_on_left(value: Char) -> I32 { if 'a' < value { 1 } else { 2 } }\n",
             "pub fn byte_literal_on_left(value: Byte) -> I32 { if b'A' < value { 1 } else { 2 } }\n",
+            "pub fn not_parameter_literal(value: I8) -> I32 { if not (value < 10) { 1 } else { 2 } }\n",
+            "pub fn not_literal_parameter(value: F32) -> I32 { if not (1.5 < value) { 1 } else { 2 } }\n",
             "pub fn wrong_literal_type(value: I8) -> I32 { if value < true { 1 } else { 2 } }\n",
             "pub fn wrong_fixed_literal_type_on_left(value: I8) -> I32 { if true < value { 1 } else { 2 } }\n",
             "pub fn integer_literal_left_wrong_type(value: F32) -> I32 { if 10 < value { 1 } else { 2 } }\n",
             "pub fn float_literal_left_wrong_type(value: I8) -> I32 { if 1.5 < value { 1 } else { 2 } }\n",
             "pub fn integer_out_of_range(value: I8) -> I32 { if value < 128 { 1 } else { 2 } }\n",
             "pub fn condition_and_branch_errors(value: I8) -> I8 { if value < 128 { true } else { 128 } }\n",
+            "pub fn not_condition_and_branch_errors(value: I8) -> I8 { if not (128 < value) { true } else { 128 } }\n",
             "pub fn constant_on_right(value: I8) -> I32 { if value < OTHER { 1 } else { 2 } }\n",
             "pub fn nested_right_operand(value: I8) -> I32 { if value < 1 + 2 { 1 } else { 2 } }\n",
             "pub fn mixed_condition(value: I8) -> I32 { if value < 1 and true { 1 } else { 2 } }\n",
             "pub fn two_parameters(value: I8, other: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+            "pub fn double_negated_comparison(value: I8) -> I32 { if not not (value < 10) { 1 } else { 2 } }\n",
+            "pub fn negated_mixed_condition(value: I8) -> I32 { if not (value < 1 and true) { 1 } else { 2 } }\n",
+            "pub fn negated_two_parameters(value: I8, other: I8) -> I32 { if not (10 < value) { 1 } else { 2 } }\n",
             "pub fn aliased_parameter(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
             "pub fn string_parameter(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
             "pub fn unit_parameter(value: ()) -> I32 { if value == () { 1 } else { 2 } }\n",
@@ -24781,9 +24791,9 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 25);
+        assert_eq!(owners.len(), 31);
 
-        for index in 0..10 {
+        for index in 0..12 {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -24792,7 +24802,7 @@ mod tests {
             ));
         }
         assert!(matches!(
-            owners[10]
+            owners[12]
                 .body_type_check()
                 .expect("literal type mismatch is diagnosed"),
             FunctionBodyTypeCheck::Supported { diagnostics }
@@ -24800,7 +24810,7 @@ mod tests {
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
         assert!(matches!(
-            owners[11]
+            owners[13]
                 .body_type_check()
                 .expect("fixed-type left literal mismatch is diagnosed"),
             FunctionBodyTypeCheck::Supported { diagnostics }
@@ -24808,7 +24818,7 @@ mod tests {
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
         assert!(matches!(
-            owners[12]
+            owners[14]
                 .body_type_check()
                 .expect("integer left literal type mismatch is diagnosed at the parameter"),
             FunctionBodyTypeCheck::Supported { diagnostics }
@@ -24816,7 +24826,7 @@ mod tests {
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
         assert!(matches!(
-            owners[13]
+            owners[15]
                 .body_type_check()
                 .expect("float left literal type mismatch is diagnosed at the parameter"),
             FunctionBodyTypeCheck::Supported { diagnostics }
@@ -24824,7 +24834,7 @@ mod tests {
                     && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
         ));
         assert!(matches!(
-            owners[14]
+            owners[16]
                 .body_type_check()
                 .expect("literal range error is diagnosed"),
             FunctionBodyTypeCheck::Supported { diagnostics }
@@ -24832,7 +24842,7 @@ mod tests {
                     && diagnostics[0].code == sai_diagnostics::Code::LiteralOutOfRange
         ));
         assert!(matches!(
-            owners[15]
+            owners[17]
                 .body_type_check()
                 .expect("condition and both branches are checked in source order"),
             FunctionBodyTypeCheck::Supported { diagnostics }
@@ -24843,7 +24853,19 @@ mod tests {
                         sai_diagnostics::Code::LiteralOutOfRange,
                     ]
         ));
-        for (index, owner) in owners.iter().enumerate().skip(16) {
+        assert!(matches!(
+            owners[18]
+                .body_type_check()
+                .expect("a negated condition still checks its comparison and branches in order"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.iter().map(|diagnostic| diagnostic.code).collect::<Vec<_>>()
+                    == [
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        sai_diagnostics::Code::TypeMismatch,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                    ]
+        ));
+        for (index, owner) in owners.iter().enumerate().skip(19) {
             let check = owner
                 .body_type_check()
                 .expect("unsupported parameter-literal comparison shape is gated");
