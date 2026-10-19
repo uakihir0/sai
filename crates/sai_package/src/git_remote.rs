@@ -3388,16 +3388,32 @@ mod tests {
 
     #[test]
     fn missing_object_classification_rejects_broken_pipe_client_errors() {
-        let error = gix::remote::fetch::Error::Fetch(gix::protocol::fetch::Error::Client(
-            gix_transport::client::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
-        ));
+        let broken_pipe = || {
+            gix::remote::fetch::Error::Fetch(gix::protocol::fetch::Error::Client(
+                gix_transport::client::Error::Io(std::io::Error::from(
+                    std::io::ErrorKind::BrokenPipe,
+                )),
+            ))
+        };
+        let unavailable =
+            gix::ObjectId::from_hex(b"ffffffffffffffffffffffffffffffffffffffff").unwrap();
 
+        let error = broken_pipe();
         assert!(!super::is_locked_commit_unavailable(&error));
         assert_eq!(
             super::map_locked_commit_fetch_error(
                 error,
-                &gix::ObjectId::from_hex(b"ffffffffffffffffffffffffffffffffffffffff").unwrap(),
+                &unavailable,
                 super::LockedCommitFetchContext::RepositoryPackage,
+            ),
+            GitRemoteReleaseFetchError::FetchFailed
+        );
+
+        assert_eq!(
+            super::map_locked_commit_fetch_error(
+                broken_pipe(),
+                &unavailable,
+                super::LockedCommitFetchContext::ReleaseTag("refs/tags/v1.2.3"),
             ),
             GitRemoteReleaseFetchError::FetchFailed
         );
@@ -7827,7 +7843,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_locked_commit_unavailable_when_deleted_tag_cannot_be_fetched() {
+    fn deleted_tag_locked_commit_fetch_requires_missing_object_evidence() {
         let remote = TestRemote::new("refs/tags/v1.2.3", false);
         std::fs::remove_file(remote.directory.path.join("refs/tags/v1.2.3")).unwrap();
         let unavailable =
@@ -7835,17 +7851,22 @@ mod tests {
 
         let error = fetch_fixture(&remote, Some(&unavailable), None).unwrap_err();
 
-        assert_eq!(
-            error,
-            GitRemoteReleaseFetchError::LockedCommitUnavailable {
-                name: "refs/tags/v1.2.3".into(),
-                commit: unavailable,
+        // Local upload-pack may reject an unavailable object with a protocol
+        // error or close its subprocess pipe before the error reaches us. Only
+        // the protocol response is sufficient evidence to report it as missing.
+        match error {
+            GitRemoteReleaseFetchError::LockedCommitUnavailable { name, commit } => {
+                assert_eq!(name.as_ref(), "refs/tags/v1.2.3");
+                assert_eq!(commit, unavailable);
+                let error = GitRemoteReleaseFetchError::LockedCommitUnavailable { name, commit };
+                assert_eq!(
+                    error.diagnostic_code(),
+                    sai_diagnostics::Code::VersionNotFound
+                );
             }
-        );
-        assert_eq!(
-            error.diagnostic_code(),
-            sai_diagnostics::Code::VersionNotFound
-        );
+            GitRemoteReleaseFetchError::FetchFailed => {}
+            error => panic!("unexpected deleted-tag fetch error: {error:?}"),
+        }
     }
 
     #[test]
