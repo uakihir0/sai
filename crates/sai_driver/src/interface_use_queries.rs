@@ -2863,7 +2863,9 @@ fn collect_interface_uses_input(
             }
             let item_type_references = if matches!(
                 kind,
-                super::InterfaceMemberKind::Alias | super::InterfaceMemberKind::Function
+                super::InterfaceMemberKind::Alias
+                    | super::InterfaceMemberKind::Function
+                    | super::InterfaceMemberKind::Struct
             ) {
                 &generated_alias_type_references
             } else {

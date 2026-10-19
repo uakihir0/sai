@@ -51351,24 +51351,140 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
+    fn generated_wit_emits_record_fields_that_reference_later_aliases() {
+        let source = concat!(
+            "interface api {\n",
+            "  type Envelope { value: Later }\n",
+            "  type RejectedRecord { value: Rejected }\n",
+            "  type BeforeRecord { value: LaterRecord }\n",
+            "  enum BeforeVariant { Value(Later) }\n",
+            "  type LaterRecord { value: U64 }\n",
+            "  type Rejected = USize\n",
+            "  type Later = U32\n",
+            "  type Independent = U64\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated forward record reference loads");
+        assert!(
+            result.failure.is_none(),
+            "forward record reference text parses and resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        assert!(
+            generated.text.contains("record envelope {"),
+            "{}",
+            generated.text
+        );
+        assert!(generated.text.contains("value: later"));
+        assert!(!generated.text.contains("rejected-record"));
+        assert!(!generated.text.contains("before-record"));
+        assert!(!generated.text.contains("before-variant"));
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        let item_names = interface
+            .items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(item_names.len(), 4);
+        for name in ["envelope", "later-record", "later", "independent"] {
+            assert!(
+                item_names.contains(&name),
+                "the valid declaration {name} survives pruning"
+            );
+        }
+        assert_eq!(
+            interface
+                .items
+                .iter_enumerated()
+                .map(|(index, _)| index.index())
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3],
+            "surviving item references compact after omitted forward targets"
+        );
+        let later_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "later").then_some(index))
+            .expect("the target alias remains in the parsed model");
+        let envelope = interface
+            .items
+            .iter()
+            .find(|item| item.name == "envelope")
+            .expect("the valid forward record remains in the parsed model");
+        let sai_wit::WitItemKind::Record(fields) = &envelope.kind else {
+            panic!("envelope remains a record after parsing");
+        };
+        let sai_wit::WitType::Named(reference) = &fields[0].ty else {
+            panic!("the record field refers to a named later alias");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.interface.name, "api");
+        assert_eq!(reference.item, later_index);
+        assert_eq!(reference.item_name, "later");
+    }
+
+    #[test]
     fn generated_wit_prunes_forward_alias_cycles_and_omitted_targets() {
         let source = concat!(
             "interface api {\n",
             "  type Before = After\n",
             "  fn use_later(value: After) -> After\n",
             "  fn use_rejected(value: Rejected) -> Rejected\n",
-            "  type BeforeRecord { value: After }\n",
+            "  type BeforeRecord { value: LaterRecord }\n",
+            "  enum BeforeVariant { Value(After) }\n",
             "  fn use_resource(value: LaterResource)\n",
             "  resource LaterResource {}\n",
             "  type CycleA = CycleB\n",
             "  fn use_cycle(value: CycleA) -> CycleA\n",
+            "  type RecordCycle { value: CycleA }\n",
             "  type CycleB = CycleA\n",
             "  type UsesCycle = CycleA\n",
             "  type UsesRejected = Rejected\n",
             "  type Rejected = USize\n",
             "  type UsesUsesRejected = UsesRejected\n",
             "  type After = U32\n",
-            "  type LaterRecord = U64\n",
+            "  type LaterRecord { value: U64 }\n",
             "  fn independent(value: U64)\n",
             "}\n",
             "interface other {\n",
@@ -51444,8 +51560,10 @@ interface facade { use middle.{payload}; }"#;
         );
         assert!(!generated.text.contains("use-rejected"));
         assert!(!generated.text.contains("before-record"));
+        assert!(!generated.text.contains("before-variant"));
         assert!(!generated.text.contains("use-resource"));
         assert!(!generated.text.contains("use-cycle"));
+        assert!(!generated.text.contains("record-cycle"));
         assert!(!generated.text.contains("cycle"));
         assert!(!generated.text.contains("uses-cycle"));
         assert!(!generated.text.contains("rejected"));

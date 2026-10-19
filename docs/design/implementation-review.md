@@ -5585,6 +5585,15 @@
 - **Human review:** **Review required:** Confirm that function parameters and results should be allowed to reference later aliases while records, variants, enums, and resources remain source ordered, and that function consumers of omitted aliases should be removed by the existing dependency-pruning pass.
 - **Remaining scope:** Forward references from records, variants, enums, and resources, cross-interface item references, resource forward references, and the broader transitive-poisoning plan remain incomplete.
 
+### IR-684: allow record fields to reference later same-interface aliases
+
+- **Decision:** Select the reserved later-alias reference map for generated records as well as aliases and functions. Keep variants, enums, resources, and record-to-record references on the already-emitted reference map.
+- **Reason:** A record field may retain the exact local alias identity before that alias is converted. The existing pruning pass can then drop records whose target alias is unsupported or cyclic and compact the references of surviving records. Restricting the wider map to aliases, functions, and records avoids introducing general forward-reference resolution or name-based lookup.
+- **Verification:** The round-trip regression confirms that a record field references the exact later alias by unit, interface, item index, and name after printed WIT is parsed. The pruning fixture confirms that records depending on unsupported or cyclic aliases are removed, while record-to-later-record, variant-to-later-alias, and function-to-later-resource references remain omitted; independent declarations survive and indices compact. Both focused tests pass. The full locked workspace suite passes (329 `sai_driver` library tests), as do `cargo fmt --all -- --check` and `git diff --check`.
+- **Review:** Hostile review found no actionable P0–P2 issues. It confirmed that the widened reference map is limited to Alias, Function, and Struct, and that enum/variant/resource conversion still receives only already-emitted references.
+- **Human review:** **Review required:** Confirm that record fields may refer forward to later aliases while record-to-record, variant, enum, and resource references remain source ordered, and that the existing dependency-pruning pass correctly removes records that depend on omitted aliases.
+- **Remaining scope:** Record references to later records, variant and enum references to later aliases, resource forward references, cross-interface item references, and the broader transitive-poisoning plan remain incomplete.
+
 ### CI follow-up: keep missing-commit classification strict across Git transports
 
 - **Decision:** Keep `BrokenPipe` and other generic transport failures classified as `FetchFailed`, including release-tag fetches. The local deleted-tag integration test may accept either an explicit missing-object response (`LockedCommitUnavailable`) or an ambiguous subprocess transport failure (`FetchFailed`); separate deterministic tests continue to assert the exact classification for both error forms. Keep every operating-system Actions job enabled.
