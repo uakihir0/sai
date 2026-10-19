@@ -5949,30 +5949,44 @@ fn check_function_body_type(
             ) {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
             }
-            let condition_is_supported =
-                function_if_condition_uses_parameter_binding(cond, body_parameter, locals, inputs)
-                    && matches!(
-                        resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs),
-                        Some(FunctionDirectType::Primitive(
-                            sai_resolve::prelude::PrimTy::Bool
-                        ))
-                    );
-            let Some(diagnostics) = check_function_if_literal_branches(
-                owner,
-                *return_ty,
-                condition_is_supported,
-                then,
-                else_expr,
-                type_paths,
-                symbols,
+            let condition_diagnostics = if function_if_condition_uses_parameter_binding(
+                cond,
+                body_parameter,
+                locals,
                 inputs,
-                snapshot,
+            ) && matches!(
+                resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs),
+                Some(FunctionDirectType::Primitive(
+                    sai_resolve::prelude::PrimTy::Bool
+                ))
+            ) {
+                Some(Vec::new())
+            } else {
+                check_function_if_parameter_comparison_condition(
+                    owner,
+                    cond,
+                    *parameter.ty,
+                    body_parameter,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+            };
+            let Some(mut condition_diagnostics) = condition_diagnostics else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            let Some(mut branch_diagnostics) = check_function_if_literal_branches(
+                owner, *return_ty, true, then, else_expr, type_paths, symbols, inputs, snapshot,
                 target_cfg,
             )?
             else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
             };
-            diagnostics
+            condition_diagnostics.append(&mut branch_diagnostics);
+            condition_diagnostics
         } else {
             let ExprKind::Path(path) = tail.kind else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
@@ -6169,15 +6183,27 @@ fn function_if_condition_uses_parameter_binding(
     locals: &LocalResolution,
     inputs: &CurrentOwnerInputs,
 ) -> bool {
-    let path = match condition.kind {
-        ExprKind::Path(path) => Some(path),
+    let path_expression = match condition.kind {
+        ExprKind::Path(_) => Some(condition),
         ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
-            ExprKind::Path(path) => Some(path),
+            ExprKind::Path(_) => Some(operand),
             _ => None,
         },
         _ => None,
     };
-    let Some(path) = path else {
+    let Some(path_expression) = path_expression else {
+        return false;
+    };
+    function_if_path_uses_parameter_binding(path_expression, body_parameter, locals, inputs)
+}
+
+fn function_if_path_uses_parameter_binding(
+    expression: &HirExpr<'_>,
+    body_parameter: &sai_hir::body::BodyParam,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let ExprKind::Path(path) = expression.kind else {
         return false;
     };
     path.root == PathRoot::Plain
@@ -6192,6 +6218,45 @@ fn function_if_condition_uses_parameter_binding(
                 segment_count: 1,
             }) if *resolved_binding == body_parameter.binding
         )
+}
+
+fn check_function_if_parameter_comparison_condition(
+    owner: &HirOwner<'_>,
+    condition: &HirExpr<'_>,
+    parameter_ty: Ty<'_>,
+    body_parameter: &sai_hir::body::BodyParam,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let ExprKind::Binary(operator, left, right) = condition.kind else {
+        return Ok(None);
+    };
+    if !matches!(
+        operator,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+    ) || !function_if_path_uses_parameter_binding(left, body_parameter, locals, inputs)
+        || !is_direct_function_scalar_literal(right)
+        || !matches!(
+            resolve_function_direct_type(parameter_ty, type_paths, symbols, inputs),
+            Some(FunctionDirectType::Primitive(_))
+        )
+    {
+        return Ok(None);
+    }
+    check_const_literal_leaf(
+        owner,
+        parameter_ty,
+        right,
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )
 }
 
 fn function_if_binary_condition_uses_parameter_bindings(
@@ -24598,6 +24663,94 @@ mod tests {
             let check = owner
                 .body_type_check()
                 .expect("unsupported parameter condition is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_checks_a_primitive_parameter_against_a_literal_condition() {
+        let root = concat!(
+            "const OTHER: I8 = 1\n",
+            "type I8Alias = I8\n",
+            "pub fn bool_equal(value: Bool) -> I32 { if value == true { 1 } else { 2 } }\n",
+            "pub fn integer_less(value: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+            "pub fn float_greater_equal(value: F64) -> I32 { if value >= 1.5 { 1 } else { 2 } }\n",
+            "pub fn character_less(value: Char) -> I32 { if value < 'z' { 1 } else { 2 } }\n",
+            "pub fn byte_equal(value: Byte) -> I32 { if value == b'Z' { 1 } else { 2 } }\n",
+            "pub fn pointer_sized(value: ISize) -> I32 { if value >= 0 { 1 } else { 2 } }\n",
+            "pub fn wrong_literal_type(value: I8) -> I32 { if value < true { 1 } else { 2 } }\n",
+            "pub fn integer_out_of_range(value: I8) -> I32 { if value < 128 { 1 } else { 2 } }\n",
+            "pub fn condition_and_branch_errors(value: I8) -> I8 { if value < 128 { true } else { 128 } }\n",
+            "pub fn literal_on_left(value: I8) -> I32 { if 10 < value { 1 } else { 2 } }\n",
+            "pub fn constant_on_right(value: I8) -> I32 { if value < OTHER { 1 } else { 2 } }\n",
+            "pub fn nested_right_operand(value: I8) -> I32 { if value < 1 + 2 { 1 } else { 2 } }\n",
+            "pub fn mixed_condition(value: I8) -> I32 { if value < 1 and true { 1 } else { 2 } }\n",
+            "pub fn two_parameters(value: I8, other: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+            "pub fn aliased_parameter(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+            "pub fn string_parameter(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
+            "pub fn unit_parameter(value: ()) -> I32 { if value == () { 1 } else { 2 } }\n",
+            "pub fn mutable_parameter(var value: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+            "pub fn missing_else(value: I8) -> I32 { if value < 10 { 1 } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 19);
+
+        for index in 0..6 {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("primitive parameter comparisons with matching literals are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        assert!(matches!(
+            owners[6]
+                .body_type_check()
+                .expect("literal type mismatch is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        assert!(matches!(
+            owners[7]
+                .body_type_check()
+                .expect("literal range error is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::LiteralOutOfRange
+        ));
+        assert!(matches!(
+            owners[8]
+                .body_type_check()
+                .expect("condition and both branches are checked in source order"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.iter().map(|diagnostic| diagnostic.code).collect::<Vec<_>>()
+                    == [
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        sai_diagnostics::Code::TypeMismatch,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                    ]
+        ));
+        for (index, owner) in owners.iter().enumerate().skip(9) {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported parameter-literal comparison shape is gated");
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Unsupported),
                 "function owner {index} unexpectedly passed the bounded slice: {check:?}"
