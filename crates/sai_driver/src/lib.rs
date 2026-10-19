@@ -5616,11 +5616,11 @@ impl ConstOwnerResolution {
     }
 }
 
-/// Result of checking one public primitive-typed constant literal.
+/// Result of checking one public primitive-typed or canonical `Str` constant literal.
 ///
 /// This deliberately covers only `Bool`, `Char`, `Byte`, fixed-width integer
-/// primitive types, and `F32`/`F64` literals. It does not imply that other
-/// constant expressions are evaluated.
+/// primitive types, `F32`/`F64`, and direct `Str` literals. It does not imply
+/// that other constant expressions are evaluated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstLiteralCheck {
     /// The declaration or HIR shape is outside this checking slice.
@@ -5633,21 +5633,29 @@ pub enum ConstLiteralCheck {
         primitive: sai_resolve::prelude::PrimTy,
         diagnostics: Vec<Diagnostic>,
     },
+    /// A direct string literal checked against the canonical `Str` prelude
+    /// item whose early name resolution is intentionally deferred.
+    SupportedStr { diagnostics: Vec<Diagnostic> },
 }
 
 impl ConstLiteralCheck {
     pub const fn is_supported(&self) -> bool {
-        matches!(self, Self::Supported { .. })
+        matches!(self, Self::Supported { .. } | Self::SupportedStr { .. })
     }
 
     pub fn is_valid(&self) -> bool {
-        matches!(self, Self::Supported { diagnostics, .. } if diagnostics.is_empty())
+        match self {
+            Self::Supported { diagnostics, .. } | Self::SupportedStr { diagnostics } => {
+                diagnostics.is_empty()
+            }
+            Self::Unsupported => false,
+        }
     }
 
     pub fn diagnostics(&self) -> &[Diagnostic] {
         match self {
             Self::Unsupported => &[],
-            Self::Supported { diagnostics, .. } => diagnostics,
+            Self::Supported { diagnostics, .. } | Self::SupportedStr { diagnostics } => diagnostics,
         }
     }
 }
@@ -5694,15 +5702,40 @@ fn check_const_literal_owner(
     let Some(type_paths) = type_paths else {
         return Ok(ConstLiteralCheck::Unsupported);
     };
-    let Some(PathRes {
-        base: Res::PrimTy(primitive),
-        resolved_segments: 1,
-        segment_count: 1,
-    }) = type_paths.paths().get(&path.hir_id)
-    else {
-        return Ok(ConstLiteralCheck::Unsupported);
+    let primitive = match type_paths.paths().get(&path.hir_id) {
+        Some(PathRes {
+            base: Res::PrimTy(primitive),
+            resolved_segments: 1,
+            segment_count: 1,
+        }) => *primitive,
+        None if is_deferred_canonical_str_path(path, type_paths, symbols, inputs) => {
+            let Some(body) = owner.body else {
+                return Ok(ConstLiteralCheck::Unsupported);
+            };
+            let ExprKind::Lit(literal) = body.value.kind else {
+                return Ok(ConstLiteralCheck::Unsupported);
+            };
+            let diagnostics = match literal {
+                Lit::Str(_) => Vec::new(),
+                literal => vec![const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    body.value.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `Str`, found {}",
+                        const_literal_found_type(literal)
+                    ),
+                    "type mismatch",
+                )?],
+            };
+            return Ok(ConstLiteralCheck::SupportedStr { diagnostics });
+        }
+        _ => {
+            return Ok(ConstLiteralCheck::Unsupported);
+        }
     };
-    let primitive = *primitive;
     if !is_supported_const_literal_primitive(primitive) {
         return Ok(ConstLiteralCheck::Unsupported);
     }
@@ -5777,6 +5810,50 @@ fn check_const_literal_owner(
         primitive,
         diagnostics,
     })
+}
+
+fn is_deferred_canonical_str_path(
+    path: HirPath<'_>,
+    type_paths: &TypeOwnerPathResolution,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return false;
+    }
+
+    let symbol = path.segments[0].name.sym;
+    if symbols.resolve(symbol).ok().as_deref() != Some("Str")
+        || !type_paths
+            .deferred_paths()
+            .iter()
+            .any(|deferred| deferred.hir_id == path.hir_id && deferred.name == symbol)
+    {
+        return false;
+    }
+
+    let canonical_str = CANONICAL_PRELUDE_ITEMS.iter().any(|item| {
+        item.name == "Str"
+            && item.path.package == "sai:core"
+            && item.path.kind == CanonicalPreludeKind::Type
+            && matches!(
+                item.path.segments,
+                [
+                    CanonicalPreludeSegment::Module("str"),
+                    CanonicalPreludeSegment::Type("Str")
+                ]
+            )
+    });
+    if !canonical_str {
+        return false;
+    }
+
+    let range = path.span.range;
+    inputs
+        .source
+        .text()
+        .get(range.start().to_usize()..range.end().to_usize())
+        == Some("Str")
 }
 
 fn is_supported_const_name_convention(name: &str, written_name: &str) -> bool {
@@ -25183,13 +25260,127 @@ mod tests {
             assert!(diagnostics[0].has_workspace_snapshot());
             assert!(diagnostics[0].primary().is_some());
         }
-        for index in [12, 13] {
+        assert_eq!(
+            checks[12],
+            &ConstLiteralCheck::SupportedStr {
+                diagnostics: Vec::new(),
+            },
+            "a direct canonical Str literal is supported"
+        );
+        assert_eq!(
+            checks[13],
+            &ConstLiteralCheck::Unsupported,
+            "references remain outside the literal slice"
+        );
+    }
+
+    #[test]
+    fn const_str_literal_check_accepts_only_deferred_canonical_str_paths() {
+        let root = concat!(
+            "pub const EMPTY: Str = \"\"\n",
+            "pub const ESCAPED: Str = \"line\\nfeed\"\n",
+            "pub const RAW: Str = r#\"raw { text }\"#\n",
+            "pub const MULTILINE: Str = \"\"\"\n",
+            "    first\n",
+            "    second\n",
+            "    \"\"\"\n",
+            "pub const UNICODE: Str = \"こんにちは\"\n",
+            "pub const BOOL_MISMATCH: Str = true\n",
+            "pub const BYTE_STRING_MISMATCH: Str = b\"bytes\"\n",
+            "pub const INTEGER_MISMATCH: I8 = \"text\"\n",
+            "pub const FORMAT: Str = f\"text\"\n",
+            "pub const BLOCK: Str = { \"text\" }\n",
+            "pub const ALIAS: UserStr = \"text\"\n",
+            "pub const RAW_TYPE: r#Str = \"text\"\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(checks.len(), 12);
+        for index in 0..5 {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::SupportedStr {
+                    diagnostics: Vec::new(),
+                },
+                "direct string literal at owner index {index} is supported"
+            );
+        }
+        for index in [5, 6] {
+            let ConstLiteralCheck::SupportedStr { diagnostics } = checks[index] else {
+                panic!("Str mismatch at owner index {index} should be diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::TypeMismatch,
+                "owner index {index}"
+            );
+            assert!(diagnostics[0].has_workspace_snapshot());
+            assert!(diagnostics[0].primary().is_some());
+        }
+        let ConstLiteralCheck::Supported {
+            primitive,
+            diagnostics,
+        } = checks[7]
+        else {
+            panic!("integer-typed string literal should have a type mismatch");
+        };
+        assert_eq!(*primitive, sai_resolve::prelude::PrimTy::I8);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        for index in [8, 9, 10, 11] {
             assert_eq!(
                 checks[index],
                 &ConstLiteralCheck::Unsupported,
-                "strings and references remain outside the literal slice"
+                "unsupported string form or noncanonical type at owner index {index}"
             );
         }
+
+        let shadowed = concat!(
+            "pub type Str = U8\n",
+            "pub const SHADOWED: Str = \"text\"\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(shadowed.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("shadowing const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("shadowing const owners resolve");
+        assert_eq!(
+            resolved.owners()[0]
+                .literal_check()
+                .expect("literal checks use the current owner snapshot"),
+            &ConstLiteralCheck::Unsupported,
+            "a source type binding named Str must not use the canonical prelude fallback"
+        );
     }
 
     #[test]

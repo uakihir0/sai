@@ -99,7 +99,7 @@ fn assert_success_result(output: Output, target: &str, profile: &str) {
     assert_eq!(
         output.status.code(),
         Some(0),
-        "empty root module should be supported:\n{stdout}"
+        "supported check input should succeed:\n{stdout}"
     );
     assert!(output.stderr.is_empty());
     let records = stdout.lines().collect::<Vec<_>>();
@@ -329,6 +329,59 @@ fn public_float_const_literals_emit_check_results() {
 }
 
 #[test]
+fn public_str_const_literals_emit_check_results() {
+    let source = concat!(
+        "pub const EMPTY: Str = \"\"\n",
+        "pub const ESCAPED: Str = \"line\\nfeed\"\n",
+        "pub const RAW: Str = r#\"raw { text }\"#\n",
+        "pub const MULTILINE: Str = \"\"\"\n",
+        "    first\n",
+        "    second\n",
+        "    \"\"\"\n",
+        "pub const UNICODE: Str = \"こんにちは\"\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn public_str_const_type_errors_suppress_the_check_result() {
+    for source in [
+        "pub const BAD_BOOL: Str = true\n",
+        "pub const BAD_BYTES: Str = b\"bytes\"\n",
+        "pub const FIRST: Str = \"ok\"\npub const SECOND: Str = true\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: Str type mismatch should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a supported Str type mismatch without a result or feature gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn str_const_forms_outside_the_literal_slice_remain_gated() {
+    for source in [
+        "pub const FORMATTED: Str = f\"text\"\n",
+        "pub const BLOCK: Str = { \"text\" }\n",
+        "pub const ALIAS: Text = \"text\"\n",
+        "pub type Text = Str\npub const ALIAS: Text = \"text\"\n",
+        "pub const RAW_TYPE: r#Str = \"text\"\n",
+        "pub const BYTE_SLICE: Slice<Byte> = b\"bytes\"\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_check_stays_gated(&output, source);
+    }
+}
+
+#[test]
 fn public_float_const_errors_and_invalid_later_const_suppress_results() {
     for (source, expected_code) in [
         (
@@ -487,7 +540,6 @@ fn const_forms_outside_literal_slice_remain_gated() {
         "const PRIVATE: I8 = 1\n",
         "pub const EXPRESSION: I8 = 1 + 2\n",
         "pub const ALIAS: MyInt = 1\n",
-        "pub const TEXT: Str = \"text\"\n",
         "pub const BORROWED: &Bool = &true\n",
         "use missing;\npub const VALUE: I8 = 1\n",
         "unsafe module\npub const VALUE: I8 = 1\n",
