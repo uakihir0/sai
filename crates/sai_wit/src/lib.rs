@@ -425,6 +425,13 @@ impl ParsedWitPackageGroup {
         self.source_names.iter().map(String::as_str)
     }
 
+    pub(crate) fn source_text(&self, path: &str) -> Option<&str> {
+        self.source_texts
+            .iter()
+            .find(|source| source.path == path)
+            .map(|source| source.text.as_str())
+    }
+
     /// Returns foreign package references in source-file and lexical order.
     pub fn foreign_references(&self) -> &[WitForeignReference] {
         &self.foreign_references

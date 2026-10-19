@@ -90,6 +90,7 @@ struct SourceWorldInclude {
     target_package: String,
     target_world: String,
     names: Vec<(String, String)>,
+    docs: Option<std::sync::Arc<str>>,
     since: Option<WitStabilityVersion>,
     deprecated: Option<WitStabilityVersion>,
     source_start: u32,
@@ -356,6 +357,7 @@ fn capture_source_world_includes(
 ) -> Result<Vec<SourceWorldInclude>, WitModelError> {
     let local_package = parsed.unit().canonical_name().to_owned();
     let mut result = Vec::new();
+    let mut doc_scanners = HashMap::new();
     for (_, world) in parsed.group.main.worlds.iter() {
         for include in &world.includes {
             if matches!(include.stability, Stability::Unstable { .. }) {
@@ -382,6 +384,17 @@ fn capture_source_world_includes(
                     (local_package.clone(), target.name.clone())
                 };
             let (since, deprecated) = stability(&include.stability)?;
+            let location = parsed.location_for_parser_span(include.span);
+            let docs = location
+                .as_ref()
+                .and_then(|location| {
+                    let source = parsed.source_text(&location.path)?;
+                    let scanner = doc_scanners
+                        .entry(location.path.clone())
+                        .or_insert_with(|| crate::source_scan::WorldIncludeDocScanner::new(source));
+                    scanner.docs(location.range.start)
+                })
+                .map(std::sync::Arc::from);
             result.push(SourceWorldInclude {
                 source_world: world.name.clone(),
                 target_package,
@@ -391,15 +404,14 @@ fn capture_source_world_includes(
                     .iter()
                     .map(|name| (name.name.clone(), name.as_.clone()))
                     .collect(),
+                docs,
                 since,
                 deprecated,
                 source_start: include.span.start(),
-                span: parsed
-                    .location_for_parser_span(include.span)
-                    .map(|location| WitSpan {
-                        path: location.path,
-                        range: location.range,
-                    }),
+                span: location.map(|location| WitSpan {
+                    path: location.path,
+                    range: location.range,
+                }),
             });
         }
     }
@@ -688,6 +700,7 @@ fn model_package(
             )?;
             includes.push(WitWorldRef {
                 names: include.names.clone(),
+                docs: include.docs.clone(),
                 since: include.since.clone(),
                 deprecated: include.deprecated.clone(),
                 span: include.span.clone(),
@@ -1689,6 +1702,7 @@ fn world_reference(
         world: world_index(raw_world_index)?,
         name: parser_world.name.clone(),
         names: Vec::new(),
+        docs: None,
         since: None,
         deprecated: None,
         span: None,
@@ -2423,6 +2437,66 @@ world app {
                 result: None,
                 is_async: false
             })
+        );
+    }
+
+    #[test]
+    fn preserves_authored_world_include_docs_in_printing_round_trip_and_hash() {
+        let unit = dir_unit();
+        let source = "\
+package acme:graphics@1.2.3;
+world base {}
+world app {
+  /// Included worker contract.
+  @since(version = 0.3.0)
+  include base;
+}
+";
+        let parsed = parse_source_files(
+            unit.clone(),
+            [WitSourceFile::new("include-docs.wit", source)],
+        )
+        .expect("valid WIT parses");
+        let mut context = WitResolveContext::default();
+        let mut resolve = Resolve::default();
+        let package = context
+            .push_package(&mut resolve, parsed)
+            .expect("authored package resolves");
+        let app_index = package
+            .worlds
+            .iter_enumerated()
+            .find_map(|(index, world)| (world.name == "app").then_some(index))
+            .expect("app world is retained");
+        let include = &package.worlds[app_index].includes[0];
+        assert_eq!(include.docs.as_deref(), Some("Included worker contract."));
+
+        let printed = print_wit(&package);
+        assert!(printed.contains(
+            "  /// Included worker contract.\n  @since(version = 0.3.0)\n  include base;\n"
+        ));
+        let reparsed = parse_source_files(unit, [WitSourceFile::new("round-trip.wit", printed)])
+            .expect("printed WIT parses");
+        let mut round_trip_context = WitResolveContext::default();
+        let mut round_trip_resolve = Resolve::default();
+        let round_trip = round_trip_context
+            .push_package(&mut round_trip_resolve, reparsed)
+            .expect("printed package resolves");
+        let round_trip_app = round_trip
+            .worlds
+            .iter()
+            .find(|world| world.name == "app")
+            .expect("app world survives round trip");
+        assert_eq!(
+            round_trip_app.includes[0].docs.as_deref(),
+            Some("Included worker contract.")
+        );
+
+        let mut without_docs = package.clone();
+        without_docs.worlds[app_index].includes[0].docs = None;
+        assert_ne!(
+            sai_stable_hash::fingerprint(&package),
+            sai_stable_hash::fingerprint(&without_docs),
+            "include documentation participates in the stable model hash"
         );
     }
 

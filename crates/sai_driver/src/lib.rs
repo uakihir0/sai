@@ -48469,6 +48469,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     fn generated_wit_emits_external_world_includes_from_the_selected_wit_view() {
         let source = b"world facade {\n\
             import fn before()\n\
+            /// External base contract.\n\
             include acme:dependency/base\n\
             include acme:dependency/api\n\
             include acme:dependency/missing\n\
@@ -48554,7 +48555,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         assert!(
             generated
                 .text
-                .contains("include acme:dependency/base@1.4.12;")
+                .contains("/// External base contract.\n  include acme:dependency/base@1.4.12;")
         );
         assert!(!generated.text.contains("include acme:dependency/api"));
         assert!(!generated.text.contains("include acme:dependency/missing"));
@@ -48593,6 +48594,10 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         );
         assert_eq!(world.includes[0].name, "base");
         assert_eq!(world.includes[0].world.raw(), 0);
+        assert_eq!(
+            world.includes[0].docs.as_deref(),
+            Some("External base contract.")
+        );
         assert_eq!(
             world.source_order,
             [
@@ -49042,7 +49047,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
-    fn generated_wit_omits_world_includes_with_unrepresentable_documentation() {
+    fn generated_wit_retains_world_include_documentation() {
         let source = concat!(
             "world facade {\n",
             "  /// Included worker contract.\n",
@@ -49053,20 +49058,37 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         let (unit, result) = generated_wit_for_source(source.as_bytes());
         let generated = generated_text_for_unit(&result, &unit);
         assert!(
-            !generated.complete,
-            "an omitted include with docs keeps the generated package incomplete"
+            generated.complete,
+            "a representable include with docs keeps the generated package complete"
         );
-        assert!(!generated.text.contains("include worker;"));
-        assert!(!generated.text.contains("Included worker contract."));
+        assert_eq!(
+            generated.text.as_ref(),
+            concat!(
+                "package acme:phase1@1.0.0;\n\n",
+                "world facade {\n",
+                "  /// Included worker contract.\n",
+                "  include worker;\n",
+                "}\n\n",
+                "world worker {}\n"
+            )
+        );
 
-        let package = result.package.expect("partial generated WIT model loads");
+        let package = result.package.expect("generated WIT model loads");
         let facade = package
             .root()
             .worlds
             .iter()
             .find(|world| world.name == "facade")
             .expect("facade world remains");
-        assert!(facade.includes.is_empty());
+        assert_eq!(facade.includes.len(), 1);
+        assert_eq!(
+            facade.includes[0].docs.as_deref(),
+            Some("Included worker contract.")
+        );
+        assert_eq!(
+            facade.source_order,
+            [sai_wit::WitWorldItemOrder::include(0)]
+        );
     }
 
     #[test]

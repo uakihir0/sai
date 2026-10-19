@@ -1139,6 +1139,7 @@ fn generated_world_include_item(
     let Some(mut reference) = generated_worlds.get(definition).cloned() else {
         return Ok(None);
     };
+    reference.docs = entry.docs.clone().map(Arc::from);
     reference.since = since;
     reference.deprecated = deprecated;
     Ok(Some((reference, *definition, candidate.span)))
@@ -1219,6 +1220,7 @@ fn generated_external_world_include_item(
             world: target.wit,
             name: target_world.name.clone(),
             names: Vec::new(),
+            docs: entry.docs.clone().map(Arc::from),
             since,
             deprecated,
             span: None,
@@ -3095,6 +3097,7 @@ fn collect_interface_uses_input(
                                 world: *index,
                                 name: name.to_string(),
                                 names: Vec::new(),
+                                docs: None,
                                 since: None,
                                 deprecated: None,
                                 span: None,
@@ -3319,11 +3322,6 @@ fn collect_interface_uses_input(
                             location,
                         });
                         if !include_targets.insert(target) {
-                            generated_complete = false;
-                            continue;
-                        }
-                        if entry.docs.is_some() {
-                            // WitWorldRef cannot retain include documentation yet.
                             generated_complete = false;
                             continue;
                         }
@@ -6428,6 +6426,7 @@ mod tests {
             world,
             name: name.to_owned(),
             names: Vec::new(),
+            docs: None,
             since: None,
             deprecated: None,
             span: None,

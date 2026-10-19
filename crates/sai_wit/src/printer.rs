@@ -228,6 +228,7 @@ fn print_world(package: &WitPackage, world: &WitWorld) -> String {
             WorldEntry::Import(item) => print_world_item(&mut output, package, "import", item),
             WorldEntry::Export(item) => print_world_item(&mut output, package, "export", item),
             WorldEntry::Include(reference) => {
+                push_docs(&mut output, reference.docs.as_deref(), 1);
                 push_stability(
                     &mut output,
                     reference.since.as_ref(),
@@ -773,6 +774,7 @@ mod tests {
                 world: crate::WitWorldIdx::from_raw(0),
                 name: "base".to_owned(),
                 names: Vec::new(),
+                docs: None,
                 since: None,
                 deprecated: None,
                 span: None,
@@ -1070,6 +1072,7 @@ mod tests {
                     world: crate::WitWorldIdx::from_raw(0),
                     name: "base".to_owned(),
                     names: Vec::new(),
+                    docs: None,
                     since: None,
                     deprecated: None,
                     span: None,

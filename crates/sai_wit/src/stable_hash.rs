@@ -267,6 +267,7 @@ impl StableHash for WitWorldRef {
             name.stable_hash(hasher);
             alias.stable_hash(hasher);
         }
+        self.docs.stable_hash(hasher);
         stable_version(&self.since, hasher);
         stable_version(&self.deprecated, hasher);
         self.span.stable_hash(hasher);

@@ -496,7 +496,7 @@ pub struct WitWorld {
     pub exports: Vec<WitWorldItem>,
     /// Included worlds in source or generation order.
     pub includes: Vec<WitWorldRef>,
-    /// The source or generation order interleaving `imports` and `exports`.
+    /// The source or generation order interleaving imports, exports, and includes.
     ///
     /// Each entry points into the corresponding vector. An empty vector is
     /// accepted for hand-built models and prints imports followed by exports.
@@ -580,6 +580,8 @@ pub struct WitWorldRef {
     pub name: String,
     /// Names renamed by a WIT `include ... with { ... }` declaration.
     pub names: Vec<(String, String)>,
+    /// Documentation attached to the WIT `include` declaration.
+    pub docs: Option<Arc<str>>,
     pub since: Option<WitStabilityVersion>,
     pub deprecated: Option<WitStabilityVersion>,
     /// Source range of the include declaration when it came from an authored
