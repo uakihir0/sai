@@ -2806,6 +2806,12 @@ fn collect_interface_uses_input(
                 .iter()
                 .map(|(definition, reference)| (*definition, reference.clone())),
         );
+        // Keep prior-interface references local to the variant-payload consumer map.
+        generated_variant_type_references.extend(
+            generated_local_type_references
+                .iter()
+                .map(|(definition, reference)| (*definition, reference.clone())),
+        );
         // Keep prior-interface references local to the record-field consumer map.
         generated_record_type_references.extend(
             generated_local_type_references

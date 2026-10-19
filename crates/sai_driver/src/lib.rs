@@ -51080,6 +51080,215 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
+    fn generated_wit_variants_reference_prior_local_interfaces_only() {
+        let source = concat!(
+            "interface early {\n",
+            "  enum FuturePayload { Value(types.Id) }\n",
+            "  enum Keep { Ready }\n",
+            "}\n",
+            "interface types {\n",
+            "  type Hidden = USize\n",
+            "  type Id = U32\n",
+            "  resource Handle {}\n",
+            "}\n",
+            "interface variants {\n",
+            "  enum Wrapped { Value(types.Id) }\n",
+            "  enum HandleBox { Value(types.Handle) }\n",
+            "  enum Missing { Value(types.Hidden) }\n",
+            "  fn use_wrapped(value: Wrapped)\n",
+            "  fn use_handle_box(value: HandleBox)\n",
+            "  fn use_missing(value: Missing)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("cross-interface variant payloads remain queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning unsupported variant targets leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "later-interface and omitted-type variant targets remain incomplete"
+        );
+        assert!(generated.text.contains("enum keep {"), "{}", generated.text);
+        assert!(generated.text.contains("type id = u32;"));
+        assert!(generated.text.contains("use types.{handle, id};"));
+        assert!(
+            generated.text.contains("variant wrapped {"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated.text.contains("variant handle-box {"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("use-wrapped: func(value: wrapped);")
+        );
+        assert!(
+            generated
+                .text
+                .contains("use-handle-box: func(value: handle-box);")
+        );
+        assert!(generated.text.contains("resource handle;"));
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("future-payload"));
+        assert!(!generated.text.contains("type hidden ="));
+        assert!(!generated.text.contains("variant missing"));
+        assert!(!generated.text.contains("use-missing:"));
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let root = package_model.root();
+        let (types_index, types) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "types")
+            .expect("the earlier interface with supported targets remains");
+        let (id_index, _) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the supported earlier alias remains");
+        let (handle_index, handle) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the earlier resource remains");
+        assert!(matches!(handle.kind, sai_wit::WitItemKind::Resource(_)));
+        assert_eq!(
+            types
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "handle"],
+            "the unsupported earlier item is removed while the resource remains"
+        );
+
+        let early = root
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "early")
+            .expect("the earlier interface with an independent enum remains");
+        assert_eq!(
+            early
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["keep"],
+            "a variant cannot reference a later interface"
+        );
+
+        let (variants_index, variants) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "variants")
+            .expect("the consuming interface remains");
+        for (variant_name, function_name, target_index, target_name, is_resource) in [
+            ("wrapped", "use-wrapped", id_index, "id", false),
+            ("handle-box", "use-handle-box", handle_index, "handle", true),
+        ] {
+            let variant_index = variants
+                .items
+                .iter_enumerated()
+                .find_map(|(index, item)| (item.name == variant_name).then_some(index))
+                .expect("the supported payload variant has a compact parsed item index");
+            let variant = variants
+                .items
+                .iter()
+                .find(|item| item.name == variant_name)
+                .expect("the variant with a supported payload remains");
+            let sai_wit::WitItemKind::Variant(cases) = &variant.kind else {
+                panic!("{variant_name} remains a payload variant");
+            };
+            let payload = cases[0]
+                .payload
+                .as_ref()
+                .expect("the payload type is retained");
+            let payload_reference = match (is_resource, payload) {
+                (false, sai_wit::WitType::Named(reference))
+                | (true, sai_wit::WitType::Own(reference)) => reference,
+                _ => panic!("{variant_name} retains the expected named or owned payload"),
+            };
+            let (import_index, import) = variants
+                .items
+                .iter_enumerated()
+                .find(|(_, item)| item.name == target_name)
+                .expect("the parsed local use alias for the target remains");
+            assert_eq!(payload_reference.interface.unit, unit);
+            assert_eq!(payload_reference.interface.interface, variants_index);
+            assert_eq!(payload_reference.interface.name, "variants");
+            assert_eq!(payload_reference.item, import_index);
+            assert_eq!(payload_reference.item_name, target_name);
+            match (is_resource, &import.kind) {
+                (false, sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(reference)))
+                | (true, sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(reference))) => {
+                    assert_eq!(reference.interface.unit, unit);
+                    assert_eq!(reference.interface.interface, types_index);
+                    assert_eq!(reference.interface.name, "types");
+                    assert_eq!(reference.item, target_index);
+                    assert_eq!(reference.item_name, target_name);
+                }
+                _ => panic!("{target_name} use alias retains its exact target kind"),
+            }
+
+            let function = variants
+                .items
+                .iter()
+                .find(|item| item.name == function_name)
+                .expect("the variant consumer function remains");
+            let sai_wit::WitItemKind::Func(function) = &function.kind else {
+                panic!("{function_name} remains a function");
+            };
+            let sai_wit::WitType::Named(function_reference) = &function.params[0].1 else {
+                panic!("the function retains a reference to its local variant");
+            };
+            assert_eq!(function_reference.interface.unit, unit);
+            assert_eq!(function_reference.interface.interface, variants_index);
+            assert_eq!(function_reference.item_name, variant_name);
+            assert_eq!(function_reference.item, variant_index);
+            assert_eq!(cases[0].name, "value");
+        }
+    }
+
+    #[test]
     fn generated_wit_aliases_reference_prior_local_interfaces_only() {
         let source = concat!(
             "interface early {\n",
@@ -52993,6 +53202,7 @@ interface facade { use middle.{payload}; }"#;
     fn generated_wit_prunes_items_that_depend_on_cyclic_interfaces() {
         let source = concat!(
             "interface first {\n",
+            "  type Safe = U32\n",
             "  type Request = second.Response\n",
             "}\n",
             "interface second {\n",
@@ -53003,6 +53213,8 @@ interface facade { use middle.{payload}; }"#;
             "  fn read(value: Handle)\n",
             "  type RecordHandle { value: first.Request }\n",
             "  fn read_record(value: RecordHandle)\n",
+            "  enum VariantHandle { Wrapped(first.Safe) }\n",
+            "  fn read_variant(value: VariantHandle)\n",
             "  fn independent(value: U32)\n",
             "}\n",
             "world server {\n",
@@ -53055,6 +53267,8 @@ interface facade { use middle.{payload}; }"#;
         assert!(!generated.text.contains("read:"));
         assert!(!generated.text.contains("record record-handle"));
         assert!(!generated.text.contains("read-record:"));
+        assert!(!generated.text.contains("variant variant-handle"));
+        assert!(!generated.text.contains("read-variant:"));
         assert!(generated.text.contains("interface public"));
         assert!(generated.text.contains("independent: func(value: u32)"));
         assert!(!generated.text.contains("import first;"));
