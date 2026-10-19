@@ -3121,6 +3121,14 @@ fn collect_interface_uses_input(
                 .iter()
                 .map(|(definition, reference)| (*definition, reference.clone())),
         );
+        // Keep this extension record-only: variant and resource-member maps retain
+        // their earlier scope, while ordinary functions have their own Used map.
+        generated_record_type_references.extend(
+            foreign_interface_used_type_references
+                .by_definition
+                .iter()
+                .map(|(definition, reference)| (*definition, reference.clone())),
+        );
         for (member_index, (entry, member_owner)) in member_entries
             .into_iter()
             .zip(parent_members.iter().copied())

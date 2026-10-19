@@ -46594,7 +46594,6 @@ interface chain { use middle.{intermediate as chained}; }"#;
             "use acme:codec/chain as chain\n",
             "interface client {\n",
             "  type PayloadAlias = chain.Chained\n",
-            "  type PayloadRecord { payload: api.Request }\n",
             "  enum PayloadVariant { Wrapped(api.Request) }\n",
             "  fn consume_alias(value: PayloadAlias)\n",
             "  fn independent(value: U32)\n",
@@ -46696,7 +46695,7 @@ interface chain { use middle.{intermediate as chained}; }"#;
         let generated = generated_text_for_unit(&result, &generated_unit);
         assert!(
             !generated.complete,
-            "Used facades remain unsupported in record fields and variant payloads"
+            "Used facades remain unsupported in variant payloads"
         );
         assert!(
             generated
@@ -46715,7 +46714,6 @@ interface chain { use middle.{intermediate as chained}; }"#;
                 .text
                 .contains("use acme:codec/api@1.2.3.{request};")
         );
-        assert!(!generated.text.contains("record payload-record"));
         assert!(!generated.text.contains("variant payload-variant"));
 
         let package = result
@@ -46788,8 +46786,10 @@ interface chain { use middle.{intermediate as chained}; }"#;
             "use acme:codec/api as api\n",
             "interface client {\n",
             "  type RequestAlias = api.Request\n",
+            "  type RequestRecord { payload: api.Request }\n",
             "  fn consume(value: api.Request)\n",
             "  fn consume_alias(value: RequestAlias)\n",
+            "  fn consume_record(value: RequestRecord)\n",
             "  fn independent(value: U32)\n",
             "}\n",
         );
@@ -46856,13 +46856,214 @@ interface api { use types.{payload as request}; }"#;
                 .contains("use acme:codec/api@1.2.3.{request};")
         );
         assert!(generated.text.contains("type request-alias = request;"));
+        assert!(generated.text.contains("record request-record {"));
         assert!(generated.text.contains("consume: func(value: request);"));
         assert!(
             generated
                 .text
                 .contains("consume-alias: func(value: request-alias);")
         );
+        assert!(
+            generated
+                .text
+                .contains("consume-record: func(value: request-record);")
+        );
         assert!(generated.text.contains("independent: func(value: u32);"));
+    }
+
+    #[test]
+    fn generated_interface_record_fields_preserve_used_facades_without_leaking_to_siblings() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  type PayloadRecord { payload: api.Request }\n",
+            "  type ResourceRecord { handle: api.ResourceHandle }\n",
+            "  enum PayloadVariant { Wrapped(api.Request) }\n",
+            "  resource Container {\n",
+            "    fn take(self: borrow Self, payload: api.Request)\n",
+            "  }\n",
+            "  fn consume_record(value: PayloadRecord)\n",
+            "  fn consume_resource_record(value: ResourceRecord)\n",
+            "  fn consume_variant(value: PayloadVariant)\n",
+            "  fn consume_container(value: own Container)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types { record payload { value: u32 } resource handle; }
+interface api { use types.{payload as request, handle as resource-handle}; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let (expected_request, payload_target, resource_target) = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            let api = codec_view.view.interfaces.get("api").unwrap();
+            let member = api.members.get("Request").unwrap();
+            let item = &codec_view.view.model.interfaces[api.wit].items[member.item];
+            let expected_request = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: api.wit,
+                    name: "api".to_owned(),
+                },
+                item: member.item,
+                item_name: item.name.clone(),
+            };
+            let types = codec_view.view.interfaces.get("types").unwrap();
+            let payload = types.members.get("Payload").unwrap();
+            let item = &codec_view.view.model.interfaces[types.wit].items[payload.item];
+            let payload_target = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: types.wit,
+                    name: "types".to_owned(),
+                },
+                item: payload.item,
+                item_name: item.name.clone(),
+            };
+            let resource = types.members.get("Handle").unwrap();
+            let item = &codec_view.view.model.interfaces[types.wit].items[resource.item];
+            let resource_target = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: types.wit,
+                    name: "types".to_owned(),
+                },
+                item: resource.item,
+                item_name: item.name.clone(),
+            };
+            (expected_request, payload_target, resource_target)
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "Request",
+            payload_target,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "ResourceHandle",
+            resource_target,
+        );
+
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact selected authored WIT view");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "omitted sibling consumers leave parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            !generated.complete,
+            "record-field support remains isolated from unsupported variant and resource consumers"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{request};")
+        );
+        assert!(generated.text.contains("record payload-record {"));
+        assert!(
+            !generated.text.contains("record resource-record"),
+            "a Used facade that resolves to a resource remains unsupported in record fields"
+        );
+        assert!(!generated.text.contains("resource-handle"));
+        assert!(
+            generated
+                .text
+                .contains("consume-record: func(value: payload-record);")
+        );
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("variant payload-variant"));
+        assert!(!generated.text.contains("resource container"));
+        assert!(!generated.text.contains("consume-resource-record:"));
+        assert!(!generated.text.contains("consume-variant:"));
+        assert!(!generated.text.contains("consume-container:"));
+
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated WIT remains parseable");
+        let (client_index, client) = package
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "client")
+            .expect("the client interface remains generated");
+        let (_, record) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "payload-record")
+            .expect("the record field using the Used facade remains");
+        let sai_wit::WitItemKind::Record(fields) = &record.kind else {
+            panic!("the generated facade consumer remains a record");
+        };
+        let local_import_reference = match &fields[0].ty {
+            sai_wit::WitType::Named(reference) => reference,
+            other => panic!("the record field retains its named facade: {other:?}"),
+        };
+        assert_eq!(local_import_reference.interface.unit, generated_unit);
+        assert_eq!(local_import_reference.interface.interface, client_index);
+        assert_eq!(local_import_reference.interface.name, "client");
+        assert_eq!(local_import_reference.item_name, "request");
+        let local_import = &client.items[local_import_reference.item];
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(foreign_reference)) =
+            &local_import.kind
+        else {
+            panic!("the generated record field imports a named Used facade");
+        };
+        assert_eq!(foreign_reference, &expected_request);
+
+        let consumer = client
+            .items
+            .iter()
+            .find(|item| item.name == "consume-record")
+            .expect("the record consumer remains");
+        let sai_wit::WitItemKind::Func(consumer) = &consumer.kind else {
+            panic!("the record consumer remains a WIT function");
+        };
+        assert!(
+            matches!(
+                &consumer.params[0].1,
+                sai_wit::WitType::Named(reference)
+                    if reference.interface.unit == generated_unit
+                        && reference.interface.interface == client_index
+                        && reference.item_name == "payload-record"
+            ),
+            "the function retains its exact generated record"
+        );
     }
 
     #[test]
