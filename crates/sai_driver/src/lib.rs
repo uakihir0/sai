@@ -6050,20 +6050,37 @@ fn check_function_body_type(
         ) {
             return Ok(FunctionBodyTypeCheck::Unsupported);
         }
+        let first_parameter_type =
+            resolve_function_direct_type(*first.ty, type_paths, symbols, inputs);
+        let second_parameter_type =
+            resolve_function_direct_type(*second.ty, type_paths, symbols, inputs);
+        let parameter_types_are_supported = match cond.kind {
+            ExprKind::Binary(BinOp::And | BinOp::Or, _, _) => {
+                let bool_type = Some(FunctionDirectType::Primitive(
+                    sai_resolve::prelude::PrimTy::Bool,
+                ));
+                first_parameter_type == bool_type && second_parameter_type == bool_type
+            }
+            ExprKind::Binary(
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+                _,
+                _,
+            ) => matches!(
+                (first_parameter_type, second_parameter_type),
+                (
+                    Some(FunctionDirectType::Primitive(first)),
+                    Some(FunctionDirectType::Primitive(second))
+                ) if first == second
+            ),
+            _ => false,
+        };
         let condition_is_supported = function_if_binary_condition_uses_parameter_bindings(
             cond,
             first_body,
             second_body,
             locals,
             inputs,
-        ) && [first.ty, second.ty].into_iter().all(|ty| {
-            matches!(
-                resolve_function_direct_type(*ty, type_paths, symbols, inputs),
-                Some(FunctionDirectType::Primitive(
-                    sai_resolve::prelude::PrimTy::Bool
-                ))
-            )
-        });
+        ) && parameter_types_are_supported;
         let Some(diagnostics) = check_function_if_literal_branches(
             owner,
             *return_ty,
@@ -24733,10 +24750,11 @@ mod tests {
     }
 
     #[test]
-    fn function_body_type_check_accepts_all_bool_comparisons_of_two_bool_parameters() {
+    fn function_body_type_check_accepts_same_primitive_comparisons_of_two_parameters() {
         let root = concat!(
             "const OTHER: Bool = true\n",
             "type BoolAlias = Bool\n",
+            "type IntegerAlias = I32\n",
             "pub fn equal(left: Bool, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
             "pub fn reversed_equal(right: Bool, left: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
             "pub fn not_equal(left: Bool, right: Bool) -> I32 { if left != right { 1 } else { 2 } }\n",
@@ -24749,7 +24767,21 @@ mod tests {
             "pub fn reversed_greater(left: Bool, right: Bool) -> I32 { if right > left { 1 } else { 2 } }\n",
             "pub fn greater_equal(left: Bool, right: Bool) -> I32 { if left >= right { 1 } else { 2 } }\n",
             "pub fn reversed_greater_equal(left: Bool, right: Bool) -> I32 { if right >= left { 1 } else { 2 } }\n",
-            "pub fn other_primitive_type(left: I32, right: I32) -> I32 { if left < right { 1 } else { 2 } }\n",
+            "pub fn signed_integer(left: I32, right: I32) -> I32 { if left < right { 1 } else { 2 } }\n",
+            "pub fn unsigned_integer(left: U32, right: U32) -> I32 { if left <= right { 1 } else { 2 } }\n",
+            "pub fn float32(left: F32, right: F32) -> I32 { if left > right { 1 } else { 2 } }\n",
+            "pub fn float64(left: F64, right: F64) -> I32 { if left >= right { 1 } else { 2 } }\n",
+            "pub fn character(left: Char, right: Char) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn byte(left: Byte, right: Byte) -> I32 { if left != right { 1 } else { 2 } }\n",
+            "pub fn signed_pointer(left: ISize, right: ISize) -> I32 { if left < right { 1 } else { 2 } }\n",
+            "pub fn unsigned_pointer(left: USize, right: USize) -> I32 { if left >= right { 1 } else { 2 } }\n",
+            "pub fn builtin_int_alias(left: Int, right: Int) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn builtin_uint_alias(left: UInt, right: UInt) -> I32 { if left != right { 1 } else { 2 } }\n",
+            "pub fn other_primitive_type(left: I32, right: U32) -> I32 { if left < right { 1 } else { 2 } }\n",
+            "pub fn aliased_primitive_type(left: IntegerAlias, right: IntegerAlias) -> I32 { if left < right { 1 } else { 2 } }\n",
+            "pub fn string_type(left: Str, right: Str) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn integer_and(left: I32, right: I32) -> I32 { if left and right { 1 } else { 2 } }\n",
+            "pub fn integer_or(left: I32, right: I32) -> I32 { if left or right { 1 } else { 2 } }\n",
             "pub fn repeated_operand(left: Bool, right: Bool) -> I32 { if left == left { 1 } else { 2 } }\n",
             "pub fn other_binding(left: Bool, right: Bool) -> I32 { if left == OTHER { 1 } else { 2 } }\n",
             "pub fn non_path_operand(left: Bool, right: Bool) -> I32 { if left == true { 1 } else { 2 } }\n",
@@ -24774,17 +24806,17 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 22);
+        assert_eq!(owners.len(), 36);
 
-        for index in 0..12 {
+        for index in 0..22 {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
-                    .expect("all bool comparisons and operand orders are checked"),
+                    .expect("all same-primitive comparisons and operand orders are checked"),
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for (index, owner) in owners.iter().enumerate().skip(12) {
+        for (index, owner) in owners.iter().enumerate().skip(22) {
             let check = owner
                 .body_type_check()
                 .expect("unsupported comparison or operand form is gated");
