@@ -41,7 +41,7 @@ use sai_hir::arena::HirArena;
 use sai_hir::attrs::ValidatedAttrs;
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::expressions::{
-    Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind,
+    Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind, UnOp,
 };
 use sai_hir::item_tree::{
     ItemTree, ItemTreeEntry, ItemTreeKind, TargetFilterError, TargetFilterResult,
@@ -5929,27 +5929,14 @@ fn check_function_body_type(
             ) {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
             }
-            let condition_is_supported = matches!(
-                cond.kind,
-                ExprKind::Path(path)
-                    if path.root == PathRoot::Plain
-                        && path.segments.len() == 1
-                        && path.segments[0].args.is_none()
-                        && is_plain_ascii_identifier(path.segments[0].name, inputs)
-                        && matches!(
-                            locals.paths.get(&path.hir_id),
-                            Some(PathRes {
-                                base: Res::Local(resolved_binding),
-                                resolved_segments: 1,
-                                segment_count: 1,
-                            }) if *resolved_binding == body_parameter.binding
-                        )
-            ) && matches!(
-                resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs),
-                Some(FunctionDirectType::Primitive(
-                    sai_resolve::prelude::PrimTy::Bool
-                ))
-            );
+            let condition_is_supported =
+                function_if_condition_uses_parameter_binding(cond, body_parameter, locals, inputs)
+                    && matches!(
+                        resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs),
+                        Some(FunctionDirectType::Primitive(
+                            sai_resolve::prelude::PrimTy::Bool
+                        ))
+                    );
             let Some(diagnostics) = check_function_if_literal_branches(
                 owner,
                 *return_ty,
@@ -6086,6 +6073,37 @@ fn check_function_body_type(
         }
     };
     Ok(FunctionBodyTypeCheck::Supported { diagnostics })
+}
+
+fn function_if_condition_uses_parameter_binding(
+    condition: &HirExpr<'_>,
+    body_parameter: &sai_hir::body::BodyParam,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let path = match condition.kind {
+        ExprKind::Path(path) => Some(path),
+        ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
+            ExprKind::Path(path) => Some(path),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(path) = path else {
+        return false;
+    };
+    path.root == PathRoot::Plain
+        && path.segments.len() == 1
+        && path.segments[0].args.is_none()
+        && is_plain_ascii_identifier(path.segments[0].name, inputs)
+        && matches!(
+            locals.paths.get(&path.hir_id),
+            Some(PathRes {
+                base: Res::Local(resolved_binding),
+                resolved_segments: 1,
+                segment_count: 1,
+            }) if *resolved_binding == body_parameter.binding
+        )
 }
 
 fn check_function_if_literal_branches(
@@ -24438,6 +24456,52 @@ mod tests {
             let check = owner
                 .body_type_check()
                 .expect("unsupported parameter condition is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_not_of_the_bool_parameter_condition() {
+        let root = concat!(
+            "const OTHER: Bool = true\n",
+            "type BoolAlias = Bool\n",
+            "pub fn negated(flag: Bool) -> I32 { if not flag { 1 } else { 2 } }\n",
+            "pub fn nested_not(flag: Bool) -> I32 { if not not flag { 1 } else { 2 } }\n",
+            "pub fn other_binding(flag: Bool) -> I32 { if not OTHER { 1 } else { 2 } }\n",
+            "pub fn wrong_parameter_type(flag: I32) -> I32 { if not flag { 1 } else { 2 } }\n",
+            "pub fn aliased_parameter_type(flag: BoolAlias) -> I32 { if not flag { 1 } else { 2 } }\n",
+            "pub fn logical_and(flag: Bool) -> I32 { if flag and true { 1 } else { 2 } }\n",
+            "pub fn negated_literal_without_parameter() -> I32 { if not true { 1 } else { 2 } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 7);
+
+        assert!(matches!(
+            owners[0]
+                .body_type_check()
+                .expect("one not operator over the bool parameter is supported"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        for (index, owner) in owners.iter().enumerate().skip(1) {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported negated condition is gated");
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Unsupported),
                 "function owner {index} unexpectedly passed the bounded slice: {check:?}"
