@@ -51360,6 +51360,10 @@ interface facade { use middle.{payload}; }"#;
             "  fn use_rejected_later_record(value: RejectedLaterRecord)\n",
             "  type RejectedLaterRecord { value: USize }\n",
             "  type BeforeRecord { value: LaterRecord }\n",
+            "  type BeforeEnumRecord { value: LaterVariant }\n",
+            "  type BeforePayloadVariantRecord { value: LaterPayloadVariant }\n",
+            "  enum BeforeEnumPayload { Value(LaterVariant) }\n",
+            "  enum BeforePayloadVariant { Value(LaterPayloadVariant) }\n",
             "  type AliasBeforeRecord = LaterRecord\n",
             "  type AliasBeforeVariant = LaterPayloadVariant\n",
             "  type AliasBeforeEnum = LaterVariant\n",
@@ -51455,6 +51459,12 @@ interface facade { use middle.{payload}; }"#;
                 .text
                 .contains("type alias-before-enum = later-variant;")
         );
+        assert!(generated.text.contains("record before-enum-record {"));
+        assert!(
+            generated
+                .text
+                .contains("record before-payload-variant-record {")
+        );
         assert!(
             generated
                 .text
@@ -51472,6 +51482,8 @@ interface facade { use middle.{payload}; }"#;
         );
         assert!(generated.text.contains("variant before-variant {"));
         assert!(generated.text.contains("variant variant-before-record {"));
+        assert!(generated.text.contains("variant before-enum-payload {"));
+        assert!(generated.text.contains("variant before-payload-variant {"));
 
         let package_model = result.package.expect("partial generated WIT model loads");
         let (interface_index, interface) = package_model
@@ -51485,10 +51497,14 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(item_names.len(), 15);
+        assert_eq!(item_names.len(), 19);
         for name in [
             "envelope",
             "before-record",
+            "before-enum-record",
+            "before-payload-variant-record",
+            "before-enum-payload",
+            "before-payload-variant",
             "alias-before-record",
             "alias-before-variant",
             "alias-before-enum",
@@ -51514,7 +51530,9 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+            [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+            ],
             "surviving item references compact after omitted forward targets"
         );
         let later_index = interface
@@ -51576,6 +51594,39 @@ interface facade { use middle.{payload}; }"#;
             let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(reference)) = &alias.kind
             else {
                 panic!("{alias_name} remains an alias to a named target");
+            };
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.interface.name, "api");
+            assert_eq!(reference.item, target_index);
+            assert_eq!(reference.item_name, target_name);
+        }
+        for (consumer_name, target_name) in [
+            ("before-enum-record", "later-variant"),
+            ("before-payload-variant-record", "later-payload-variant"),
+            ("before-enum-payload", "later-variant"),
+            ("before-payload-variant", "later-payload-variant"),
+        ] {
+            let target_index = interface
+                .items
+                .iter_enumerated()
+                .find_map(|(index, item)| (item.name == target_name).then_some(index))
+                .expect("the later enum or variant target remains in the parsed model");
+            let consumer = interface
+                .items
+                .iter()
+                .find(|item| item.name == consumer_name)
+                .expect("the consumer referencing a later enum item remains in the model");
+            let reference = match &consumer.kind {
+                sai_wit::WitItemKind::Record(fields) => match &fields[0].ty {
+                    sai_wit::WitType::Named(reference) => reference,
+                    _ => panic!("{consumer_name} retains a named record field"),
+                },
+                sai_wit::WitItemKind::Variant(cases) => match cases[0].payload.as_ref() {
+                    Some(sai_wit::WitType::Named(reference)) => reference,
+                    _ => panic!("{consumer_name} retains a named variant payload"),
+                },
+                _ => panic!("{consumer_name} remains a record or payload variant"),
             };
             assert_eq!(reference.interface.unit, unit);
             assert_eq!(reference.interface.interface, interface_index);
@@ -51708,9 +51759,19 @@ interface facade { use middle.{payload}; }"#;
             "  enum LaterVariantCycle { Value(AliasVariantCycleAlias) }\n",
             "  type UsesAliasVariantCycle { value: AliasVariantCycleAlias }\n",
             "  fn use_alias_variant_cycle(value: AliasVariantCycleAlias)\n",
+            "  type RecordVariantForwardCycle { value: LaterVariantRecordCycle }\n",
+            "  enum LaterVariantRecordCycle { Value(RecordVariantForwardCycle) }\n",
+            "  type UsesRecordVariantForwardCycle { value: RecordVariantForwardCycle }\n",
+            "  fn use_record_variant_forward_cycle(value: RecordVariantForwardCycle)\n",
+            "  enum VariantForwardCycleA { Value(VariantForwardCycleB) }\n",
+            "  enum VariantForwardCycleB { Value(VariantForwardCycleA) }\n",
+            "  fn use_variant_forward_cycle(value: VariantForwardCycleA)\n",
             "  type AliasToRejectedLaterVariant = RejectedLaterVariant\n",
             "  fn use_rejected_later_variant_alias(value: AliasToRejectedLaterVariant)\n",
             "  type AliasToFutureResource = LaterResource\n",
+            "  type RecordUsesRejectedLaterVariant { value: RejectedLaterVariant }\n",
+            "  enum VariantUsesRejectedLaterVariant { Value(RejectedLaterVariant) }\n",
+            "  type RecordUsesFutureResource { value: LaterResource }\n",
             "  type AliasFutureRecordCycle = FutureRecordCycle\n",
             "  type FutureRecordCycle { value: AliasFutureRecordCycle }\n",
             "  type UsesFutureRecordCycle { value: FutureRecordCycle }\n",
@@ -51833,6 +51894,24 @@ interface facade { use middle.{payload}; }"#;
             "surviving item indices compact after pruning cycles and unsupported targets"
         );
         assert!(!generated.text.contains("use-rejected"));
+        assert!(
+            !generated
+                .text
+                .contains("record-uses-rejected-later-variant")
+        );
+        assert!(
+            !generated
+                .text
+                .contains("variant-uses-rejected-later-variant")
+        );
+        assert!(!generated.text.contains("record-uses-future-resource"));
+        assert!(!generated.text.contains("record-variant-forward-cycle"));
+        assert!(!generated.text.contains("later-variant-record-cycle"));
+        assert!(!generated.text.contains("uses-record-variant-forward-cycle"));
+        assert!(!generated.text.contains("use-record-variant-forward-cycle"));
+        assert!(!generated.text.contains("variant-forward-cycle-a"));
+        assert!(!generated.text.contains("variant-forward-cycle-b"));
+        assert!(!generated.text.contains("use-variant-forward-cycle"));
         assert!(generated.text.contains("record before-record {"));
         assert!(generated.text.contains("variant before-variant {"));
         assert!(!generated.text.contains("rejected-variant"));
