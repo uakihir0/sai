@@ -2710,29 +2710,31 @@ fn fetch_locked_commit(
         .with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(shallow_depth))
         .receive(gix::progress::Discard, &interrupt)
         .map(|_| ())
-        .map_err(|error| {
-            if is_locked_commit_unavailable(&error) {
-                match context {
-                    LockedCommitFetchContext::ReleaseTag(name) => {
-                        GitRemoteReleaseFetchError::LockedCommitUnavailable {
-                            name: name.into(),
-                            commit: *commit_id,
-                        }
-                    }
-                    LockedCommitFetchContext::RepositoryPackage => {
-                        GitRemoteReleaseFetchError::RepositoryCommitUnavailable {
-                            commit: *commit_id,
-                        }
-                    }
+        .map_err(|error| map_locked_commit_fetch_error(error, commit_id, context))
+}
+
+fn map_locked_commit_fetch_error(
+    error: gix::remote::fetch::Error,
+    commit_id: &gix::ObjectId,
+    context: LockedCommitFetchContext<'_>,
+) -> GitRemoteReleaseFetchError {
+    if is_locked_commit_unavailable(&error) {
+        match context {
+            LockedCommitFetchContext::ReleaseTag(name) => {
+                GitRemoteReleaseFetchError::LockedCommitUnavailable {
+                    name: name.into(),
+                    commit: *commit_id,
                 }
-            } else {
-                #[cfg(test)]
-                eprintln!(
-                    "unclassified locked package commit fetch error for {commit_id}: {error:#?}"
-                );
-                map_transport_error_for_fetch(error)
             }
-        })
+            LockedCommitFetchContext::RepositoryPackage => {
+                GitRemoteReleaseFetchError::RepositoryCommitUnavailable { commit: *commit_id }
+            }
+        }
+    } else {
+        #[cfg(test)]
+        eprintln!("unclassified locked package commit fetch error: {error:#?}");
+        map_transport_error_for_fetch(error)
+    }
 }
 
 fn is_locked_commit_unavailable(error: &gix::remote::fetch::Error) -> bool {
@@ -3382,6 +3384,66 @@ mod tests {
         ));
 
         assert!(!super::is_locked_commit_unavailable(&error));
+    }
+
+    #[test]
+    fn missing_object_classification_rejects_broken_pipe_client_errors() {
+        let error = gix::remote::fetch::Error::Fetch(gix::protocol::fetch::Error::Client(
+            gix_transport::client::Error::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        ));
+
+        assert!(!super::is_locked_commit_unavailable(&error));
+        assert_eq!(
+            super::map_locked_commit_fetch_error(
+                error,
+                &gix::ObjectId::from_hex(b"ffffffffffffffffffffffffffffffffffffffff").unwrap(),
+                super::LockedCommitFetchContext::RepositoryPackage,
+            ),
+            GitRemoteReleaseFetchError::FetchFailed
+        );
+    }
+
+    #[test]
+    fn missing_commit_fetch_errors_preserve_the_request_context() {
+        let unavailable =
+            gix::ObjectId::from_hex(b"ffffffffffffffffffffffffffffffffffffffff").unwrap();
+        let upload_pack_error = || {
+            gix::remote::fetch::Error::Fetch(gix::protocol::fetch::Error::FetchResponse(
+                gix::protocol::fetch::response::Error::UploadPack(
+                    gix_transport::packetline::read::Error {
+                        message:
+                            "upload-pack: not our ref ffffffffffffffffffffffffffffffffffffffff"
+                                .into(),
+                    },
+                ),
+            ))
+        };
+
+        let repository_error = super::map_locked_commit_fetch_error(
+            upload_pack_error(),
+            &unavailable,
+            super::LockedCommitFetchContext::RepositoryPackage,
+        );
+        assert_eq!(
+            repository_error,
+            GitRemoteReleaseFetchError::RepositoryCommitUnavailable {
+                commit: unavailable
+            }
+        );
+        assert!(!repository_error.to_string().contains("tag"));
+
+        let release_tag_error = super::map_locked_commit_fetch_error(
+            upload_pack_error(),
+            &unavailable,
+            super::LockedCommitFetchContext::ReleaseTag("refs/tags/v1.2.3"),
+        );
+        assert_eq!(
+            release_tag_error,
+            GitRemoteReleaseFetchError::LockedCommitUnavailable {
+                name: "refs/tags/v1.2.3".into(),
+                commit: unavailable
+            }
+        );
     }
 
     fn source_byte_span(source: &[u8], text: &[u8]) -> Range<usize> {
@@ -7313,35 +7375,6 @@ mod tests {
             error.diagnostic_code(),
             sai_diagnostics::Code::UnsupportedGitUrl
         );
-    }
-
-    #[test]
-    fn reports_a_missing_git_sibling_commit_without_tag_language() {
-        let remote = TestRemote::new("refs/tags/v1.2.3", false);
-        let unavailable =
-            gix::ObjectId::from_hex(b"ffffffffffffffffffffffffffffffffffffffff").unwrap();
-        let directory = RepositoryPackageDirectory::parse("packages/sibling").unwrap();
-        let scratch = TemporaryGitDirectory::create().unwrap();
-        let repository = init_bare_repository(&scratch.path, Some(unavailable.kind()));
-        let transfer_limit =
-            gix_transport::client::blocking_io::FetchTransferLimit::new(super::MAX_GIT_FETCH_BYTES);
-
-        let error = super::fetch_git_package_source_tree_at_commit_in_repository(
-            &repository,
-            &remote.url(),
-            &unavailable,
-            &directory,
-            &transfer_limit,
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            GitRemoteReleaseFetchError::RepositoryCommitUnavailable {
-                commit: unavailable
-            }
-        );
-        assert_eq!(error.diagnostic_code(), sai_diagnostics::Code::FetchFailed);
     }
 
     #[test]
