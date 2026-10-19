@@ -2823,6 +2823,15 @@ fn set_writable_file_handle(
     metadata: &fs::Metadata,
     path: &Path,
 ) -> Result<(), PackageCacheError> {
+    #[cfg(not(unix))]
+    if !metadata.permissions().readonly() {
+        // Cache files are opened read-only while walking an untrusted tree.
+        // Avoid asking Windows to clear an attribute that is already clear;
+        // updating permissions through that handle can fail without changing
+        // the file's state.
+        return Ok(());
+    }
+
     let result = {
         #[cfg(unix)]
         {
@@ -4554,6 +4563,31 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(attempts.get(), 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn corrupt_source_removal_handles_already_writable_files() {
+        let temp = TestDirectory::new("verify-source-windows-writable-removal");
+        let cache = PackageCache::open(temp.path().join("cache")).unwrap();
+        let source = TestRepository::new().verified_source();
+        let checksum = source.source_tree().checksum.clone();
+        let source_path = cache
+            .materialize_source(source)
+            .unwrap()
+            .path()
+            .to_path_buf();
+        let source_file = source_path.join("sai.package");
+        let mut permissions = fs::metadata(&source_file).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&source_file, permissions).unwrap();
+        fs::write(&source_file, b"corrupt package content").unwrap();
+
+        assert_eq!(
+            cache.remove_corrupt_source(&checksum).unwrap(),
+            SourceCacheRemoval::Removed
+        );
+        assert!(!source_path.exists());
     }
 
     #[cfg(windows)]

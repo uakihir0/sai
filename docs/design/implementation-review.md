@@ -5464,3 +5464,11 @@
 - **Verification:** The exact Actions `BrokenPipe` error shape is asserted to remain unclassified and map to `FetchFailed`; the typed `UploadPack` test verifies both request contexts. All 722 `sai_package` tests pass, as do formatting and `git diff --check`. A new Actions run is pending.
 - **Review:** Hostile review found no production correctness issue. It initially requested exact coverage for the Actions `BrokenPipe` shape; the follow-up test now asserts both classifier rejection and the final `FetchFailed` mapping, closing that gap.
 - **Human review:** **Review required:** Confirm that deterministic typed-error mapping tests are sufficient while the local `file://` integration is removed, and that the CI workflow should remain enabled while the next hosted run verifies this repair.
+
+### CI follow-up: remove corrupt Windows cache entries with writable files
+
+- **Decision:** Skip permission updates for non-Unix cache files that are already writable. Add Windows coverage that corrupts a materialized source file and removes the source while that file remains writable.
+- **Reason:** The Windows Actions cache-recovery test returned a generic fetch failure before reporting the offline cache miss. Cache-tree removal opens files read-only and previously attempted to clear the read-only attribute unconditionally, including for files whose attribute was already clear. That unnecessary update can fail on the opened handle and prevent recovery.
+- **Verification:** All 722 `sai_package` tests, all three `locked_git_preflight` integration tests, workspace formatting, and `git diff --check` pass locally. The added regression is Windows-only and the hosted rerun is pending.
+- **Review:** Hostile review found no P0–P2 findings. It requested matching the CLI reproducer's writable `sai.package` file rather than a `main.sai` file; the regression test now uses the manifest. The next hosted Windows run must confirm the causal fix.
+- **Human review:** **Review required:** Confirm that skipping unchanged non-Unix permission updates is appropriate for supported filesystems, and retain the Windows regression as a required Actions check.
