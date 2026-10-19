@@ -1500,8 +1500,8 @@ mod windows_handle {
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
         FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-        FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation, NtCreateFile,
-        NtSetInformationFile,
+        FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation,
+        FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         GENERIC_READ, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
@@ -1511,6 +1511,9 @@ mod windows_handle {
         SetFileInformationByHandle,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    use windows_sys::Win32::System::WindowsProgramming::{
+        FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+    };
 
     use super::is_reparse_point;
 
@@ -1763,11 +1766,23 @@ mod windows_handle {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "destination is too long"))?;
         let mut storage = vec![0usize; information_length.div_ceil(mem::size_of::<usize>())];
         let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let information_class = if replace_if_exists {
+            FileRenameInformationEx
+        } else {
+            FileRenameInformation
+        };
         // SAFETY: `storage` is pointer-aligned and sized for the fixed header
         // plus the UTF-16 filename bytes. The trailing name bytes are copied
         // into the flexible-array tail expected by FILE_RENAME_INFORMATION.
         unsafe {
-            (*information).Anonymous.ReplaceIfExists = replace_if_exists;
+            if replace_if_exists {
+                // Preserve open readers on the old file while atomically
+                // rebinding its name to the replacement.
+                (*information).Anonymous.Flags =
+                    FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+            } else {
+                (*information).Anonymous.ReplaceIfExists = false;
+            }
             (*information).RootDirectory = parent.as_raw_handle().cast();
             (*information).FileNameLength = file_name_bytes_u32;
             ptr::copy_nonoverlapping(
@@ -1787,7 +1802,7 @@ mod windows_handle {
                 &mut io_status,
                 information.cast(),
                 information_length_u32,
-                FileRenameInformation,
+                information_class,
             )
         };
         // The rename API only accepts `RenameableDirectory`, whose handle is
