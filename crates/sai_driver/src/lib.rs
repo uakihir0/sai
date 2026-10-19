@@ -5618,8 +5618,9 @@ impl ConstOwnerResolution {
 
 /// Result of checking one public primitive-typed constant literal.
 ///
-/// This deliberately covers only `Bool` and fixed-width integer primitive
-/// types. It does not imply that other constant expressions are evaluated.
+/// This deliberately covers only `Bool`, `Char`, `Byte`, and fixed-width
+/// integer primitive types. It does not imply that other constant expressions
+/// are evaluated.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConstLiteralCheck {
     /// The declaration or HIR shape is outside this checking slice.
@@ -5713,6 +5714,8 @@ fn check_const_literal_owner(
 
     let diagnostics = match (primitive, literal) {
         (sai_resolve::prelude::PrimTy::Bool, Lit::Bool(_)) => Vec::new(),
+        (sai_resolve::prelude::PrimTy::Char, Lit::Char(_))
+        | (sai_resolve::prelude::PrimTy::Byte, Lit::Byte(_)) => Vec::new(),
         (primitive, Lit::Int { value, negated }) if is_fixed_width_integer_primitive(primitive) => {
             if const_integer_literal_fits(primitive, value, negated) {
                 Vec::new()
@@ -5761,7 +5764,12 @@ fn is_supported_const_name_convention(name: &str, written_name: &str) -> bool {
 }
 
 fn is_supported_const_literal_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
-    primitive == sai_resolve::prelude::PrimTy::Bool || is_fixed_width_integer_primitive(primitive)
+    matches!(
+        primitive,
+        sai_resolve::prelude::PrimTy::Bool
+            | sai_resolve::prelude::PrimTy::Char
+            | sai_resolve::prelude::PrimTy::Byte
+    ) || is_fixed_width_integer_primitive(primitive)
 }
 
 fn is_fixed_width_integer_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
@@ -24874,6 +24882,103 @@ mod tests {
         }
         assert!(!const_integer_literal_fits(PrimTy::I64, None, false));
         assert!(!const_integer_literal_fits(PrimTy::U64, None, false));
+    }
+
+    #[test]
+    fn const_char_byte_literal_check_uses_decoded_unicode_and_byte_values() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub const CHAR_ASCII: Char = 'a'\n",
+            "pub const CHAR_NULL: Char = '\\0'\n",
+            "pub const CHAR_POST_SURROGATE: Char = '\\u{e000}'\n",
+            "pub const CHAR_MAX: Char = '\\u{10ffff}'\n",
+            "pub const BYTE_ASCII: Byte = b'z'\n",
+            "pub const BYTE_MIN: Byte = b'\\x00'\n",
+            "pub const BYTE_MAX: Byte = b'\\xff'\n",
+            "pub const CHAR_BYTE_MISMATCH: Char = b'a'\n",
+            "pub const BYTE_CHAR_MISMATCH: Byte = 'a'\n",
+            "pub const BYTE_INT_MISMATCH: Byte = 255\n",
+            "pub const CHAR_STRING_MISMATCH: Char = \"a\"\n",
+            "pub const BYTE_STRING_MISMATCH: Byte = b\"a\"\n",
+            "pub const FLOAT: F64 = 1.5\n",
+            "pub const TEXT: Str = \"text\"\n",
+            "pub const BORROWED: &Bool = &true\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(checks.len(), 15);
+        for (index, primitive) in [
+            (0, PrimTy::Char),
+            (1, PrimTy::Char),
+            (2, PrimTy::Char),
+            (3, PrimTy::Char),
+            (4, PrimTy::Byte),
+            (5, PrimTy::Byte),
+            (6, PrimTy::Byte),
+        ] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Supported {
+                    primitive,
+                    diagnostics: Vec::new(),
+                },
+                "decoded literal at owner index {index} should fit its exact primitive"
+            );
+        }
+        for index in 7..=11 {
+            let ConstLiteralCheck::Supported {
+                primitive,
+                diagnostics,
+            } = checks[index]
+            else {
+                panic!("mismatched literal at owner index {index} should be diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::TypeMismatch,
+                "owner index {index}"
+            );
+            assert_eq!(
+                *primitive,
+                match index {
+                    7 | 10 => PrimTy::Char,
+                    _ => PrimTy::Byte,
+                },
+                "owner index {index}"
+            );
+            assert!(diagnostics[0].has_workspace_snapshot());
+            assert!(diagnostics[0].primary().is_some());
+        }
+        for index in [12, 13, 14] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Unsupported,
+                "floats, strings, and references remain outside the literal slice"
+            );
+        }
     }
 
     #[test]

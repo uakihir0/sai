@@ -237,6 +237,21 @@ fn multiple_public_primitive_const_literals_emit_one_check_result() {
 }
 
 #[test]
+fn public_char_and_byte_const_literals_emit_check_results() {
+    for source in [
+        "pub const ASCII: Char = 'a'\n",
+        "pub const UNICODE: Char = 'λ'\n",
+        "pub const NULL: Char = '\\0'\n",
+        "pub const MAX_SCALAR: Char = '\\u{10ffff}'\n",
+        "pub const ASCII: Byte = b'z'\n",
+        "pub const MIN: Byte = b'\\x00'\n",
+        "pub const MAX: Byte = b'\\xff'\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
 fn public_primitive_const_type_errors_do_not_emit_results() {
     let cases = [
         ("pub const BAD: Bool = 1\n", "TYPE_MISMATCH"),
@@ -269,6 +284,46 @@ fn public_primitive_const_type_errors_do_not_emit_results() {
             "{source:?}: expected supported {code} without a result or feature gate:\n{stdout}"
         );
     }
+}
+
+#[test]
+fn char_and_byte_literal_type_mismatches_do_not_emit_results() {
+    for source in [
+        "pub const BAD_CHAR: Char = b'a'\n",
+        "pub const BAD_BYTE: Byte = 'a'\n",
+        "pub const BAD_BYTE: Byte = 255\n",
+        "pub const BAD_CHAR: Char = \"a\"\n",
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{source:?}: type mismatch should exit 1:\n{stdout}"
+        );
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+            "{source:?}: expected a supported type mismatch without a result or feature gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn escaped_bidi_char_literal_cannot_emit_a_check_result() {
+    let output = run_check(r"pub const BIDI: Char = '\u{202e}'", "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an escaped bidi control must fail the package check:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"FORBIDDEN_CHARACTER\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the escaped bidi control must be diagnosed and must not produce a result:\n{stdout}"
+    );
 }
 
 #[test]
@@ -321,6 +376,9 @@ fn const_forms_outside_literal_slice_remain_gated() {
         "const PRIVATE: I8 = 1\n",
         "pub const EXPRESSION: I8 = 1 + 2\n",
         "pub const ALIAS: MyInt = 1\n",
+        "pub const FLOAT: F64 = 1.5\n",
+        "pub const TEXT: Str = \"text\"\n",
+        "pub const BORROWED: &Bool = &true\n",
         "use missing;\npub const VALUE: I8 = 1\n",
         "unsafe module\npub const VALUE: I8 = 1\n",
         "property \"coverage\" () {}\npub const VALUE: I8 = 1\n",
