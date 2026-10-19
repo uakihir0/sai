@@ -51357,13 +51357,16 @@ interface facade { use middle.{payload}; }"#;
             "  type Envelope { value: Later }\n",
             "  type RejectedRecord { value: Rejected }\n",
             "  type UsesRejectedLaterRecord { value: RejectedLaterRecord }\n",
+            "  fn use_rejected_later_record(value: RejectedLaterRecord)\n",
             "  type RejectedLaterRecord { value: USize }\n",
             "  type BeforeRecord { value: LaterRecord }\n",
             "  type AliasBeforeRecord = LaterRecord\n",
-            "  fn use_later_record(value: LaterRecord)\n",
+            "  fn use_later_record(value: LaterRecord) -> LaterRecord\n",
+            "  fn use_later_variant(value: LaterVariant)\n",
             "  enum BeforeVariant { Value(Later) }\n",
             "  enum VariantBeforeRecord { Value(LaterRecord) }\n",
             "  type LaterRecord { value: U64 }\n",
+            "  enum LaterVariant { Ready }\n",
             "  type Rejected = USize\n",
             "  type Later = U32\n",
             "  type Independent = U64\n",
@@ -51416,11 +51419,17 @@ interface facade { use middle.{payload}; }"#;
         assert!(generated.text.contains("value: later"));
         assert!(!generated.text.contains("rejected-record"));
         assert!(!generated.text.contains("uses-rejected-later-record"));
+        assert!(!generated.text.contains("use-rejected-later-record"));
         assert!(!generated.text.contains("rejected-later-record"));
         assert!(generated.text.contains("record before-record {"));
         assert!(generated.text.contains("value: later-record"));
         assert!(!generated.text.contains("alias-before-record"));
-        assert!(!generated.text.contains("use-later-record"));
+        assert!(
+            generated
+                .text
+                .contains("use-later-record: func(value: later-record) -> later-record;")
+        );
+        assert!(!generated.text.contains("use-later-variant"));
         assert!(generated.text.contains("variant before-variant {"));
         assert!(generated.text.contains("variant variant-before-record {"));
 
@@ -51436,13 +51445,15 @@ interface facade { use middle.{payload}; }"#;
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(item_names.len(), 7);
+        assert_eq!(item_names.len(), 9);
         for name in [
             "envelope",
             "before-record",
             "before-variant",
             "variant-before-record",
+            "use-later-record",
             "later-record",
+            "later-variant",
             "later",
             "independent",
         ] {
@@ -51457,7 +51468,7 @@ interface facade { use middle.{payload}; }"#;
                 .iter_enumerated()
                 .map(|(index, _)| index.index())
                 .collect::<Vec<_>>(),
-            [0, 1, 2, 3, 4, 5, 6],
+            [0, 1, 2, 3, 4, 5, 6, 7, 8],
             "surviving item references compact after omitted forward targets"
         );
         let later_index = interface
@@ -51487,6 +51498,31 @@ interface facade { use middle.{payload}; }"#;
             .iter_enumerated()
             .find_map(|(index, item)| (item.name == "later-record").then_some(index))
             .expect("the target record remains in the parsed model");
+        let use_later_record = interface
+            .items
+            .iter()
+            .find(|item| item.name == "use-later-record")
+            .expect("the function referencing the later record remains in the parsed model");
+        let sai_wit::WitItemKind::Func(use_later_record) = &use_later_record.kind else {
+            panic!("use-later-record remains a function after parsing");
+        };
+        let sai_wit::WitType::Named(parameter) = &use_later_record.params[0].1 else {
+            panic!("the function parameter refers to a named later record");
+        };
+        let sai_wit::WitType::Named(result) = use_later_record
+            .result
+            .as_ref()
+            .expect("the function result is retained")
+        else {
+            panic!("the function result refers to a named later record");
+        };
+        for reference in [parameter, result] {
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.interface.name, "api");
+            assert_eq!(reference.item, later_record_index);
+            assert_eq!(reference.item_name, "later-record");
+        }
         let variant_before_record = interface
             .items
             .iter()

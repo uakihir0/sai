@@ -2912,9 +2912,8 @@ fn collect_interface_uses_input(
                 poisoned_owners.insert(member_owner);
             }
             let item_type_references = match kind {
-                super::InterfaceMemberKind::Alias | super::InterfaceMemberKind::Function => {
-                    &generated_alias_type_references
-                }
+                super::InterfaceMemberKind::Alias => &generated_alias_type_references,
+                super::InterfaceMemberKind::Function => &generated_record_type_references,
                 super::InterfaceMemberKind::Struct => &generated_record_type_references,
                 super::InterfaceMemberKind::Enum => &generated_variant_type_references,
                 _ => &generated_named_type_references,

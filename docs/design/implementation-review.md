@@ -5629,6 +5629,15 @@
 - **Human review:** **Review required:** Confirm that one-payload variants may refer forward to same-interface aliases and records, while future resources and cross-interface items stay unsupported, and that pruning every resulting local Alias/Record/Variant cycle and its dependents remains the right policy.
 - **Remaining scope:** Variant payloads referencing later resources, alias/function references to later non-alias types, cross-interface references, and the broader transitive-poisoning plan remain incomplete.
 
+### IR-688: allow function signatures to reference later same-interface records
+
+- **Decision:** Use the reserved later-record reference map for interface functions. That map includes later aliases and records, and receives successfully emitted named items as iteration proceeds; future variants and resources are not reserved.
+- **Reason:** Functions consume named types but are not type definitions in the Alias/Record/Variant cycle graph. Reusing the record map enables only the missing function-to-later-record edges, while existing pruning still removes consumers of unsupported targets and future resources remain fail-closed.
+- **Verification:** The print/parse regression confirms exact unit, interface, item index, and name for a later record in both a function parameter and result. It also confirms that functions referencing future variants, future resources, or unsupported later records are omitted. All 50 generated-WIT driver tests and the full locked workspace suite pass, including 329 `sai_driver` and 722 `sai_package` tests; `cargo fmt --all -- --check` and `git diff --check` pass.
+- **Review:** Hostile review found no implementation/pruning defect and identified a missing regression for future variants. The added test confirms the earlier function is omitted while the later variant survives; re-review found no remaining actionable P0–P2 issue.
+- **Human review:** **Review required:** Confirm that function signatures may refer forward to same-interface aliases and records, while future variants/resources and cross-interface items remain unsupported, and that unsupported targets should prune their function consumers.
+- **Remaining scope:** Alias references to later non-alias types, function references to later variants/enums/resources, variant payloads referencing later resources, cross-interface item references, and the broader transitive-poisoning plan remain incomplete.
+
 ### CI follow-up: keep missing-commit classification strict across Git transports
 
 - **Decision:** Keep `BrokenPipe` and other generic transport failures classified as `FetchFailed`, including release-tag fetches. The local deleted-tag integration test may accept either an explicit missing-object response (`LockedCommitUnavailable`) or an ambiguous subprocess transport failure (`FetchFailed`); separate deterministic tests continue to assert the exact classification for both error forms. Keep every operating-system Actions job enabled.
