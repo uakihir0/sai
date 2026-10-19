@@ -3074,8 +3074,14 @@ fn collect_interface_uses_input(
         }
         let mut generated_resource_member_type_references =
             generated_function_type_references.clone();
-        // Clone resource members before extending ordinary functions with Used
-        // facades so resource members retain their independent consumer scope.
+        generated_resource_member_type_references.extend(
+            foreign_interface_used_type_references
+                .by_definition
+                .iter()
+                .map(|(definition, reference)| (*definition, reference.clone())),
+        );
+        // Copy foreign Used facades before ordinary functions gain later-local
+        // references, keeping resource members within their own visibility boundary.
         generated_function_type_references.extend(
             foreign_interface_used_type_references
                 .by_definition
