@@ -5875,6 +5875,7 @@ fn check_function_body_type(
     if sig.safety != sai_hir::Safety::Safe
         || sig.is_async
         || sig.params.len() != 1
+        || sig.params[0].is_self
         || sig.params[0].mutable
         || body.params.len() != 1
         || body.params[0].mutable
@@ -5940,7 +5941,7 @@ fn check_function_body_type(
         }
         None => FunctionDirectType::Unit,
     };
-    let diagnostics = if expected == found {
+    let diagnostics = if expected == found || expected == FunctionDirectType::Unit {
         Vec::new()
     } else {
         vec![const_literal_diagnostic(
@@ -23828,7 +23829,10 @@ mod tests {
         let root = concat!(
             "pub fn identity(value: I32) -> I32 { value }\n",
             "pub fn mismatch(value: I32) -> Bool { value }\n",
+            "pub fn discard(value: I32) { value }\n",
+            "pub fn discard_explicit(value: I32) -> () { value }\n",
             "pub fn computed(value: I32) -> I32 { value + 1 }\n",
+            "pub fn self_param(self: I32) -> I32 { self }\n",
             "pub fn string_identity(value: Str) -> Str { value }\n",
             "pub fn mutable_identity(var value: I32) -> I32 { value }\n",
             "pub fn identityValue(value: I32) -> I32 { value }\n",
@@ -23854,7 +23858,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 13);
+        assert_eq!(resolved.owners().len(), 16);
         assert!(matches!(
             resolved.owners()[0]
                 .body_type_check()
@@ -23888,10 +23892,16 @@ mod tests {
             .expect("body tail range is ordered")
         );
 
-        for owner in resolved.owners()[2..7]
-            .iter()
-            .chain(&resolved.owners()[7..])
-        {
+        for owner in &resolved.owners()[2..4] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("unit-returning body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+
+        for owner in &resolved.owners()[4..] {
             assert!(matches!(
                 owner
                     .body_type_check()
