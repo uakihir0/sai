@@ -6364,18 +6364,24 @@ fn check_function_body_primitive_local_block(
             ExprKind::Binary(operator, left, right)
                 if is_function_primitive_local_binary_operator(operator) =>
             {
-                for operand in [left, right] {
+                let is_preceding_path = |operand: &HirExpr<'_>| {
                     let ExprKind::Path(path) = operand.kind else {
-                        return Ok(None);
+                        return false;
                     };
-                    let Some(source_binding) =
-                        resolved_plain_local_path_binding(path, locals, inputs)
-                    else {
-                        return Ok(None);
-                    };
-                    if !preceding_bindings.contains(&source_binding) {
-                        return Ok(None);
+                    resolved_plain_local_path_binding(path, locals, inputs)
+                        .is_some_and(|binding| preceding_bindings.contains(&binding))
+                };
+                let supported_shape = match operator {
+                    BinOp::And | BinOp::Or => is_preceding_path(left) && is_preceding_path(right),
+                    BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                        (is_preceding_path(left) && is_preceding_path(right))
+                            || (is_preceding_path(left) && is_direct_function_scalar_literal(right))
+                            || (is_direct_function_scalar_literal(left) && is_preceding_path(right))
                     }
+                    _ => false,
+                };
+                if !supported_shape {
+                    return Ok(None);
                 }
             }
             _ => return Ok(None),
@@ -6417,16 +6423,14 @@ fn check_function_body_primitive_local_block(
 }
 
 fn is_function_primitive_local_binary_operator(operator: BinOp) -> bool {
+    matches!(operator, BinOp::And | BinOp::Or)
+        || is_function_primitive_local_comparison_operator(operator)
+}
+
+fn is_function_primitive_local_comparison_operator(operator: BinOp) -> bool {
     matches!(
         operator,
-        BinOp::And
-            | BinOp::Or
-            | BinOp::Eq
-            | BinOp::Ne
-            | BinOp::Lt
-            | BinOp::Le
-            | BinOp::Gt
-            | BinOp::Ge
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
     )
 }
 
