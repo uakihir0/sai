@@ -1910,6 +1910,26 @@ The hint passed down is the expected type with every variable shallow-resolved. 
 - `Byte` literals, `Char` literals, `Bool`, `Str` literals (type `Str` with `Region::Static`), byte strings (`Slice<Byte>`, static) follow spec/06 §6.3.3.
 - Range checks (`LITERAL_OUT_OF_RANGE`, spec/02) are done when the literal's type is known: immediately if it was known at the literal, otherwise after end-of-body defaulting (spec/05 §5.16.5 step 3). A literal whose value did not fit in `u128` ([impl/02](02-frontend-ast-hir.md) `value: None`) is always out of range.
 
+**Current Stage 0 implementation slice (IR-750).** The reusable semantic kernel in `sai_ty::typeck::literal` checks one already-resolved scalar primitive type against a direct HIR literal:
+
+```rust
+pub enum PrimitiveLiteralResult {
+    Match,
+    TypeMismatch,
+    OutOfRange,
+}
+pub fn check_primitive_literal(
+    expected: PrimTy,
+    literal: sai_hir::literals::Lit<'_>,
+    symbols: &Interner,
+    pointer_width: u8,
+) -> PrimitiveLiteralResult;
+```
+
+The kernel accepts only the exact kind/type pairs: `Bool`, `Char`, and `Byte` literals with their corresponding primitive; integer literals with an integer primitive; and floating-point literals with `F32` or `F64`. It checks signed and unsigned integer bounds, including the direct negative-literal boundary and the explicitly supplied target width for `ISize` and `USize`. It resolves interned decimal float text through the interner and parses directly at the expected width, preserving IEEE 754 roundTiesToEven rounding. A failed parse or a rounded non-finite value returns `OutOfRange`; a nonzero float that rounds to zero remains accepted. The `TypeMismatch` result covers other literal kinds.
+
+The driver remains responsible for resolving the expected type, selecting `pointer_width` from the current target, and constructing diagnostics using the expression span, owner, and `WorkspaceSnapshot`. It also retains canonical `Str` and unit handling outside this kernel, and turns `OutOfRange` into the existing integer or floating-point range diagnostic based on the HIR literal kind. The kernel is reused by the existing direct-literal checks, but this slice does not implement expression inference, literal variables, defaulting, coercions, `TypeckResults`, or general `typeck(owner)`. Those remain governed by the complete design above, including the end-of-body order below; implementing this leaf operation does not claim full Stage 0 type checking.
+
 **End of body** (N-E-30). After the last expression of the owner, `typeck` runs, in order: `select_where_possible()`; defaulting of every remaining `ι` to `I64` and `φ` to `F64`, in creation order; `select_where_possible()` again; capture analysis and the closure kinds of every closure of the owner (§3.11.2, §3.11.3), which resolves the stalled `ClosureKind` goals and cannot bind any type variable; `select_where_possible()` once more; the literal range checks; the reports of `as` casts (§3.10.3); `select_all_or_error()`; and finally the report of every remaining `α` or `κ` (spec/05 §5.16.5 step 4): one `TYPE_ANNOTATIONS_NEEDED` per variable, at the leftmost expression whose recorded type mentions it, skipping variables unioned with a variable already reported. The fix inserts a type annotation on the `let` that introduced the variable, or explicit generic arguments on the path whose omitted argument created it, depending on the variable's origin.
 
 ### 3.7.7 Paths and implicit members
