@@ -394,10 +394,60 @@ fn parameter_local_copy_reports_semantic_errors_without_a_feature_gate() {
 #[test]
 fn unsupported_parameter_local_copy_forms_remain_gated() {
     for source in [
-        "pub fn copy(source: I32, other: I32) -> I32 {\n    let copied: I32 = source\n    copied\n}\n",
         "pub fn copy(var source: I32) -> I32 {\n    let copied: I32 = source\n    copied\n}\n",
         "pub fn copy(self: I32) -> I32 {\n    let copied: I32 = self\n    copied\n}\n",
         "pub fn parameter_tail(source: I32) -> I32 {\n    let copied: I32 = source\n    source\n}\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn public_two_parameter_local_copies_emit_check_result() {
+    for source in [
+        "pub fn copy_pair(first: I32, second: Bool) -> I32 {\n    let first_copy: I32 = first\n    let second_copy: Bool = second\n    first_copy\n}\n",
+        "pub fn copy_pair(first: I32, second: Bool) -> I32 {\n    let first_copy = first\n    let second_copy = second\n    first_copy\n}\n",
+        "pub fn copy_triple(first: I32, second: Bool, third: U16) -> U16 {\n    let first_copy = first\n    let second_copy: Bool = second\n    let third_copy = third\n    third_copy\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn two_parameter_local_copy_type_mismatch_is_reported_at_initializer() {
+    let source = "pub fn copy_pair(first: I32, second: Bool) -> F32 {\n    let first_copy: F32 = first\n    let second_copy: Bool = second\n    first_copy\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let initializer_start = source
+        .find("= first\n")
+        .map(|start| start + "= ".len())
+        .expect("first parameter initializer exists");
+    let initializer_end = initializer_start + "first".len();
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "supported parameter-local mismatch must not be hidden by a feature gate:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `F32`, found `I32`",
+        initializer_start,
+        initializer_end,
+    );
+}
+
+#[test]
+fn unsupported_two_parameter_local_copy_forms_remain_gated() {
+    for source in [
+        "pub fn copy_pair(first: I32, var second: Bool) -> I32 {\n    let first_copy: I32 = first\n    let second_copy: Bool = second\n    first_copy\n}\n",
+        "pub fn copy_pair(first: I32, second: Str) -> I32 {\n    let first_copy: I32 = first\n    let second_copy: Str = second\n    first_copy\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
