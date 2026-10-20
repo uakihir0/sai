@@ -162,84 +162,15 @@ pub fn check_return_constrained_primitive_local_body(
         return PrimitiveBodyCheck::Unsupported;
     };
 
-    let mut errors = Vec::new();
-    match found {
-        PrimitiveLiteralKind::Integer if is_integer_primitive(input.return_type) => {
-            if check_primitive_literal(
-                input.return_type,
-                literal,
-                input.symbols,
-                input.pointer_width,
-            ) == PrimitiveLiteralResult::OutOfRange
-            {
-                errors.push(PrimitiveBodyError {
-                    node: init.hir_id,
-                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                        expected: input.return_type,
-                        found,
-                    },
-                });
-            }
-        }
-        PrimitiveLiteralKind::FloatingPoint
-            if matches!(input.return_type, PrimTy::F32 | PrimTy::F64) =>
-        {
-            if check_primitive_literal(
-                input.return_type,
-                literal,
-                input.symbols,
-                input.pointer_width,
-            ) == PrimitiveLiteralResult::OutOfRange
-            {
-                errors.push(PrimitiveBodyError {
-                    node: init.hir_id,
-                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                        expected: input.return_type,
-                        found,
-                    },
-                });
-            }
-        }
-        PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint => {
-            errors.push(PrimitiveBodyError {
-                node: tail.hir_id,
-                kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
-                    expected: input.return_type,
-                    found,
-                },
-            });
-
-            // If the expected type cannot constrain the literal family, its
-            // inference variable defaults at the end of the body.
-            let default_type = match found {
-                PrimitiveLiteralKind::Integer => PrimTy::I64,
-                PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
-                PrimitiveLiteralKind::Bool
-                | PrimitiveLiteralKind::Byte
-                | PrimitiveLiteralKind::Character => unreachable!(),
-            };
-            if check_primitive_literal(default_type, literal, input.symbols, input.pointer_width)
-                == PrimitiveLiteralResult::OutOfRange
-            {
-                errors.push(PrimitiveBodyError {
-                    node: init.hir_id,
-                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                        expected: default_type,
-                        found,
-                    },
-                });
-            }
-        }
-        PrimitiveLiteralKind::Bool => {
-            check_concrete_literal_type(&mut errors, input.return_type, PrimTy::Bool, tail.hir_id);
-        }
-        PrimitiveLiteralKind::Byte => {
-            check_concrete_literal_type(&mut errors, input.return_type, PrimTy::Byte, tail.hir_id);
-        }
-        PrimitiveLiteralKind::Character => {
-            check_concrete_literal_type(&mut errors, input.return_type, PrimTy::Char, tail.hir_id);
-        }
-    }
+    let errors = check_unannotated_literal_against_return(
+        literal,
+        found,
+        input.return_type,
+        input.symbols,
+        input.pointer_width,
+        init.hir_id,
+        tail.hir_id,
+    );
 
     PrimitiveBodyCheck::Supported { errors }
 }
@@ -249,7 +180,7 @@ pub fn check_return_constrained_primitive_local_body(
 ///
 /// The initializer of the unannotated binding is a local path, so it inherits
 /// the source binding's exact type without a coercion.
-pub fn check_unannotated_copy_of_annotated_primitive_local_body(
+pub fn check_unannotated_copy_of_primitive_local_body(
     input: PrimitiveBodyInput<'_, '_>,
 ) -> PrimitiveBodyCheck {
     if !supports_primitive_literal(input.return_type) {
@@ -265,7 +196,7 @@ pub fn check_unannotated_copy_of_annotated_primitive_local_body(
 
     let StmtKind::Let {
         pat: source_pat,
-        ty: Some(source_ty),
+        ty: source_ty,
         init: source_init,
         els: None,
     } = block.stmts[0].kind
@@ -281,12 +212,18 @@ pub fn check_unannotated_copy_of_annotated_primitive_local_body(
     else {
         return PrimitiveBodyCheck::Unsupported;
     };
-    let Some(source_type) = input.primitive_types.get(&source_ty.hir_id).copied() else {
-        return PrimitiveBodyCheck::Unsupported;
+    let source_type = match source_ty {
+        Some(source_ty) => {
+            let Some(source_type) = input.primitive_types.get(&source_ty.hir_id).copied() else {
+                return PrimitiveBodyCheck::Unsupported;
+            };
+            if !supports_primitive_literal(source_type) {
+                return PrimitiveBodyCheck::Unsupported;
+            }
+            Some(source_type)
+        }
+        None => None,
     };
-    if !supports_primitive_literal(source_type) {
-        return PrimitiveBodyCheck::Unsupported;
-    }
     let ExprKind::Lit(source_literal) = source_init.kind else {
         return PrimitiveBodyCheck::Unsupported;
     };
@@ -338,43 +275,135 @@ pub fn check_unannotated_copy_of_annotated_primitive_local_body(
     }
 
     let mut errors = Vec::new();
-    match check_primitive_literal(
-        source_type,
-        source_literal,
-        input.symbols,
-        input.pointer_width,
-    ) {
-        PrimitiveLiteralResult::Match => {}
-        PrimitiveLiteralResult::TypeMismatch => {
+    if let Some(source_type) = source_type {
+        match check_primitive_literal(
+            source_type,
+            source_literal,
+            input.symbols,
+            input.pointer_width,
+        ) {
+            PrimitiveLiteralResult::Match => {}
+            PrimitiveLiteralResult::TypeMismatch => {
+                errors.push(PrimitiveBodyError {
+                    node: source_init.hir_id,
+                    kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                        expected: source_type,
+                        found: source_literal_kind,
+                    },
+                });
+            }
+            PrimitiveLiteralResult::OutOfRange => {
+                errors.push(PrimitiveBodyError {
+                    node: source_init.hir_id,
+                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                        expected: source_type,
+                        found: source_literal_kind,
+                    },
+                });
+            }
+        }
+        if source_type != input.return_type {
             errors.push(PrimitiveBodyError {
-                node: source_init.hir_id,
-                kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
-                    expected: source_type,
-                    found: source_literal_kind,
+                node: tail.hir_id,
+                kind: PrimitiveBodyErrorKind::TypeMismatch {
+                    expected: input.return_type,
+                    found: source_type,
                 },
             });
         }
-        PrimitiveLiteralResult::OutOfRange => {
-            errors.push(PrimitiveBodyError {
-                node: source_init.hir_id,
-                kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                    expected: source_type,
-                    found: source_literal_kind,
-                },
-            });
-        }
-    }
-    if source_type != input.return_type {
-        errors.push(PrimitiveBodyError {
-            node: tail.hir_id,
-            kind: PrimitiveBodyErrorKind::TypeMismatch {
-                expected: input.return_type,
-                found: source_type,
-            },
-        });
+    } else {
+        errors = check_unannotated_literal_against_return(
+            source_literal,
+            source_literal_kind,
+            input.return_type,
+            input.symbols,
+            input.pointer_width,
+            source_init.hir_id,
+            tail.hir_id,
+        );
     }
 
     PrimitiveBodyCheck::Supported { errors }
+}
+
+fn check_unannotated_literal_against_return(
+    literal: Lit<'_>,
+    found: PrimitiveLiteralKind,
+    return_type: PrimTy,
+    symbols: &Interner,
+    pointer_width: u8,
+    initializer: HirId,
+    tail: HirId,
+) -> Vec<PrimitiveBodyError> {
+    let mut errors = Vec::new();
+    match found {
+        PrimitiveLiteralKind::Integer if is_integer_primitive(return_type) => {
+            if check_primitive_literal(return_type, literal, symbols, pointer_width)
+                == PrimitiveLiteralResult::OutOfRange
+            {
+                errors.push(PrimitiveBodyError {
+                    node: initializer,
+                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                        expected: return_type,
+                        found,
+                    },
+                });
+            }
+        }
+        PrimitiveLiteralKind::FloatingPoint if matches!(return_type, PrimTy::F32 | PrimTy::F64) => {
+            if check_primitive_literal(return_type, literal, symbols, pointer_width)
+                == PrimitiveLiteralResult::OutOfRange
+            {
+                errors.push(PrimitiveBodyError {
+                    node: initializer,
+                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                        expected: return_type,
+                        found,
+                    },
+                });
+            }
+        }
+        PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint => {
+            errors.push(PrimitiveBodyError {
+                node: tail,
+                kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                    expected: return_type,
+                    found,
+                },
+            });
+
+            // Keep the source literal variable unresolved until its body-end
+            // default so the copied binding observes the tail constraint.
+            let default_type = match found {
+                PrimitiveLiteralKind::Integer => PrimTy::I64,
+                PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
+                PrimitiveLiteralKind::Bool
+                | PrimitiveLiteralKind::Byte
+                | PrimitiveLiteralKind::Character => unreachable!(),
+            };
+            if check_primitive_literal(default_type, literal, symbols, pointer_width)
+                == PrimitiveLiteralResult::OutOfRange
+            {
+                errors.push(PrimitiveBodyError {
+                    node: initializer,
+                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                        expected: default_type,
+                        found,
+                    },
+                });
+            }
+        }
+        PrimitiveLiteralKind::Bool => {
+            check_concrete_literal_type(&mut errors, return_type, PrimTy::Bool, tail);
+        }
+        PrimitiveLiteralKind::Byte => {
+            check_concrete_literal_type(&mut errors, return_type, PrimTy::Byte, tail);
+        }
+        PrimitiveLiteralKind::Character => {
+            check_concrete_literal_type(&mut errors, return_type, PrimTy::Char, tail);
+        }
+    }
+    errors
 }
 
 fn check_concrete_literal_type(
