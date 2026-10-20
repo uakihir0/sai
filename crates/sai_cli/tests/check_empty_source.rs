@@ -338,7 +338,7 @@ fn unannotated_copy_of_annotated_primitive_local_reports_semantic_errors() {
 #[test]
 fn unsupported_unannotated_copy_local_forms_remain_gated() {
     for source in [
-        "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = source / 1\n    copied\n}\n",
+        "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = source / (1 / 1)\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = r#source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source: I32 = 42\n    var copied = source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    var source: I32 = 42\n    let copied = source\n    copied\n}\n",
@@ -1057,7 +1057,7 @@ fn primitive_add_local_literal_type_and_annotation_errors_have_exact_spans() {
 }
 
 #[test]
-fn primitive_sub_mul_local_initializers_accept_right_numeric_literals() {
+fn primitive_sub_mul_div_local_initializers_accept_right_numeric_literals() {
     for primitive in [
         "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize", "F32", "F64",
     ] {
@@ -1067,12 +1067,12 @@ fn primitive_sub_mul_local_initializers_accept_right_numeric_literals() {
             "1"
         };
         let signed_minimum = if primitive == "I8" {
-            "    let signed_minimum = value - -128\n"
+            "    let signed_minimum = value / -128\n"
         } else {
             ""
         };
         let unsigned_negative_zero = if primitive == "U8" {
-            "    let unsigned_negative_zero = value * -0\n"
+            "    let unsigned_negative_zero = value / -0\n"
         } else {
             ""
         };
@@ -1084,6 +1084,8 @@ fn primitive_sub_mul_local_initializers_accept_right_numeric_literals() {
                 "    let sub_local: {primitive} = earlier - {literal}\n",
                 "    let mul_param = value * {literal}\n",
                 "    let mul_local: {primitive} = earlier * {literal}\n",
+                "    let div_param = value / {literal}\n",
+                "    let div_local: {primitive} = earlier / {literal}\n",
                 "{signed_minimum}",
                 "{unsigned_negative_zero}",
                 "    sub_param\n",
@@ -1107,8 +1109,22 @@ fn primitive_sub_mul_local_initializers_accept_right_numeric_literals() {
 }
 
 #[test]
+fn primitive_integer_division_by_zero_is_a_type_check_success() {
+    let source =
+        "pub fn divide(value: I32) -> I32 {\n    let quotient = value / 0\n    quotient\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "zero is a valid integer literal operand; division-by-zero behavior belongs to execution:\n{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
 fn primitive_arithmetic_local_initializers_accept_left_numeric_literals() {
-    for (operator_name, operator) in [("add", "+"), ("sub", "-"), ("mul", "*")] {
+    for (operator_name, operator) in [("add", "+"), ("sub", "-"), ("mul", "*"), ("div", "/")] {
         for primitive in [
             "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize", "F32", "F64",
         ] {
@@ -1148,11 +1164,12 @@ fn primitive_arithmetic_local_initializers_accept_left_numeric_literals() {
 #[test]
 fn primitive_arithmetic_left_literal_mismatches_keep_context_and_recover() {
     let source = concat!(
-        "pub fn mismatches(f32_value: F32, f64_value: F64, integer: I32) -> F32 {\n",
+        "pub fn mismatches(f32_value: F32, f64_value: F64, integer: I32, narrow: I8) -> F32 {\n",
         "    let constrained = 7 + f32_value\n",
         "    let constrained_copy: I8 = constrained\n",
         "    let bad_annotation: F32 = 8 - f64_value\n",
         "    let float_mismatch = 1.5 * integer\n",
+        "    let division_mismatch = 1.5 / narrow\n",
         "    bad_annotation\n",
         "}\n",
     );
@@ -1173,11 +1190,15 @@ fn primitive_arithmetic_left_literal_mismatches_keep_context_and_recover() {
         .find("* integer")
         .map(|start| start + "* ".len())
         .expect("float literal family mismatch path exists");
+    let division_path = source
+        .find("/ narrow")
+        .map(|start| start + "/ ".len())
+        .expect("division literal family mismatch path exists");
 
     assert_eq!(output.status.code(), Some(1), "{stdout}");
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        4,
+        5,
         "family and annotation mismatches should be reported while later context is preserved:\n{stdout}"
     );
     assert!(
@@ -1213,13 +1234,20 @@ fn primitive_arithmetic_left_literal_mismatches_keep_context_and_recover() {
         float_path,
         float_path + "integer".len(),
     );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `F64`, found `I8`",
+        division_path,
+        division_path + "narrow".len(),
+    );
 }
 
 #[test]
 fn primitive_arithmetic_left_literal_defaulting_checks_range_after_family_mismatch() {
     let source = concat!(
         "pub fn default_on_failure(floating: F32, result: I64) -> I64 {\n",
-        "    let too_large = 18446744073709551616 + floating\n",
+        "    let too_large = 18446744073709551616 / floating\n",
         "    result\n",
         "}\n",
     );
@@ -1229,8 +1257,8 @@ fn primitive_arithmetic_left_literal_defaulting_checks_range_after_family_mismat
         .find("18446744073709551616")
         .expect("large integer literal exists");
     let path = source
-        .find("+ floating")
-        .map(|start| start + "+ ".len())
+        .find("/ floating")
+        .map(|start| start + "/ ".len())
         .expect("mismatched float path exists");
 
     assert_eq!(output.status.code(), Some(1), "{stdout}");
@@ -1269,15 +1297,15 @@ fn primitive_arithmetic_left_literal_defaulting_checks_range_after_family_mismat
 fn primitive_arithmetic_left_literal_tail_constrains_after_family_mismatch() {
     let source = concat!(
         "pub fn tail_constraint(floating: F32) -> I8 {\n",
-        "    let result = 7 + floating\n",
+        "    let result = 7 / floating\n",
         "    result\n",
         "}\n",
     );
     let output = run_check(source, "", &[], &[]);
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     let path = source
-        .find("+ floating")
-        .map(|start| start + "+ ".len())
+        .find("/ floating")
+        .map(|start| start + "/ ".len())
         .expect("mismatched path exists");
 
     assert_eq!(output.status.code(), Some(1), "{stdout}");
@@ -1303,16 +1331,17 @@ fn primitive_arithmetic_left_literal_tail_constrains_after_family_mismatch() {
 #[test]
 fn primitive_arithmetic_left_negative_literals_report_signed_range_spans() {
     let source = concat!(
-        "pub fn negative_ranges(signed: I8, unsigned: U8, result: I8) -> I8 {\n",
-        "    let signed_range = -129 + signed\n",
+        "pub fn negative_ranges(signed: I8, wide: I64, unsigned: U8, result: I8) -> I8 {\n",
+        "    let signed_range = -9223372036854775809 + wide\n",
         "    let unsigned_range = -1 * unsigned\n",
+        "    let division_range = -129 / signed\n",
         "    result\n",
         "}\n",
     );
     let output = run_check(source, "", &[], &[]);
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     let signed = source
-        .find("-129")
+        .find("-9223372036854775809")
         .expect("out-of-range signed literal exists");
     let unsigned = source
         .find("-1 * unsigned")
@@ -1321,7 +1350,7 @@ fn primitive_arithmetic_left_negative_literals_report_signed_range_spans() {
     assert_eq!(output.status.code(), Some(1), "{stdout}");
     assert_eq!(
         stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
-        2,
+        3,
         "both left negative literals should be range-checked:\n{stdout}"
     );
     assert!(
@@ -1333,9 +1362,9 @@ fn primitive_arithmetic_left_negative_literals_report_signed_range_spans() {
     assert_json_diagnostic_primary_span(
         &stdout,
         "LITERAL_OUT_OF_RANGE",
-        "integer literal is out of range for `I8`",
+        "integer literal is out of range for `I64`",
         signed,
-        signed + "-129".len(),
+        signed + "-9223372036854775809".len(),
     );
     assert_json_diagnostic_primary_span(
         &stdout,
@@ -1343,6 +1372,16 @@ fn primitive_arithmetic_left_negative_literals_report_signed_range_spans() {
         "integer literal is out of range for `U8`",
         unsigned,
         unsigned + "-1".len(),
+    );
+    let division = source
+        .find("-129 / signed")
+        .expect("division literal exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        division,
+        division + "-129".len(),
     );
 }
 
@@ -1352,9 +1391,9 @@ fn primitive_arithmetic_left_literal_range_uses_the_selected_pointer_width() {
     let source = concat!(
         "pub fn bounds(unsigned: USize, signed: ISize) -> USize {\n",
         "    let unsigned_32 = 4294967295 + unsigned\n",
-        "    let unsigned_64 = 18446744073709551615 + unsigned\n",
         "    let signed_min_32 = -2147483648 + signed\n",
-        "    let signed_min_64 = -9223372036854775808 + signed\n",
+        "    let div_unsigned_64 = 18446744073709551615 / unsigned\n",
+        "    let div_signed_min_64 = -9223372036854775808 / signed\n",
         "    unsigned_32\n",
         "}\n",
     );
@@ -1366,27 +1405,28 @@ fn primitive_arithmetic_left_literal_range_uses_the_selected_pointer_width() {
             .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
             .count(),
         2,
-        "out-of-range left literals should use wasm32 bounds:\n{wasm32_stdout}"
+        "out-of-range division literals should use wasm32 bounds:\n{wasm32_stdout}"
     );
-    for (token, message) in [
-        (
-            "18446744073709551615",
-            "integer literal is out of range for `USize`",
-        ),
-        (
-            "-9223372036854775808",
-            "integer literal is out of range for `ISize`",
-        ),
-    ] {
-        let start = source.find(token).expect("pointer-sized literal exists");
-        assert_json_diagnostic_primary_span(
-            &wasm32_stdout,
-            "LITERAL_OUT_OF_RANGE",
-            message,
-            start,
-            start + token.len(),
-        );
-    }
+    let div_unsigned = source
+        .find("18446744073709551615 / unsigned")
+        .expect("division USize literal exists");
+    assert_json_diagnostic_primary_span(
+        &wasm32_stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `USize`",
+        div_unsigned,
+        div_unsigned + "18446744073709551615".len(),
+    );
+    let div_signed = source
+        .find("-9223372036854775808 / signed")
+        .expect("division ISize literal exists");
+    assert_json_diagnostic_primary_span(
+        &wasm32_stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `ISize`",
+        div_signed,
+        div_signed + "-9223372036854775808".len(),
+    );
 
     let wasm64 = run_check(source, manifest, &[], &["--target", "wasm64-core"]);
     assert_eq!(
@@ -1399,15 +1439,15 @@ fn primitive_arithmetic_left_literal_range_uses_the_selected_pointer_width() {
 }
 
 #[test]
-fn primitive_sub_mul_local_literal_errors_use_literal_spans_and_recover() {
+fn primitive_arithmetic_local_literal_errors_use_literal_spans_and_recover() {
     let source = concat!(
         "pub fn errors(narrow: I8, unsigned: U8, floating: F32, integer: I32) -> U32 {\n",
-        "    let integer_range = narrow - -129\n",
-        "    let unsigned_negative_range = unsigned * -1\n",
-        "    let int_to_float = floating * 1\n",
-        "    let float_range = floating * 1e39\n",
-        "    let float_to_int = integer - 1.5\n",
-        "    let annotation: U32 = integer * 1\n",
+        "    let integer_range = narrow / -129\n",
+        "    let unsigned_negative_range = unsigned / -1\n",
+        "    let int_to_float = floating / 1\n",
+        "    let float_range = floating / 1e39\n",
+        "    let float_to_int = integer / 1.5\n",
+        "    let annotation: U32 = integer / 1\n",
         "    let annotation_copy: U32 = annotation\n",
         "    annotation_copy\n",
         "}\n",
@@ -1420,23 +1460,24 @@ fn primitive_sub_mul_local_literal_errors_use_literal_spans_and_recover() {
     };
     let int_range = span_for("-129");
     let unsigned_negative_range_start = source
-        .find("unsigned * -1")
-        .map(|start| start + "unsigned * ".len())
+        .find("unsigned / -1")
+        .map(|start| start + "unsigned / ".len())
         .expect("negative U8 literal exists");
     let unsigned_negative_range = (
         unsigned_negative_range_start,
         unsigned_negative_range_start + 2,
     );
     let int_to_float_start = source
-        .find("floating * 1")
-        .map(|start| start + "floating * ".len())
+        .find("floating / 1")
+        .map(|start| start + "floating / ".len())
         .expect("integer literal against F32 exists");
     let int_to_float = (int_to_float_start, int_to_float_start + "1".len());
     let float_range = span_for("1e39");
     let float_to_int = span_for("1.5");
     let annotation = source
-        .find("integer * 1")
-        .expect("annotated multiplication initializer exists");
+        .find("annotation: U32 = integer / 1")
+        .map(|start| start + "annotation: U32 = ".len())
+        .expect("annotated division initializer exists");
 
     assert_eq!(output.status.code(), Some(1), "{stdout}");
     assert_eq!(
@@ -1494,18 +1535,18 @@ fn primitive_sub_mul_local_literal_errors_use_literal_spans_and_recover() {
         "TYPE_MISMATCH",
         "expected `U32`, found `I32`",
         annotation,
-        annotation + "integer * 1".len(),
+        annotation + "integer / 1".len(),
     );
 }
 
 #[test]
-fn primitive_sub_mul_local_literal_range_uses_the_selected_pointer_width() {
+fn primitive_arithmetic_local_literal_range_uses_the_selected_pointer_width() {
     let manifest = "targets { wasm32-core, wasm64-core }\n";
     let source = concat!(
         "pub fn bounds(unsigned: USize, signed: ISize) -> ISize {\n",
-        "    let sub_result = unsigned - 4294967296\n",
-        "    let mul_result = signed * 2147483648\n",
-        "    mul_result\n",
+        "    let quotient_unsigned = unsigned / 4294967296\n",
+        "    let quotient_signed = signed / 2147483648\n",
+        "    quotient_signed\n",
         "}\n",
     );
     let wasm32 = run_check(source, manifest, &[], &["--target", "wasm32-core"]);
@@ -1516,7 +1557,7 @@ fn primitive_sub_mul_local_literal_range_uses_the_selected_pointer_width() {
             .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
             .count(),
         2,
-        "both right literals must use wasm32 pointer-width bounds:\n{wasm32_stdout}"
+        "both division literals must use wasm32 pointer-width bounds:\n{wasm32_stdout}"
     );
     for (literal, message) in [
         ("4294967296", "integer literal is out of range for `USize`"),
@@ -1558,8 +1599,8 @@ fn unsupported_primitive_add_local_literal_shapes_remain_gated() {
 }
 
 #[test]
-fn primitive_sub_mul_local_initializers_accept_integer_and_float_paths() {
-    for (operator_name, operator) in [("sub", "-"), ("mul", "*")] {
+fn primitive_sub_mul_div_local_initializers_accept_integer_and_float_paths() {
+    for (operator_name, operator) in [("sub", "-"), ("mul", "*"), ("div", "/")] {
         for primitive in [
             "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize", "F32", "F64",
         ] {
@@ -1577,17 +1618,18 @@ fn primitive_sub_mul_local_initializers_accept_integer_and_float_paths() {
             assert_success_result(output, "wasm32-core", "dev");
         }
     }
-    let source = "pub fn shadow(left: I32, right: U32) -> U32 {\n    let left: U32 = 2\n    let difference = left - right\n    let product = left * right\n    product\n}\n";
+    let source = "pub fn shadow(left: I32, right: U32) -> U32 {\n    let left: U32 = 2\n    let difference = left - right\n    let product = left * right\n    let quotient = left / right\n    quotient\n}\n";
     assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
 }
 
 #[test]
-fn primitive_sub_mul_right_mismatches_point_to_right_path_and_recover_to_left_type() {
+fn primitive_sub_mul_div_right_mismatches_point_to_right_path_and_recover_to_left_type() {
     let source = concat!(
         "pub fn mismatch(left: I32, right: U32, f32_value: F32, f64_value: F64) -> I32 {\n",
         "    let difference = left - right\n",
         "    let product = f32_value * f64_value\n",
         "    let product_copy: F32 = product\n",
+        "    let quotient = left / f32_value\n",
         "    difference\n",
         "}\n",
     );
@@ -1605,7 +1647,7 @@ fn primitive_sub_mul_right_mismatches_point_to_right_path_and_recover_to_left_ty
     assert_eq!(output.status.code(), Some(1), "{stdout}");
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        2,
+        3,
         "{stdout}"
     );
     assert!(
@@ -1619,8 +1661,11 @@ fn primitive_sub_mul_right_mismatches_point_to_right_path_and_recover_to_left_ty
     let mul_message = stdout
         .find("\"message\":\"expected `F32`, found `F64`\"")
         .expect("multiplication mismatch exists");
+    let div_message = stdout
+        .find("\"message\":\"expected `I32`, found `F32`\"")
+        .expect("division mismatch exists");
     assert!(
-        sub_message < mul_message,
+        sub_message < mul_message && mul_message < div_message,
         "diagnostics should follow source order:\n{stdout}"
     );
     assert_json_diagnostic_primary_span(
@@ -1637,15 +1682,27 @@ fn primitive_sub_mul_right_mismatches_point_to_right_path_and_recover_to_left_ty
         right_mul_start,
         right_mul_start + "f64_value".len(),
     );
+    let right_div_start = source
+        .find("/ f32_value")
+        .map(|start| start + "/ ".len())
+        .expect("right division operand exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `F32`",
+        right_div_start,
+        right_div_start + "f32_value".len(),
+    );
 }
 
 #[test]
-fn primitive_sub_mul_annotation_mismatches_point_to_initializer_and_recover_to_annotation() {
+fn primitive_sub_mul_div_annotation_mismatches_point_to_initializer_and_recover_to_annotation() {
     let source = concat!(
         "pub fn mismatch(left: I32, right: I32, float: F32) -> U32 {\n",
         "    let difference: U32 = left - right\n",
         "    let product: F64 = float * float\n",
         "    let product_copy: F64 = product\n",
+        "    let quotient: I8 = left / right\n",
         "    difference\n",
         "}\n",
     );
@@ -1657,11 +1714,14 @@ fn primitive_sub_mul_annotation_mismatches_point_to_initializer_and_recover_to_a
     let mul_start = source
         .find("float * float")
         .expect("multiplication initializer exists");
+    let div_start = source
+        .find("left / right")
+        .expect("division initializer exists");
 
     assert_eq!(output.status.code(), Some(1), "{stdout}");
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        2,
+        3,
         "{stdout}"
     );
     assert!(
@@ -1683,15 +1743,26 @@ fn primitive_sub_mul_annotation_mismatches_point_to_initializer_and_recover_to_a
         mul_start,
         mul_start + "float * float".len(),
     );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I8`, found `I32`",
+        div_start,
+        div_start + "left / right".len(),
+    );
 }
 
 #[test]
-fn unsupported_primitive_sub_mul_local_initializer_shapes_remain_gated() {
+fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
     for source in [
+        "pub fn div_literal_left() -> I32 {\n    let result = 1 / 2\n    result\n}\n",
+        "pub fn div_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one / left\n    result\n}\n",
+        "pub fn div_nested_right(left: I32, right: I32) -> I32 {\n    let result = left / (right / 1)\n    result\n}\n",
+        "pub fn div_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left / right) / left\n    result\n}\n",
+        "type IntegerAlias = I32\npub fn div_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left / right\n    result\n}\n",
         "pub fn mul(left: I32, right: I32) -> I32 {\n    let result = 1 * 2\n    result\n}\n",
         "pub fn mul(left: I32, right: I32) -> I32 {\n    let one = 1\n    let result = one * left\n    result\n}\n",
         "pub fn nested(left: I32, right: I32) -> I32 {\n    let result = (left - right) * left\n    result\n}\n",
-        "pub fn unsupported(left: I32, right: I32) -> I32 {\n    let result = left / right\n    result\n}\n",
         "pub fn remainder(left: I32, right: I32) -> I32 {\n    let result = left % 2\n    result\n}\n",
         "pub fn wrapping_add(left: I32) -> I32 {\n    let result = left +% 1\n    result\n}\n",
         "pub fn wrapping_sub(left: I32) -> I32 {\n    let result = left -% 1\n    result\n}\n",
@@ -1699,6 +1770,8 @@ fn unsupported_primitive_sub_mul_local_initializer_shapes_remain_gated() {
         "pub fn byte(left: Byte, right: Byte) -> Byte {\n    let result = left - right\n    result\n}\n",
         "pub fn char(left: Char, right: Char) -> Char {\n    let result = left * right\n    result\n}\n",
         "pub fn bool(left: Bool, right: Bool) -> Bool {\n    let result = left - right\n    result\n}\n",
+        "pub fn byte_div(left: Byte, right: Byte) -> Byte {\n    let result = left / right\n    result\n}\n",
+        "pub fn bool_div(left: Bool, right: Bool) -> Bool {\n    let result = left / right\n    result\n}\n",
         "type IntegerAlias = I32\npub fn alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left * right\n    result\n}\n",
         "pub fn forward(left: I32) -> I32 {\n    let result = later * left\n    let later: I32 = 1\n    result\n}\n",
         "pub fn self_reference(left: I32) -> I32 {\n    let result = result - left\n    result\n}\n",
@@ -1708,7 +1781,7 @@ fn unsupported_primitive_sub_mul_local_initializer_shapes_remain_gated() {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
 
-    for (function, operator) in [("sub", "-"), ("mul", "*")] {
+    for (function, operator) in [("sub", "-"), ("mul", "*"), ("div", "/")] {
         let source = format!(
             "use acme:empty/values as values\npub fn {function}(right: I32) -> I32 {{\n    let result = values.VALUE {operator} right\n    result\n}}\n"
         );
@@ -1788,7 +1861,7 @@ fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
         "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = 1 + 2\n    sum\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let one = 1\n    let sum = one + right\n    sum\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = (left + right) + left\n    sum\n}\n",
-        "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = left / right\n    sum\n}\n",
+        "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = left % right\n    sum\n}\n",
         "pub fn add(left: Byte, right: Byte) -> Byte {\n    let sum = left + right\n    sum\n}\n",
         "pub fn add(left: Char, right: Char) -> Char {\n    let sum = left + right\n    sum\n}\n",
         "pub fn add(left: Bool, right: Bool) -> Bool {\n    let sum = left + right\n    sum\n}\n",
@@ -1901,7 +1974,7 @@ fn primitive_comparison_local_uses_shadowed_binding_and_source_order() {
 fn unsupported_primitive_comparison_local_initializer_shapes_remain_gated() {
     for source in [
         "pub fn compare(left: I32) -> Bool {\n    let inferred = 1\n    let result = inferred == left\n    result\n}\n",
-        "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left / right\n    result\n}\n",
+        "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left % right\n    result\n}\n",
         "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = (left == right) and (left < right)\n    result\n}\n",
         "pub fn compare(left: Str, right: Str) -> Bool {\n    let result = left == right\n    result\n}\n",
         "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left as I64 == right as I64\n    result\n}\n",
@@ -3393,7 +3466,7 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local() -> I32 {\nlet value: I32 = 42\n{ value }\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nvar second: I32 = 2\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = 40 + 2\nfirst\n}\n",
-        "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first / 1\nfirst\n}\n",
+        "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first % 1\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nfirst\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nlet copy: I32 = r#value\ncopy\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = second\nlet second: I32 = 2\nfirst\n}\n",
