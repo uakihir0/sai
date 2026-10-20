@@ -6107,24 +6107,20 @@ fn check_function_body_type(
             ),
             _ => false,
         };
-        let mixed_condition_diagnostics = if condition_is_negated {
-            None
-        } else {
-            check_function_if_mixed_logical_comparison_condition(
-                owner,
-                cond,
-                *first.ty,
-                first_body,
-                *second.ty,
-                second_body,
-                locals,
-                type_paths,
-                symbols,
-                inputs,
-                snapshot,
-                target_cfg,
-            )?
-        };
+        let mixed_condition_diagnostics = check_function_if_mixed_logical_comparison_condition(
+            owner,
+            comparison_condition,
+            *first.ty,
+            first_body,
+            *second.ty,
+            second_body,
+            locals,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?;
         let direct_condition_is_supported = (!condition_is_negated
             || condition_is_supported_when_negated)
             && function_if_binary_condition_uses_parameter_bindings(
@@ -25245,10 +25241,19 @@ mod tests {
             "pub fn disjunction_reversed(value: I32, enabled: Bool) -> I32 { if value < 20 or enabled { 1 } else { 2 } }\n",
             "pub fn disjunction_literal_left(enabled: Bool, value: U8) -> I32 { if 18 <= value or enabled { 1 } else { 2 } }\n",
             "pub fn negated_condition(enabled: Bool, value: I32) -> I32 { if not (enabled and value >= 18) { 1 } else { 2 } }\n",
+            "pub fn negated_disjunction(value: I32, enabled: Bool) -> I32 { if not (value < 20 or enabled) { 1 } else { 2 } }\n",
             "pub fn negated_comparison(enabled: Bool, value: I32) -> I32 { if enabled and not (value >= 18) { 1 } else { 2 } }\n",
+            "pub fn negated_disjunction_comparison(enabled: Bool, value: I32) -> I32 { if enabled or not (value >= 18) { 1 } else { 2 } }\n",
             "pub fn nested_condition(enabled: Bool, value: I32) -> I32 { if enabled and (value > 0 and value < 10) { 1 } else { 2 } }\n",
+            "pub fn negated_nested_condition(enabled: Bool, value: I32) -> I32 { if not (enabled and (value > 0 and value < 10)) { 1 } else { 2 } }\n",
+            "pub fn negated_nested_disjunction(enabled: Bool, value: I32) -> I32 { if not (enabled or (value > 0 or value < 10)) { 1 } else { 2 } }\n",
+            "pub fn negated_bool_path(enabled: Bool, value: I32) -> I32 { if not (not enabled and value >= 18) { 1 } else { 2 } }\n",
             "pub fn repeated_parameter(enabled: Bool, value: I32) -> I32 { if enabled and enabled >= 18 { 1 } else { 2 } }\n",
             "pub fn disjunction_repeated_parameter(enabled: Bool, value: I32) -> I32 { if enabled or enabled >= 18 { 1 } else { 2 } }\n",
+            "pub fn negated_repeated_parameter(enabled: Bool, value: I32) -> I32 { if not (enabled and enabled >= 18) { 1 } else { 2 } }\n",
+            "pub fn negated_repeated_disjunction(enabled: Bool, value: I32) -> I32 { if not (enabled or enabled >= 18) { 1 } else { 2 } }\n",
+            "pub fn double_negated_condition(enabled: Bool, value: I32) -> I32 { if not not (enabled and value >= 18) { 1 } else { 2 } }\n",
+            "pub fn double_negated_disjunction(enabled: Bool, value: I32) -> I32 { if not not (enabled or value >= 18) { 1 } else { 2 } }\n",
             "pub fn aliased_bool(enabled: BoolAlias, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
             "pub fn wrong_bool_type(enabled: I32, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
             "pub fn extra_parameter(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
@@ -25267,9 +25272,9 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 15);
+        assert_eq!(owners.len(), 24);
 
-        for index in 0..7 {
+        for index in 0..9 {
             let check = owners[index]
                 .body_type_check()
                 .expect("both logical and comparison operand orders are checked");
@@ -25278,7 +25283,7 @@ mod tests {
                 "function owner {index} unexpectedly failed the mixed condition slice: {check:?}"
             );
         }
-        for (index, owner) in owners.iter().enumerate().skip(7) {
+        for (index, owner) in owners.iter().enumerate().skip(9) {
             let check = owner
                 .body_type_check()
                 .expect("unsupported mixed condition shape is gated");
