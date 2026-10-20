@@ -11,3 +11,6 @@ every project builds today.
 - [`mini-task-board`](mini-task-board/README.md) splits a small task board
   across modules and demonstrates records, enums, command dispatch, and a
   summary.
+- [`market-checkout`](market-checkout/README.md) models a small market's
+  catalog, orders, stock checks, discounts, tax, and operator reports across
+  several modules.

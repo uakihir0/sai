@@ -1,0 +1,39 @@
+use sai:core/fmt.{Writer}
+use sai:process
+use acme:market-checkout/report
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        report.print_usage(borrow mut out)
+        return process.ExitCode.failure()
+    }
+
+    let command = args[1].as_str()
+    if command == "catalog" {
+        report.print_catalog(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "orders" {
+        report.print_orders(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "quote" {
+        report.print_quotes(borrow mut out, false)
+        return process.ExitCode.success()
+    }
+    if command == "fulfill" {
+        report.print_quotes(borrow mut out, true)
+        return process.ExitCode.success()
+    }
+    if command == "inventory" {
+        report.print_inventory(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    report.print_usage(borrow mut out)
+    process.ExitCode.failure()
+}
