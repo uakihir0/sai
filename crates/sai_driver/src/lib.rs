@@ -6350,7 +6350,7 @@ fn check_function_body_primitive_local_block(
                 }
             }
             ExprKind::Binary(operator, left, right)
-                if is_function_primitive_comparison_operator(operator) =>
+                if is_function_primitive_local_binary_operator(operator) =>
             {
                 for operand in [left, right] {
                     let ExprKind::Path(path) = operand.kind else {
@@ -6404,10 +6404,17 @@ fn check_function_body_primitive_local_block(
     primitive_body_errors_to_diagnostics(owner, block, tail, errors, inputs, snapshot)
 }
 
-fn is_function_primitive_comparison_operator(operator: BinOp) -> bool {
+fn is_function_primitive_local_binary_operator(operator: BinOp) -> bool {
     matches!(
         operator,
-        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        BinOp::And
+            | BinOp::Or
+            | BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
     )
 }
 
