@@ -1123,6 +1123,337 @@ fn primitive_integer_division_by_zero_is_a_type_check_success() {
 }
 
 #[test]
+fn primitive_integer_remainder_accepts_flat_local_forms_for_every_integer_type() {
+    for primitive in [
+        "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
+    ] {
+        let lower = primitive.to_ascii_lowercase();
+        let literal = match primitive {
+            "I8" => "-128",
+            "U8" => "-0",
+            _ => "1",
+        };
+        let forms = [
+            (
+                "paths",
+                format!(
+                    "pub fn remainder_{lower}_paths(left: {primitive}, right: {primitive}) -> {primitive} {{\n    let result = left % right\n    result\n}}\n"
+                ),
+            ),
+            (
+                "right literal",
+                format!(
+                    "pub fn remainder_{lower}_right_literal(left: {primitive}) -> {primitive} {{\n    let result = left % 0\n    result\n}}\n"
+                ),
+            ),
+            (
+                "left literal",
+                format!(
+                    "pub fn remainder_{lower}_left_literal(right: {primitive}) -> {primitive} {{\n    let result = {literal} % right\n    result\n}}\n"
+                ),
+            ),
+        ];
+        for (form, source) in forms {
+            let output = run_check(&source, "", &[], &[]);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "integer remainder should accept matching {primitive} {form}, including zero divisors at type-check time:\n{source}\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_success_result(output, "wasm32-core", "dev");
+        }
+    }
+}
+
+#[test]
+fn primitive_integer_remainder_checks_signed_unsigned_and_pointer_width_ranges() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let sign_source = concat!(
+        "pub fn sign_ranges(signed: I8, unsigned: U8) -> I8 {\n",
+        "    let signed_minimum = -128 % signed\n",
+        "    let unsigned_negative_zero = -0 % unsigned\n",
+        "    let signed_out_of_range = -129 % signed\n",
+        "    let unsigned_out_of_range = -1 % unsigned\n",
+        "    signed_minimum\n",
+        "}\n",
+    );
+    let sign_output = run_check(sign_source, "", &[], &[]);
+    let sign_stdout = String::from_utf8(sign_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(sign_output.status.code(), Some(1), "{sign_stdout}");
+    assert_eq!(
+        sign_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        2,
+        "signed and unsigned boundaries should be checked:\n{sign_stdout}"
+    );
+    for (literal, message) in [
+        ("-129", "integer literal is out of range for `I8`"),
+        ("-1 % unsigned", "integer literal is out of range for `U8`"),
+    ] {
+        let start = sign_source
+            .find(literal)
+            .expect("out-of-range literal exists");
+        let end = if literal == "-1 % unsigned" {
+            start + "-1".len()
+        } else {
+            start + literal.len()
+        };
+        assert_json_diagnostic_primary_span(
+            &sign_stdout,
+            "LITERAL_OUT_OF_RANGE",
+            message,
+            start,
+            end,
+        );
+    }
+
+    let pointer_source = concat!(
+        "pub fn pointer_ranges(unsigned: USize, signed: ISize) -> ISize {\n",
+        "    let unsigned_32 = 4294967295 % unsigned\n",
+        "    let signed_minimum_32 = -2147483648 % signed\n",
+        "    let unsigned_64 = 18446744073709551615 % unsigned\n",
+        "    let signed_minimum_64 = -9223372036854775808 % signed\n",
+        "    signed_minimum_32\n",
+        "}\n",
+    );
+    let wasm32 = run_check(pointer_source, manifest, &[], &["--target", "wasm32-core"]);
+    let wasm32_stdout = String::from_utf8(wasm32.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(wasm32.status.code(), Some(1), "{wasm32_stdout}");
+    assert_eq!(
+        wasm32_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        2,
+        "pointer-sized remainder literals must use wasm32 bounds:\n{wasm32_stdout}"
+    );
+    for (literal, message) in [
+        (
+            "18446744073709551615",
+            "integer literal is out of range for `USize`",
+        ),
+        (
+            "-9223372036854775808",
+            "integer literal is out of range for `ISize`",
+        ),
+    ] {
+        let start = pointer_source
+            .find(literal)
+            .expect("out-of-range pointer literal exists");
+        assert_json_diagnostic_primary_span(
+            &wasm32_stdout,
+            "LITERAL_OUT_OF_RANGE",
+            message,
+            start,
+            start + literal.len(),
+        );
+    }
+
+    let wasm64 = run_check(pointer_source, manifest, &[], &["--target", "wasm64-core"]);
+    assert_eq!(
+        wasm64.status.code(),
+        Some(0),
+        "pointer-sized remainder literals should fit wasm64:\n{}",
+        String::from_utf8_lossy(&wasm64.stdout)
+    );
+    assert_success_result(wasm64, "wasm64-core", "dev");
+}
+
+#[test]
+fn primitive_integer_remainder_operand_and_annotation_mismatches_recover() {
+    let right_source = concat!(
+        "pub fn right_mismatch(left: I32, right: U32) -> I32 {\n",
+        "    let result = left % right\n",
+        "    result\n",
+        "}\n",
+    );
+    let right_output = run_check(right_source, "", &[], &[]);
+    let right_stdout = String::from_utf8(right_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(right_output.status.code(), Some(1), "{right_stdout}");
+    assert_eq!(
+        right_stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "{right_stdout}"
+    );
+    assert!(
+        !right_stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !right_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !right_stdout.contains("\"type\":\"result\""),
+        "integer operand mismatches should recover without gating or float-operator errors:\n{right_stdout}"
+    );
+    let right = right_source
+        .find("% right")
+        .map(|start| start + "% ".len())
+        .expect("right operand exists");
+    assert_json_diagnostic_primary_span(
+        &right_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `U32`",
+        right,
+        right + "right".len(),
+    );
+
+    let annotation_source = concat!(
+        "pub fn annotation_mismatch(left: I32, right: I32) -> U32 {\n",
+        "    let result: U32 = left % right\n",
+        "    result\n",
+        "}\n",
+    );
+    let annotation_output = run_check(annotation_source, "", &[], &[]);
+    let annotation_stdout =
+        String::from_utf8(annotation_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        annotation_output.status.code(),
+        Some(1),
+        "{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "{annotation_stdout}"
+    );
+    assert!(
+        !annotation_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !annotation_stdout.contains("\"type\":\"result\""),
+        "integer annotation mismatch should recover to U32 and reach the tail:\n{annotation_stdout}"
+    );
+    let annotation = annotation_source
+        .find("left % right")
+        .expect("annotated remainder exists");
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "TYPE_MISMATCH",
+        "expected `U32`, found `I32`",
+        annotation,
+        annotation + "left % right".len(),
+    );
+}
+
+#[test]
+fn primitive_float_remainder_reports_operator_help_and_recovers() {
+    let cases = [
+        (
+            concat!(
+                "pub fn float_paths(left: F32, right: F32) -> F32 {\n",
+                "    let result = left % right\n",
+                "    result\n",
+                "}\n",
+            ),
+            "left % right",
+            "operator `%` is not defined for `F32`",
+            None,
+        ),
+        (
+            concat!(
+                "pub fn float_right_literal(left: F32) -> F32 {\n",
+                "    let result = left % 1\n",
+                "    result\n",
+                "}\n",
+            ),
+            "left % 1",
+            "operator `%` is not defined for `F32`",
+            Some(("expected `F32`, found an integer literal", 7, 1)),
+        ),
+        (
+            concat!(
+                "pub fn float_left_literal(right: F64) -> F64 {\n",
+                "    let result = 1.5 % right\n",
+                "    result\n",
+                "}\n",
+            ),
+            "1.5 % right",
+            "operator `%` is not defined for `F64`",
+            None,
+        ),
+        (
+            concat!(
+                "pub fn float_path_mismatch(left: F32, right: F64) -> F32 {\n",
+                "    let result = left % right\n",
+                "    result\n",
+                "}\n",
+            ),
+            "left % right",
+            "operator `%` is not defined for `F32`",
+            Some(("expected `F32`, found `F64`", 7, 5)),
+        ),
+        (
+            concat!(
+                "pub fn float_literal_path_mismatch(right: I32) -> F64 {\n",
+                "    let result = 1.5 % right\n",
+                "    result\n",
+                "}\n",
+            ),
+            "1.5 % right",
+            "operator `%` is not defined for floating-point values",
+            Some(("expected `F64`, found `I32`", 6, 5)),
+        ),
+        (
+            concat!(
+                "pub fn float_literal_path_mismatch(right: I32) -> F32 {\n",
+                "    let result: F32 = 1.5 % right\n",
+                "    result\n",
+                "}\n",
+            ),
+            "1.5 % right",
+            "operator `%` is not defined for floating-point values",
+            Some(("expected `F64`, found `I32`", 6, 5)),
+        ),
+    ];
+    for (source, expression, operator_message, mismatch) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        let operator_records = stdout
+            .lines()
+            .filter(|record| record.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\""))
+            .collect::<Vec<_>>();
+        assert_eq!(operator_records.len(), 1, "{stdout}");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "supported flat float forms should report the operator error instead of being gated:\n{stdout}"
+        );
+        let operator_record = operator_records[0];
+        assert!(
+            operator_record.contains("\"data\":{}")
+                && operator_record.contains(&format!(
+                    "\"message\":\"use the floating-point `rem` method (for example, `left.rem(right)`)"
+                )),
+            "{operator_record}"
+        );
+        let expression_start = source
+            .find(expression)
+            .expect("remainder expression exists");
+        let expression_end = expression_start + expression.len();
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            operator_message,
+            expression_start,
+            expression_end,
+        );
+        if let Some((message, offset, length)) = mismatch {
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                message,
+                expression_start + offset,
+                expression_start + offset + length,
+            );
+        }
+        if source.contains("float_literal_path_mismatch") {
+            assert!(
+                !stdout.contains("expected `F32`, found `F64`"),
+                "the annotation should resolve the literal without retroactively making the unsupported-operator diagnostic claim F64:\n{stdout}"
+            );
+        }
+    }
+}
+
+#[test]
 fn primitive_arithmetic_local_initializers_accept_left_numeric_literals() {
     for (operator_name, operator) in [("add", "+"), ("sub", "-"), ("mul", "*"), ("div", "/")] {
         for primitive in [
@@ -1763,7 +2094,17 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn mul(left: I32, right: I32) -> I32 {\n    let result = 1 * 2\n    result\n}\n",
         "pub fn mul(left: I32, right: I32) -> I32 {\n    let one = 1\n    let result = one * left\n    result\n}\n",
         "pub fn nested(left: I32, right: I32) -> I32 {\n    let result = (left - right) * left\n    result\n}\n",
-        "pub fn remainder(left: I32, right: I32) -> I32 {\n    let result = left % 2\n    result\n}\n",
+        "pub fn remainder_literal_literal() -> I32 {\n    let result = 1 % 2\n    result\n}\n",
+        "pub fn remainder_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one % left\n    result\n}\n",
+        "pub fn remainder_nested_right(left: I32, right: I32) -> I32 {\n    let result = left % (right % 1)\n    result\n}\n",
+        "pub fn remainder_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left % right) % left\n    result\n}\n",
+        "type IntegerAlias = I32\npub fn remainder_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left % right\n    result\n}\n",
+        "pub fn remainder_byte(left: Byte, right: Byte) -> Byte {\n    let result = left % right\n    result\n}\n",
+        "pub fn remainder_bool(left: Bool, right: Bool) -> Bool {\n    let result = left % right\n    result\n}\n",
+        "pub fn remainder_char(left: Char, right: Char) -> Char {\n    let result = left % right\n    result\n}\n",
+        "pub fn remainder_byte_rhs(left: I32, right: Byte) -> I32 {\n    let result = left % right\n    result\n}\n",
+        "pub fn remainder_bool_rhs(left: I32, right: Bool) -> I32 {\n    let result = left % right\n    result\n}\n",
+        "pub fn remainder_char_rhs(left: I32, right: Char) -> I32 {\n    let result = left % right\n    result\n}\n",
         "pub fn wrapping_add(left: I32) -> I32 {\n    let result = left +% 1\n    result\n}\n",
         "pub fn wrapping_sub(left: I32) -> I32 {\n    let result = left -% 1\n    result\n}\n",
         "pub fn wrapping_mul(left: I32) -> I32 {\n    let result = left *% 1\n    result\n}\n",
@@ -1861,7 +2202,6 @@ fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
         "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = 1 + 2\n    sum\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let one = 1\n    let sum = one + right\n    sum\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = (left + right) + left\n    sum\n}\n",
-        "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = left % right\n    sum\n}\n",
         "pub fn add(left: Byte, right: Byte) -> Byte {\n    let sum = left + right\n    sum\n}\n",
         "pub fn add(left: Char, right: Char) -> Char {\n    let sum = left + right\n    sum\n}\n",
         "pub fn add(left: Bool, right: Bool) -> Bool {\n    let sum = left + right\n    sum\n}\n",
@@ -1974,7 +2314,6 @@ fn primitive_comparison_local_uses_shadowed_binding_and_source_order() {
 fn unsupported_primitive_comparison_local_initializer_shapes_remain_gated() {
     for source in [
         "pub fn compare(left: I32) -> Bool {\n    let inferred = 1\n    let result = inferred == left\n    result\n}\n",
-        "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left % right\n    result\n}\n",
         "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = (left == right) and (left < right)\n    result\n}\n",
         "pub fn compare(left: Str, right: Str) -> Bool {\n    let result = left == right\n    result\n}\n",
         "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left as I64 == right as I64\n    result\n}\n",
@@ -3466,7 +3805,7 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local() -> I32 {\nlet value: I32 = 42\n{ value }\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nvar second: I32 = 2\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = 40 + 2\nfirst\n}\n",
-        "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first % 1\nfirst\n}\n",
+        "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first % (1 + 0)\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nfirst\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nlet copy: I32 = r#value\ncopy\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = second\nlet second: I32 = 2\nfirst\n}\n",
