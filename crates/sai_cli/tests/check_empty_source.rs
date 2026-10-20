@@ -1454,6 +1454,250 @@ fn primitive_float_remainder_reports_operator_help_and_recovers() {
 }
 
 #[test]
+fn primitive_integer_wrapping_operators_accept_matching_path_pairs() {
+    let primitives = [
+        "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
+    ];
+    let operators = [("add", "+%"), ("sub", "-%"), ("mul", "*%")];
+    for (name, operator) in operators {
+        for primitive in primitives {
+            let lower = primitive.to_ascii_lowercase();
+            let source = format!(
+                concat!(
+                    "pub fn wrapping_{name}_{lower}(left: {primitive}, right: {primitive}) -> {primitive} {{\n",
+                    "    let result = left {operator} right\n",
+                    "    result\n",
+                    "}}\n",
+                ),
+                name = name,
+                lower = lower,
+                primitive = primitive,
+                operator = operator,
+            );
+            let output = run_check(&source, "", &[], &[]);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{operator} should accept matching {primitive} paths:\n{source}\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_success_result(output, "wasm32-core", "dev");
+        }
+
+        let shadow_source = format!(
+            concat!(
+                "pub fn wrapping_{name}_shadow(left: I32, right: I32) -> I32 {{\n",
+                "    let left: I32 = right\n",
+                "    let result = left {operator} right\n",
+                "    result\n",
+                "}}\n",
+            ),
+            name = name,
+            operator = operator,
+        );
+        let shadow_output = run_check(&shadow_source, "", &[], &[]);
+        assert_eq!(
+            shadow_output.status.code(),
+            Some(0),
+            "shadowed path resolution should preserve binding identity for {operator}:\n{shadow_source}\n{}",
+            String::from_utf8_lossy(&shadow_output.stdout)
+        );
+        assert_success_result(shadow_output, "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_wrapping_operators_recover_path_and_annotation_mismatches() {
+    let path_source = concat!(
+        "pub fn wrapping_path_mismatch(left: I32, right: U32) -> I32 {\n",
+        "    let result = left +% right\n",
+        "    result\n",
+        "}\n",
+    );
+    let path_output = run_check(path_source, "", &[], &[]);
+    let path_stdout = String::from_utf8(path_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(path_output.status.code(), Some(1), "{path_stdout}");
+    assert_eq!(
+        path_stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "{path_stdout}"
+    );
+    assert!(
+        !path_stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !path_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !path_stdout.contains("\"type\":\"result\""),
+        "an integer wrapping path mismatch should recover to the left type:\n{path_stdout}"
+    );
+    let right_start = path_source
+        .find("+% right")
+        .map(|start| start + "+% ".len())
+        .expect("right path exists");
+    assert_json_diagnostic_primary_span(
+        &path_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `U32`",
+        right_start,
+        right_start + "right".len(),
+    );
+
+    let annotation_source = concat!(
+        "pub fn wrapping_annotation_mismatch(left: I32, right: I32) -> U32 {\n",
+        "    let result: U32 = left -% right\n",
+        "    result\n",
+        "}\n",
+    );
+    let annotation_output = run_check(annotation_source, "", &[], &[]);
+    let annotation_stdout =
+        String::from_utf8(annotation_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        annotation_output.status.code(),
+        Some(1),
+        "{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "{annotation_stdout}"
+    );
+    assert!(
+        !annotation_stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !annotation_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !annotation_stdout.contains("\"type\":\"result\""),
+        "an annotation mismatch should recover the wrapping local to its declaration:\n{annotation_stdout}"
+    );
+    let expression_start = annotation_source
+        .find("left -% right")
+        .expect("wrapping expression exists");
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "TYPE_MISMATCH",
+        "expected `U32`, found `I32`",
+        expression_start,
+        expression_start + "left -% right".len(),
+    );
+}
+
+#[test]
+fn non_integer_primitive_wrapping_operators_report_operator_not_supported() {
+    for (name, operator) in [("add", "+%"), ("sub", "-%"), ("mul", "*%")] {
+        for primitive in ["F32", "F64", "Bool", "Byte", "Char"] {
+            let source = format!(
+                concat!(
+                    "pub fn wrapping_{name}_{lower}(left: {primitive}, right: {primitive}) -> {primitive} {{\n",
+                    "    let result = left {operator} right\n",
+                    "    result\n",
+                    "}}\n",
+                ),
+                name = name,
+                operator = operator,
+                primitive = primitive,
+                lower = primitive.to_ascii_lowercase(),
+            );
+            let output = run_check(&source, "", &[], &[]);
+            let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+            assert_eq!(output.status.code(), Some(1), "{stdout}");
+            assert_eq!(
+                stdout
+                    .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                    .count(),
+                1,
+                "{stdout}"
+            );
+            assert!(
+                !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                    && !stdout.contains("\"type\":\"result\""),
+                "known non-integer primitive `{primitive}` should report the unsupported operator:\n{source}\n{stdout}"
+            );
+            let expression_start = source
+                .find(&format!("left {operator} right"))
+                .expect("wrapping expression exists");
+            let expression_end = expression_start + format!("left {operator} right").len();
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "OPERATOR_NOT_SUPPORTED",
+                &format!("operator `{operator}` is not defined for `{primitive}`"),
+                expression_start,
+                expression_end,
+            );
+        }
+    }
+
+    let mismatch_source = concat!(
+        "pub fn wrapping_float_mismatch(left: F32, right: F64) -> F32 {\n",
+        "    let result = left *% right\n",
+        "    result\n",
+        "}\n",
+    );
+    let mismatch_output = run_check(mismatch_source, "", &[], &[]);
+    let mismatch_stdout = String::from_utf8(mismatch_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(mismatch_output.status.code(), Some(1), "{mismatch_stdout}");
+    assert_eq!(
+        mismatch_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "{mismatch_stdout}"
+    );
+    assert_eq!(
+        mismatch_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "{mismatch_stdout}"
+    );
+    let expression_start = mismatch_source
+        .find("left *% right")
+        .expect("wrapping expression exists");
+    assert_json_diagnostic_primary_span(
+        &mismatch_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `*%` is not defined for `F32`",
+        expression_start,
+        expression_start + "left *% right".len(),
+    );
+    let right_start = mismatch_source
+        .find("*% right")
+        .map(|start| start + "*% ".len())
+        .expect("right path exists");
+    assert_json_diagnostic_primary_span(
+        &mismatch_stdout,
+        "TYPE_MISMATCH",
+        "expected `F32`, found `F64`",
+        right_start,
+        right_start + "right".len(),
+    );
+
+    let char_mismatch_source = concat!(
+        "pub fn wrapping_char_mismatch(left: Char, right: Bool) -> Char {\n",
+        "    let result = left +% right\n",
+        "    result\n",
+        "}\n",
+    );
+    let char_mismatch_output = run_check(char_mismatch_source, "", &[], &[]);
+    let char_mismatch_stdout =
+        String::from_utf8(char_mismatch_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        char_mismatch_output.status.code(),
+        Some(1),
+        "{char_mismatch_stdout}"
+    );
+    assert_eq!(
+        char_mismatch_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "{char_mismatch_stdout}"
+    );
+    assert!(
+        !char_mismatch_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !char_mismatch_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "Char follows the missing-trait operator error without a synthesized right mismatch:\n{char_mismatch_stdout}"
+    );
+}
+
+#[test]
 fn primitive_arithmetic_local_initializers_accept_left_numeric_literals() {
     for (operator_name, operator) in [("add", "+"), ("sub", "-"), ("mul", "*"), ("div", "/")] {
         for primitive in [
@@ -2108,6 +2352,11 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn wrapping_add(left: I32) -> I32 {\n    let result = left +% 1\n    result\n}\n",
         "pub fn wrapping_sub(left: I32) -> I32 {\n    let result = left -% 1\n    result\n}\n",
         "pub fn wrapping_mul(left: I32) -> I32 {\n    let result = left *% 1\n    result\n}\n",
+        "pub fn wrapping_left_literal(right: I32) -> I32 {\n    let result = 1 +% right\n    result\n}\n",
+        "pub fn wrapping_literal_literal() -> I32 {\n    let result = 1 +% 2\n    result\n}\n",
+        "pub fn wrapping_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one +% left\n    result\n}\n",
+        "pub fn wrapping_nested(left: I32, right: I32) -> I32 {\n    let result = left +% (right +% left)\n    result\n}\n",
+        "type IntegerAlias = I32\npub fn wrapping_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left +% right\n    result\n}\n",
         "pub fn byte(left: Byte, right: Byte) -> Byte {\n    let result = left - right\n    result\n}\n",
         "pub fn char(left: Char, right: Char) -> Char {\n    let result = left * right\n    result\n}\n",
         "pub fn bool(left: Bool, right: Bool) -> Bool {\n    let result = left - right\n    result\n}\n",
