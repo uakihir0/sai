@@ -6110,6 +6110,7 @@ fn check_function_body_type(
         let mixed_condition_diagnostics = check_function_if_mixed_logical_comparison_condition(
             owner,
             comparison_condition,
+            !condition_is_negated,
             *first.ty,
             first_body,
             *second.ty,
@@ -6375,6 +6376,7 @@ fn check_function_if_parameter_comparison_condition(
 fn check_function_if_mixed_logical_comparison_condition(
     owner: &HirOwner<'_>,
     condition: &HirExpr<'_>,
+    allow_negated_comparison_operand: bool,
     first_parameter_ty: Ty<'_>,
     first_body_parameter: &sai_hir::body::BodyParam,
     second_parameter_ty: Ty<'_>,
@@ -6396,8 +6398,12 @@ fn check_function_if_mixed_logical_comparison_condition(
     } else {
         return Ok(None);
     };
+    let comparison_for_shape = match comparison.kind {
+        ExprKind::Unary(UnOp::Not, operand) if allow_negated_comparison_operand => operand,
+        _ => comparison,
+    };
     if !matches!(
-        comparison.kind,
+        comparison_for_shape.kind,
         ExprKind::Binary(
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
             _,
@@ -25244,6 +25250,9 @@ mod tests {
             "pub fn negated_disjunction(value: I32, enabled: Bool) -> I32 { if not (value < 20 or enabled) { 1 } else { 2 } }\n",
             "pub fn negated_comparison(enabled: Bool, value: I32) -> I32 { if enabled and not (value >= 18) { 1 } else { 2 } }\n",
             "pub fn negated_disjunction_comparison(enabled: Bool, value: I32) -> I32 { if enabled or not (value >= 18) { 1 } else { 2 } }\n",
+            "pub fn negated_comparison_reversed(value: U8, enabled: Bool) -> I32 { if not (18 <= value) and enabled { 1 } else { 2 } }\n",
+            "pub fn negated_disjunction_reversed(value: I32, enabled: Bool) -> I32 { if not (value < 20) or enabled { 1 } else { 2 } }\n",
+            "pub fn negated_comparison_twice(enabled: Bool, value: I32) -> I32 { if enabled and not (not (value >= 18)) { 1 } else { 2 } }\n",
             "pub fn nested_condition(enabled: Bool, value: I32) -> I32 { if enabled and (value > 0 and value < 10) { 1 } else { 2 } }\n",
             "pub fn negated_nested_condition(enabled: Bool, value: I32) -> I32 { if not (enabled and (value > 0 and value < 10)) { 1 } else { 2 } }\n",
             "pub fn negated_nested_disjunction(enabled: Bool, value: I32) -> I32 { if not (enabled or (value > 0 or value < 10)) { 1 } else { 2 } }\n",
@@ -25272,9 +25281,9 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 24);
+        assert_eq!(owners.len(), 27);
 
-        for index in 0..9 {
+        for index in 0..13 {
             let check = owners[index]
                 .body_type_check()
                 .expect("both logical and comparison operand orders are checked");
@@ -25283,7 +25292,7 @@ mod tests {
                 "function owner {index} unexpectedly failed the mixed condition slice: {check:?}"
             );
         }
-        for (index, owner) in owners.iter().enumerate().skip(9) {
+        for (index, owner) in owners.iter().enumerate().skip(13) {
             let check = owner
                 .body_type_check()
                 .expect("unsupported mixed condition shape is gated");
