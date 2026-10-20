@@ -349,6 +349,61 @@ fn unsupported_unannotated_copy_local_forms_remain_gated() {
 }
 
 #[test]
+fn public_parameter_local_copy_emits_check_result() {
+    for source in [
+        "pub fn copy_annotated(source: I32) -> I32 {\n    let copied: I32 = source\n    copied\n}\n",
+        "pub fn copy_unannotated(source: I32) -> I32 {\n    let copied = source\n    copied\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn parameter_local_copy_reports_semantic_errors_without_a_feature_gate() {
+    for (source, message, token) in [
+        (
+            "pub fn copy_mismatch(source: I32) -> F32 {\n    let copied: F32 = source\n    copied\n}\n",
+            "expected `F32`, found `I32`",
+            "source",
+        ),
+        (
+            "pub fn return_mismatch(source: I32) -> Bool {\n    let copied: I32 = source\n    copied\n}\n",
+            "expected `Bool`, found `I32`",
+            "copied",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let start = source.rfind(token).expect("diagnostic token exists");
+        let end = start + token.len();
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "supported parameter-local errors must not be hidden by a feature gate:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(&stdout, "TYPE_MISMATCH", message, start, end);
+    }
+}
+
+#[test]
+fn unsupported_parameter_local_copy_forms_remain_gated() {
+    for source in [
+        "pub fn copy(source: I32, other: I32) -> I32 {\n    let copied: I32 = source\n    copied\n}\n",
+        "pub fn copy(var source: I32) -> I32 {\n    let copied: I32 = source\n    copied\n}\n",
+        "pub fn copy(self: I32) -> I32 {\n    let copied: I32 = self\n    copied\n}\n",
+        "pub fn parameter_tail(source: I32) -> I32 {\n    let copied: I32 = source\n    source\n}\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn public_unannotated_literal_copy_emits_check_result() {
     for source in [
         "pub fn integer_copy() -> I32 {\n    let source = 42\n    let copied = source\n    copied\n}\n",

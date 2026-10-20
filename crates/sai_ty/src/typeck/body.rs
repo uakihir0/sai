@@ -17,11 +17,12 @@ use std::collections::HashMap;
 /// Facts resolved by the owner-aware driver before body checking.
 ///
 /// The maps are intentionally small and snapshot-independent. The driver
-/// inserts only direct built-in primitive type paths and local path resolutions
-/// from the current owner analysis.
+/// inserts only direct built-in primitive type paths, eligible immutable
+/// parameter types, and local path resolutions from the current owner analysis.
 pub struct PrimitiveBodyInput<'a, 'hir> {
     pub body: &'a Body<'hir>,
     pub return_type: PrimTy,
+    pub initial_bindings: &'a HashMap<BindingId, PrimTy>,
     pub primitive_types: &'a HashMap<HirId, PrimTy>,
     pub local_paths: &'a HashMap<HirId, BindingId>,
     pub symbols: &'a Interner,
@@ -96,9 +97,14 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
     if !supports_primitive_literal(input.return_type) {
         return PrimitiveBodyCheck::Unsupported;
     }
+    let known_bindings = input
+        .initial_bindings
+        .iter()
+        .map(|(binding, ty)| (*binding, LocalType::Concrete(*ty)))
+        .collect();
     let mut context = FnCtxt {
         input,
-        known_bindings: HashMap::new(),
+        known_bindings,
         literal_variables: Vec::new(),
         errors: Vec::new(),
     };
