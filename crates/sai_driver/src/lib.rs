@@ -6373,7 +6373,7 @@ fn check_function_body_primitive_local_block(
                 };
                 let supported_shape = match operator {
                     BinOp::And | BinOp::Or => is_preceding_path(left) && is_preceding_path(right),
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                         (is_preceding_path(left) && is_preceding_path(right))
                             || (is_preceding_path(left)
                                 && is_direct_function_numeric_literal(right))
@@ -6432,7 +6432,7 @@ fn check_function_body_primitive_local_block(
 fn is_function_primitive_local_binary_operator(operator: BinOp) -> bool {
     matches!(
         operator,
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::And | BinOp::Or
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::And | BinOp::Or
     ) || is_function_primitive_local_comparison_operator(operator)
 }
 
@@ -6486,7 +6486,9 @@ fn primitive_body_errors_to_diagnostics(
         let Some(span) = span else {
             return Ok(None);
         };
-        use sai_ty::typeck::body::{PrimitiveBodyErrorKind, PrimitiveLiteralKind};
+        use sai_ty::typeck::body::{
+            PrimitiveBodyErrorKind, PrimitiveLiteralKind, PrimitiveRemainderOperand,
+        };
         let diagnostic = match error.kind {
             PrimitiveBodyErrorKind::LiteralTypeMismatch { expected, found } => {
                 let found = match found {
@@ -6543,6 +6545,38 @@ fn primitive_body_errors_to_diagnostics(
                 ),
                 "type mismatch",
             )?,
+            PrimitiveBodyErrorKind::OperatorNotSupported { operand } => {
+                let message = match operand {
+                    PrimitiveRemainderOperand::Concrete(operand) => format!(
+                        "operator `%` is not defined for `{}`",
+                        const_primitive_name(operand)
+                    ),
+                    PrimitiveRemainderOperand::FloatingPointLiteral => {
+                        "operator `%` is not defined for floating-point values".to_owned()
+                    }
+                };
+                let mut diagnostic = const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    message,
+                    "floating-point remainder is not supported",
+                )?;
+                diagnostic
+                    .push_child(Child {
+                        kind: ChildKind::Help,
+                        message:
+                            "use the floating-point `rem` method (for example, `left.rem(right)`)"
+                                .to_owned(),
+                        location: None,
+                    })
+                    .map_err(|_| {
+                        OwnerControlFlowResolutionError::InvalidSourceLocation(owner.id)
+                    })?;
+                diagnostic
+            }
         };
         diagnostics.push(diagnostic);
     }
@@ -25536,7 +25570,7 @@ mod tests {
             "pub fn raw_local() -> I32 {\n    let r#value: I32 = 42\n    r#value\n}\n",
             "pub fn unannotated_computed() -> I32 {\n    let value = 40 + 2\n    value\n}\n",
             "pub fn unannotated_copy_from_constant() -> I32 {\n    let copy = ONE\n    copy\n}\n",
-            "pub fn unannotated_copy_computed() -> I32 {\n    let source: I32 = 42\n    let copy = source % 1\n    copy\n}\n",
+            "pub fn unannotated_copy_computed() -> I32 {\n    let source: I32 = 42\n    let copy = source % (1 + 0)\n    copy\n}\n",
             "pub fn unannotated_raw_copy() -> I32 {\n    let source: I32 = 42\n    let copy = r#source\n    copy\n}\n",
             "pub fn mutable_unannotated_copy() -> I32 {\n    let source: I32 = 42\n    var copy = source\n    copy\n}\n",
             "pub fn mutable_source_copy() -> I32 {\n    var source: I32 = 42\n    let copy = source\n    copy\n}\n",

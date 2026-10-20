@@ -60,6 +60,18 @@ pub enum PrimitiveBodyErrorKind {
         expected: PrimTy,
         found: PrimTy,
     },
+    OperatorNotSupported {
+        operand: PrimitiveRemainderOperand,
+    },
+}
+
+/// An operand description for the unsupported floating-point remainder
+/// diagnostic. Float literals can still be unresolved when the operator is
+/// checked, so they must not be reported as a concrete `F64` prematurely.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrimitiveRemainderOperand {
+    Concrete(PrimTy),
+    FloatingPointLiteral,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,7 +126,8 @@ struct LiteralVariable<'hir> {
 /// top-level logical operation between Bool paths, and direct arithmetic
 /// between matching concrete numeric paths are accepted as initializers. A
 /// Direct numeric literals are accepted on either side of `+`, `-`, `*`, and
-/// `/` when paired with an eligible concrete numeric path.
+/// `/` when paired with an eligible concrete numeric path. `%` accepts integer
+/// paths and direct integer literals; float `%` returns an operator diagnostic.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
@@ -225,8 +238,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
             }
             ExprKind::Binary(operator, left, right) => {
-                if matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
-                    let result = self.check_arithmetic(operator, left, right)?;
+                if matches!(
+                    operator,
+                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+                ) {
+                    let result = self.check_arithmetic(operator, left, right, init.hir_id)?;
                     if let Some(expected) = annotation {
                         self.check_annotated_path(result, expected, init.hir_id)?;
                         // The annotation determines the local's recovered
@@ -299,7 +315,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         operator: BinOp,
         left: &'hir Expr<'hir>,
         right: &'hir Expr<'hir>,
+        expression: HirId,
     ) -> Result<LocalType, ()> {
+        if operator == BinOp::Rem {
+            return self.check_remainder(left, right, expression);
+        }
+
         if let ExprKind::Lit(literal) = left.kind {
             let Some(kind) = primitive_literal_kind(literal) else {
                 return Err(());
@@ -375,6 +396,120 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             PrimitiveArithmeticResult::Unsupported => Err(()),
         }
+    }
+
+    fn check_remainder(
+        &mut self,
+        left: &'hir Expr<'hir>,
+        right: &'hir Expr<'hir>,
+        expression: HirId,
+    ) -> Result<LocalType, ()> {
+        if let ExprKind::Lit(literal) = left.kind {
+            let Some(kind @ (PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint)) =
+                primitive_literal_kind(literal)
+            else {
+                return Err(());
+            };
+            let right_type = self
+                .check_local_path(right)
+                .ok()
+                .and_then(|local_type| self.concrete_local_type(local_type))
+                .ok_or(())?;
+            if !is_arithmetic_primitive(right_type) {
+                return Err(());
+            }
+
+            let local_type = self.local_type_for_unannotated_literal(literal, kind, left.hir_id);
+            if literal_family_accepts(kind, right_type) {
+                let LocalType::LiteralVariable(id) = local_type else {
+                    return Err(());
+                };
+                self.resolve_literal_variable(id, right_type)?;
+                if !is_integer_primitive(right_type) {
+                    self.report_unsupported_float_remainder(expression, right_type);
+                }
+            } else {
+                let expected = match kind {
+                    PrimitiveLiteralKind::Integer => PrimTy::I64,
+                    PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
+                    PrimitiveLiteralKind::Bool
+                    | PrimitiveLiteralKind::Byte
+                    | PrimitiveLiteralKind::Character => unreachable!(),
+                };
+                self.errors.push(PrimitiveBodyError {
+                    node: right.hir_id,
+                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                        expected,
+                        found: right_type,
+                    },
+                });
+                // A floating literal selects the float remainder operator
+                // family even when the right path fails its family check.
+                if kind == PrimitiveLiteralKind::FloatingPoint {
+                    self.errors.push(PrimitiveBodyError {
+                        node: expression,
+                        kind: PrimitiveBodyErrorKind::OperatorNotSupported {
+                            operand: PrimitiveRemainderOperand::FloatingPointLiteral,
+                        },
+                    });
+                }
+            }
+            return Ok(local_type);
+        }
+
+        let left_type = self
+            .check_local_path(left)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .ok_or(())?;
+        if !is_arithmetic_primitive(left_type) {
+            return Err(());
+        }
+
+        if let ExprKind::Lit(literal) = right.kind {
+            let Some(found) = primitive_literal_kind(literal) else {
+                return Err(());
+            };
+            if !matches!(
+                found,
+                PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+            ) {
+                return Err(());
+            }
+            self.check_annotated_literal(left_type, literal, found, right.hir_id);
+        } else {
+            let right_type = self
+                .check_local_path(right)
+                .ok()
+                .and_then(|local_type| self.concrete_local_type(local_type))
+                .ok_or(())?;
+            if !is_arithmetic_primitive(right_type) {
+                return Err(());
+            }
+            if left_type != right_type {
+                self.errors.push(PrimitiveBodyError {
+                    node: right.hir_id,
+                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                        expected: left_type,
+                        found: right_type,
+                    },
+                });
+            }
+        }
+
+        if !is_integer_primitive(left_type) {
+            self.report_unsupported_float_remainder(expression, left_type);
+        }
+        Ok(LocalType::Concrete(left_type))
+    }
+
+    fn report_unsupported_float_remainder(&mut self, node: HirId, operand: PrimTy) {
+        self.errors.push(PrimitiveBodyError {
+            node,
+            kind: PrimitiveBodyErrorKind::OperatorNotSupported {
+                operand: PrimitiveRemainderOperand::Concrete(operand),
+            },
+        });
     }
 
     fn check_comparison(
