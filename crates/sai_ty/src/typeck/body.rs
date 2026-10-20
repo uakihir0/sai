@@ -765,7 +765,7 @@ fn primitive_arithmetic_literal_expected_type(
     left: PrimTy,
     literal: PrimitiveLiteralKind,
 ) -> Option<PrimTy> {
-    (operator == BinOp::Add
+    (matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul)
         && is_arithmetic_primitive(left)
         && matches!(
             literal,
@@ -920,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn addition_accepts_only_numeric_literals_against_concrete_numeric_left_types() {
+    fn arithmetic_accepts_only_numeric_literals_against_concrete_numeric_left_types() {
         let arithmetic_primitives = [
             PrimTy::I8,
             PrimTy::I16,
@@ -935,29 +935,39 @@ mod tests {
             PrimTy::F32,
             PrimTy::F64,
         ];
-        for primitive in arithmetic_primitives {
-            for literal in [
-                PrimitiveLiteralKind::Integer,
-                PrimitiveLiteralKind::FloatingPoint,
-            ] {
+        for operator in ARITHMETIC_OPERATORS {
+            for primitive in arithmetic_primitives {
                 assert_eq!(
-                    primitive_arithmetic_literal_expected_type(BinOp::Add, primitive, literal),
+                    primitive_arithmetic_literal_expected_type(
+                        operator,
+                        primitive,
+                        PrimitiveLiteralKind::Integer
+                    ),
                     Some(primitive),
-                    "{literal:?} on the right of {primitive:?} addition"
+                    "integer literal on the right of {primitive:?} {operator:?}"
                 );
-            }
-            for literal in [
-                PrimitiveLiteralKind::Bool,
-                PrimitiveLiteralKind::Byte,
-                PrimitiveLiteralKind::Character,
-            ] {
                 assert_eq!(
-                    primitive_arithmetic_literal_expected_type(BinOp::Add, primitive, literal),
-                    None,
-                    "{literal:?} on the right of {primitive:?} addition"
+                    primitive_arithmetic_literal_expected_type(
+                        operator,
+                        primitive,
+                        PrimitiveLiteralKind::FloatingPoint
+                    ),
+                    Some(primitive),
+                    "float literal on the right of {primitive:?} {operator:?}"
                 );
+                for literal in [
+                    PrimitiveLiteralKind::Bool,
+                    PrimitiveLiteralKind::Byte,
+                    PrimitiveLiteralKind::Character,
+                ] {
+                    assert_eq!(
+                        primitive_arithmetic_literal_expected_type(operator, primitive, literal),
+                        None,
+                        "{literal:?} on the right of {primitive:?} {operator:?}"
+                    );
+                }
             }
-            for operator in [BinOp::Sub, BinOp::Mul] {
+            for primitive in [PrimTy::Bool, PrimTy::Byte, PrimTy::Char, PrimTy::Never] {
                 assert_eq!(
                     primitive_arithmetic_literal_expected_type(
                         operator,
@@ -965,19 +975,19 @@ mod tests {
                         PrimitiveLiteralKind::Integer
                     ),
                     None,
-                    "literals remain gated for {operator:?}"
+                    "non-numeric {primitive:?} left type for {operator:?}"
                 );
             }
         }
-        for primitive in [PrimTy::Bool, PrimTy::Byte, PrimTy::Char, PrimTy::Never] {
+        for operator in [BinOp::Div, BinOp::Rem, BinOp::And, BinOp::Eq] {
             assert_eq!(
                 primitive_arithmetic_literal_expected_type(
-                    BinOp::Add,
-                    primitive,
+                    operator,
+                    PrimTy::I32,
                     PrimitiveLiteralKind::Integer
                 ),
                 None,
-                "non-numeric {primitive:?} left type"
+                "numeric literals remain gated for {operator:?}"
             );
         }
     }
