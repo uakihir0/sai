@@ -1,0 +1,50 @@
+use acme:reading-log/catalog
+use acme:reading-log/model.{Book, Status, Summary}
+
+pub fn completion_percent(book: Book) -> U32 {
+    if book.total_pages == 0 {
+        return 0
+    }
+    book.pages_read * 100 / book.total_pages
+}
+
+pub fn summarize() -> Summary {
+    var pages_read: U32 = 0
+    var total_pages: U32 = 0
+    var reading_count: USize = 0
+    var finished_count: USize = 0
+    var queued_count: USize = 0
+
+    for book in catalog.all() {
+        pages_read += book.pages_read
+        total_pages += book.total_pages
+        match book.status {
+            Status.ToRead => {
+                queued_count += 1
+            }
+            Status.Reading => {
+                reading_count += 1
+            }
+            Status.Finished => {
+                finished_count += 1
+            }
+        }
+    }
+
+    Summary(
+        pages_read: pages_read,
+        total_pages: total_pages,
+        reading_count: reading_count,
+        finished_count: finished_count,
+        queued_count: queued_count,
+    )
+}
+
+pub fn next_book() -> Option<Book> {
+    for book in catalog.all() {
+        if book.status == Status.ToRead {
+            return Some(book)
+        }
+    }
+    None
+}

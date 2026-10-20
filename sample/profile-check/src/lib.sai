@@ -1,0 +1,40 @@
+use acme:profile-check/fixtures
+use acme:profile-check/report
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        report.print_usage(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    let command = args[1].as_str()
+    if command == "valid" {
+        report.check_example(borrow mut out, "Valid example", fixtures.valid_profile())
+        return process.ExitCode.success()
+    }
+    if command == "invalid" {
+        report.check_example(borrow mut out, "Validation example", fixtures.underage_profile())
+        return process.ExitCode.success()
+    }
+    if command == "malformed" {
+        report.check_example(borrow mut out, "Parsing example", fixtures.malformed_profile())
+        return process.ExitCode.success()
+    }
+    if command == "unknown-key" {
+        report.check_example(
+            borrow mut out,
+            "Unknown-field example",
+            fixtures.unknown_key_profile(),
+        )
+        return process.ExitCode.success()
+    }
+
+    report.print_usage(borrow mut out)
+    process.ExitCode.failure()
+}

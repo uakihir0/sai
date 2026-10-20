@@ -1,0 +1,60 @@
+use acme:reading-log/catalog
+use acme:reading-log/model.{Book, Status}
+use acme:reading-log/progress
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn status_name(status: Status) -> Str {
+    match status {
+        Status.ToRead => "to read"
+        Status.Reading => "reading"
+        Status.Finished => "finished"
+    }
+}
+
+fn print_book(out: borrow mut Stdout, book: Book)
+    effects { stdio.write, alloc }
+{
+    if book.status == Status.Reading {
+        out.write_str(
+            f"[{status_name(book.status)}] {book.title} — {book.pages_read}/{book.total_pages} pages ({progress.completion_percent(book)}%)\n".as_str(),
+        )
+    } else {
+        out.write_str(f"[{status_name(book.status)}] {book.title} — {book.author}\n".as_str())
+    }
+}
+
+pub fn print_list(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Reading queue\n")
+    for book in catalog.all() {
+        print_book(borrow mut out, book)
+    }
+}
+
+pub fn print_progress(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let summary = progress.summarize()
+    let percent = if summary.total_pages == 0 {
+        0
+    } else {
+        summary.pages_read * 100 / summary.total_pages
+    }
+    out.write_str(
+        f"You have read {summary.pages_read} of {summary.total_pages} pages ({percent}%).\n".as_str(),
+    )
+    out.write_str(
+        f"{summary.reading_count} books in progress, {summary.finished_count} finished, and {summary.queued_count} waiting to be read.\n".as_str(),
+    )
+}
+
+pub fn print_next(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    match progress.next_book() {
+        Some(book) => out.write_str(f"Next up: {book.title} by {book.author}.\n".as_str())
+        None => out.write_str("Your reading queue is clear.\n")
+    }
+}

@@ -1,0 +1,34 @@
+use acme:reading-log/model.{Book, Status}
+
+pub fn all() -> Array<Book, 4> {
+    [
+        Book(
+            title: "A Wizard of Earthsea",
+            author: "Ursula K. Le Guin",
+            total_pages: 224,
+            pages_read: 168,
+            status: Status.Reading,
+        ),
+        Book(
+            title: "The Left Hand of Darkness",
+            author: "Ursula K. Le Guin",
+            total_pages: 400,
+            pages_read: 0,
+            status: Status.ToRead,
+        ),
+        Book(
+            title: "Kindred",
+            author: "Octavia E. Butler",
+            total_pages: 264,
+            pages_read: 264,
+            status: Status.Finished,
+        ),
+        Book(
+            title: "The Dispossessed",
+            author: "Ursula K. Le Guin",
+            total_pages: 387,
+            pages_read: 120,
+            status: Status.Reading,
+        ),
+    ]
+}

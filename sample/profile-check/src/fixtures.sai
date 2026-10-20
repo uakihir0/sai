@@ -1,0 +1,33 @@
+pub fn valid_profile() -> Str {
+    "# A profile that passes every rule\n\
+        name = Rin Tanaka\n\
+        email = rin@example.org\n\
+        age = 29\n\
+        visibility = public\n\
+        daily_goal = 4\n"
+}
+
+pub fn underage_profile() -> Str {
+    "name = Alex Chen\n\
+        email = alex@example.org\n\
+        age = 12\n\
+        visibility = private\n\
+        daily_goal = 3\n"
+}
+
+pub fn malformed_profile() -> Str {
+    "name = Sam Rivera\n\
+        email = sam@example.org\n\
+        age = twenty\n\
+        visibility = friends-only\n\
+        daily_goal = 5\n"
+}
+
+pub fn unknown_key_profile() -> Str {
+    "name = Noor Ali\n\
+        email = noor@example.org\n\
+        age = 31\n\
+        visibility = unlisted\n\
+        daily_goal = 2\n\
+        timezone = Asia/Tokyo\n"
+}

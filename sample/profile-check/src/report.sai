@@ -1,0 +1,84 @@
+use acme:profile-check/config
+use acme:profile-check/model.{ConfigError, Profile, Visibility}
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn visibility_name(visibility: Visibility) -> Str {
+    match visibility {
+        Visibility.Public => "public"
+        Visibility.Private => "private"
+        Visibility.Unlisted => "unlisted"
+    }
+}
+
+fn print_profile(out: borrow mut Stdout, profile: Profile)
+    effects { stdio.write, alloc }
+{
+    out.write_str(f"Accepted profile for {profile.name}\n".as_str())
+    out.write_str(f"  email: {profile.email}\n".as_str())
+    out.write_str(f"  age: {profile.age}\n".as_str())
+    out.write_str(f"  visibility: {visibility_name(profile.visibility)}\n".as_str())
+    out.write_str(f"  daily goal: {profile.daily_goal} items\n".as_str())
+}
+
+fn print_error(out: borrow mut Stdout, error: ConfigError)
+    effects { stdio.write, alloc }
+{
+    match error {
+        ConfigError.MalformedLine(line) => {
+            out.write_str(f"line {line}: expected a key = value pair\n".as_str())
+        }
+        ConfigError.DuplicateKey(key) => {
+            out.write_str(f"duplicate field: {key}\n".as_str())
+        }
+        ConfigError.UnknownKey(key) => {
+            out.write_str(f"unknown field: {key}\n".as_str())
+        }
+        ConfigError.MissingName => out.write_str("missing required field: name\n")
+        ConfigError.MissingEmail => out.write_str("missing required field: email\n")
+        ConfigError.MissingAge => out.write_str("missing required field: age\n")
+        ConfigError.MissingVisibility => {
+            out.write_str("missing required field: visibility\n")
+        }
+        ConfigError.MissingDailyGoal => {
+            out.write_str("missing required field: daily_goal\n")
+        }
+        ConfigError.BadNumber(field) => {
+            out.write_str(f"field {field} must be an unsigned whole number\n".as_str())
+        }
+        ConfigError.UnknownVisibility(value) => {
+            out.write_str(
+                f"visibility must be public, private, or unlisted (got {value})\n".as_str(),
+            )
+        }
+        ConfigError.EmptyName => out.write_str("name must not be empty\n")
+        ConfigError.InvalidEmail => {
+            out.write_str("email must have a local part and a dotted domain\n")
+        }
+        ConfigError.AgeOutOfRange(age) => {
+            out.write_str(f"age {age} is outside the supported range (13 to 120)\n".as_str())
+        }
+        ConfigError.DailyGoalOutOfRange(goal) => {
+            out.write_str(f"daily_goal {goal} is outside the supported range (1 to 12)\n".as_str())
+        }
+    }
+}
+
+pub fn check_example(out: borrow mut Stdout, label: Str, text: Str)
+    effects { stdio.write, alloc }
+{
+    out.write_str(f"\n{label}\n".as_str())
+    match config.parse(text) {
+        Ok(profile) => print_profile(borrow mut out, profile)
+        Err(error) => {
+            out.write_str("Rejected profile: ")
+            print_error(borrow mut out, error)
+        }
+    }
+}
+
+pub fn print_usage(out: borrow mut Stdout)
+    effects { stdio.write }
+{
+    out.write_str("usage: profile-check [valid|invalid|malformed|unknown-key]\n")
+}
