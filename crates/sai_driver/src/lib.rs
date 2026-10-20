@@ -5887,17 +5887,7 @@ fn check_function_body_type(
         return Ok(FunctionBodyTypeCheck::Unsupported);
     }
     if sig.params.is_empty() && body.params.is_empty() {
-        if let Some(diagnostics) = check_function_body_annotated_primitive_local(
-            owner, sig, body, locals, type_paths, symbols, inputs, snapshot, target_cfg,
-        )? {
-            return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
-        }
-        if let Some(diagnostics) = check_function_body_return_constrained_primitive_local(
-            owner, sig, body, locals, type_paths, symbols, inputs, snapshot, target_cfg,
-        )? {
-            return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
-        }
-        if let Some(diagnostics) = check_function_body_unannotated_copy_of_primitive_local(
+        if let Some(diagnostics) = check_function_body_primitive_local_block(
             owner, sig, body, locals, type_paths, symbols, inputs, snapshot, target_cfg,
         )? {
             return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
@@ -6238,7 +6228,7 @@ fn check_function_body_type(
     Ok(FunctionBodyTypeCheck::Supported { diagnostics })
 }
 
-fn check_function_body_annotated_primitive_local(
+fn check_function_body_primitive_local_block(
     owner: &HirOwner<'_>,
     sig: sai_hir::body::FnSig<'_>,
     body: &sai_hir::body::Body<'_>,
@@ -6260,28 +6250,25 @@ fn check_function_body_annotated_primitive_local(
     let ExprKind::Block(block) = body.value.kind else {
         return Ok(None);
     };
-    if block.stmts.is_empty() {
+    if block.safety != sai_hir::Safety::Safe || block.stmts.is_empty() {
         return Ok(None);
     }
     let Some(tail) = block.tail else {
         return Ok(None);
     };
-    let ExprKind::Path(path) = tail.kind else {
+    let ExprKind::Path(tail_path) = tail.kind else {
         return Ok(None);
     };
-    if path.root != PathRoot::Plain
-        || path.segments.len() != 1
-        || path.segments[0].args.is_some()
-        || !is_plain_ascii_identifier(path.segments[0].name, inputs)
-    {
+    let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs) else {
         return Ok(None);
-    }
+    };
 
     let mut primitive_types = HashMap::new();
+    let mut preceding_bindings = HashSet::with_capacity(block.stmts.len());
     for stmt in block.stmts {
         let StmtKind::Let {
             pat,
-            ty: Some(ty),
+            ty,
             init,
             els: None,
         } = stmt.kind
@@ -6298,33 +6285,45 @@ fn check_function_body_annotated_primitive_local(
         else {
             return Ok(None);
         };
-        if !function_name_is_supported(name, symbols, inputs) {
-            return Ok(None);
-        }
-        if let ExprKind::Path(path) = init.kind
-            && (path.root != PathRoot::Plain
-                || path.segments.len() != 1
-                || path.segments[0].args.is_some()
-                || !is_plain_ascii_identifier(path.segments[0].name, inputs))
+        if !function_name_is_supported(name, symbols, inputs)
+            || !matches!(
+                locals.bindings.get(&binding),
+                Some(sai_resolve::owner::LocalBinding {
+                    kind: sai_resolve::owner::BindingKind::Let,
+                    ..
+                })
+            )
         {
             return Ok(None);
         }
-        if !matches!(
-            locals.bindings.get(&binding),
-            Some(sai_resolve::owner::LocalBinding {
-                kind: sai_resolve::owner::BindingKind::Let,
-                ..
-            })
-        ) {
-            return Ok(None);
+        if let Some(ty) = ty {
+            let Some(FunctionDirectType::Primitive(local_type)) =
+                resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+            else {
+                return Ok(None);
+            };
+            primitive_types.insert(ty.hir_id, local_type);
         }
-        let Some(FunctionDirectType::Primitive(local_type)) =
-            resolve_function_direct_type(*ty, type_paths, symbols, inputs)
-        else {
-            return Ok(None);
-        };
-        primitive_types.insert(ty.hir_id, local_type);
+
+        match init.kind {
+            ExprKind::Lit(_) if is_direct_function_scalar_literal(init) => {}
+            ExprKind::Path(path) => {
+                let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
+                else {
+                    return Ok(None);
+                };
+                if !preceding_bindings.contains(&source_binding) {
+                    return Ok(None);
+                }
+            }
+            _ => return Ok(None),
+        }
+        preceding_bindings.insert(binding);
     }
+    if !preceding_bindings.contains(&tail_binding) {
+        return Ok(None);
+    }
+
     let local_paths = locals
         .paths
         .iter()
@@ -6337,7 +6336,7 @@ fn check_function_body_annotated_primitive_local(
             _ => None,
         })
         .collect::<HashMap<_, _>>();
-    let check = sai_ty::typeck::body::check_annotated_primitive_local_body(
+    let check = sai_ty::typeck::body::check_primitive_local_block_body(
         sai_ty::typeck::body::PrimitiveBodyInput {
             body,
             return_type,
@@ -6354,258 +6353,26 @@ fn check_function_body_annotated_primitive_local(
     primitive_body_errors_to_diagnostics(owner, block, tail, errors, inputs, snapshot)
 }
 
-fn check_function_body_return_constrained_primitive_local(
-    owner: &HirOwner<'_>,
-    sig: sai_hir::body::FnSig<'_>,
-    body: &sai_hir::body::Body<'_>,
+fn resolved_plain_local_path_binding(
+    path: HirPath<'_>,
     locals: &LocalResolution,
-    type_paths: Option<&TypeOwnerPathResolution>,
-    symbols: &Interner,
     inputs: &CurrentOwnerInputs,
-    snapshot: &WorkspaceSnapshot,
-    target_cfg: &TargetCfg,
-) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    let Some(return_ty) = sig.ret else {
-        return Ok(None);
-    };
-    let Some(FunctionDirectType::Primitive(return_type)) =
-        resolve_function_direct_type(*return_ty, type_paths, symbols, inputs)
-    else {
-        return Ok(None);
-    };
-    let ExprKind::Block(block) = body.value.kind else {
-        return Ok(None);
-    };
-    if block.safety != sai_hir::Safety::Safe || block.stmts.len() != 1 {
-        return Ok(None);
-    }
-    let StmtKind::Let {
-        pat,
-        ty: None,
-        init: _,
-        els: None,
-    } = block.stmts[0].kind
-    else {
-        return Ok(None);
-    };
-    let PatKind::Binding {
-        mode: sai_hir::patterns::BindingMode::Value,
-        name,
-        binding,
-        sub: None,
-        ..
-    } = pat.kind
-    else {
-        return Ok(None);
-    };
-    if !function_name_is_supported(name, symbols, inputs)
-        || !matches!(
-            locals.bindings.get(&binding),
-            Some(sai_resolve::owner::LocalBinding {
-                kind: sai_resolve::owner::BindingKind::Let,
-                ..
-            })
-        )
-    {
-        return Ok(None);
-    }
-    let Some(tail) = block.tail else {
-        return Ok(None);
-    };
-    let ExprKind::Path(path) = tail.kind else {
-        return Ok(None);
-    };
+) -> Option<sai_hir::BindingId> {
     if path.root != PathRoot::Plain
         || path.segments.len() != 1
         || path.segments[0].args.is_some()
         || !is_plain_ascii_identifier(path.segments[0].name, inputs)
     {
-        return Ok(None);
+        return None;
     }
-    let local_paths = locals
-        .paths
-        .iter()
-        .filter_map(|(hir_id, resolution)| match resolution.base {
-            Res::Local(binding)
-                if resolution.resolved_segments == 1 && resolution.segment_count == 1 =>
-            {
-                Some((*hir_id, binding))
-            }
-            _ => None,
-        })
-        .collect::<HashMap<_, _>>();
-    let primitive_types = HashMap::new();
-    let check = sai_ty::typeck::body::check_return_constrained_primitive_local_body(
-        sai_ty::typeck::body::PrimitiveBodyInput {
-            body,
-            return_type,
-            primitive_types: &primitive_types,
-            local_paths: &local_paths,
-            symbols,
-            pointer_width: target_cfg.pointer_width(),
-        },
-    );
-    let sai_ty::typeck::body::PrimitiveBodyCheck::Supported { errors } = check else {
-        return Ok(None);
-    };
-
-    primitive_body_errors_to_diagnostics(owner, block, tail, errors, inputs, snapshot)
-}
-
-fn check_function_body_unannotated_copy_of_primitive_local(
-    owner: &HirOwner<'_>,
-    sig: sai_hir::body::FnSig<'_>,
-    body: &sai_hir::body::Body<'_>,
-    locals: &LocalResolution,
-    type_paths: Option<&TypeOwnerPathResolution>,
-    symbols: &Interner,
-    inputs: &CurrentOwnerInputs,
-    snapshot: &WorkspaceSnapshot,
-    target_cfg: &TargetCfg,
-) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
-    let Some(return_ty) = sig.ret else {
-        return Ok(None);
-    };
-    let Some(FunctionDirectType::Primitive(return_type)) =
-        resolve_function_direct_type(*return_ty, type_paths, symbols, inputs)
-    else {
-        return Ok(None);
-    };
-    let ExprKind::Block(block) = body.value.kind else {
-        return Ok(None);
-    };
-    if block.safety != sai_hir::Safety::Safe || block.stmts.len() != 2 {
-        return Ok(None);
+    match locals.paths.get(&path.hir_id) {
+        Some(PathRes {
+            base: Res::Local(binding),
+            resolved_segments: 1,
+            segment_count: 1,
+        }) => Some(*binding),
+        _ => None,
     }
-
-    let StmtKind::Let {
-        pat: source_pat,
-        ty: source_ty,
-        init: source_init,
-        els: None,
-    } = block.stmts[0].kind
-    else {
-        return Ok(None);
-    };
-    let PatKind::Binding {
-        mode: sai_hir::patterns::BindingMode::Value,
-        name: source_name,
-        binding: source_binding,
-        sub: None,
-        ..
-    } = source_pat.kind
-    else {
-        return Ok(None);
-    };
-    if !function_name_is_supported(source_name, symbols, inputs)
-        || !matches!(
-            locals.bindings.get(&source_binding),
-            Some(sai_resolve::owner::LocalBinding {
-                kind: sai_resolve::owner::BindingKind::Let,
-                ..
-            })
-        )
-        || !matches!(source_init.kind, ExprKind::Lit(_))
-    {
-        return Ok(None);
-    }
-    let source_type = if let Some(source_ty) = source_ty {
-        let Some(FunctionDirectType::Primitive(source_type)) =
-            resolve_function_direct_type(*source_ty, type_paths, symbols, inputs)
-        else {
-            return Ok(None);
-        };
-        Some(source_type)
-    } else {
-        None
-    };
-
-    let StmtKind::Let {
-        pat: copy_pat,
-        ty: None,
-        init: copy_init,
-        els: None,
-    } = block.stmts[1].kind
-    else {
-        return Ok(None);
-    };
-    let PatKind::Binding {
-        mode: sai_hir::patterns::BindingMode::Value,
-        name: copy_name,
-        binding: copy_binding,
-        sub: None,
-        ..
-    } = copy_pat.kind
-    else {
-        return Ok(None);
-    };
-    if !function_name_is_supported(copy_name, symbols, inputs)
-        || !matches!(
-            locals.bindings.get(&copy_binding),
-            Some(sai_resolve::owner::LocalBinding {
-                kind: sai_resolve::owner::BindingKind::Let,
-                ..
-            })
-        )
-    {
-        return Ok(None);
-    }
-    let ExprKind::Path(copy_path) = copy_init.kind else {
-        return Ok(None);
-    };
-    if copy_path.root != PathRoot::Plain
-        || copy_path.segments.len() != 1
-        || copy_path.segments[0].args.is_some()
-        || !is_plain_ascii_identifier(copy_path.segments[0].name, inputs)
-    {
-        return Ok(None);
-    }
-
-    let Some(tail) = block.tail else {
-        return Ok(None);
-    };
-    let ExprKind::Path(tail_path) = tail.kind else {
-        return Ok(None);
-    };
-    if tail_path.root != PathRoot::Plain
-        || tail_path.segments.len() != 1
-        || tail_path.segments[0].args.is_some()
-        || !is_plain_ascii_identifier(tail_path.segments[0].name, inputs)
-    {
-        return Ok(None);
-    }
-
-    let primitive_types = source_ty
-        .zip(source_type)
-        .map(|(source_ty, source_type)| HashMap::from([(source_ty.hir_id, source_type)]))
-        .unwrap_or_default();
-    let local_paths = locals
-        .paths
-        .iter()
-        .filter_map(|(hir_id, resolution)| match resolution.base {
-            Res::Local(binding)
-                if resolution.resolved_segments == 1 && resolution.segment_count == 1 =>
-            {
-                Some((*hir_id, binding))
-            }
-            _ => None,
-        })
-        .collect::<HashMap<_, _>>();
-    let check = sai_ty::typeck::body::check_unannotated_copy_of_primitive_local_body(
-        sai_ty::typeck::body::PrimitiveBodyInput {
-            body,
-            return_type,
-            primitive_types: &primitive_types,
-            local_paths: &local_paths,
-            symbols,
-            pointer_width: target_cfg.pointer_width(),
-        },
-    );
-    let sai_ty::typeck::body::PrimitiveBodyCheck::Supported { errors } = check else {
-        return Ok(None);
-    };
-
-    primitive_body_errors_to_diagnostics(owner, block, tail, errors, inputs, snapshot)
 }
 
 fn primitive_body_errors_to_diagnostics(
@@ -25641,7 +25408,6 @@ mod tests {
             "pub fn mutable() -> I32 {\n    var value: I32 = 42\n    value\n}\n",
             "pub fn mutable_let() -> I32 {\n    let var value: I32 = 42\n    value\n}\n",
             "pub fn computed() -> I32 {\n    let value: I32 = 40 + 2\n    value\n}\n",
-            "pub fn multiple_unannotated() -> I32 {\n    let first: I32 = 1\n    let second = 2\n    first\n}\n",
             "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second: I32 = 2\n    first\n}\n",
             "pub fn multiple_computed() -> I32 {\n    let first: I32 = 1\n    let second: I32 = 40 + 2\n    first\n}\n",
             "pub fn multiple_expr_stmt() -> I32 {\n    let first: I32 = 1\n    first\n    first\n}\n",
@@ -25656,10 +25422,8 @@ mod tests {
             "pub fn unannotated_copy_from_constant() -> I32 {\n    let copy = ONE\n    copy\n}\n",
             "pub fn unannotated_copy_computed() -> I32 {\n    let source: I32 = 42\n    let copy = source + 1\n    copy\n}\n",
             "pub fn unannotated_raw_copy() -> I32 {\n    let source: I32 = 42\n    let copy = r#source\n    copy\n}\n",
-            "pub fn unannotated_wrong_tail() -> I32 {\n    let source: I32 = 42\n    let copy = source\n    source\n}\n",
             "pub fn mutable_unannotated_copy() -> I32 {\n    let source: I32 = 42\n    var copy = source\n    copy\n}\n",
             "pub fn mutable_source_copy() -> I32 {\n    var source: I32 = 42\n    let copy = source\n    copy\n}\n",
-            "pub fn unannotated_multiple() -> I32 {\n    let first = 1\n    let second = 2\n    first\n}\n",
             "pub fn unannotated_string() -> Str {\n    let value = \"text\"\n    value\n}\n",
             "pub fn destructured() -> I32 {\n    let (first, second): (I32, I32) = (1, 2)\n    first\n}\n",
             "pub fn alias() -> I32 {\n    let value: Number = 42\n    value\n}\n",
@@ -25678,7 +25442,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 25);
+        assert_eq!(resolved.owners().len(), 22);
         for owner in resolved.owners() {
             assert!(matches!(
                 owner

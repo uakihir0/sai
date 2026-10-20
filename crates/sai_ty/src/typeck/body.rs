@@ -1,4 +1,4 @@
-//! Narrow, compositional checks for directly annotated function-body locals.
+//! Narrow, compositional checks for flat primitive-local function bodies.
 
 use super::literal::{
     PrimitiveLiteralResult, check_primitive_literal, is_integer_primitive,
@@ -71,363 +71,57 @@ pub enum PrimitiveLiteralKind {
     Character,
 }
 
-/// Check one or more immutable, annotated primitive locals followed by a tail
-/// read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalType {
+    Concrete(PrimTy),
+    LiteralVariable(usize),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LiteralVariable<'hir> {
+    literal: Lit<'hir>,
+    kind: PrimitiveLiteralKind,
+    origin: HirId,
+    resolved: Option<PrimTy>,
+}
+
+/// Check a flat sequence of immutable primitive locals and a local-path tail.
 ///
-/// Statements and expressions are checked in order. The local becomes
-/// available to the tail expression only after its initializer has been
-/// checked. Other valid body forms remain unsupported until their own
-/// type-checking slices are implemented.
-pub fn check_annotated_primitive_local_body(
-    input: PrimitiveBodyInput<'_, '_>,
-) -> PrimitiveBodyCheck {
+/// Direct scalar literals and plain paths to earlier locals are accepted as
+/// initializers. Unannotated numeric literals retain one inference variable
+/// across copies until a coercion site or the tail constrains it. Other body
+/// forms remain unsupported until their own type-checking slices are
+/// implemented.
+pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> PrimitiveBodyCheck {
     if !supports_primitive_literal(input.return_type) {
         return PrimitiveBodyCheck::Unsupported;
     }
-
-    let ExprKind::Block(block) = input.body.value.kind else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-
     let mut context = FnCtxt {
         input,
         known_bindings: HashMap::new(),
+        literal_variables: Vec::new(),
         errors: Vec::new(),
+    };
+    let ExprKind::Block(block) = context.input.body.value.kind else {
+        return PrimitiveBodyCheck::Unsupported;
     };
     if context.check_block(block).is_err() {
         return PrimitiveBodyCheck::Unsupported;
     }
-
     PrimitiveBodyCheck::Supported {
         errors: context.errors,
     }
 }
 
-/// Check one unannotated scalar-literal local whose type is constrained by a
-/// tail read in a function with an explicit primitive return type.
-///
-/// Integer and floating-point literal variables are constrained by the tail
-/// expectation. Other scalar literals already have concrete types. All other
-/// body forms remain unsupported.
-pub fn check_return_constrained_primitive_local_body(
-    input: PrimitiveBodyInput<'_, '_>,
-) -> PrimitiveBodyCheck {
-    if !supports_primitive_literal(input.return_type) {
-        return PrimitiveBodyCheck::Unsupported;
-    }
-
-    let ExprKind::Block(block) = input.body.value.kind else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    if block.safety != Safety::Safe || block.stmts.len() != 1 {
-        return PrimitiveBodyCheck::Unsupported;
-    }
-
-    let StmtKind::Let {
-        pat,
-        ty: None,
-        init,
-        els: None,
-    } = block.stmts[0].kind
-    else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    let PatKind::Binding {
-        mode: BindingMode::Value,
-        binding,
-        sub: None,
-        ..
-    } = pat.kind
-    else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    let Some(tail) = block.tail else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    let ExprKind::Path(path) = tail.kind else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    if path.root != PathRoot::Plain
-        || path.segments.len() != 1
-        || path.segments[0].args.is_some()
-        || input.local_paths.get(&path.hir_id) != Some(&binding)
-    {
-        return PrimitiveBodyCheck::Unsupported;
-    }
-
-    let ExprKind::Lit(literal) = init.kind else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    let Some(found) = primitive_literal_kind(literal) else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-
-    let errors = check_unannotated_literal_against_return(
-        literal,
-        found,
-        input.return_type,
-        input.symbols,
-        input.pointer_width,
-        init.hir_id,
-        tail.hir_id,
-    );
-
-    PrimitiveBodyCheck::Supported { errors }
-}
-
-/// Check a concrete annotated primitive local copied into one unannotated
-/// local whose tail read is constrained by the explicit function result.
-///
-/// The initializer of the unannotated binding is a local path, so it inherits
-/// the source binding's exact type without a coercion.
-pub fn check_unannotated_copy_of_primitive_local_body(
-    input: PrimitiveBodyInput<'_, '_>,
-) -> PrimitiveBodyCheck {
-    if !supports_primitive_literal(input.return_type) {
-        return PrimitiveBodyCheck::Unsupported;
-    }
-
-    let ExprKind::Block(block) = input.body.value.kind else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    if block.safety != Safety::Safe || block.stmts.len() != 2 {
-        return PrimitiveBodyCheck::Unsupported;
-    }
-
-    let StmtKind::Let {
-        pat: source_pat,
-        ty: source_ty,
-        init: source_init,
-        els: None,
-    } = block.stmts[0].kind
-    else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    let PatKind::Binding {
-        mode: BindingMode::Value,
-        binding: source_binding,
-        sub: None,
-        ..
-    } = source_pat.kind
-    else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    let source_type = match source_ty {
-        Some(source_ty) => {
-            let Some(source_type) = input.primitive_types.get(&source_ty.hir_id).copied() else {
-                return PrimitiveBodyCheck::Unsupported;
-            };
-            if !supports_primitive_literal(source_type) {
-                return PrimitiveBodyCheck::Unsupported;
-            }
-            Some(source_type)
-        }
-        None => None,
-    };
-    let ExprKind::Lit(source_literal) = source_init.kind else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    let Some(source_literal_kind) = primitive_literal_kind(source_literal) else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-
-    let StmtKind::Let {
-        pat: copy_pat,
-        ty: None,
-        init: copy_init,
-        els: None,
-    } = block.stmts[1].kind
-    else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    let PatKind::Binding {
-        mode: BindingMode::Value,
-        binding: copy_binding,
-        sub: None,
-        ..
-    } = copy_pat.kind
-    else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    let ExprKind::Path(copy_path) = copy_init.kind else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    if copy_path.root != PathRoot::Plain
-        || copy_path.segments.len() != 1
-        || copy_path.segments[0].args.is_some()
-        || input.local_paths.get(&copy_path.hir_id) != Some(&source_binding)
-    {
-        return PrimitiveBodyCheck::Unsupported;
-    }
-
-    let Some(tail) = block.tail else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    let ExprKind::Path(tail_path) = tail.kind else {
-        return PrimitiveBodyCheck::Unsupported;
-    };
-    if tail_path.root != PathRoot::Plain
-        || tail_path.segments.len() != 1
-        || tail_path.segments[0].args.is_some()
-        || input.local_paths.get(&tail_path.hir_id) != Some(&copy_binding)
-    {
-        return PrimitiveBodyCheck::Unsupported;
-    }
-
-    let mut errors = Vec::new();
-    if let Some(source_type) = source_type {
-        match check_primitive_literal(
-            source_type,
-            source_literal,
-            input.symbols,
-            input.pointer_width,
-        ) {
-            PrimitiveLiteralResult::Match => {}
-            PrimitiveLiteralResult::TypeMismatch => {
-                errors.push(PrimitiveBodyError {
-                    node: source_init.hir_id,
-                    kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
-                        expected: source_type,
-                        found: source_literal_kind,
-                    },
-                });
-            }
-            PrimitiveLiteralResult::OutOfRange => {
-                errors.push(PrimitiveBodyError {
-                    node: source_init.hir_id,
-                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                        expected: source_type,
-                        found: source_literal_kind,
-                    },
-                });
-            }
-        }
-        if source_type != input.return_type {
-            errors.push(PrimitiveBodyError {
-                node: tail.hir_id,
-                kind: PrimitiveBodyErrorKind::TypeMismatch {
-                    expected: input.return_type,
-                    found: source_type,
-                },
-            });
-        }
-    } else {
-        errors = check_unannotated_literal_against_return(
-            source_literal,
-            source_literal_kind,
-            input.return_type,
-            input.symbols,
-            input.pointer_width,
-            source_init.hir_id,
-            tail.hir_id,
-        );
-    }
-
-    PrimitiveBodyCheck::Supported { errors }
-}
-
-fn check_unannotated_literal_against_return(
-    literal: Lit<'_>,
-    found: PrimitiveLiteralKind,
-    return_type: PrimTy,
-    symbols: &Interner,
-    pointer_width: u8,
-    initializer: HirId,
-    tail: HirId,
-) -> Vec<PrimitiveBodyError> {
-    let mut errors = Vec::new();
-    match found {
-        PrimitiveLiteralKind::Integer if is_integer_primitive(return_type) => {
-            if check_primitive_literal(return_type, literal, symbols, pointer_width)
-                == PrimitiveLiteralResult::OutOfRange
-            {
-                errors.push(PrimitiveBodyError {
-                    node: initializer,
-                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                        expected: return_type,
-                        found,
-                    },
-                });
-            }
-        }
-        PrimitiveLiteralKind::FloatingPoint if matches!(return_type, PrimTy::F32 | PrimTy::F64) => {
-            if check_primitive_literal(return_type, literal, symbols, pointer_width)
-                == PrimitiveLiteralResult::OutOfRange
-            {
-                errors.push(PrimitiveBodyError {
-                    node: initializer,
-                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                        expected: return_type,
-                        found,
-                    },
-                });
-            }
-        }
-        PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint => {
-            errors.push(PrimitiveBodyError {
-                node: tail,
-                kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
-                    expected: return_type,
-                    found,
-                },
-            });
-
-            // Keep the source literal variable unresolved until its body-end
-            // default so the copied binding observes the tail constraint.
-            let default_type = match found {
-                PrimitiveLiteralKind::Integer => PrimTy::I64,
-                PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
-                PrimitiveLiteralKind::Bool
-                | PrimitiveLiteralKind::Byte
-                | PrimitiveLiteralKind::Character => unreachable!(),
-            };
-            if check_primitive_literal(default_type, literal, symbols, pointer_width)
-                == PrimitiveLiteralResult::OutOfRange
-            {
-                errors.push(PrimitiveBodyError {
-                    node: initializer,
-                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                        expected: default_type,
-                        found,
-                    },
-                });
-            }
-        }
-        PrimitiveLiteralKind::Bool => {
-            check_concrete_literal_type(&mut errors, return_type, PrimTy::Bool, tail);
-        }
-        PrimitiveLiteralKind::Byte => {
-            check_concrete_literal_type(&mut errors, return_type, PrimTy::Byte, tail);
-        }
-        PrimitiveLiteralKind::Character => {
-            check_concrete_literal_type(&mut errors, return_type, PrimTy::Char, tail);
-        }
-    }
-    errors
-}
-
-fn check_concrete_literal_type(
-    errors: &mut Vec<PrimitiveBodyError>,
-    expected: PrimTy,
-    found: PrimTy,
-    node: HirId,
-) {
-    if expected != found {
-        errors.push(PrimitiveBodyError {
-            node,
-            kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
-        });
-    }
-}
-
 struct FnCtxt<'a, 'hir> {
     input: PrimitiveBodyInput<'a, 'hir>,
-    known_bindings: HashMap<BindingId, PrimTy>,
+    known_bindings: HashMap<BindingId, LocalType>,
+    literal_variables: Vec<LiteralVariable<'hir>>,
     errors: Vec<PrimitiveBodyError>,
 }
 
-impl FnCtxt<'_, '_> {
-    fn check_block(&mut self, block: &Block<'_>) -> Result<(), ()> {
+impl<'a, 'hir> FnCtxt<'a, 'hir> {
+    fn check_block(&mut self, block: &Block<'hir>) -> Result<(), ()> {
         if block.safety != Safety::Safe || block.stmts.is_empty() {
             return Err(());
         }
@@ -439,13 +133,15 @@ impl FnCtxt<'_, '_> {
         let Some(tail) = block.tail else {
             return Err(());
         };
-        self.check_expr(tail)
+        self.check_expr(tail)?;
+        self.default_unresolved_literals();
+        Ok(())
     }
 
-    fn check_stmt(&mut self, stmt: &Stmt<'_>) -> Result<(), ()> {
+    fn check_stmt(&mut self, stmt: &Stmt<'hir>) -> Result<(), ()> {
         let StmtKind::Let {
             pat,
-            ty: Some(ty),
+            ty,
             init,
             els: None,
         } = stmt.kind
@@ -463,79 +159,244 @@ impl FnCtxt<'_, '_> {
             return Err(());
         };
 
-        let Some(primitive) = self.input.primitive_types.get(&ty.hir_id).copied() else {
-            return Err(());
+        let annotation = match ty {
+            Some(ty) => {
+                let Some(primitive) = self.input.primitive_types.get(&ty.hir_id).copied() else {
+                    return Err(());
+                };
+                if !supports_primitive_literal(primitive) {
+                    return Err(());
+                }
+                Some(primitive)
+            }
+            None => None,
         };
-        if !supports_primitive_literal(primitive) {
-            return Err(());
-        }
 
-        match init.kind {
+        let local_type = match init.kind {
             ExprKind::Lit(literal) => {
                 let Some(found) = primitive_literal_kind(literal) else {
                     return Err(());
                 };
-                match check_primitive_literal(
-                    primitive,
-                    literal,
-                    self.input.symbols,
-                    self.input.pointer_width,
-                ) {
-                    PrimitiveLiteralResult::Match => {}
-                    PrimitiveLiteralResult::TypeMismatch => {
-                        self.errors.push(PrimitiveBodyError {
-                            node: init.hir_id,
-                            kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
-                                expected: primitive,
-                                found,
-                            },
-                        });
-                    }
-                    PrimitiveLiteralResult::OutOfRange => {
-                        self.errors.push(PrimitiveBodyError {
-                            node: init.hir_id,
-                            kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                                expected: primitive,
-                                found,
-                            },
-                        });
-                    }
+                if let Some(expected) = annotation {
+                    self.check_annotated_literal(expected, literal, found, init.hir_id);
+                    LocalType::Concrete(expected)
+                } else {
+                    self.local_type_for_unannotated_literal(literal, found, init.hir_id)
                 }
             }
             ExprKind::Path(_) => {
-                let found = self.check_local_path(init)?;
-                if found != primitive {
-                    self.errors.push(PrimitiveBodyError {
-                        node: init.hir_id,
-                        kind: PrimitiveBodyErrorKind::TypeMismatch {
-                            expected: primitive,
-                            found,
-                        },
-                    });
+                let source_type = self.check_local_path(init)?;
+                if let Some(expected) = annotation {
+                    self.check_annotated_path(source_type, expected, init.hir_id)?;
+                    LocalType::Concrete(expected)
+                } else {
+                    source_type
                 }
             }
             _ => return Err(()),
-        }
+        };
 
-        self.known_bindings.insert(binding, primitive);
+        self.known_bindings.insert(binding, local_type);
         Ok(())
     }
 
-    fn check_expr(&mut self, expression: &Expr<'_>) -> Result<(), ()> {
-        let found = self.check_local_path(expression)?;
+    fn check_annotated_literal(
+        &mut self,
+        expected: PrimTy,
+        literal: Lit<'hir>,
+        found: PrimitiveLiteralKind,
+        node: HirId,
+    ) {
+        match check_primitive_literal(
+            expected,
+            literal,
+            self.input.symbols,
+            self.input.pointer_width,
+        ) {
+            PrimitiveLiteralResult::Match => {}
+            PrimitiveLiteralResult::TypeMismatch => {
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::LiteralTypeMismatch { expected, found },
+                });
+            }
+            PrimitiveLiteralResult::OutOfRange => {
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange { expected, found },
+                });
+            }
+        }
+    }
+
+    fn local_type_for_unannotated_literal(
+        &mut self,
+        literal: Lit<'hir>,
+        kind: PrimitiveLiteralKind,
+        origin: HirId,
+    ) -> LocalType {
+        match kind {
+            PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint => {
+                let id = self.literal_variables.len();
+                self.literal_variables.push(LiteralVariable {
+                    literal,
+                    kind,
+                    origin,
+                    resolved: None,
+                });
+                LocalType::LiteralVariable(id)
+            }
+            PrimitiveLiteralKind::Bool => LocalType::Concrete(PrimTy::Bool),
+            PrimitiveLiteralKind::Byte => LocalType::Concrete(PrimTy::Byte),
+            PrimitiveLiteralKind::Character => LocalType::Concrete(PrimTy::Char),
+        }
+    }
+
+    fn check_annotated_path(
+        &mut self,
+        source_type: LocalType,
+        expected: PrimTy,
+        node: HirId,
+    ) -> Result<(), ()> {
+        match source_type {
+            LocalType::Concrete(found) if found != expected => {
+                self.errors.push(PrimitiveBodyError {
+                    node,
+                    kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                });
+            }
+            LocalType::Concrete(_) => {}
+            LocalType::LiteralVariable(id) => {
+                let Some(variable) = self.literal_variables.get(id).copied() else {
+                    return Err(());
+                };
+                match variable.resolved {
+                    Some(found) if found != expected => {
+                        self.errors.push(PrimitiveBodyError {
+                            node,
+                            kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                        });
+                    }
+                    Some(_) => {}
+                    None if literal_family_accepts(variable.kind, expected) => {
+                        self.resolve_literal_variable(id, expected)?;
+                    }
+                    None => {
+                        self.errors.push(PrimitiveBodyError {
+                            node,
+                            kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                expected,
+                                found: variable.kind,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_expr(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
+        let local_type = self.check_local_path(expression)?;
+        match local_type {
+            LocalType::Concrete(found) => {
+                self.check_concrete_tail_type(found, expression.hir_id);
+            }
+            LocalType::LiteralVariable(id) => {
+                let Some(variable) = self.literal_variables.get(id).copied() else {
+                    return Err(());
+                };
+                match variable.resolved {
+                    Some(found) => self.check_concrete_tail_type(found, expression.hir_id),
+                    None if literal_family_accepts(variable.kind, self.input.return_type) => {
+                        self.resolve_literal_variable(id, self.input.return_type)?;
+                    }
+                    None => {
+                        self.errors.push(PrimitiveBodyError {
+                            node: expression.hir_id,
+                            kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                expected: self.input.return_type,
+                                found: variable.kind,
+                            },
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_concrete_tail_type(&mut self, found: PrimTy, node: HirId) {
         if found != self.input.return_type {
             self.errors.push(PrimitiveBodyError {
-                node: expression.hir_id,
+                node,
                 kind: PrimitiveBodyErrorKind::TypeMismatch {
                     expected: self.input.return_type,
                     found,
                 },
             });
         }
+    }
+
+    fn resolve_literal_variable(&mut self, id: usize, expected: PrimTy) -> Result<(), ()> {
+        let Some(variable) = self.literal_variables.get_mut(id) else {
+            return Err(());
+        };
+        if variable.resolved.is_some() || !literal_family_accepts(variable.kind, expected) {
+            return Err(());
+        }
+        variable.resolved = Some(expected);
+        if check_primitive_literal(
+            expected,
+            variable.literal,
+            self.input.symbols,
+            self.input.pointer_width,
+        ) == PrimitiveLiteralResult::OutOfRange
+        {
+            self.errors.push(PrimitiveBodyError {
+                node: variable.origin,
+                kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                    expected,
+                    found: variable.kind,
+                },
+            });
+        }
         Ok(())
     }
 
-    fn check_local_path(&self, expression: &Expr<'_>) -> Result<PrimTy, ()> {
+    fn default_unresolved_literals(&mut self) {
+        for id in 0..self.literal_variables.len() {
+            let variable = self.literal_variables[id];
+            if variable.resolved.is_some() {
+                continue;
+            }
+            let expected = match variable.kind {
+                PrimitiveLiteralKind::Integer => PrimTy::I64,
+                PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
+                PrimitiveLiteralKind::Bool
+                | PrimitiveLiteralKind::Byte
+                | PrimitiveLiteralKind::Character => unreachable!(),
+            };
+            self.literal_variables[id].resolved = Some(expected);
+            if check_primitive_literal(
+                expected,
+                variable.literal,
+                self.input.symbols,
+                self.input.pointer_width,
+            ) == PrimitiveLiteralResult::OutOfRange
+            {
+                self.errors.push(PrimitiveBodyError {
+                    node: variable.origin,
+                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                        expected,
+                        found: variable.kind,
+                    },
+                });
+            }
+        }
+    }
+
+    fn check_local_path(&self, expression: &Expr<'hir>) -> Result<LocalType, ()> {
         let ExprKind::Path(path) = expression.kind else {
             return Err(());
         };
@@ -549,10 +410,20 @@ impl FnCtxt<'_, '_> {
         let Some(binding) = self.input.local_paths.get(&path.hir_id).copied() else {
             return Err(());
         };
-        let Some(primitive) = self.known_bindings.get(&binding).copied() else {
+        let Some(local_type) = self.known_bindings.get(&binding).copied() else {
             return Err(());
         };
-        Ok(primitive)
+        Ok(local_type)
+    }
+}
+
+fn literal_family_accepts(kind: PrimitiveLiteralKind, expected: PrimTy) -> bool {
+    match kind {
+        PrimitiveLiteralKind::Integer => is_integer_primitive(expected),
+        PrimitiveLiteralKind::FloatingPoint => matches!(expected, PrimTy::F32 | PrimTy::F64),
+        PrimitiveLiteralKind::Bool
+        | PrimitiveLiteralKind::Byte
+        | PrimitiveLiteralKind::Character => false,
     }
 }
 
