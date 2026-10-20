@@ -884,7 +884,6 @@ fn primitive_comparison_local_uses_shadowed_binding_and_source_order() {
 #[test]
 fn unsupported_primitive_comparison_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left == 1\n    result\n}\n",
         "pub fn compare(left: I32) -> Bool {\n    let inferred = 1\n    let result = inferred == left\n    result\n}\n",
         "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left + right\n    result\n}\n",
         "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = (left == right) and (left < right)\n    result\n}\n",
@@ -904,6 +903,267 @@ fn unsupported_primitive_comparison_local_initializer_shapes_remain_gated() {
             &[],
         ),
         source,
+    );
+}
+
+#[test]
+fn primitive_comparison_local_initializers_accept_one_path_and_one_scalar_literal() {
+    for source in [
+        "pub fn bool_right(value: Bool) -> Bool {\n    let result: Bool = value == true\n    result\n}\n",
+        "pub fn bool_left(value: Bool) -> Bool {\n    let result = false < value\n    result\n}\n",
+        "pub fn char_right(value: Char) -> Bool {\n    let result = value <= 'z'\n    result\n}\n",
+        "pub fn char_left(value: Char) -> Bool {\n    let result = 'a' < value\n    result\n}\n",
+        "pub fn byte_right(value: Byte) -> Bool {\n    let result = value == b'Z'\n    result\n}\n",
+        "pub fn byte_left(value: Byte) -> Bool {\n    let result = b'A' < value\n    result\n}\n",
+        "pub fn integer_right(value: I8) -> Bool {\n    let result = value < 10\n    result\n}\n",
+        "pub fn integer_left(value: USize) -> Bool {\n    let result = 10 <= value\n    result\n}\n",
+        "pub fn float_right(value: F64) -> Bool {\n    let result = value >= 1.5\n    result\n}\n",
+        "pub fn float_left(value: F32) -> Bool {\n    let result = 1.5 < value\n    result\n}\n",
+        "pub fn greater(value: I32) -> Bool {\n    let result = 1 > value\n    result\n}\n",
+        "pub fn greater_equal(value: I32) -> Bool {\n    let result = 1 >= value\n    result\n}\n",
+        "pub fn not_equal_left(value: I32) -> Bool {\n    let result = 1 != value\n    result\n}\n",
+        "pub fn preceding_local(value: I16) -> Bool {\n    let source: I16 = value\n    let result = source != 0\n    result\n}\n",
+        "pub fn shadowed(source: I32) -> Bool {\n    let source: Bool = true\n    let result = false <= source\n    result\n}\n",
+        "pub fn character_path_literal(value: Char) -> Bool {\n    let result = value == 'x'\n    result\n}\n",
+        "pub fn builtin_alias(value: Int) -> Bool {\n    let result = value < 10\n    result\n}\n",
+        "pub fn builtin_unsigned_alias(value: UInt) -> Bool {\n    let result = 10 <= value\n    result\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_comparison_local_literal_range_uses_the_selected_pointer_width() {
+    let source = "pub fn pointer_sized(value: USize) -> Bool {\n    let result = 4294967296 <= value\n    result\n}\n";
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+
+    let output = run_check(source, manifest, &[], &["--target", "wasm32-core"]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let literal_start = source
+        .find("4294967296")
+        .expect("pointer-sized literal exists");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && stdout.contains("\"message\":\"integer literal is out of range for `USize`\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a 32-bit pointer-sized comparison literal should be out of range:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `USize`",
+        literal_start,
+        literal_start + "4294967296".len(),
+    );
+
+    assert_success_result(
+        run_check(source, manifest, &[], &["--target", "wasm64-core"]),
+        "wasm64-core",
+        "dev",
+    );
+}
+
+#[test]
+fn primitive_comparison_left_literal_family_mismatch_still_checks_default_range() {
+    let source = "pub fn compare(value: F32) -> Bool {\n    let result = 18446744073709551616 < value\n    result\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let literal_start = source
+        .find("18446744073709551616")
+        .expect("oversized integer literal exists");
+    let path_start = source
+        .find("value\n")
+        .expect("right comparison path exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "a mismatched literal family still reports the path type:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        1,
+        "the integer literal must also be checked against its default I64 type:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a literal-family mismatch and default range error should recover as Bool:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I64`",
+        literal_start,
+        literal_start + "18446744073709551616".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I64`, found `F32`",
+        path_start,
+        path_start + "value".len(),
+    );
+}
+
+#[test]
+fn primitive_comparison_local_literal_errors_use_operand_spans_and_recover_as_bool() {
+    let source = concat!(
+        "pub fn diagnostics(left: I32, float_value: F32, narrow: I8) -> Bool {\n",
+        "    let first = left == true\n",
+        "    let second = 10 < float_value\n",
+        "    let right_family_mismatch = float_value < 10\n",
+        "    let family_mismatch = 1.5 < narrow\n",
+        "    let third: I8 = false == left\n",
+        "    let fourth = narrow < 128\n",
+        "    fourth\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        6,
+        "literal/path and annotation errors should be reported without a feature gate:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        1,
+        "the comparison result should recover to Bool through the tail:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "supported comparisons with diagnosed operands still recover to Bool:\n{stdout}"
+    );
+
+    let right_literal = source.find("true").expect("right Bool literal exists");
+    let left_family_path = source
+        .find("10 < float_value")
+        .map(|start| start + "10 < ".len())
+        .expect("integer-left comparison path exists");
+    let float_family_path = source
+        .find("1.5 < narrow")
+        .map(|start| start + "1.5 < ".len())
+        .expect("float-left comparison path exists");
+    let right_family_literal = source
+        .find("float_value < 10")
+        .map(|start| start + "float_value < ".len())
+        .expect("right-side literal mismatch exists");
+    let fixed_family_path = source
+        .find("false == left")
+        .map(|start| start + "false == ".len())
+        .expect("Bool-left comparison path exists");
+    let invalid_annotation = source
+        .find("false == left")
+        .expect("comparison with a bad annotation exists");
+    let out_of_range_literal = source.find("128").expect("out-of-range literal exists");
+
+    let ordered_messages = [
+        "\"message\":\"expected `I32`, found a Bool literal\"",
+        "\"message\":\"expected `I64`, found `F32`\"",
+        "\"message\":\"expected `F32`, found an integer literal\"",
+        "\"message\":\"expected `F64`, found `I8`\"",
+        "\"message\":\"expected `I8`, found `Bool`\"",
+        "\"message\":\"expected `Bool`, found `I32`\"",
+        "\"message\":\"integer literal is out of range for `I8`\"",
+    ];
+    let message_positions =
+        ordered_messages.map(|message| stdout.find(message).expect("expected diagnostic exists"));
+    assert!(
+        message_positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "diagnostics should follow their primary source spans:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found a Bool literal",
+        right_literal,
+        right_literal + "true".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I64`, found `F32`",
+        left_family_path,
+        left_family_path + "float_value".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `F32`, found an integer literal",
+        right_family_literal,
+        right_family_literal + "10".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `F64`, found `I8`",
+        float_family_path,
+        float_family_path + "narrow".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        fixed_family_path,
+        fixed_family_path + "left".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I8`, found `Bool`",
+        invalid_annotation,
+        invalid_annotation + "false == left".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        out_of_range_literal,
+        out_of_range_literal + "128".len(),
+    );
+}
+
+#[test]
+fn unsupported_primitive_comparison_local_path_literal_shapes_remain_gated() {
+    for source in [
+        "pub fn compare(value: I32) -> Bool {\n    let result = 1 == 2\n    result\n}\n",
+        "pub fn compare(value: I32) -> Bool {\n    let result = value < (1 + 2)\n    result\n}\n",
+        "pub fn compare(value: I32) -> Bool {\n    let result = (value + 1) < 2\n    result\n}\n",
+        "pub fn compare(value: I32) -> Bool {\n    let result = not (value < 1)\n    result\n}\n",
+        "pub fn compare(value: I32) -> Bool {\n    let result = value < 1 and true\n    result\n}\n",
+        "pub fn compare() -> Bool {\n    let inferred = 1\n    let result = inferred < 2\n    result\n}\n",
+        "pub fn compare(value: I32) -> Bool {\n    let result = value < later\n    let later: I32 = 1\n    result\n}\n",
+        "pub fn compare(value: I32) -> Bool {\n    let result = result < 1\n    result\n}\n",
+        "pub fn compare(value: I32) -> Bool {\n    let result = value < missing\n    result\n}\n",
+        "type IntegerAlias = I32\npub fn compare(value: IntegerAlias) -> Bool {\n    let result = value < 1\n    result\n}\n",
+        "pub fn compare(value: Str) -> Bool {\n    let result = value == \"text\"\n    result\n}\n",
+        "pub fn compare(value: ()) -> Bool {\n    let result = value == ()\n    result\n}\n",
+        "const LIMIT: I32 = 10\npub fn compare(value: I32) -> Bool {\n    let result = value < LIMIT\n    result\n}\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+
+    let qualified = concat!(
+        "use acme:empty/values as values\n",
+        "pub fn compare(value: I32) -> Bool {\n",
+        "    let result = values.LIMIT < value\n",
+        "    result\n",
+        "}\n",
+    );
+    assert_check_stays_gated(
+        &run_check(
+            qualified,
+            "",
+            &[("src/values.sai", "pub const LIMIT: I32 = 10\n")],
+            &[],
+        ),
+        qualified,
     );
 }
 

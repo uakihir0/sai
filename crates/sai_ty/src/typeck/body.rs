@@ -103,8 +103,9 @@ struct LiteralVariable<'hir> {
 /// Check a flat sequence of immutable primitive locals and a local-path tail.
 ///
 /// Direct scalar literals, plain paths to earlier bindings, comparisons
-/// between concrete primitive paths, and one top-level logical operation
-/// between Bool paths are accepted as initializers.
+/// between concrete primitive paths or one path and one scalar literal, and
+/// one top-level logical operation between Bool paths are accepted as
+/// initializers.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
@@ -277,32 +278,98 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         left: &'hir Expr<'hir>,
         right: &'hir Expr<'hir>,
     ) -> Result<LocalType, ()> {
-        let left_type = self
+        let left_path_type = self
             .check_local_path(left)
             .ok()
-            .and_then(|local_type| self.concrete_local_type(local_type))
-            .ok_or(())?;
-        let right_type = self
+            .and_then(|local_type| self.concrete_local_type(local_type));
+        let right_path_type = self
             .check_local_path(right)
             .ok()
-            .and_then(|local_type| self.concrete_local_type(local_type))
-            .ok_or(())?;
+            .and_then(|local_type| self.concrete_local_type(local_type));
+        let left_literal = match left.kind {
+            ExprKind::Lit(literal) => primitive_literal_kind(literal).map(|kind| (literal, kind)),
+            _ => None,
+        };
+        let right_literal = match right.kind {
+            ExprKind::Lit(literal) => primitive_literal_kind(literal).map(|kind| (literal, kind)),
+            _ => None,
+        };
 
-        match primitive_comparison_result(operator, left_type, right_type) {
-            PrimitiveComparisonResult::Bool => {}
-            PrimitiveComparisonResult::TypeMismatch { expected, found } => {
-                self.errors.push(PrimitiveBodyError {
-                    node: right.hir_id,
-                    kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
-                });
+        match (left_path_type, right_path_type, left_literal, right_literal) {
+            (Some(left_type), Some(right_type), None, None) => {
+                match primitive_comparison_result(operator, left_type, right_type) {
+                    PrimitiveComparisonResult::Bool => {}
+                    PrimitiveComparisonResult::TypeMismatch { expected, found } => {
+                        self.errors.push(PrimitiveBodyError {
+                            node: right.hir_id,
+                            kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                        });
+                    }
+                    PrimitiveComparisonResult::Unsupported => return Err(()),
+                }
             }
-            PrimitiveComparisonResult::Unsupported => return Err(()),
+            (Some(path_type), None, None, Some((literal, kind))) => {
+                self.check_comparison_literal(
+                    operator, left, path_type, right, literal, kind, false,
+                )?;
+            }
+            (None, Some(path_type), Some((literal, kind)), None) => {
+                self.check_comparison_literal(
+                    operator, right, path_type, left, literal, kind, true,
+                )?;
+            }
+            _ => return Err(()),
         }
 
         // A failed operand comparison still has Bool as its recovered result,
         // so later statements and the tail are checked against the expression
         // type instead of inheriting either operand's type.
         Ok(LocalType::Concrete(PrimTy::Bool))
+    }
+
+    fn check_comparison_literal(
+        &mut self,
+        operator: BinOp,
+        path: &'hir Expr<'hir>,
+        path_type: PrimTy,
+        literal_expression: &'hir Expr<'hir>,
+        literal: Lit<'hir>,
+        literal_kind: PrimitiveLiteralKind,
+        literal_is_left: bool,
+    ) -> Result<(), ()> {
+        if primitive_comparison_result(operator, path_type, path_type)
+            == PrimitiveComparisonResult::Unsupported
+        {
+            return Err(());
+        }
+
+        match primitive_comparison_literal_expected_type(literal_kind, path_type, literal_is_left) {
+            Ok(expected) => self.check_annotated_literal(
+                expected,
+                literal,
+                literal_kind,
+                literal_expression.hir_id,
+            ),
+            Err(expected) => {
+                self.errors.push(PrimitiveBodyError {
+                    node: path.hir_id,
+                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                        expected,
+                        found: path_type,
+                    },
+                });
+                // Even when a left numeric literal cannot unify with the
+                // path's family, its default type can independently fail
+                // range checking. Keep that diagnostic on the literal.
+                self.check_annotated_literal(
+                    expected,
+                    literal,
+                    literal_kind,
+                    literal_expression.hir_id,
+                );
+            }
+        }
+        Ok(())
     }
 
     fn check_logical(
@@ -590,6 +657,36 @@ fn primitive_comparison_result(
     PrimitiveComparisonResult::Bool
 }
 
+fn primitive_comparison_literal_expected_type(
+    kind: PrimitiveLiteralKind,
+    path_type: PrimTy,
+    literal_is_left: bool,
+) -> Result<PrimTy, PrimTy> {
+    if !literal_is_left {
+        return Ok(path_type);
+    }
+
+    let default_type = match kind {
+        PrimitiveLiteralKind::Integer => PrimTy::I64,
+        PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
+        PrimitiveLiteralKind::Bool => PrimTy::Bool,
+        PrimitiveLiteralKind::Byte => PrimTy::Byte,
+        PrimitiveLiteralKind::Character => PrimTy::Char,
+    };
+    let family_accepts = match kind {
+        PrimitiveLiteralKind::Integer => is_integer_primitive(path_type),
+        PrimitiveLiteralKind::FloatingPoint => matches!(path_type, PrimTy::F32 | PrimTy::F64),
+        PrimitiveLiteralKind::Bool => path_type == PrimTy::Bool,
+        PrimitiveLiteralKind::Byte => path_type == PrimTy::Byte,
+        PrimitiveLiteralKind::Character => path_type == PrimTy::Char,
+    };
+    if family_accepts {
+        Ok(path_type)
+    } else {
+        Err(default_type)
+    }
+}
+
 fn primitive_bool_operand_result(found: PrimTy) -> PrimitiveBoolOperandResult {
     if found == PrimTy::Bool {
         PrimitiveBoolOperandResult::Bool
@@ -614,7 +711,7 @@ fn literal_family_accepts(kind: PrimitiveLiteralKind, expected: PrimTy) -> bool 
 mod tests {
     use super::{
         PrimitiveBoolOperandResult, PrimitiveComparisonResult, primitive_bool_operand_result,
-        primitive_comparison_result,
+        primitive_comparison_literal_expected_type, primitive_comparison_result,
     };
     use sai_hir::expressions::BinOp;
     use sai_resolve::prelude::PrimTy;
@@ -677,6 +774,87 @@ mod tests {
         assert_eq!(
             primitive_comparison_result(BinOp::Eq, PrimTy::Never, PrimTy::Never),
             PrimitiveComparisonResult::Unsupported
+        );
+    }
+
+    #[test]
+    fn comparison_literals_follow_operand_order_and_literal_family() {
+        for (kind, matching_path, other_path) in [
+            (super::PrimitiveLiteralKind::Bool, PrimTy::Bool, PrimTy::I32),
+            (
+                super::PrimitiveLiteralKind::Character,
+                PrimTy::Char,
+                PrimTy::I32,
+            ),
+            (super::PrimitiveLiteralKind::Byte, PrimTy::Byte, PrimTy::I32),
+            (
+                super::PrimitiveLiteralKind::Integer,
+                PrimTy::I8,
+                PrimTy::F32,
+            ),
+            (
+                super::PrimitiveLiteralKind::FloatingPoint,
+                PrimTy::F32,
+                PrimTy::I8,
+            ),
+        ] {
+            assert_eq!(
+                primitive_comparison_literal_expected_type(kind, matching_path, true),
+                Ok(matching_path),
+                "{kind:?} literal on the left"
+            );
+            assert_eq!(
+                primitive_comparison_literal_expected_type(kind, matching_path, false),
+                Ok(matching_path),
+                "{kind:?} literal on the right"
+            );
+            let expected_default = match kind {
+                super::PrimitiveLiteralKind::Integer => PrimTy::I64,
+                super::PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
+                super::PrimitiveLiteralKind::Bool => PrimTy::Bool,
+                super::PrimitiveLiteralKind::Byte => PrimTy::Byte,
+                super::PrimitiveLiteralKind::Character => PrimTy::Char,
+            };
+            assert_eq!(
+                primitive_comparison_literal_expected_type(kind, other_path, true),
+                Err(expected_default),
+                "{kind:?} literal on the left with incompatible path type"
+            );
+            assert_eq!(
+                primitive_comparison_literal_expected_type(kind, other_path, false),
+                Ok(other_path),
+                "{kind:?} literal on the right is checked against the path"
+            );
+        }
+
+        for integer_type in [
+            PrimTy::I8,
+            PrimTy::I16,
+            PrimTy::I32,
+            PrimTy::I64,
+            PrimTy::U8,
+            PrimTy::U16,
+            PrimTy::U32,
+            PrimTy::U64,
+            PrimTy::ISize,
+            PrimTy::USize,
+        ] {
+            assert_eq!(
+                primitive_comparison_literal_expected_type(
+                    super::PrimitiveLiteralKind::Integer,
+                    integer_type,
+                    true,
+                ),
+                Ok(integer_type)
+            );
+        }
+        assert_eq!(
+            primitive_comparison_literal_expected_type(
+                super::PrimitiveLiteralKind::FloatingPoint,
+                PrimTy::F64,
+                true,
+            ),
+            Ok(PrimTy::F64)
         );
     }
 
