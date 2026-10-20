@@ -338,7 +338,7 @@ fn unannotated_copy_of_annotated_primitive_local_reports_semantic_errors() {
 #[test]
 fn unsupported_unannotated_copy_local_forms_remain_gated() {
     for source in [
-        "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = source + 1\n    copied\n}\n",
+        "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = source - 1\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source: I32 = 42\n    let copied = r#source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    let source: I32 = 42\n    var copied = source\n    copied\n}\n",
         "pub fn copy() -> I32 {\n    var source: I32 = 42\n    let copied = source\n    copied\n}\n",
@@ -872,6 +872,208 @@ fn primitive_add_annotation_mismatch_points_to_initializer_and_recovers_to_annot
 }
 
 #[test]
+fn primitive_add_local_initializers_accept_a_right_numeric_literal() {
+    for source in [
+        "pub fn signed(value: I8) -> I8 {\n    let sum: I8 = value + 127\n    sum\n}\n",
+        "pub fn signed_min(value: I8) -> I8 {\n    let sum = value + -128\n    sum\n}\n",
+        "pub fn unsigned(value: U8) -> U8 {\n    let sum = value + 255\n    sum\n}\n",
+        "pub fn float32(value: F32) -> F32 {\n    let sum: F32 = value + 1.25\n    sum\n}\n",
+        "pub fn float64(value: F64) -> F64 {\n    let sum = value + 1e308\n    sum\n}\n",
+        "pub fn preceding(value: U32) -> U32 {\n    let source: U32 = value\n    let sum = source + 42\n    sum\n}\n",
+        "pub fn builtin_int_alias(value: Int) -> Int {\n    let sum = value + 42\n    sum\n}\n",
+        "pub fn builtin_uint_alias(value: UInt) -> UInt {\n    let sum = value + 42\n    sum\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_add_local_literal_range_uses_the_selected_pointer_width() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    for source in [
+        "pub fn unsigned_edge(value: USize) -> USize {\n    let sum = value + 4294967295\n    sum\n}\n",
+        "pub fn signed_min(value: ISize) -> ISize {\n    let sum = value + -2147483648\n    sum\n}\n",
+        "pub fn signed_max(value: ISize) -> ISize {\n    let sum = value + 2147483647\n    sum\n}\n",
+    ] {
+        let output = run_check(source, manifest, &[], &["--target", "wasm32-core"]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "wasm32 boundary should fit:\n{source}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_success_result(output, "wasm32-core", "dev");
+    }
+
+    for source in [
+        "pub fn unsigned_edge(value: USize) -> USize {\n    let sum = value + 18446744073709551615\n    sum\n}\n",
+        "pub fn signed_min(value: ISize) -> ISize {\n    let sum = value + -9223372036854775808\n    sum\n}\n",
+        "pub fn signed_max(value: ISize) -> ISize {\n    let sum = value + 9223372036854775807\n    sum\n}\n",
+    ] {
+        let output = run_check(source, manifest, &[], &["--target", "wasm64-core"]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "wasm64 boundary should fit:\n{source}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_success_result(output, "wasm64-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_add_local_literal_range_errors_use_literal_spans_and_recover() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    for (source, literal, message) in [
+        (
+            "pub fn out_of_range(value: USize) -> USize {\n    let sum = value + 4294967296\n    sum\n}\n",
+            "4294967296",
+            "integer literal is out of range for `USize`",
+        ),
+        (
+            "pub fn out_of_range(value: ISize) -> ISize {\n    let sum = value + 2147483648\n    sum\n}\n",
+            "2147483648",
+            "integer literal is out of range for `ISize`",
+        ),
+    ] {
+        let output = run_check(source, manifest, &[], &["--target", "wasm32-core"]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let literal_start = source.find(literal).expect("out-of-range literal exists");
+
+        assert_eq!(output.status.code(), Some(1), "{source}\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+            1,
+            "the right literal should be range-checked at the wasm32 width:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "the literal error should recover through the path result and tail:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "LITERAL_OUT_OF_RANGE",
+            message,
+            literal_start,
+            literal_start + literal.len(),
+        );
+    }
+
+    for source in [
+        "pub fn unsigned(value: USize) -> USize {\n    let sum = value + 4294967296\n    sum\n}\n",
+        "pub fn signed(value: ISize) -> ISize {\n    let sum = value + 2147483648\n    sum\n}\n",
+    ] {
+        let output = run_check(source, manifest, &[], &["--target", "wasm64-core"]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "wasm64 right literal should fit:\n{source}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_success_result(output, "wasm64-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_add_local_literal_type_and_annotation_errors_have_exact_spans() {
+    let source = concat!(
+        "pub fn errors(narrow: I8, floating: F32, integer: I32) -> U32 {\n",
+        "    let out_of_range = narrow + 128\n",
+        "    let int_to_float = floating + 1\n",
+        "    let float_out_of_range = floating + 1e39\n",
+        "    let float_to_int = integer + 1.5\n",
+        "    let annotation: U32 = integer + 1\n",
+        "    annotation\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let out_of_range_literal = source.find("128").expect("I8 range literal exists");
+    let float_out_of_range_literal = source
+        .find("1e39")
+        .expect("F32 out-of-range float literal exists");
+    let int_to_float_literal = source.find("+ 1\n").map(|start| start + 2).unwrap();
+    let float_to_int_literal = source
+        .find("+ 1.5")
+        .map(|start| start + 2)
+        .expect("floating literal exists");
+    let annotation_initializer = source
+        .rfind("integer + 1")
+        .expect("annotated addition exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        3,
+        "literal-family and annotation errors should recover without a feature gate:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        2,
+        "both numeric literals should be range-checked at the path type:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "literal errors should retain the synthesized left result type:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        out_of_range_literal,
+        out_of_range_literal + "128".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "floating-point literal is out of range for `F32`",
+        float_out_of_range_literal,
+        float_out_of_range_literal + "1e39".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `F32`, found an integer literal",
+        int_to_float_literal,
+        int_to_float_literal + "1".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found a floating-point literal",
+        float_to_int_literal,
+        float_to_int_literal + "1.5".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U32`, found `I32`",
+        annotation_initializer,
+        annotation_initializer + "integer + 1".len(),
+    );
+}
+
+#[test]
+fn unsupported_primitive_add_local_literal_shapes_remain_gated() {
+    for source in [
+        "pub fn literal_left(value: I32) -> I32 {\n    let sum = 1 + value\n    sum\n}\n",
+        "pub fn subtraction(value: I32) -> I32 {\n    let result = value - 1\n    result\n}\n",
+        "pub fn multiplication(value: I32) -> I32 {\n    let result = value * 1\n    result\n}\n",
+        "pub fn fixed_literal(value: I32) -> I32 {\n    let result = value + true\n    result\n}\n",
+        "pub fn byte_path(value: Byte) -> Byte {\n    let result = value + 1\n    result\n}\n",
+        "pub fn unresolved_number(value: I32) -> I32 {\n    let number = 1\n    let result = value + number\n    result\n}\n",
+        "pub fn nested(value: I32) -> I32 {\n    let result = value + (1 + 1)\n    result\n}\n",
+        "pub fn computed_left(value: I32) -> I32 {\n    let result = (value + 1) + value\n    result\n}\n",
+        "pub fn forward(value: I32) -> I32 {\n    let result = later + 1\n    let later = value\n    result\n}\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn primitive_sub_mul_local_initializers_accept_integer_and_float_paths() {
     for (operator_name, operator) in [("sub", "-"), ("mul", "*")] {
         for primitive in [
@@ -1096,7 +1298,7 @@ fn primitive_add_diagnostics_follow_source_order_after_shadowed_binding_resoluti
 #[test]
 fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = left + 1\n    sum\n}\n",
+        "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = 1 + left\n    sum\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = 1 + 2\n    sum\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let one = 1\n    let sum = one + right\n    sum\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = (left + right) + left\n    sum\n}\n",
@@ -2705,7 +2907,7 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local() -> I32 {\nlet value: I32 = 42\n{ value }\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nvar second: I32 = 2\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = 40 + 2\nfirst\n}\n",
-        "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first + 1\nfirst\n}\n",
+        "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first - 1\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nfirst\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nlet copy: I32 = r#value\ncopy\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = second\nlet second: I32 = 2\nfirst\n}\n",
