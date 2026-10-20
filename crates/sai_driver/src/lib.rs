@@ -5897,11 +5897,9 @@ fn check_function_body_type(
         )? {
             return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
         }
-        if let Some(diagnostics) =
-            check_function_body_unannotated_copy_of_annotated_primitive_local(
-                owner, sig, body, locals, type_paths, symbols, inputs, snapshot, target_cfg,
-            )?
-        {
+        if let Some(diagnostics) = check_function_body_unannotated_copy_of_primitive_local(
+            owner, sig, body, locals, type_paths, symbols, inputs, snapshot, target_cfg,
+        )? {
             return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
         }
     }
@@ -6454,7 +6452,7 @@ fn check_function_body_return_constrained_primitive_local(
     primitive_body_errors_to_diagnostics(owner, block, tail, errors, inputs, snapshot)
 }
 
-fn check_function_body_unannotated_copy_of_annotated_primitive_local(
+fn check_function_body_unannotated_copy_of_primitive_local(
     owner: &HirOwner<'_>,
     sig: sai_hir::body::FnSig<'_>,
     body: &sai_hir::body::Body<'_>,
@@ -6482,7 +6480,7 @@ fn check_function_body_unannotated_copy_of_annotated_primitive_local(
 
     let StmtKind::Let {
         pat: source_pat,
-        ty: Some(source_ty),
+        ty: source_ty,
         init: source_init,
         els: None,
     } = block.stmts[0].kind
@@ -6511,10 +6509,15 @@ fn check_function_body_unannotated_copy_of_annotated_primitive_local(
     {
         return Ok(None);
     }
-    let Some(FunctionDirectType::Primitive(source_type)) =
-        resolve_function_direct_type(*source_ty, type_paths, symbols, inputs)
-    else {
-        return Ok(None);
+    let source_type = if let Some(source_ty) = source_ty {
+        let Some(FunctionDirectType::Primitive(source_type)) =
+            resolve_function_direct_type(*source_ty, type_paths, symbols, inputs)
+        else {
+            return Ok(None);
+        };
+        Some(source_type)
+    } else {
+        None
     };
 
     let StmtKind::Let {
@@ -6572,7 +6575,10 @@ fn check_function_body_unannotated_copy_of_annotated_primitive_local(
         return Ok(None);
     }
 
-    let primitive_types = HashMap::from([(source_ty.hir_id, source_type)]);
+    let primitive_types = source_ty
+        .zip(source_type)
+        .map(|(source_ty, source_type)| HashMap::from([(source_ty.hir_id, source_type)]))
+        .unwrap_or_default();
     let local_paths = locals
         .paths
         .iter()
@@ -6585,7 +6591,7 @@ fn check_function_body_unannotated_copy_of_annotated_primitive_local(
             _ => None,
         })
         .collect::<HashMap<_, _>>();
-    let check = sai_ty::typeck::body::check_unannotated_copy_of_annotated_primitive_local_body(
+    let check = sai_ty::typeck::body::check_unannotated_copy_of_primitive_local_body(
         sai_ty::typeck::body::PrimitiveBodyInput {
             body,
             return_type,
@@ -25309,6 +25315,154 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_checks_unannotated_copy_from_unannotated_literal() {
+        let root = concat!(
+            "pub fn integer_copy() -> I8 {\n",
+            "    let source = 127\n",
+            "    let copied = source\n",
+            "    copied\n",
+            "}\n",
+            "pub fn float_copy() -> F32 {\n",
+            "    let source = 1.5\n",
+            "    let copied = source\n",
+            "    copied\n",
+            "}\n",
+            "pub fn integer_family_mismatch() -> F32 {\n",
+            "    let source = 340282366920938463463374607431768211456\n",
+            "    let copied = source\n",
+            "    copied\n",
+            "}\n",
+            "pub fn float_family_mismatch() -> I32 {\n",
+            "    let source = 1e309\n",
+            "    let copied = source\n",
+            "    copied\n",
+            "}\n",
+            "pub fn integer_overflow() -> I8 {\n",
+            "    let source = 128\n",
+            "    let copied = source\n",
+            "    copied\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 5);
+        for index in 0..2 {
+            let check = resolved.owners()[index]
+                .body_type_check()
+                .expect("same-family literal copies are checked");
+            assert!(
+                matches!(
+                    check,
+                    FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+                ),
+                "{check:?}"
+            );
+        }
+
+        for (index, function, expected) in [
+            (
+                2,
+                "integer_family_mismatch",
+                &[
+                    (
+                        sai_diagnostics::Code::TypeMismatch,
+                        "expected `F32`, found an integer literal",
+                        "copied",
+                    ),
+                    (
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        "integer literal is out of range for `I64`",
+                        "340282366920938463463374607431768211456",
+                    ),
+                ][..],
+            ),
+            (
+                3,
+                "float_family_mismatch",
+                &[
+                    (
+                        sai_diagnostics::Code::TypeMismatch,
+                        "expected `I32`, found a floating-point literal",
+                        "copied",
+                    ),
+                    (
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        "floating-point literal is out of range for `F64`",
+                        "1e309",
+                    ),
+                ][..],
+            ),
+            (
+                4,
+                "integer_overflow",
+                &[(
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    "integer literal is out of range for `I8`",
+                    "128",
+                )][..],
+            ),
+        ] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
+                .body_type_check()
+                .expect("supported copy diagnostics are reported")
+            else {
+                panic!("{function} must be supported");
+            };
+            assert_eq!(
+                diagnostics.len(),
+                expected.len(),
+                "{function}: {diagnostics:?}"
+            );
+
+            let function_start = root
+                .find(&format!("pub fn {function}"))
+                .expect("function exists");
+            let function_end = root[function_start..]
+                .find("\npub fn ")
+                .map_or(root.len(), |offset| function_start + offset);
+            let function_text = &root[function_start..function_end];
+            for &(code, message, token) in expected {
+                let diagnostic = diagnostics
+                    .iter()
+                    .find(|diagnostic| diagnostic.code == code && diagnostic.message == message)
+                    .unwrap_or_else(|| panic!("{function}: missing {message}: {diagnostics:?}"));
+                let relative_start = if token == "copied" {
+                    function_text.rfind(token)
+                } else {
+                    function_text.find(token)
+                }
+                .expect("diagnostic token exists in function");
+                let start = (function_start + relative_start) as u32;
+                assert_eq!(
+                    diagnostic
+                        .primary()
+                        .expect("body type diagnostic has a primary span")
+                        .span
+                        .range,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(start),
+                        sai_diagnostics::TextSize::new(start + token.len() as u32),
+                    )
+                    .expect("diagnostic token range is ordered"),
+                    "{function}: {message}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn function_body_type_check_checks_multiple_annotated_locals_and_copies_in_source_order() {
         let root = concat!(
             "pub fn first_local() -> U8 {\n",
@@ -25499,7 +25653,6 @@ mod tests {
             "pub fn camel_local() -> I32 {\n    let valueName: I32 = 42\n    valueName\n}\n",
             "pub fn raw_local() -> I32 {\n    let r#value: I32 = 42\n    r#value\n}\n",
             "pub fn unannotated_computed() -> I32 {\n    let value = 40 + 2\n    value\n}\n",
-            "pub fn unannotated_copy_from_unannotated() -> I32 {\n    let source = 42\n    let copy = source\n    copy\n}\n",
             "pub fn unannotated_copy_from_constant() -> I32 {\n    let copy = ONE\n    copy\n}\n",
             "pub fn unannotated_copy_computed() -> I32 {\n    let source: I32 = 42\n    let copy = source + 1\n    copy\n}\n",
             "pub fn unannotated_raw_copy() -> I32 {\n    let source: I32 = 42\n    let copy = r#source\n    copy\n}\n",
@@ -25525,7 +25678,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 26);
+        assert_eq!(resolved.owners().len(), 25);
         for owner in resolved.owners() {
             assert!(matches!(
                 owner
