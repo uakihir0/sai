@@ -1,0 +1,50 @@
+use acme:market-checkout/model.{Category, Product}
+
+pub fn products() -> Array<Product, 5> {
+    [
+        Product(
+            sku: "BEAN-ETHIOPIA",
+            name: "Ethiopian beans",
+            category: Category.Coffee,
+            price_cents: 1450,
+            on_hand: 8
+        ),
+        Product(
+            sku: "BEAN-DECAF",
+            name: "Decaf beans",
+            category: Category.Coffee,
+            price_cents: 1250,
+            on_hand: 5
+        ),
+        Product(
+            sku: "TEA-SENCHA",
+            name: "Sencha tea",
+            category: Category.Tea,
+            price_cents: 980,
+            on_hand: 3
+        ),
+        Product(
+            sku: "MUG-TRAVEL",
+            name: "Travel mug",
+            category: Category.Equipment,
+            price_cents: 2200,
+            on_hand: 4
+        ),
+        Product(
+            sku: "FILTER-01",
+            name: "Paper filters",
+            category: Category.Equipment,
+            price_cents: 700,
+            on_hand: 12
+        )
+    ]
+}
+
+pub fn find(sku: Str) -> Option<Product> {
+    for product in products() {
+        if product.sku == sku {
+            return Some(product)
+        }
+    }
+    None
+}

@@ -1,0 +1,124 @@
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+use acme:market-checkout/catalog
+use acme:market-checkout/checkout
+use acme:market-checkout/model.{CartLine, Category, HoldReason, Product, SalesOrder}
+use acme:market-checkout/orders
+
+fn write_money(out: borrow mut Stdout, cents: U32)
+    effects { stdio.write, alloc }
+{
+    let dollars = cents / 100
+    let remainder = cents % 100
+    out.write_str(f"${dollars}.{remainder:zpad(2)}".as_str())
+}
+
+fn category_name(category: Category) -> Str {
+    match category {
+        Category.Coffee => "coffee"
+        Category.Tea => "tea"
+        Category.Equipment => "equipment"
+    }
+}
+
+fn print_product(out: borrow mut Stdout, product: Product)
+    effects { stdio.write, alloc }
+{
+    let dollars = product.price_cents / 100
+    let remainder = product.price_cents % 100
+    out.write_str(
+        f"{product.sku}  {product.name}  {category_name(product.category)}  ${dollars}.{remainder:zpad(2)}  stock: {product.on_hand}\n".as_str()
+    )
+}
+
+fn print_line(out: borrow mut Stdout, line: CartLine)
+    effects { stdio.write, alloc }
+{
+    out.write_str(f"  {line.quantity} x {line.sku}\n".as_str())
+}
+
+fn print_order(out: borrow mut Stdout, order: SalesOrder)
+    effects { stdio.write, alloc }
+{
+    out.write_str(f"Order #{order.id} for {order.customer}\n".as_str())
+    for line in order.lines {
+        print_line(borrow mut out, line)
+    }
+}
+
+fn print_reason(out: borrow mut Stdout, reason: HoldReason)
+    effects { stdio.write }
+{
+    match reason {
+        HoldReason.None => out.write_str("ready")
+        HoldReason.UnknownProduct => out.write_str("hold — unknown product code")
+        HoldReason.InsufficientStock => out.write_str("hold — stock is too low")
+        HoldReason.MultipleIssues => out.write_str("hold — product and stock issues")
+    }
+}
+
+pub fn print_usage(out: borrow mut Stdout)
+    effects { stdio.write }
+{
+    out.write_str("usage: market-checkout [catalog|orders|quote|fulfill|inventory]\n")
+}
+
+pub fn print_catalog(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Market catalog\n")
+    for product in catalog.products() {
+        print_product(borrow mut out, product)
+    }
+}
+
+pub fn print_orders(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    for order in orders.sample() {
+        print_order(borrow mut out, order)
+    }
+}
+
+pub fn print_quotes(out: borrow mut Stdout, ready_only: Bool)
+    effects { stdio.write, alloc }
+{
+    for order in orders.sample() {
+        let quote = checkout.quote(order)
+        if !ready_only || quote.hold_reason == HoldReason.None {
+            out.write_str(f"Order #{quote.order_id} for {quote.customer}: ".as_str())
+            print_reason(borrow mut out, quote.hold_reason)
+            out.write_str("\n")
+
+            if quote.hold_reason == HoldReason.None {
+                out.write_str("  subtotal ")
+                write_money(borrow mut out, quote.subtotal_cents)
+                out.write_str(", discount ")
+                write_money(borrow mut out, quote.discount_cents)
+                out.write_str(", tax ")
+                write_money(borrow mut out, quote.tax_cents)
+                out.write_str(", total ")
+                write_money(borrow mut out, quote.total_cents)
+                out.write_str("\n")
+            }
+        }
+    }
+}
+
+pub fn print_inventory(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    var product_count: U32 = 0
+    var units_on_hand: U32 = 0
+    var retail_value_cents: U32 = 0
+
+    for product in catalog.products() {
+        product_count += 1
+        units_on_hand += product.on_hand
+        retail_value_cents += product.price_cents * product.on_hand
+    }
+
+    out.write_str(f"{product_count} products; {units_on_hand} units on hand; retail value ".as_str())
+    write_money(borrow mut out, retail_value_cents)
+    out.write_str("\n")
+}

@@ -1,0 +1,42 @@
+use acme:market-checkout/model.{CartLine, SalesOrder}
+
+pub fn sample() -> Array<SalesOrder, 4> {
+    [
+        SalesOrder(
+            id: 1042,
+            customer: "Jun",
+            lines: [
+                CartLine(sku: "BEAN-ETHIOPIA", quantity: 2),
+                CartLine(sku: "MUG-TRAVEL", quantity: 1)
+            ],
+            requested_discount_cents: 350
+        ),
+        SalesOrder(
+            id: 1043,
+            customer: "Emi",
+            lines: [
+                CartLine(sku: "TEA-SENCHA", quantity: 2),
+                CartLine(sku: "TEA-SENCHA", quantity: 2)
+            ],
+            requested_discount_cents: 0
+        ),
+        SalesOrder(
+            id: 1044,
+            customer: "Kai",
+            lines: [
+                CartLine(sku: "BEAN-DECAF", quantity: 2),
+                CartLine(sku: "FILTER-01", quantity: 2)
+            ],
+            requested_discount_cents: 150
+        ),
+        SalesOrder(
+            id: 1045,
+            customer: "Ren",
+            lines: [
+                CartLine(sku: "COFFEE-GIFT-BOX", quantity: 1),
+                CartLine(sku: "BEAN-ETHIOPIA", quantity: 1)
+            ],
+            requested_discount_cents: 5000
+        )
+    ]
+}
