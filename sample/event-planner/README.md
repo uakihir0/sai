@@ -41,8 +41,10 @@ waitlisted requests do not create conflicts. Sessions use start and end minutes
 since midnight for overlap checks and display separate clock-time strings.
 The sample is read-only and does not accept new registrations or save changes.
 
-The package uses the `sai:process` command-line entry point and multiple
-modules. It is illustrative: the current compiler does not yet support the
+The command dispatcher assumes its host supplies the executable name as
+`argv[0]`, with the requested command at `argv[1]`. The package uses the
+`sai:process` command-line entry point and multiple modules. It is illustrative:
+the current compiler does not yet support the
 complete package, process, loop, formatting, and multi-module pipeline needed
 to build and run it. The fixture and printed arithmetic are checked, but no
 successful semantic or runtime check is claimed.
