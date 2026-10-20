@@ -11431,8 +11431,11 @@ fn run_explain(
         .first()
         .map(|(argument, _)| argument.to_string_lossy().into_owned())
         .unwrap_or_default();
-    if sai_diagnostics::Code::from_name(&name).is_none() {
+    let Some(code) = sai_diagnostics::Code::from_name(&name) else {
         return report_unknown_diagnostic_code(parsed, &name, stdout, stderr);
+    };
+    if let Some(explanation) = sai_diagnostics::explain_diagnostic(code) {
+        return report_explain_diagnostic(parsed.globals.format, explanation, stdout, stderr);
     }
 
     report_feature_not_implemented(
@@ -11447,6 +11450,72 @@ fn run_explain(
         "sai explain",
         stdout,
         stderr,
+    )
+}
+
+fn report_explain_diagnostic(
+    format: OutputFormat,
+    explanation: &sai_diagnostics::ExplainDiagnostic,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    match format {
+        OutputFormat::Human => write_stdout_text(stdout, explanation.markdown, stderr),
+        OutputFormat::Json => {
+            if let Err(error) = write_json_explain_diagnostic(stdout, explanation) {
+                report_stdout_failure(stderr, error);
+                4
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn write_json_explain_diagnostic(
+    writer: &mut impl Write,
+    explanation: &sai_diagnostics::ExplainDiagnostic,
+) -> io::Result<()> {
+    write_json_success_header(writer, "explain")?;
+    let severity = explanation.severity.map_or_else(
+        || "null".to_owned(),
+        |value| format!("\"{}\"", value.as_str()),
+    );
+    let default_level = explanation.default_level.map_or_else(
+        || "null".to_owned(),
+        |value| format!("\"{}\"", value.as_str()),
+    );
+    let superseded_by = if explanation.superseded_by.is_empty() {
+        "null".to_owned()
+    } else {
+        format!(
+            "[{}]",
+            explanation
+                .superseded_by
+                .iter()
+                .map(|code| format!("\"{}\"", escape_json(code)))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
+    writeln!(
+        writer,
+        "{{\"type\":\"result\",\"kind\":\"explain\",\"data\":{{\"code\":\"{}\",\"class\":\"{}\",\"severity\":{},\"default_level\":{},\"stage\":{},\"owner\":\"{}\",\"since\":\"{}\",\"status\":\"{}\",\"superseded_by\":{},\"summary\":\"{}\",\"markdown\":\"{}\"}}}}",
+        explanation.code.as_str(),
+        explanation.class.as_str(),
+        severity,
+        default_level,
+        explanation.stage,
+        escape_json(explanation.owner),
+        escape_json(explanation.since),
+        explanation.status.as_str(),
+        superseded_by,
+        escape_json(explanation.summary),
+        escape_json(explanation.markdown),
+    )?;
+    writeln!(
+        writer,
+        "{{\"type\":\"summary\",\"errors\":0,\"warnings\":0,\"infos\":0,\"shown_errors\":0,\"suppressed\":{{\"cascade\":0,\"duplicate\":0,\"dependency\":0}},\"exit_code\":0}}"
     )
 }
 
@@ -19413,13 +19482,23 @@ mod tests {
     }
 
     #[test]
-    fn explain_defers_single_code_markdown_until_full_records_exist() {
-        let (exit_code, stdout, stderr) = invoke(&["--format=json", "explain", "UNKNOWN_FIELD"]);
+    fn explain_keeps_every_other_registered_code_gated() {
+        for entry in EXPLAIN_CODE_SUMMARIES {
+            if entry.code == sai_diagnostics::Code::TypeMismatch {
+                continue;
+            }
+            let code = entry.code.as_str();
+            let (exit_code, stdout, stderr) = invoke(&["--format=json", "explain", code]);
 
-        assert_eq!(exit_code, 1);
-        assert!(stderr.is_empty());
-        assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
-        assert!(stdout.contains("\"feature\":\"sai explain\""));
+            assert_eq!(exit_code, 1, "{code}: {stdout}");
+            assert!(stderr.is_empty(), "{code}: {stderr:?}");
+            assert!(
+                stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+                "{code}: {stdout}"
+            );
+            assert!(stdout.contains("\"feature\":\"sai explain\""), "{code}");
+            assert!(!stdout.contains("\"kind\":\"explain\""), "{code}");
+        }
     }
 
     #[test]

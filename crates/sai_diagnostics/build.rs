@@ -3,7 +3,7 @@ use std::{
     env,
     fmt::Write as _,
     fs,
-    path::PathBuf,
+    path::{Component, PathBuf},
 };
 
 const LEGACY_CODE_COUNT: usize = 76;
@@ -14,6 +14,8 @@ fn main() {
     println!("cargo:rerun-if-changed={}", source_path.display());
     let summary_path = PathBuf::from("src/diagnostic_code_summaries.txt");
     println!("cargo:rerun-if-changed={}", summary_path.display());
+    let explanation_path = PathBuf::from("src/explain_code_metadata.txt");
+    println!("cargo:rerun-if-changed={}", explanation_path.display());
     let legacy_order_path = PathBuf::from("src/diagnostic_code_legacy_order.txt");
     println!("cargo:rerun-if-changed={}", legacy_order_path.display());
 
@@ -38,6 +40,9 @@ fn main() {
             "the summary snapshot has no entry for diagnostic code {name:?}"
         );
     }
+    let explanation_source = fs::read_to_string(&explanation_path)
+        .unwrap_or_else(|error| panic!("could not read {}: {error}", explanation_path.display()));
+    let explanations = parse_explanation_snapshot(&explanation_source, &names, &summaries);
 
     let mut previous = None;
     let mut variants = BTreeSet::new();
@@ -166,11 +171,205 @@ fn main() {
         .expect("write to String");
     }
     generated.push_str("];\n");
+    generated.push_str(
+        "\n\
+         pub const EXPLAIN_DIAGNOSTICS: &[ExplainDiagnostic] = &[\n",
+    );
+    for explanation in &explanations {
+        let variant = variant_name(&explanation.code);
+        let class = match explanation.class.as_str() {
+            "hard" => "Hard",
+            "lint" => "Lint",
+            _ => unreachable!("class was validated"),
+        };
+        let severity = explanation.severity.as_deref().map_or_else(
+            || "None".to_owned(),
+            |value| format!("Some(Severity::{})", severity_variant(value)),
+        );
+        let default_level = explanation.default_level.as_deref().map_or_else(
+            || "None".to_owned(),
+            |value| format!("Some(LintLevel::{})", lint_level_variant(value)),
+        );
+        let status = match explanation.status.as_str() {
+            "active" => "Active",
+            "deprecated" => "Deprecated",
+            "removed" => "Removed",
+            _ => unreachable!("status was validated"),
+        };
+        let superseded_by = if explanation.superseded_by.is_empty() {
+            "&[]".to_owned()
+        } else {
+            format!(
+                "&[{}]",
+                explanation
+                    .superseded_by
+                    .iter()
+                    .map(|code| format!("{code:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        writeln!(
+            generated,
+            "    ExplainDiagnostic {{ code: Code::{variant}, class: DiagnosticCodeClass::{class}, severity: {severity}, default_level: {default_level}, stage: {}, owner: {:?}, since: {:?}, status: DiagnosticCodeStatus::{status}, superseded_by: {superseded_by}, summary: {:?}, markdown: {:?} }},",
+            explanation.stage,
+            explanation.owner,
+            explanation.since,
+            explanation.summary,
+            explanation.markdown,
+        )
+        .expect("write to String");
+    }
+    generated.push_str("];\n");
 
     let output =
         PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set")).join("diagnostic_codes.rs");
     fs::write(&output, generated)
         .unwrap_or_else(|error| panic!("could not write {}: {error}", output.display()));
+}
+
+struct ExplanationMetadata {
+    code: String,
+    class: String,
+    severity: Option<String>,
+    default_level: Option<String>,
+    stage: u8,
+    owner: String,
+    since: String,
+    status: String,
+    superseded_by: Vec<String>,
+    summary: String,
+    markdown: String,
+}
+
+fn parse_explanation_snapshot(
+    source: &str,
+    names: &[&str],
+    summaries: &BTreeMap<String, (bool, usize, String)>,
+) -> Vec<ExplanationMetadata> {
+    let mut entries = Vec::new();
+    let mut previous: Option<&str> = None;
+    for line in source.lines().filter(|line| !line.is_empty()) {
+        let fields = line.splitn(10, '|').collect::<Vec<_>>();
+        assert_eq!(
+            fields.len(),
+            10,
+            "explanation metadata line must have 10 fields: {line:?}"
+        );
+        let [
+            code,
+            class,
+            severity,
+            default_level,
+            stage,
+            owner,
+            since,
+            status,
+            superseded_by,
+            path,
+        ] = fields.as_slice()
+        else {
+            unreachable!("field count was checked")
+        };
+        assert!(
+            names.contains(code),
+            "explanation metadata names unknown diagnostic code {code:?}"
+        );
+        if let Some(previous) = previous {
+            assert!(
+                previous < *code,
+                "explanation metadata must be unique and sorted: {previous:?}, {code:?}"
+            );
+        }
+        previous = Some(code);
+
+        let (is_lint, _, summary) = summaries
+            .get(*code)
+            .unwrap_or_else(|| panic!("Appendix A has no summary for {code:?}"));
+        match (*class, *severity, *default_level, *is_lint) {
+            ("hard", "error" | "warning" | "info", "", false) => {}
+            ("lint", "", "allow" | "info" | "warn" | "deny", true) => {}
+            _ => panic!("invalid class/severity/default-level combination for {code:?}"),
+        }
+        let stage = stage
+            .parse::<u8>()
+            .unwrap_or_else(|_| panic!("invalid stage for diagnostic code {code:?}"));
+        assert!(stage <= 7, "stage must be in 0..=7 for {code:?}");
+        assert!(
+            owner.starts_with("spec/") || owner.starts_with("impl/"),
+            "invalid owner path for diagnostic code {code:?}"
+        );
+        assert!(!since.is_empty(), "missing since version for {code:?}");
+        assert!(
+            matches!(*status, "active" | "deprecated" | "removed"),
+            "invalid status for diagnostic code {code:?}"
+        );
+        let superseded_by = if superseded_by.is_empty() {
+            Vec::new()
+        } else {
+            superseded_by
+                .split(',')
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            superseded_by
+                .iter()
+                .all(|name| names.contains(&name.as_str())),
+            "superseded_by contains an unknown code for {code:?}"
+        );
+        let markdown_path = PathBuf::from("src").join(path);
+        assert!(
+            markdown_path
+                .components()
+                .all(|component| { matches!(component, Component::Normal(_)) }),
+            "explanation markdown path must stay under src: {path:?}"
+        );
+        println!("cargo:rerun-if-changed={}", markdown_path.display());
+        let markdown = fs::read_to_string(&markdown_path).unwrap_or_else(|error| {
+            panic!(
+                "could not read explanation markdown {} for {code:?}: {error}",
+                markdown_path.display()
+            )
+        });
+        assert!(
+            markdown.ends_with('\n'),
+            "explanation markdown for {code:?} must end with a newline"
+        );
+        entries.push(ExplanationMetadata {
+            code: (*code).to_owned(),
+            class: (*class).to_owned(),
+            severity: (!severity.is_empty()).then(|| (*severity).to_owned()),
+            default_level: (!default_level.is_empty()).then(|| (*default_level).to_owned()),
+            stage,
+            owner: (*owner).to_owned(),
+            since: (*since).to_owned(),
+            status: (*status).to_owned(),
+            superseded_by,
+            summary: summary.clone(),
+            markdown,
+        });
+    }
+    entries
+}
+
+fn severity_variant(value: &str) -> &'static str {
+    match value {
+        "error" => "Error",
+        "warning" => "Warning",
+        "info" => "Info",
+        _ => unreachable!("severity was validated"),
+    }
+}
+
+fn lint_level_variant(value: &str) -> &'static str {
+    match value {
+        "allow" => "Allow",
+        "info" => "Info",
+        "warn" => "Warn",
+        "deny" => "Deny",
+        _ => unreachable!("lint level was validated"),
+    }
 }
 
 fn variant_name(name: &str) -> String {

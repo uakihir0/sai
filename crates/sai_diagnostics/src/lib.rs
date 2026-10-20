@@ -43,11 +43,61 @@ pub struct ExplainCodeSummary {
     pub summary: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DiagnosticCodeStatus {
+    Active,
+    Deprecated,
+    Removed,
+}
+
+impl DiagnosticCodeStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Deprecated => "deprecated",
+            Self::Removed => "removed",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExplainDiagnostic {
+    pub code: Code,
+    pub class: DiagnosticCodeClass,
+    pub severity: Option<Severity>,
+    pub default_level: Option<LintLevel>,
+    pub stage: u8,
+    pub owner: &'static str,
+    pub since: &'static str,
+    pub status: DiagnosticCodeStatus,
+    pub superseded_by: &'static [&'static str],
+    pub summary: &'static str,
+    pub markdown: &'static str,
+}
+
+/// Fully authored `sai explain CODE` records. Other registered codes remain
+/// intentionally unavailable until their complete explanation records exist.
+pub fn explain_diagnostic(code: Code) -> Option<&'static ExplainDiagnostic> {
+    EXPLAIN_DIAGNOSTICS
+        .iter()
+        .find(|record| record.code == code)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Severity {
     Error,
     Warning,
     Info,
+}
+
+impl Severity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Info => "info",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -56,6 +106,17 @@ pub enum LintLevel {
     Info,
     Warn,
     Deny,
+}
+
+impl LintLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Deny => "deny",
+        }
+    }
 }
 
 /// The registered metadata needed to recognize and configure one lint.
@@ -2666,6 +2727,48 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn authored_explanation_matches_its_appendix_a_entry() {
+        let appendix_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/spec/appendix-a-diagnostic-codes.md");
+        let Ok(appendix) = std::fs::read_to_string(appendix_path) else {
+            return;
+        };
+        let row = appendix
+            .lines()
+            .find(|line| line.contains("| `TYPE_MISMATCH` |"))
+            .expect("Appendix A contains TYPE_MISMATCH");
+        let columns = row.split('|').map(str::trim).collect::<Vec<_>>();
+        let record = explain_diagnostic(Code::TypeMismatch).expect("authored explanation");
+
+        assert_eq!(EXPLAIN_DIAGNOSTICS.len(), 1);
+        assert_eq!(record.code, Code::TypeMismatch);
+        assert_eq!(record.class, DiagnosticCodeClass::Hard);
+        assert_eq!(record.severity, Some(Severity::Error));
+        assert_eq!(record.default_level, None);
+        assert_eq!(record.stage, 1);
+        assert_eq!(record.owner, "spec/05-types.md");
+        assert_eq!(record.since, "0.1.0");
+        assert_eq!(record.status, DiagnosticCodeStatus::Active);
+        assert!(record.superseded_by.is_empty());
+        assert_eq!(columns[1], "`TYPE_MISMATCH`");
+        assert_eq!(columns[2], "error");
+        assert_eq!(columns[3], "[05](05-types.md)");
+        assert_eq!(columns[4], record.summary);
+        assert_eq!(
+            record.summary,
+            "Two types that must be equal, or a coercion that does not apply; names the expected and found types and the origin of the expectation"
+        );
+        assert_eq!(
+            record.markdown,
+            include_str!("explanations/type_mismatch.md")
+        );
+        assert!(
+            explain_diagnostic(Code::UnknownField).is_none(),
+            "other individual explanations remain gated"
+        );
     }
 
     #[test]
