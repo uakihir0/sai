@@ -113,8 +113,8 @@ struct LiteralVariable<'hir> {
 /// between concrete primitive paths or one path and one scalar literal, one
 /// top-level logical operation between Bool paths, and direct arithmetic
 /// between matching concrete numeric paths are accepted as initializers. A
-/// Direct numeric literals are accepted on either side of `+`, `-`, and `*`
-/// when paired with an eligible concrete numeric path.
+/// Direct numeric literals are accepted on either side of `+`, `-`, `*`, and
+/// `/` when paired with an eligible concrete numeric path.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
@@ -225,7 +225,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
             }
             ExprKind::Binary(operator, left, right) => {
-                if matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+                if matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div) {
                     let result = self.check_arithmetic(operator, left, right)?;
                     if let Some(expected) = annotation {
                         self.check_annotated_path(result, expected, init.hir_id)?;
@@ -767,7 +767,7 @@ fn primitive_arithmetic_result(
     left: PrimTy,
     right: PrimTy,
 ) -> PrimitiveArithmeticResult {
-    if !matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul)
+    if !matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
         || !is_arithmetic_primitive(left)
         || !is_arithmetic_primitive(right)
     {
@@ -792,7 +792,7 @@ fn primitive_arithmetic_literal_expected_type(
     left: PrimTy,
     literal: PrimitiveLiteralKind,
 ) -> Option<PrimTy> {
-    (matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul)
+    (matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
         && is_arithmetic_primitive(left)
         && matches!(
             literal,
@@ -806,7 +806,7 @@ fn primitive_arithmetic_literal_left_result(
     literal: PrimitiveLiteralKind,
     right: PrimTy,
 ) -> PrimitiveArithmeticResult {
-    if !matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul)
+    if !matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div)
         || !is_arithmetic_primitive(right)
         || !matches!(
             literal,
@@ -895,7 +895,7 @@ mod tests {
     use sai_hir::expressions::BinOp;
     use sai_resolve::prelude::PrimTy;
 
-    const ARITHMETIC_OPERATORS: [BinOp; 3] = [BinOp::Add, BinOp::Sub, BinOp::Mul];
+    const ARITHMETIC_OPERATORS: [BinOp; 4] = [BinOp::Add, BinOp::Sub, BinOp::Mul, BinOp::Div];
 
     const COMPARISON_OPERATORS: [BinOp; 6] = [
         BinOp::Eq,
@@ -970,7 +970,7 @@ mod tests {
                 PrimitiveArithmeticResult::Unsupported
             );
         }
-        for unsupported in [BinOp::Div, BinOp::Rem, BinOp::And, BinOp::Eq] {
+        for unsupported in [BinOp::Rem, BinOp::And, BinOp::Eq] {
             assert_eq!(
                 primitive_arithmetic_result(unsupported, PrimTy::I32, PrimTy::I32),
                 PrimitiveArithmeticResult::Unsupported,
@@ -1039,7 +1039,7 @@ mod tests {
                 );
             }
         }
-        for operator in [BinOp::Div, BinOp::Rem, BinOp::And, BinOp::Eq] {
+        for operator in [BinOp::Rem, BinOp::And, BinOp::Eq] {
             assert_eq!(
                 primitive_arithmetic_literal_expected_type(
                     operator,
@@ -1134,7 +1134,7 @@ mod tests {
                 );
             }
         }
-        for operator in [BinOp::Div, BinOp::Rem, BinOp::And, BinOp::Eq] {
+        for operator in [BinOp::Rem, BinOp::And, BinOp::Eq] {
             assert_eq!(
                 primitive_arithmetic_literal_left_result(
                     operator,
