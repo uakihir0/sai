@@ -194,6 +194,7 @@ fn public_function_with_annotated_primitive_locals_emits_check_result() {
     for source in [
         "pub fn answer() -> I32 {\n    let first: U8 = 7\n    let value: I32 = 42\n    value\n}\n",
         "pub fn first() -> U8 {\n    let first: U8 = 7\n    let value: I32 = 42\n    first\n}\n",
+        "pub fn copy_chain() -> I32 {\n    let first: I32 = 21\n    let second: I32 = first\n    let third: I32 = second\n    third\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -221,6 +222,11 @@ fn annotated_primitive_local_reports_semantic_errors_without_a_feature_gate() {
             "pub fn mismatch() -> Bool {\n    let first: I32 = true\n    let second: I8 = 128\n    first\n}\n",
             "TYPE_MISMATCH",
             "expected `Bool`, found `I32`",
+        ),
+        (
+            "pub fn copy_mismatch() -> Bool {\n    let first: U8 = 7\n    let second: I32 = first\n    second\n}\n",
+            "TYPE_MISMATCH",
+            "expected `I32`, found `U8`",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);
@@ -1049,7 +1055,12 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second = 2\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nvar second: I32 = 2\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = 40 + 2\nfirst\n}\n",
+        "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first + 1\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nfirst\nfirst\n}\n",
+        "pub fn local() -> I32 {\nlet value: I32 = 42\nlet copy: I32 = r#value\ncopy\n}\n",
+        "pub fn local() -> I32 {\nlet first: I32 = second\nlet second: I32 = 2\nfirst\n}\n",
+        "pub fn local() -> I32 {\nlet value: I32 = value\nvalue\n}\n",
+        "const ONE: I32 = 1\npub fn local() -> I32 {\nlet copy: I32 = ONE\ncopy\n}\n",
         "pub fn local() -> I32 {\nlet valueName: I32 = 42\nvalueName\n}\n",
         "pub fn local() -> I32 {\nlet r#value: I32 = 42\nr#value\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nr#value\n}\n",

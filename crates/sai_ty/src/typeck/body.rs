@@ -150,37 +150,51 @@ impl FnCtxt<'_, '_> {
             return Err(());
         }
 
-        let ExprKind::Lit(literal) = init.kind else {
-            return Err(());
-        };
-        let Some(found) = primitive_literal_kind(literal) else {
-            return Err(());
-        };
-        match check_primitive_literal(
-            primitive,
-            literal,
-            self.input.symbols,
-            self.input.pointer_width,
-        ) {
-            PrimitiveLiteralResult::Match => {}
-            PrimitiveLiteralResult::TypeMismatch => {
-                self.errors.push(PrimitiveBodyError {
-                    node: init.hir_id,
-                    kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
-                        expected: primitive,
-                        found,
-                    },
-                });
+        match init.kind {
+            ExprKind::Lit(literal) => {
+                let Some(found) = primitive_literal_kind(literal) else {
+                    return Err(());
+                };
+                match check_primitive_literal(
+                    primitive,
+                    literal,
+                    self.input.symbols,
+                    self.input.pointer_width,
+                ) {
+                    PrimitiveLiteralResult::Match => {}
+                    PrimitiveLiteralResult::TypeMismatch => {
+                        self.errors.push(PrimitiveBodyError {
+                            node: init.hir_id,
+                            kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                                expected: primitive,
+                                found,
+                            },
+                        });
+                    }
+                    PrimitiveLiteralResult::OutOfRange => {
+                        self.errors.push(PrimitiveBodyError {
+                            node: init.hir_id,
+                            kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                                expected: primitive,
+                                found,
+                            },
+                        });
+                    }
+                }
             }
-            PrimitiveLiteralResult::OutOfRange => {
-                self.errors.push(PrimitiveBodyError {
-                    node: init.hir_id,
-                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                        expected: primitive,
-                        found,
-                    },
-                });
+            ExprKind::Path(_) => {
+                let found = self.check_local_path(init)?;
+                if found != primitive {
+                    self.errors.push(PrimitiveBodyError {
+                        node: init.hir_id,
+                        kind: PrimitiveBodyErrorKind::TypeMismatch {
+                            expected: primitive,
+                            found,
+                        },
+                    });
+                }
             }
+            _ => return Err(()),
         }
 
         self.known_bindings.insert(binding, primitive);
@@ -188,6 +202,20 @@ impl FnCtxt<'_, '_> {
     }
 
     fn check_expr(&mut self, expression: &Expr<'_>) -> Result<(), ()> {
+        let found = self.check_local_path(expression)?;
+        if found != self.input.return_type {
+            self.errors.push(PrimitiveBodyError {
+                node: expression.hir_id,
+                kind: PrimitiveBodyErrorKind::TypeMismatch {
+                    expected: self.input.return_type,
+                    found,
+                },
+            });
+        }
+        Ok(())
+    }
+
+    fn check_local_path(&self, expression: &Expr<'_>) -> Result<PrimTy, ()> {
         let ExprKind::Path(path) = expression.kind else {
             return Err(());
         };
@@ -201,19 +229,10 @@ impl FnCtxt<'_, '_> {
         let Some(binding) = self.input.local_paths.get(&path.hir_id).copied() else {
             return Err(());
         };
-        let Some(found) = self.known_bindings.get(&binding).copied() else {
+        let Some(primitive) = self.known_bindings.get(&binding).copied() else {
             return Err(());
         };
-        if found != self.input.return_type {
-            self.errors.push(PrimitiveBodyError {
-                node: expression.hir_id,
-                kind: PrimitiveBodyErrorKind::TypeMismatch {
-                    expected: self.input.return_type,
-                    found,
-                },
-            });
-        }
-        Ok(())
+        Ok(primitive)
     }
 }
 
