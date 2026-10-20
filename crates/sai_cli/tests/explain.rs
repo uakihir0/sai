@@ -35,7 +35,7 @@ fn run_explain(arguments: &[&str]) -> Output {
         .expect("run sai explain subprocess")
 }
 
-fn run_check(source: &str) -> Output {
+fn run_package_command(source: &str, arguments: &[&str]) -> Output {
     let temporary = TestDirectory::new();
     let root = &temporary.0;
     fs::create_dir_all(root.join("src")).expect("create source directory");
@@ -53,9 +53,20 @@ fn run_check(source: &str) -> Output {
 
     Command::new(env!("CARGO_BIN_EXE_sai"))
         .current_dir(root)
-        .args(["--format=json", "check"])
+        .args(arguments)
         .output()
-        .expect("run sai check subprocess")
+        .expect("run SAI package command subprocess")
+}
+
+fn run_check(source: &str) -> Output {
+    run_package_command(source, &["--format=json", "check"])
+}
+
+fn run_build(source: &str) -> Output {
+    run_package_command(
+        source,
+        &["--format=json", "build", "--target", "wasm32-core"],
+    )
 }
 
 fn source_block(markdown: &str, section: &str) -> String {
@@ -191,6 +202,22 @@ fn explanation_example_and_fix_compile_with_the_documented_result() {
         "{accepted_stdout}"
     );
     assert!(!accepted_stdout.contains("\"type\":\"diagnostic\""));
+
+    // Stage 1 code generation is not implemented yet. Keep this explicit so
+    // the check result is not mistaken for a successful target build.
+    let build = run_build(&fix);
+    let build_stdout = String::from_utf8(build.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(build.status.code(), Some(1), "{build_stdout}");
+    assert!(build.stderr.is_empty());
+    assert!(
+        build_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "{build_stdout}"
+    );
+    assert!(build_stdout.contains("\"stage\":1"), "{build_stdout}");
+    assert!(
+        build_stdout.contains("\"feature\":\"sai build\""),
+        "{build_stdout}"
+    );
 
     for (label, source) in [("Example", example), ("Fix", fix)] {
         let formatted = run_fmt_check(&source);

@@ -336,6 +336,21 @@ fn parse_explanation_snapshot(
             markdown.ends_with('\n'),
             "explanation markdown for {code:?} must end with a newline"
         );
+        validate_explanation_markdown(
+            &markdown,
+            code,
+            class,
+            if *class == "lint" {
+                default_level
+            } else {
+                severity
+            },
+            stage,
+            owner,
+            since,
+            status,
+            summary,
+        );
         entries.push(ExplanationMetadata {
             code: (*code).to_owned(),
             class: (*class).to_owned(),
@@ -351,6 +366,116 @@ fn parse_explanation_snapshot(
         });
     }
     entries
+}
+
+fn validate_explanation_markdown(
+    markdown: &str,
+    code: &str,
+    class: &str,
+    severity_or_level: &str,
+    stage: u8,
+    owner: &str,
+    since: &str,
+    status: &str,
+    summary: &str,
+) {
+    let lines = markdown.lines().collect::<Vec<_>>();
+    let expected_heading = format!("# {code}");
+    assert_eq!(
+        lines.first().copied(),
+        Some(expected_heading.as_str()),
+        "explanation markdown for {code:?} must start with its code heading"
+    );
+    assert_eq!(
+        lines.get(1).copied(),
+        Some(""),
+        "explanation markdown for {code:?} must separate the heading from its metadata table"
+    );
+    assert_eq!(
+        lines.get(2).copied(),
+        Some("| Class | Severity | Stage | Owner | Since | Status |"),
+        "explanation markdown for {code:?} has an invalid metadata header"
+    );
+    assert_eq!(
+        lines.get(3).copied(),
+        Some("|---|---|---|---|---|---|"),
+        "explanation markdown for {code:?} has an invalid metadata separator"
+    );
+    let expected_metadata =
+        format!("| {class} | {severity_or_level} | {stage} | {owner} | {since} | {status} |");
+    assert_eq!(
+        lines.get(4).copied(),
+        Some(expected_metadata.as_str()),
+        "explanation markdown metadata for {code:?} does not match its sidecar record"
+    );
+    assert_eq!(
+        lines.get(5).copied(),
+        Some(""),
+        "explanation markdown for {code:?} must separate its metadata table from the body"
+    );
+
+    let headings = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| line.starts_with("## ").then_some((index, *line)))
+        .collect::<Vec<_>>();
+    let allowed = [
+        "## Summary",
+        "## Explanation",
+        "## Example",
+        "## Fix",
+        "## See also",
+    ];
+    let heading_positions = headings
+        .iter()
+        .map(|(_, heading)| {
+            allowed
+                .iter()
+                .position(|expected| expected == heading)
+                .unwrap_or_else(|| {
+                    panic!("explanation markdown for {code:?} has an unknown section {heading:?}")
+                })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        heading_positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "explanation markdown for {code:?} must use the documented section order without duplicates"
+    );
+    let required = ["## Summary", "## Explanation", "## Example"];
+    let mut required_positions = Vec::new();
+    for expected in required {
+        let positions = headings
+            .iter()
+            .filter_map(|(index, heading)| (*heading == expected).then_some(*index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            positions.len(),
+            1,
+            "explanation markdown for {code:?} must contain exactly one {expected} section"
+        );
+        required_positions.push(positions[0]);
+    }
+    assert!(
+        required_positions.windows(2).all(|pair| pair[0] < pair[1]),
+        "explanation markdown for {code:?} must order Summary, Explanation, and Example"
+    );
+
+    let summary_index = headings
+        .iter()
+        .find_map(|(index, heading)| (*heading == "## Summary").then_some(*index))
+        .expect("the required Summary heading was validated");
+    let summary_end = headings
+        .iter()
+        .find_map(|(index, _)| (*index > summary_index).then_some(*index))
+        .unwrap_or(lines.len());
+    let actual_summary = lines[summary_index + 1..summary_end]
+        .join("\n")
+        .trim()
+        .to_owned();
+    assert_eq!(
+        actual_summary, summary,
+        "explanation summary for {code:?} does not match Appendix A"
+    );
 }
 
 fn severity_variant(value: &str) -> &'static str {

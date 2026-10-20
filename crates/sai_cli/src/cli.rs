@@ -13580,7 +13580,7 @@ mod tests {
         phase1_package_collection_order, read_file_limited_with_progress, relative_path,
         report_fmt_diagnostics, run, run_new_with_creator, run_with_cancellation,
         run_with_cancellation_and_input, write_file_atomically_in_directory,
-        write_human_diagnostics,
+        write_human_diagnostics, write_json_explain_diagnostic,
     };
     use sai_diagnostics::{Value, ValueObject};
     use sai_driver::CancellationToken;
@@ -19361,6 +19361,33 @@ mod tests {
                 < records[1].find("\"code\":\"WORLD_IMPORT_UNDECLARED\"")
         );
         assert!(records[2].contains("\"exit_code\":0"));
+    }
+
+    #[test]
+    fn explain_json_serializes_nonempty_superseded_codes_as_an_array() {
+        let explanation = sai_diagnostics::ExplainDiagnostic {
+            code: sai_diagnostics::Code::TypeMismatch,
+            class: sai_diagnostics::DiagnosticCodeClass::Hard,
+            severity: Some(sai_diagnostics::Severity::Error),
+            default_level: None,
+            stage: 1,
+            owner: "spec/05-types.md",
+            since: "0.1.0",
+            status: sai_diagnostics::DiagnosticCodeStatus::Deprecated,
+            superseded_by: &["UNKNOWN_FIELD", "UNKNOWN_MODULE"],
+            summary: "synthetic serializer fixture",
+            markdown: "# synthetic\n",
+        };
+        let mut output = Vec::new();
+
+        write_json_explain_diagnostic(&mut output, &explanation)
+            .expect("JSON explanation serialization succeeds");
+
+        let output = String::from_utf8(output).expect("JSON output is UTF-8");
+        assert!(
+            output.contains("\"superseded_by\":[\"UNKNOWN_FIELD\",\"UNKNOWN_MODULE\"]"),
+            "{output}"
+        );
     }
 
     #[test]
