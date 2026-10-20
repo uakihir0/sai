@@ -1107,6 +1107,298 @@ fn primitive_sub_mul_local_initializers_accept_right_numeric_literals() {
 }
 
 #[test]
+fn primitive_arithmetic_local_initializers_accept_left_numeric_literals() {
+    for (operator_name, operator) in [("add", "+"), ("sub", "-"), ("mul", "*")] {
+        for primitive in [
+            "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize", "F32", "F64",
+        ] {
+            let literal = match primitive {
+                "I8" => "-128",
+                "U8" => "-0",
+                "F32" | "F64" => "-1.25",
+                _ => "42",
+            };
+            let source = format!(
+                concat!(
+                    "pub fn {operator_name}_{lower}(value: {primitive}) -> {primitive} {{\n",
+                    "    let from_parameter: {primitive} = {literal} {operator} value\n",
+                    "    let earlier: {primitive} = value\n",
+                    "    let from_local = {literal} {operator} earlier\n",
+                    "    from_local\n",
+                    "}}\n",
+                ),
+                operator_name = operator_name,
+                lower = primitive.to_ascii_lowercase(),
+                primitive = primitive,
+                literal = literal,
+                operator = operator,
+            );
+            let output = run_check(&source, "", &[], &[]);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{operator_name} with a left {primitive} literal should infer from parameter and preceding-local paths:\n{source}\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_success_result(output, "wasm32-core", "dev");
+        }
+    }
+}
+
+#[test]
+fn primitive_arithmetic_left_literal_mismatches_keep_context_and_recover() {
+    let source = concat!(
+        "pub fn mismatches(f32_value: F32, f64_value: F64, integer: I32) -> F32 {\n",
+        "    let constrained = 7 + f32_value\n",
+        "    let constrained_copy: I8 = constrained\n",
+        "    let bad_annotation: F32 = 8 - f64_value\n",
+        "    let float_mismatch = 1.5 * integer\n",
+        "    bad_annotation\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let first_path = source
+        .find("+ f32_value")
+        .map(|start| start + "+ ".len())
+        .expect("first mismatched path exists");
+    let bad_annotation_path = source
+        .find("- f64_value")
+        .map(|start| start + "- ".len())
+        .expect("annotated mismatched path exists");
+    let bad_annotation = source
+        .find("8 - f64_value")
+        .expect("bad annotation initializer exists");
+    let float_path = source
+        .find("* integer")
+        .map(|start| start + "* ".len())
+        .expect("float literal family mismatch path exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        4,
+        "family and annotation mismatches should be reported while later context is preserved:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "mismatches should recover through later annotations and the function tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I64`, found `F32`",
+        first_path,
+        first_path + "f32_value".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I64`, found `F64`",
+        bad_annotation_path,
+        bad_annotation_path + "f64_value".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `F32`, found an integer literal",
+        bad_annotation,
+        bad_annotation + "8 - f64_value".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `F64`, found `I32`",
+        float_path,
+        float_path + "integer".len(),
+    );
+}
+
+#[test]
+fn primitive_arithmetic_left_literal_defaulting_checks_range_after_family_mismatch() {
+    let source = concat!(
+        "pub fn default_on_failure(floating: F32, result: I64) -> I64 {\n",
+        "    let too_large = 18446744073709551616 + floating\n",
+        "    result\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let literal = source
+        .find("18446744073709551616")
+        .expect("large integer literal exists");
+    let path = source
+        .find("+ floating")
+        .map(|start| start + "+ ".len())
+        .expect("mismatched float path exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the cross-family error should point to the path:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        1,
+        "the unresolved integer literal should default and range-check at body end:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "failed family unification should retain a defaultable literal result:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I64`, found `F32`",
+        path,
+        path + "floating".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I64`",
+        literal,
+        literal + "18446744073709551616".len(),
+    );
+}
+
+#[test]
+fn primitive_arithmetic_left_literal_tail_constrains_after_family_mismatch() {
+    let source = concat!(
+        "pub fn tail_constraint(floating: F32) -> I8 {\n",
+        "    let result = 7 + floating\n",
+        "    result\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let path = source
+        .find("+ floating")
+        .map(|start| start + "+ ".len())
+        .expect("mismatched path exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the tail should constrain the unresolved left integer literal:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the failed operand match should retain a usable literal result type:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I64`, found `F32`",
+        path,
+        path + "floating".len(),
+    );
+}
+
+#[test]
+fn primitive_arithmetic_left_negative_literals_report_signed_range_spans() {
+    let source = concat!(
+        "pub fn negative_ranges(signed: I8, unsigned: U8, result: I8) -> I8 {\n",
+        "    let signed_range = -129 + signed\n",
+        "    let unsigned_range = -1 * unsigned\n",
+        "    result\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let signed = source
+        .find("-129")
+        .expect("out-of-range signed literal exists");
+    let unsigned = source
+        .find("-1 * unsigned")
+        .expect("out-of-range unsigned literal exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        2,
+        "both left negative literals should be range-checked:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "negative literal range errors should recover to each right path type:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        signed,
+        signed + "-129".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `U8`",
+        unsigned,
+        unsigned + "-1".len(),
+    );
+}
+
+#[test]
+fn primitive_arithmetic_left_literal_range_uses_the_selected_pointer_width() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let source = concat!(
+        "pub fn bounds(unsigned: USize, signed: ISize) -> USize {\n",
+        "    let unsigned_32 = 4294967295 + unsigned\n",
+        "    let unsigned_64 = 18446744073709551615 + unsigned\n",
+        "    let signed_min_32 = -2147483648 + signed\n",
+        "    let signed_min_64 = -9223372036854775808 + signed\n",
+        "    unsigned_32\n",
+        "}\n",
+    );
+    let wasm32 = run_check(source, manifest, &[], &["--target", "wasm32-core"]);
+    let wasm32_stdout = String::from_utf8(wasm32.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(wasm32.status.code(), Some(1), "{wasm32_stdout}");
+    assert_eq!(
+        wasm32_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        2,
+        "out-of-range left literals should use wasm32 bounds:\n{wasm32_stdout}"
+    );
+    for (token, message) in [
+        (
+            "18446744073709551615",
+            "integer literal is out of range for `USize`",
+        ),
+        (
+            "-9223372036854775808",
+            "integer literal is out of range for `ISize`",
+        ),
+    ] {
+        let start = source.find(token).expect("pointer-sized literal exists");
+        assert_json_diagnostic_primary_span(
+            &wasm32_stdout,
+            "LITERAL_OUT_OF_RANGE",
+            message,
+            start,
+            start + token.len(),
+        );
+    }
+
+    let wasm64 = run_check(source, manifest, &[], &["--target", "wasm64-core"]);
+    assert_eq!(
+        wasm64.status.code(),
+        Some(0),
+        "all left literals should fit wasm64:\n{}",
+        String::from_utf8_lossy(&wasm64.stdout)
+    );
+    assert_success_result(wasm64, "wasm64-core", "dev");
+}
+
+#[test]
 fn primitive_sub_mul_local_literal_errors_use_literal_spans_and_recover() {
     let source = concat!(
         "pub fn errors(narrow: I8, unsigned: U8, floating: F32, integer: I32) -> U32 {\n",
@@ -1253,8 +1545,8 @@ fn primitive_sub_mul_local_literal_range_uses_the_selected_pointer_width() {
 #[test]
 fn unsupported_primitive_add_local_literal_shapes_remain_gated() {
     for source in [
-        "pub fn literal_left(value: I32) -> I32 {\n    let sum = 1 + value\n    sum\n}\n",
         "pub fn fixed_literal(value: I32) -> I32 {\n    let result = value + true\n    result\n}\n",
+        "pub fn fixed_literal_left(value: I32) -> I32 {\n    let result = true + value\n    result\n}\n",
         "pub fn byte_path(value: Byte) -> Byte {\n    let result = value + 1\n    result\n}\n",
         "pub fn unresolved_number(value: I32) -> I32 {\n    let number = 1\n    let result = value + number\n    result\n}\n",
         "pub fn nested(value: I32) -> I32 {\n    let result = value + (1 + 1)\n    result\n}\n",
@@ -1396,8 +1688,6 @@ fn primitive_sub_mul_annotation_mismatches_point_to_initializer_and_recover_to_a
 #[test]
 fn unsupported_primitive_sub_mul_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn sub_literal_left(left: I32, right: I32) -> I32 {\n    let result = 1 - left\n    result\n}\n",
-        "pub fn mul_literal_left(left: I32, right: I32) -> I32 {\n    let result = 1 * left\n    result\n}\n",
         "pub fn mul(left: I32, right: I32) -> I32 {\n    let result = 1 * 2\n    result\n}\n",
         "pub fn mul(left: I32, right: I32) -> I32 {\n    let one = 1\n    let result = one * left\n    result\n}\n",
         "pub fn nested(left: I32, right: I32) -> I32 {\n    let result = (left - right) * left\n    result\n}\n",
@@ -1495,7 +1785,6 @@ fn primitive_add_diagnostics_follow_source_order_after_shadowed_binding_resoluti
 #[test]
 fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = 1 + left\n    sum\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = 1 + 2\n    sum\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let one = 1\n    let sum = one + right\n    sum\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = (left + right) + left\n    sum\n}\n",
