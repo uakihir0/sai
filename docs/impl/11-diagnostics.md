@@ -1141,6 +1141,8 @@ The human output is this Markdown text. A terminal renderer MAY add styling, but
 {"type":"result","kind":"explain","data":{"code":"UNKNOWN_FIELD","class":"hard","severity":"error","default_level":null,"stage":1,"owner":"spec/06-expressions-and-statements.md","since":"0.1.0","status":"active","superseded_by":null,"summary":"A field access names a field that the record type does not have.","markdown":"# UNKNOWN_FIELD\n..."}}
 ```
 
+For this JSON record, an empty `superseded_by` list is `null`; one or more replacement codes are an array of strings.
+
 With `--list`, the JSON stream uses the same standard header and summary records, and contains exactly one result record of kind `explain.list`; that result's `data.codes` array follows the byte order above.
 
 ---

@@ -1661,7 +1661,9 @@ Every result record that a command of this chapter writes MUST validate against 
       "type": "object", "required": ["code", "class", "severity", "default_level", "stage", "owner", "since", "status", "superseded_by", "summary", "markdown"], "additionalProperties": false,
       "properties": { "code": { "type": "string" }, "class": { "enum": ["hard", "lint"] }, "severity": { "enum": ["error", "warning", "info", null] },
         "default_level": { "enum": ["allow", "info", "warn", "deny", null] }, "stage": { "type": "integer", "minimum": 0, "maximum": 7 }, "owner": { "type": "string" },
-        "since": { "type": "string" }, "status": { "enum": ["active", "deprecated", "removed"] }, "superseded_by": { "type": ["string", "null"] }, "summary": { "type": "string" }, "markdown": { "type": "string" } }
+        "since": { "type": "string" }, "status": { "enum": ["active", "deprecated", "removed"] },
+        "superseded_by": { "oneOf": [{ "type": "string" }, { "type": "array", "items": { "type": "string" } }, { "type": "null" }] },
+        "summary": { "type": "string" }, "markdown": { "type": "string" } }
     },
     "explain_list": {
       "type": "object", "required": ["codes"], "additionalProperties": false,
