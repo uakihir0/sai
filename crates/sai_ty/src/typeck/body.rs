@@ -112,7 +112,9 @@ struct LiteralVariable<'hir> {
 /// Direct scalar literals, plain paths to earlier bindings, comparisons
 /// between concrete primitive paths or one path and one scalar literal, one
 /// top-level logical operation between Bool paths, and direct arithmetic
-/// between matching concrete numeric paths are accepted as initializers.
+/// between matching concrete numeric paths are accepted as initializers. A
+/// direct numeric literal is also accepted as the right operand of `+` when
+/// the left operand is an eligible concrete numeric path.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
@@ -311,6 +313,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             .ok()
             .and_then(|local_type| self.concrete_local_type(local_type))
             .ok_or(())?;
+
+        if let ExprKind::Lit(literal) = right.kind {
+            let Some(found) = primitive_literal_kind(literal) else {
+                return Err(());
+            };
+            let Some(expected) =
+                primitive_arithmetic_literal_expected_type(operator, left_type, found)
+            else {
+                return Err(());
+            };
+            self.check_annotated_literal(expected, literal, found, right.hir_id);
+            // The built-in operator's result is determined by the synthesized
+            // left operand, including after a literal type or range error.
+            return Ok(LocalType::Concrete(left_type));
+        }
+
         let right_type = self
             .check_local_path(right)
             .ok()
@@ -742,6 +760,20 @@ const fn is_arithmetic_primitive(primitive: PrimTy) -> bool {
     is_integer_primitive(primitive) || matches!(primitive, PrimTy::F32 | PrimTy::F64)
 }
 
+fn primitive_arithmetic_literal_expected_type(
+    operator: BinOp,
+    left: PrimTy,
+    literal: PrimitiveLiteralKind,
+) -> Option<PrimTy> {
+    (operator == BinOp::Add
+        && is_arithmetic_primitive(left)
+        && matches!(
+            literal,
+            PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+        ))
+    .then_some(left)
+}
+
 fn primitive_comparison_literal_expected_type(
     kind: PrimitiveLiteralKind,
     path_type: PrimTy,
@@ -796,6 +828,7 @@ fn literal_family_accepts(kind: PrimitiveLiteralKind, expected: PrimTy) -> bool 
 mod tests {
     use super::{
         PrimitiveArithmeticResult, PrimitiveBoolOperandResult, PrimitiveComparisonResult,
+        PrimitiveLiteralKind, primitive_arithmetic_literal_expected_type,
         primitive_arithmetic_result, primitive_bool_operand_result,
         primitive_comparison_literal_expected_type, primitive_comparison_result,
     };
@@ -882,6 +915,69 @@ mod tests {
                 primitive_arithmetic_result(unsupported, PrimTy::I32, PrimTy::I32),
                 PrimitiveArithmeticResult::Unsupported,
                 "{unsupported:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn addition_accepts_only_numeric_literals_against_concrete_numeric_left_types() {
+        let arithmetic_primitives = [
+            PrimTy::I8,
+            PrimTy::I16,
+            PrimTy::I32,
+            PrimTy::I64,
+            PrimTy::U8,
+            PrimTy::U16,
+            PrimTy::U32,
+            PrimTy::U64,
+            PrimTy::ISize,
+            PrimTy::USize,
+            PrimTy::F32,
+            PrimTy::F64,
+        ];
+        for primitive in arithmetic_primitives {
+            for literal in [
+                PrimitiveLiteralKind::Integer,
+                PrimitiveLiteralKind::FloatingPoint,
+            ] {
+                assert_eq!(
+                    primitive_arithmetic_literal_expected_type(BinOp::Add, primitive, literal),
+                    Some(primitive),
+                    "{literal:?} on the right of {primitive:?} addition"
+                );
+            }
+            for literal in [
+                PrimitiveLiteralKind::Bool,
+                PrimitiveLiteralKind::Byte,
+                PrimitiveLiteralKind::Character,
+            ] {
+                assert_eq!(
+                    primitive_arithmetic_literal_expected_type(BinOp::Add, primitive, literal),
+                    None,
+                    "{literal:?} on the right of {primitive:?} addition"
+                );
+            }
+            for operator in [BinOp::Sub, BinOp::Mul] {
+                assert_eq!(
+                    primitive_arithmetic_literal_expected_type(
+                        operator,
+                        primitive,
+                        PrimitiveLiteralKind::Integer
+                    ),
+                    None,
+                    "literals remain gated for {operator:?}"
+                );
+            }
+        }
+        for primitive in [PrimTy::Bool, PrimTy::Byte, PrimTy::Char, PrimTy::Never] {
+            assert_eq!(
+                primitive_arithmetic_literal_expected_type(
+                    BinOp::Add,
+                    primitive,
+                    PrimitiveLiteralKind::Integer
+                ),
+                None,
+                "non-numeric {primitive:?} left type"
             );
         }
     }
