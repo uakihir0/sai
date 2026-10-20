@@ -1,9 +1,8 @@
 # Hello World
 
-This is a minimal SAI source package. Its root module is `src/lib.sai`.
+A minimal WASI command that writes `Hello, world!` to standard output. It uses
+`process.Env` to obtain stdout and the core `Writer` trait to write the greeting.
 
-From the repository root, check it with:
-
-```sh
-cargo run -p sai_cli -- check --directory sample/hello-world
-```
+The project targets `wasm32-wasi`. Its `main` entry point and standard-stream
+support are specified, but the current compiler does not yet implement every
+stage needed to build and run this example.

@@ -1,0 +1,27 @@
+use sai:core/fmt.{Writer}
+use sai:process
+use acme:mini-task-board/board
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        board.print_all(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    let command = args[1].as_str()
+    if command == "list" {
+        board.print_all(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "summary" {
+        board.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    out.write_str("usage: mini-task-board [list|summary]\n")
+    process.ExitCode.failure()
+}

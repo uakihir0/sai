@@ -1,0 +1,17 @@
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        out.write_str("usage: greet-cli <name>\n")
+        return process.ExitCode.failure()
+    }
+
+    let name = args[1].as_str()
+    out.write_str(f"Hello, {name}!\n".as_str())
+    process.ExitCode.success()
+}

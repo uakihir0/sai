@@ -1,4 +1,10 @@
-pub fn answer() -> I32 {
-    let answer: I32 = 42
-    answer
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { stdio.write }
+{
+    var out = env.stdout()
+    out.write_str("Hello, world!\n")
+    process.ExitCode.success()
 }
