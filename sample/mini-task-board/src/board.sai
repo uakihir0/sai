@@ -1,0 +1,57 @@
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Status {
+    Todo
+    Doing
+    Done
+}
+
+pub type Task {
+    id: U8
+    title: Str
+    status: Status
+}
+
+fn status_name(status: Status) -> Str {
+    match status {
+        Status.Todo => "todo"
+        Status.Doing => "doing"
+        Status.Done => "done"
+    }
+}
+
+fn sample_tasks() -> Array<Task, 3> {
+    [
+        Task(id: 1, title: "Review the parser recovery notes", status: Status.Todo),
+        Task(id: 2, title: "Add a borrow-checker regression", status: Status.Doing),
+        Task(id: 3, title: "Document the package layout", status: Status.Done)
+    ]
+}
+
+pub fn print_all(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    for task in sample_tasks() {
+        out.write_str(
+            f"#{task.id} [{status_name(task.status)}] {task.title}\n".as_str()
+        )
+    }
+}
+
+pub fn print_summary(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    var todo: USize = 0
+    var doing: USize = 0
+    var done: USize = 0
+    for task in sample_tasks() {
+        match task.status {
+            Status.Todo => { todo += 1 }
+            Status.Doing => { doing += 1 }
+            Status.Done => { done += 1 }
+        }
+    }
+    out.write_str(f"3 tasks: {todo} todo, {doing} doing, {done} done\n".as_str())
+}

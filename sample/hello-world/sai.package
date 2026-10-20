@@ -2,5 +2,11 @@ package acme:hello-world @ 0.1.0
 compiler ^0.1
 source "src"
 
-targets { wasm32-core }
-description "A minimal SAI package"
+requires {
+    sai:process @ ^0.1
+        from git "https://github.com/sai-lang/process"
+}
+
+targets { wasm32-wasi }
+allow { wasi:cli }
+description "A minimal SAI Hello World command"
