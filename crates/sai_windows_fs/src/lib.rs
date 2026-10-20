@@ -15,6 +15,24 @@ pub struct FileIdentity {
     file: [u8; 16],
 }
 
+/// A verified directory handle opened for a handle-relative rename.
+///
+/// This type can only be created by
+/// [`open_child_directory_for_rename_without_following`], which opens a
+/// synchronous Windows handle suitable for the rename operation.
+#[derive(Debug)]
+pub struct RenameableDirectory {
+    file: File,
+}
+
+impl RenameableDirectory {
+    /// Returns the underlying directory handle for metadata and identity
+    /// queries. The handle remains owned by this wrapper.
+    pub fn as_file(&self) -> &File {
+        &self.file
+    }
+}
+
 /// Returns a filesystem identity for an already-open file or directory.
 pub fn file_identity(file: &File) -> io::Result<FileIdentity> {
     #[cfg(unix)]
@@ -744,6 +762,122 @@ pub fn open_directory_path_without_following(path: &Path) -> io::Result<File> {
     }
 }
 
+/// Open an absolute directory path without following links, granting rights
+/// to atomically update its direct child entries.
+///
+/// The handle remains anchored to the final directory while atomic file
+/// replacements are performed. Earlier path components are opened with the
+/// ordinary read-only directory access used for traversal.
+pub fn open_directory_path_for_child_updates_without_following(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        let root = path.ancestors().last().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path must be absolute",
+            )
+        })?;
+        let relative = path.strip_prefix(root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path must be normalized",
+            )
+        })?;
+        if relative.components().next().is_none() {
+            return windows_handle::open_directory_for_child_updates(root);
+        }
+        let mut current = open_directory_without_following(root)?;
+        let mut current_path = root.to_path_buf();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            match component {
+                Component::Normal(name) => {
+                    current = if components.peek().is_none() {
+                        open_child_directory_for_child_updates_without_following(
+                            &current,
+                            &current_path,
+                            name,
+                        )?
+                    } else {
+                        open_child_directory_without_following(&current, &current_path, name)?
+                    };
+                    current_path.push(name);
+                }
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "directory path must be normalized",
+                    ));
+                }
+            }
+        }
+        Ok(current)
+    }
+    #[cfg(not(windows))]
+    {
+        open_directory_path_without_following(path)
+    }
+}
+
+/// Open an absolute directory path without following links, granting rights to
+/// atomically update direct child files without creating child directories.
+///
+/// The handle remains anchored to the final directory while atomic file
+/// replacements are performed. Earlier path components are opened with the
+/// ordinary read-only directory access used for traversal.
+pub fn open_directory_path_for_file_updates_without_following(path: &Path) -> io::Result<File> {
+    #[cfg(windows)]
+    {
+        let root = path.ancestors().last().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path must be absolute",
+            )
+        })?;
+        let relative = path.strip_prefix(root).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path must be normalized",
+            )
+        })?;
+        if relative.components().next().is_none() {
+            return windows_handle::open_directory_for_file_updates(root);
+        }
+        let mut current = open_directory_without_following(root)?;
+        let mut current_path = root.to_path_buf();
+        let mut components = relative.components().peekable();
+        while let Some(component) = components.next() {
+            match component {
+                Component::Normal(name) => {
+                    current = if components.peek().is_none() {
+                        open_child_directory_for_file_updates_without_following(
+                            &current,
+                            &current_path,
+                            name,
+                        )?
+                    } else {
+                        open_child_directory_without_following(&current, &current_path, name)?
+                    };
+                    current_path.push(name);
+                }
+                Component::CurDir => {}
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "directory path must be normalized",
+                    ));
+                }
+            }
+        }
+        Ok(current)
+    }
+    #[cfg(not(windows))]
+    {
+        open_directory_path_without_following(path)
+    }
+}
+
 /// Open a direct child directory without following a symbolic link or junction.
 ///
 /// `child_name` must be one normal path component. Unix uses `openat`; Windows
@@ -773,6 +907,66 @@ pub fn open_child_directory_without_following(
         )
         .map(File::from)
         .map_err(Into::into)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, parent_path, child_name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "opening child directories without following links is unavailable on this platform",
+        ))
+    }
+}
+
+/// Open a direct child directory without following a link, granting rights to
+/// atomically update its direct child entries.
+///
+/// The opened directory denies delete sharing so it cannot be moved while its
+/// formatter capability remains alive.
+pub fn open_child_directory_for_child_updates_without_following(
+    parent: &File,
+    parent_path: &Path,
+    child_name: &OsStr,
+) -> io::Result<File> {
+    validate_child_name(child_name)?;
+    #[cfg(windows)]
+    {
+        let _ = parent_path;
+        windows_handle::open_child_for_child_updates(parent, child_name)
+    }
+    #[cfg(unix)]
+    {
+        open_child_directory_without_following(parent, parent_path, child_name)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, parent_path, child_name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "opening child directories without following links is unavailable on this platform",
+        ))
+    }
+}
+
+/// Open a direct child directory without following a link, granting rights to
+/// atomically update direct child files without creating child directories.
+///
+/// The opened directory denies delete sharing so it cannot be moved while its
+/// file-update capability remains alive.
+pub fn open_child_directory_for_file_updates_without_following(
+    parent: &File,
+    parent_path: &Path,
+    child_name: &OsStr,
+) -> io::Result<File> {
+    validate_child_name(child_name)?;
+    #[cfg(windows)]
+    {
+        let _ = parent_path;
+        windows_handle::open_child_for_file_updates(parent, child_name)
+    }
+    #[cfg(unix)]
+    {
+        open_child_directory_without_following(parent, parent_path, child_name)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -832,6 +1026,29 @@ pub fn open_file_without_following(
     }
 }
 
+/// Open a direct child regular file without following a reparse point, with
+/// rights to update its file attributes.
+///
+/// `file_name` must be one normal path component. The returned handle can
+/// update attributes such as the Windows read-only flag without granting
+/// access to modify the file's contents. It is opened with a zero Windows
+/// share-access mask. Windows does not apply share checks to attribute-only
+/// accesses, so this handle is not an exclusive lock against another
+/// attribute-only open or path-based hard-link creation. This also does not
+/// lock the parent directory's namespace: an operation authorized by the
+/// parent directory, such as a rename using `FILE_DELETE_CHILD`, can still
+/// move the entry.
+#[cfg(windows)]
+pub fn open_file_for_attribute_updates_without_following(
+    parent: &File,
+    parent_path: &Path,
+    file_name: &OsStr,
+) -> io::Result<File> {
+    validate_child_name(file_name)?;
+    let _ = parent_path;
+    windows_handle::open_child_for_attribute_updates(parent, file_name)
+}
+
 /// Atomically replace one child file with another, relative to `parent`.
 ///
 /// Both names must be one normal path component.
@@ -840,24 +1057,130 @@ pub fn replace_file_in_directory(
     source_name: &OsStr,
     destination_name: &OsStr,
 ) -> io::Result<()> {
+    replace_file_between_directories(parent, source_name, parent, destination_name)
+}
+
+/// Atomically replace one child file with another, relative to open directories.
+///
+/// Both names must be one normal path component. The source and destination
+/// directories must be on the same volume.
+pub fn replace_file_between_directories(
+    source_parent: &File,
+    source_name: &OsStr,
+    destination_parent: &File,
+    destination_name: &OsStr,
+) -> io::Result<()> {
     validate_child_name(source_name)?;
     validate_child_name(destination_name)?;
     #[cfg(windows)]
     {
-        windows_handle::replace_child(parent, source_name, destination_name)
+        windows_handle::replace_child(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )
     }
     #[cfg(unix)]
     {
         use rustix::fs::renameat;
 
-        renameat(parent, source_name, parent, destination_name).map_err(Into::into)
+        renameat(
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        )
+        .map_err(Into::into)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (parent, source_name, destination_name);
+        let _ = (
+            source_parent,
+            source_name,
+            destination_parent,
+            destination_name,
+        );
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "handle-relative file replacement is unavailable on this platform",
+        ))
+    }
+}
+
+/// Open a direct child directory without following a reparse point while
+/// allowing the opened directory to be renamed through its handle.
+///
+/// `child_name` must be one normal path component. The returned Windows handle
+/// has delete access and permits delete sharing so a handle-relative rename can
+/// publish the directory without resolving its source path again.
+pub fn open_child_directory_for_rename_without_following(
+    parent: &File,
+    child_name: &OsStr,
+) -> io::Result<RenameableDirectory> {
+    validate_child_name(child_name)?;
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES};
+
+        let file = windows_handle::open_child_with_access(
+            parent,
+            child_name,
+            true,
+            DELETE | FILE_READ_ATTRIBUTES,
+            true,
+        )?;
+        if is_reparse_point(&file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path is a Windows reparse point",
+            ));
+        }
+        if !file.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not a directory",
+            ));
+        }
+        Ok(RenameableDirectory { file })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (parent, child_name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Windows directory handles are unavailable on this platform",
+        ))
+    }
+}
+
+/// Rename an already-open directory to a direct child of `parent` without
+/// replacing an existing entry.
+///
+/// The source handle must have been opened with delete access and must refer to
+/// a directory on the same volume as `parent`.
+pub fn move_directory_handle_to_child_without_replacing(
+    source: &RenameableDirectory,
+    parent: &File,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    validate_child_name(destination_name)?;
+    #[cfg(windows)]
+    {
+        if is_reparse_point(&source.file)? || !source.file.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "source handle is not a directory",
+            ));
+        }
+        windows_handle::rename_open_child(parent, &source.file, destination_name, false)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (source, parent, destination_name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "handle-relative directory moves are available only on Windows",
         ))
     }
 }
@@ -899,6 +1222,11 @@ pub fn replace_file_in_directory_if_unchanged(
             "destination contents changed after they were read",
         ));
     }
+    // Windows can reject replacement while a handle to the destination is
+    // still open, even when that handle allows delete sharing. The identity
+    // and contents check is complete; cooperating writers remain serialized
+    // by the caller's workspace lock until the rename below.
+    drop(current);
     replace_file_in_directory(parent, source_name, destination_name)
 }
 
@@ -1170,22 +1498,26 @@ mod windows_handle {
     use std::mem::{self, offset_of};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::path::Path;
     use std::ptr;
 
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{
         FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT,
-        FILE_SYNCHRONOUS_IO_NONALERT, NtCreateFile,
+        FILE_RENAME_INFORMATION, FILE_SYNCHRONOUS_IO_NONALERT, FileRenameInformation,
+        FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
         GENERIC_READ, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_DISPOSITION_INFO, FILE_INFO_BY_HANDLE_CLASS, FILE_READ_ATTRIBUTES,
-        FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FileDispositionInfo, FileRenameInfo, SYNCHRONIZE, SetFileInformationByHandle,
+        DELETE, FILE_DISPOSITION_INFO, FILE_READ_ATTRIBUTES, FileDispositionInfo, SYNCHRONIZE,
+        SetFileInformationByHandle,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    use windows_sys::Win32::System::WindowsProgramming::{
+        FILE_RENAME_FLAG_POSIX_SEMANTICS, FILE_RENAME_FLAG_REPLACE_IF_EXISTS,
+    };
 
     use super::is_reparse_point;
 
@@ -1197,6 +1529,105 @@ mod windows_handle {
             GENERIC_READ | FILE_READ_ATTRIBUTES,
             !directory,
         )?;
+        validate_opened_child(file, directory)
+    }
+
+    pub(super) fn open_child_for_child_updates(parent: &File, name: &OsStr) -> io::Result<File> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD,
+        };
+
+        let file = open_child_with_access(
+            parent,
+            name,
+            true,
+            GENERIC_READ
+                | FILE_READ_ATTRIBUTES
+                | FILE_ADD_FILE
+                | FILE_ADD_SUBDIRECTORY
+                | FILE_DELETE_CHILD,
+            false,
+        )?;
+        validate_opened_child(file, true)
+    }
+
+    pub(super) fn open_child_for_file_updates(parent: &File, name: &OsStr) -> io::Result<File> {
+        use windows_sys::Win32::Storage::FileSystem::{FILE_ADD_FILE, FILE_DELETE_CHILD};
+
+        let file = open_child_with_access(
+            parent,
+            name,
+            true,
+            GENERIC_READ | FILE_READ_ATTRIBUTES | FILE_ADD_FILE | FILE_DELETE_CHILD,
+            false,
+        )?;
+        validate_opened_child(file, true)
+    }
+
+    pub(super) fn open_child_for_attribute_updates(
+        parent: &File,
+        name: &OsStr,
+    ) -> io::Result<File> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_READ_ATTRIBUTES, FILE_WRITE_ATTRIBUTES,
+        };
+
+        let file = open_child_with_access_and_share(
+            parent,
+            name,
+            false,
+            FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
+            0,
+        )?;
+        validate_opened_child(file, false)
+    }
+
+    pub(super) fn open_directory_for_child_updates(path: &Path) -> io::Result<File> {
+        open_directory_for_updates(path, true)
+    }
+
+    pub(super) fn open_directory_for_file_updates(path: &Path) -> io::Result<File> {
+        open_directory_for_updates(path, false)
+    }
+
+    fn open_directory_for_updates(path: &Path, allow_child_directories: bool) -> io::Result<File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let desired_access = GENERIC_READ
+            | FILE_READ_ATTRIBUTES
+            | FILE_ADD_FILE
+            | FILE_DELETE_CHILD
+            | if allow_child_directories {
+                FILE_ADD_SUBDIRECTORY
+            } else {
+                0
+            };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .access_mode(desired_access)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        if is_reparse_point(&file)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory path is a Windows reparse point",
+            ));
+        }
+        if !file.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path is not a directory",
+            ));
+        }
+        Ok(file)
+    }
+
+    fn validate_opened_child(file: File, directory: bool) -> io::Result<File> {
         if is_reparse_point(&file)? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1217,12 +1648,28 @@ mod windows_handle {
         Ok(file)
     }
 
-    fn open_child_with_access(
+    pub(super) fn open_child_with_access(
         parent: &File,
         name: &OsStr,
         directory: bool,
         desired_access: u32,
         share_delete: bool,
+    ) -> io::Result<File> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let share_access =
+            FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
+        open_child_with_access_and_share(parent, name, directory, desired_access, share_access)
+    }
+
+    pub(super) fn open_child_with_access_and_share(
+        parent: &File,
+        name: &OsStr,
+        directory: bool,
+        desired_access: u32,
+        share_access: u32,
     ) -> io::Result<File> {
         super::validate_child_name(name)?;
         let wide = name.encode_wide().collect::<Vec<_>>();
@@ -1245,8 +1692,6 @@ mod windows_handle {
         };
         let mut io_status = IO_STATUS_BLOCK::default();
         let mut handle = ptr::null_mut();
-        let share_access =
-            FILE_SHARE_READ | FILE_SHARE_WRITE | if share_delete { FILE_SHARE_DELETE } else { 0 };
         let create_options = FILE_OPEN_REPARSE_POINT
             | FILE_SYNCHRONOUS_IO_NONALERT
             | if directory {
@@ -1285,17 +1730,27 @@ mod windows_handle {
     }
 
     pub(super) fn replace_child(
-        parent: &File,
+        source_parent: &File,
         source_name: &OsStr,
+        destination_parent: &File,
         destination_name: &OsStr,
     ) -> io::Result<()> {
         let source = open_child_with_access(
-            parent,
+            source_parent,
             source_name,
             false,
             DELETE | FILE_READ_ATTRIBUTES,
             true,
         )?;
+        rename_open_child(destination_parent, &source, destination_name, true)
+    }
+
+    pub(super) fn rename_open_child(
+        parent: &File,
+        source: &File,
+        destination_name: &OsStr,
+        replace_if_exists: bool,
+    ) -> io::Result<()> {
         let destination = destination_name.encode_wide().collect::<Vec<_>>();
         let file_name_bytes = destination
             .len()
@@ -1305,20 +1760,33 @@ mod windows_handle {
             })?;
         let file_name_bytes_u32 = u32::try_from(file_name_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "destination is too long"))?;
-        let file_name_offset = offset_of!(FILE_RENAME_INFO, FileName);
-        let information_length = file_name_offset
+        let file_name_offset = offset_of!(FILE_RENAME_INFORMATION, FileName);
+        let information_length = mem::size_of::<FILE_RENAME_INFORMATION>()
             .checked_add(file_name_bytes)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination is too long"))?
-            .max(mem::size_of::<FILE_RENAME_INFO>());
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "destination is too long")
+            })?;
         let information_length_u32 = u32::try_from(information_length)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "destination is too long"))?;
         let mut storage = vec![0usize; information_length.div_ceil(mem::size_of::<usize>())];
-        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFO>();
+        let information = storage.as_mut_ptr().cast::<FILE_RENAME_INFORMATION>();
+        let information_class = if replace_if_exists {
+            FileRenameInformationEx
+        } else {
+            FileRenameInformation
+        };
         // SAFETY: `storage` is pointer-aligned and sized for the fixed header
         // plus the UTF-16 filename bytes. The trailing name bytes are copied
-        // into the flexible-array tail expected by FILE_RENAME_INFO.
+        // into the flexible-array tail expected by FILE_RENAME_INFORMATION.
         unsafe {
-            (*information).Anonymous.ReplaceIfExists = true;
+            if replace_if_exists {
+                // Preserve open readers on the old file while atomically
+                // rebinding its name to the replacement.
+                (*information).Anonymous.Flags =
+                    FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
+            } else {
+                (*information).Anonymous.ReplaceIfExists = false;
+            }
             (*information).RootDirectory = parent.as_raw_handle().cast();
             (*information).FileNameLength = file_name_bytes_u32;
             ptr::copy_nonoverlapping(
@@ -1327,19 +1795,33 @@ mod windows_handle {
                 destination.len(),
             );
         }
-        let class: FILE_INFO_BY_HANDLE_CLASS = FileRenameInfo;
-        // SAFETY: `source` is an open file with DELETE access. The information
-        // buffer has the required native layout and remains alive for the call.
-        let succeeded = unsafe {
-            SetFileInformationByHandle(
+        let mut io_status = IO_STATUS_BLOCK::default();
+        // SAFETY: `source` is an open file or directory with DELETE access.
+        // `parent` is an open destination directory on the same volume. The
+        // information buffer has the native layout and both handles remain
+        // alive for the synchronous call.
+        let status = unsafe {
+            NtSetInformationFile(
                 source.as_raw_handle().cast(),
-                class,
+                &mut io_status,
                 information.cast(),
                 information_length_u32,
+                information_class,
             )
         };
-        if succeeded == 0 {
-            return Err(io::Error::last_os_error());
+        // The rename API only accepts `RenameableDirectory`, whose handle is
+        // opened with FILE_SYNCHRONOUS_IO_NONALERT. A pending result would
+        // violate that contract and would leave the stack-backed I/O status
+        // block and rename buffer live for too short a period.
+        if status == windows_sys::Win32::Foundation::STATUS_PENDING {
+            return Err(io::Error::other(
+                "synchronous directory rename unexpectedly returned STATUS_PENDING",
+            ));
+        }
+        if status < 0 {
+            // SAFETY: this conversion accepts any NTSTATUS value.
+            let win32_error = unsafe { RtlNtStatusToDosError(status) };
+            return Err(io::Error::from_raw_os_error(win32_error as i32));
         }
         Ok(())
     }
@@ -1373,7 +1855,7 @@ mod unix_tests {
 
     use super::{
         open_child_directory_without_following, open_directory_without_following,
-        open_file_without_following, remove_file_in_directory,
+        open_file_without_following, remove_file_in_directory, replace_file_between_directories,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1443,17 +1925,59 @@ mod unix_tests {
         assert_eq!(fs::read(sibling).unwrap(), b"keep");
         assert_eq!(fs::read(root.join("temporary")).unwrap(), b"safe");
     }
+
+    #[test]
+    fn replaces_a_file_across_open_directories_without_a_delete_gap() {
+        let directory = TestDirectory::new();
+        let source_directory = directory.0.join("source");
+        let destination_directory = directory.0.join("destination");
+        fs::create_dir(&source_directory).unwrap();
+        fs::create_dir(&destination_directory).unwrap();
+        fs::write(source_directory.join("staged"), b"new record").unwrap();
+        let destination_path = destination_directory.join("record");
+        fs::write(&destination_path, b"old record").unwrap();
+        let old_reader = fs::File::open(&destination_path).unwrap();
+
+        let source_parent = open_directory_without_following(&source_directory).unwrap();
+        let destination_parent = open_directory_without_following(&destination_directory).unwrap();
+        replace_file_between_directories(
+            &source_parent,
+            std::ffi::OsStr::new("staged"),
+            &destination_parent,
+            std::ffi::OsStr::new("record"),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&destination_path).unwrap(), b"new record");
+        assert_eq!(
+            fs::read(source_directory.join("staged"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let mut old_bytes = Vec::new();
+        use std::io::Read;
+        let mut old_reader = old_reader;
+        old_reader.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, b"old record");
+    }
 }
 
 #[cfg(all(test, windows))]
 mod windows_tests {
     use std::fs;
+    use std::io::Write;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        open_child_directory_without_following, open_directory_path_without_following,
-        remove_file_in_directory, replace_file_in_directory,
+        file_identity, move_directory_handle_to_child_without_replacing,
+        open_child_directory_for_rename_without_following, open_child_directory_without_following,
+        open_directory_path_for_child_updates_without_following,
+        open_directory_path_for_file_updates_without_following,
+        open_directory_path_without_following, open_file_for_attribute_updates_without_following,
+        remove_file_in_directory, replace_file_between_directories, replace_file_in_directory,
+        replace_file_in_directory_if_unchanged,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1486,7 +2010,8 @@ mod windows_tests {
         fs::write(package.join("sai.package"), b"original").unwrap();
 
         let canonical = fs::canonicalize(&package).unwrap();
-        let package_handle = open_directory_path_without_following(&canonical).unwrap();
+        let package_handle =
+            open_directory_path_for_file_updates_without_following(&canonical).unwrap();
         assert!(fs::rename(&package, &moved).is_err());
 
         replace_file_in_directory(
@@ -1500,6 +2025,76 @@ mod windows_tests {
 
         remove_file_in_directory(&package_handle, std::ffi::OsStr::new("sai.package")).unwrap();
         assert!(!package.join("sai.package").exists());
+    }
+
+    #[test]
+    fn cross_directory_replace_keeps_existing_reader_handles_valid() {
+        let directory = TestDirectory::new();
+        let source_directory = directory.0.join("source");
+        let destination_directory = directory.0.join("destination");
+        fs::create_dir(&source_directory).unwrap();
+        fs::create_dir(&destination_directory).unwrap();
+        fs::write(source_directory.join("staged"), b"new record").unwrap();
+        let destination_path = destination_directory.join("record");
+        fs::write(&destination_path, b"old record").unwrap();
+        let old_reader = fs::File::open(&destination_path).unwrap();
+
+        let source_parent =
+            open_directory_path_for_file_updates_without_following(&source_directory).unwrap();
+        let destination_parent =
+            open_directory_path_for_file_updates_without_following(&destination_directory).unwrap();
+        replace_file_between_directories(
+            &source_parent,
+            std::ffi::OsStr::new("staged"),
+            &destination_parent,
+            std::ffi::OsStr::new("record"),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(&destination_path).unwrap(), b"new record");
+        assert_eq!(
+            fs::read(source_directory.join("staged"))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::NotFound
+        );
+        let mut old_bytes = Vec::new();
+        use std::io::Read;
+        let mut old_reader = old_reader;
+        old_reader.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, b"old record");
+    }
+
+    #[test]
+    fn compare_before_replace_releases_the_destination_handle() {
+        let directory = TestDirectory::new();
+        fs::write(directory.0.join("temporary"), b"formatted").unwrap();
+        fs::write(directory.0.join("sai.package"), b"original").unwrap();
+
+        let package_path = fs::canonicalize(&directory.0).unwrap();
+        let package =
+            open_directory_path_for_file_updates_without_following(&package_path).unwrap();
+        let current = super::open_file_without_following(
+            &package,
+            &package_path,
+            std::ffi::OsStr::new("sai.package"),
+        )
+        .unwrap();
+        let identity_guard = file_identity(&current).unwrap();
+
+        replace_file_in_directory_if_unchanged(
+            &package,
+            std::ffi::OsStr::new("temporary"),
+            std::ffi::OsStr::new("sai.package"),
+            identity_guard,
+            b"original",
+        )
+        .unwrap();
+        assert_eq!(file_identity(&current).unwrap(), identity_guard);
+        assert_eq!(
+            fs::read(directory.0.join("sai.package")).unwrap(),
+            b"formatted"
+        );
     }
 
     #[test]
@@ -1519,5 +2114,140 @@ mod windows_tests {
         )
         .unwrap();
         assert!(child.metadata().unwrap().is_dir());
+    }
+
+    #[test]
+    fn attribute_update_handle_can_clear_readonly_without_content_write_access() {
+        let directory = TestDirectory::new();
+        let file_path = directory.0.join("readonly");
+        let moved_path = directory.0.join("moved");
+        fs::write(&file_path, b"unchanged").unwrap();
+
+        let directory_handle =
+            open_directory_path_without_following(&fs::canonicalize(&directory.0).unwrap())
+                .unwrap();
+        let mut update_guard = open_file_for_attribute_updates_without_following(
+            &directory_handle,
+            &directory.0,
+            std::ffi::OsStr::new("readonly"),
+        )
+        .unwrap();
+        assert!(
+            update_guard.write_all(b"changed").is_err(),
+            "the attribute handle cannot write file contents"
+        );
+        drop(update_guard);
+
+        let mut permissions = fs::metadata(&file_path).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&file_path, permissions).unwrap();
+
+        let mut file = open_file_for_attribute_updates_without_following(
+            &directory_handle,
+            &directory.0,
+            std::ffi::OsStr::new("readonly"),
+        )
+        .unwrap();
+        let mut permissions = file.metadata().unwrap().permissions();
+        assert!(permissions.readonly());
+        permissions.set_readonly(false);
+        file.set_permissions(permissions).unwrap();
+        assert!(
+            file.write_all(b"changed").is_err(),
+            "clearing the read-only flag does not grant content write access"
+        );
+        drop(file);
+
+        assert!(!fs::metadata(&file_path).unwrap().permissions().readonly());
+        assert_eq!(fs::read(&file_path).unwrap(), b"unchanged");
+        fs::rename(&file_path, &moved_path).unwrap();
+    }
+
+    #[test]
+    fn attribute_only_update_handles_do_not_exclude_each_other() {
+        let directory = TestDirectory::new();
+        let file_path = directory.0.join("readonly");
+        fs::write(&file_path, b"unchanged").unwrap();
+
+        let directory_handle =
+            open_directory_path_without_following(&fs::canonicalize(&directory.0).unwrap())
+                .unwrap();
+        let update_guard = open_file_for_attribute_updates_without_following(
+            &directory_handle,
+            &directory.0,
+            std::ffi::OsStr::new("readonly"),
+        )
+        .unwrap();
+
+        let second_update_guard = open_file_for_attribute_updates_without_following(
+            &directory_handle,
+            &directory.0,
+            std::ffi::OsStr::new("readonly"),
+        )
+        .expect("Windows does not apply share checks to attribute-only opens");
+        drop(second_update_guard);
+        drop(update_guard);
+    }
+
+    #[test]
+    fn handle_relative_directory_move_preserves_identity_and_never_replaces() {
+        let directory = TestDirectory::new();
+        let parent = directory.0.join("parent");
+        let source = parent.join("temporary");
+        let destination = parent.join("src");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("marker"), b"source").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("marker"), b"destination").unwrap();
+
+        let parent_handle = open_directory_path_for_child_updates_without_following(
+            &fs::canonicalize(&parent).unwrap(),
+        )
+        .unwrap();
+        let source_handle = open_child_directory_for_rename_without_following(
+            &parent_handle,
+            std::ffi::OsStr::new("temporary"),
+        )
+        .unwrap();
+        let source_identity = file_identity(source_handle.as_file()).unwrap();
+
+        let error = move_directory_handle_to_child_without_replacing(
+            &source_handle,
+            &parent_handle,
+            std::ffi::OsStr::new("src"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            file_identity(source_handle.as_file()).unwrap(),
+            source_identity
+        );
+        assert_eq!(fs::read(source.join("marker")).unwrap(), b"source");
+        assert_eq!(
+            fs::read(destination.join("marker")).unwrap(),
+            b"destination"
+        );
+        drop(source_handle);
+        fs::remove_dir_all(&destination).unwrap();
+
+        let source_handle = open_child_directory_for_rename_without_following(
+            &parent_handle,
+            std::ffi::OsStr::new("temporary"),
+        )
+        .unwrap();
+        move_directory_handle_to_child_without_replacing(
+            &source_handle,
+            &parent_handle,
+            std::ffi::OsStr::new("src"),
+        )
+        .unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(fs::read(destination.join("marker")).unwrap(), b"source");
+        assert_eq!(
+            file_identity(source_handle.as_file()).unwrap(),
+            source_identity
+        );
     }
 }

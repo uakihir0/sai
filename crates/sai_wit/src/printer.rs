@@ -5,7 +5,7 @@ use crate::{
     WitStabilityVersion, WitType, WitTypeRef, WitWorld, WitWorldItem, WitWorldItemDirection,
     WitWorldItemOrder, WitWorldRef,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Write as _;
 
 /// Print a generated WIT package in the canonical format of spec/13 §13.11.
@@ -218,16 +218,33 @@ fn print_world(package: &WitPackage, world: &WitWorld) -> String {
         0,
     );
     let entries = world_entries(world);
+    let uses = collect_world_uses(package, &entries);
     if entries.is_empty() {
         let _ = write!(output, "world {} {{}}", wit_identifier(&world.name));
         return output;
     }
     let _ = writeln!(output, "world {} {{", wit_identifier(&world.name));
+    for (path, members) in &uses {
+        let _ = writeln!(
+            output,
+            "  use {}.{{{}}};",
+            path,
+            members
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !uses.is_empty() {
+        output.push('\n');
+    }
     for entry in entries {
         match entry {
             WorldEntry::Import(item) => print_world_item(&mut output, package, "import", item),
             WorldEntry::Export(item) => print_world_item(&mut output, package, "export", item),
             WorldEntry::Include(reference) => {
+                push_docs(&mut output, reference.docs.as_deref(), 1);
                 push_stability(
                     &mut output,
                     reference.since.as_ref(),
@@ -303,6 +320,117 @@ fn world_entries(world: &WitWorld) -> Vec<WorldEntry<'_>> {
         .collect()
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct WorldTypeUseIdentity {
+    unit: crate::WitUnit,
+    interface: WitIfaceIdx,
+    item: crate::WitItemIdx,
+}
+
+struct WorldTypeUse {
+    identity: WorldTypeUseIdentity,
+    path: String,
+    member: String,
+}
+
+fn collect_world_uses(
+    package: &WitPackage,
+    entries: &[WorldEntry<'_>],
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut type_uses = Vec::new();
+    for entry in entries {
+        let item = match entry {
+            WorldEntry::Import(item) | WorldEntry::Export(item) => item,
+            WorldEntry::Include(_) => continue,
+        };
+        if let WitWorldItem::Func { func, .. } = item {
+            for (_, ty) in &func.params {
+                collect_world_type_uses(package, ty, &mut type_uses);
+            }
+            if let Some(result) = &func.result {
+                collect_world_type_uses(package, result, &mut type_uses);
+            }
+        }
+    }
+
+    // Sort by the text that appears in the canonical output before deduping
+    // by resolved identity. This keeps output stable even if hand-built model
+    // references carry inconsistent retained spellings for one item.
+    type_uses.sort_by(|left, right| {
+        (
+            left.path.as_str(),
+            wit_identifier(&left.member),
+            left.identity.unit.canonical_name(),
+            left.identity.interface.raw(),
+            left.identity.item.raw(),
+        )
+            .cmp(&(
+                right.path.as_str(),
+                wit_identifier(&right.member),
+                right.identity.unit.canonical_name(),
+                right.identity.interface.raw(),
+                right.identity.item.raw(),
+            ))
+    });
+
+    let mut seen = HashSet::new();
+    let mut uses = BTreeMap::<String, BTreeSet<String>>::new();
+    for type_use in type_uses {
+        if seen.insert(type_use.identity) {
+            uses.entry(type_use.path)
+                .or_default()
+                .insert(wit_identifier(&type_use.member));
+        }
+    }
+    uses
+}
+
+fn collect_world_type_uses(package: &WitPackage, ty: &WitType, uses: &mut Vec<WorldTypeUse>) {
+    match ty {
+        WitType::List(inner)
+        | WitType::Option(inner)
+        | WitType::Future(Some(inner))
+        | WitType::Stream(Some(inner)) => collect_world_type_uses(package, inner, uses),
+        WitType::Result { ok, err } => {
+            for inner in ok.iter().chain(err.iter()) {
+                collect_world_type_uses(package, inner, uses);
+            }
+        }
+        WitType::Tuple(types) => {
+            for ty in types {
+                collect_world_type_uses(package, ty, uses);
+            }
+        }
+        WitType::Named(reference) | WitType::Own(reference) | WitType::Borrow(reference) => {
+            uses.push(WorldTypeUse {
+                identity: WorldTypeUseIdentity {
+                    unit: reference.interface.unit.clone(),
+                    interface: reference.interface.interface,
+                    item: reference.item,
+                },
+                path: print_interface_path(package, &reference.interface),
+                member: reference.item_name.clone(),
+            });
+        }
+        WitType::Future(None)
+        | WitType::Stream(None)
+        | WitType::Bool
+        | WitType::S8
+        | WitType::S16
+        | WitType::S32
+        | WitType::S64
+        | WitType::U8
+        | WitType::U16
+        | WitType::U32
+        | WitType::U64
+        | WitType::F32
+        | WitType::F64
+        | WitType::Char
+        | WitType::String
+        | WitType::Unsupported(_) => {}
+    }
+}
+
 fn print_world_item(
     output: &mut String,
     package: &WitPackage,
@@ -312,27 +440,31 @@ fn print_world_item(
     match item {
         WitWorldItem::Interface {
             reference,
+            docs,
             since,
             deprecated,
             ..
         } => {
+            push_docs(output, docs.as_deref(), 1);
             push_stability(output, since.as_ref(), deprecated.as_ref(), 1);
             let path = print_interface_path(package, reference);
             let _ = writeln!(output, "  {direction} {path};");
         }
         WitWorldItem::Func {
             name,
+            docs,
             func,
             since,
             deprecated,
             ..
         } => {
+            push_docs(output, docs.as_deref(), 1);
             push_stability(output, since.as_ref(), deprecated.as_ref(), 1);
             let _ = writeln!(
                 output,
                 "  {direction} {}: {};",
                 wit_identifier(name),
-                print_function(func, true)
+                print_function(func, false)
             );
         }
     }
@@ -738,6 +870,7 @@ mod tests {
             imports: vec![
                 WitWorldItem::Func {
                     name: "first".to_owned(),
+                    docs: None,
                     func: function(Vec::new(), None),
                     unsupported: None,
                     since: None,
@@ -746,6 +879,7 @@ mod tests {
                 },
                 WitWorldItem::Func {
                     name: "second".to_owned(),
+                    docs: None,
                     func: function(Vec::new(), None),
                     unsupported: None,
                     since: None,
@@ -755,6 +889,7 @@ mod tests {
             ],
             exports: vec![WitWorldItem::Func {
                 name: "middle".to_owned(),
+                docs: None,
                 func: function(Vec::new(), None),
                 unsupported: None,
                 since: None,
@@ -766,6 +901,7 @@ mod tests {
                 world: crate::WitWorldIdx::from_raw(0),
                 name: "base".to_owned(),
                 names: Vec::new(),
+                docs: None,
                 since: None,
                 deprecated: None,
                 span: None,
@@ -1045,6 +1181,139 @@ mod tests {
     }
 
     #[test]
+    fn projects_sorted_type_uses_for_direct_world_function_signatures() {
+        let local = dir_unit("acme:root", "1.0.0");
+        let external = dir_unit("acme:dep", "2.0.0");
+        let reference =
+            |unit: WitUnit, interface: u32, interface_name: &str, item: u32, item_name: &str| {
+                WitTypeRef {
+                    interface: WitIfaceRef {
+                        unit,
+                        interface: WitIfaceIdx::from_raw(interface),
+                        name: interface_name.to_owned(),
+                    },
+                    item: WitItemIdx::from_raw(item),
+                    item_name: item_name.to_owned(),
+                }
+            };
+        let api_id = reference(local.clone(), 0, "api", 0, "id");
+        let worker = reference(local.clone(), 1, "handles", 0, "worker");
+        let token = reference(external.clone(), 0, "types", 0, "token");
+        let error = reference(external.clone(), 0, "types", 1, "error");
+        let secret = reference(external, 0, "types", 2, "secret");
+        let model = package(
+            local.clone(),
+            vec![
+                interface("api", vec![item("id", WitItemKind::Alias(WitType::U32))]),
+                interface(
+                    "handles",
+                    vec![item("worker", WitItemKind::Resource(Vec::new()))],
+                ),
+                interface(
+                    "unused",
+                    vec![item(
+                        "inspect",
+                        WitItemKind::Func(function(
+                            vec![("secret".to_owned(), WitType::Named(secret))],
+                            None,
+                        )),
+                    )],
+                ),
+            ],
+            vec![WitWorld {
+                name: "service".to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                imports: vec![
+                    WitWorldItem::Func {
+                        name: "consume".to_owned(),
+                        docs: None,
+                        func: function(
+                            vec![
+                                (
+                                    "wrapped".to_owned(),
+                                    WitType::List(Box::new(WitType::Named(api_id.clone()))),
+                                ),
+                                ("owned".to_owned(), WitType::Own(worker.clone())),
+                                ("borrowed".to_owned(), WitType::Borrow(worker.clone())),
+                                ("token".to_owned(), WitType::Borrow(token.clone())),
+                            ],
+                            Some(WitType::Result {
+                                ok: Some(Box::new(WitType::Named(api_id.clone()))),
+                                err: Some(Box::new(WitType::Future(Some(Box::new(
+                                    WitType::Stream(Some(Box::new(WitType::Named(error.clone())))),
+                                ))))),
+                            }),
+                        ),
+                        unsupported: None,
+                        since: None,
+                        deprecated: None,
+                        span: None,
+                    },
+                    WitWorldItem::Interface {
+                        reference: WitIfaceRef {
+                            unit: local.clone(),
+                            interface: WitIfaceIdx::from_raw(2),
+                            name: "unused".to_owned(),
+                        },
+                        docs: None,
+                        since: None,
+                        deprecated: None,
+                        span: None,
+                    },
+                ],
+                exports: vec![WitWorldItem::Func {
+                    name: "produce".to_owned(),
+                    docs: None,
+                    func: function(
+                        vec![
+                            ("id".to_owned(), WitType::Named(api_id.clone())),
+                            ("token".to_owned(), WitType::Own(token)),
+                        ],
+                        Some(WitType::Tuple(vec![
+                            WitType::Named(api_id),
+                            WitType::Named(error),
+                        ])),
+                    ),
+                    unsupported: None,
+                    since: None,
+                    deprecated: None,
+                    span: None,
+                }],
+                includes: Vec::new(),
+                source_order: vec![
+                    WitWorldItemOrder::import(0),
+                    WitWorldItemOrder::export(0),
+                    WitWorldItemOrder::import(1),
+                ],
+                unsupported: None,
+                span: None,
+            }],
+        );
+
+        let text = print_wit(&model);
+        let world = text
+            .split_once("world service {\n")
+            .expect("printed service world")
+            .1;
+        assert_eq!(
+            world,
+            concat!(
+                "  use acme:dep/types@2.0.0.{error, token};\n",
+                "  use api.{id};\n",
+                "  use handles.{worker};\n",
+                "\n",
+                "  import consume: func(wrapped: list<id>, owned: worker, borrowed: borrow<worker>, token: borrow<token>) -> result<id, future<stream<error>>>;\n",
+                "  export produce: func(id: id, token: token) -> tuple<id, error>;\n",
+                "  import unused;\n",
+                "}\n"
+            )
+        );
+        assert!(!world.contains("secret"));
+    }
+
+    #[test]
     fn escapes_reserved_package_identity_segments() {
         let root = dir_unit("acme:root", "1.0.0");
         let dependency = dir_unit("acme:interface", "2.0.0");
@@ -1063,6 +1332,7 @@ mod tests {
                     world: crate::WitWorldIdx::from_raw(0),
                     name: "base".to_owned(),
                     names: Vec::new(),
+                    docs: None,
                     since: None,
                     deprecated: None,
                     span: None,

@@ -192,6 +192,7 @@ Exceeding a limit is the error `PACKAGE_TOO_LARGE`, naming the package, the limi
 2. Moving a verified directory from `tmp/` into `src/` and updating tag records require the exclusive lock on `<cache>/v1/lock`, which is held only for that step. If the target directory already exists, another process has installed the same content; the new copy is discarded.
 3. Readers take no lock: entries are immutable and appear atomically.
 4. A temporary directory left by an interrupted fetch is removed by the next writer once it is more than 24 hours old.
+5. On Windows, atomically replacing a cache record requires `FileRenameInformationEx` with POSIX rename semantics, available from Windows 10 version 1709, and a filesystem that supports that operation. Local NTFS supports it. If the selected cache filesystem does not, publication returns an I/O error rather than removing the old record before publishing its replacement.
 
 ---
 

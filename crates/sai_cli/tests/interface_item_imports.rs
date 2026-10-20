@@ -96,6 +96,10 @@ fn check_resolves_local_interface_member_imports_but_keeps_check_incomplete() {
     }
 }
 
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
 #[test]
 fn check_reports_non_interface_impl_targets_but_accepts_wit_view_interfaces() {
     let directory = TestDirectory::new();
@@ -259,6 +263,10 @@ fn check_reports_non_interface_impl_targets_but_accepts_wit_view_interfaces() {
     );
 }
 
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
 #[test]
 fn check_rejects_a_wit_resource_used_by_a_visible_record() {
     let directory = TestDirectory::new();

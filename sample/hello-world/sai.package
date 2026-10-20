@@ -1,0 +1,6 @@
+package acme:hello-world @ 0.1.0
+compiler ^0.1
+source "src"
+
+targets { wasm32-core }
+description "A minimal SAI package"

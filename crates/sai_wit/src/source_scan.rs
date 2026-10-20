@@ -685,6 +685,181 @@ pub(super) fn is_wit_keyword(identifier: &str) -> bool {
     )
 }
 
+/// A tokenized WIT file used to recover documentation for its world includes.
+///
+/// Keeping this scanner for the whole source file avoids lexing the complete
+/// file again for every include.
+pub(super) struct WorldIncludeDocScanner<'a> {
+    source: &'a str,
+    tokens: Vec<Token>,
+    include_indices: Vec<usize>,
+}
+
+impl<'a> WorldIncludeDocScanner<'a> {
+    pub(super) fn new(source: &'a str) -> Self {
+        let tokens = lex(source);
+        let include_indices = tokens
+            .iter()
+            .enumerate()
+            .filter(|(_, token)| is_identifier(source, token, "include"))
+            .map(|(index, _)| index)
+            .collect();
+        Self {
+            source,
+            tokens,
+            include_indices,
+        }
+    }
+
+    /// Recover the documentation trivia attached to the include whose target
+    /// starts at `target_start`.
+    ///
+    /// `wit-parser` 0.246.0 parses the documentation passed to
+    /// `WorldItem::Include` but drops it from its unresolved and resolved world
+    /// models. The include's parser span points at the target name, so locate
+    /// the preceding `include` token and reproduce `wit-parser`'s
+    /// documentation normalization from the original source.
+    pub(super) fn docs(&self, target_start: usize) -> Option<String> {
+        let include_position = self
+            .include_indices
+            .partition_point(|index| self.tokens[*index].range.start < target_start);
+        let include_index = *self.include_indices.get(include_position.checked_sub(1)?)?;
+
+        // `parse_docs` runs before the include's attributes, so documentation
+        // is immediately before the first attribute rather than the `include`
+        // token.
+        let mut docs_end = include_index;
+        while let Some(attribute_start) = trailing_attribute_start(&self.tokens, docs_end) {
+            docs_end = attribute_start;
+        }
+        let trivia_end = self.tokens[docs_end].range.start;
+        let trivia_start = self.tokens[..docs_end]
+            .last()
+            .map_or(0, |token| token.range.end);
+        let comments = comments_in_trivia(self.source, trivia_start..trivia_end)?;
+        normalize_doc_comments(&comments)
+    }
+}
+
+/// Convenience wrapper for single-use callers such as source-scanner tests.
+#[cfg(test)]
+fn world_include_docs(source: &str, target_start: usize) -> Option<String> {
+    WorldIncludeDocScanner::new(source).docs(target_start)
+}
+
+fn trailing_attribute_start(tokens: &[Token], end: usize) -> Option<usize> {
+    let close = end.checked_sub(1)?;
+    if tokens[close].kind != TokenKind::Punctuation(b')') {
+        return None;
+    }
+    let open = matching_open_delimiter(tokens, close, b'(', b')')?;
+    let name = open.checked_sub(1)?;
+    let at = name.checked_sub(1)?;
+    (tokens[name].kind == TokenKind::Identifier && tokens[at].kind == TokenKind::Punctuation(b'@'))
+        .then_some(at)
+}
+
+fn comments_in_trivia(source: &str, range: Range<usize>) -> Option<Vec<&str>> {
+    let mut comments = Vec::new();
+    let mut index = range.start;
+    while index < range.end {
+        let ch = source[index..].chars().next()?;
+        if ch.is_ascii_whitespace() {
+            index += ch.len_utf8();
+            continue;
+        }
+        if source[index..].starts_with("//") {
+            let start = index;
+            index += 2;
+            while index < range.end {
+                let ch = source[index..].chars().next()?;
+                if ch == '\n' {
+                    break;
+                }
+                index += ch.len_utf8();
+            }
+            comments.push(&source[start..index]);
+            continue;
+        }
+        if source[index..].starts_with("/*") {
+            let start = index;
+            index += 2;
+            let mut depth = 1_u32;
+            while index < range.end && depth > 0 {
+                if source[index..].starts_with("/*") {
+                    depth += 1;
+                    index += 2;
+                } else if source[index..].starts_with("*/") {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += source[index..].chars().next()?.len_utf8();
+                }
+            }
+            if depth != 0 {
+                return None;
+            }
+            comments.push(&source[start..index]);
+            continue;
+        }
+        return None;
+    }
+    Some(comments)
+}
+
+fn normalize_doc_comments(comments: &[&str]) -> Option<String> {
+    if comments.is_empty() {
+        return None;
+    }
+    let docs = comments
+        .iter()
+        .map(|comment| {
+            let contents = match comment.strip_prefix("/**") {
+                Some(contents) => contents.strip_suffix("*/")?,
+                None => comment.trim_start_matches('/'),
+            };
+            Some(contents.trim_end().to_owned())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let min_leading_ws = docs
+        .iter()
+        .filter(|doc| !doc.is_empty())
+        .map(|doc| {
+            doc.bytes()
+                .take_while(|byte| byte.is_ascii_whitespace())
+                .count()
+        })
+        .min()
+        .unwrap_or(0);
+    let leading_ws = " ".repeat(min_leading_ws);
+    let docs = docs
+        .iter()
+        .map(|doc| {
+            if min_leading_ws == 0 {
+                doc.as_str()
+            } else {
+                doc.strip_prefix(&leading_ws).unwrap_or(doc)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut contents = String::new();
+    for doc in docs {
+        if doc.is_empty() {
+            contents.push('\n');
+        } else {
+            for line in doc.lines() {
+                contents.push_str(line);
+                contents.push('\n');
+            }
+        }
+    }
+    while contents.ends_with('\n') {
+        contents.pop();
+    }
+    Some(contents)
+}
+
 fn lex(source: &str) -> Vec<Token> {
     let mut tokens = Vec::new();
     let mut index = 0;
@@ -852,7 +1027,73 @@ fn is_keylike_continue(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_foreign_references, scan_source};
+    use super::{scan_foreign_references, scan_source, world_include_docs};
+
+    #[test]
+    fn recovers_docs_before_world_include_attributes_and_multiple_crlf_includes() {
+        let source = concat!(
+            "world app {\r\n",
+            "  /** first include /* nested block */ docs */\r\n",
+            "  @since(version = 0.3.0)\r\n",
+            "  include base;\r\n",
+            "  // second include comment\r\n",
+            "  @deprecated(version = 1.0.0)\r\n",
+            "  include other;\r\n",
+            "}\r\n",
+        );
+
+        let first = source.find("base;").expect("first include target exists");
+        let second = source.find("other;").expect("second include target exists");
+        assert_eq!(
+            world_include_docs(source, first),
+            Some("first include /* nested block */ docs".to_owned())
+        );
+        assert_eq!(
+            world_include_docs(source, second),
+            Some("second include comment".to_owned())
+        );
+    }
+
+    #[test]
+    fn follows_wit_parser_comment_rules_for_world_include_docs() {
+        let source = concat!(
+            "world app {\n",
+            "  // ordinary line comment\n",
+            "  include ordinary;\n",
+            "  /// triple-slash doc comment\n",
+            "  include documented;\n",
+            "  /* ordinary nested /* block */ comment */\n",
+            "  include block;\n",
+            "}\n",
+        );
+
+        for (target, expected) in [
+            ("ordinary;", "ordinary line comment"),
+            ("documented;", "triple-slash doc comment"),
+            ("block;", "* ordinary nested /* block */ comment */"),
+        ] {
+            assert_eq!(
+                world_include_docs(source, source.find(target).unwrap()),
+                Some(expected.to_owned()),
+                "comment behavior follows wit-parser 0.246.0 for {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_attach_comments_inside_include_attributes() {
+        let source = concat!(
+            "world app {\n",
+            "  /// attached docs\n",
+            "  @since(version /* not documentation */ = 1.0.0)\n",
+            "  include base;\n",
+            "}\n",
+        );
+        assert_eq!(
+            world_include_docs(source, source.find("base;").unwrap()),
+            Some("attached docs".to_owned())
+        );
+    }
 
     #[test]
     fn ignores_package_keywords_inside_comments_and_strings() {

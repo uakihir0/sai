@@ -463,11 +463,12 @@ fn run_check(
     let mut root_package_key = None;
     let mut package_header_span = None;
     let mut manifest_source = None;
+    let mut root_coverage = CheckRootCoverage::default();
     let include_source_lines = parsed.globals.format == OutputFormat::Human;
 
     let manifest_path = package_root.join("sai.package");
     let manifest_display_path = fmt_path_reference(&manifest_path, &cwd, Some(&package_root));
-    let manifest_selection = crate::fmt_paths::select_fmt_paths(
+    let manifest_selection = crate::fmt_paths::select_fmt_paths_for_check(
         std::slice::from_ref(&manifest_path),
         &cwd,
         cancellation,
@@ -695,6 +696,31 @@ fn run_check(
             }
         }
     }
+    let mut root_manifest_semantically_valid = false;
+    if !check_locked_mode(command)
+        && let (Some(manifest), Some(source)) = (parsed_manifest.as_ref(), manifest_source.as_ref())
+    {
+        let toolchain_version = sai_package::version::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("the CLI package version is a valid language version");
+        let validation = sai_package::validation::validate(
+            manifest,
+            sai_package::validation::PackageValidationContext {
+                compiler_version: Some(&toolchain_version),
+            },
+        );
+        root_manifest_semantically_valid =
+            validation.errors.is_empty() && validation.warnings.is_empty();
+        let (semantic_diagnostics, errors, warnings) = package_validation_check_diagnostics(
+            source,
+            &manifest_display_path,
+            &validation,
+            root_identity.as_deref(),
+            include_source_lines,
+        );
+        diagnostics.extend(semantic_diagnostics);
+        total_errors = total_errors.saturating_add(errors);
+        total_warnings = total_warnings.saturating_add(warnings);
+    }
     let dependency_target_cfg = parsed_manifest.as_ref().and_then(|manifest| {
         let target = check_target_override(command)
             .or_else(|| manifest_target_names(manifest).first().cloned())?;
@@ -823,7 +849,7 @@ fn run_check(
     let mut dependency_sources_parsed = false;
     let mut missing_root_module_tree_input = None;
 
-    if let Some(manifest) = parsed_manifest {
+    if let Some(manifest) = parsed_manifest.as_ref() {
         let declared_source = manifest.file().declarations.iter().find_map(|declaration| {
             if let sai_package::manifest::PackageDeclaration::Source(source) = &declaration.value {
                 Some(source.as_ref())
@@ -1265,7 +1291,7 @@ fn run_check(
                                         target_cfg.as_ref(),
                                         package_graph.take(),
                                     );
-                                    push_module_tree_check_result(
+                                    root_coverage = push_module_tree_check_result(
                                         &mut diagnostics,
                                         &mut total_errors,
                                         &mut total_warnings,
@@ -1562,7 +1588,7 @@ fn run_check(
             dependency_target_cfg.as_ref(),
             package_graph.take(),
         );
-        push_module_tree_check_result(
+        root_coverage = push_module_tree_check_result(
             &mut diagnostics,
             &mut total_errors,
             &mut total_warnings,
@@ -1585,7 +1611,7 @@ fn run_check(
             dependency_target_cfg.as_ref(),
             package_graph.take(),
         );
-        push_module_tree_check_result(
+        root_coverage = push_module_tree_check_result(
             &mut diagnostics,
             &mut total_errors,
             &mut total_warnings,
@@ -1649,8 +1675,72 @@ fn run_check(
     if cancellation.is_cancelled() {
         return report_interrupted(parsed, stdout, stderr);
     }
-    diagnostics.push(check_incomplete_diagnostic(command));
-    total_errors = total_errors.saturating_add(1);
+
+    let tail = command_tail(command);
+    let analyzes_tests = tail.iter().any(|(argument, _)| argument == "--tests");
+    let applies_fixes = tail.iter().any(|(argument, _)| argument == "--fix");
+    let empty_root_manifest_supported = parsed_manifest
+        .as_ref()
+        .is_some_and(check_manifest_supports_empty_root_success);
+    let target = check_target_override(command).or_else(|| {
+        parsed_manifest
+            .as_ref()
+            .and_then(|manifest| manifest_target_names(manifest).into_iter().next())
+    });
+    let profile = check_profile_override(command).unwrap_or_else(|| "dev".to_owned());
+    let root_analysis_is_covered = root_coverage.empty_root_module_only_covered
+        || root_coverage.public_primitive_const_set_covered
+        || root_coverage.single_public_function_body_covered;
+    let check_slice_is_supported = root_analysis_is_covered
+        && empty_root_manifest_supported
+        && root_manifest_semantically_valid
+        && matches!(target.as_deref(), Some("wasm32-core" | "wasm64-core"))
+        && profile == "dev"
+        && !check_locked_mode(command)
+        && !check_has_lint_overrides(command)
+        && !analyzes_tests
+        && !applies_fixes;
+
+    if check_slice_is_supported && total_errors == 0 {
+        let Some(target) = target else {
+            diagnostics.push(check_incomplete_diagnostic(command));
+            total_errors = total_errors.saturating_add(1);
+            return report_check_diagnostics(
+                parsed,
+                diagnostics,
+                total_errors,
+                total_warnings,
+                total_infos,
+                root_identity.as_deref(),
+                stdout,
+                stderr,
+            );
+        };
+        let result = CheckSuccessRecord {
+            target,
+            profile,
+            tests: false,
+            packages: 1,
+            fixes_applied: 0,
+            changed_files: Vec::new(),
+        };
+        return report_check_outcome(
+            parsed,
+            diagnostics,
+            total_errors,
+            total_warnings,
+            total_infos,
+            root_identity.as_deref(),
+            Some(&result),
+            stdout,
+            stderr,
+        );
+    }
+
+    if !check_slice_is_supported {
+        diagnostics.push(check_incomplete_diagnostic(command));
+        total_errors = total_errors.saturating_add(1);
+    }
     report_check_diagnostics(
         parsed,
         diagnostics,
@@ -1753,6 +1843,587 @@ fn manifest_target_names(manifest: &sai_package::manifest::PackageParseOutput) -
             }
         })
         .unwrap_or_default()
+}
+
+fn check_manifest_supports_empty_root_success(
+    manifest: &sai_package::manifest::PackageParseOutput,
+) -> bool {
+    manifest.file().declarations.iter().all(|declaration| {
+        matches!(
+            &declaration.value,
+            sai_package::manifest::PackageDeclaration::Compiler(_)
+                | sai_package::manifest::PackageDeclaration::Source(_)
+                | sai_package::manifest::PackageDeclaration::Targets(_)
+                | sai_package::manifest::PackageDeclaration::Description(_)
+                | sai_package::manifest::PackageDeclaration::License(_)
+                | sai_package::manifest::PackageDeclaration::Repository(_)
+                | sai_package::manifest::PackageDeclaration::Authors(_)
+        )
+    })
+}
+
+fn check_source_is_unattributed_public_const_set(source: &[u8]) -> Option<usize> {
+    use sai_syntax::ast::AstNode as _;
+
+    let parsed = sai_fmt::parse_source(source).ok()?;
+    let source_file = sai_syntax::ast::SourceFile::cast(parsed.root().clone())?;
+    if source_file.module_header().is_some()
+        || source_file.test_decls().next().is_some()
+        || source_file.property_decls().next().is_some()
+        || source_file
+            .syntax()
+            .children()
+            .any(|child| sai_syntax::ast::UseDecl::can_cast(child.kind()))
+    {
+        return None;
+    }
+    let mut const_count = 0usize;
+    for item in source_file.items() {
+        let sai_syntax::ast::Item::Const(constant) = item else {
+            return None;
+        };
+        if constant.attrs().next().is_some()
+            || !constant
+                .visibility()
+                .is_some_and(|visibility| visibility.pub_token().is_some())
+        {
+            return None;
+        }
+        let name = constant.name()?;
+        let name_token = name.token()?;
+        let written_name = name_token.text();
+        if written_name.starts_with("r#")
+            || !written_name
+                .bytes()
+                .all(|byte| byte == b'_' || byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            return None;
+        }
+        const_count = const_count.checked_add(1)?;
+    }
+    (const_count > 0).then_some(const_count)
+}
+
+fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
+    use sai_syntax::ast::AstNode as _;
+
+    let Some(parsed) = sai_fmt::parse_source(source).ok() else {
+        return false;
+    };
+    let Some(source_file) = sai_syntax::ast::SourceFile::cast(parsed.root().clone()) else {
+        return false;
+    };
+    if source_file.module_header().is_some()
+        || source_file.test_decls().next().is_some()
+        || source_file.property_decls().next().is_some()
+        || source_file
+            .syntax()
+            .children()
+            .any(|child| sai_syntax::ast::UseDecl::can_cast(child.kind()))
+    {
+        return false;
+    }
+    let mut items = source_file.items();
+    let Some(sai_syntax::ast::Item::Function(function)) = items.next() else {
+        return false;
+    };
+    items.next().is_none()
+        && function.attrs().next().is_none()
+        && function
+            .visibility()
+            .is_some_and(|visibility| visibility.pub_token().is_some())
+}
+
+fn check_public_primitive_const_set_coverage(
+    source_count: usize,
+    scopes: &sai_driver::Phase1PackageScopes,
+    const_resolutions: &sai_driver::ConstOwnerResolutions,
+) -> bool {
+    if scopes.modules.len() != 1
+        || !scopes.modules[0].imports.is_empty()
+        || scopes.top_level_owners.len() != source_count
+        || const_resolutions.owners().len() != source_count
+    {
+        return false;
+    }
+
+    let active_owner_ids = scopes
+        .top_level_owners
+        .iter()
+        .filter(|descriptor| descriptor.kind == sai_driver::TopLevelOwnerKind::Const)
+        .map(|descriptor| descriptor.owner)
+        .collect::<HashSet<_>>();
+    let resolved_owner_ids = const_resolutions
+        .owners()
+        .iter()
+        .map(sai_driver::ConstOwnerResolution::owner)
+        .collect::<HashSet<_>>();
+
+    active_owner_ids.len() == source_count
+        && resolved_owner_ids.len() == source_count
+        && active_owner_ids == resolved_owner_ids
+        && const_resolutions.owners().iter().all(|owner| {
+            owner
+                .literal_check()
+                .is_ok_and(sai_driver::ConstLiteralCheck::is_supported)
+        })
+}
+
+fn check_public_function_body_coverage(
+    source_is_candidate: bool,
+    scopes: &sai_driver::Phase1PackageScopes,
+    function_resolutions: &sai_driver::FunctionOwnerResolutions,
+) -> bool {
+    if !source_is_candidate
+        || scopes.modules.len() != 1
+        || !scopes.modules[0].imports.is_empty()
+        || scopes.top_level_owners.len() != 1
+        || function_resolutions.owners().len() != 1
+        || scopes.top_level_owners[0].kind != sai_driver::TopLevelOwnerKind::Function
+    {
+        return false;
+    }
+    let owner = &function_resolutions.owners()[0];
+    if owner.owner() != scopes.top_level_owners[0].owner {
+        return false;
+    }
+    owner
+        .body_type_check()
+        .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
+        && owner
+            .local_resolution()
+            .is_ok_and(|locals| locals.is_some_and(|locals| locals.diagnostics.is_empty()))
+        && owner
+            .resolution()
+            .is_ok_and(|resolution| resolution.diagnostics.is_empty())
+        && owner.lowering_diagnostics().is_empty()
+}
+
+fn active_public_name_diagnostics(
+    database: &mut RootDatabase,
+    collection: &sai_driver::Phase1PackageScopesCollection,
+    snapshot: &WorkspaceSnapshot,
+    source_by_key: &HashMap<String, (String, Arc<[u8]>)>,
+    package_identity: &str,
+    include_source_lines: bool,
+) -> Result<Vec<CheckDiagnostic>, String> {
+    use sai_syntax::ast::AstNode as _;
+
+    let mut diagnostics = Vec::new();
+    let mut parsed_files = HashMap::new();
+    for descriptor in &collection.scopes().top_level_owners {
+        if !matches!(
+            descriptor.kind,
+            sai_driver::TopLevelOwnerKind::Function
+                | sai_driver::TopLevelOwnerKind::Struct
+                | sai_driver::TopLevelOwnerKind::Alias
+                | sai_driver::TopLevelOwnerKind::Refined
+                | sai_driver::TopLevelOwnerKind::Enum
+                | sai_driver::TopLevelOwnerKind::Distinct
+                | sai_driver::TopLevelOwnerKind::Resource
+                | sai_driver::TopLevelOwnerKind::Trait
+                | sai_driver::TopLevelOwnerKind::Impl
+                | sai_driver::TopLevelOwnerKind::Const
+                | sai_driver::TopLevelOwnerKind::Effect
+                | sai_driver::TopLevelOwnerKind::Interface
+                | sai_driver::TopLevelOwnerKind::World
+        ) {
+            continue;
+        }
+
+        let (parsed, ast_ids) = if let Some(parsed) = parsed_files.get(&descriptor.file) {
+            parsed
+        } else {
+            let parsed = database
+                .parse_file(snapshot, descriptor.file)
+                .map_err(|error| format!("public-name source parse failed: {error:?}"))?;
+            let ast_ids = database
+                .ast_id_map(snapshot, descriptor.file)
+                .map_err(|error| format!("public-name AST indexing failed: {error:?}"))?;
+            parsed_files.insert(descriptor.file, (parsed, ast_ids));
+            parsed_files
+                .get(&descriptor.file)
+                .expect("the parsed file was just inserted")
+        };
+        let Some(ast_id) = sai_syntax::ast::AstId::<sai_syntax::ast::Item>::from_erased(
+            ast_ids,
+            descriptor.item_id,
+        ) else {
+            return Err(format!(
+                "public-name owner {:?} has no matching syntax item",
+                descriptor.owner
+            ));
+        };
+        let Some(item) = ast_ids
+            .get(ast_id)
+            .and_then(|pointer| pointer.resolve(descriptor.file, &parsed.root))
+        else {
+            return Err(format!(
+                "public-name owner {:?} could not be resolved in its source file",
+                descriptor.owner
+            ));
+        };
+
+        let mut public_name_ranges = Vec::new();
+        match (descriptor.kind, item) {
+            (
+                sai_driver::TopLevelOwnerKind::Function,
+                sai_syntax::ast::Item::Function(function),
+            ) => {
+                if function.visibility().is_some_and(|visibility| {
+                    visibility.pub_token().is_some() || visibility.export_token().is_some()
+                }) {
+                    push_name_range(
+                        &mut public_name_ranges,
+                        function.name().and_then(|name| name.token()),
+                    );
+                }
+            }
+            (sai_driver::TopLevelOwnerKind::Trait, sai_syntax::ast::Item::Trait(trait_decl)) => {
+                if is_public_visibility(trait_decl.visibility()) {
+                    push_name_range(
+                        &mut public_name_ranges,
+                        trait_decl.name().and_then(|name| name.token()),
+                    );
+                    if let Some(items) = trait_decl.items() {
+                        for function in items.functions() {
+                            push_name_range(
+                                &mut public_name_ranges,
+                                function.name().and_then(|name| name.token()),
+                            );
+                        }
+                        for assoc_type in items.assoc_type_decls() {
+                            push_name_range(
+                                &mut public_name_ranges,
+                                assoc_type.name().and_then(|name| name.token()),
+                            );
+                        }
+                    }
+                }
+            }
+            (sai_driver::TopLevelOwnerKind::Impl, sai_syntax::ast::Item::Impl(impl_decl)) => {
+                if impl_decl.inherent_type().is_some() {
+                    if let Some(items) = impl_decl.items() {
+                        for function in items.functions().filter(|function| {
+                            function
+                                .visibility()
+                                .is_some_and(|visibility| visibility.pub_token().is_some())
+                        }) {
+                            push_name_range(
+                                &mut public_name_ranges,
+                                function.name().and_then(|name| name.token()),
+                            );
+                        }
+                    }
+                }
+            }
+            (sai_driver::TopLevelOwnerKind::Struct, sai_syntax::ast::Item::Type(type_decl))
+            | (sai_driver::TopLevelOwnerKind::Alias, sai_syntax::ast::Item::Type(type_decl))
+            | (sai_driver::TopLevelOwnerKind::Refined, sai_syntax::ast::Item::Type(type_decl)) => {
+                push_type_public_names(&mut public_name_ranges, &type_decl, false);
+            }
+            (sai_driver::TopLevelOwnerKind::Enum, sai_syntax::ast::Item::Enum(enumeration)) => {
+                if is_public_visibility(enumeration.visibility()) {
+                    push_enum_public_names(&mut public_name_ranges, &enumeration);
+                }
+            }
+            (
+                sai_driver::TopLevelOwnerKind::Distinct,
+                sai_syntax::ast::Item::Distinct(distinct),
+            ) => {
+                if is_public_visibility(distinct.visibility()) {
+                    push_name_range(
+                        &mut public_name_ranges,
+                        distinct.name().and_then(|name| name.token()),
+                    );
+                }
+            }
+            (
+                sai_driver::TopLevelOwnerKind::Resource,
+                sai_syntax::ast::Item::Resource(resource),
+            ) => {
+                if is_public_visibility(resource.visibility()) {
+                    push_name_range(
+                        &mut public_name_ranges,
+                        resource.name().and_then(|name| name.token()),
+                    );
+                }
+                if let Some(fields) = resource.fields() {
+                    for field in fields.fields().filter(|field| field.pub_token().is_some()) {
+                        push_name_range(
+                            &mut public_name_ranges,
+                            field.name().and_then(|name| name.token()),
+                        );
+                    }
+                }
+            }
+            (sai_driver::TopLevelOwnerKind::Const, sai_syntax::ast::Item::Const(constant)) => {
+                if is_public_visibility(constant.visibility()) {
+                    push_name_range(
+                        &mut public_name_ranges,
+                        constant.name().and_then(|name| name.token()),
+                    );
+                }
+            }
+            (sai_driver::TopLevelOwnerKind::Effect, sai_syntax::ast::Item::Effect(effect)) => {
+                if is_public_visibility(effect.visibility()) {
+                    push_name_range(
+                        &mut public_name_ranges,
+                        effect.name().and_then(|name| name.token()),
+                    );
+                }
+            }
+            (
+                sai_driver::TopLevelOwnerKind::Interface,
+                sai_syntax::ast::Item::Interface(interface),
+            ) => {
+                push_name_range(
+                    &mut public_name_ranges,
+                    interface.name().and_then(|name| name.token()),
+                );
+                if let Some(items) = interface.items() {
+                    for type_decl in items.types() {
+                        push_type_public_names(&mut public_name_ranges, &type_decl, true);
+                    }
+                    for enumeration in items.enums() {
+                        push_enum_public_names(&mut public_name_ranges, &enumeration);
+                    }
+                    for resource in items.iface_resources() {
+                        push_name_range(
+                            &mut public_name_ranges,
+                            resource.name().and_then(|name| name.token()),
+                        );
+                        if let Some(items) = resource.items() {
+                            for function in items.functions() {
+                                push_wit_function_public_names(&mut public_name_ranges, function);
+                            }
+                            for assoc_type in items.assoc_type_decls() {
+                                push_name_range(
+                                    &mut public_name_ranges,
+                                    assoc_type.name().and_then(|name| name.token()),
+                                );
+                            }
+                            for assoc_type in items.assoc_type_defs() {
+                                push_name_range(
+                                    &mut public_name_ranges,
+                                    assoc_type.name().and_then(|name| name.token()),
+                                );
+                            }
+                        }
+                    }
+                    for function in items
+                        .syntax()
+                        .children()
+                        .filter_map(sai_syntax::ast::FnDecl::cast)
+                    {
+                        push_wit_function_public_names(&mut public_name_ranges, function);
+                    }
+                }
+            }
+            (sai_driver::TopLevelOwnerKind::World, sai_syntax::ast::Item::World(world)) => {
+                push_name_range(
+                    &mut public_name_ranges,
+                    world.name().and_then(|name| name.token()),
+                );
+                if let Some(items) = world.items() {
+                    for type_decl in items.types() {
+                        push_type_public_names(&mut public_name_ranges, &type_decl, true);
+                    }
+                    for enumeration in items.enums() {
+                        push_enum_public_names(&mut public_name_ranges, &enumeration);
+                    }
+                    for world_item in items.world_imports() {
+                        push_world_item_public_names(
+                            &mut public_name_ranges,
+                            world_item.function(),
+                        );
+                    }
+                    for world_item in items.world_exports() {
+                        push_world_item_public_names(
+                            &mut public_name_ranges,
+                            world_item.function(),
+                        );
+                    }
+                }
+            }
+            (kind, _) => {
+                return Err(format!(
+                    "public-name owner {:?} has unexpected syntax for {kind:?}",
+                    descriptor.owner
+                ));
+            }
+        }
+
+        let Some(file_key) = database.file_key(descriptor.file) else {
+            return Err(format!(
+                "public-name owner {:?} has no source file key",
+                descriptor.owner
+            ));
+        };
+        let Some((display_path, source)) = source_by_key.get(file_key.path()) else {
+            return Err(format!(
+                "public-name source {} is missing from its package snapshot",
+                file_key.path()
+            ));
+        };
+        let decoded_source = SourceFile::decode(descriptor.file, source)
+            .map_err(|error| format!("public-name source decode failed: {error:?}"))?;
+        for range in public_name_ranges {
+            push_public_name_diagnostic(
+                &mut diagnostics,
+                source,
+                &decoded_source,
+                display_path,
+                package_identity,
+                include_source_lines,
+                range,
+            );
+        }
+    }
+
+    for module in &collection.scopes().modules {
+        for import in module.imports.iter().filter(|import| {
+            import.is_pub && import.item_index.is_some() && !import.inactive && !import.test_only
+        }) {
+            let Some(file_key) = database.file_key(import.name_span.file) else {
+                return Err("public re-export has no source file key".to_owned());
+            };
+            let Some((display_path, source)) = source_by_key.get(file_key.path()) else {
+                return Err(format!(
+                    "public re-export source {} is missing from its package snapshot",
+                    file_key.path()
+                ));
+            };
+            let decoded_source = SourceFile::decode(import.name_span.file, source)
+                .map_err(|error| format!("public re-export source decode failed: {error:?}"))?;
+            let range =
+                import.name_span.range.start().to_usize()..import.name_span.range.end().to_usize();
+            push_public_name_diagnostic(
+                &mut diagnostics,
+                source,
+                &decoded_source,
+                display_path,
+                package_identity,
+                include_source_lines,
+                range,
+            );
+        }
+    }
+
+    Ok(diagnostics)
+}
+
+fn is_public_visibility(visibility: Option<sai_syntax::ast::Visibility>) -> bool {
+    visibility.is_some_and(|visibility| {
+        visibility.pub_token().is_some() || visibility.export_token().is_some()
+    })
+}
+
+fn push_name_range(
+    ranges: &mut Vec<std::ops::Range<usize>>,
+    token: Option<sai_syntax::SyntaxToken>,
+) {
+    if let Some(token) = token {
+        ranges.push(token.text_range().start().to_usize()..token.text_range().end().to_usize());
+    }
+}
+
+fn push_type_public_names(
+    ranges: &mut Vec<std::ops::Range<usize>>,
+    type_decl: &sai_syntax::ast::TypeDecl,
+    include_all_fields: bool,
+) {
+    if include_all_fields || is_public_visibility(type_decl.visibility()) {
+        push_name_range(ranges, type_decl.name().and_then(|name| name.token()));
+    }
+    if let Some(fields) = type_decl
+        .struct_def()
+        .and_then(|definition| definition.fields())
+    {
+        for field in fields
+            .fields()
+            .filter(|field| include_all_fields || field.pub_token().is_some())
+        {
+            push_name_range(ranges, field.name().and_then(|name| name.token()));
+        }
+    }
+}
+
+fn push_enum_public_names(
+    ranges: &mut Vec<std::ops::Range<usize>>,
+    enumeration: &sai_syntax::ast::EnumDecl,
+) {
+    push_name_range(ranges, enumeration.name().and_then(|name| name.token()));
+    if let Some(variants) = enumeration.variants() {
+        for variant in variants.variants() {
+            push_name_range(ranges, variant.name().and_then(|name| name.token()));
+            if let Some(fields) = variant.record_shape() {
+                for field in fields.fields() {
+                    push_name_range(ranges, field.name().and_then(|name| name.token()));
+                }
+            }
+        }
+    }
+}
+
+fn push_world_item_public_names(
+    ranges: &mut Vec<std::ops::Range<usize>>,
+    function: Option<sai_syntax::ast::FnDecl>,
+) {
+    if let Some(function) = function {
+        push_wit_function_public_names(ranges, function);
+    }
+}
+
+fn push_wit_function_public_names(
+    ranges: &mut Vec<std::ops::Range<usize>>,
+    function: sai_syntax::ast::FnDecl,
+) {
+    push_name_range(ranges, function.name().and_then(|name| name.token()));
+    if let Some(params) = function.params() {
+        for param in params.params() {
+            push_name_range(ranges, param.name().and_then(|name| name.token()));
+        }
+    }
+}
+
+fn push_public_name_diagnostic(
+    diagnostics: &mut Vec<CheckDiagnostic>,
+    source: &Arc<[u8]>,
+    decoded_source: &SourceFile,
+    display_path: &str,
+    package_identity: &str,
+    include_source_lines: bool,
+    decoded_span: std::ops::Range<usize>,
+) {
+    if decoded_source
+        .text()
+        .get(decoded_span.clone())
+        .is_none_or(str::is_ascii)
+    {
+        return;
+    }
+    let source_span = decoded_source_range_to_original(Some(decoded_source), decoded_span);
+    let mut diagnostic = cli_source_diagnostic(
+        &mut CliSourceIndex::new(Arc::clone(source)),
+        FmtDiagnosticSource {
+            path: display_path,
+            include_source_line: include_source_lines,
+        },
+        "NON_ASCII_PUBLIC_NAME",
+        "non-ASCII character in a public name".to_owned(),
+        source_span,
+        None,
+        None,
+    );
+    diagnostic.primary_label = "public name must use ASCII characters".to_owned();
+    diagnostics.push(CheckDiagnostic {
+        diagnostic,
+        severity: sai_diagnostics::Severity::Error,
+        package: Some(package_identity.to_owned()),
+        related: Vec::new(),
+        children: Vec::new(),
+    });
 }
 
 fn check_target_override(command: &crate::args::ParsedCommand) -> Option<String> {
@@ -1914,6 +2585,27 @@ fn check_locked_mode(command: &crate::args::ParsedCommand) -> bool {
         .any(|(argument, _)| matches!(argument.to_str(), Some("--locked" | "--frozen")))
 }
 
+fn check_has_lint_overrides(command: &crate::args::ParsedCommand) -> bool {
+    for (argument, _) in command_tail(command) {
+        if argument == "--" {
+            break;
+        }
+        let Some(argument) = argument.to_str() else {
+            continue;
+        };
+        if matches!(
+            argument,
+            "--allow" | "--warn" | "--deny" | "--deny-warnings"
+        ) || ["--allow=", "--warn=", "--deny="]
+            .iter()
+            .any(|prefix| argument.starts_with(prefix))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn check_locked_lock_presence(
     package_root: &Path,
     cwd: &Path,
@@ -1922,8 +2614,11 @@ fn check_locked_lock_presence(
 ) -> CheckLockPresence {
     let lock_path = package_root.join("sai.lock");
     let display_path = fmt_path_reference(&lock_path, cwd, Some(package_root));
-    let selection =
-        crate::fmt_paths::select_fmt_paths(std::slice::from_ref(&lock_path), cwd, cancellation);
+    let selection = crate::fmt_paths::select_fmt_paths_for_check(
+        std::slice::from_ref(&lock_path),
+        cwd,
+        cancellation,
+    );
     if selection.interrupted || cancellation.is_cancelled() {
         return CheckLockPresence::Interrupted;
     }
@@ -1981,8 +2676,11 @@ fn check_locked_lock_file_only(
 
     let lock_path = package_root.join("sai.lock");
     let lock_display_path = fmt_path_reference(&lock_path, cwd, Some(package_root));
-    let selection =
-        crate::fmt_paths::select_fmt_paths(std::slice::from_ref(&lock_path), cwd, cancellation);
+    let selection = crate::fmt_paths::select_fmt_paths_for_check(
+        std::slice::from_ref(&lock_path),
+        cwd,
+        cancellation,
+    );
     if selection.interrupted || cancellation.is_cancelled() {
         return CheckLockLocalPreflight::Interrupted;
     }
@@ -2216,8 +2914,11 @@ fn check_locked_preflight(
 
     let lock_path = package_root.join("sai.lock");
     let lock_display_path = fmt_path_reference(&lock_path, cwd, Some(package_root));
-    let selection =
-        crate::fmt_paths::select_fmt_paths(std::slice::from_ref(&lock_path), cwd, cancellation);
+    let selection = crate::fmt_paths::select_fmt_paths_for_check(
+        std::slice::from_ref(&lock_path),
+        cwd,
+        cancellation,
+    );
     if selection.interrupted || cancellation.is_cancelled() {
         return CheckLockPreflight::Interrupted;
     }
@@ -4598,6 +5299,30 @@ struct CheckModuleTreePackageInput {
     analyzes_tests: bool,
 }
 
+struct CheckWorkspaceDiagnostics {
+    diagnostics: Vec<CheckDiagnostic>,
+    errors: usize,
+    warnings: usize,
+    infos: usize,
+    root_coverage: CheckRootCoverage,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CheckRootCoverage {
+    empty_root_module_only_covered: bool,
+    public_primitive_const_set_covered: bool,
+    single_public_function_body_covered: bool,
+}
+
+struct CheckSuccessRecord {
+    target: String,
+    profile: String,
+    tests: bool,
+    packages: usize,
+    fixes_applied: usize,
+    changed_files: Vec<String>,
+}
+
 struct MissingSourceModuleTreeInput<'a> {
     package_key: &'a str,
     source_directory: &'a str,
@@ -4872,22 +5597,88 @@ fn module_tree_workspace_check_diagnostics(
     include_source_lines: bool,
     target_cfg: Option<&TargetCfg>,
     package_graph: Option<sai_driver::package_graph::PackageGraph>,
-) -> Result<(Vec<CheckDiagnostic>, usize, usize, usize), String> {
+) -> Result<CheckWorkspaceDiagnostics, String> {
     let workspace_limits = CheckWorkspaceSourceBudget::default().snapshot_limits();
     if check_module_tree_workspace_exceeds_limits(inputs, workspace_limits)
         && let Some(input) = inputs.first()
     {
-        return Ok((
-            vec![check_dependency_source_error(
+        return Ok(CheckWorkspaceDiagnostics {
+            diagnostics: vec![check_dependency_source_error(
                 "IMPLEMENTATION_LIMIT_EXCEEDED",
                 "combined root and active dependency sources exceed the supported workspace snapshot limits",
                 &input.package_identity,
             )],
-            1,
-            0,
-            0,
-        ));
+            errors: 1,
+            warnings: 0,
+            infos: 0,
+            root_coverage: CheckRootCoverage::default(),
+        });
     }
+    let mut empty_root_module_only_covered = inputs.len() == 1
+        && inputs[0].is_root_package
+        && !inputs[0].analyzes_tests
+        && !inputs[0].inspection_incomplete
+        && inputs[0].source_directory_exists
+        && inputs[0].source_inputs.len() == 1
+        && package_manifests.len() == 1
+        && package_manifests[0].role == sai_package::manifest::PackageRole::Root
+        && wit_packages.is_empty()
+        && package_graph.is_none()
+        && target_cfg.is_some()
+        && inputs[0]
+            .source_inputs
+            .first()
+            .is_some_and(|(path, _, source)| {
+                let root_source_path = if inputs[0].source_directory == "." {
+                    "lib.sai".to_owned()
+                } else {
+                    format!("{}/lib.sai", inputs[0].source_directory)
+                };
+                path == &root_source_path && source.is_empty()
+            });
+    let root_const_input_shape = inputs.len() == 1
+        && inputs[0].is_root_package
+        && !inputs[0].analyzes_tests
+        && !inputs[0].inspection_incomplete
+        && inputs[0].source_directory_exists
+        && inputs[0].source_inputs.len() == 1
+        && package_manifests.len() == 1
+        && package_manifests[0].role == sai_package::manifest::PackageRole::Root
+        && wit_packages.is_empty()
+        && package_graph.is_none()
+        && target_cfg.is_some();
+    let root_const_source_count = if root_const_input_shape {
+        let root_source_path = if inputs[0].source_directory == "." {
+            "lib.sai".to_owned()
+        } else {
+            format!("{}/lib.sai", inputs[0].source_directory)
+        };
+        inputs[0]
+            .source_inputs
+            .first()
+            .and_then(|(path, _, source)| {
+                (path == &root_source_path)
+                    .then(|| check_source_is_unattributed_public_const_set(source.as_ref()))
+                    .flatten()
+            })
+    } else {
+        None
+    };
+    let root_single_function_source_candidate = root_const_input_shape
+        && inputs[0]
+            .source_inputs
+            .first()
+            .is_some_and(|(path, _, source)| {
+                let root_source_path = if inputs[0].source_directory == "." {
+                    "lib.sai".to_owned()
+                } else {
+                    format!("{}/lib.sai", inputs[0].source_directory)
+                };
+                path == &root_source_path
+                    && check_source_is_single_unattributed_public_function(source.as_ref())
+            });
+    let mut public_primitive_const_set_covered = false;
+    let mut single_public_function_body_covered = false;
     let mut database = RootDatabase::new()
         .map_err(|error| format!("could not initialize query database: {error:?}"))?;
     let package_graph_for_scopes = package_graph.clone();
@@ -5000,6 +5791,11 @@ fn module_tree_workspace_check_diagnostics(
         let module_tree = database
             .module_tree(*package_id, source_directory.clone(), Some(package_field))
             .map_err(|error| format!("module-tree query failed: {error:?}"))?;
+        if input.is_root_package
+            && (module_tree.modules.len() != 1 || !module_tree.diagnostics.is_empty())
+        {
+            empty_root_module_only_covered = false;
+        }
 
         let mut source_by_key = HashMap::new();
         source_by_key.insert(
@@ -5090,6 +5886,9 @@ fn module_tree_workspace_check_diagnostics(
         }
     }
     let has_source_files = !workspace_files.is_empty();
+    if complete_packages.len() != 1 || !complete_packages.first().copied().unwrap_or(false) {
+        empty_root_module_only_covered = false;
+    }
     workspace_files.extend(manifest_snapshot_files);
     let workspace_snapshot = if workspace_files.is_empty() {
         None
@@ -5359,6 +6158,15 @@ fn module_tree_workspace_check_diagnostics(
             }
             .map_err(|error| format!("Phase 1 collection failed: {error:?}"))?;
             let phase1 = collection.scopes();
+            if input.is_root_package
+                && (!phase1.top_level_owners.is_empty()
+                    || phase1
+                        .modules
+                        .iter()
+                        .any(|module| !module.imports.is_empty()))
+            {
+                empty_root_module_only_covered = false;
+            }
             let (phase1_diagnostics, phase1_errors, phase1_warnings, phase1_infos) =
                 phase1_check_diagnostics(
                     &phase1.diagnostics,
@@ -5370,6 +6178,18 @@ fn module_tree_workspace_check_diagnostics(
             errors = errors.saturating_add(phase1_errors);
             warnings = warnings.saturating_add(phase1_warnings);
             infos = infos.saturating_add(phase1_infos);
+
+            let public_name_diagnostics = active_public_name_diagnostics(
+                &mut database,
+                &collection,
+                &workspace_snapshot,
+                source_by_key,
+                &input.package_identity,
+                include_source_lines,
+            )
+            .map_err(|error| format!("public-name analysis failed: {error}"))?;
+            errors = errors.saturating_add(public_name_diagnostics.len());
+            diagnostics.extend(public_name_diagnostics);
 
             let package_analysis_diagnostics = collection
                 .package_wit_names()
@@ -5390,6 +6210,100 @@ fn module_tree_workspace_check_diagnostics(
             errors = errors.saturating_add(package_errors);
             warnings = warnings.saturating_add(package_warnings);
             infos = infos.saturating_add(package_infos);
+
+            if package_graph_for_scopes.is_none() && input.is_root_package {
+                let const_resolutions = database
+                    .resolve_const_owner_paths(&collection, module_tree, &workspace_snapshot)
+                    .map_err(|error| format!("const owner analysis failed: {error:?}"))?;
+                let mut literal_diagnostics = Vec::new();
+                for owner in const_resolutions.owners() {
+                    match owner.literal_check() {
+                        Ok(literal_check) => {
+                            literal_diagnostics.extend(literal_check.diagnostics().iter().cloned())
+                        }
+                        Err(error) => {
+                            diagnostics.push(check_diagnostic_with_package(
+                                check_internal_diagnostic(
+                                    &format!("const literal check failed: {error:?}"),
+                                    None,
+                                ),
+                                Some(&input.package_identity),
+                            ));
+                            errors = errors.saturating_add(1);
+                        }
+                    }
+                }
+                let (literal_diagnostics, literal_errors, literal_warnings, literal_infos) =
+                    phase1_check_diagnostics(
+                        &literal_diagnostics,
+                        &workspace_source_by_key,
+                        &input.package_identity,
+                        include_source_lines,
+                    );
+                diagnostics.extend(literal_diagnostics);
+                errors = errors.saturating_add(literal_errors);
+                warnings = warnings.saturating_add(literal_warnings);
+                infos = infos.saturating_add(literal_infos);
+
+                if root_const_source_count.is_some_and(|source_count| {
+                    check_public_primitive_const_set_coverage(
+                        source_count,
+                        collection.scopes(),
+                        &const_resolutions,
+                    )
+                }) {
+                    public_primitive_const_set_covered = true;
+                }
+
+                if root_single_function_source_candidate {
+                    let function_resolutions = database
+                        .resolve_function_owner_analyses(
+                            &collection,
+                            module_tree,
+                            &workspace_snapshot,
+                        )
+                        .map_err(|error| format!("function owner analysis failed: {error:?}"))?;
+                    let mut body_diagnostics = Vec::new();
+                    for owner in function_resolutions.owners() {
+                        match owner.body_type_check() {
+                            Ok(body_check) => {
+                                body_diagnostics.extend(body_check.diagnostics().iter().cloned())
+                            }
+                            Err(error) => {
+                                diagnostics.push(check_diagnostic_with_package(
+                                    check_internal_diagnostic(
+                                        &format!("function body type check failed: {error:?}"),
+                                        None,
+                                    ),
+                                    Some(&input.package_identity),
+                                ));
+                                errors = errors.saturating_add(1);
+                            }
+                        }
+                    }
+                    let (body_diagnostics, body_errors, body_warnings, body_infos) =
+                        phase1_check_diagnostics(
+                            &body_diagnostics,
+                            &workspace_source_by_key,
+                            &input.package_identity,
+                            include_source_lines,
+                        );
+                    diagnostics.extend(body_diagnostics);
+                    errors = errors.saturating_add(body_errors);
+                    warnings = warnings.saturating_add(body_warnings);
+                    infos = infos.saturating_add(body_infos);
+
+                    if root_single_function_source_candidate
+                        && check_public_function_body_coverage(
+                            true,
+                            collection.scopes(),
+                            &function_resolutions,
+                        )
+                    {
+                        single_public_function_body_covered = true;
+                    }
+                }
+            }
 
             if let Some(graph) = package_graph_for_scopes.as_ref()
                 && graph.node(&package_key).is_some()
@@ -5675,6 +6589,21 @@ fn module_tree_workspace_check_diagnostics(
                             errors = errors.saturating_add(1);
                         }
                     }
+                    match owner.literal_check() {
+                        Ok(literal_check) => {
+                            owner_diagnostics.extend(literal_check.diagnostics().iter().cloned())
+                        }
+                        Err(error) => {
+                            diagnostics.push(check_diagnostic_with_package(
+                                check_internal_diagnostic(
+                                    &format!("const literal check failed: {error:?}"),
+                                    None,
+                                ),
+                                Some(&input.package_identity),
+                            ));
+                            errors = errors.saturating_add(1);
+                        }
+                    }
                 }
                 for owner in invariant_resolutions
                     .owners()
@@ -5948,7 +6877,17 @@ fn module_tree_workspace_check_diagnostics(
             }
         }
     }
-    Ok((diagnostics, errors, warnings, infos))
+    Ok(CheckWorkspaceDiagnostics {
+        diagnostics,
+        errors,
+        warnings,
+        infos,
+        root_coverage: CheckRootCoverage {
+            empty_root_module_only_covered,
+            public_primitive_const_set_covered,
+            single_public_function_body_covered,
+        },
+    })
 }
 
 fn active_source_member_packages_for(
@@ -6186,15 +7125,16 @@ fn push_module_tree_check_result(
     total_error_count: &mut usize,
     total_warning_count: &mut usize,
     total_info_count: &mut usize,
-    result: Result<(Vec<CheckDiagnostic>, usize, usize, usize), String>,
+    result: Result<CheckWorkspaceDiagnostics, String>,
     package_identity: Option<&str>,
-) {
+) -> CheckRootCoverage {
     match result {
-        Ok((tree_diagnostics, errors, warnings, infos)) => {
-            diagnostics.extend(tree_diagnostics);
-            *total_error_count = total_error_count.saturating_add(errors);
-            *total_warning_count = total_warning_count.saturating_add(warnings);
-            *total_info_count = total_info_count.saturating_add(infos);
+        Ok(result) => {
+            diagnostics.extend(result.diagnostics);
+            *total_error_count = total_error_count.saturating_add(result.errors);
+            *total_warning_count = total_warning_count.saturating_add(result.warnings);
+            *total_info_count = total_info_count.saturating_add(result.infos);
+            result.root_coverage
         }
         Err(error) => {
             diagnostics.push(check_diagnostic_with_package(
@@ -6205,6 +7145,7 @@ fn push_module_tree_check_result(
                 package_identity,
             ));
             *total_error_count = total_error_count.saturating_add(1);
+            CheckRootCoverage::default()
         }
     }
 }
@@ -6323,6 +7264,75 @@ fn package_manifest_check_diagnostics(
             .saturating_add(parsed.error_count()),
         parsed.warnings().len(),
     )
+}
+
+fn package_validation_check_diagnostics(
+    source: &Arc<[u8]>,
+    source_path: &str,
+    validation: &sai_package::validation::PackageValidationOutput,
+    package_identity: Option<&str>,
+    include_source_lines: bool,
+) -> (Vec<CheckDiagnostic>, usize, usize) {
+    let mut source_index = CliSourceIndex::new(Arc::clone(source));
+    let mut diagnostics = Vec::with_capacity(validation.errors.len() + validation.warnings.len());
+    let mut errors = 0usize;
+    let mut warnings = 0usize;
+    for error in &validation.errors {
+        let (code, message) = check_package_validation_fields(&error.kind);
+        diagnostics.push(CheckDiagnostic {
+            diagnostic: cli_source_diagnostic(
+                &mut source_index,
+                FmtDiagnosticSource {
+                    path: source_path,
+                    include_source_line: include_source_lines,
+                },
+                code,
+                message,
+                error.span.clone(),
+                None,
+                None,
+            ),
+            severity: sai_diagnostics::Severity::Error,
+            package: package_identity.map(str::to_owned),
+            related: Vec::new(),
+            children: Vec::new(),
+        });
+        errors = errors.saturating_add(1);
+    }
+    for warning in &validation.warnings {
+        let (code, message) = match warning.kind {
+            sai_package::validation::PackageValidationWarningKind::VersionRequirementSpansLines => {
+                (
+                    "VERSION_REQ_SPANS_LINES",
+                    "package version requirement admits stable versions outside its compatibility line",
+                )
+            }
+            sai_package::validation::PackageValidationWarningKind::InvalidLicenseExpression => (
+                "INVALID_LICENSE_EXPRESSION",
+                "`license` is not a valid SPDX expression",
+            ),
+        };
+        diagnostics.push(CheckDiagnostic {
+            diagnostic: cli_source_diagnostic(
+                &mut source_index,
+                FmtDiagnosticSource {
+                    path: source_path,
+                    include_source_line: include_source_lines,
+                },
+                code,
+                message.to_owned(),
+                warning.span.clone(),
+                None,
+                None,
+            ),
+            severity: sai_diagnostics::Severity::Warning,
+            package: package_identity.map(str::to_owned),
+            related: Vec::new(),
+            children: Vec::new(),
+        });
+        warnings = warnings.saturating_add(1);
+    }
+    (diagnostics, errors, warnings)
 }
 
 fn check_source_diagnostics(
@@ -6484,11 +7494,35 @@ fn check_incomplete_diagnostic(command: &crate::args::ParsedCommand) -> CheckDia
 
 fn report_check_diagnostics(
     parsed: &ParsedArgs,
+    diagnostics: Vec<CheckDiagnostic>,
+    total_error_count: usize,
+    total_warning_count: usize,
+    total_info_count: usize,
+    root_identity: Option<&str>,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> i32 {
+    report_check_outcome(
+        parsed,
+        diagnostics,
+        total_error_count,
+        total_warning_count,
+        total_info_count,
+        root_identity,
+        None,
+        stdout,
+        stderr,
+    )
+}
+
+fn report_check_outcome(
+    parsed: &ParsedArgs,
     mut diagnostics: Vec<CheckDiagnostic>,
     total_error_count: usize,
     total_warning_count: usize,
     total_info_count: usize,
     root_identity: Option<&str>,
+    result_record: Option<&CheckSuccessRecord>,
     stdout: &mut impl Write,
     stderr: &mut impl Write,
 ) -> i32 {
@@ -6517,6 +7551,8 @@ fn report_check_diagnostics(
         .any(|diagnostic| diagnostic.diagnostic.code == "NO_PACKAGE_FOUND")
     {
         2
+    } else if result_record.is_some() && total_error_count == 0 {
+        0
     } else {
         1
     };
@@ -6572,6 +7608,9 @@ fn report_check_diagnostics(
             let result = (|| -> io::Result<()> {
                 write_json_check_header(stdout, root_identity)?;
                 write_json_check_diagnostic_records(stdout, &diagnostics)?;
+                if let Some(result_record) = result_record {
+                    write_json_check_success(stdout, result_record)?;
+                }
                 writeln!(
                     stdout,
                     "{{\"type\":\"summary\",\"errors\":{},\"warnings\":{},\"infos\":{},\"shown_errors\":{},\"suppressed\":{{\"cascade\":0,\"duplicate\":0,\"dependency\":0}},\"exit_code\":{exit_code}}}",
@@ -6735,6 +7774,22 @@ fn write_json_check_diagnostic_records(
         )?;
     }
     Ok(())
+}
+
+fn write_json_check_success(
+    writer: &mut impl Write,
+    result: &CheckSuccessRecord,
+) -> io::Result<()> {
+    writeln!(
+        writer,
+        "{{\"type\":\"result\",\"kind\":\"check\",\"data\":{{\"target\":\"{}\",\"profile\":\"{}\",\"tests\":{},\"packages\":{},\"fixes_applied\":{},\"changed_files\":{}}}}}",
+        escape_json(&result.target),
+        escape_json(&result.profile),
+        result.tests,
+        result.packages,
+        result.fixes_applied,
+        json_string_array(&result.changed_files)
+    )
 }
 
 fn run_fmt(
@@ -8004,7 +9059,13 @@ fn run_fmt_paths_for_inputs(
         .and_then(|signature| signature.root.as_deref())
         .map(|root| fmt_workspace_diagnostic_base(root, &cwd, parsed.globals.format));
     let mut selection = if workspace_discovery_signature.is_some() {
-        crate::fmt_paths::select_fmt_workspace_paths(input_paths, &cwd, cancellation)
+        if check {
+            crate::fmt_paths::select_fmt_workspace_paths_for_check(input_paths, &cwd, cancellation)
+        } else {
+            crate::fmt_paths::select_fmt_workspace_paths(input_paths, &cwd, cancellation)
+        }
+    } else if check {
+        crate::fmt_paths::select_fmt_paths_for_check(input_paths, &cwd, cancellation)
     } else {
         crate::fmt_paths::select_fmt_paths(input_paths, &cwd, cancellation)
     };
@@ -8523,6 +9584,11 @@ fn run_fmt_paths_for_inputs(
                     if cancellation.is_cancelled() {
                         return report_interrupted(parsed, stdout, stderr);
                     }
+                    // The atomic writer reopens the selected destination and
+                    // verifies its identity and bytes immediately before
+                    // replacement. Release the manifest's selection guard so
+                    // Windows can replace that destination.
+                    drop(file.identity_guard.take());
                     match write_file_atomically_in_directory(
                         file.parent
                             .as_deref()
@@ -8847,7 +9913,10 @@ fn write_file_atomically_in_directory(
             options.mode(0o600);
         }
         let temporary_parent = parent.try_clone().map_err(|source| AtomicFmtWriteError {
-            source,
+            source: contextual_atomic_fmt_write_error(
+                source,
+                "could not retain the formatter directory capability",
+            ),
             installed: false,
         })?;
         let mut temporary_file = match parent.open_with(&temporary_name, &options) {
@@ -8855,7 +9924,10 @@ fn write_file_atomically_in_directory(
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(source) => {
                 return Err(AtomicFmtWriteError {
-                    source,
+                    source: contextual_atomic_fmt_write_error(
+                        source,
+                        "could not create the formatter temporary file",
+                    ),
                     installed: false,
                 });
             }
@@ -8868,26 +9940,38 @@ fn write_file_atomically_in_directory(
         temporary_file
             .write_all(contents)
             .map_err(|source| AtomicFmtWriteError {
-                source,
+                source: contextual_atomic_fmt_write_error(
+                    source,
+                    "could not write the formatter temporary file",
+                ),
                 installed: false,
             })?;
         temporary_file
             .set_permissions(permissions.clone())
             .map_err(|source| AtomicFmtWriteError {
-                source,
+                source: contextual_atomic_fmt_write_error(
+                    source,
+                    "could not copy permissions to the formatter temporary file",
+                ),
                 installed: false,
             })?;
         temporary_file
             .sync_all()
             .map_err(|source| AtomicFmtWriteError {
-                source,
+                source: contextual_atomic_fmt_write_error(
+                    source,
+                    "could not sync the formatter temporary file",
+                ),
                 installed: false,
             })?;
         drop(temporary_file);
         let parent_handle = parent
             .try_clone()
             .map_err(|source| AtomicFmtWriteError {
-                source,
+                source: contextual_atomic_fmt_write_error(
+                    source,
+                    "could not retain the formatter directory capability",
+                ),
                 installed: false,
             })?
             .into_std_file();
@@ -8899,12 +9983,18 @@ fn write_file_atomically_in_directory(
             expected_contents,
         )
         .map_err(|source| AtomicFmtWriteError {
-            source,
+            source: contextual_atomic_fmt_write_error(
+                source,
+                "could not atomically replace the formatted file",
+            ),
             installed: false,
         })?;
         temporary.published = true;
         sync_fmt_parent_directory(parent).map_err(|source| AtomicFmtWriteError {
-            source,
+            source: contextual_atomic_fmt_write_error(
+                source,
+                "could not sync the formatter directory",
+            ),
             installed: true,
         })?;
         return Ok(());
@@ -8916,6 +10006,10 @@ fn write_file_atomically_in_directory(
         ),
         installed: false,
     })
+}
+
+fn contextual_atomic_fmt_write_error(source: io::Error, context: &str) -> io::Error {
+    io::Error::new(source.kind(), format!("{context}: {source}"))
 }
 
 struct TemporaryFmtFile {
@@ -12592,6 +13686,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn dependency_snapshot_limit_stops_before_scanning_later_packages() {
         let temporary = TestDirectory::new();
         let first_path = temporary.child("first");
@@ -13492,9 +14590,20 @@ mod tests {
         let lines = stderr.lines().collect::<Vec<_>>();
         assert_eq!(lines.len(), 3);
         assert!(lines[0].starts_with("wrote "));
-        assert!(lines[0].contains("/image/sai.package ("));
-        assert!(lines[1].contains("/image/.gitignore ("));
-        assert!(lines[2].contains("/image/src/lib.sai ("));
+        let written_paths = lines
+            .iter()
+            .map(|line| {
+                line.strip_prefix("wrote ")
+                    .expect("new-package output has a path")
+                    .split_once(" (")
+                    .expect("new-package output has a byte count")
+                    .0
+                    .replace('\\', "/")
+            })
+            .collect::<Vec<_>>();
+        assert!(written_paths[0].ends_with("image/sai.package"));
+        assert!(written_paths[1].ends_with("image/.gitignore"));
+        assert!(written_paths[2].ends_with("image/src/lib.sai"));
         assert!(lines.iter().all(|line| !line.starts_with("wrote /")));
         assert_eq!(
             fs::read_to_string(temporary.child("image/sai.package"))
@@ -13898,6 +15007,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_validates_active_local_path_dependency_offline() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -13945,6 +15058,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_reports_compiler_mismatch_for_an_active_dependency() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -14004,6 +15121,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_reports_contract_mismatch_before_active_dependency_compiler_mismatch() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -14067,6 +15188,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_does_not_gate_inactive_dependency_compiler_compatibility() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -14118,6 +15243,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_compares_inactive_path_pinned_dependency_contracts() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -14230,6 +15359,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_classifies_a_changed_local_lock_floor_as_out_of_date() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -14284,6 +15417,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_rejects_an_artifact_only_allocator_package() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -14333,6 +15470,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     fn check_locked_rejects_use_artifact_on_a_source_only_package() {
         let temporary = TestDirectory::new();
         let package = create_check_package(&temporary);
@@ -15688,6 +16829,8 @@ mod tests {
         assert_eq!(exit_code, 1);
         assert!(stderr.is_empty());
         assert!(stdout.contains("\"code\":\"MISSING_ROOT_MODULE\""));
+        assert!(stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""));
+        assert!(!stdout.contains("\"type\":\"result\""));
         assert_eq!(
             stdout.matches("\"code\":\"MISSING_ROOT_MODULE\"").count(),
             1
@@ -17006,7 +18149,7 @@ mod tests {
         assert_eq!(exit_code, 0);
         assert!(stdout.is_empty());
         assert!(stderr.starts_with("formatted "));
-        assert!(stderr.ends_with("/sai.package\n"));
+        assert!(stderr.replace('\\', "/").ends_with("/sai.package\n"));
 
         fs::write(
             directory.child("sai.package"),
@@ -17108,6 +18251,20 @@ mod tests {
         assert_eq!(selected_contents, b"selected bytes");
         assert_eq!(fs::read(manifest).unwrap(), b"replacement bytes");
         assert!(file.identity_guard.is_some());
+    }
+
+    #[test]
+    fn formatter_atomic_write_context_preserves_io_error_kind() {
+        let error = super::contextual_atomic_fmt_write_error(
+            io::Error::new(io::ErrorKind::PermissionDenied, "access denied"),
+            "could not create the formatter temporary file",
+        );
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            error.to_string(),
+            "could not create the formatter temporary file: access denied"
+        );
     }
 
     #[test]
@@ -18697,19 +19854,30 @@ mod tests {
 
     #[test]
     fn human_paths_are_relative_and_use_forward_slashes() {
-        assert_eq!(
-            relative_path(
-                Path::new("/workspace/project"),
-                Path::new("/workspace/project/a/b")
-            ),
-            Some(PathBuf::from("a/b"))
+        #[cfg(windows)]
+        let (project, external) = (
+            PathBuf::from(r"C:\workspace\project"),
+            PathBuf::from(r"C:\tmp\image\lib.sai"),
+        );
+        #[cfg(not(windows))]
+        let (project, external) = (
+            PathBuf::from("/workspace/project"),
+            PathBuf::from("/tmp/image/lib.sai"),
         );
         assert_eq!(
-            relative_path(
-                Path::new("/workspace/project/src"),
-                Path::new("/tmp/image/lib.sai")
-            ),
-            Some(PathBuf::from("../../../tmp/image/lib.sai"))
+            relative_path(&project, &project.join("a").join("b")),
+            Some(PathBuf::from("a").join("b"))
+        );
+        assert_eq!(
+            relative_path(&project.join("src"), &external),
+            Some(
+                PathBuf::from("..")
+                    .join("..")
+                    .join("..")
+                    .join("tmp")
+                    .join("image")
+                    .join("lib.sai")
+            )
         );
         assert_eq!(
             human_file_path("image/./src/../sai.package"),

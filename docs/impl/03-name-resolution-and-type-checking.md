@@ -1910,6 +1910,26 @@ The hint passed down is the expected type with every variable shallow-resolved. 
 - `Byte` literals, `Char` literals, `Bool`, `Str` literals (type `Str` with `Region::Static`), byte strings (`Slice<Byte>`, static) follow spec/06 §6.3.3.
 - Range checks (`LITERAL_OUT_OF_RANGE`, spec/02) are done when the literal's type is known: immediately if it was known at the literal, otherwise after end-of-body defaulting (spec/05 §5.16.5 step 3). A literal whose value did not fit in `u128` ([impl/02](02-frontend-ast-hir.md) `value: None`) is always out of range.
 
+**Current Stage 0 implementation slice (IR-750).** The reusable semantic kernel in `sai_ty::typeck::literal` checks one already-resolved scalar primitive type against a direct HIR literal:
+
+```rust
+pub enum PrimitiveLiteralResult {
+    Match,
+    TypeMismatch,
+    OutOfRange,
+}
+pub fn check_primitive_literal(
+    expected: PrimTy,
+    literal: sai_hir::literals::Lit<'_>,
+    symbols: &Interner,
+    pointer_width: u8,
+) -> PrimitiveLiteralResult;
+```
+
+The kernel accepts only the exact kind/type pairs: `Bool`, `Char`, and `Byte` literals with their corresponding primitive; integer literals with an integer primitive; and floating-point literals with `F32` or `F64`. It checks signed and unsigned integer bounds, including the direct negative-literal boundary and the explicitly supplied target width for `ISize` and `USize`. It resolves interned decimal float text through the interner and parses directly at the expected width, preserving IEEE 754 roundTiesToEven rounding. A failed parse or a rounded non-finite value returns `OutOfRange`; a nonzero float that rounds to zero remains accepted. The `TypeMismatch` result covers other literal kinds.
+
+The driver remains responsible for resolving the expected type, selecting `pointer_width` from the current target, and constructing diagnostics using the expression span, owner, and `WorkspaceSnapshot`. It also retains canonical `Str` and unit handling outside this kernel, and turns `OutOfRange` into the existing integer or floating-point range diagnostic based on the HIR literal kind. The kernel is reused by the existing direct-literal checks, but this slice does not implement expression inference, literal variables, defaulting, coercions, `TypeckResults`, or general `typeck(owner)`. Those remain governed by the complete design above, including the end-of-body order below; implementing this leaf operation does not claim full Stage 0 type checking.
+
 **End of body** (N-E-30). After the last expression of the owner, `typeck` runs, in order: `select_where_possible()`; defaulting of every remaining `ι` to `I64` and `φ` to `F64`, in creation order; `select_where_possible()` again; capture analysis and the closure kinds of every closure of the owner (§3.11.2, §3.11.3), which resolves the stalled `ClosureKind` goals and cannot bind any type variable; `select_where_possible()` once more; the literal range checks; the reports of `as` casts (§3.10.3); `select_all_or_error()`; and finally the report of every remaining `α` or `κ` (spec/05 §5.16.5 step 4): one `TYPE_ANNOTATIONS_NEEDED` per variable, at the leftmost expression whose recorded type mentions it, skipping variables unioned with a variable already reported. The fix inserts a type annotation on the `let` that introduced the variable, or explicit generic arguments on the path whose omitted argument created it, depending on the variable's origin.
 
 ### 3.7.7 Paths and implicit members
@@ -1934,6 +1954,10 @@ An **implicit member** `.V` ([impl/02](02-frontend-ast-hir.md) `ExprKind::Implic
 - **Compound assignment** `p op= e` follows spec/06 §6.13.2: built-in when both sides are primitive numeric types accepted by the operator (§3.10.1), otherwise the `…Assign` trait of the operator, with the left side in a mutable place context. The result is recorded as `OpRes` (§3.10.1).
 - **`assert c, m`** checks `c` against `Bool` and `m` (if present) against `Str` or `String`: `m` is synthesized, `structurally_resolve`d, and must be `Str` or `String` (`TYPE_MISMATCH` naming both). An `assert` in a const initializer is `NOT_CONST_EXPRESSION`.
 - **Expression statements** are checked with no expectation. The discarded-value rules of spec/06 §6.25.2 are applied after the end-of-body processing, on resolved types: `UNUSED_MUST_USE` for a `@must_use` type or a call of a `@must_use` function, else `STATEMENT_HAS_NO_EFFECT` for a side-effect-free expression by the syntactic list of spec/06 §6.25.2. A statement beginning with an implicit member gets `IMPLICIT_MEMBER_NEEDS_TYPE` through the absent expectation.
+
+**Current Stage 0 body-checking slice (IR-751).** As an initial compositional body-checking step, accept a non-generic, safe, synchronous function with no parameters whose body consists of exactly one immutable, single-name `let name: T = literal` statement followed by a tail path that resolves by `BindingId` to that binding. The binding name and tail-read spelling must be plain ASCII identifiers, and the binding name must not trigger the current function-name convention gate; names that could trigger `NAMING_CONVENTION`, non-ASCII names, and raw identifiers remain gated because the general lint checks are unavailable. The annotation and function return type must each resolve directly to a supported primitive type, and the initializer must be a direct scalar primitive literal. Check the initializer against the annotation using the primitive-literal semantics of §3.7.6, give the binding that annotated type, and check the tail read against the function return type. This exercises one source-ordered statement, an explicit expected type, and a resolved local read. It does not implement unannotated-local inference, general patterns, computed expressions, nested blocks, or general `typeck(owner)`.
+
+This slice gates `var`, `let`-`else`, tuple, refutable or multi-binding patterns, multiple statements or local bindings, non-literal initializers, non-local or computed tails, function parameters, generic functions, aliases, refined and distinct types, and every other unsupported body shape. Existing direct-literal and bounded conditional body slices remain separate; this entry does not claim complete Stage 0 type checking.
 
 **Divergence.** `FnCtxt::diverges` tracks spec/06 §6.26: when a subexpression's synthesized type is `Never`, the flag becomes `Always { span }`. Before checking the next operand of the enclosing expression, or the next statement of the enclosing block, the checker tests the flag; if it is `Always`, the warning `UNREACHABLE_CODE` is reported on that operand or statement, the flag becomes `WarnedAlways` (so it is reported once per diverging expression), and the operand's or statement's `HirId` is appended to `TypeckResults::unreachable` (N-E-29). Unreachable code is checked normally. The flag is saved and restored around branches: an `if` diverges only if both branches do, a `match` only if every arm does (or it has no arms), a loop only if it is a `loop` without a `break` to it.
 

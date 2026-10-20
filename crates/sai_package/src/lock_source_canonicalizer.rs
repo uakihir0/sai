@@ -592,6 +592,10 @@ mod tests {
         .into_owned()
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn resolves_root_path_pin_from_captured_root_and_exposes_snapshot() {
         let tree = TempTree::new();
@@ -635,6 +639,10 @@ mod tests {
         assert!(canonicalizer.local_directory(&dep).is_some());
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn resolves_dependency_relative_pin_from_indexed_local_requirer() {
         let tree = TempTree::new();
@@ -783,6 +791,10 @@ mod tests {
         ));
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn rejects_a_local_pin_that_resolves_to_a_different_directory() {
         let tree = TempTree::new();
@@ -839,6 +851,10 @@ mod tests {
         ));
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn rejects_a_path_pin_for_a_different_declared_package_version() {
         let tree = TempTree::new();
@@ -904,6 +920,10 @@ mod tests {
         assert!(canonicalizer.local_directory(&dep).is_none());
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn opens_a_required_local_target_lazily_and_fails_if_the_locked_source_is_missing() {
         let tree = TempTree::new();

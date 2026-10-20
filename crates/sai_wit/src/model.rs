@@ -496,7 +496,7 @@ pub struct WitWorld {
     pub exports: Vec<WitWorldItem>,
     /// Included worlds in source or generation order.
     pub includes: Vec<WitWorldRef>,
-    /// The source or generation order interleaving `imports` and `exports`.
+    /// The source or generation order interleaving imports, exports, and includes.
     ///
     /// Each entry points into the corresponding vector. An empty vector is
     /// accepted for hand-built models and prints imports followed by exports.
@@ -511,6 +511,8 @@ pub struct WitWorld {
 pub enum WitWorldItem {
     Interface {
         reference: WitIfaceRef,
+        /// Documentation attached to this world interface import or export.
+        docs: Option<Arc<str>>,
         since: Option<WitStabilityVersion>,
         deprecated: Option<WitStabilityVersion>,
         /// Source range of this `import` or `export` item when it came from
@@ -519,6 +521,8 @@ pub enum WitWorldItem {
     },
     Func {
         name: String,
+        /// Documentation attached to this world function.
+        docs: Option<Arc<str>>,
         func: WitFunc,
         unsupported: Option<Unsupported>,
         since: Option<WitStabilityVersion>,
@@ -576,6 +580,8 @@ pub struct WitWorldRef {
     pub name: String,
     /// Names renamed by a WIT `include ... with { ... }` declaration.
     pub names: Vec<(String, String)>,
+    /// Documentation attached to the WIT `include` declaration.
+    pub docs: Option<Arc<str>>,
     pub since: Option<WitStabilityVersion>,
     pub deprecated: Option<WitStabilityVersion>,
     /// Source range of the include declaration when it came from an authored

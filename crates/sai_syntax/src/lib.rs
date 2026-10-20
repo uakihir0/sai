@@ -1444,6 +1444,7 @@ struct EscapeScan {
     valid: bool,
     line_break_follows: bool,
     value: Option<EscapeValue>,
+    forbidden_bidi: Option<char>,
 }
 
 #[derive(Clone, Copy)]
@@ -1572,6 +1573,16 @@ impl<'a> Lexer<'a> {
             .chars()
             .next()
             .ok_or(LexError::InvalidSourceSpan)?;
+        self.report_forbidden_scalar_at(message, start, end, character)
+    }
+
+    fn report_forbidden_scalar_at(
+        &mut self,
+        message: impl Into<String>,
+        start: usize,
+        end: usize,
+        character: char,
+    ) -> Result<(), LexError> {
         let diagnostic_index = self.output.errors.len();
         self.report_at(
             Code::ForbiddenCharacter,
@@ -2088,7 +2099,15 @@ impl<'a> Lexer<'a> {
                     }
                     let start = self.pos;
                     let escape = scan_escape(self.text, start, EscapeMode::SimpleString);
-                    if !escape.valid {
+                    if let Some(character) = escape.forbidden_bidi {
+                        flags.insert(TokenFlags::HAS_ERROR);
+                        self.report_forbidden_scalar_at(
+                            "bidirectional control characters are forbidden in source text",
+                            start,
+                            escape.end,
+                            character,
+                        )?;
+                    } else if !escape.valid {
                         flags.insert(TokenFlags::HAS_ERROR);
                         if !escape.line_break_follows
                             && !self.range_contains_invalid_utf8(start, escape.end)?
@@ -2491,7 +2510,16 @@ impl<'a> Lexer<'a> {
                 break;
             }
             if ch == '\\' {
-                let escape = scan_escape(self.text, self.pos, EscapeMode::SimpleString);
+                let start = self.pos;
+                let escape = scan_escape(self.text, start, EscapeMode::SimpleString);
+                if let Some(character) = escape.forbidden_bidi {
+                    self.report_forbidden_scalar_at(
+                        "bidirectional control characters are forbidden in source text",
+                        start,
+                        escape.end,
+                        character,
+                    )?;
+                }
                 if escape.line_break_follows {
                     break;
                 }
@@ -2682,7 +2710,7 @@ impl<'a> Lexer<'a> {
                         self.pos + 1,
                         Code::InvalidLineEnding,
                         "lone CR is an invalid line ending",
-                        false,
+                        None,
                     ));
                     has_error = true;
                     self.pos + 1
@@ -2695,7 +2723,7 @@ impl<'a> Lexer<'a> {
                     opener_end,
                     Code::MalformedMultilineString,
                     "multiline string opener must be followed by a line break",
-                    false,
+                    None,
                 ));
                 has_error = true;
             }
@@ -2716,7 +2744,7 @@ impl<'a> Lexer<'a> {
                     opener_end,
                     Code::UnterminatedString,
                     "unterminated multiline string literal",
-                    false,
+                    None,
                 ));
                 has_error = true;
                 (self.text.len(), self.text.len(), String::new())
@@ -2739,7 +2767,7 @@ impl<'a> Lexer<'a> {
                         line_end,
                         Code::InconsistentIndent,
                         "multiline string line does not start with the base indentation",
-                        false,
+                        None,
                     ));
                     has_error = true;
                 }
@@ -2770,7 +2798,16 @@ impl<'a> Lexer<'a> {
                     self.pos,
                     EscapeMode::MultilineString,
                 );
-                if !escape.valid {
+                if let Some(character) = escape.forbidden_bidi {
+                    has_error = true;
+                    errors.push((
+                        self.pos,
+                        escape.end,
+                        Code::ForbiddenCharacter,
+                        "bidirectional control characters are forbidden in source text",
+                        Some(character),
+                    ));
+                } else if !escape.valid {
                     has_error = true;
                     if !self.range_contains_invalid_utf8(self.pos, escape.end)? {
                         errors.push((
@@ -2778,7 +2815,7 @@ impl<'a> Lexer<'a> {
                             escape.end,
                             Code::InvalidEscape,
                             "invalid escape sequence",
-                            false,
+                            None,
                         ));
                     }
                 }
@@ -2801,7 +2838,7 @@ impl<'a> Lexer<'a> {
                         self.pos,
                         Code::InvalidLineEnding,
                         "lone CR is an invalid line ending",
-                        false,
+                        None,
                     ));
                     has_error = true;
                 }
@@ -2831,20 +2868,24 @@ impl<'a> Lexer<'a> {
                 }
                 cursor += next.len_utf8();
             }
+            let forbidden_character = token_text[run_start..]
+                .chars()
+                .next()
+                .ok_or(LexError::InvalidSourceSpan)?;
             errors.push((
                 start + run_start,
                 start + cursor,
                 Code::ForbiddenCharacter,
                 "bidirectional control characters are forbidden in source text",
-                true,
+                Some(forbidden_character),
             ));
             has_error = true;
         }
 
         errors.sort_by_key(|error| error.0);
-        for (error_start, error_end, code, message, forbidden) in errors {
-            if forbidden {
-                self.report_forbidden_at(message, error_start, error_end)?;
+        for (error_start, error_end, code, message, forbidden_character) in errors {
+            if let Some(character) = forbidden_character {
+                self.report_forbidden_scalar_at(message, error_start, error_end, character)?;
             } else {
                 self.report_at(code, Severity::Error, message, error_start, error_end)?;
             }
@@ -2909,7 +2950,15 @@ impl<'a> Lexer<'a> {
                     continue;
                 }
                 let escape = scan_escape(self.text, self.pos, mode);
-                if !escape.valid {
+                if let Some(character) = escape.forbidden_bidi {
+                    has_error = true;
+                    self.report_forbidden_scalar_at(
+                        "bidirectional control characters are forbidden in source text",
+                        self.pos,
+                        escape.end,
+                        character,
+                    )?;
+                } else if !escape.valid {
                     has_error = true;
                     if !escape.line_break_follows
                         && !self.range_contains_invalid_utf8(self.pos, escape.end)?
@@ -3085,7 +3134,15 @@ impl<'a> Lexer<'a> {
                     continue;
                 }
                 let escape = scan_escape(self.text, self.pos, mode);
-                if !escape.valid {
+                if let Some(character) = escape.forbidden_bidi {
+                    has_error = true;
+                    self.report_forbidden_scalar_at(
+                        "bidirectional control characters are forbidden in source text",
+                        self.pos,
+                        escape.end,
+                        character,
+                    )?;
+                } else if !escape.valid {
                     has_error = true;
                     if !escape.line_break_follows
                         && !self.range_contains_invalid_utf8(self.pos, escape.end)?
@@ -4238,12 +4295,24 @@ fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
         valid: false,
         line_break_follows: false,
         value: None,
+        forbidden_bidi: None,
     };
-    let valid = |end, value| EscapeScan {
-        end,
-        valid: true,
-        line_break_follows: false,
-        value: Some(value),
+    let valid = |end, value| {
+        let forbidden_bidi = match value {
+            EscapeValue::Scalar(character)
+                if forbidden_class(character) == Some(ForbiddenClass::Bidi) =>
+            {
+                Some(character)
+            }
+            _ => None,
+        };
+        EscapeScan {
+            end,
+            valid: forbidden_bidi.is_none(),
+            line_break_follows: false,
+            value: Some(value),
+            forbidden_bidi,
+        }
     };
     let Some(escaped) = text
         .get(start + 1..)
@@ -4260,6 +4329,7 @@ fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
                 valid: false,
                 line_break_follows: true,
                 value: None,
+                forbidden_bidi: None,
             };
         }
         if escaped == '\n' {
@@ -4275,6 +4345,7 @@ fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
                 valid: true,
                 line_break_follows: true,
                 value: None,
+                forbidden_bidi: None,
             };
         }
         if text.as_bytes().get(end) != Some(&b'\n') {
@@ -4283,6 +4354,7 @@ fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
                 valid: false,
                 line_break_follows: true,
                 value: None,
+                forbidden_bidi: None,
             };
         }
         end += 1;
@@ -4298,6 +4370,7 @@ fn scan_escape(text: &str, start: usize, mode: EscapeMode) -> EscapeScan {
             valid: true,
             line_break_follows: true,
             value: None,
+            forbidden_bidi: None,
         };
     }
 
@@ -5201,6 +5274,77 @@ mod tests {
         assert_eq!(
             output.errors[1].children()[0].message,
             "first forbidden character is U+00A0 NO-BREAK SPACE"
+        );
+    }
+
+    #[test]
+    fn escaped_bidi_scalars_are_forbidden_in_unicode_escape_literal_modes() {
+        let cases = [
+            ("character", r"'\u{202e}'"),
+            ("simple string", r#""\u{202e}""#),
+            ("multiline string", "\"\"\"\n\\u{202e}\n\"\"\""),
+            ("format string", r#"f"\u{202e}""#),
+        ];
+
+        for (context, source) in cases {
+            let output = lex_text(source);
+            let forbidden = output
+                .errors
+                .iter()
+                .find(|error| error.code == Code::ForbiddenCharacter)
+                .unwrap_or_else(|| panic!("{context}: expected FORBIDDEN_CHARACTER"));
+            assert!(
+                !output
+                    .errors
+                    .iter()
+                    .any(|error| error.code == Code::InvalidEscape),
+                "{context}: a valid Unicode escape should not also be diagnosed as INVALID_ESCAPE"
+            );
+            assert_eq!(
+                forbidden.children()[0].message,
+                "first forbidden character is U+202E RIGHT-TO-LEFT OVERRIDE",
+                "{context}"
+            );
+            let escaped_start = source.find(r"\u{202e}").expect("escaped bidi spelling");
+            let escaped_end = escaped_start + r"\u{202e}".len();
+            assert_eq!(
+                forbidden
+                    .primary()
+                    .expect("forbidden escape has a primary span")
+                    .span
+                    .range,
+                TextRange::new(
+                    TextSize::new(escaped_start as u32),
+                    TextSize::new(escaped_end as u32),
+                )
+                .expect("escape span is ordered"),
+                "{context}: primary span covers the escaped spelling"
+            );
+            assert!(
+                output.tokens.iter().any(|token| {
+                    token.range.start().to_usize() <= escaped_start
+                        && token.range.end().to_usize() >= escaped_end
+                        && token.flags.contains(TokenFlags::HAS_ERROR)
+                }),
+                "{context}: the containing token is marked erroneous"
+            );
+        }
+
+        let raw_char = format!("'{}'", '\u{202e}');
+        let raw_output = lex_text(&raw_char);
+        assert!(
+            raw_output
+                .errors
+                .iter()
+                .any(|error| error.code == Code::ForbiddenCharacter),
+            "raw bidi controls inside character literals remain forbidden"
+        );
+        assert!(
+            raw_output
+                .tokens
+                .iter()
+                .any(|token| token.flags.contains(TokenFlags::HAS_ERROR)),
+            "the raw character token is marked erroneous"
         );
     }
 

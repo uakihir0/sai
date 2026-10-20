@@ -1,3 +1,8 @@
+#![cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;

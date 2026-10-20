@@ -267,6 +267,7 @@ impl StableHash for WitWorldRef {
             name.stable_hash(hasher);
             alias.stable_hash(hasher);
         }
+        self.docs.stable_hash(hasher);
         stable_version(&self.since, hasher);
         stable_version(&self.deprecated, hasher);
         self.span.stable_hash(hasher);
@@ -311,18 +312,21 @@ impl StableHash for WitWorldItem {
         match self {
             Self::Interface {
                 reference,
+                docs,
                 since,
                 deprecated,
                 span,
             } => {
                 hasher.write_tag(0x01);
                 reference.stable_hash(hasher);
+                docs.stable_hash(hasher);
                 stable_version(since, hasher);
                 stable_version(deprecated, hasher);
                 span.stable_hash(hasher);
             }
             Self::Func {
                 name,
+                docs,
                 func,
                 unsupported,
                 since,
@@ -331,6 +335,7 @@ impl StableHash for WitWorldItem {
             } => {
                 hasher.write_tag(0x02);
                 name.stable_hash(hasher);
+                docs.stable_hash(hasher);
                 func.stable_hash(hasher);
                 unsupported.stable_hash(hasher);
                 stable_version(since, hasher);

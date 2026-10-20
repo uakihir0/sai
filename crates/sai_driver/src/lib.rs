@@ -41,7 +41,7 @@ use sai_hir::arena::HirArena;
 use sai_hir::attrs::ValidatedAttrs;
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::expressions::{
-    Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind,
+    BinOp, Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind, UnOp,
 };
 use sai_hir::item_tree::{
     ItemTree, ItemTreeEntry, ItemTreeKind, TargetFilterError, TargetFilterResult,
@@ -50,6 +50,7 @@ use sai_hir::items::{
     HirOwner, ImplItemKind, ImplKind, InterfaceItemKind as HirInterfaceItemKind, ItemKind,
     OwnerNode, TraitItemKind, VariantShape, WorldItemKind, WorldRef,
 };
+use sai_hir::literals::Lit;
 use sai_hir::lower::{
     ExternItemIds, HirLoweringContext, HirLoweringError, InterfaceResourceMemberIds, WorldItemIds,
     lower_alias_owner, lower_const_owner, lower_distinct_owner, lower_effect_owner,
@@ -66,7 +67,7 @@ use sai_hir::types::{
     Bound, BoundKind, EffectRef as HirEffectRef, GenericArg, GenericArgs, GenericParamKind, Name,
     Path as HirPath, PathRoot, PathSegment, Ty, TyKind,
 };
-use sai_hir::{DefId, DefPath, DefPathData, DefPathInterner, DefPathInternerError};
+use sai_hir::{DefId, DefPath, DefPathData, DefPathInterner, DefPathInternerError, Visibility};
 use sai_hir::{HirId, OwnerId};
 use sai_hir::{ItemTreeQueries, ItemTreeQueryError};
 use sai_intern::{Interner, LookupError, PackageId, PackageIdError, PackageInterner, Symbol};
@@ -2394,6 +2395,7 @@ pub struct FunctionOwnerResolution {
     owner: OwnerId,
     resolution: Result<LabelResolution, FunctionOwnerResolutionError>,
     local_resolution: Result<Option<LocalResolution>, FunctionOwnerResolutionError>,
+    body_type_check: Result<FunctionBodyTypeCheck, FunctionOwnerResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, FunctionOwnerResolutionError>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, FunctionOwnerResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, FunctionOwnerResolutionError>,
@@ -2422,6 +2424,13 @@ impl FunctionOwnerResolution {
         self.local_resolution
             .as_ref()
             .map(|resolution| resolution.as_ref())
+    }
+
+    /// Returns the result of the supported direct function-body type checks.
+    ///
+    /// `Unsupported` keeps the owner behind the caller's feature gate.
+    pub fn body_type_check(&self) -> Result<&FunctionBodyTypeCheck, &FunctionOwnerResolutionError> {
+        self.body_type_check.as_ref()
     }
 
     /// Returns module-scope path results for names not resolved as locals or
@@ -5538,6 +5547,7 @@ pub struct ConstOwnerResolution {
     local_resolution: Result<Option<LocalResolution>, OwnerControlFlowResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, OwnerControlFlowResolutionError>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, OwnerControlFlowResolutionError>,
+    literal_check: Result<ConstLiteralCheck, OwnerControlFlowResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution:
         Result<Option<OwnerTestOnlyPathResolution>, OwnerControlFlowResolutionError>,
@@ -5577,6 +5587,15 @@ impl ConstOwnerResolution {
             .map(|resolution| resolution.as_ref())
     }
 
+    /// Checks the narrow direct-literal subset handled by the driver.
+    ///
+    /// `Unsupported` means the caller must keep the feature gate in place.
+    /// `Supported` carries any hard type or range diagnostics produced by
+    /// this subset; an empty diagnostic list means the literal is valid.
+    pub fn literal_check(&self) -> Result<&ConstLiteralCheck, &OwnerControlFlowResolutionError> {
+        self.literal_check.as_ref()
+    }
+
     /// Returns snapshot-bound diagnostics for typed member failures when this
     /// owner was resolved with a validated active-source closure. Package-local
     /// calls leave diagnostic mapping to their caller.
@@ -5603,6 +5622,1481 @@ impl ConstOwnerResolution {
     pub fn lowering_diagnostics(&self) -> &[Diagnostic] {
         &self.lowering_diagnostics
     }
+}
+
+/// Result of checking one supported direct function-body form.
+///
+/// This is an initial Stage 0 body-checking slice, not a general expression
+/// type checker. It also accepts an explicit unit return with an empty body or
+/// a direct unit tail. Unsupported owner and expression shapes remain gated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FunctionBodyTypeCheck {
+    Unsupported,
+    Supported { diagnostics: Vec<Diagnostic> },
+}
+
+impl FunctionBodyTypeCheck {
+    pub const fn is_supported(&self) -> bool {
+        matches!(self, Self::Supported { .. })
+    }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        match self {
+            Self::Unsupported => &[],
+            Self::Supported { diagnostics } => diagnostics,
+        }
+    }
+}
+
+/// Result of checking one public primitive, canonical `Str`, unit, or flat tuple constant.
+///
+/// This deliberately covers only direct literals of supported primitive
+/// types, canonical `Str`, the unit literal `()`, and flat tuple literals
+/// whose fields are supported direct scalar or unit literals. It does not
+/// imply that other constant expressions are evaluated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConstLiteralCheck {
+    /// The declaration or HIR shape is outside this checking slice.
+    Unsupported,
+    /// The primitive type and literal form are in scope for this checker.
+    ///
+    /// A nonempty diagnostic list represents a supported but invalid
+    /// initializer. An empty list means the initializer passed this check.
+    Supported {
+        primitive: sai_resolve::prelude::PrimTy,
+        diagnostics: Vec<Diagnostic>,
+    },
+    /// A direct string literal checked against the canonical `Str` prelude
+    /// item whose early name resolution is intentionally deferred.
+    SupportedStr { diagnostics: Vec<Diagnostic> },
+    /// The empty tuple type and direct unit literal, checked without general
+    /// type resolution.
+    SupportedUnit { diagnostics: Vec<Diagnostic> },
+    /// A flat tuple whose fields each have a supported direct scalar or unit literal.
+    SupportedTuple { diagnostics: Vec<Diagnostic> },
+}
+
+impl ConstLiteralCheck {
+    pub const fn is_supported(&self) -> bool {
+        matches!(
+            self,
+            Self::Supported { .. }
+                | Self::SupportedStr { .. }
+                | Self::SupportedUnit { .. }
+                | Self::SupportedTuple { .. }
+        )
+    }
+
+    pub fn is_valid(&self) -> bool {
+        match self {
+            Self::Supported { diagnostics, .. }
+            | Self::SupportedStr { diagnostics }
+            | Self::SupportedUnit { diagnostics }
+            | Self::SupportedTuple { diagnostics } => diagnostics.is_empty(),
+            Self::Unsupported => false,
+        }
+    }
+
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        match self {
+            Self::Unsupported => &[],
+            Self::Supported { diagnostics, .. }
+            | Self::SupportedStr { diagnostics }
+            | Self::SupportedUnit { diagnostics }
+            | Self::SupportedTuple { diagnostics } => diagnostics,
+        }
+    }
+}
+
+fn check_const_literal_owner(
+    owner: &HirOwner<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<ConstLiteralCheck, OwnerControlFlowResolutionError> {
+    if !owner.raw_attrs.is_empty() {
+        return Ok(ConstLiteralCheck::Unsupported);
+    }
+    let OwnerNode::Item(item) = owner.node else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    if item.vis != Visibility::Pub {
+        return Ok(ConstLiteralCheck::Unsupported);
+    }
+    let ItemKind::Const { ty } = item.kind else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    let Ok(name) = symbols.resolve(item.name.sym) else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    let Some(written_name) = inputs
+        .source
+        .text()
+        .get(item.name.span.range.start().to_usize()..item.name.span.range.end().to_usize())
+    else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    if !is_supported_const_name_convention(&name, written_name) {
+        return Ok(ConstLiteralCheck::Unsupported);
+    }
+    let Some(body) = owner.body else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    if let TyKind::Tuple(elements) = ty.kind {
+        if elements.is_empty() {
+            let Some(diagnostics) = check_const_literal_leaf(
+                owner,
+                *ty,
+                &body.value,
+                type_paths,
+                symbols,
+                inputs,
+                snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(ConstLiteralCheck::Unsupported);
+            };
+            return Ok(ConstLiteralCheck::SupportedUnit { diagnostics });
+        }
+
+        let Some(diagnostics) = check_const_tuple_literal(
+            owner,
+            elements,
+            &body.value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(ConstLiteralCheck::Unsupported);
+        };
+        return Ok(ConstLiteralCheck::SupportedTuple { diagnostics });
+    }
+
+    let Some(literal_type) = resolve_const_literal_type(*ty, type_paths, symbols, inputs) else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+    let Some(diagnostics) = check_const_literal_leaf(
+        owner,
+        *ty,
+        &body.value,
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )?
+    else {
+        return Ok(ConstLiteralCheck::Unsupported);
+    };
+
+    Ok(match literal_type {
+        ConstLiteralType::Primitive(primitive) => ConstLiteralCheck::Supported {
+            primitive,
+            diagnostics,
+        },
+        ConstLiteralType::Str => ConstLiteralCheck::SupportedStr { diagnostics },
+        ConstLiteralType::Unit => ConstLiteralCheck::SupportedUnit { diagnostics },
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConstLiteralType {
+    Primitive(sai_resolve::prelude::PrimTy),
+    Str,
+    Unit,
+}
+
+fn resolve_const_literal_type(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<ConstLiteralType> {
+    match ty.kind {
+        TyKind::Tuple(elements) if elements.is_empty() => Some(ConstLiteralType::Unit),
+        TyKind::Tuple(_) => None,
+        TyKind::Path(path)
+            if path.root == PathRoot::Plain
+                && path.segments.len() == 1
+                && path.segments[0].args.is_none()
+                && is_plain_ascii_identifier(path.segments[0].name, inputs) =>
+        {
+            let type_paths = type_paths?;
+            match type_paths.paths().get(&path.hir_id) {
+                Some(PathRes {
+                    base: Res::PrimTy(primitive),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                }) if is_supported_const_literal_primitive(*primitive) => {
+                    Some(ConstLiteralType::Primitive(*primitive))
+                }
+                None if is_deferred_canonical_str_path(path, type_paths, symbols, inputs) => {
+                    Some(ConstLiteralType::Str)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn check_function_body_type(
+    owner: &HirOwner<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<FunctionBodyTypeCheck, OwnerControlFlowResolutionError> {
+    if !owner.raw_attrs.is_empty() || !body.contracts.is_empty() || !body.invariant_preds.is_empty()
+    {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+    let OwnerNode::Item(item) = owner.node else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    if item.vis != Visibility::Pub {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+    let ItemKind::Fn {
+        sig,
+        generics,
+        has_body: true,
+    } = item.kind
+    else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    if sig.safety != sai_hir::Safety::Safe
+        || sig.is_async
+        || sig.borrows.is_some()
+        || sig.effects.is_some()
+        || !sig.requires.is_empty()
+        || !sig.ensures.is_empty()
+        || !generics.params.is_empty()
+        || !generics.where_preds.is_empty()
+        || !function_name_is_supported(item.name, symbols, inputs)
+    {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+    if sig.params.is_empty() && body.params.is_empty() {
+        if let Some(diagnostics) = check_function_body_annotated_primitive_local(
+            owner, sig, body, locals, type_paths, symbols, inputs, snapshot, target_cfg,
+        )? {
+            return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
+        }
+    }
+    let (parameter, parameter_pair) = match (sig.params, body.params) {
+        ([], []) => (None, None),
+        ([parameter], [body_parameter])
+            if !parameter.is_self
+                && !parameter.mutable
+                && !body_parameter.mutable
+                && parameter
+                    .name
+                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
+                && parameter.name == body_parameter.name =>
+        {
+            (Some((parameter, body_parameter)), None)
+        }
+        ([first, second], [first_body, second_body])
+            if !first.is_self
+                && !second.is_self
+                && !first.mutable
+                && !second.mutable
+                && !first_body.mutable
+                && !second_body.mutable
+                && first
+                    .name
+                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
+                && second
+                    .name
+                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
+                && first.name == first_body.name
+                && second.name == second_body.name
+                && first.name != second.name
+                && first_body.binding != second_body.binding =>
+        {
+            (None, Some((first, first_body, second, second_body)))
+        }
+        _ => return Ok(FunctionBodyTypeCheck::Unsupported),
+    };
+
+    let block = match body.value.kind {
+        ExprKind::Block(block)
+            if block.safety == sai_hir::Safety::Safe && block.stmts.is_empty() =>
+        {
+            block
+        }
+        _ => return Ok(FunctionBodyTypeCheck::Unsupported),
+    };
+    let diagnostics = if let Some((parameter, body_parameter)) = parameter {
+        let Some(tail) = block.tail else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        if let ExprKind::If {
+            cond,
+            then,
+            els: Some(else_expr),
+        } = tail.kind
+        {
+            let Some(return_ty) = sig.ret else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            if !matches!(
+                resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
+                Some(FunctionDirectType::Primitive(_))
+            ) {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
+            let condition_diagnostics = if function_if_condition_uses_parameter_binding(
+                cond,
+                body_parameter,
+                locals,
+                inputs,
+            ) && matches!(
+                resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs),
+                Some(FunctionDirectType::Primitive(
+                    sai_resolve::prelude::PrimTy::Bool
+                ))
+            ) {
+                Some(Vec::new())
+            } else {
+                check_function_if_parameter_comparison_condition(
+                    owner,
+                    cond,
+                    *parameter.ty,
+                    body_parameter,
+                    locals,
+                    type_paths,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )?
+            };
+            let Some(mut condition_diagnostics) = condition_diagnostics else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            let Some(mut branch_diagnostics) = check_function_if_literal_branches(
+                owner, *return_ty, true, then, else_expr, type_paths, symbols, inputs, snapshot,
+                target_cfg,
+            )?
+            else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            condition_diagnostics.append(&mut branch_diagnostics);
+            condition_diagnostics
+        } else {
+            let ExprKind::Path(path) = tail.kind else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            if path.root != PathRoot::Plain
+                || path.segments.len() != 1
+                || path.segments[0].args.is_some()
+                || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+            {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
+            if !matches!(
+                locals.paths.get(&path.hir_id),
+                Some(PathRes {
+                    base: Res::Local(resolved_binding),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                }) if *resolved_binding == body_parameter.binding
+            ) {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
+
+            let Some(found) =
+                resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
+            else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            let expected = match sig.ret {
+                Some(ty) => {
+                    let Some(expected) =
+                        resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+                    else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    expected
+                }
+                None => FunctionDirectType::Unit,
+            };
+            if expected == found || expected == FunctionDirectType::Unit {
+                Vec::new()
+            } else {
+                vec![const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    tail.span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `{}`, found `{}`",
+                        function_direct_type_name(expected),
+                        function_direct_type_name(found)
+                    ),
+                    "type mismatch",
+                )?]
+            }
+        }
+    } else if let Some((first, first_body, second, second_body)) = parameter_pair {
+        let Some(tail) = block.tail else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        let ExprKind::If {
+            cond,
+            then,
+            els: Some(else_expr),
+        } = tail.kind
+        else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        let Some(return_ty) = sig.ret else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        if !matches!(
+            resolve_function_direct_type(*return_ty, type_paths, symbols, inputs),
+            Some(FunctionDirectType::Primitive(_))
+        ) {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        }
+        let first_parameter_type =
+            resolve_function_direct_type(*first.ty, type_paths, symbols, inputs);
+        let second_parameter_type =
+            resolve_function_direct_type(*second.ty, type_paths, symbols, inputs);
+        let (comparison_condition, condition_is_negated) = match cond.kind {
+            ExprKind::Unary(UnOp::Not, operand) => (operand, true),
+            _ => (cond, false),
+        };
+        let condition_is_supported_when_negated = matches!(
+            comparison_condition.kind,
+            ExprKind::Binary(
+                BinOp::And
+                    | BinOp::Or
+                    | BinOp::Eq
+                    | BinOp::Ne
+                    | BinOp::Lt
+                    | BinOp::Le
+                    | BinOp::Gt
+                    | BinOp::Ge,
+                _,
+                _
+            )
+        );
+        let parameter_types_are_supported = match comparison_condition.kind {
+            ExprKind::Binary(BinOp::And | BinOp::Or, _, _) => {
+                let bool_type = Some(FunctionDirectType::Primitive(
+                    sai_resolve::prelude::PrimTy::Bool,
+                ));
+                first_parameter_type == bool_type && second_parameter_type == bool_type
+            }
+            ExprKind::Binary(
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+                _,
+                _,
+            ) => matches!(
+                (first_parameter_type, second_parameter_type),
+                (
+                    Some(FunctionDirectType::Primitive(first)),
+                    Some(FunctionDirectType::Primitive(second))
+                ) if first == second
+            ),
+            _ => false,
+        };
+        let mixed_condition_diagnostics = check_function_if_mixed_logical_comparison_condition(
+            owner,
+            comparison_condition,
+            !condition_is_negated,
+            *first.ty,
+            first_body,
+            *second.ty,
+            second_body,
+            locals,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?;
+        let direct_condition_is_supported = (!condition_is_negated
+            || condition_is_supported_when_negated)
+            && function_if_binary_condition_uses_parameter_bindings(
+                comparison_condition,
+                first_body,
+                second_body,
+                locals,
+                inputs,
+            )
+            && parameter_types_are_supported;
+        let condition_is_supported =
+            direct_condition_is_supported || mixed_condition_diagnostics.is_some();
+        let Some(mut diagnostics) = check_function_if_literal_branches(
+            owner,
+            *return_ty,
+            condition_is_supported,
+            then,
+            else_expr,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        if let Some(mut condition_diagnostics) = mixed_condition_diagnostics {
+            condition_diagnostics.append(&mut diagnostics);
+            condition_diagnostics
+        } else {
+            diagnostics
+        }
+    } else {
+        let Some(return_ty) = sig.ret else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        match resolve_function_direct_type(*return_ty, type_paths, symbols, inputs) {
+            Some(FunctionDirectType::Unit) if block.tail.is_none() => Vec::new(),
+            Some(FunctionDirectType::Unit) => {
+                let Some(tail) = block.tail else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                if !matches!(tail.kind, ExprKind::Tuple(elements) if elements.is_empty()) {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+                let Some(diagnostics) = check_const_literal_leaf(
+                    owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+                )?
+                else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                diagnostics
+            }
+            Some(FunctionDirectType::Primitive(_)) => {
+                let Some(tail) = block.tail else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                if let ExprKind::If {
+                    cond,
+                    then,
+                    els: Some(else_expr),
+                } = tail.kind
+                {
+                    let Some(diagnostics) = check_function_if_literal_branches(
+                        owner,
+                        *return_ty,
+                        matches!(cond.kind, ExprKind::Lit(Lit::Bool(_))),
+                        then,
+                        else_expr,
+                        type_paths,
+                        symbols,
+                        inputs,
+                        snapshot,
+                        target_cfg,
+                    )?
+                    else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    diagnostics
+                } else {
+                    if !is_direct_function_scalar_literal(tail) {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    }
+                    let Some(diagnostics) = check_const_literal_leaf(
+                        owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+                    )?
+                    else {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    };
+                    diagnostics
+                }
+            }
+            None => return Ok(FunctionBodyTypeCheck::Unsupported),
+        }
+    };
+    Ok(FunctionBodyTypeCheck::Supported { diagnostics })
+}
+
+fn check_function_body_annotated_primitive_local(
+    owner: &HirOwner<'_>,
+    sig: sai_hir::body::FnSig<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let Some(return_ty) = sig.ret else {
+        return Ok(None);
+    };
+    let Some(FunctionDirectType::Primitive(return_type)) =
+        resolve_function_direct_type(*return_ty, type_paths, symbols, inputs)
+    else {
+        return Ok(None);
+    };
+    let ExprKind::Block(block) = body.value.kind else {
+        return Ok(None);
+    };
+    let [stmt] = block.stmts else {
+        return Ok(None);
+    };
+    let StmtKind::Let {
+        pat,
+        ty: Some(ty),
+        els: None,
+        ..
+    } = stmt.kind
+    else {
+        return Ok(None);
+    };
+    let PatKind::Binding {
+        mode: sai_hir::patterns::BindingMode::Value,
+        name,
+        binding,
+        sub: None,
+        ..
+    } = pat.kind
+    else {
+        return Ok(None);
+    };
+    if !function_name_is_supported(name, symbols, inputs) {
+        return Ok(None);
+    }
+    if !matches!(
+        locals.bindings.get(&binding),
+        Some(sai_resolve::owner::LocalBinding {
+            kind: sai_resolve::owner::BindingKind::Let,
+            ..
+        })
+    ) {
+        return Ok(None);
+    }
+    let Some(FunctionDirectType::Primitive(local_type)) =
+        resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+    else {
+        return Ok(None);
+    };
+    let Some(tail) = block.tail else {
+        return Ok(None);
+    };
+    let ExprKind::Path(path) = tail.kind else {
+        return Ok(None);
+    };
+    if path.root != PathRoot::Plain
+        || path.segments.len() != 1
+        || path.segments[0].args.is_some()
+        || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+    {
+        return Ok(None);
+    }
+
+    let primitive_types = HashMap::from([(ty.hir_id, local_type)]);
+    let local_paths = locals
+        .paths
+        .iter()
+        .filter_map(|(hir_id, resolution)| match resolution.base {
+            Res::Local(binding)
+                if resolution.resolved_segments == 1 && resolution.segment_count == 1 =>
+            {
+                Some((*hir_id, binding))
+            }
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let check = sai_ty::typeck::body::check_annotated_primitive_local_body(
+        sai_ty::typeck::body::PrimitiveBodyInput {
+            body,
+            return_type,
+            primitive_types: &primitive_types,
+            local_paths: &local_paths,
+            symbols,
+            pointer_width: target_cfg.pointer_width(),
+        },
+    );
+    let sai_ty::typeck::body::PrimitiveBodyCheck::Supported { errors } = check else {
+        return Ok(None);
+    };
+    let StmtKind::Let { init, .. } = stmt.kind else {
+        return Ok(None);
+    };
+
+    let mut diagnostics = Vec::with_capacity(errors.len());
+    for error in errors {
+        let span = if error.node == init.hir_id {
+            init.span
+        } else if error.node == tail.hir_id {
+            tail.span
+        } else {
+            return Ok(None);
+        };
+        use sai_ty::typeck::body::{PrimitiveBodyErrorKind, PrimitiveLiteralKind};
+        let diagnostic = match error.kind {
+            PrimitiveBodyErrorKind::LiteralTypeMismatch { expected, found } => {
+                let found = match found {
+                    PrimitiveLiteralKind::Integer => "an integer literal",
+                    PrimitiveLiteralKind::FloatingPoint => "a floating-point literal",
+                    PrimitiveLiteralKind::Bool => "a Bool literal",
+                    PrimitiveLiteralKind::Byte => "a byte literal",
+                    PrimitiveLiteralKind::Character => "a character literal",
+                };
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `{}`, found {found}",
+                        const_primitive_name(expected)
+                    ),
+                    "type mismatch",
+                )?
+            }
+            PrimitiveBodyErrorKind::LiteralOutOfRange { expected, found } => {
+                let label = match found {
+                    PrimitiveLiteralKind::Integer => "integer",
+                    PrimitiveLiteralKind::FloatingPoint => "floating-point",
+                    PrimitiveLiteralKind::Bool
+                    | PrimitiveLiteralKind::Byte
+                    | PrimitiveLiteralKind::Character => return Ok(None),
+                };
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    format!(
+                        "{label} literal is out of range for `{}`",
+                        const_primitive_name(expected)
+                    ),
+                    "literal out of range",
+                )?
+            }
+            PrimitiveBodyErrorKind::TypeMismatch { expected, found } => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!(
+                    "expected `{}`, found `{}`",
+                    const_primitive_name(expected),
+                    const_primitive_name(found)
+                ),
+                "type mismatch",
+            )?,
+        };
+        diagnostics.push(diagnostic);
+    }
+    Ok(Some(diagnostics))
+}
+
+fn function_if_condition_uses_parameter_binding(
+    condition: &HirExpr<'_>,
+    body_parameter: &sai_hir::body::BodyParam,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let path_expression = match condition.kind {
+        ExprKind::Path(_) => Some(condition),
+        ExprKind::Unary(UnOp::Not, operand) => match operand.kind {
+            ExprKind::Path(_) => Some(operand),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(path_expression) = path_expression else {
+        return false;
+    };
+    function_if_path_uses_parameter_binding(path_expression, body_parameter, locals, inputs)
+}
+
+fn function_if_path_uses_parameter_binding(
+    expression: &HirExpr<'_>,
+    body_parameter: &sai_hir::body::BodyParam,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let ExprKind::Path(path) = expression.kind else {
+        return false;
+    };
+    path.root == PathRoot::Plain
+        && path.segments.len() == 1
+        && path.segments[0].args.is_none()
+        && is_plain_ascii_identifier(path.segments[0].name, inputs)
+        && matches!(
+            locals.paths.get(&path.hir_id),
+            Some(PathRes {
+                base: Res::Local(resolved_binding),
+                resolved_segments: 1,
+                segment_count: 1,
+            }) if *resolved_binding == body_parameter.binding
+        )
+}
+
+fn check_function_if_parameter_comparison_condition(
+    owner: &HirOwner<'_>,
+    condition: &HirExpr<'_>,
+    parameter_ty: Ty<'_>,
+    body_parameter: &sai_hir::body::BodyParam,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let comparison_condition = match condition.kind {
+        ExprKind::Unary(UnOp::Not, operand) => operand,
+        _ => condition,
+    };
+    let ExprKind::Binary(operator, left, right) = comparison_condition.kind else {
+        return Ok(None);
+    };
+    if !matches!(
+        operator,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+    ) {
+        return Ok(None);
+    }
+    let (literal, parameter_path, literal_is_left) =
+        if function_if_path_uses_parameter_binding(left, body_parameter, locals, inputs)
+            && is_direct_function_scalar_literal(right)
+        {
+            (right, left, false)
+        } else if is_direct_function_scalar_literal(left)
+            && function_if_path_uses_parameter_binding(right, body_parameter, locals, inputs)
+        {
+            (left, right, true)
+        } else {
+            return Ok(None);
+        };
+    let Some(FunctionDirectType::Primitive(parameter_primitive)) =
+        resolve_function_direct_type(parameter_ty, type_paths, symbols, inputs)
+    else {
+        return Ok(None);
+    };
+    if literal_is_left {
+        let literal_primitive = match literal.kind {
+            ExprKind::Lit(Lit::Bool(_)) => Some(sai_resolve::prelude::PrimTy::Bool),
+            ExprKind::Lit(Lit::Char(_)) => Some(sai_resolve::prelude::PrimTy::Char),
+            ExprKind::Lit(Lit::Byte(_)) => Some(sai_resolve::prelude::PrimTy::Byte),
+            _ => None,
+        };
+        if let Some(literal_primitive) = literal_primitive {
+            if literal_primitive == parameter_primitive {
+                return Ok(Some(Vec::new()));
+            }
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                parameter_path.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!(
+                    "expected `{}`, found `{}`",
+                    const_primitive_name(literal_primitive),
+                    const_primitive_name(parameter_primitive)
+                ),
+                "type mismatch",
+            )?]));
+        }
+        let default_primitive = match literal.kind {
+            ExprKind::Lit(Lit::Int { .. }) if !is_integer_primitive(parameter_primitive) => {
+                Some(sai_resolve::prelude::PrimTy::I64)
+            }
+            ExprKind::Lit(Lit::Float { .. })
+                if !matches!(
+                    parameter_primitive,
+                    sai_resolve::prelude::PrimTy::F32 | sai_resolve::prelude::PrimTy::F64
+                ) =>
+            {
+                Some(sai_resolve::prelude::PrimTy::F64)
+            }
+            _ => None,
+        };
+        if let Some(default_primitive) = default_primitive {
+            return Ok(Some(vec![const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                parameter_path.span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!(
+                    "expected `{}`, found `{}`",
+                    const_primitive_name(default_primitive),
+                    const_primitive_name(parameter_primitive)
+                ),
+                "type mismatch",
+            )?]));
+        }
+    }
+    check_const_literal_leaf(
+        owner,
+        parameter_ty,
+        literal,
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )
+}
+
+fn check_function_if_mixed_logical_comparison_condition(
+    owner: &HirOwner<'_>,
+    condition: &HirExpr<'_>,
+    allow_negated_comparison_operand: bool,
+    first_parameter_ty: Ty<'_>,
+    first_body_parameter: &sai_hir::body::BodyParam,
+    second_parameter_ty: Ty<'_>,
+    second_body_parameter: &sai_hir::body::BodyParam,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let ExprKind::Binary(BinOp::And | BinOp::Or, left, right) = condition.kind else {
+        return Ok(None);
+    };
+    let (bool_path, comparison) = if matches!(left.kind, ExprKind::Path(_)) {
+        (left, right)
+    } else if matches!(right.kind, ExprKind::Path(_)) {
+        (right, left)
+    } else {
+        return Ok(None);
+    };
+    let comparison_for_shape = match comparison.kind {
+        ExprKind::Unary(UnOp::Not, operand) if allow_negated_comparison_operand => operand,
+        _ => comparison,
+    };
+    if !matches!(
+        comparison_for_shape.kind,
+        ExprKind::Binary(
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge,
+            _,
+            _
+        )
+    ) {
+        return Ok(None);
+    }
+
+    let bool_type = Some(FunctionDirectType::Primitive(
+        sai_resolve::prelude::PrimTy::Bool,
+    ));
+    let (comparison_parameter, comparison_parameter_ty) =
+        if resolve_function_direct_type(first_parameter_ty, type_paths, symbols, inputs)
+            == bool_type
+            && function_if_path_uses_parameter_binding(
+                bool_path,
+                first_body_parameter,
+                locals,
+                inputs,
+            )
+        {
+            (second_body_parameter, second_parameter_ty)
+        } else if resolve_function_direct_type(second_parameter_ty, type_paths, symbols, inputs)
+            == bool_type
+            && function_if_path_uses_parameter_binding(
+                bool_path,
+                second_body_parameter,
+                locals,
+                inputs,
+            )
+        {
+            (first_body_parameter, first_parameter_ty)
+        } else {
+            return Ok(None);
+        };
+    check_function_if_parameter_comparison_condition(
+        owner,
+        comparison,
+        comparison_parameter_ty,
+        comparison_parameter,
+        locals,
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )
+}
+
+fn function_if_binary_condition_uses_parameter_bindings(
+    condition: &HirExpr<'_>,
+    first_body_parameter: &sai_hir::body::BodyParam,
+    second_body_parameter: &sai_hir::body::BodyParam,
+    locals: &LocalResolution,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    let ExprKind::Binary(operator, left, right) = condition.kind else {
+        return false;
+    };
+    if !matches!(
+        operator,
+        BinOp::And
+            | BinOp::Or
+            | BinOp::Eq
+            | BinOp::Ne
+            | BinOp::Lt
+            | BinOp::Le
+            | BinOp::Gt
+            | BinOp::Ge
+    ) {
+        return false;
+    }
+    let path_binding = |expression: &HirExpr<'_>| {
+        let ExprKind::Path(path) = expression.kind else {
+            return None;
+        };
+        if path.root != PathRoot::Plain
+            || path.segments.len() != 1
+            || path.segments[0].args.is_some()
+            || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+        {
+            return None;
+        }
+        match locals.paths.get(&path.hir_id) {
+            Some(PathRes {
+                base: Res::Local(binding),
+                resolved_segments: 1,
+                segment_count: 1,
+            }) => Some(*binding),
+            _ => None,
+        }
+    };
+    let (Some(left_binding), Some(right_binding)) = (path_binding(left), path_binding(right))
+    else {
+        return false;
+    };
+    left_binding != right_binding
+        && ((left_binding == first_body_parameter.binding
+            && right_binding == second_body_parameter.binding)
+            || (left_binding == second_body_parameter.binding
+                && right_binding == first_body_parameter.binding))
+}
+
+fn check_function_if_literal_branches(
+    owner: &HirOwner<'_>,
+    return_ty: Ty<'_>,
+    condition_is_supported: bool,
+    then_block: &HirBlock<'_>,
+    else_expr: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    if !condition_is_supported
+        || then_block.safety != sai_hir::Safety::Safe
+        || !then_block.stmts.is_empty()
+    {
+        return Ok(None);
+    }
+    let Some(then_tail) = then_block.tail else {
+        return Ok(None);
+    };
+    if !is_direct_function_scalar_literal(then_tail) {
+        return Ok(None);
+    }
+
+    let ExprKind::Block(else_block) = else_expr.kind else {
+        return Ok(None);
+    };
+    if else_block.safety != sai_hir::Safety::Safe || !else_block.stmts.is_empty() {
+        return Ok(None);
+    }
+    let Some(else_tail) = else_block.tail else {
+        return Ok(None);
+    };
+    if !is_direct_function_scalar_literal(else_tail) {
+        return Ok(None);
+    }
+
+    let Some(mut diagnostics) = check_const_literal_leaf(
+        owner, return_ty, then_tail, type_paths, symbols, inputs, snapshot, target_cfg,
+    )?
+    else {
+        return Ok(None);
+    };
+    let Some(mut else_diagnostics) = check_const_literal_leaf(
+        owner, return_ty, else_tail, type_paths, symbols, inputs, snapshot, target_cfg,
+    )?
+    else {
+        return Ok(None);
+    };
+    diagnostics.append(&mut else_diagnostics);
+    Ok(Some(diagnostics))
+}
+
+fn is_direct_function_scalar_literal(expression: &HirExpr<'_>) -> bool {
+    matches!(
+        expression.kind,
+        ExprKind::Lit(
+            Lit::Bool(_) | Lit::Char(_) | Lit::Byte(_) | Lit::Int { .. } | Lit::Float { .. }
+        )
+    )
+}
+
+fn function_name_is_supported(name: Name, symbols: &Interner, inputs: &CurrentOwnerInputs) -> bool {
+    is_plain_ascii_identifier(name, inputs)
+        && symbols
+            .resolve(name.sym)
+            .is_ok_and(|name| !name.chars().any(char::is_uppercase))
+}
+
+fn is_plain_ascii_identifier(name: Name, inputs: &CurrentOwnerInputs) -> bool {
+    inputs
+        .source
+        .text()
+        .get(name.span.range.start().to_usize()..name.span.range.end().to_usize())
+        .is_some_and(|written| written.is_ascii() && !written.starts_with("r#"))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FunctionDirectType {
+    Primitive(sai_resolve::prelude::PrimTy),
+    Unit,
+}
+
+fn resolve_function_direct_type(
+    ty: Ty<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<FunctionDirectType> {
+    match resolve_const_literal_type(ty, type_paths, symbols, inputs)? {
+        ConstLiteralType::Primitive(primitive) => Some(FunctionDirectType::Primitive(primitive)),
+        ConstLiteralType::Unit => Some(FunctionDirectType::Unit),
+        ConstLiteralType::Str => None,
+    }
+}
+
+fn function_direct_type_name(ty: FunctionDirectType) -> &'static str {
+    match ty {
+        FunctionDirectType::Primitive(primitive) => const_primitive_name(primitive),
+        FunctionDirectType::Unit => "()",
+    }
+}
+
+fn check_const_tuple_literal(
+    owner: &HirOwner<'_>,
+    expected_elements: &[Ty<'_>],
+    value: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let Some(_expected_types) = expected_elements
+        .iter()
+        .map(|ty| resolve_const_literal_type(*ty, type_paths, symbols, inputs))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Ok(None);
+    };
+
+    let ExprKind::Tuple(values) = value.kind else {
+        let ExprKind::Lit(literal) = value.kind else {
+            return Ok(None);
+        };
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected a tuple, found {}",
+                const_literal_found_type(literal)
+            ),
+            "type mismatch",
+        )?]));
+    };
+
+    if values
+        .iter()
+        .any(|value| !is_direct_const_literal_or_unit(value))
+    {
+        return Ok(None);
+    }
+    if values.len() != expected_elements.len() {
+        return Ok(Some(vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!(
+                "expected a tuple with {} elements, found {}",
+                expected_elements.len(),
+                values.len()
+            ),
+            "type mismatch",
+        )?]));
+    }
+
+    let mut diagnostics = Vec::new();
+    for (expected_ty, value) in expected_elements.iter().zip(values) {
+        let Some(mut field_diagnostics) = check_const_literal_leaf(
+            owner,
+            *expected_ty,
+            value,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+            target_cfg,
+        )?
+        else {
+            return Ok(None);
+        };
+        diagnostics.append(&mut field_diagnostics);
+    }
+    Ok(Some(diagnostics))
+}
+
+fn is_direct_const_literal_or_unit(value: &HirExpr<'_>) -> bool {
+    match value.kind {
+        ExprKind::Lit(_) => true,
+        ExprKind::Tuple(elements) => elements.is_empty(),
+        _ => false,
+    }
+}
+
+fn check_const_literal_leaf(
+    owner: &HirOwner<'_>,
+    ty: Ty<'_>,
+    value: &HirExpr<'_>,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let Some(literal_type) = resolve_const_literal_type(ty, type_paths, symbols, inputs) else {
+        return Ok(None);
+    };
+    let literal = match value.kind {
+        ExprKind::Lit(literal) => Some(literal),
+        ExprKind::Tuple(elements) if elements.is_empty() => None,
+        _ => return Ok(None),
+    };
+
+    let mismatch = |expected: &str, found: &str| {
+        const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected `{expected}`, found {found}"),
+            "type mismatch",
+        )
+    };
+
+    let Some(literal) = literal else {
+        let diagnostic = match literal_type {
+            ConstLiteralType::Unit => None,
+            ConstLiteralType::Primitive(primitive) => {
+                Some(mismatch(const_primitive_name(primitive), "unit")?)
+            }
+            ConstLiteralType::Str => Some(mismatch("Str", "unit")?),
+        };
+        return Ok(Some(diagnostic.into_iter().collect()));
+    };
+
+    let diagnostics = match literal_type {
+        ConstLiteralType::Unit => vec![const_literal_diagnostic(
+            owner.id,
+            inputs,
+            snapshot,
+            value.span,
+            sai_diagnostics::Code::TypeMismatch,
+            format!("expected `()`, found {}", const_literal_found_type(literal)),
+            "type mismatch",
+        )?],
+        ConstLiteralType::Str => match literal {
+            Lit::Str(_) => Vec::new(),
+            literal => vec![mismatch("Str", const_literal_found_type(literal))?],
+        },
+        ConstLiteralType::Primitive(primitive) => {
+            match sai_ty::typeck::literal::check_primitive_literal(
+                primitive,
+                literal,
+                symbols,
+                target_cfg.pointer_width(),
+            ) {
+                sai_ty::typeck::literal::PrimitiveLiteralResult::Match => Vec::new(),
+                sai_ty::typeck::literal::PrimitiveLiteralResult::TypeMismatch => vec![mismatch(
+                    const_primitive_name(primitive),
+                    const_literal_found_type(literal),
+                )?],
+                sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => {
+                    let label = if matches!(literal, Lit::Int { .. }) {
+                        "integer"
+                    } else {
+                        "floating-point"
+                    };
+                    vec![const_literal_diagnostic(
+                        owner.id,
+                        inputs,
+                        snapshot,
+                        value.span,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        format!(
+                            "{label} literal is out of range for `{}`",
+                            const_primitive_name(primitive)
+                        ),
+                        "literal out of range",
+                    )?]
+                }
+            }
+        }
+    };
+    Ok(Some(diagnostics))
+}
+
+fn is_deferred_canonical_str_path(
+    path: HirPath<'_>,
+    type_paths: &TypeOwnerPathResolution,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> bool {
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return false;
+    }
+
+    let symbol = path.segments[0].name.sym;
+    if symbols.resolve(symbol).ok().as_deref() != Some("Str")
+        || !type_paths
+            .deferred_paths()
+            .iter()
+            .any(|deferred| deferred.hir_id == path.hir_id && deferred.name == symbol)
+    {
+        return false;
+    }
+
+    let canonical_str = CANONICAL_PRELUDE_ITEMS.iter().any(|item| {
+        item.name == "Str"
+            && item.path.package == "sai:core"
+            && item.path.kind == CanonicalPreludeKind::Type
+            && matches!(
+                item.path.segments,
+                [
+                    CanonicalPreludeSegment::Module("str"),
+                    CanonicalPreludeSegment::Type("Str")
+                ]
+            )
+    });
+    if !canonical_str {
+        return false;
+    }
+
+    let range = path.span.range;
+    inputs
+        .source
+        .text()
+        .get(range.start().to_usize()..range.end().to_usize())
+        == Some("Str")
+}
+
+fn is_supported_const_name_convention(name: &str, written_name: &str) -> bool {
+    !written_name.starts_with("r#")
+        && !name.is_empty()
+        && name.chars().all(|character| {
+            character == '_' || character.is_ascii_uppercase() || character.is_ascii_digit()
+        })
+}
+
+fn is_supported_const_literal_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
+    sai_ty::typeck::literal::supports_primitive_literal(primitive)
+}
+
+fn is_integer_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
+    sai_ty::typeck::literal::is_integer_primitive(primitive)
+}
+
+fn const_primitive_name(primitive: sai_resolve::prelude::PrimTy) -> &'static str {
+    match primitive {
+        sai_resolve::prelude::PrimTy::I8 => "I8",
+        sai_resolve::prelude::PrimTy::I16 => "I16",
+        sai_resolve::prelude::PrimTy::I32 => "I32",
+        sai_resolve::prelude::PrimTy::I64 => "I64",
+        sai_resolve::prelude::PrimTy::U8 => "U8",
+        sai_resolve::prelude::PrimTy::U16 => "U16",
+        sai_resolve::prelude::PrimTy::U32 => "U32",
+        sai_resolve::prelude::PrimTy::U64 => "U64",
+        sai_resolve::prelude::PrimTy::ISize => "ISize",
+        sai_resolve::prelude::PrimTy::USize => "USize",
+        sai_resolve::prelude::PrimTy::F32 => "F32",
+        sai_resolve::prelude::PrimTy::F64 => "F64",
+        sai_resolve::prelude::PrimTy::Bool => "Bool",
+        sai_resolve::prelude::PrimTy::Byte => "Byte",
+        sai_resolve::prelude::PrimTy::Char => "Char",
+        sai_resolve::prelude::PrimTy::Never => "Never",
+        sai_resolve::prelude::PrimTy::Array => "Array",
+    }
+}
+
+fn const_literal_found_type(literal: Lit<'_>) -> &'static str {
+    match literal {
+        Lit::Int { .. } => "an integer literal",
+        Lit::Float { .. } => "a floating-point literal",
+        Lit::Str(_) => "a string literal",
+        Lit::ByteStr(_) => "a byte string literal",
+        Lit::Char(_) => "a character literal",
+        Lit::Byte(_) => "a byte literal",
+        Lit::Bool(_) => "a Bool literal",
+    }
+}
+
+fn const_literal_diagnostic(
+    owner: OwnerId,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    span: sai_hir::Span,
+    code: sai_diagnostics::Code,
+    message: String,
+    primary_label: &str,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    let location = sai_diagnostics::Location::from_decoded_source(
+        inputs.source_ref.clone(),
+        sai_diagnostics::Span::new(span.file, span.range),
+        &inputs.source,
+    )
+    .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        owner,
+    ))?;
+    let mut diagnostic = Diagnostic::new(
+        code,
+        sai_diagnostics::Severity::Error,
+        message,
+        Some(location),
+    );
+    diagnostic.primary_label = primary_label.to_owned();
+    diagnostic.package = inputs.source_ref.package.clone();
+    diagnostic
+        .with_workspace_snapshot(snapshot)
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))
 }
 
 /// Per-owner path results tagged with their package-collection provenance.
@@ -6397,6 +7891,18 @@ fn canonical_wit_path_name(name: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("-")
+}
+
+fn wit_view_world_by_name<'a>(
+    view: &'a WitView,
+    requested_name: &str,
+) -> Option<&'a sai_wit::ViewWorld> {
+    view.worlds.values().find(|world| {
+        view.model
+            .worlds
+            .get(world.wit)
+            .is_some_and(|model| canonical_wit_path_name(&model.name) == requested_name)
+    })
 }
 
 fn world_package_path_diagnostic(
@@ -11849,6 +13355,7 @@ impl RootDatabase {
                                 owner: descriptor.owner,
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
+                                body_type_check: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
                                 module_path_diagnostics: Err(error.clone()),
@@ -11872,6 +13379,7 @@ impl RootDatabase {
             for descriptor in &descriptors[group_start..group_end] {
                 let mut lowering_diagnostics = Vec::new();
                 let mut local_resolution = None;
+                let mut body_type_check = None;
                 let mut module_resolution = None;
                 let mut type_path_resolution = None;
                 let mut module_path_diagnostics = None;
@@ -12012,6 +13520,20 @@ impl RootDatabase {
                             };
                             match locals {
                                 Ok(locals) => {
+                                    let resolved_type_paths = type_path_resolution
+                                        .as_ref()
+                                        .and_then(|result| result.as_ref().ok())
+                                        .and_then(Option::as_ref);
+                                    body_type_check = Some(check_function_body_type(
+                                        &hir_owner,
+                                        body,
+                                        &locals,
+                                        resolved_type_paths,
+                                        &self.symbols,
+                                        &inputs,
+                                        snapshot,
+                                        &collection.target_cfg,
+                                    )?);
                                     let mut module_paths = match &module_scope {
                                         Ok(module_scope) => Ok(resolve_owner_module_paths(
                                             &locals,
@@ -12089,6 +13611,11 @@ impl RootDatabase {
                 })();
                 let local_resolution =
                     local_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
+                let body_type_check = body_type_check.map(Ok).unwrap_or_else(|| {
+                    resolution
+                        .clone()
+                        .map(|_| FunctionBodyTypeCheck::Unsupported)
+                });
                 let module_resolution =
                     module_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let type_path_resolution =
@@ -12113,6 +13640,7 @@ impl RootDatabase {
                     owner: descriptor.owner,
                     resolution,
                     local_resolution,
+                    body_type_check,
                     module_resolution,
                     type_path_resolution,
                     module_path_diagnostics,
@@ -12275,6 +13803,7 @@ impl RootDatabase {
                                 local_resolution: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
+                                literal_check: Err(error.clone()),
                                 module_path_diagnostics: Err(error.clone()),
                                 test_only_path_resolution: Err(error.clone()),
                                 test_only_diagnostics: Err(error.clone()),
@@ -12304,6 +13833,7 @@ impl RootDatabase {
                             OwnerControlFlowResolutionError,
                         >,
                         Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
+                        Result<ConstLiteralCheck, OwnerControlFlowResolutionError>,
                     ),
                     OwnerControlFlowResolutionError,
                 > = (|| {
@@ -12394,6 +13924,17 @@ impl RootDatabase {
                             ),
                             (_, _, Err(error)) => Err(error),
                         };
+                    let literal_check = check_const_literal_owner(
+                        &hir_owner,
+                        type_path_resolution
+                            .as_ref()
+                            .ok()
+                            .and_then(|resolution| resolution.as_ref()),
+                        &self.symbols,
+                        &inputs,
+                        snapshot,
+                        &collection.target_cfg,
+                    );
                     module_path_diagnostics = match (member_scopes, type_path_resolution.as_ref()) {
                         (Some(member_scopes), Ok(Some(path_resolution))) => Some(
                             self.type_owner_module_path_diagnostics(
@@ -12422,6 +13963,7 @@ impl RootDatabase {
                             type_path_resolution,
                             path_resolution,
                             non_expression_diagnostics,
+                            literal_check,
                         ));
                     };
                     let locals = match &module_aliases {
@@ -12477,6 +14019,7 @@ impl RootDatabase {
                                 type_path_resolution,
                                 path_resolution,
                                 test_only_diagnostics,
+                                literal_check,
                             ))
                         }
                         Err(error) => Ok((
@@ -12485,6 +14028,7 @@ impl RootDatabase {
                             type_path_resolution,
                             path_resolution,
                             non_expression_diagnostics,
+                            literal_check,
                         )),
                     }
                 })();
@@ -12494,8 +14038,10 @@ impl RootDatabase {
                     type_path_resolution,
                     test_only_path_resolution,
                     test_only_diagnostics,
+                    literal_check,
                 ) = analysis.unwrap_or_else(|error| {
                     (
+                        Err(error.clone()),
                         Err(error.clone()),
                         Err(error.clone()),
                         Err(error.clone()),
@@ -12513,6 +14059,7 @@ impl RootDatabase {
                     local_resolution,
                     module_resolution,
                     type_path_resolution,
+                    literal_check,
                     module_path_diagnostics,
                     test_only_path_resolution,
                     test_only_diagnostics,
@@ -17225,6 +18772,8 @@ impl RootDatabase {
 
         let mut external_worlds = Vec::new();
         let mut external_world_ids = HashSet::new();
+        let mut external_worlds_by_address = HashMap::new();
+        let mut incomplete_external_world_ids = HashSet::new();
         let mut external_exports = HashMap::new();
         if let Some(scopes) = wit_view_scopes {
             for view in scopes.views() {
@@ -17234,10 +18783,71 @@ impl RootDatabase {
                             OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch,
                         );
                     }
+                    let address = (
+                        view.view.unit.canonical_name().to_owned(),
+                        view.view.unit.stable_key().to_owned(),
+                        world.wit.raw(),
+                    );
+                    if external_worlds_by_address
+                        .insert(address, world.def)
+                        .is_some()
+                    {
+                        return Err(
+                            OwnerControlFlowResolutionError::WorldReferenceCollectionMismatch,
+                        );
+                    }
+                    if !view.view.complete {
+                        // Generated source views can be partial projections.
+                        // An omitted world function is not authoritative
+                        // evidence that the source package lacks that name.
+                        incomplete_external_world_ids.insert(world.def);
+                    }
                     external_worlds.push((world.def, world.import_fns.clone()));
                     external_exports.insert(world.def, world.export_fns.clone());
                 }
             }
+        }
+        let mut external_world_includes = HashMap::<DefId, Vec<DefId>>::new();
+        if let Some(scopes) = wit_view_scopes {
+            for view in scopes.views() {
+                for world in view.view.worlds.values() {
+                    let model = &view.view.model.worlds[world.wit];
+                    let mut targets = Vec::with_capacity(model.includes.len());
+                    for include in &model.includes {
+                        let address = (
+                            include.unit.canonical_name().to_owned(),
+                            include.unit.stable_key().to_owned(),
+                            include.world.raw(),
+                        );
+                        if let Some(target) = external_worlds_by_address.get(&address).copied() {
+                            targets.push(target);
+                        } else {
+                            // A WIT view can resolve a complete facade world
+                            // whose included package world is unavailable in
+                            // this active closure. Its member set is still
+                            // incomplete for downstream name lookup.
+                            incomplete_external_world_ids.insert(world.def);
+                        }
+                    }
+                    external_world_includes.insert(world.def, targets);
+                }
+            }
+        }
+        loop {
+            let newly_incomplete = external_world_includes
+                .iter()
+                .filter(|(_, targets)| {
+                    targets
+                        .iter()
+                        .any(|target| incomplete_external_world_ids.contains(target))
+                })
+                .map(|(world, _)| *world)
+                .filter(|world| !incomplete_external_world_ids.contains(world))
+                .collect::<Vec<_>>();
+            if newly_incomplete.is_empty() {
+                break;
+            }
+            incomplete_external_world_ids.extend(newly_incomplete);
         }
 
         let local_world_ids = descriptors
@@ -17370,7 +18980,14 @@ impl RootDatabase {
                     break;
                 }
                 for target in include_targets.get(&current).into_iter().flatten().rev() {
-                    if external_world_ids.contains(target) || cyclic_worlds.contains(target) {
+                    if external_world_ids.contains(target) {
+                        if incomplete_external_world_ids.contains(target) {
+                            incomplete = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    if cyclic_worlds.contains(target) {
                         continue;
                     }
                     if local_world_ids.contains(target) {
@@ -18372,9 +19989,7 @@ impl RootDatabase {
                 Vec::new(),
             ));
         }
-        let found_world = view.worlds.values().find(|world| {
-            canonical_wit_path_name(&view.model.worlds[world.wit].name) == requested_name
-        });
+        let found_world = wit_view_world_by_name(view, &requested_name);
         if let Some(world) = found_world {
             if position == WorldReferencePosition::Include
                 && let Some(unsupported) = view.model.worlds[world.wit].unsupported
@@ -22002,6 +23617,51 @@ mod tests {
         (database, module_tree.as_ref().clone(), snapshot, package)
     }
 
+    fn generated_wit_for_source(source: &[u8]) -> (WitUnit, WitPackageResult) {
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source, b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated WIT package query completes");
+        assert!(
+            result.failure.is_none(),
+            "generated source remains parseable: {:?}",
+            result.failure
+        );
+        (unit, result)
+    }
+
+    fn generated_text_for_unit(result: &WitPackageResult, unit: &WitUnit) -> Arc<GeneratedText> {
+        result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == unit)
+            .map(|(_, generated)| Arc::clone(generated))
+            .expect("the generated root text is retained")
+    }
+
     fn phase1_snapshot_from_vfs(
         database: &mut RootDatabase,
         module_tree: &ModuleTree,
@@ -22823,6 +24483,1009 @@ mod tests {
                 .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::ShadowsModule),
             "the root module's alias does not leak into the child module"
         );
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_only_a_direct_parameter_tail() {
+        let root = concat!(
+            "pub fn identity(value: I32) -> I32 { value }\n",
+            "pub fn mismatch(value: I32) -> Bool { value }\n",
+            "pub fn discard(value: I32) { value }\n",
+            "pub fn discard_explicit(value: I32) -> () { value }\n",
+            "pub fn computed(value: I32) -> I32 { value + 1 }\n",
+            "pub fn self_param(self: I32) -> I32 { self }\n",
+            "pub fn string_identity(value: Str) -> Str { value }\n",
+            "pub fn mutable_identity(var value: I32) -> I32 { value }\n",
+            "pub fn identityValue(value: I32) -> I32 { value }\n",
+            "pub fn parameter_case(valueItem: I32) -> I32 { valueItem }\n",
+            "pub fn identité(value: I32) -> I32 { value }\n",
+            "pub fn non_ascii_param(valué: I32) -> I32 { valué }\n",
+            "pub fn r#raw_function(value: I32) -> I32 { value }\n",
+            "pub fn raw_parameter(r#value: I32) -> I32 { r#value }\n",
+            "pub fn raw_tail(value: I32) -> I32 { r#value }\n",
+            "pub fn raw_type(value: r#I32) -> r#I32 { value }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 16);
+        assert!(matches!(
+            resolved.owners()[0]
+                .body_type_check()
+                .expect("identity body check succeeds"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+
+        let mismatch = resolved.owners()[1]
+            .body_type_check()
+            .expect("mismatched body check succeeds");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = mismatch else {
+            panic!("primitive parameter tail is in the supported checking slice");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_eq!(diagnostics[0].message, "expected `Bool`, found `I32`");
+        let value_start = root
+            .find("pub fn mismatch(value: I32) -> Bool { ")
+            .expect("mismatched body exists") as u32
+            + "pub fn mismatch(value: I32) -> Bool { ".len() as u32;
+        assert_eq!(
+            diagnostics[0]
+                .primary()
+                .expect("type mismatch points at the body tail")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(value_start),
+                sai_diagnostics::TextSize::new(value_start + "value".len() as u32),
+            )
+            .expect("body tail range is ordered")
+        );
+
+        for owner in &resolved.owners()[2..4] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("unit-returning body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+
+        for owner in &resolved.owners()[4..] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("unsupported body check succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_direct_scalar_literal_tails_without_parameters() {
+        let root = concat!(
+            "pub fn identity(value: I32) -> I32 { value }\n",
+            "pub fn integer() -> I32 { 42 }\n",
+            "pub fn boolean() -> Bool { true }\n",
+            "pub fn byte() -> Byte { b'z' }\n",
+            "pub fn character() -> Char { 'z' }\n",
+            "pub fn float() -> F32 { 1.25 }\n",
+            "pub fn signed_minimum() -> I8 { -128 }\n",
+            "pub fn builtin_int_alias() -> Int { 42 }\n",
+            "pub fn builtin_uint_alias() -> UInt { 42 }\n",
+            "pub fn mismatch() -> Bool { 42 }\n",
+            "pub fn integer_overflow() -> I8 { 128 }\n",
+            "pub fn pointer_overflow() -> USize { 4294967296 }\n",
+            "pub fn omitted_return() { 1 }\n",
+            "pub fn unit_return() -> () { () }\n",
+            "pub fn string_return() -> Str { \"text\" }\n",
+            "pub fn byte_string_return() -> Byte { b\"text\" }\n",
+            "pub fn expression() -> I32 { 40 + 2 }\n",
+            "type Number = I32\n",
+            "pub fn user_alias_return() -> Number { 42 }\n",
+            "pub fn unit_empty_body() -> () {}\n",
+            "pub fn unit_non_unit_tail() -> () { 42 }\n",
+            "pub fn omitted_unit_return() { () }\n",
+            "pub fn unit_with_statement() -> () { let value = (); () }\n",
+            "pub fn primitive_unit_tail() -> I32 { () }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 23);
+        for owner in &owners[..9] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("direct function body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        for index in [13, 18] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("explicit unit body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+
+        for (index, expected_code, expected_message, function, literal) in [
+            (
+                9,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `Bool`, found an integer literal",
+                "mismatch",
+                "42",
+            ),
+            (
+                10,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                "integer literal is out of range for `I8`",
+                "integer_overflow",
+                "128",
+            ),
+            (
+                11,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                "integer literal is out of range for `USize`",
+                "pointer_overflow",
+                "4294967296",
+            ),
+        ] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
+                .body_type_check()
+                .expect("supported direct literal mismatch is diagnosed")
+            else {
+                panic!("direct primitive literal mismatch remains in the supported slice");
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, expected_code);
+            assert_eq!(diagnostics[0].message, expected_message);
+            let function_start = root
+                .find(&format!("pub fn {function}"))
+                .expect("function exists");
+            let start = (function_start
+                + root[function_start..]
+                    .find(literal)
+                    .expect("literal exists in function")) as u32;
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("direct literal diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + literal.len() as u32),
+                )
+                .expect("literal range is ordered")
+            );
+        }
+
+        for owner in owners[12..13]
+            .iter()
+            .chain(owners[14..18].iter())
+            .chain(owners[19..].iter())
+        {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("unsupported function body check succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
+        assert!(
+            owners[17]
+                .type_path_resolution()
+                .expect("user-defined alias path resolution succeeds")
+                .expect("user-defined alias owner has type-path results")
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::Alias, _))),
+            "the gated return type must resolve to a user-defined alias"
+        );
+    }
+
+    #[test]
+    fn function_body_type_check_checks_one_annotated_primitive_local() {
+        let root = concat!(
+            "pub fn local() -> I32 {\n    let value: I32 = 42\n    value\n}\n",
+            "pub fn initializer_mismatch() -> I32 {\n    let value: I32 = true\n    value\n}\n",
+            "pub fn initializer_overflow() -> I8 {\n    let value: I8 = 128\n    value\n}\n",
+            "pub fn return_mismatch() -> Bool {\n    let value: I32 = 42\n    value\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 4);
+        let local_check = resolved.owners()[0]
+            .body_type_check()
+            .expect("supported local body check succeeds");
+        assert!(
+            matches!(
+                local_check,
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ),
+            "{local_check:?}"
+        );
+
+        for (index, expected_code, expected_message, function, token) in [
+            (
+                1,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `I32`, found a Bool literal",
+                "initializer_mismatch",
+                "true",
+            ),
+            (
+                2,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                "integer literal is out of range for `I8`",
+                "initializer_overflow",
+                "128",
+            ),
+            (
+                3,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `Bool`, found `I32`",
+                "return_mismatch",
+                "value",
+            ),
+        ] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
+                .body_type_check()
+                .expect("supported local error is reported")
+            else {
+                panic!("a semantic error must not turn a supported local body into a gate");
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, expected_code);
+            assert_eq!(diagnostics[0].message, expected_message);
+            let function_start = root
+                .find(&format!("pub fn {function}"))
+                .expect("function exists");
+            let function_end = root[function_start..]
+                .find("\npub fn ")
+                .map_or(root.len(), |offset| function_start + offset);
+            let function_text = &root[function_start..function_end];
+            let relative_start = if function == "return_mismatch" {
+                function_text.rfind(token)
+            } else {
+                function_text.find(token)
+            }
+            .expect("diagnostic token exists in function");
+            let start = (function_start + relative_start) as u32;
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("body type diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + token.len() as u32),
+                )
+                .expect("diagnostic token range is ordered")
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_keeps_other_local_forms_unsupported() {
+        let root = concat!(
+            "type Number = I32\n",
+            "pub fn unannotated() -> I32 {\n    let value = 42\n    value\n}\n",
+            "pub fn mutable() -> I32 {\n    var value: I32 = 42\n    value\n}\n",
+            "pub fn mutable_let() -> I32 {\n    let var value: I32 = 42\n    value\n}\n",
+            "pub fn computed() -> I32 {\n    let value: I32 = 40 + 2\n    value\n}\n",
+            "pub fn multiple() -> I32 {\n    let first: I32 = 1\n    let second: I32 = 2\n    first\n}\n",
+            "pub fn nested() -> I32 {\n    let value: I32 = 42\n    { value }\n}\n",
+            "pub fn camel_local() -> I32 {\n    let valueName: I32 = 42\n    valueName\n}\n",
+            "pub fn raw_local() -> I32 {\n    let r#value: I32 = 42\n    r#value\n}\n",
+            "pub fn destructured() -> I32 {\n    let (first, second): (I32, I32) = (1, 2)\n    first\n}\n",
+            "pub fn alias() -> I32 {\n    let value: Number = 42\n    value\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 10);
+        for owner in resolved.owners() {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("unsupported local form is gated"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_checks_both_direct_if_literal_branches() {
+        let root = concat!(
+            "pub fn selected_then() -> I32 { if true { 1 } else { 2 } }\n",
+            "pub fn selected_else() -> I32 { if false { 3 } else { 4 } }\n",
+            "pub fn unselected_else_mismatch() -> I32 { if true { 5 } else { false } }\n",
+            "pub fn unselected_then_mismatch() -> I32 { if false { false } else { 6 } }\n",
+            "pub fn both_branches_overflow() -> I8 { if true { 128 } else { -129 } }\n",
+            "pub fn missing_else() -> I32 { if true { 1 } }\n",
+            "pub fn nonliteral_condition() -> I32 { if 1 { 1 } else { 2 } }\n",
+            "pub fn nested_else_if() -> I32 { if true { 1 } else if false { 2 } else { 3 } }\n",
+            "pub fn branch_statement() -> I32 { if true { let value = 1\nvalue } else { 2 } }\n",
+            "pub fn unit_branch() -> I32 { if true { () } else { () } }\n",
+            "pub fn expression_branch() -> I32 { if true { 1 + 2 } else { 3 } }\n",
+            "pub fn string_branch() -> I32 { if true { \"text\" } else { \"other\" } }\n",
+            "pub fn tuple_branch() -> I32 { if true { (1, 2) } else { (3, 4) } }\n",
+            "pub fn unit_result() -> () { if true { () } else { () } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 14);
+
+        for index in [0, 1] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("both valid if branches are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+
+        for (index, expected_code, expected_message, function, literal) in [
+            (
+                2,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `I32`, found a Bool literal",
+                "unselected_else_mismatch",
+                "false",
+            ),
+            (
+                3,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `I32`, found a Bool literal",
+                "unselected_then_mismatch",
+                "false",
+            ),
+        ] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
+                .body_type_check()
+                .expect("unselected branch mismatch is checked")
+            else {
+                panic!("direct if literal branches stay in the supported slice");
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, expected_code);
+            assert_eq!(diagnostics[0].message, expected_message);
+
+            let function_start = root
+                .find(&format!("pub fn {function}"))
+                .expect("function exists");
+            let function_end = root[function_start..]
+                .find('\n')
+                .map_or(root.len(), |offset| function_start + offset);
+            let function_source = &root[function_start..function_end];
+            let start = (function_start
+                + function_source
+                    .rfind(literal)
+                    .expect("mismatched unselected branch literal exists"))
+                as u32;
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("branch mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + literal.len() as u32),
+                )
+                .expect("branch literal range is ordered")
+            );
+        }
+
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: both_branch_diagnostics,
+        } = owners[4]
+            .body_type_check()
+            .expect("both branches are checked even when one is unselected")
+        else {
+            panic!("direct if literal branches stay in the supported slice");
+        };
+        assert_eq!(both_branch_diagnostics.len(), 2);
+        assert!(
+            both_branch_diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::LiteralOutOfRange)
+        );
+        let branch_starts = both_branch_diagnostics
+            .iter()
+            .map(|diagnostic| {
+                diagnostic
+                    .primary()
+                    .expect("range diagnostic has a primary span")
+                    .span
+                    .range
+                    .start()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            branch_starts[0] < branch_starts[1],
+            "both-branch diagnostics must retain then/else source order"
+        );
+        let both_function_start = root
+            .find("pub fn both_branches_overflow")
+            .expect("overflow function exists");
+        for (diagnostic, literal) in both_branch_diagnostics.iter().zip(["128", "-129"]) {
+            let start = (both_function_start
+                + root[both_function_start..]
+                    .find(literal)
+                    .expect("overflow branch literal exists")) as u32;
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("range diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + literal.len() as u32),
+                )
+                .expect("overflow branch range is ordered")
+            );
+        }
+
+        for owner in &owners[5..] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("unsupported if form check succeeds"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_only_the_bool_parameter_if_condition() {
+        let root = concat!(
+            "const OTHER: Bool = true\n",
+            "type BoolAlias = Bool\n",
+            "pub fn selected(flag: Bool) -> I32 { if flag { 1 } else { 2 } }\n",
+            "pub fn wrong_parameter_type(flag: I32) -> I32 { if flag { 1 } else { 2 } }\n",
+            "pub fn aliased_parameter_type(flag: BoolAlias) -> I32 { if flag { 1 } else { 2 } }\n",
+            "pub fn other_binding(flag: Bool) -> I32 { if OTHER { 1 } else { 2 } }\n",
+            "pub fn mutable_parameter(var flag: Bool) -> I32 { if flag { 1 } else { 2 } }\n",
+            "pub fn self_parameter(self: Bool) -> I32 { if self { 1 } else { 2 } }\n",
+            "pub fn multiple_parameters(flag: Bool, other: Bool) -> I32 { if flag { 1 } else { 2 } }\n",
+            "pub fn non_path_condition(flag: Bool) -> I32 { if 1 { 1 } else { 2 } }\n",
+            "pub fn direct_literal_condition(flag: Bool) -> I32 { if true { 1 } else { 2 } }\n",
+            "pub fn missing_else(flag: Bool) -> I32 { if flag { 1 } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 10);
+
+        assert!(matches!(
+            owners[0]
+                .body_type_check()
+                .expect("the bool parameter path is type-checked"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        for (index, owner) in owners.iter().enumerate().skip(1) {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported parameter condition is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_checks_a_primitive_parameter_against_a_literal_condition() {
+        let root = concat!(
+            "const OTHER: I8 = 1\n",
+            "type I8Alias = I8\n",
+            "pub fn bool_equal(value: Bool) -> I32 { if value == true { 1 } else { 2 } }\n",
+            "pub fn integer_less(value: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+            "pub fn float_greater_equal(value: F64) -> I32 { if value >= 1.5 { 1 } else { 2 } }\n",
+            "pub fn character_less(value: Char) -> I32 { if value < 'z' { 1 } else { 2 } }\n",
+            "pub fn byte_equal(value: Byte) -> I32 { if value == b'Z' { 1 } else { 2 } }\n",
+            "pub fn pointer_sized(value: ISize) -> I32 { if value >= 0 { 1 } else { 2 } }\n",
+            "pub fn literal_on_left(value: I8) -> I32 { if 10 < value { 1 } else { 2 } }\n",
+            "pub fn bool_literal_on_left(value: Bool) -> I32 { if false < value { 1 } else { 2 } }\n",
+            "pub fn char_literal_on_left(value: Char) -> I32 { if 'a' < value { 1 } else { 2 } }\n",
+            "pub fn byte_literal_on_left(value: Byte) -> I32 { if b'A' < value { 1 } else { 2 } }\n",
+            "pub fn not_parameter_literal(value: I8) -> I32 { if not (value < 10) { 1 } else { 2 } }\n",
+            "pub fn not_literal_parameter(value: F32) -> I32 { if not (1.5 < value) { 1 } else { 2 } }\n",
+            "pub fn wrong_literal_type(value: I8) -> I32 { if value < true { 1 } else { 2 } }\n",
+            "pub fn wrong_fixed_literal_type_on_left(value: I8) -> I32 { if true < value { 1 } else { 2 } }\n",
+            "pub fn integer_literal_left_wrong_type(value: F32) -> I32 { if 10 < value { 1 } else { 2 } }\n",
+            "pub fn float_literal_left_wrong_type(value: I8) -> I32 { if 1.5 < value { 1 } else { 2 } }\n",
+            "pub fn integer_out_of_range(value: I8) -> I32 { if value < 128 { 1 } else { 2 } }\n",
+            "pub fn condition_and_branch_errors(value: I8) -> I8 { if value < 128 { true } else { 128 } }\n",
+            "pub fn not_condition_and_branch_errors(value: I8) -> I8 { if not (128 < value) { true } else { 128 } }\n",
+            "pub fn constant_on_right(value: I8) -> I32 { if value < OTHER { 1 } else { 2 } }\n",
+            "pub fn nested_right_operand(value: I8) -> I32 { if value < 1 + 2 { 1 } else { 2 } }\n",
+            "pub fn mixed_condition(value: I8) -> I32 { if value < 1 and true { 1 } else { 2 } }\n",
+            "pub fn two_parameters(value: I8, other: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+            "pub fn double_negated_comparison(value: I8) -> I32 { if not not (value < 10) { 1 } else { 2 } }\n",
+            "pub fn negated_mixed_condition(value: I8) -> I32 { if not (value < 1 and true) { 1 } else { 2 } }\n",
+            "pub fn negated_two_parameters(value: I8, other: I8) -> I32 { if not (10 < value) { 1 } else { 2 } }\n",
+            "pub fn aliased_parameter(value: I8Alias) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+            "pub fn string_parameter(value: Str) -> I32 { if value == \"x\" { 1 } else { 2 } }\n",
+            "pub fn unit_parameter(value: ()) -> I32 { if value == () { 1 } else { 2 } }\n",
+            "pub fn mutable_parameter(var value: I8) -> I32 { if value < 10 { 1 } else { 2 } }\n",
+            "pub fn missing_else(value: I8) -> I32 { if value < 10 { 1 } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 31);
+
+        for index in 0..12 {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("primitive parameter comparisons with matching literals are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        assert!(matches!(
+            owners[12]
+                .body_type_check()
+                .expect("literal type mismatch is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        assert!(matches!(
+            owners[13]
+                .body_type_check()
+                .expect("fixed-type left literal mismatch is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        assert!(matches!(
+            owners[14]
+                .body_type_check()
+                .expect("integer left literal type mismatch is diagnosed at the parameter"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        assert!(matches!(
+            owners[15]
+                .body_type_check()
+                .expect("float left literal type mismatch is diagnosed at the parameter"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::TypeMismatch
+        ));
+        assert!(matches!(
+            owners[16]
+                .body_type_check()
+                .expect("literal range error is diagnosed"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.len() == 1
+                    && diagnostics[0].code == sai_diagnostics::Code::LiteralOutOfRange
+        ));
+        assert!(matches!(
+            owners[17]
+                .body_type_check()
+                .expect("condition and both branches are checked in source order"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.iter().map(|diagnostic| diagnostic.code).collect::<Vec<_>>()
+                    == [
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        sai_diagnostics::Code::TypeMismatch,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                    ]
+        ));
+        assert!(matches!(
+            owners[18]
+                .body_type_check()
+                .expect("a negated condition still checks its comparison and branches in order"),
+            FunctionBodyTypeCheck::Supported { diagnostics }
+                if diagnostics.iter().map(|diagnostic| diagnostic.code).collect::<Vec<_>>()
+                    == [
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        sai_diagnostics::Code::TypeMismatch,
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                    ]
+        ));
+        for (index, owner) in owners.iter().enumerate().skip(19) {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported parameter-literal comparison shape is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_not_of_the_bool_parameter_condition() {
+        let root = concat!(
+            "const OTHER: Bool = true\n",
+            "type BoolAlias = Bool\n",
+            "pub fn negated(flag: Bool) -> I32 { if not flag { 1 } else { 2 } }\n",
+            "pub fn nested_not(flag: Bool) -> I32 { if not not flag { 1 } else { 2 } }\n",
+            "pub fn other_binding(flag: Bool) -> I32 { if not OTHER { 1 } else { 2 } }\n",
+            "pub fn wrong_parameter_type(flag: I32) -> I32 { if not flag { 1 } else { 2 } }\n",
+            "pub fn aliased_parameter_type(flag: BoolAlias) -> I32 { if not flag { 1 } else { 2 } }\n",
+            "pub fn logical_and(flag: Bool) -> I32 { if flag and true { 1 } else { 2 } }\n",
+            "pub fn negated_literal_without_parameter() -> I32 { if not true { 1 } else { 2 } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 7);
+
+        assert!(matches!(
+            owners[0]
+                .body_type_check()
+                .expect("one not operator over the bool parameter is supported"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+        for (index, owner) in owners.iter().enumerate().skip(1) {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported negated condition is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_and_of_two_bool_parameters() {
+        let root = concat!(
+            "const OTHER: Bool = true\n",
+            "type BoolAlias = Bool\n",
+            "pub fn conjunction(flag: Bool, other: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
+            "pub fn reversed_conjunction(other: Bool, flag: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
+            "pub fn repeated_operand(flag: Bool, other: Bool) -> I32 { if flag and flag { 1 } else { 2 } }\n",
+            "pub fn other_binding(flag: Bool, other: Bool) -> I32 { if flag and OTHER { 1 } else { 2 } }\n",
+            "pub fn wrong_parameter_type(flag: I32, other: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
+            "pub fn aliased_parameter_type(flag: BoolAlias, other: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
+            "pub fn mutable_parameter(var flag: Bool, other: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
+            "pub fn self_parameter(self: Bool, other: Bool) -> I32 { if self and other { 1 } else { 2 } }\n",
+            "pub fn unary_operand(flag: Bool, other: Bool) -> I32 { if not flag and other { 1 } else { 2 } }\n",
+            "pub fn one_parameter(flag: Bool) -> I32 { if flag and true { 1 } else { 2 } }\n",
+            "pub fn three_parameters(flag: Bool, other: Bool, extra: Bool) -> I32 { if flag and other { 1 } else { 2 } }\n",
+            "pub fn nonconditional_body(flag: Bool, other: Bool) -> I32 { flag }\n",
+            "pub fn missing_else(flag: Bool, other: Bool) -> I32 { if flag and other { 1 } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 13);
+
+        for index in [0, 1] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("both distinct bool parameter paths are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        for (index, owner) in owners.iter().enumerate().skip(2) {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported two-parameter form is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_only_or_of_two_bool_parameters() {
+        let root = concat!(
+            "pub fn disjunction(left: Bool, right: Bool) -> I32 { if left or right { 1 } else { 2 } }\n",
+            "pub fn reversed_disjunction(right: Bool, left: Bool) -> I32 { if left or right { 1 } else { 2 } }\n",
+            "pub fn mixed_operators(left: Bool, right: Bool) -> I32 { if left and right or left { 1 } else { 2 } }\n",
+            "pub fn nested_right(left: Bool, right: Bool) -> I32 { if left or (right and left) { 1 } else { 2 } }\n",
+            "pub fn nested_left(left: Bool, right: Bool) -> I32 { if (left or right) and left { 1 } else { 2 } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 5);
+
+        for index in [0, 1] {
+            assert!(matches!(
+                owners[index]
+                    .body_type_check()
+                    .expect("both operand orders of the bool-parameter or are checked"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+        for (index, owner) in owners.iter().enumerate().skip(2) {
+            let check = owner
+                .body_type_check()
+                .expect("mixed or nested boolean operator is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_same_primitive_comparisons_of_two_parameters() {
+        let root = concat!(
+            "const OTHER: Bool = true\n",
+            "type BoolAlias = Bool\n",
+            "type IntegerAlias = I32\n",
+            "pub fn equal(left: Bool, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn reversed_equal(right: Bool, left: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn not_equal(left: Bool, right: Bool) -> I32 { if left != right { 1 } else { 2 } }\n",
+            "pub fn reversed_not_equal(right: Bool, left: Bool) -> I32 { if left != right { 1 } else { 2 } }\n",
+            "pub fn less(left: Bool, right: Bool) -> I32 { if left < right { 1 } else { 2 } }\n",
+            "pub fn reversed_less(left: Bool, right: Bool) -> I32 { if right < left { 1 } else { 2 } }\n",
+            "pub fn less_equal(left: Bool, right: Bool) -> I32 { if left <= right { 1 } else { 2 } }\n",
+            "pub fn reversed_less_equal(left: Bool, right: Bool) -> I32 { if right <= left { 1 } else { 2 } }\n",
+            "pub fn greater(left: Bool, right: Bool) -> I32 { if left > right { 1 } else { 2 } }\n",
+            "pub fn reversed_greater(left: Bool, right: Bool) -> I32 { if right > left { 1 } else { 2 } }\n",
+            "pub fn greater_equal(left: Bool, right: Bool) -> I32 { if left >= right { 1 } else { 2 } }\n",
+            "pub fn reversed_greater_equal(left: Bool, right: Bool) -> I32 { if right >= left { 1 } else { 2 } }\n",
+            "pub fn signed_integer(left: I32, right: I32) -> I32 { if left < right { 1 } else { 2 } }\n",
+            "pub fn unsigned_integer(left: U32, right: U32) -> I32 { if left <= right { 1 } else { 2 } }\n",
+            "pub fn float32(left: F32, right: F32) -> I32 { if left > right { 1 } else { 2 } }\n",
+            "pub fn float64(left: F64, right: F64) -> I32 { if left >= right { 1 } else { 2 } }\n",
+            "pub fn character(left: Char, right: Char) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn byte(left: Byte, right: Byte) -> I32 { if left != right { 1 } else { 2 } }\n",
+            "pub fn signed_pointer(left: ISize, right: ISize) -> I32 { if left < right { 1 } else { 2 } }\n",
+            "pub fn unsigned_pointer(left: USize, right: USize) -> I32 { if left >= right { 1 } else { 2 } }\n",
+            "pub fn builtin_int_alias(left: Int, right: Int) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn builtin_uint_alias(left: UInt, right: UInt) -> I32 { if left != right { 1 } else { 2 } }\n",
+            "pub fn negated_bool_comparison(left: Bool, right: Bool) -> I32 { if not (left < right) { 1 } else { 2 } }\n",
+            "pub fn negated_float_comparison(left: F32, right: F32) -> I32 { if not (right <= left) { 1 } else { 2 } }\n",
+            "pub fn negated_and(left: Bool, right: Bool) -> I32 { if not (left and right) { 1 } else { 2 } }\n",
+            "pub fn negated_or(left: Bool, right: Bool) -> I32 { if not (right or left) { 1 } else { 2 } }\n",
+            "pub fn other_primitive_type(left: I32, right: U32) -> I32 { if left < right { 1 } else { 2 } }\n",
+            "pub fn aliased_primitive_type(left: IntegerAlias, right: IntegerAlias) -> I32 { if left < right { 1 } else { 2 } }\n",
+            "pub fn string_type(left: Str, right: Str) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn double_negated_comparison(left: Bool, right: Bool) -> I32 { if not not (left < right) { 1 } else { 2 } }\n",
+            "pub fn negated_mixed_comparison(left: Bool, right: Bool) -> I32 { if not (left < right and left) { 1 } else { 2 } }\n",
+            "pub fn double_negated_and(left: Bool, right: Bool) -> I32 { if not not (left and right) { 1 } else { 2 } }\n",
+            "pub fn double_negated_or(left: Bool, right: Bool) -> I32 { if not not (left or right) { 1 } else { 2 } }\n",
+            "pub fn chained_negated_and(left: Bool, right: Bool) -> I32 { if not (left and right and left) { 1 } else { 2 } }\n",
+            "pub fn chained_negated_or(left: Bool, right: Bool) -> I32 { if not (left or right or left) { 1 } else { 2 } }\n",
+            "pub fn negated_repeated_operand(left: Bool, right: Bool) -> I32 { if not (left and left) { 1 } else { 2 } }\n",
+            "pub fn integer_and(left: I32, right: I32) -> I32 { if left and right { 1 } else { 2 } }\n",
+            "pub fn integer_or(left: I32, right: I32) -> I32 { if left or right { 1 } else { 2 } }\n",
+            "pub fn repeated_operand(left: Bool, right: Bool) -> I32 { if left == left { 1 } else { 2 } }\n",
+            "pub fn other_binding(left: Bool, right: Bool) -> I32 { if left == OTHER { 1 } else { 2 } }\n",
+            "pub fn non_path_operand(left: Bool, right: Bool) -> I32 { if left == true { 1 } else { 2 } }\n",
+            "pub fn mixed_expression(left: Bool, right: Bool) -> I32 { if left == right and left { 1 } else { 2 } }\n",
+            "pub fn nested_expression(left: Bool, right: Bool) -> I32 { if (left == right) == true { 1 } else { 2 } }\n",
+            "pub fn wrong_parameter_type(left: I32, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn aliased_parameter_type(left: BoolAlias, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn mutable_parameter(var left: Bool, right: Bool) -> I32 { if left == right { 1 } else { 2 } }\n",
+            "pub fn self_parameter(self: Bool, right: Bool) -> I32 { if self == right { 1 } else { 2 } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 47);
+
+        for index in 0..26 {
+            let check = owners[index]
+                .body_type_check()
+                .expect("all same-primitive comparisons and operand orders are checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the supported comparison slice: {check:?}"
+            );
+        }
+        for (index, owner) in owners.iter().enumerate().skip(26) {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported comparison or operand form is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the bounded slice: {check:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_mixed_logical_parameter_and_comparison_conditions() {
+        let root = concat!(
+            "type BoolAlias = Bool\n",
+            "pub fn bool_first(enabled: Bool, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+            "pub fn bool_second(value: I32, enabled: Bool) -> I32 { if value < 20 and enabled { 1 } else { 2 } }\n",
+            "pub fn literal_left(enabled: Bool, value: U8) -> I32 { if enabled and 18 <= value { 1 } else { 2 } }\n",
+            "pub fn literal_right(value: I32, enabled: Bool) -> I32 { if 10 < value and enabled { 1 } else { 2 } }\n",
+            "pub fn disjunction(enabled: Bool, value: I32) -> I32 { if enabled or value >= 18 { 1 } else { 2 } }\n",
+            "pub fn disjunction_reversed(value: I32, enabled: Bool) -> I32 { if value < 20 or enabled { 1 } else { 2 } }\n",
+            "pub fn disjunction_literal_left(enabled: Bool, value: U8) -> I32 { if 18 <= value or enabled { 1 } else { 2 } }\n",
+            "pub fn negated_condition(enabled: Bool, value: I32) -> I32 { if not (enabled and value >= 18) { 1 } else { 2 } }\n",
+            "pub fn negated_disjunction(value: I32, enabled: Bool) -> I32 { if not (value < 20 or enabled) { 1 } else { 2 } }\n",
+            "pub fn negated_comparison(enabled: Bool, value: I32) -> I32 { if enabled and not (value >= 18) { 1 } else { 2 } }\n",
+            "pub fn negated_disjunction_comparison(enabled: Bool, value: I32) -> I32 { if enabled or not (value >= 18) { 1 } else { 2 } }\n",
+            "pub fn negated_comparison_reversed(value: U8, enabled: Bool) -> I32 { if not (18 <= value) and enabled { 1 } else { 2 } }\n",
+            "pub fn negated_disjunction_reversed(value: I32, enabled: Bool) -> I32 { if not (value < 20) or enabled { 1 } else { 2 } }\n",
+            "pub fn negated_comparison_twice(enabled: Bool, value: I32) -> I32 { if enabled and not (not (value >= 18)) { 1 } else { 2 } }\n",
+            "pub fn nested_condition(enabled: Bool, value: I32) -> I32 { if enabled and (value > 0 and value < 10) { 1 } else { 2 } }\n",
+            "pub fn negated_nested_condition(enabled: Bool, value: I32) -> I32 { if not (enabled and (value > 0 and value < 10)) { 1 } else { 2 } }\n",
+            "pub fn negated_nested_disjunction(enabled: Bool, value: I32) -> I32 { if not (enabled or (value > 0 or value < 10)) { 1 } else { 2 } }\n",
+            "pub fn negated_bool_path(enabled: Bool, value: I32) -> I32 { if not (not enabled and value >= 18) { 1 } else { 2 } }\n",
+            "pub fn repeated_parameter(enabled: Bool, value: I32) -> I32 { if enabled and enabled >= 18 { 1 } else { 2 } }\n",
+            "pub fn disjunction_repeated_parameter(enabled: Bool, value: I32) -> I32 { if enabled or enabled >= 18 { 1 } else { 2 } }\n",
+            "pub fn negated_repeated_parameter(enabled: Bool, value: I32) -> I32 { if not (enabled and enabled >= 18) { 1 } else { 2 } }\n",
+            "pub fn negated_repeated_disjunction(enabled: Bool, value: I32) -> I32 { if not (enabled or enabled >= 18) { 1 } else { 2 } }\n",
+            "pub fn double_negated_condition(enabled: Bool, value: I32) -> I32 { if not not (enabled and value >= 18) { 1 } else { 2 } }\n",
+            "pub fn double_negated_disjunction(enabled: Bool, value: I32) -> I32 { if not not (enabled or value >= 18) { 1 } else { 2 } }\n",
+            "pub fn aliased_bool(enabled: BoolAlias, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+            "pub fn wrong_bool_type(enabled: I32, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+            "pub fn extra_parameter(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 27);
+
+        for index in 0..13 {
+            let check = owners[index]
+                .body_type_check()
+                .expect("both logical and comparison operand orders are checked");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {index} unexpectedly failed the mixed condition slice: {check:?}"
+            );
+        }
+        for (index, owner) in owners.iter().enumerate().skip(13) {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported mixed condition shape is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the mixed condition slice: {check:?}"
+            );
+        }
     }
 
     #[test]
@@ -24290,6 +26953,778 @@ mod tests {
                 .any(|path| path.base == Res::PrimTy(sai_resolve::prelude::PrimTy::U32)),
             "initializer body annotations participate in type-head resolution"
         );
+    }
+
+    #[test]
+    fn const_primitive_literal_check_uses_resolved_types_and_hir_literals() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub type Alias = U8\n",
+            "pub const BOOL_TRUE: Bool = true\n",
+            "pub const BOOL_FALSE: Bool = false\n",
+            "pub const I8_MIN: I8 = -128\n",
+            "pub const I8_MAX: I8 = 127\n",
+            "pub const I8_LOW: I8 = -129\n",
+            "pub const I8_HIGH: I8 = 128\n",
+            "pub const U8_MAX: U8 = 255\n",
+            "pub const U8_HIGH: U8 = 256\n",
+            "pub const U8_NEG_ZERO: U8 = -0\n",
+            "pub const U8_NEG_ONE: U8 = -1\n",
+            "pub const BOOL_MISMATCH: Bool = 1\n",
+            "pub const INT_MISMATCH: I16 = false\n",
+            "pub const INT64_HIGH: I64 = 9223372036854775808\n",
+            "pub const UINT64_MAX: U64 = 18446744073709551615\n",
+            "pub const UINT64_HIGH: U64 = 18446744073709551616\n",
+            "pub const TOO_WIDE: I64 = 340282366920938463463374607431768211456\n",
+            "pub const ALIAS_TYPE: Alias = 1\n",
+            "pub const BLOCK: Bool = { true }\n",
+            "const PRIVATE: Bool = true\n",
+            "pub const INT_MIN: Int = -9223372036854775808\n",
+            "pub const UINT_MAX: UInt = 18446744073709551615\n",
+            "pub const INT_HIGH: Int = 9223372036854775808\n",
+            "pub const UINT_HIGH: UInt = 18446744073709551616\n",
+            "pub const Max_size: I8 = 1\n",
+            "pub const r#READY: Bool = true\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(checks.len(), 25);
+        for index in [0, 1, 2, 3, 6, 8, 13, 19, 20] {
+            assert!(
+                checks[index].is_valid(),
+                "const at owner index {index} is a supported valid literal: {:?}",
+                checks[index]
+            );
+        }
+        assert_eq!(
+            checks[0],
+            &ConstLiteralCheck::Supported {
+                primitive: PrimTy::Bool,
+                diagnostics: Vec::new(),
+            }
+        );
+        assert_eq!(
+            checks[2],
+            &ConstLiteralCheck::Supported {
+                primitive: PrimTy::I8,
+                diagnostics: Vec::new(),
+            },
+            "the direct negative literal `-128` lowers to a signed literal value"
+        );
+        assert_eq!(
+            checks[8],
+            &ConstLiteralCheck::Supported {
+                primitive: PrimTy::U8,
+                diagnostics: Vec::new(),
+            },
+            "negative zero is the mathematical value zero"
+        );
+
+        for (index, code) in [
+            (4, sai_diagnostics::Code::LiteralOutOfRange),
+            (5, sai_diagnostics::Code::LiteralOutOfRange),
+            (7, sai_diagnostics::Code::LiteralOutOfRange),
+            (9, sai_diagnostics::Code::LiteralOutOfRange),
+            (10, sai_diagnostics::Code::TypeMismatch),
+            (11, sai_diagnostics::Code::TypeMismatch),
+            (12, sai_diagnostics::Code::LiteralOutOfRange),
+            (14, sai_diagnostics::Code::LiteralOutOfRange),
+            (15, sai_diagnostics::Code::LiteralOutOfRange),
+            (21, sai_diagnostics::Code::LiteralOutOfRange),
+            (22, sai_diagnostics::Code::LiteralOutOfRange),
+        ] {
+            let ConstLiteralCheck::Supported { diagnostics, .. } = checks[index] else {
+                panic!("owner index {index} should be supported");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(diagnostics[0].code, code, "owner index {index}");
+            assert!(
+                diagnostics[0].has_workspace_snapshot(),
+                "owner index {index} diagnostic is bound to the current snapshot"
+            );
+            assert!(
+                diagnostics[0].primary().is_some(),
+                "owner index {index} diagnostic points to the literal"
+            );
+        }
+        for index in [16, 17, 18, 23, 24] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Unsupported,
+                "aliases, non-literal expressions, private consts, raw identifiers and names outside the supported ASCII UPPER_SNAKE_CASE convention remain gated"
+            );
+        }
+    }
+
+    #[test]
+    fn const_pointer_sized_integer_literals_use_the_selected_target_width() {
+        use sai_resolve::prelude::PrimTy;
+
+        for (
+            target,
+            signed_min,
+            signed_max,
+            unsigned_max,
+            signed_below,
+            signed_above,
+            unsigned_above,
+        ) in [
+            (
+                "wasm32-core",
+                "-2147483648",
+                "2147483647",
+                "4294967295",
+                "-2147483649",
+                "2147483648",
+                "4294967296",
+            ),
+            (
+                "wasm64-core",
+                "-9223372036854775808",
+                "9223372036854775807",
+                "18446744073709551615",
+                "-9223372036854775809",
+                "9223372036854775808",
+                "18446744073709551616",
+            ),
+        ] {
+            let root = format!(
+                concat!(
+                    "pub const SIGNED_MIN: ISize = {}\n",
+                    "pub const SIGNED_MAX: ISize = {}\n",
+                    "pub const UNSIGNED_MAX: USize = {}\n",
+                    "pub const SIGNED_BELOW: ISize = {}\n",
+                    "pub const SIGNED_ABOVE: ISize = {}\n",
+                    "pub const UNSIGNED_ABOVE: USize = {}\n",
+                    "pub const UNSIGNED_NEG_ZERO: USize = -0\n",
+                    "pub const UNSIGNED_NEG_ONE: USize = -1\n",
+                    "pub const SIGNED_TOO_WIDE: ISize = 340282366920938463463374607431768211456\n",
+                    "pub const UNSIGNED_TOO_WIDE: USize = 340282366920938463463374607431768211456\n",
+                ),
+                signed_min, signed_max, unsigned_max, signed_below, signed_above, unsigned_above,
+            );
+            let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+            let target_cfg = target_cfg_for_check(target).expect("target config is valid");
+            let expected_width = if target == "wasm32-core" { 32 } else { 64 };
+            assert_eq!(target_cfg.pointer_width(), expected_width, "{target}");
+            let collection = database
+                .collect_phase1_package_scopes_collection(
+                    &module_tree,
+                    &snapshot,
+                    &target_cfg,
+                    Phase1BuildContext::default(),
+                )
+                .expect("const package scopes collect");
+            let resolved = database
+                .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+                .expect("const owners resolve");
+            let checks = resolved
+                .owners()
+                .iter()
+                .map(|owner| {
+                    owner
+                        .literal_check()
+                        .expect("literal checks use the current owner snapshot")
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(checks.len(), 10, "{target}");
+            for (index, primitive) in [
+                (0, PrimTy::ISize),
+                (1, PrimTy::ISize),
+                (2, PrimTy::USize),
+                (6, PrimTy::USize),
+            ] {
+                assert_eq!(
+                    checks[index],
+                    &ConstLiteralCheck::Supported {
+                        primitive,
+                        diagnostics: Vec::new(),
+                    },
+                    "pointer-sized boundary at owner index {index} should fit on {target}"
+                );
+            }
+            for index in [3, 4, 5, 7, 8, 9] {
+                let ConstLiteralCheck::Supported {
+                    primitive,
+                    diagnostics,
+                } = checks[index]
+                else {
+                    panic!("out-of-range pointer literal at {index} should be checked on {target}");
+                };
+                assert_eq!(
+                    *primitive,
+                    if matches!(index, 3 | 4 | 8) {
+                        PrimTy::ISize
+                    } else {
+                        PrimTy::USize
+                    },
+                    "owner index {index} on {target}"
+                );
+                assert_eq!(diagnostics.len(), 1, "owner index {index} on {target}");
+                assert_eq!(
+                    diagnostics[0].code,
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    "owner index {index} on {target}"
+                );
+                assert!(diagnostics[0].has_workspace_snapshot());
+                assert!(diagnostics[0].primary().is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn const_char_byte_literal_check_uses_decoded_unicode_and_byte_values() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub const CHAR_ASCII: Char = 'a'\n",
+            "pub const CHAR_NULL: Char = '\\0'\n",
+            "pub const CHAR_POST_SURROGATE: Char = '\\u{e000}'\n",
+            "pub const CHAR_MAX: Char = '\\u{10ffff}'\n",
+            "pub const BYTE_ASCII: Byte = b'z'\n",
+            "pub const BYTE_MIN: Byte = b'\\x00'\n",
+            "pub const BYTE_MAX: Byte = b'\\xff'\n",
+            "pub const CHAR_BYTE_MISMATCH: Char = b'a'\n",
+            "pub const BYTE_CHAR_MISMATCH: Byte = 'a'\n",
+            "pub const BYTE_INT_MISMATCH: Byte = 255\n",
+            "pub const CHAR_STRING_MISMATCH: Char = \"a\"\n",
+            "pub const BYTE_STRING_MISMATCH: Byte = b\"a\"\n",
+            "pub const TEXT: Str = \"text\"\n",
+            "pub const BORROWED: &Bool = &true\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(checks.len(), 14);
+        for (index, primitive) in [
+            (0, PrimTy::Char),
+            (1, PrimTy::Char),
+            (2, PrimTy::Char),
+            (3, PrimTy::Char),
+            (4, PrimTy::Byte),
+            (5, PrimTy::Byte),
+            (6, PrimTy::Byte),
+        ] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Supported {
+                    primitive,
+                    diagnostics: Vec::new(),
+                },
+                "decoded literal at owner index {index} should fit its exact primitive"
+            );
+        }
+        for index in 7..=11 {
+            let ConstLiteralCheck::Supported {
+                primitive,
+                diagnostics,
+            } = checks[index]
+            else {
+                panic!("mismatched literal at owner index {index} should be diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::TypeMismatch,
+                "owner index {index}"
+            );
+            assert_eq!(
+                *primitive,
+                match index {
+                    7 | 10 => PrimTy::Char,
+                    _ => PrimTy::Byte,
+                },
+                "owner index {index}"
+            );
+            assert!(diagnostics[0].has_workspace_snapshot());
+            assert!(diagnostics[0].primary().is_some());
+        }
+        assert_eq!(
+            checks[12],
+            &ConstLiteralCheck::SupportedStr {
+                diagnostics: Vec::new(),
+            },
+            "a direct canonical Str literal is supported"
+        );
+        assert_eq!(
+            checks[13],
+            &ConstLiteralCheck::Unsupported,
+            "references remain outside the literal slice"
+        );
+    }
+
+    #[test]
+    fn const_str_literal_check_accepts_only_deferred_canonical_str_paths() {
+        let root = concat!(
+            "pub const EMPTY: Str = \"\"\n",
+            "pub const ESCAPED: Str = \"line\\nfeed\"\n",
+            "pub const RAW: Str = r#\"raw { text }\"#\n",
+            "pub const MULTILINE: Str = \"\"\"\n",
+            "    first\n",
+            "    second\n",
+            "    \"\"\"\n",
+            "pub const UNICODE: Str = \"こんにちは\"\n",
+            "pub const BOOL_MISMATCH: Str = true\n",
+            "pub const BYTE_STRING_MISMATCH: Str = b\"bytes\"\n",
+            "pub const INTEGER_MISMATCH: I8 = \"text\"\n",
+            "pub const FORMAT: Str = f\"text\"\n",
+            "pub const BLOCK: Str = { \"text\" }\n",
+            "pub const ALIAS: UserStr = \"text\"\n",
+            "pub const RAW_TYPE: r#Str = \"text\"\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(checks.len(), 12);
+        for index in 0..5 {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::SupportedStr {
+                    diagnostics: Vec::new(),
+                },
+                "direct string literal at owner index {index} is supported"
+            );
+        }
+        for index in [5, 6] {
+            let ConstLiteralCheck::SupportedStr { diagnostics } = checks[index] else {
+                panic!("Str mismatch at owner index {index} should be diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::TypeMismatch,
+                "owner index {index}"
+            );
+            assert!(diagnostics[0].has_workspace_snapshot());
+            assert!(diagnostics[0].primary().is_some());
+        }
+        let ConstLiteralCheck::Supported {
+            primitive,
+            diagnostics,
+        } = checks[7]
+        else {
+            panic!("integer-typed string literal should have a type mismatch");
+        };
+        assert_eq!(*primitive, sai_resolve::prelude::PrimTy::I8);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        for index in [8, 9, 10, 11] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Unsupported,
+                "unsupported string form or noncanonical type at owner index {index}"
+            );
+        }
+
+        let shadowed = concat!(
+            "pub type Str = U8\n",
+            "pub const SHADOWED: Str = \"text\"\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(shadowed.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("shadowing const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("shadowing const owners resolve");
+        assert_eq!(
+            resolved.owners()[0]
+                .literal_check()
+                .expect("literal checks use the current owner snapshot"),
+            &ConstLiteralCheck::Unsupported,
+            "a source type binding named Str must not use the canonical prelude fallback"
+        );
+    }
+
+    #[test]
+    fn const_unit_literal_check_accepts_only_empty_tuple_type_and_literal() {
+        let root = concat!(
+            "pub const UNIT: () = ()\n",
+            "pub const OTHER_UNIT: () = ()\n",
+            "pub const BOOL_MISMATCH: () = true\n",
+            "pub const INTEGER_MISMATCH: () = 0\n",
+            "pub const STRING_MISMATCH: () = \"text\"\n",
+            "pub const NON_EMPTY_TUPLE: () = (1,)\n",
+            "pub const BLOCK: () = { () }\n",
+            "pub const ALIAS: Unit = ()\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(checks.len(), 8);
+        for index in [0, 1] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::SupportedUnit {
+                    diagnostics: Vec::new(),
+                },
+                "direct unit literal at owner index {index} is supported"
+            );
+        }
+        for index in [2, 3, 4] {
+            let ConstLiteralCheck::SupportedUnit { diagnostics } = checks[index] else {
+                panic!("unit type mismatch at owner index {index} should be diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::TypeMismatch,
+                "owner index {index}"
+            );
+            assert!(diagnostics[0].has_workspace_snapshot());
+            assert!(diagnostics[0].primary().is_some());
+        }
+        for index in [5, 6, 7] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Unsupported,
+                "nonliteral unit form or alias at owner index {index} remains unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn const_flat_tuple_literal_check_accepts_only_supported_direct_fields() {
+        let root = concat!(
+            "pub const PAIR: (I32, Bool) = (1, true)\n",
+            "pub const SINGLE: (U8,) = (255,)\n",
+            "pub const MIXED: (F32, Str, ()) = (1.25, \"text\", ())\n",
+            "pub const FIELD_MISMATCH: (I32, Bool) = (1, 2)\n",
+            "pub const FIELD_RANGE: (I8,) = (128,)\n",
+            "pub const ARITY_SHORT: (I32, Bool) = (1,)\n",
+            "pub const ARITY_LONG: (I32,) = (1, true)\n",
+            "pub const SCALAR_MISMATCH: (I32, Bool) = false\n",
+            "pub const NESTED: ((I32,),) = ((1,),)\n",
+            "pub const ARRAY: Array<I32, 1> = [1]\n",
+            "pub const BLOCK_FIELD: (I32,) = ({ 1 },)\n",
+            "pub type Number = I32\n",
+            "pub const ALIAS_FIELD: (Number,) = (1,)\n",
+            "pub const GROUPING: (I32,) = (1)\n",
+            "pub const UNIT_NONEMPTY_MISMATCH: () = (1,)\n",
+            "pub const SCALAR_TUPLE_MISMATCH: I32 = (1,)\n",
+            "pub const MULTIPLE_FIELD_ERRORS: (I8, Bool) = (128, 1)\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(checks.len(), 16);
+        let assert_primary_literal_span =
+            |diagnostic: &Diagnostic, declaration: &str, literal: &str| {
+                let declaration_start = root
+                    .find(declaration)
+                    .unwrap_or_else(|| panic!("test source contains {declaration:?}"));
+                let value_start = root[declaration_start..]
+                    .find(" = ")
+                    .expect("const declaration has an initializer")
+                    + declaration_start
+                    + " = ".len();
+                let value_end = root[value_start..]
+                    .find('\n')
+                    .map_or(root.len(), |relative_end| value_start + relative_end);
+                let literal_start = root[value_start..value_end]
+                    .rfind(literal)
+                    .unwrap_or_else(|| panic!("initializer contains {literal:?}"))
+                    + value_start;
+                let expected_range = sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(literal_start as u32),
+                    sai_diagnostics::TextSize::new((literal_start + literal.len()) as u32),
+                )
+                .expect("literal span is ordered");
+                assert_eq!(
+                    diagnostic.primary().map(|location| location.span.range),
+                    Some(expected_range),
+                    "primary diagnostic span should cover literal {literal:?}"
+                );
+            };
+        for index in 0..3 {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::SupportedTuple {
+                    diagnostics: Vec::new(),
+                },
+                "direct flat tuple at owner index {index} is supported"
+            );
+        }
+        for index in [3, 5, 6, 7] {
+            let ConstLiteralCheck::SupportedTuple { diagnostics } = checks[index] else {
+                panic!("supported tuple mismatch at owner index {index} should be diagnosed");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::TypeMismatch,
+                "owner index {index}"
+            );
+            assert!(diagnostics[0].has_workspace_snapshot());
+            assert!(diagnostics[0].primary().is_some());
+        }
+        let ConstLiteralCheck::SupportedTuple { diagnostics } = checks[3] else {
+            panic!("field mismatch at owner index 3 should be diagnosed");
+        };
+        assert_primary_literal_span(&diagnostics[0], "pub const FIELD_MISMATCH:", "2");
+        let ConstLiteralCheck::SupportedTuple { diagnostics } = checks[4] else {
+            panic!("out-of-range tuple field at owner index 4 should be diagnosed");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].code,
+            sai_diagnostics::Code::LiteralOutOfRange
+        );
+        let ConstLiteralCheck::SupportedTuple { diagnostics } = checks[12] else {
+            panic!("grouped scalar at tuple owner index 12 should be diagnosed");
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_eq!(
+            checks[13],
+            &ConstLiteralCheck::Unsupported,
+            "nonempty tuple values against unit remain gated without tuple inference"
+        );
+        assert_eq!(
+            checks[14],
+            &ConstLiteralCheck::Unsupported,
+            "nonempty tuple values against scalar types remain gated"
+        );
+        let ConstLiteralCheck::SupportedTuple { diagnostics } = checks[15] else {
+            panic!("multiple supported tuple field errors should be collected");
+        };
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            vec![
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::TypeMismatch
+            ]
+        );
+        assert_primary_literal_span(&diagnostics[0], "pub const MULTIPLE_FIELD_ERRORS:", "128");
+        assert_primary_literal_span(&diagnostics[1], "pub const MULTIPLE_FIELD_ERRORS:", "1");
+        for index in [8, 9, 10, 11] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Unsupported,
+                "nested, array, expression, or alias form at owner index {index} stays gated"
+            );
+        }
+    }
+
+    #[test]
+    fn const_float_literals_round_at_the_declared_width_and_report_failures() {
+        use sai_resolve::prelude::PrimTy;
+
+        let root = concat!(
+            "pub const F32_POSITIVE: F32 = 1.25\n",
+            "pub const F32_NEGATIVE: F32 = -1.25\n",
+            "pub const F32_SEPARATORS: F32 = 1_234.5_0e+1_0\n",
+            "pub const F32_TIE_EVEN: F32 = 1.000000059604644775390625\n",
+            "pub const F32_DOUBLE_ROUNDING: F32 = 1.000000059604644775390626\n",
+            "pub const F32_UNDERFLOW: F32 = 1e-50\n",
+            "pub const F32_MAX: F32 = 3.4028235e38\n",
+            "pub const F64_POSITIVE: F64 = 1.25\n",
+            "pub const F64_NEGATIVE: F64 = -1.25\n",
+            "pub const F64_TIE_EVEN: F64 = 1.00000000000000011102230246251565404236316680908203125\n",
+            "pub const F64_UNDERFLOW: F64 = 1e-400\n",
+            "pub const F64_MAX: F64 = 1.7976931348623157e308\n",
+            "pub const F32_OVERFLOW: F32 = 3.4028236e38\n",
+            "pub const F64_OVERFLOW: F64 = 1.7976931348623159e308\n",
+            "pub const F32_MISMATCH: F32 = true\n",
+            "pub const F64_MISMATCH: F64 = 1\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("const package scopes collect");
+        let resolved = database
+            .resolve_const_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("const owners resolve");
+        let checks = resolved
+            .owners()
+            .iter()
+            .map(|owner| {
+                owner
+                    .literal_check()
+                    .expect("literal checks use the current owner snapshot")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(checks.len(), 16);
+        for (index, primitive) in [
+            (0, PrimTy::F32),
+            (1, PrimTy::F32),
+            (2, PrimTy::F32),
+            (3, PrimTy::F32),
+            (4, PrimTy::F32),
+            (5, PrimTy::F32),
+            (6, PrimTy::F32),
+            (7, PrimTy::F64),
+            (8, PrimTy::F64),
+            (9, PrimTy::F64),
+            (10, PrimTy::F64),
+            (11, PrimTy::F64),
+        ] {
+            assert_eq!(
+                checks[index],
+                &ConstLiteralCheck::Supported {
+                    primitive,
+                    diagnostics: Vec::new(),
+                },
+                "valid float at owner index {index} should be checked"
+            );
+        }
+        for index in [12, 13] {
+            let ConstLiteralCheck::Supported {
+                primitive,
+                diagnostics,
+            } = checks[index]
+            else {
+                panic!("overflowing float at owner index {index} should be checked");
+            };
+            assert_eq!(
+                *primitive,
+                if index == 12 {
+                    PrimTy::F32
+                } else {
+                    PrimTy::F64
+                }
+            );
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                "owner index {index}"
+            );
+            assert!(diagnostics[0].has_workspace_snapshot());
+            assert!(diagnostics[0].primary().is_some());
+        }
+        for index in [14, 15] {
+            let ConstLiteralCheck::Supported { diagnostics, .. } = checks[index] else {
+                panic!("mismatched float at owner index {index} should be checked");
+            };
+            assert_eq!(diagnostics.len(), 1, "owner index {index}");
+            assert_eq!(
+                diagnostics[0].code,
+                sai_diagnostics::Code::TypeMismatch,
+                "owner index {index}"
+            );
+            assert!(diagnostics[0].has_workspace_snapshot());
+            assert!(diagnostics[0].primary().is_some());
+        }
     }
 
     #[test]
@@ -39219,10 +42654,19 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
-    fn world_package_reference_defers_when_generated_source_view_is_incomplete() {
-        let root_source = b"world references { import acme:wit-source/server }\n";
+    fn world_package_reference_resolves_when_generated_source_world_is_present() {
+        let root_source = b"world references {\n\
+            include acme:wit-source/server\n\
+            include acme:wit-facade/facade\n\
+        }\n\
+            world source_interfaces {\n\
+                import acme:wit-source/public\n\
+                import acme:wit-source/hidden\n\
+                import acme:wit-source/nested/api\n\
+            }\n\
+            fn use_omitted_import() { references.unsupported }\n";
         let mut database = RootDatabase::new().expect("driver initializes");
-        let (_, root_tree, mut snapshot_files) = multi_package_fixture(
+        let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
             &mut database,
             "acme:root#1",
             "acme:root@1.0.0",
@@ -39232,8 +42676,46 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             &mut database,
             "acme:wit-source#1",
             "acme:wit-source@1.0.0",
-            &[("lib.sai", b"pub world server {}\n")],
+            &[
+                (
+                    "lib.sai",
+                    b"pub interface public {}\n\
+                      interface hidden {}\n\
+                      pub world server { import fn unsupported(pointer: USize) }\n",
+                ),
+                ("nested.sai", b"pub interface api {}\n"),
+            ],
         );
+        let (facade_package, facade_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:wit-facade",
+            "1.0.0",
+            b"package acme:wit-facade@1.0.0;\n\
+              world facade { include acme:wit-source/server; }",
+        );
+        let facade_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:wit-facade @ 1.0.0\n\
+              artifact component {}\n\
+              wit \"wit\"\n\
+              requires { acme:wit-source @ ^1 }\n"[..],
+        );
+        database
+            .set_package_manifest(
+                facade_package,
+                facade_manifest,
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("facade contract declares the generated-world dependency");
+        let facade_node = PackageGraphNode::new(
+            facade_node.key().clone(),
+            facade_node.identity(),
+            facade_node.version().clone(),
+            facade_node.form(),
+            facade_node.role(),
+            vec![graph_edge("acme:wit-source#1", "acme:wit-source")],
+        )
+        .expect("facade package graph node includes the generated source dependency");
         snapshot_files.extend(source_files);
         let snapshot =
             WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
@@ -39248,7 +42730,10 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                     Version::parse("1.0.0").expect("root package version is valid"),
                     PackageForm::Source,
                     PackageGraphRole::Root,
-                    vec![graph_edge("acme:wit-source#1", "acme:wit-source")],
+                    vec![
+                        graph_edge("acme:wit-source#1", "acme:wit-source"),
+                        graph_edge("acme:wit-facade#1", "acme:wit-facade"),
+                    ],
                 )
                 .expect("root package graph node is valid"),
                 PackageGraphNode::new(
@@ -39260,6 +42745,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                     Vec::new(),
                 )
                 .expect("source package graph node is valid"),
+                facade_node,
             ],
         )
         .expect("package graph is valid");
@@ -39305,10 +42791,26 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .find(|scope| scope.view.unit.canonical_name() == "acme:wit-source@1.0.0")
             .expect("the generated WIT view is present");
         assert!(!generated_view.view.complete);
+        assert!(
+            generated_view.view.interfaces.contains_key("hidden"),
+            "generated source views include the private interface, so world generation must enforce source visibility"
+        );
+        let facade_view = partial_views
+            .views()
+            .find(|scope| scope.view.unit.canonical_name() == "acme:wit-facade@1.0.0")
+            .expect("the authored facade WIT view is present");
+        assert!(
+            facade_view.view.complete,
+            "the facade view itself is complete even though it includes a partial generated world"
+        );
 
         let root_manifest: Arc<[u8]> = Arc::from(
             &b"package acme:root @ 1.0.0\n\
-              requires { acme:wit-source @ ^1 }\n"[..],
+              source \"src\"\n\
+              requires {\n\
+                acme:wit-source @ ^1\n\
+                acme:wit-facade @ ^1\n\
+              }\n"[..],
         );
         let root_collection = database
             .collect_phase1_package_scopes_with_manifest_and_foreign_scopes_and_wit_views(
@@ -39322,6 +42824,101 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 &partial_views,
             )
             .expect("root scopes capture the source package and partial WIT view");
+        let root_generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated-WIT query succeeds")
+            .expect("root source package publishes a generated snapshot");
+        assert!(!root_generated.complete);
+        assert!(
+            root_generated
+                .text
+                .contains("include acme:wit-source/server@1.0.0;")
+        );
+        assert!(
+            root_generated
+                .text
+                .contains("import acme:wit-source/public@1.0.0;")
+        );
+        assert!(
+            root_generated
+                .text
+                .contains("import acme:wit-source/api@1.0.0;")
+        );
+        assert!(
+            !root_generated
+                .text
+                .contains("import acme:wit-source/hidden@1.0.0;"),
+            "private source interfaces must not be emitted from a generated WIT view"
+        );
+        let root_unit = WitUnit::generated(
+            root_package,
+            &database.packages,
+            &MvsPackageVersion::new(
+                "acme:root",
+                Version::parse("1.0.0").expect("root package version is valid"),
+            )
+            .expect("root package identity is valid"),
+        )
+        .expect("root WIT unit uses its selected version");
+        let root_wit = database
+            .wit_package(&root_unit)
+            .expect("root WIT package with the generated source include loads");
+        assert!(
+            root_wit.failure.is_none(),
+            "the generated source include remains parseable: {:?}",
+            root_wit.failure
+        );
+        let root_wit = root_wit.package.expect("root WIT model is available");
+        let root_world = root_wit
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "references")
+            .expect("root references world is generated");
+        let interface_world = root_wit
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "source-interfaces")
+            .expect("root source interface references world is generated");
+        let emitted_interfaces = interface_world
+            .imports
+            .iter()
+            .filter_map(|item| match item {
+                sai_wit::WitWorldItem::Interface { reference, .. } => Some(reference),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            emitted_interfaces
+                .iter()
+                .map(|reference| reference.name.as_str())
+                .collect::<Vec<_>>(),
+            ["public", "api"],
+            "the public root interface and nested-module interface survive, while the private one is omitted"
+        );
+        let nested_api = emitted_interfaces
+            .iter()
+            .find(|reference| reference.name == "api")
+            .expect("the nested module interface is imported from the partial view");
+        assert_eq!(
+            nested_api.unit, generated_view.view.unit,
+            "the import keeps the exact partial generated-source unit"
+        );
+        assert_eq!(
+            nested_api.interface, generated_view.view.interfaces["api"].wit,
+            "the nested source path keeps the selected interface index"
+        );
+        let source_include = root_world
+            .includes
+            .iter()
+            .find(|include| include.unit.canonical_name() == "acme:wit-source@1.0.0")
+            .expect("the exact generated source unit is included");
+        assert_eq!(source_include.name, "server");
+        assert_eq!(
+            source_include.world, generated_view.view.worlds["server"].wit,
+            "the include keeps the world index from the selected generated view"
+        );
         let member_scopes = database
             .collect_active_source_member_scopes(
                 &root_collection,
@@ -39337,18 +42934,122 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 &member_scopes,
                 &partial_views,
             )
-            .expect("partial generated view leaves an absent source world deferred");
+            .expect("partial generated view can resolve an emitted source world");
         let partial_reference = partial_resolutions
             .owners()
             .iter()
             .flat_map(|owner| owner.references())
-            .next()
-            .expect("one package reference is retained");
-        assert_eq!(
-            partial_reference.path_result(),
-            &WorldReferencePathResult::Pkg("acme:wit-source/server".to_owned())
+            .find(|reference| {
+                matches!(
+                    reference.path_result(),
+                    WorldReferencePathResult::ResolvedPkg(PathRes {
+                        base: Res::Def(sai_resolve::package_scopes::DefKind::World, _),
+                        ..
+                    })
+                )
+            })
+            .expect("the generated source world package reference is retained");
+        assert!(
+            matches!(
+                partial_reference.path_result(),
+                WorldReferencePathResult::ResolvedPkg(PathRes {
+                    base: Res::Def(sai_resolve::package_scopes::DefKind::World, _),
+                    ..
+                })
+            ),
+            "{:?}",
+            partial_reference.path_result()
         );
-        assert!(partial_reference.diagnostics().is_empty());
+        assert!(
+            partial_reference.diagnostics().is_empty(),
+            "{:?}",
+            partial_reference.diagnostics()
+        );
+        let function_resolutions = database
+            .resolve_function_owner_analyses_with_world_fields(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &partial_resolutions,
+                Some(&member_scopes),
+                Some(&partial_views),
+            )
+            .expect("world member lookup consumes the partial generated view");
+        assert_eq!(function_resolutions.owners().len(), 1);
+        let world_fields = function_resolutions.owners()[0]
+            .world_field_resolution()
+            .expect("world field resolution succeeds")
+            .expect("the requested analysis includes world fields");
+        assert!(
+            world_fields.diagnostics.is_empty(),
+            "an omitted function in a partial view is not an authoritative miss: {:#?}",
+            world_fields.diagnostics
+        );
+        assert_eq!(
+            world_fields
+                .deferred
+                .iter()
+                .map(|field| field.reason)
+                .collect::<Vec<_>>(),
+            [sai_resolve::WorldMemberDeferral::ImportLookupIncomplete],
+            "a partial external world makes the including world's import lookup incomplete"
+        );
+        let local_world = root_collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
+            .expect("the root package declares one world")
+            .owner
+            .def_id
+            .to_def_id();
+        let partial_elaboration_input = database
+            .resolve_world_elaboration_input(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &partial_resolutions,
+                &member_scopes,
+                &partial_views,
+            )
+            .expect("partial generated worlds are available for elaboration");
+        let partial_server = generated_view
+            .view
+            .worlds
+            .get("server")
+            .expect("partial generated view contains the emitted world")
+            .def;
+        let partial_external_server = partial_elaboration_input
+            .external_worlds
+            .iter()
+            .find(|world| world.world == partial_server)
+            .expect("partial generated world is projected into elaboration");
+        assert!(
+            !partial_external_server.complete,
+            "external world frame inherits the partial view status"
+        );
+        let partial_facade = facade_view
+            .view
+            .worlds
+            .get("facade")
+            .expect("the authored facade view contains its world")
+            .def;
+        let partial_external_facade = partial_elaboration_input
+            .external_worlds
+            .iter()
+            .find(|world| world.world == partial_facade)
+            .expect("authored facade world is projected into elaboration");
+        assert!(
+            !partial_external_facade.complete,
+            "facade frame inherits incompleteness from its included generated world"
+        );
+        let partial_elaboration =
+            sai_resolve::elaborated_world(local_world, partial_elaboration_input)
+                .expect("the including local world elaborates for recovery");
+        assert!(
+            !partial_elaboration.complete,
+            "the local world remains incomplete when it includes a partial generated world"
+        );
 
         let complete_generated = sai_wit::GeneratedText {
             complete: true,
@@ -39384,6 +43085,18 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         let complete_views = database
             .collect_active_wit_view_scopes(&root_tree, &snapshot, &target_cfg, &graph)
             .expect("complete generated view reloads");
+        let complete_view = complete_views
+            .views()
+            .find(|scope| scope.view.unit.canonical_name() == "acme:wit-source@1.0.0")
+            .expect("the complete generated view is present");
+        let complete_facade_view = complete_views
+            .views()
+            .find(|scope| scope.view.unit.canonical_name() == "acme:wit-facade@1.0.0")
+            .expect("the complete authored facade view is present");
+        assert!(
+            complete_view.view.complete,
+            "the generated snapshot is complete"
+        );
         assert_ne!(
             partial_views.closure_fingerprint(),
             complete_views.closure_fingerprint(),
@@ -39416,18 +43129,113 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 &complete_member_scopes,
                 &complete_views,
             )
-            .expect("a complete generated view authoritatively omits the world");
+            .expect("a complete generated view keeps the emitted world resolvable");
         let complete_reference = complete_resolutions
             .owners()
             .iter()
             .flat_map(|owner| owner.references())
-            .next()
-            .expect("one package reference is retained");
-        assert!(matches!(
-            complete_reference.path_result(),
-            WorldReferencePathResult::ResolvedPkg(PathRes { base: Res::Err, .. })
-        ));
+            .find(|reference| {
+                matches!(
+                    reference.path_result(),
+                    WorldReferencePathResult::ResolvedPkg(PathRes {
+                        base: Res::Def(sai_resolve::package_scopes::DefKind::World, _),
+                        ..
+                    })
+                )
+            })
+            .expect("the generated source world package reference is retained");
+        assert!(
+            matches!(
+                complete_reference.path_result(),
+                WorldReferencePathResult::ResolvedPkg(PathRes {
+                    base: Res::Def(sai_resolve::package_scopes::DefKind::World, _),
+                    ..
+                })
+            ),
+            "{:?}",
+            complete_reference.path_result()
+        );
         assert!(complete_reference.diagnostics().is_empty());
+        let complete_local_world = complete_collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::World)
+            .expect("the refreshed root package declares one world")
+            .owner
+            .def_id
+            .to_def_id();
+        let complete_elaboration_input = database
+            .resolve_world_elaboration_input(
+                &complete_collection,
+                &root_tree,
+                &snapshot,
+                &complete_resolutions,
+                &complete_member_scopes,
+                &complete_views,
+            )
+            .expect("complete generated worlds are available for elaboration");
+        let complete_server = complete_view
+            .view
+            .worlds
+            .get("server")
+            .expect("complete generated view contains the emitted world")
+            .def;
+        assert!(
+            complete_elaboration_input
+                .external_worlds
+                .iter()
+                .find(|world| world.world == complete_server)
+                .expect("complete generated world is projected into elaboration")
+                .complete,
+            "external world frame inherits the complete view status"
+        );
+        let complete_facade = complete_facade_view
+            .view
+            .worlds
+            .get("facade")
+            .expect("the complete facade view contains its world")
+            .def;
+        assert!(
+            complete_elaboration_input
+                .external_worlds
+                .iter()
+                .find(|world| world.world == complete_facade)
+                .expect("complete facade world is projected into elaboration")
+                .complete,
+            "facade frame stays complete when its included generated world is complete"
+        );
+        let complete_elaboration =
+            sai_resolve::elaborated_world(complete_local_world, complete_elaboration_input)
+                .expect("the complete including world elaborates");
+        assert!(
+            complete_elaboration.complete,
+            "a complete generated view keeps the including world complete"
+        );
+        let complete_function_resolutions = database
+            .resolve_function_owner_analyses_with_world_fields(
+                &complete_collection,
+                &root_tree,
+                &snapshot,
+                &complete_resolutions,
+                Some(&complete_member_scopes),
+                Some(&complete_views),
+            )
+            .expect("complete generated views enable authoritative world misses");
+        let complete_world_fields = complete_function_resolutions.owners()[0]
+            .world_field_resolution()
+            .expect("complete world field resolution succeeds")
+            .expect("the requested analysis includes world fields");
+        assert_eq!(
+            complete_world_fields
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::UnresolvedName],
+            "a complete view can authoritatively reject the absent function"
+        );
+        assert!(complete_world_fields.deferred.is_empty());
     }
 
     #[test]
@@ -44694,6 +48502,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             "  type LocalAlias = api.Data\n",
             "  fn local_member(value: api.Data)\n",
             "}\n",
+            "world client { import fn consume(value: api.Data) -> api.Data }\n",
         );
         let mut database = RootDatabase::new().expect("driver initializes");
         let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
@@ -44847,6 +48656,11 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         assert!(generated.text.contains("use acme:codec/api@1.2.3.{data};"));
         assert!(generated.text.contains("type local-alias = data;"));
         assert!(generated.text.contains("local-member: func(value: data);"));
+        assert!(
+            generated
+                .text
+                .contains("import consume: func(value: data) -> data;")
+        );
 
         let root_model = generated_result
             .package
@@ -44893,15 +48707,3355 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                     && reference.interface.interface == root_interface_index
                     && reference.item_name == "data"
         ));
+        let client = root_model
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "client")
+            .expect("the direct world is generated");
+        let sai_wit::WitWorldItem::Func { func, .. } = client
+            .imports
+            .iter()
+            .find(|item| matches!(item, sai_wit::WitWorldItem::Func { .. }))
+            .expect("the world import remains a function")
+        else {
+            unreachable!("the matched world import is a function");
+        };
+        for ty in [
+            &func.params[0].1,
+            func.result.as_ref().expect("result type is present"),
+        ] {
+            let sai_wit::WitType::Named(reference) = ty else {
+                panic!("the external world function keeps a named type reference");
+            };
+            assert_eq!(reference.interface.unit, codec_view.view.unit);
+            assert_eq!(reference.interface.interface, codec_interface.wit);
+            assert_eq!(reference.item, codec_item.item);
+            assert_eq!(reference.item_name, "data");
+        }
     }
 
     #[test]
-    fn generated_wit_references_named_types_from_embedded_wasi_views() {
+    fn generated_world_function_keeps_types_from_partial_foreign_views_incomplete() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "world client {\n",
+            "  import fn consume(value: api.Data)\n",
+            "  import fn consume_handle(value: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
+            "  import fn wrong_kind(value: borrow api.Data)\n",
+            "  export fn borrowed_result() -> borrow api.Handle\n",
+            "  export fn missing(value: api.Missing)\n",
+            "}\n",
+        );
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", root_source.as_bytes())],
+        );
+        let (codec_package, codec_tree, codec_files) = multi_package_fixture(
+            &mut database,
+            "acme:codec#1",
+            "acme:codec@1.2.3",
+            &[(
+                "lib.sai",
+                b"pub interface api { resource Handle {} type Data = U32; type Hidden = USize }\n",
+            )],
+        );
+        snapshot_files.extend(codec_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:codec#1", "acme:codec")],
+                ),
+                graph_node(
+                    "acme:codec#1",
+                    "acme:codec",
+                    "1.2.3",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("generated-source dependency graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let codec_manifest: Arc<[u8]> =
+            Arc::from(&b"package acme:codec @ 1.2.3\nsource \"src\"\n"[..]);
+        let codec_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &codec_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                codec_manifest,
+                PackageRole::Dependency,
+                &[],
+            )
+            .expect("generated-source dependency scopes collect");
+        let codec_member_package = codec_collection.module_member_scope_package();
+        let codec_generated = database
+            .generated_wit_text(codec_package)
+            .expect("dependency generated WIT query succeeds")
+            .expect("source dependency publishes a generated WIT snapshot");
+        assert!(!codec_generated.complete);
+
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target, &graph)
+            .expect("active generated-source WIT view loads");
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the direct source dependency has a generated WIT view");
+        assert!(!codec_view.view.complete);
+        let codec_interface = codec_view
+            .view
+            .interfaces
+            .get("api")
+            .expect("the partial view retains the api interface");
+        let codec_item = codec_interface
+            .members
+            .get("Data")
+            .expect("the partial view retains the supported Data type");
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &[codec_member_package.as_foreign_package_scopes("acme:codec")],
+                &wit_views,
+            )
+            .expect("root scopes use the exact selected partial source view");
+
+        let selected = MvsPackageVersion::new(
+            "acme:root",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query completes");
+        assert!(
+            result.failure.is_none(),
+            "a present type in a partial dependency remains parseable: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(!generated.complete);
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{data, handle};")
+        );
+        assert!(
+            generated
+                .text
+                .contains("import consume: func(value: data);")
+        );
+        assert!(
+            generated.text.contains(
+                "import consume-handle: func(value: handle, borrowed: borrow<handle>) -> handle;"
+            ),
+            "a present resource in a partial selected view remains usable: {}",
+            generated.text
+        );
+        assert!(!generated.text.contains("wrong-kind:"));
+        assert!(!generated.text.contains("borrowed-result:"));
+        assert!(!generated.text.contains("missing:"));
+        let package = result
+            .package
+            .expect("generated root WIT model is available");
+        let world = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "client")
+            .expect("the direct world is generated");
+        let sai_wit::WitWorldItem::Func { func, .. } = world
+            .imports
+            .iter()
+            .find(|item| matches!(item, sai_wit::WitWorldItem::Func { .. }))
+            .expect("the supported world import remains a function")
+        else {
+            unreachable!("the matched world import is a function");
+        };
+        assert!(world.exports.is_empty());
+        let sai_wit::WitType::Named(reference) = &func.params[0].1 else {
+            panic!("the world signature retains its external named type");
+        };
+        assert_eq!(reference.interface.unit, codec_view.view.unit);
+        assert_eq!(reference.interface.interface, codec_interface.wit);
+        assert_eq!(reference.item, codec_item.item);
+        assert_eq!(reference.item_name, "data");
+    }
+
+    #[test]
+    fn generated_world_resource_function_propagates_only_partial_view_incompleteness() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "world client {\n",
+            "  import fn consume_handle(value: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
+            "}\n",
+            "interface local {\n",
+            "  fn consume_interface(value: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
+            "  resource Proxy {\n",
+            "    fn inspect(self: borrow Self, value: borrow api.Handle) -> api.Handle\n",
+            "  }\n",
+            "}\n",
+        );
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (root_package, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", root_source.as_bytes())],
+        );
+        let (codec_package, codec_tree, codec_files) = multi_package_fixture(
+            &mut database,
+            "acme:codec#1",
+            "acme:codec@1.2.3",
+            &[(
+                "lib.sai",
+                b"pub interface api { resource Handle {} type Hidden = USize }\n",
+            )],
+        );
+        snapshot_files.extend(codec_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:codec#1", "acme:codec")],
+                ),
+                graph_node(
+                    "acme:codec#1",
+                    "acme:codec",
+                    "1.2.3",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("generated-source dependency graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let codec_manifest: Arc<[u8]> =
+            Arc::from(&b"package acme:codec @ 1.2.3\nsource \"src\"\n"[..]);
+        let codec_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &codec_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                codec_manifest,
+                PackageRole::Dependency,
+                &[],
+            )
+            .expect("generated-source dependency scopes collect");
+        let codec_member_package = codec_collection.module_member_scope_package();
+        let codec_generated = database
+            .generated_wit_text(codec_package)
+            .expect("dependency generated WIT query succeeds")
+            .expect("source dependency publishes a generated WIT snapshot");
+        assert!(
+            !codec_generated.complete,
+            "the unsupported foreign item makes only the dependency view partial"
+        );
+        assert!(codec_generated.text.contains("resource handle;"));
+        assert!(!codec_generated.text.contains("type hidden"));
+
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target, &graph)
+            .expect("active generated-source WIT view loads");
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the direct source dependency has a generated WIT view");
+        assert!(!codec_view.view.complete);
+        assert!(
+            codec_view.view.interfaces["api"]
+                .members
+                .contains_key("Handle")
+        );
+        let codec_interface = codec_view
+            .view
+            .interfaces
+            .get("api")
+            .expect("the partial generated view retains api");
+        let codec_item = codec_interface
+            .members
+            .get("Handle")
+            .expect("the partial generated view retains the resource");
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        let root_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &[codec_member_package.as_foreign_package_scopes("acme:codec")],
+                &wit_views,
+            )
+            .expect("root scopes use the exact selected partial source view");
+        assert!(root_collection.interface_check_diagnostics().is_empty());
+
+        let generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated WIT query succeeds")
+            .expect("root source package publishes generated WIT");
+        assert!(
+            !generated.complete,
+            "the sole supported world function inherits incompleteness from its resource view"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{handle};")
+        );
+        assert!(
+            generated.text.contains(
+                "import consume-handle: func(value: handle, borrowed: borrow<handle>) -> handle;"
+            ),
+            "the function remains emitted while its selected view is partial: {}",
+            generated.text
+        );
+        assert!(generated.text.contains("consume-interface: func("));
+        assert!(generated.text.contains("resource proxy {"));
+        assert!(generated.text.contains("inspect: func("));
+        assert_eq!(generated.text.matches("import consume-handle:").count(), 1);
+
+        let selected = MvsPackageVersion::new(
+            "acme:root",
+            Version::parse("1.0.0").expect("root version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let parsed = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT still parses with local resource signatures");
+        let package = parsed
+            .package
+            .as_ref()
+            .expect("root generated WIT model remains available");
+        let (local_index, local) = package
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "local")
+            .expect("the local interface is generated");
+        let (_, handle_alias) = local
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the interface imports the selected resource");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(foreign_reference)) =
+            &handle_alias.kind
+        else {
+            panic!("the generated resource alias retains its selected source origin");
+        };
+        assert_eq!(foreign_reference.interface.unit, codec_view.view.unit);
+        assert_eq!(foreign_reference.interface.interface, codec_interface.wit);
+        assert_eq!(foreign_reference.item, codec_item.item);
+        assert_eq!(foreign_reference.item_name, "handle");
+        let (_, consume_interface) = local
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "consume-interface")
+            .expect("the local interface function remains");
+        let sai_wit::WitItemKind::Func(consume_interface) = &consume_interface.kind else {
+            panic!("the local interface function remains a WIT function");
+        };
+        assert!(matches!(
+            consume_interface.params[0].1,
+            sai_wit::WitType::Own(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == local_index
+                    && reference.item_name == "handle"
+        ));
+        assert!(matches!(
+            consume_interface.params[1].1,
+            sai_wit::WitType::Borrow(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == local_index
+                    && reference.item_name == "handle"
+        ));
+        assert!(matches!(
+            consume_interface.result,
+            Some(sai_wit::WitType::Own(ref reference))
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == local_index
+                    && reference.item_name == "handle"
+        ));
+    }
+
+    #[test]
+    fn generated_world_function_uses_only_exact_direct_foreign_resources() {
+        let source = concat!(
+            "use acme:codec/api as api\n",
+            "use acme:codec/facade as facade\n",
+            "world client {\n",
+            "  import fn accepted(value: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
+            "  import fn unselected(value: facade.Handle)\n",
+            "  import fn wrong_kind(value: borrow api.Data)\n",
+            "  export fn borrowed_result() -> borrow api.Handle\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, root_package) =
+            phase1_fixture(source.as_bytes(), b"");
+        let root_key = PackageKey::new("acme:phase1#1").expect("root package key is valid");
+        let (codec, codec_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:codec",
+            "1.2.3",
+            b"package acme:codec@1.2.3; \
+              interface api { resource handle; record data { value: u32, } } \
+              interface facade { use acme:base/types@1.0.0.{handle}; }",
+        );
+        let (_base, base_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:base",
+            "1.0.0",
+            b"package acme:base@1.0.0; interface types { resource handle; }",
+        );
+        database
+            .set_package_manifest(
+                codec,
+                Arc::from(
+                    &b"package acme:codec @ 1.2.3\n\
+                      artifact component {}\n\
+                      wit \"wit\"\n\
+                      requires { acme:base @ ^1 }\n"[..],
+                ),
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("codec's transitive WIT dependency is recorded");
+        let codec_node = PackageGraphNode::new(
+            codec_node.key().clone(),
+            codec_node.identity(),
+            codec_node.version().clone(),
+            codec_node.form(),
+            codec_node.role(),
+            vec![graph_edge(base_node.key().as_str(), "acme:base")],
+        )
+        .expect("codec graph node includes the base package");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    root_key.as_str(),
+                    "acme:phase1",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge(codec_node.key().as_str(), "acme:codec")],
+                ),
+                codec_node,
+                base_node,
+            ],
+        )
+        .expect("direct and transitive package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target, &graph)
+            .expect("direct and transitive WIT views load");
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the codec view is selected for the direct edge");
+        assert!(codec_view.directly_visible);
+        let base_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:base")
+            .expect("the base view is available transitively");
+        assert!(!base_view.directly_visible);
+        assert_eq!(codec_view.view.unit.canonical_name(), "acme:codec@1.2.3");
+
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root collection uses the active selected WIT views");
+        let generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated WIT query succeeds")
+            .expect("the root source package publishes generated WIT");
+        assert!(
+            !generated.complete,
+            "omitted unselected and wrong-kind resource references keep output incomplete"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{handle};")
+        );
+        assert!(
+            generated.text.contains(
+                "import accepted: func(value: handle, borrowed: borrow<handle>) -> handle;"
+            ),
+            "the selected external resource supports own params/results and borrow params: {}",
+            generated.text
+        );
+        assert!(!generated.text.contains("unselected:"));
+        assert!(!generated.text.contains("wrong-kind:"));
+        assert!(!generated.text.contains("borrowed-result:"));
+        assert!(
+            !generated.text.contains("acme:base/types"),
+            "the transitive same-named resource must not leak into the generated world"
+        );
+    }
+
+    #[test]
+    fn generated_interface_functions_use_only_exact_direct_foreign_resources() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "use acme:codec/facade as facade\n",
+            "interface client {\n",
+            "  type HandleAlias = api.Handle\n",
+            "  fn alias_consumer(value: HandleAlias)\n",
+            "  type HandleRecord { handle: api.Handle }\n",
+            "  type BorrowedRecord { handle: borrow api.Handle }\n",
+            "  enum HandleVariant { Wrapped(api.Handle) }\n",
+            "  enum BorrowedVariant { Wrapped(borrow api.Handle) }\n",
+            "  fn record_consumer(value: HandleRecord)\n",
+            "  fn borrowed_record_consumer(value: BorrowedRecord)\n",
+            "  fn variant_consumer(value: HandleVariant)\n",
+            "  fn borrowed_variant_consumer(value: BorrowedVariant)\n",
+            "  fn accepted(value: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
+            "  resource Proxy {\n",
+            "    fn new(handle: api.Handle) -> Self\n",
+            "    fn inspect(self: borrow Self, owned_handle: api.Handle, borrowed: borrow api.Handle) -> api.Handle\n",
+            "    fn from_foreign(handle: api.Handle) -> api.Handle\n",
+            "  }\n",
+            "  resource Broken {\n",
+            "    fn fail(self: borrow Self, value: borrow api.Data)\n",
+            "  }\n",
+            "  resource BadResult {\n",
+            "    fn leak(self: borrow Self) -> borrow api.Handle\n",
+            "  }\n",
+            "  fn take_proxy(value: Proxy)\n",
+            "  fn take_broken(value: Broken)\n",
+            "  fn take_bad_result(value: BadResult)\n",
+            "  fn transitive(value: facade.ForwardedResource)\n",
+            "  fn wrong_kind(value: borrow api.Data)\n",
+            "  fn borrowed_result() -> borrow api.Handle\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface api {
+  resource handle;
+  record data { value: u32, }
+}
+interface facade { use acme:base/types@1.0.0.{handle as forwarded-resource}; }"#;
+        let base_wit = br#"package acme:base@1.0.0; interface types { resource handle; }"#;
+        let (mut database, module_tree, snapshot, root_package, wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, Some(base_wit));
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact selected authored WIT view");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query supports selected foreign resources");
+        assert!(
+            result.failure.is_none(),
+            "omitted unsupported resource references leave parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(!generated.complete);
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{handle};")
+        );
+        assert!(generated.text.contains("resource proxy {"));
+        assert!(
+            generated.text.contains("type handle-alias = handle;"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("alias-consumer: func(value: handle-alias);")
+        );
+        assert!(generated.text.contains("record handle-record {"));
+        assert!(
+            generated
+                .text
+                .contains("record-consumer: func(value: handle-record);")
+        );
+        assert!(!generated.text.contains("record borrowed-record"));
+        assert!(!generated.text.contains("borrowed-record-consumer:"));
+        assert!(generated.text.contains("variant handle-variant {"));
+        assert!(
+            generated
+                .text
+                .contains("variant-consumer: func(value: handle-variant);")
+        );
+        assert!(!generated.text.contains("variant borrowed-variant"));
+        assert!(!generated.text.contains("borrowed-variant-consumer:"));
+        assert!(generated.text.contains("accepted: func("));
+        assert!(generated.text.contains("inspect: func("));
+        assert!(generated.text.contains("from-foreign: static func("));
+        assert!(generated.text.contains("take-proxy: func(value: proxy);"));
+        assert!(
+            generated
+                .text
+                .contains("transitive: func(value: forwarded-resource);")
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/facade@1.2.3.{forwarded-resource};")
+        );
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("resource broken"));
+        assert!(!generated.text.contains("take-broken:"));
+        assert!(!generated.text.contains("resource bad-result"));
+        assert!(!generated.text.contains("take-bad-result:"));
+        assert!(!generated.text.contains("wrong-kind:"));
+        assert!(!generated.text.contains("borrowed-result:"));
+        assert!(
+            !generated.text.contains("acme:base/types"),
+            "a transitive resource target must not leak into generated WIT"
+        );
+
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the direct codec dependency is in the selected WIT closure");
+        assert!(codec_view.directly_visible);
+        let api = codec_view
+            .view
+            .interfaces
+            .get("api")
+            .expect("the exact direct interface is present");
+        let handle = api
+            .members
+            .get("Handle")
+            .expect("the direct resource is present");
+        let api_item = &codec_view.view.model.interfaces[api.wit].items[handle.item];
+        assert!(matches!(api_item.kind, sai_wit::WitItemKind::Resource(_)));
+        let package = result
+            .package
+            .as_ref()
+            .expect("the partial generated package model remains available");
+        let (client_index, client) = package
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "client")
+            .expect("the generated interface remains");
+        let assert_reference =
+            |ty: &sai_wit::WitType, expected_kind: fn(&sai_wit::WitType) -> bool| {
+                assert!(
+                    expected_kind(ty),
+                    "the foreign handle keeps its ownership form: {ty:?}"
+                );
+                let reference = match ty {
+                    sai_wit::WitType::Named(reference)
+                    | sai_wit::WitType::Own(reference)
+                    | sai_wit::WitType::Borrow(reference) => reference,
+                    _ => panic!("the reference targets an exact foreign resource"),
+                };
+                assert_eq!(reference.interface.unit, generated_unit);
+                assert_eq!(reference.interface.interface, client_index);
+                assert_eq!(reference.interface.name, "client");
+                assert_eq!(reference.item_name, "handle");
+                let local_import = &client.items[reference.item];
+                assert_eq!(local_import.name, "handle");
+                let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(foreign_reference)) =
+                    &local_import.kind
+                else {
+                    panic!("the generated use alias targets the exact foreign resource");
+                };
+                assert_eq!(foreign_reference.interface.unit, codec_view.view.unit);
+                assert_eq!(foreign_reference.interface.interface, api.wit);
+                assert_eq!(foreign_reference.interface.name, "api");
+                assert_eq!(foreign_reference.item, handle.item);
+                assert_eq!(foreign_reference.item_name, api_item.name);
+            };
+        let is_own = |ty: &sai_wit::WitType| matches!(ty, sai_wit::WitType::Own(_));
+        let is_borrow = |ty: &sai_wit::WitType| matches!(ty, sai_wit::WitType::Borrow(_));
+        let is_named = |ty: &sai_wit::WitType| matches!(ty, sai_wit::WitType::Named(_));
+
+        let (handle_alias_index, handle_alias) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle-alias")
+            .expect("the alias of the exact direct foreign resource remains");
+        let sai_wit::WitItemKind::Alias(alias_target) = &handle_alias.kind else {
+            panic!("the generated foreign-resource alias remains a type alias");
+        };
+        assert_reference(alias_target, is_named);
+
+        let (_, alias_consumer) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "alias-consumer")
+            .expect("the function consuming the generated alias remains");
+        let sai_wit::WitItemKind::Func(alias_consumer) = &alias_consumer.kind else {
+            panic!("the generated alias consumer remains a WIT function");
+        };
+        assert!(
+            matches!(
+                &alias_consumer.params[0].1,
+                sai_wit::WitType::Own(reference)
+                    if reference.interface.unit == generated_unit
+                        && reference.interface.interface == client_index
+                        && reference.item == handle_alias_index
+                        && reference.item_name == "handle-alias"
+            ),
+            "the consumer points to the exact generated local alias"
+        );
+
+        let (handle_record_index, handle_record) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle-record")
+            .expect("the record with a direct foreign resource field remains");
+        let sai_wit::WitItemKind::Record(fields) = &handle_record.kind else {
+            panic!("the direct-resource record remains a WIT record");
+        };
+        assert_eq!(fields.len(), 1);
+        assert_reference(&fields[0].ty, is_own);
+
+        let (_, record_consumer) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "record-consumer")
+            .expect("the function consuming the generated record remains");
+        let sai_wit::WitItemKind::Func(record_consumer) = &record_consumer.kind else {
+            panic!("the generated record consumer remains a WIT function");
+        };
+        assert!(
+            matches!(
+                &record_consumer.params[0].1,
+                sai_wit::WitType::Named(reference)
+                    if reference.interface.unit == generated_unit
+                        && reference.interface.interface == client_index
+                        && reference.item == handle_record_index
+                        && reference.item_name == "handle-record"
+            ),
+            "the consumer points to the exact generated local record"
+        );
+
+        let (handle_variant_index, handle_variant) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle-variant")
+            .expect("the variant with a direct foreign resource payload remains");
+        let sai_wit::WitItemKind::Variant(cases) = &handle_variant.kind else {
+            panic!("the direct-resource variant remains a WIT variant");
+        };
+        let wrapped = cases
+            .iter()
+            .find(|case| case.name == "wrapped")
+            .expect("the resource payload case remains");
+        assert_reference(
+            wrapped
+                .payload
+                .as_ref()
+                .expect("the resource payload remains owned"),
+            is_own,
+        );
+
+        let (_, variant_consumer) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "variant-consumer")
+            .expect("the function consuming the generated variant remains");
+        let sai_wit::WitItemKind::Func(variant_consumer) = &variant_consumer.kind else {
+            panic!("the generated variant consumer remains a WIT function");
+        };
+        assert!(
+            matches!(
+                &variant_consumer.params[0].1,
+                sai_wit::WitType::Named(reference)
+                    if reference.interface.unit == generated_unit
+                        && reference.interface.interface == client_index
+                        && reference.item == handle_variant_index
+                        && reference.item_name == "handle-variant"
+            ),
+            "the consumer points to the exact generated local variant"
+        );
+
+        let (_, accepted) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "accepted")
+            .expect("the function with exact direct resource types remains");
+        let sai_wit::WitItemKind::Func(accepted) = &accepted.kind else {
+            panic!("the selected-resource function remains a WIT function");
+        };
+        assert_reference(&accepted.params[0].1, is_own);
+        assert_reference(&accepted.params[1].1, is_borrow);
+        assert_reference(
+            accepted
+                .result
+                .as_ref()
+                .expect("owned resource result remains"),
+            is_own,
+        );
+
+        let (_, proxy) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "proxy")
+            .expect("the resource with exact direct foreign member types remains");
+        let sai_wit::WitItemKind::Resource(members) = &proxy.kind else {
+            panic!("the direct-resource members remain inside the proxy resource");
+        };
+        let constructor = members
+            .iter()
+            .find(|member| member.kind == sai_wit::WitMemberKind::Constructor)
+            .expect("the resource constructor remains");
+        assert_reference(&constructor.func.params[0].1, is_own);
+        let inspect = members
+            .iter()
+            .find(|member| member.name == "inspect")
+            .expect("the resource method remains");
+        assert_eq!(inspect.kind, sai_wit::WitMemberKind::Method);
+        assert_reference(&inspect.func.params[1].1, is_own);
+        assert_reference(&inspect.func.params[2].1, is_borrow);
+        assert_reference(
+            inspect
+                .func
+                .result
+                .as_ref()
+                .expect("the method's owned foreign resource result remains"),
+            is_own,
+        );
+        let static_member = members
+            .iter()
+            .find(|member| member.name == "from-foreign")
+            .expect("the resource static remains");
+        assert_eq!(static_member.kind, sai_wit::WitMemberKind::Static);
+        assert_reference(&static_member.func.params[0].1, is_own);
+        assert_reference(
+            static_member
+                .func
+                .result
+                .as_ref()
+                .expect("the static's owned foreign resource result remains"),
+            is_own,
+        );
+
+        let (_, take_proxy) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "take-proxy")
+            .expect("the exact local resource consumer remains");
+        let sai_wit::WitItemKind::Func(take_proxy) = &take_proxy.kind else {
+            panic!("the proxy consumer remains a WIT function");
+        };
+        assert!(matches!(
+            take_proxy.params[0].1,
+            sai_wit::WitType::Own(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == client_index
+                    && reference.item_name == "proxy"
+        ));
+    }
+
+    #[test]
+    fn generated_interface_resource_members_preserve_used_data_facades() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  resource Proxy {\n",
+            "    fn new(value: api.Request) -> Self\n",
+            "    fn inspect(self: borrow Self, value: api.Request) -> api.Request\n",
+            "    fn from_request(value: api.Request) -> api.Request\n",
+            "  }\n",
+            "  fn take_proxy(value: Proxy)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types { record payload { value: u32 } }
+interface middle { use types.{payload as intermediate}; }
+interface api { use middle.{intermediate as request}; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let (expected_request, intermediate_target, payload_target) = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            let api = codec_view.view.interfaces.get("api").unwrap();
+            let request = api.members.get("Request").unwrap();
+            let item = &codec_view.view.model.interfaces[api.wit].items[request.item];
+            let expected_request = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: api.wit,
+                    name: "api".to_owned(),
+                },
+                item: request.item,
+                item_name: item.name.clone(),
+            };
+            let middle = codec_view.view.interfaces.get("middle").unwrap();
+            let intermediate = middle.members.get("Intermediate").unwrap();
+            let item = &codec_view.view.model.interfaces[middle.wit].items[intermediate.item];
+            let intermediate_target = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: middle.wit,
+                    name: "middle".to_owned(),
+                },
+                item: intermediate.item,
+                item_name: item.name.clone(),
+            };
+            let types = codec_view.view.interfaces.get("types").unwrap();
+            let payload = types.members.get("Payload").unwrap();
+            let item = &codec_view.view.model.interfaces[types.wit].items[payload.item];
+            let payload_target = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: types.wit,
+                    name: "types".to_owned(),
+                },
+                item: payload.item,
+                item_name: item.name.clone(),
+            };
+            (expected_request, intermediate_target, payload_target)
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "Request",
+            intermediate_target,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "middle",
+            "Intermediate",
+            payload_target,
+        );
+
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact selected authored WIT view");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "the Used facade resource members parse: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            generated.complete,
+            "supported members retain their Used facade without omissions"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{request};")
+        );
+        assert!(generated.text.contains("resource proxy {"));
+        assert!(generated.text.contains("constructor(value: request);"));
+        assert!(
+            generated
+                .text
+                .contains("inspect: func(value: request) -> request;")
+        );
+        assert!(
+            generated
+                .text
+                .contains("from-request: static func(value: request) -> request;")
+        );
+        assert!(generated.text.contains("take-proxy: func(value: proxy);"));
+        assert!(generated.text.contains("independent: func(value: u32);"));
+
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated WIT remains parseable");
+        let (client_index, client) = package
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "client")
+            .expect("the generated client interface remains");
+        let proxy = client
+            .items
+            .iter()
+            .find(|item| item.name == "proxy")
+            .expect("the resource with supported Used facade members remains");
+        let sai_wit::WitItemKind::Resource(members) = &proxy.kind else {
+            panic!("the resource remains a WIT resource");
+        };
+        let assert_used_facade = |ty: &sai_wit::WitType| {
+            let sai_wit::WitType::Named(reference) = ty else {
+                panic!("resource signatures retain a named Used facade: {ty:?}");
+            };
+            assert_eq!(reference.interface.unit, generated_unit);
+            assert_eq!(reference.interface.interface, client_index);
+            assert_eq!(reference.interface.name, "client");
+            assert_eq!(reference.item_name, "request");
+            let local_import = &client.items[reference.item];
+            assert_eq!(local_import.name, "request");
+            let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(foreign_reference)) =
+                &local_import.kind
+            else {
+                panic!("the member facade import remains a named alias");
+            };
+            assert_eq!(foreign_reference, &expected_request);
+        };
+        let constructor = members
+            .iter()
+            .find(|member| member.kind == sai_wit::WitMemberKind::Constructor)
+            .expect("the facade-using constructor remains");
+        assert_used_facade(&constructor.func.params[0].1);
+        let method = members
+            .iter()
+            .find(|member| member.name == "inspect")
+            .expect("the facade-using method remains");
+        assert_eq!(method.kind, sai_wit::WitMemberKind::Method);
+        assert_used_facade(&method.func.params[1].1);
+        assert_used_facade(
+            method
+                .func
+                .result
+                .as_ref()
+                .expect("the method facade result remains"),
+        );
+        let static_member = members
+            .iter()
+            .find(|member| member.name == "from-request")
+            .expect("the facade-using static remains");
+        assert_eq!(static_member.kind, sai_wit::WitMemberKind::Static);
+        assert_used_facade(&static_member.func.params[0].1);
+        assert_used_facade(
+            static_member
+                .func
+                .result
+                .as_ref()
+                .expect("the static facade result remains"),
+        );
+    }
+
+    #[test]
+    fn generated_interface_resource_member_used_aliases_commit_only_with_the_resource() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  type Request = U32\n",
+            "  resource Broken {\n",
+            "    fn accept(self: borrow Self, value: api.Request)\n",
+            "    fn reject(self: borrow Self, value: borrow api.Request)\n",
+            "  }\n",
+            "  resource ResourceFacade {\n",
+            "    fn reject(self: borrow Self, value: api.ResourceHandle)\n",
+            "  }\n",
+            "  resource NestedResourceFacade {\n",
+            "    fn reject(self: borrow Self, value: api.NestedHandle)\n",
+            "  }\n",
+            "  fn take_broken(value: Broken)\n",
+            "  fn take_resource_facade(value: ResourceFacade)\n",
+            "  fn take_nested_resource_facade(value: NestedResourceFacade)\n",
+            "  fn independent(value: Request)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types {
+  record payload { value: u32 }
+  resource handle;
+  type owned-handle = own<handle>;
+}
+interface middle { use types.{payload as intermediate}; }
+interface api {
+  use middle.{intermediate as request};
+  use types.{handle as resource-handle, owned-handle as nested-handle};
+}"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let (intermediate_target, payload_target, resource_target, nested_target) = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            let item_reference = |interface_name: &str, member_name: &str| {
+                let interface = codec_view
+                    .view
+                    .interfaces
+                    .get(interface_name)
+                    .expect("the WIT interface exists");
+                let member = interface
+                    .members
+                    .get(member_name)
+                    .expect("the WIT member exists");
+                let item = &codec_view.view.model.interfaces[interface.wit].items[member.item];
+                sai_wit::WitTypeRef {
+                    interface: sai_wit::WitIfaceRef {
+                        unit: codec_view.view.unit.clone(),
+                        interface: interface.wit,
+                        name: interface_name.to_owned(),
+                    },
+                    item: member.item,
+                    item_name: item.name.clone(),
+                }
+            };
+            (
+                item_reference("middle", "Intermediate"),
+                item_reference("types", "Payload"),
+                item_reference("types", "Handle"),
+                item_reference("types", "OwnedHandle"),
+            )
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "Request",
+            intermediate_target,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "middle",
+            "Intermediate",
+            payload_target,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "ResourceHandle",
+            resource_target,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "NestedHandle",
+            nested_target,
+        );
+
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact selected authored WIT view");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "unsupported resources leave parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            !generated.complete,
+            "unsupported resource members remain omitted from output"
+        );
+        assert!(
+            generated.text.contains("type request = u32;"),
+            "the independent local type wins after the resource is pruned"
+        );
+        assert!(
+            generated
+                .text
+                .contains("independent: func(value: request);")
+        );
+        assert!(
+            !generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{request};"),
+            "a failed resource does not leave its staged facade import"
+        );
+        assert!(
+            !generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{resource-handle};")
+        );
+        assert!(
+            !generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{nested-handle};")
+        );
+        assert!(!generated.text.contains("resource broken"));
+        assert!(!generated.text.contains("resource resource-facade"));
+        assert!(!generated.text.contains("resource nested-resource-facade"));
+        assert!(!generated.text.contains("take-broken:"));
+        assert!(!generated.text.contains("take-resource-facade:"));
+        assert!(!generated.text.contains("take-nested-resource-facade:"));
+
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated WIT remains parseable");
+        let client = package
+            .root()
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "client")
+            .expect("the generated client interface remains");
+        let request = client
+            .items
+            .iter()
+            .find(|item| item.name == "request")
+            .expect("the independent local request alias remains");
+        assert!(matches!(
+            &request.kind,
+            sai_wit::WitItemKind::Alias(sai_wit::WitType::U32)
+        ));
+    }
+
+    #[test]
+    fn generated_interface_functions_preserve_direct_and_chained_used_facades() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "use acme:codec/chain as chain\n",
+            "interface client {\n",
+            "  type Payload = U32\n",
+            "  type DirectHandle = U32\n",
+            "  type Ignored = U32\n",
+            "  fn direct(value: api.Request) -> api.Request\n",
+            "  fn consume_chain(value: chain.Chained) -> chain.Chained\n",
+            "  unsafe fn unsafe_consumer(value: api.Ignored)\n",
+            "  fn owned_alias(value: api.NestedHandle)\n",
+            "  fn resource_alias(value: api.DirectHandle)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types {
+  record payload { value: u32 }
+  resource handle;
+  type owned-handle = own<handle>;
+}
+interface api {
+  use types.{payload as request, payload as ignored, owned-handle as nested-handle, handle as direct-handle};
+}
+interface middle { use types.{payload as intermediate}; }
+interface chain { use middle.{intermediate as chained}; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let (payload, owned_handle, handle, middle_facade) = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            assert!(codec_view.directly_visible);
+            let item_reference = |interface_name: &str, member_name: &str| {
+                let interface = codec_view
+                    .view
+                    .interfaces
+                    .get(interface_name)
+                    .expect("the WIT interface exists");
+                let member = interface
+                    .members
+                    .get(member_name)
+                    .expect("the WIT member exists");
+                let item = &codec_view.view.model.interfaces[interface.wit].items[member.item];
+                sai_wit::WitTypeRef {
+                    interface: sai_wit::WitIfaceRef {
+                        unit: codec_view.view.unit.clone(),
+                        interface: interface.wit,
+                        name: interface_name.to_owned(),
+                    },
+                    item: member.item,
+                    item_name: item.name.clone(),
+                }
+            };
+            (
+                item_reference("types", "Payload"),
+                item_reference("types", "OwnedHandle"),
+                item_reference("types", "Handle"),
+                item_reference("middle", "Intermediate"),
+            )
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "Request",
+            payload.clone(),
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "Ignored",
+            payload.clone(),
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "NestedHandle",
+            owned_handle,
+        );
+        set_authored_wit_item_as_used(&mut wit_views, "acme:codec", "api", "DirectHandle", handle);
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "middle",
+            "Intermediate",
+            payload,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "chain",
+            "Chained",
+            middle_facade,
+        );
+
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact selected authored WIT view");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "unsupported Used aliases leave parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            !generated.complete,
+            "resource and resource-handle alias facades remain unsupported"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{request};"),
+            "the selected facade spelling is retained: {}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/chain@1.2.3.{chained};"),
+            "multi-hop Used chains retain their public facade identity: {}",
+            generated.text
+        );
+        assert!(
+            generated.text.contains("type payload = u32;"),
+            "the local payload name does not collide with the renamed facade"
+        );
+        assert!(
+            generated.text.contains("type direct-handle = u32;"),
+            "an omitted resource facade must not leave a phantom imported name that poisons a local type"
+        );
+        assert!(
+            generated.text.contains("type ignored = u32;"),
+            "an omitted unsafe function must not leave a phantom imported name that poisons a local type"
+        );
+        assert!(
+            generated
+                .text
+                .contains("direct: func(value: request) -> request;")
+        );
+        assert!(
+            generated
+                .text
+                .contains("consume-chain: func(value: chained) -> chained;")
+        );
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("unsafe-consumer:"));
+        assert!(
+            !generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{ignored};")
+        );
+        assert!(!generated.text.contains("owned-alias:"));
+        assert!(!generated.text.contains("resource-alias:"));
+
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated WIT remains parseable");
+        let (client_index, client) = package
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "client")
+            .expect("the client interface remains generated");
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the selected codec view remains available");
+        let expected_facade_reference = |interface_name: &str, member_name: &str| {
+            let interface = codec_view.view.interfaces.get(interface_name).unwrap();
+            let member = interface.members.get(member_name).unwrap();
+            let item = &codec_view.view.model.interfaces[interface.wit].items[member.item];
+            sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: interface.wit,
+                    name: interface_name.to_owned(),
+                },
+                item: member.item,
+                item_name: item.name.clone(),
+            }
+        };
+        let assert_function_uses_facade =
+            |function_name: &str, local_name: &str, expected_facade: &sai_wit::WitTypeRef| {
+                let function = client
+                    .items
+                    .iter()
+                    .find(|item| item.name == function_name)
+                    .expect("the supported facade function remains");
+                let sai_wit::WitItemKind::Func(function) = &function.kind else {
+                    panic!("the facade consumer remains a WIT function");
+                };
+                let local_reference = match &function.params[0].1 {
+                    sai_wit::WitType::Named(reference) => reference,
+                    other => panic!("the function uses a local named facade: {other:?}"),
+                };
+                assert_eq!(local_reference.interface.unit, generated_unit);
+                assert_eq!(local_reference.interface.interface, client_index);
+                assert_eq!(local_reference.interface.name, "client");
+                assert_eq!(local_reference.item_name, local_name);
+                let local_alias = &client.items[local_reference.item];
+                assert_eq!(local_alias.name, local_name);
+                let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(foreign_reference)) =
+                    &local_alias.kind
+                else {
+                    panic!("the generated local import preserves a named foreign facade");
+                };
+                assert_eq!(foreign_reference, expected_facade);
+                let result_reference = match function.result.as_ref() {
+                    Some(sai_wit::WitType::Named(reference)) => reference,
+                    other => panic!("the function result uses the same local facade: {other:?}"),
+                };
+                assert_eq!(result_reference, local_reference);
+            };
+        assert_function_uses_facade(
+            "direct",
+            "request",
+            &expected_facade_reference("api", "Request"),
+        );
+        assert_function_uses_facade(
+            "consume-chain",
+            "chained",
+            &expected_facade_reference("chain", "Chained"),
+        );
+    }
+
+    #[test]
+    fn generated_interface_aliases_preserve_used_facades_without_leaking_to_siblings() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "use acme:codec/chain as chain\n",
+            "interface client {\n",
+            "  type PayloadAlias = chain.Chained\n",
+            "  enum PayloadVariant { Wrapped(api.ResourceHandle) }\n",
+            "  fn consume_alias(value: PayloadAlias)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types { record payload { value: u32 } resource handle; }
+interface api { use types.{payload as request, handle as resource-handle}; }
+interface middle { use types.{payload as intermediate}; }
+interface chain { use middle.{intermediate as chained}; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let (payload, middle_facade, resource_target) = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            let item_reference = |interface_name: &str, member_name: &str| {
+                let interface = codec_view
+                    .view
+                    .interfaces
+                    .get(interface_name)
+                    .expect("the WIT interface exists");
+                let member = interface
+                    .members
+                    .get(member_name)
+                    .expect("the WIT member exists");
+                let item = &codec_view.view.model.interfaces[interface.wit].items[member.item];
+                sai_wit::WitTypeRef {
+                    interface: sai_wit::WitIfaceRef {
+                        unit: codec_view.view.unit.clone(),
+                        interface: interface.wit,
+                        name: interface_name.to_owned(),
+                    },
+                    item: member.item,
+                    item_name: item.name.clone(),
+                }
+            };
+            (
+                item_reference("types", "Payload"),
+                item_reference("middle", "Intermediate"),
+                item_reference("types", "Handle"),
+            )
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "Request",
+            payload.clone(),
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "middle",
+            "Intermediate",
+            payload,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "chain",
+            "Chained",
+            middle_facade,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "ResourceHandle",
+            resource_target,
+        );
+
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact selected authored WIT view");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "omitted sibling consumers leave parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            !generated.complete,
+            "Used facades resolving to resources remain unsupported in variant payloads"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/chain@1.2.3.{chained};")
+        );
+        assert!(generated.text.contains("type payload-alias = chained;"));
+        assert!(
+            generated
+                .text
+                .contains("consume-alias: func(value: payload-alias);")
+        );
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(
+            !generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{request};")
+        );
+        assert!(!generated.text.contains("variant payload-variant"));
+
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated WIT remains parseable");
+        let (client_index, client) = package
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "client")
+            .expect("the client interface remains generated");
+        let (alias_index, alias) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "payload-alias")
+            .expect("the supported foreign-facade alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(import_reference)) = &alias.kind
+        else {
+            panic!("the generated alias retains its named foreign facade");
+        };
+        assert_eq!(import_reference.interface.unit, generated_unit);
+        assert_eq!(import_reference.interface.interface, client_index);
+        assert_eq!(import_reference.interface.name, "client");
+        assert_eq!(import_reference.item_name, "chained");
+        let imported_facade = &client.items[import_reference.item];
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(foreign_reference)) =
+            &imported_facade.kind
+        else {
+            panic!("the local use alias retains a named foreign Used facade");
+        };
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the exact selected codec view remains available");
+        let chain_interface = codec_view.view.interfaces.get("chain").unwrap();
+        let chain_member = chain_interface.members.get("Chained").unwrap();
+        let chain_item =
+            &codec_view.view.model.interfaces[chain_interface.wit].items[chain_member.item];
+        assert_eq!(foreign_reference.interface.unit, codec_view.view.unit);
+        assert_eq!(foreign_reference.interface.interface, chain_interface.wit);
+        assert_eq!(foreign_reference.interface.name, "chain");
+        assert_eq!(foreign_reference.item, chain_member.item);
+        assert_eq!(foreign_reference.item_name, chain_item.name);
+
+        let consumer = client
+            .items
+            .iter()
+            .find(|item| item.name == "consume-alias")
+            .expect("the generated alias consumer remains");
+        let sai_wit::WitItemKind::Func(consumer) = &consumer.kind else {
+            panic!("the alias consumer remains a WIT function");
+        };
+        assert!(
+            matches!(
+                &consumer.params[0].1,
+                sai_wit::WitType::Named(reference)
+                    if reference.interface.unit == generated_unit
+                        && reference.interface.interface == client_index
+                        && reference.item == alias_index
+                        && reference.item_name == "payload-alias"
+            ),
+            "the function uses the exact generated local alias"
+        );
+    }
+
+    #[test]
+    fn generated_interface_used_facades_propagate_partial_view_incompleteness() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  type RequestAlias = api.Request\n",
+            "  type RequestRecord { payload: api.Request }\n",
+            "  enum RequestVariant { Wrapped(api.Request) }\n",
+            "  resource Proxy {\n",
+            "    fn inspect(self: borrow Self, value: api.Request) -> api.Request\n",
+            "  }\n",
+            "  fn consume(value: api.Request)\n",
+            "  fn consume_alias(value: RequestAlias)\n",
+            "  fn consume_record(value: RequestRecord)\n",
+            "  fn consume_variant(value: RequestVariant)\n",
+            "  fn consume_proxy(value: Proxy)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types { record payload { value: u32 } }
+interface api { use types.{payload as request}; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let target_reference = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            let types = codec_view.view.interfaces.get("types").unwrap();
+            let payload = types.members.get("Payload").unwrap();
+            let item = &codec_view.view.model.interfaces[types.wit].items[payload.item];
+            sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: types.wit,
+                    name: "types".to_owned(),
+                },
+                item: payload.item,
+                item_name: item.name.clone(),
+            }
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "Request",
+            target_reference,
+        );
+        mark_authored_wit_view_incomplete(&mut wit_views, "acme:codec");
+
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact partial authored WIT view");
+        let generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated WIT query succeeds")
+            .expect("the root source package publishes generated WIT");
+        assert!(
+            !generated.complete,
+            "the Used facade's selected partial view makes output incomplete"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{request};")
+        );
+        assert!(generated.text.contains("type request-alias = request;"));
+        assert!(generated.text.contains("record request-record {"));
+        assert!(generated.text.contains("consume: func(value: request);"));
+        assert!(
+            generated
+                .text
+                .contains("consume-alias: func(value: request-alias);")
+        );
+        assert!(
+            generated
+                .text
+                .contains("consume-record: func(value: request-record);")
+        );
+        assert!(generated.text.contains("variant request-variant {"));
+        assert!(
+            generated
+                .text
+                .contains("consume-variant: func(value: request-variant);")
+        );
+        assert!(generated.text.contains("resource proxy {"));
+        assert!(
+            generated
+                .text
+                .contains("inspect: func(value: request) -> request;")
+        );
+        assert!(
+            generated
+                .text
+                .contains("consume-proxy: func(value: proxy);")
+        );
+        assert!(generated.text.contains("independent: func(value: u32);"));
+    }
+
+    #[test]
+    fn generated_interface_record_fields_preserve_used_facades_without_leaking_to_siblings() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  type PayloadRecord { payload: api.Request }\n",
+            "  type ResourceRecord { handle: api.ResourceHandle }\n",
+            "  enum PayloadVariant { Wrapped(api.ResourceHandle) }\n",
+            "  resource Container {\n",
+            "    fn take(self: borrow Self, payload: api.Request)\n",
+            "  }\n",
+            "  fn consume_record(value: PayloadRecord)\n",
+            "  fn consume_resource_record(value: ResourceRecord)\n",
+            "  fn consume_variant(value: PayloadVariant)\n",
+            "  fn consume_container(value: Container)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types { record payload { value: u32 } resource handle; }
+interface api { use types.{payload as request, handle as resource-handle}; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let (expected_request, payload_target, resource_target) = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            let api = codec_view.view.interfaces.get("api").unwrap();
+            let member = api.members.get("Request").unwrap();
+            let item = &codec_view.view.model.interfaces[api.wit].items[member.item];
+            let expected_request = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: api.wit,
+                    name: "api".to_owned(),
+                },
+                item: member.item,
+                item_name: item.name.clone(),
+            };
+            let types = codec_view.view.interfaces.get("types").unwrap();
+            let payload = types.members.get("Payload").unwrap();
+            let item = &codec_view.view.model.interfaces[types.wit].items[payload.item];
+            let payload_target = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: types.wit,
+                    name: "types".to_owned(),
+                },
+                item: payload.item,
+                item_name: item.name.clone(),
+            };
+            let resource = types.members.get("Handle").unwrap();
+            let item = &codec_view.view.model.interfaces[types.wit].items[resource.item];
+            let resource_target = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: types.wit,
+                    name: "types".to_owned(),
+                },
+                item: resource.item,
+                item_name: item.name.clone(),
+            };
+            (expected_request, payload_target, resource_target)
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "Request",
+            payload_target,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "ResourceHandle",
+            resource_target,
+        );
+
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact selected authored WIT view");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "omitted sibling consumers leave parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            !generated.complete,
+            "Used resource facades remain unsupported in records and variants"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{request};")
+        );
+        assert!(generated.text.contains("record payload-record {"));
+        assert!(
+            !generated.text.contains("record resource-record"),
+            "a Used facade that resolves to a resource remains unsupported in record fields"
+        );
+        assert!(!generated.text.contains("resource-handle"));
+        assert!(
+            generated
+                .text
+                .contains("consume-record: func(value: payload-record);")
+        );
+        assert!(generated.text.contains("resource container {"));
+        assert!(generated.text.contains("take: func(payload: request);"));
+        assert!(
+            generated
+                .text
+                .contains("consume-container: func(value: container);")
+        );
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("variant payload-variant"));
+        assert!(!generated.text.contains("consume-resource-record:"));
+        assert!(!generated.text.contains("consume-variant:"));
+
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated WIT remains parseable");
+        let (client_index, client) = package
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "client")
+            .expect("the client interface remains generated");
+        let (_, record) = client
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "payload-record")
+            .expect("the record field using the Used facade remains");
+        let sai_wit::WitItemKind::Record(fields) = &record.kind else {
+            panic!("the generated facade consumer remains a record");
+        };
+        let local_import_reference = match &fields[0].ty {
+            sai_wit::WitType::Named(reference) => reference,
+            other => panic!("the record field retains its named facade: {other:?}"),
+        };
+        assert_eq!(local_import_reference.interface.unit, generated_unit);
+        assert_eq!(local_import_reference.interface.interface, client_index);
+        assert_eq!(local_import_reference.interface.name, "client");
+        assert_eq!(local_import_reference.item_name, "request");
+        let local_import = &client.items[local_import_reference.item];
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(foreign_reference)) =
+            &local_import.kind
+        else {
+            panic!("the generated record field imports a named Used facade");
+        };
+        assert_eq!(foreign_reference, &expected_request);
+
+        let consumer = client
+            .items
+            .iter()
+            .find(|item| item.name == "consume-record")
+            .expect("the record consumer remains");
+        let sai_wit::WitItemKind::Func(consumer) = &consumer.kind else {
+            panic!("the record consumer remains a WIT function");
+        };
+        assert!(
+            matches!(
+                &consumer.params[0].1,
+                sai_wit::WitType::Named(reference)
+                    if reference.interface.unit == generated_unit
+                        && reference.interface.interface == client_index
+                        && reference.item_name == "payload-record"
+            ),
+            "the function retains its exact generated record"
+        );
+    }
+
+    #[test]
+    fn generated_interface_variant_payloads_preserve_used_facades_without_leaking_to_siblings() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  enum RequestVariant { Wrapped(api.Request) }\n",
+            "  enum ResourceVariant { Wrapped(api.ResourceHandle) }\n",
+            "  resource Container {\n",
+            "    fn take(self: borrow Self, payload: api.Request)\n",
+            "  }\n",
+            "  fn consume_variant(value: RequestVariant)\n",
+            "  fn consume_resource_variant(value: ResourceVariant)\n",
+            "  fn consume_container(value: Container)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types { record payload { value: u32 } resource handle; }
+interface middle { use types.{payload as intermediate}; }
+interface api { use middle.{intermediate as request}; use types.{handle as resource-handle}; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let (expected_request, intermediate_target, payload_target, resource_target) = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            let api = codec_view.view.interfaces.get("api").unwrap();
+            let request = api.members.get("Request").unwrap();
+            let item = &codec_view.view.model.interfaces[api.wit].items[request.item];
+            let expected_request = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: api.wit,
+                    name: "api".to_owned(),
+                },
+                item: request.item,
+                item_name: item.name.clone(),
+            };
+            let middle = codec_view.view.interfaces.get("middle").unwrap();
+            let intermediate = middle.members.get("Intermediate").unwrap();
+            let item = &codec_view.view.model.interfaces[middle.wit].items[intermediate.item];
+            let intermediate_target = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: middle.wit,
+                    name: "middle".to_owned(),
+                },
+                item: intermediate.item,
+                item_name: item.name.clone(),
+            };
+            let types = codec_view.view.interfaces.get("types").unwrap();
+            let payload = types.members.get("Payload").unwrap();
+            let item = &codec_view.view.model.interfaces[types.wit].items[payload.item];
+            let payload_target = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: types.wit,
+                    name: "types".to_owned(),
+                },
+                item: payload.item,
+                item_name: item.name.clone(),
+            };
+            let resource = types.members.get("Handle").unwrap();
+            let item = &codec_view.view.model.interfaces[types.wit].items[resource.item];
+            let resource_target = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: types.wit,
+                    name: "types".to_owned(),
+                },
+                item: resource.item,
+                item_name: item.name.clone(),
+            };
+            (
+                expected_request,
+                intermediate_target,
+                payload_target,
+                resource_target,
+            )
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "Request",
+            intermediate_target,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "middle",
+            "Intermediate",
+            payload_target,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "api",
+            "ResourceHandle",
+            resource_target,
+        );
+
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact selected authored WIT view");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "omitted sibling consumers leave parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            !generated.complete,
+            "the resource-target variant remains unsupported"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{request};")
+        );
+        assert!(generated.text.contains("variant request-variant {"));
+        assert!(
+            !generated.text.contains("variant resource-variant"),
+            "a Used facade that resolves to a resource remains unsupported in variant payloads"
+        );
+        assert!(!generated.text.contains("resource-handle"));
+        assert!(
+            generated
+                .text
+                .contains("consume-variant: func(value: request-variant);")
+        );
+        assert!(generated.text.contains("resource container {"));
+        assert!(generated.text.contains("take: func(payload: request);"));
+        assert!(
+            generated
+                .text
+                .contains("consume-container: func(value: container);")
+        );
+        assert!(!generated.text.contains("consume-resource-variant:"));
+        assert!(generated.text.contains("independent: func(value: u32);"));
+
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated WIT remains parseable");
+        let (client_index, client) = package
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "client")
+            .expect("the client interface remains generated");
+        let variant = client
+            .items
+            .iter()
+            .find(|item| item.name == "request-variant")
+            .expect("the variant payload using the Used facade remains");
+        let sai_wit::WitItemKind::Variant(cases) = &variant.kind else {
+            panic!("the facade consumer remains a WIT variant");
+        };
+        let local_import_reference = match cases[0].payload.as_ref() {
+            Some(sai_wit::WitType::Named(reference)) => reference,
+            other => panic!("the variant payload retains its named facade: {other:?}"),
+        };
+        assert_eq!(local_import_reference.interface.unit, generated_unit);
+        assert_eq!(local_import_reference.interface.interface, client_index);
+        assert_eq!(local_import_reference.interface.name, "client");
+        assert_eq!(local_import_reference.item_name, "request");
+        let local_import = &client.items[local_import_reference.item];
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(foreign_reference)) =
+            &local_import.kind
+        else {
+            panic!("the generated variant payload imports a named Used facade");
+        };
+        assert_eq!(foreign_reference, &expected_request);
+
+        let consumer = client
+            .items
+            .iter()
+            .find(|item| item.name == "consume-variant")
+            .expect("the variant consumer remains");
+        let sai_wit::WitItemKind::Func(consumer) = &consumer.kind else {
+            panic!("the variant consumer remains a WIT function");
+        };
+        assert!(
+            matches!(
+                &consumer.params[0].1,
+                sai_wit::WitType::Named(reference)
+                    if reference.interface.unit == generated_unit
+                        && reference.interface.interface == client_index
+                        && reference.item_name == "request-variant"
+            ),
+            "the function retains its exact generated variant"
+        );
+    }
+
+    #[test]
+    fn generated_interface_resources_remain_usable_from_partial_foreign_views() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  resource Proxy {\n",
+            "    fn inspect(self: borrow Self, value: borrow api.Handle) -> api.Handle\n",
+            "  }\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3; interface api { resource handle; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        mark_authored_wit_view_incomplete(&mut wit_views, "acme:codec");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact partial foreign WIT view");
+        let generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated WIT query succeeds")
+            .expect("root source package publishes generated WIT");
+        assert!(
+            !generated.complete,
+            "using a present foreign resource from a partial view keeps output incomplete"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{handle};")
+        );
+        assert!(generated.text.contains("resource proxy {"));
+        assert!(generated.text.contains("inspect: func("));
+    }
+
+    #[test]
+    fn generated_interface_aliases_remain_usable_from_partial_foreign_views() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  type HandleAlias = api.Handle\n",
+            "  fn consume(value: HandleAlias)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3; interface api { resource handle; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        mark_authored_wit_view_incomplete(&mut wit_views, "acme:codec");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact partial foreign WIT view");
+        let generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated WIT query succeeds")
+            .expect("root source package publishes generated WIT");
+        assert!(
+            !generated.complete,
+            "a present resource alias from a partial view keeps output incomplete"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{handle};")
+        );
+        assert!(generated.text.contains("type handle-alias = handle;"));
+        assert!(
+            generated
+                .text
+                .contains("consume: func(value: handle-alias);")
+        );
+    }
+
+    #[test]
+    fn generated_interface_records_remain_usable_from_partial_foreign_views() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  type HandleRecord { handle: api.Handle }\n",
+            "  fn consume(value: HandleRecord)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3; interface api { resource handle; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        mark_authored_wit_view_incomplete(&mut wit_views, "acme:codec");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact partial foreign WIT view");
+        let generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated WIT query succeeds")
+            .expect("root source package publishes generated WIT");
+        assert!(
+            !generated.complete,
+            "a present foreign resource field from a partial view keeps output incomplete"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{handle};")
+        );
+        assert!(generated.text.contains("record handle-record {"));
+        assert!(
+            generated
+                .text
+                .contains("consume: func(value: handle-record);")
+        );
+    }
+
+    #[test]
+    fn generated_interface_variants_remain_usable_from_partial_foreign_views() {
+        let root_source = concat!(
+            "use acme:codec/api as api\n",
+            "interface client {\n",
+            "  enum HandleVariant { Wrapped(api.Handle) }\n",
+            "  fn consume(value: HandleVariant)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3; interface api { resource handle; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        mark_authored_wit_view_incomplete(&mut wit_views, "acme:codec");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root source scopes use the exact partial foreign WIT view");
+        let generated = database
+            .generated_wit_text(root_package)
+            .expect("root generated WIT query succeeds")
+            .expect("root source package publishes generated WIT");
+        assert!(
+            !generated.complete,
+            "a present foreign resource payload from a partial view keeps output incomplete"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/api@1.2.3.{handle};")
+        );
+        assert!(generated.text.contains("variant handle-variant {"));
+        assert!(
+            generated
+                .text
+                .contains("consume: func(value: handle-variant);")
+        );
+    }
+
+    fn authored_wit_world_fixture(
+        root_source: &[u8],
+        codec_wit: &[u8],
+        base_wit: Option<&[u8]>,
+    ) -> (
+        RootDatabase,
+        ModuleTree,
+        WorkspaceSnapshot,
+        PackageId,
+        Phase1ActiveWitViewScopes,
+    ) {
+        let (mut database, module_tree, snapshot, root_package) = phase1_fixture(root_source, b"");
+        let (codec, codec_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:codec",
+            "1.2.3",
+            codec_wit,
+        );
+        let base_node = base_wit.map(|source| {
+            let (_, base_node) = install_external_artifact_world_package(
+                &mut database,
+                "acme:base",
+                "1.0.0",
+                source,
+            );
+            database
+                .set_package_manifest(
+                    codec,
+                    Arc::from(
+                        &b"package acme:codec @ 1.2.3\n\
+                          artifact component {}\n\
+                          wit \"wit\"\n\
+                          requires { acme:base @ ^1 }\n"[..],
+                    ),
+                    PackageRole::Dependency,
+                    Durability::Low,
+                )
+                .expect("codec's transitive WIT dependency is recorded");
+            let codec_node = PackageGraphNode::new(
+                codec_node.key().clone(),
+                codec_node.identity(),
+                codec_node.version().clone(),
+                codec_node.form(),
+                codec_node.role(),
+                vec![graph_edge(base_node.key().as_str(), "acme:base")],
+            )
+            .expect("codec graph node includes the base package");
+            (codec_node, base_node)
+        });
+        let codec_node = base_node
+            .as_ref()
+            .map_or(codec_node, |(codec_node, _)| codec_node.clone());
+        let root_key = PackageKey::new("acme:phase1#1").expect("root package key is valid");
+        let mut graph_nodes = vec![
+            graph_node(
+                root_key.as_str(),
+                "acme:phase1",
+                "1.0.0",
+                PackageGraphRole::Root,
+                vec![graph_edge(codec_node.key().as_str(), "acme:codec")],
+            ),
+            codec_node,
+        ];
+        if let Some((_, base_node)) = base_node {
+            graph_nodes.push(base_node);
+        }
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            graph_nodes,
+        )
+        .expect("authored WIT package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&module_tree, &snapshot, &target, &graph)
+            .expect("selected authored WIT views load");
+        (database, module_tree, snapshot, root_package, wit_views)
+    }
+
+    fn set_authored_wit_item_as_used(
+        wit_views: &mut Phase1ActiveWitViewScopes,
+        visible_identity: &str,
+        interface_name: &str,
+        item_name: &str,
+        target: sai_wit::WitTypeRef,
+    ) {
+        // The authored WIT source converter normalizes `use` declarations to
+        // Alias. Keep the loaded view identity and item address, but exercise
+        // the separate Used model shape consumed at this driver boundary.
+        let entry = wit_views
+            .entries
+            .iter_mut()
+            .find(|entry| entry.identity.package_identity == visible_identity)
+            .expect("the selected authored WIT view exists");
+        let foreign = entry
+            .available
+            .as_mut()
+            .expect("the selected authored WIT view is available");
+        let view = Arc::make_mut(&mut foreign.view);
+        let interface = view
+            .interfaces
+            .get(interface_name)
+            .expect("the authored interface exists");
+        let interface_index = interface.wit;
+        let item_index = interface
+            .members
+            .get(item_name)
+            .expect("the authored member exists")
+            .item;
+        view.model.interfaces[interface_index].items[item_index].kind =
+            sai_wit::WitItemKind::Used(target);
+    }
+
+    fn mark_authored_wit_view_incomplete(
+        wit_views: &mut Phase1ActiveWitViewScopes,
+        visible_identity: &str,
+    ) {
+        let entry = wit_views
+            .entries
+            .iter_mut()
+            .find(|entry| entry.identity.package_identity == visible_identity)
+            .expect("the selected authored WIT view exists");
+        let foreign = entry
+            .available
+            .as_mut()
+            .expect("the selected authored WIT view is available");
+        Arc::make_mut(&mut foreign.view).complete = false;
+    }
+
+    #[test]
+    fn generated_world_function_propagates_incompleteness_for_multi_hop_used_type() {
+        let root_source = concat!(
+            "use acme:codec/chain as chain\n",
+            "world client {\n",
+            "  import fn consume(value: chain.Payload) -> chain.Payload\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types { record payload { value: u32 } }
+interface middle { use types.{payload}; }
+interface chain { use middle.{payload}; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let (target, middle_reference) = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            assert!(codec_view.directly_visible);
+            assert!(codec_view.view.complete);
+            let middle = codec_view
+                .view
+                .interfaces
+                .get("middle")
+                .expect("the authored middle facade interface is loaded");
+            let middle_member = middle
+                .members
+                .get("Payload")
+                .expect("the middle facade exposes Payload");
+            let item = &codec_view.view.model.interfaces[middle.wit].items[middle_member.item];
+            let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(target)) = &item.kind else {
+                panic!("the loaded use retains its exact target: {:?}", item.kind);
+            };
+            let middle_reference = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: middle.wit,
+                    name: "middle".to_owned(),
+                },
+                item: middle_member.item,
+                item_name: item.name.clone(),
+            };
+            (target.clone(), middle_reference)
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "middle",
+            "Payload",
+            target.clone(),
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "chain",
+            "Payload",
+            middle_reference,
+        );
+        mark_authored_wit_view_incomplete(&mut wit_views, "acme:codec");
+        let (foreign_view, facade_definition) = {
+            let entry = wit_views
+                .entries
+                .iter()
+                .find(|entry| entry.identity.package_identity == "acme:codec")
+                .expect("the selected authored WIT view exists");
+            let foreign = entry
+                .available
+                .as_ref()
+                .expect("the selected authored WIT view is available");
+            let view = foreign.view.as_ref();
+            let chain = view
+                .interfaces
+                .get("chain")
+                .expect("the two-hop facade remains in the loaded view");
+            let facade = chain
+                .members
+                .get("Payload")
+                .expect("the two-hop facade member remains addressable");
+            let item = &view.model.interfaces[chain.wit].items[facade.item];
+            assert!(matches!(item.kind, sai_wit::WitItemKind::Used(_)));
+            (
+                OwnedPhase1ForeignWitView {
+                    visible_identity: foreign.visible_identity.clone(),
+                    view: Arc::clone(&foreign.view),
+                    source_def_paths: foreign.source_def_paths.clone(),
+                    directly_visible: foreign.directly_visible,
+                },
+                facade.def,
+            )
+        };
+        let used_type_references =
+            interface_use_queries::generated_foreign_world_used_type_references(&[foreign_view]);
+        assert_eq!(
+            used_type_references.by_definition.get(&facade_definition),
+            Some(&target),
+            "the Used-specific map records the facade's exact target"
+        );
+        assert_eq!(
+            used_type_references.view_completeness.get(&target),
+            Some(&false),
+            "the Used-specific map carries incompleteness from the selected view"
+        );
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").expect("target config is valid"),
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root scopes use the exact selected authored WIT view");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "root generated WIT parses: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            !generated.complete,
+            "the multi-hop world function inherits incompleteness from its selected view"
+        );
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/types@1.2.3.{payload};"),
+            "the one-hop Used target keeps its exact selected version: {}",
+            generated.text
+        );
+        assert_eq!(generated.text.matches("import consume:").count(), 1);
+        assert!(
+            generated
+                .text
+                .contains("import consume: func(value: payload) -> payload;"),
+            "the function remains emitted even though its view is incomplete: {}",
+            generated.text
+        );
+
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated WIT model is available after text parsing");
+        let client = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "client")
+            .expect("the client world is generated");
+        let world_functions = client
+            .imports
+            .iter()
+            .filter_map(|item| match item {
+                sai_wit::WitWorldItem::Func { name, func, .. } => Some((name, func)),
+                sai_wit::WitWorldItem::Interface { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(world_functions.len(), 1);
+        let (name, consume) = world_functions[0];
+        assert_eq!(name, "consume");
+        let expected = sai_wit::WitType::Named(target);
+        assert_eq!(consume.params[0].1, expected.clone());
+        assert_eq!(
+            consume.result,
+            Some(expected),
+            "reparsed parameter and result preserve the exact Used target"
+        );
+    }
+
+    #[test]
+    fn generated_world_function_resolves_one_and_multi_hop_used_types_from_direct_selected_view() {
+        let root_source = concat!(
+            "use acme:codec/direct as direct\n",
+            "use acme:codec/chain as chain\n",
+            "world client {\n",
+            "  import fn consume(value: direct.Payload) -> direct.Payload\n",
+            "  import fn consume_chain(value: chain.Payload) -> chain.Payload\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface types { record payload { value: u32 } }
+interface direct { use types.{payload}; }
+interface middle { use types.{payload}; }
+interface chain { use middle.{payload}; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let (direct_target, middle_target, middle_reference) = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            assert!(codec_view.directly_visible);
+            assert_eq!(codec_view.view.unit.canonical_name(), "acme:codec@1.2.3");
+
+            let direct = codec_view
+                .view
+                .interfaces
+                .get("direct")
+                .expect("the authored direct facade interface is loaded");
+            let direct_member = direct
+                .members
+                .get("Payload")
+                .expect("the direct facade exposes Payload");
+            let direct_item =
+                &codec_view.view.model.interfaces[direct.wit].items[direct_member.item];
+            let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(direct_target)) =
+                &direct_item.kind
+            else {
+                panic!(
+                    "the loaded authored use contains its exact target: {:?}",
+                    direct_item.kind
+                );
+            };
+
+            let middle = codec_view
+                .view
+                .interfaces
+                .get("middle")
+                .expect("the authored middle facade interface is loaded");
+            let middle_member = middle
+                .members
+                .get("Payload")
+                .expect("the middle facade exposes Payload");
+            let middle_item =
+                &codec_view.view.model.interfaces[middle.wit].items[middle_member.item];
+            let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(middle_target)) =
+                &middle_item.kind
+            else {
+                panic!(
+                    "the loaded middle use contains its exact target: {:?}",
+                    middle_item.kind
+                );
+            };
+            let middle_reference = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: middle.wit,
+                    name: "middle".to_owned(),
+                },
+                item: middle_member.item,
+                item_name: "payload".to_owned(),
+            };
+            (
+                direct_target.clone(),
+                middle_target.clone(),
+                middle_reference,
+            )
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "direct",
+            "Payload",
+            direct_target.clone(),
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "middle",
+            "Payload",
+            middle_target,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "chain",
+            "Payload",
+            middle_reference,
+        );
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the authored model remains in the selected direct WIT view");
+        let direct = codec_view.view.interfaces.get("direct").unwrap();
+        let direct_member = direct.members.get("Payload").unwrap();
+        let direct_item = &codec_view.view.model.interfaces[direct.wit].items[direct_member.item];
+        let sai_wit::WitItemKind::Used(direct_target) = &direct_item.kind else {
+            panic!("the fixture has an exact Used facade item");
+        };
+        assert_eq!(direct_target.interface.unit, codec_view.view.unit);
+        assert_eq!(direct_target.interface.name, "types");
+        let target_interface = &codec_view.view.model.interfaces[direct_target.interface.interface];
+        let target_item = &target_interface.items[direct_target.item];
+        assert_eq!(target_item.name, "payload");
+        assert!(matches!(target_item.kind, sai_wit::WitItemKind::Record(_)));
+
+        let chain_interface = codec_view.view.interfaces.get("chain").unwrap();
+        let chain_member = chain_interface.members.get("Payload").unwrap();
+        let chain_item =
+            &codec_view.view.model.interfaces[chain_interface.wit].items[chain_member.item];
+        let sai_wit::WitItemKind::Used(chain_target) = &chain_item.kind else {
+            panic!("the fixture has a chained Used item");
+        };
+        let chain_target_interface =
+            &codec_view.view.model.interfaces[chain_target.interface.interface];
+        assert_eq!(chain_target_interface.name, "middle");
+        assert!(
+            matches!(
+                chain_target_interface.items[chain_target.item].kind,
+                sai_wit::WitItemKind::Used(_)
+            ),
+            "the second hop remains an exact Used facade in the selected view"
+        );
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").expect("target config is valid"),
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root scopes use the exact selected authored WIT view");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "the root WIT package parses: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(generated.complete, "both resolved Uses are representable");
+        assert!(
+            generated
+                .text
+                .contains("use acme:codec/types@1.2.3.{payload};"),
+            "the one-hop facade emits its exact selected target and version: {}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("import consume: func(value: payload) -> payload;"),
+            "the directly selected one-hop facade remains usable: {}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("import consume-chain: func(value: payload) -> payload;"),
+            "the multi-hop facade resolves to its exact terminal target: {}",
+            generated.text
+        );
+
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated root WIT model is available after parsing");
+        let client = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "client")
+            .expect("the client world is generated from the parsed text");
+        let consume = client
+            .imports
+            .iter()
+            .find_map(|item| match item {
+                sai_wit::WitWorldItem::Func { name, func, .. } if name == "consume" => Some(func),
+                _ => None,
+            })
+            .expect("the direct facade function survives text parsing");
+        let expected_reference = direct_target.clone();
+        assert_eq!(
+            consume.params[0].1,
+            sai_wit::WitType::Named(expected_reference.clone())
+        );
+        assert_eq!(
+            consume.result,
+            Some(sai_wit::WitType::Named(expected_reference.clone())),
+            "the parsed world signature preserves exact target identity"
+        );
+        let consume_chain = client
+            .imports
+            .iter()
+            .find_map(|item| match item {
+                sai_wit::WitWorldItem::Func { name, func, .. } if name == "consume-chain" => {
+                    Some(func)
+                }
+                _ => None,
+            })
+            .expect("the multi-hop facade function survives text parsing");
+        assert_eq!(
+            consume_chain.params[0].1,
+            sai_wit::WitType::Named(expected_reference.clone())
+        );
+        assert_eq!(
+            consume_chain.result,
+            Some(sai_wit::WitType::Named(expected_reference)),
+            "the parsed multi-hop signature preserves the exact terminal identity"
+        );
+    }
+
+    #[test]
+    fn generated_world_function_rejects_cyclic_used_type_facades() {
+        let root_source = concat!(
+            "use acme:codec/left as left\n",
+            "world client {\n",
+            "  import fn consume(value: left.Payload)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface left { type payload = u32; }
+interface right { type payload = u32; }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, None);
+        let (left_reference, right_reference) = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            let make_reference = |name: &str| {
+                let interface = codec_view
+                    .view
+                    .interfaces
+                    .get(name)
+                    .expect("the facade interface is loaded");
+                let member = interface
+                    .members
+                    .get("Payload")
+                    .expect("the facade exposes its Payload alias");
+                let item = &codec_view.view.model.interfaces[interface.wit].items[member.item];
+                sai_wit::WitTypeRef {
+                    interface: sai_wit::WitIfaceRef {
+                        unit: codec_view.view.unit.clone(),
+                        interface: interface.wit,
+                        name: name.to_owned(),
+                    },
+                    item: member.item,
+                    item_name: item.name.clone(),
+                }
+            };
+            (make_reference("left"), make_reference("right"))
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "left",
+            "Payload",
+            right_reference,
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "right",
+            "Payload",
+            left_reference,
+        );
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").expect("target config is valid"),
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root scopes use the exact selected authored WIT view");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query terminates on a Used cycle");
+        assert!(
+            result.failure.is_none(),
+            "the cycle is omitted without making the generated package unparsable: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            !generated.complete,
+            "a cyclic facade keeps output incomplete"
+        );
+        assert!(!generated.text.contains("consume:"));
+        assert!(
+            !generated.text.contains("acme:codec"),
+            "the rejected cycle emits no external type reference"
+        );
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated root WIT model is available");
+        let client = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "client")
+            .expect("the client world is generated");
+        assert!(
+            client.imports.is_empty(),
+            "the world function that resolves through a Used cycle is omitted"
+        );
+    }
+
+    #[test]
+    fn generated_world_function_rejects_used_types_targeting_transitive_units() {
+        let root_source = concat!(
+            "use acme:codec/facade as facade\n",
+            "world client {\n",
+            "  import fn consume(value: facade.Payload)\n",
+            "}\n",
+        );
+        let codec_wit = br#"package acme:codec@1.2.3;
+interface middle { use acme:base/types@1.0.0.{payload}; }
+interface facade { use middle.{payload}; }"#;
+        let base_wit =
+            br#"package acme:base@1.0.0; interface types { record payload { value: u32 } }"#;
+        let (mut database, module_tree, snapshot, root_package, mut wit_views) =
+            authored_wit_world_fixture(root_source.as_bytes(), codec_wit, Some(base_wit));
+        let (transitive_target, middle_reference) = {
+            let codec_view = wit_views
+                .views()
+                .find(|scope| scope.visible_identity == "acme:codec")
+                .expect("codec is selected for the direct package edge");
+            assert!(codec_view.directly_visible);
+            let middle = codec_view
+                .view
+                .interfaces
+                .get("middle")
+                .expect("the authored middle interface is loaded");
+            let middle_member = middle
+                .members
+                .get("Payload")
+                .expect("the middle interface exposes its imported Payload");
+            let item = &codec_view.view.model.interfaces[middle.wit].items[middle_member.item];
+            let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(target)) = &item.kind else {
+                panic!(
+                    "the loaded authored use retains its transitive target: {:?}",
+                    item.kind
+                );
+            };
+            let middle_reference = sai_wit::WitTypeRef {
+                interface: sai_wit::WitIfaceRef {
+                    unit: codec_view.view.unit.clone(),
+                    interface: middle.wit,
+                    name: "middle".to_owned(),
+                },
+                item: middle_member.item,
+                item_name: item.name.clone(),
+            };
+            (target.clone(), middle_reference)
+        };
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "middle",
+            "Payload",
+            transitive_target.clone(),
+        );
+        set_authored_wit_item_as_used(
+            &mut wit_views,
+            "acme:codec",
+            "facade",
+            "Payload",
+            middle_reference,
+        );
+        let codec_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:codec")
+            .expect("the selected codec view retains the Used facade");
+        let facade = codec_view.view.interfaces.get("facade").unwrap();
+        let member = facade.members.get("Payload").unwrap();
+        let item = &codec_view.view.model.interfaces[facade.wit].items[member.item];
+        assert!(matches!(item.kind, sai_wit::WitItemKind::Used(_)));
+        let base_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "acme:base")
+            .expect("base is available only through codec");
+        assert!(!base_view.directly_visible);
+        assert_eq!(transitive_target.interface.unit, base_view.view.unit);
+        assert_eq!(transitive_target.interface.name, "types");
+        assert!(matches!(
+            base_view.view.model.interfaces[transitive_target.interface.interface].items
+                [transitive_target.item]
+                .kind,
+            sai_wit::WitItemKind::Record(_)
+        ));
+
+        let root_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:codec @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &module_tree,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").expect("target config is valid"),
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root scopes use the exact selected authored WIT view");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root package version is valid"),
+        )
+        .expect("root package identity is valid");
+        let generated_unit =
+            sai_wit::WitUnit::generated(root_package, &database.packages, &selected)
+                .expect("root generated WIT unit uses its selected package version");
+        let result = database
+            .wit_package(&generated_unit)
+            .expect("root generated WIT query succeeds");
+        assert!(
+            result.failure.is_none(),
+            "unsupported transitive type use fails closed without breaking package parsing: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &generated_unit);
+        assert!(
+            !generated.complete,
+            "a Used target outside the selected direct WIT unit makes output incomplete"
+        );
+        assert!(!generated.text.contains("consume:"));
+        assert!(
+            !generated.text.contains("acme:base/types"),
+            "a transitive-unit target must not leak into generated WIT"
+        );
+        let package = result
+            .package
+            .as_ref()
+            .expect("generated root WIT model is available");
+        let client = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "client")
+            .expect("the client world is generated");
+        assert!(
+            client.imports.is_empty(),
+            "the world function with a transitive Used target is omitted"
+        );
+    }
+
+    #[test]
+    fn generated_wit_references_named_types_and_resources_from_embedded_wasi_views() {
         let source = concat!(
             "use wasi:clocks/wall-clock as wall_clock\n",
+            "use wasi:io/streams as streams\n",
             "interface local {\n",
             "  type Timestamp = wall_clock.Datetime\n",
+            "  type StreamHandle = streams.InputStream\n",
+            "  enum StreamFailure { Wrapped(streams.StreamError) }\n",
             "  fn now() -> wall_clock.Datetime\n",
+            "  fn transfer(stream: borrow streams.InputStream) -> streams.InputStream\n",
+            "  fn wrap_stream_error(error: streams.StreamError) -> StreamFailure\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, root_package) =
@@ -44928,6 +52082,24 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .members
             .get("Datetime")
             .expect("the embedded wall-clock interface contains datetime");
+        let io_view = wit_views
+            .views()
+            .find(|scope| scope.visible_identity == "wasi:io")
+            .expect("the embedded I/O package is in the active view closure");
+        assert_eq!(io_view.view.unit.canonical_name(), "wasi:io@0.2.3");
+        let streams_interface = io_view
+            .view
+            .interfaces
+            .get("streams")
+            .expect("the embedded I/O view contains streams");
+        let input_stream = streams_interface
+            .members
+            .get("InputStream")
+            .expect("the embedded streams interface contains InputStream");
+        let stream_error = streams_interface
+            .members
+            .get("StreamError")
+            .expect("the embedded streams interface contains StreamError");
 
         let manifest: Arc<[u8]> = Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]);
         let collection = database
@@ -44973,8 +52145,32 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 .text
                 .contains("use wasi:clocks/wall-clock@0.2.3.{datetime};")
         );
+        assert!(
+            generated
+                .text
+                .contains("use wasi:io/streams@0.2.3.{input-stream, stream-error};")
+        );
         assert!(generated.text.contains("type timestamp = datetime;"));
+        assert!(
+            generated
+                .text
+                .contains("type stream-handle = input-stream;")
+        );
+        assert!(generated.text.contains("variant stream-failure {"));
+        assert!(generated.text.contains("wrapped(stream-error)"));
         assert!(generated.text.contains("now: func() -> datetime;"));
+        assert!(
+            generated
+                .text
+                .contains("transfer: func(%stream: borrow<input-stream>) -> input-stream;"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("wrap-stream-error: func(error: stream-error) -> stream-failure;")
+        );
 
         let root_model = generated_result
             .package
@@ -44987,22 +52183,14 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .next()
             .expect("root source interface is generated");
         assert_eq!(root_interface.name, "local");
-        let items = root_interface.items.iter().collect::<Vec<_>>();
-        assert_eq!(
-            items
-                .iter()
-                .map(|item| item.name.as_str())
-                .collect::<Vec<_>>(),
-            ["datetime", "timestamp", "now"]
-        );
         let (generated_import_index, generated_import) = root_interface
             .items
             .iter_enumerated()
-            .next()
-            .expect("the generated interface contains its foreign import alias");
+            .find(|(_, item)| item.name == "datetime")
+            .expect("the generated interface contains its clocks import alias");
         assert_eq!(generated_import.name, "datetime");
         let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(foreign_reference)) =
-            &items[0].kind
+            &generated_import.kind
         else {
             panic!("the generated foreign import retains its exact embedded WASI reference");
         };
@@ -45010,7 +52198,12 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         assert_eq!(foreign_reference.interface.interface, clocks_interface.wit);
         assert_eq!(foreign_reference.item, datetime.item);
         assert_eq!(foreign_reference.item_name, "datetime");
-        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(local_reference)) = &items[1].kind
+        let timestamp = root_interface
+            .items
+            .iter()
+            .find(|item| item.name == "timestamp")
+            .expect("the source alias remains in the generated interface");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(local_reference)) = &timestamp.kind
         else {
             panic!("the source alias refers to the generated WASI import alias");
         };
@@ -45018,7 +52211,12 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         assert_eq!(local_reference.interface.interface, root_interface_index);
         assert_eq!(local_reference.item, generated_import_index);
         assert_eq!(local_reference.item_name, "datetime");
-        let sai_wit::WitItemKind::Func(now) = &items[2].kind else {
+        let now_item = root_interface
+            .items
+            .iter()
+            .find(|item| item.name == "now")
+            .expect("the wall-clock function remains");
+        let sai_wit::WitItemKind::Func(now) = &now_item.kind else {
             panic!("the generated function retains its embedded WASI result reference");
         };
         assert!(matches!(
@@ -45029,6 +52227,131 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                     && reference.item == generated_import_index
                     && reference.item_name == "datetime"
         ));
+        let (input_stream_import_index, input_stream_import) = root_interface
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "input-stream")
+            .expect("the generated interface contains its resource import alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(input_stream_reference)) =
+            &input_stream_import.kind
+        else {
+            panic!("the imported input stream retains an owned resource target");
+        };
+        assert_eq!(input_stream_reference.interface.unit, io_view.view.unit);
+        assert_eq!(
+            input_stream_reference.interface.interface,
+            streams_interface.wit
+        );
+        assert_eq!(input_stream_reference.item, input_stream.item);
+        assert_eq!(input_stream_reference.item_name, "input-stream");
+        let (stream_error_import_index, stream_error_import) = root_interface
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "stream-error")
+            .expect("the generated interface contains its named variant import alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(stream_error_reference)) =
+            &stream_error_import.kind
+        else {
+            panic!("the imported stream error retains its named variant target");
+        };
+        assert_eq!(stream_error_reference.interface.unit, io_view.view.unit);
+        assert_eq!(
+            stream_error_reference.interface.interface,
+            streams_interface.wit
+        );
+        assert_eq!(stream_error_reference.item, stream_error.item);
+        assert_eq!(stream_error_reference.item_name, "stream-error");
+        let (stream_handle_index, stream_handle) = root_interface
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "stream-handle")
+            .expect("the source resource alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(stream_handle_reference)) =
+            &stream_handle.kind
+        else {
+            panic!("the source alias retains its named input-stream target");
+        };
+        assert_eq!(stream_handle_reference.interface.unit, generated_unit);
+        assert_eq!(
+            stream_handle_reference.interface.interface,
+            root_interface_index
+        );
+        assert_eq!(stream_handle_reference.item, input_stream_import_index);
+        assert_eq!(stream_handle_reference.item_name, "input-stream");
+        let (stream_failure_index, stream_failure) = root_interface
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "stream-failure")
+            .expect("the source variant remains");
+        let sai_wit::WitItemKind::Variant(stream_failure_cases) = &stream_failure.kind else {
+            panic!("the source wrapper remains a payload variant");
+        };
+        let sai_wit::WitType::Named(stream_failure_payload) = stream_failure_cases[0]
+            .payload
+            .as_ref()
+            .expect("the named stream-error payload remains")
+        else {
+            panic!("the variant payload refers to the local named import alias");
+        };
+        assert_eq!(stream_failure_payload.interface.unit, generated_unit);
+        assert_eq!(
+            stream_failure_payload.interface.interface,
+            root_interface_index
+        );
+        assert_eq!(stream_failure_payload.item, stream_error_import_index);
+        assert_eq!(stream_failure_payload.item_name, "stream-error");
+        let transfer_item = root_interface
+            .items
+            .iter()
+            .find(|item| item.name == "transfer")
+            .expect("the resource function remains");
+        let sai_wit::WitItemKind::Func(transfer) = &transfer_item.kind else {
+            panic!("transfer remains a function");
+        };
+        assert!(matches!(
+            transfer.params[0].1,
+            sai_wit::WitType::Borrow(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == root_interface_index
+                    && reference.item == input_stream_import_index
+                    && reference.item_name == "input-stream"
+        ));
+        assert!(matches!(
+            transfer.result,
+            Some(sai_wit::WitType::Own(ref reference))
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == root_interface_index
+                    && reference.item == input_stream_import_index
+                    && reference.item_name == "input-stream"
+        ));
+        let failure_function = root_interface
+            .items
+            .iter()
+            .find(|item| item.name == "wrap-stream-error")
+            .expect("the stream-error consumer function remains");
+        let sai_wit::WitItemKind::Func(failure_function) = &failure_function.kind else {
+            panic!("wrap-stream-error remains a function");
+        };
+        assert!(matches!(
+            failure_function.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == root_interface_index
+                    && reference.item == stream_error_import_index
+                    && reference.item_name == "stream-error"
+        ));
+        assert!(matches!(
+            failure_function.result,
+            Some(sai_wit::WitType::Named(ref reference))
+                if reference.interface.unit == generated_unit
+                    && reference.interface.interface == root_interface_index
+                    && reference.item == stream_failure_index
+                    && reference.item_name == "stream-failure"
+        ));
+        assert!(
+            stream_handle_index < stream_failure_index,
+            "generated aliases remain before the variant in source order"
+        );
         assert_eq!(
             collection.package_key().as_str(),
             "acme:phase1#1",
@@ -45615,12 +52938,14 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     fn generated_wit_emits_owned_resource_handles_in_nested_types() {
         let source = concat!(
             "interface api {\n",
-            "  resource Handle {}\n",
             "  type HandleAlias = Handle\n",
             "  type Payload {\n",
             "    handle: Handle\n",
             "  }\n",
             "  enum Outcome { Empty, Returned(Handle) }\n",
+            "  resource Handle {\n",
+            "    fn identity(value: HandleAlias) -> HandleAlias\n",
+            "  }\n",
             "  fn echo(payload: Payload) -> Outcome\n",
             "}\n",
         );
@@ -45688,7 +53013,16 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 .collect::<Vec<_>>(),
             ["handle", "handle-alias", "payload", "outcome", "echo"]
         );
-        let resource_index = interface.items.iter_enumerated().next().unwrap().0;
+        let resource_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "handle").then_some(index))
+            .expect("the future resource is emitted");
+        let alias_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "handle-alias").then_some(index))
+            .expect("the resource alias is emitted");
         let assert_handle = |ty: &sai_wit::WitType| {
             let sai_wit::WitType::Own(reference) = ty else {
                 panic!("nested resource leaves use owned handles");
@@ -45698,24 +53032,84 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             assert_eq!(reference.item, resource_index);
             assert_eq!(reference.item_name, "handle");
         };
+        let assert_alias_handle = |ty: &sai_wit::WitType| {
+            let sai_wit::WitType::Own(reference) = ty else {
+                panic!("the resource member uses an owned alias handle");
+            };
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.item, alias_index);
+            assert_eq!(reference.item_name, "handle-alias");
+        };
 
-        let sai_wit::WitItemKind::Alias(alias) = &items[1].kind else {
+        let alias_item = items
+            .iter()
+            .find(|item| item.name == "handle-alias")
+            .expect("the resource handle alias is emitted");
+        let sai_wit::WitItemKind::Alias(alias) = &alias_item.kind else {
             panic!("the resource handle alias is emitted");
         };
         assert_handle(alias);
 
-        let sai_wit::WitItemKind::Record(fields) = &items[2].kind else {
+        let resource_item = items
+            .iter()
+            .find(|item| item.name == "handle")
+            .expect("the resource declaration is emitted");
+        let sai_wit::WitItemKind::Resource(members) = &resource_item.kind else {
+            panic!("the resource static function is emitted");
+        };
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].name, "identity");
+        assert_eq!(members[0].kind, sai_wit::WitMemberKind::Static);
+        assert_alias_handle(&members[0].func.params[0].1);
+        assert_alias_handle(
+            members[0]
+                .func
+                .result
+                .as_ref()
+                .expect("identity retains its resource result"),
+        );
+
+        let payload_item = items
+            .iter()
+            .find(|item| item.name == "payload")
+            .expect("the record is emitted before its resource");
+        let sai_wit::WitItemKind::Record(fields) = &payload_item.kind else {
             panic!("the handle payload is emitted as a record");
         };
         assert_handle(&fields[0].ty);
 
-        let sai_wit::WitItemKind::Variant(cases) = &items[3].kind else {
+        let outcome_item = items
+            .iter()
+            .find(|item| item.name == "outcome")
+            .expect("the outcome variant is emitted");
+        let sai_wit::WitItemKind::Variant(cases) = &outcome_item.kind else {
             panic!("the handle outcome is emitted as a variant");
         };
         assert_handle(cases[1].payload.as_ref().expect("handle payload"));
+        let resource_text_position = generated
+            .text
+            .find("resource handle {")
+            .expect("resource text");
         assert!(generated.text.contains("type handle-alias = handle;"));
         assert!(generated.text.contains("handle: handle,"));
         assert!(generated.text.contains("returned(handle)"));
+        assert!(
+            generated
+                .text
+                .find("record payload {")
+                .expect("record text")
+                < resource_text_position,
+            "the record declaration precedes its resource target in generated source"
+        );
+        assert!(
+            generated
+                .text
+                .find("variant outcome {")
+                .expect("variant text")
+                < resource_text_position,
+            "the variant declaration precedes its resource target in generated source"
+        );
     }
 
     #[test]
@@ -45925,6 +53319,406 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
+    fn canonical_resource_containers_reach_wit_materialization() {
+        use sai_intern::Idx;
+        use sai_ty::boundary::{
+            BoundaryDefinition, BoundaryType, BoundaryTypeContext, BoundaryTypeOutcome,
+            IncompatibleReason, Position, boundary_type_with_references,
+        };
+        use sai_wit::WitType;
+
+        fn test_span(start: u32, end: u32) -> sai_hir::Span {
+            sai_hir::Span {
+                file: FileId::new(0),
+                range: sai_vfs::TextRange::new(
+                    sai_vfs::TextSize::new(start),
+                    sai_vfs::TextSize::new(end),
+                )
+                .expect("test span is ordered"),
+                ctxt: sai_hir::SpanCtxt::Root,
+            }
+        }
+
+        fn path_type<'hir>(
+            arena: &'hir HirArena<'hir>,
+            owner: OwnerId,
+            symbols: &Interner,
+            local_id: u32,
+            spelling: &str,
+        ) -> (&'hir Ty<'hir>, HirId) {
+            let span = test_span(local_id, local_id + 1);
+            let path_hir_id = HirId {
+                owner,
+                local_id: sai_hir::ItemLocalId::from_raw(local_id + 1),
+            };
+            let segments = arena.alloc_path_segments(&[PathSegment {
+                hir_id: HirId {
+                    owner,
+                    local_id: sai_hir::ItemLocalId::from_raw(local_id + 2),
+                },
+                name: Name {
+                    sym: symbols.intern(spelling).expect("type name interns"),
+                    span,
+                },
+                args: None,
+            }]);
+            let path = arena.alloc_path(HirPath {
+                hir_id: path_hir_id,
+                root: PathRoot::Plain,
+                segments,
+                span,
+            });
+            (
+                arena.alloc_ty(Ty {
+                    hir_id: HirId {
+                        owner,
+                        local_id: sai_hir::ItemLocalId::from_raw(local_id),
+                    },
+                    kind: TyKind::Path(*path),
+                    span,
+                }),
+                path_hir_id,
+            )
+        }
+
+        fn generic_path_type<'hir>(
+            arena: &'hir HirArena<'hir>,
+            owner: OwnerId,
+            symbols: &Interner,
+            local_id: u32,
+            spelling: &str,
+            argument: &'hir Ty<'hir>,
+        ) -> (&'hir Ty<'hir>, HirId) {
+            let span = test_span(local_id, local_id + 1);
+            let path_hir_id = HirId {
+                owner,
+                local_id: sai_hir::ItemLocalId::from_raw(local_id + 1),
+            };
+            let arguments = arena.alloc_generic_args(GenericArgs {
+                args: arena.alloc_generic_args_list(&[GenericArg::Type(argument)]),
+                span,
+            });
+            let segments = arena.alloc_path_segments(&[PathSegment {
+                hir_id: HirId {
+                    owner,
+                    local_id: sai_hir::ItemLocalId::from_raw(local_id + 2),
+                },
+                name: Name {
+                    sym: symbols.intern(spelling).expect("generic type name interns"),
+                    span,
+                },
+                args: Some(arguments),
+            }]);
+            let path = arena.alloc_path(HirPath {
+                hir_id: path_hir_id,
+                root: PathRoot::Plain,
+                segments,
+                span,
+            });
+            (
+                arena.alloc_ty(Ty {
+                    hir_id: HirId {
+                        owner,
+                        local_id: sai_hir::ItemLocalId::from_raw(local_id),
+                    },
+                    kind: TyKind::Path(*path),
+                    span,
+                }),
+                path_hir_id,
+            )
+        }
+
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let owner_package = database
+            .intern_package("acme:phase1#1")
+            .expect("owner package interns");
+        let alloc_package = database
+            .intern_package("sai:alloc")
+            .expect("canonical alloc package interns");
+        let core_package = database
+            .intern_package("sai:core")
+            .expect("canonical core package interns");
+
+        let owner_name = database
+            .symbols
+            .intern("BoundaryOwner")
+            .expect("owner name interns");
+        let handle_name = database
+            .symbols
+            .intern("Handle")
+            .expect("resource name interns");
+        let owner_def_paths = Arc::new(
+            DefPathInterner::new(owner_package, &database.packages, &database.symbols)
+                .expect("owner definition paths initialize"),
+        );
+        let owner_def_id = owner_def_paths
+            .intern(
+                DefPath::new(
+                    owner_package,
+                    vec![sai_hir::DisambiguatedDefPathData {
+                        data: DefPathData::TypeNs(owner_name),
+                        disambiguator: 0,
+                    }],
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("owner path is valid"),
+            )
+            .expect("owner definition interns");
+        let resource_def = owner_def_paths
+            .intern(
+                DefPath::new(
+                    owner_package,
+                    vec![sai_hir::DisambiguatedDefPathData {
+                        data: DefPathData::TypeNs(handle_name),
+                        disambiguator: 0,
+                    }],
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("resource path is valid"),
+            )
+            .expect("resource definition interns")
+            .to_def_id();
+        database.def_paths.insert(owner_package, owner_def_paths);
+
+        let mut canonical_type = |package, module_name: &str, type_name: &str| {
+            let module = database
+                .symbols
+                .intern(module_name)
+                .expect("canonical module name interns");
+            let ty = database
+                .symbols
+                .intern(type_name)
+                .expect("canonical type name interns");
+            let paths = Arc::new(
+                DefPathInterner::new(package, &database.packages, &database.symbols)
+                    .expect("canonical definition paths initialize"),
+            );
+            let def_id = paths
+                .intern(
+                    DefPath::new(
+                        package,
+                        vec![
+                            sai_hir::DisambiguatedDefPathData {
+                                data: DefPathData::Module(module),
+                                disambiguator: 0,
+                            },
+                            sai_hir::DisambiguatedDefPathData {
+                                data: DefPathData::TypeNs(ty),
+                                disambiguator: 0,
+                            },
+                        ],
+                        &database.packages,
+                        &database.symbols,
+                    )
+                    .expect("canonical type path is valid"),
+                )
+                .expect("canonical type definition interns")
+                .to_def_id();
+            database.def_paths.insert(package, paths);
+            def_id
+        };
+        let vec_def = canonical_type(alloc_package, "vec", "Vec");
+        let slice_def = canonical_type(core_package, "slice", "Slice");
+
+        let owner = OwnerId {
+            def_id: owner_def_id,
+        };
+        let arena = HirArena::new();
+        let (handle_ty, handle_path) = path_type(&arena, owner, &database.symbols, 1, "Handle");
+        let (vec_ty, vec_path) =
+            generic_path_type(&arena, owner, &database.symbols, 5, "Vec", handle_ty);
+        let (slice_ty, slice_path) =
+            generic_path_type(&arena, owner, &database.symbols, 9, "Slice", handle_ty);
+        let path_resolutions = HashMap::from([
+            (
+                handle_path,
+                PathRes {
+                    base: Res::Def(DefKind::Struct, resource_def),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+            (
+                vec_path,
+                PathRes {
+                    base: Res::Def(DefKind::Struct, vec_def),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+            (
+                slice_path,
+                PathRes {
+                    base: Res::Def(DefKind::Struct, slice_def),
+                    resolved_segments: 1,
+                    segment_count: 1,
+                },
+            ),
+        ]);
+        let canonical_types = database.canonical_boundary_types_for_paths(&path_resolutions);
+        assert_eq!(
+            canonical_types.get(&vec_def),
+            Some(&sai_ty::boundary::CanonicalBoundaryType::Vec)
+        );
+        assert_eq!(
+            canonical_types.get(&slice_def),
+            Some(&sai_ty::boundary::CanonicalBoundaryType::Slice)
+        );
+        let definitions = HashMap::from([(resource_def, BoundaryDefinition::Resource)]);
+        let aliases = HashMap::new();
+        let boundary_context = BoundaryTypeContext {
+            path_resolutions: &path_resolutions,
+            canonical_types: &canonical_types,
+            definitions: &definitions,
+            aliases: &aliases,
+            resource_containment: None,
+            self_resource: None,
+        };
+
+        let converted_vec =
+            boundary_type_with_references(&boundary_context, owner, vec_ty, Position::Param)
+                .outcome;
+        assert_eq!(
+            converted_vec,
+            BoundaryTypeOutcome::Mapped(BoundaryType::List(Box::new(BoundaryType::Own(
+                resource_def
+            ))))
+        );
+
+        let unit_version = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = WitUnit::generated(owner_package, &database.packages, &unit_version)
+            .expect("generated WIT unit matches the package");
+        let mut interfaces =
+            sai_wit::WitIndexVec::<sai_wit::WitIfaceIdx, sai_wit::WitInterface>::new();
+        let interface_index = interfaces
+            .next_index()
+            .expect("the interface index is available");
+        let mut items = sai_wit::WitIndexVec::<sai_wit::WitItemIdx, sai_wit::WitItem>::new();
+        let resource_index = items
+            .push(sai_wit::WitItem {
+                name: "handle".to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                kind: sai_wit::WitItemKind::Resource(Vec::new()),
+                unsupported: None,
+                span: None,
+            })
+            .expect("resource item index is available");
+        let resource_reference = sai_wit::WitTypeRef {
+            interface: sai_wit::WitIfaceRef {
+                unit: unit.clone(),
+                interface: interface_index,
+                name: "api".to_owned(),
+            },
+            item: resource_index,
+            item_name: "handle".to_owned(),
+        };
+        let references = HashMap::from([(resource_def, resource_reference.clone())]);
+        let materialized_vec = sai_ty::boundary::materialize_boundary_type(
+            &match converted_vec {
+                BoundaryTypeOutcome::Mapped(boundary_type) => boundary_type,
+                _ => unreachable!("the canonical Vec conversion is mapped"),
+            },
+            &references,
+            Position::Param,
+        )
+        .expect("converted Vec materializes")
+        .expect("a parameter has a WIT type");
+        assert_eq!(
+            materialized_vec,
+            WitType::List(Box::new(WitType::Own(resource_reference)))
+        );
+        items
+            .push(sai_wit::WitItem {
+                name: "consume".to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                kind: sai_wit::WitItemKind::Func(sai_wit::WitFunc {
+                    params: vec![("values".to_owned(), materialized_vec.clone())],
+                    result: None,
+                    is_async: false,
+                }),
+                unsupported: None,
+                span: None,
+            })
+            .expect("function item index is available");
+        interfaces
+            .push(sai_wit::WitInterface {
+                name: "api".to_owned(),
+                docs: None,
+                since: None,
+                deprecated: None,
+                items,
+                span: None,
+            })
+            .expect("interface index is available");
+        let package_name = unit_version.package().to_owned();
+        let (namespace, name) = package_name
+            .split_once(':')
+            .expect("selected package has a namespace");
+        let package = sai_wit::WitPackage {
+            unit,
+            name: sai_wit::WitPackageName {
+                namespace: namespace.to_owned(),
+                name: name.to_owned(),
+                version: Some(unit_version.version().clone()),
+            },
+            interfaces,
+            worlds: sai_wit::WitIndexVec::new(),
+            declaration_order: vec![sai_wit::WitPackageDeclaration::Interface(interface_index)],
+        };
+        let printed = sai_wit::print_wit(&package);
+        assert!(
+            printed.contains("consume: func(values: list<handle>);"),
+            "WIT prints a list of owned handles using the resource name: {printed}"
+        );
+        let parsed = sai_wit::parse_source_files(
+            package.unit.clone(),
+            [sai_wit::WitSourceFile::new(
+                "generated.wit",
+                printed.as_bytes().to_vec(),
+            )],
+        )
+        .expect("the printed WIT parses");
+        let mut resolve = wit_parser::Resolve::default();
+        let reparsed = sai_wit::WitResolveContext::default()
+            .push_package(&mut resolve, parsed)
+            .expect("the printed WIT resolves");
+        let reparsed_function = reparsed.interfaces[interface_index]
+            .items
+            .iter()
+            .find(|item| item.name == "consume")
+            .expect("the consume function is present");
+        let sai_wit::WitItemKind::Func(reparsed_function) = &reparsed_function.kind else {
+            panic!("the consume declaration is a function");
+        };
+        assert_eq!(
+            reparsed_function.params[0].1, materialized_vec,
+            "the printed list retains the exact owned resource type after parsing"
+        );
+
+        assert!(
+            matches!(
+                boundary_type_with_references(&boundary_context, owner, slice_ty, Position::Param)
+                    .outcome,
+                BoundaryTypeOutcome::Incompatible(sai_ty::boundary::Incompatible {
+                    reason: IncompatibleReason::SliceContainsResource,
+                    ..
+                })
+            ),
+            "the exact canonical Slice rejects an owned resource element"
+        );
+    }
+
+    #[test]
     fn generated_wit_preserves_interface_types_named_like_containers() {
         let source = concat!(
             "interface api {\n",
@@ -45985,10 +53779,12 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
-    fn generated_wit_omits_forward_resource_handle_references() {
+    fn generated_wit_emits_forward_resource_handle_references() {
         let source = concat!(
             "interface api {\n",
             "  fn take(value: Handle)\n",
+            "  fn inspect(value: borrow Handle)\n",
+            "  fn create() -> Handle\n",
             "  resource Handle {}\n",
             "}\n",
         );
@@ -46018,10 +53814,10 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .expect("generated WIT unit uses the active package version");
         let result = database
             .wit_package(&unit)
-            .expect("the incomplete generated resource package loads");
+            .expect("the generated resource package loads");
         assert!(
             result.failure.is_none(),
-            "omitting a forward handle reference leaves parseable WIT: {:?}",
+            "forward resource handle references parse and resolve: {:?}",
             result.failure
         );
         let generated = result
@@ -46031,17 +53827,24 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .map(|(_, generated)| generated.as_ref())
             .expect("the generated root text is retained");
         assert!(
-            !generated.complete,
-            "an unsupported forward resource reference keeps generated WIT incomplete"
+            generated.complete,
+            "a valid later resource remains available to function handles: {}",
+            generated.text
         );
+        assert!(generated.text.contains("take: func(value: handle);"));
+        assert!(
+            generated
+                .text
+                .contains("inspect: func(value: borrow<handle>);")
+        );
+        assert!(generated.text.contains("create: func() -> handle;"));
         assert!(generated.text.contains("resource handle;"));
-        assert!(!generated.text.contains("take:"));
 
-        let package_model = result.package.expect("partial WIT model loads");
-        let interface = package_model
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
             .root()
             .interfaces
-            .iter()
+            .iter_enumerated()
             .next()
             .expect("the local interface remains available");
         assert_eq!(
@@ -46050,19 +53853,70 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 .iter()
                 .map(|item| item.name.as_str())
                 .collect::<Vec<_>>(),
-            ["handle"],
-            "the later resource is emitted without a dangling forward reference"
+            ["handle", "take", "inspect", "create"],
+            "the later resource and its function consumers survive print/parse"
         );
+        assert_eq!(
+            interface
+                .items
+                .iter_enumerated()
+                .map(|(index, _)| index.index())
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3],
+            "surviving references remain compact"
+        );
+        let resource_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "handle").then_some(index))
+            .expect("the later resource remains in the parsed model");
+        let resource = &interface.items[resource_index];
+        assert!(matches!(resource.kind, sai_wit::WitItemKind::Resource(_)));
+        for (function_name, borrowed) in [("take", false), ("inspect", true)] {
+            let item = interface
+                .items
+                .iter()
+                .find(|item| item.name == function_name)
+                .expect("the function with the forward resource parameter survives");
+            let sai_wit::WitItemKind::Func(function) = &item.kind else {
+                panic!("{function_name} remains a function");
+            };
+            let reference = match (&function.params[0].1, borrowed) {
+                (sai_wit::WitType::Own(reference), false)
+                | (sai_wit::WitType::Borrow(reference), true) => reference,
+                _ => panic!("{function_name} retains the expected owned or borrowed handle"),
+            };
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.item, resource_index);
+            assert_eq!(reference.item_name, "handle");
+        }
+        let create = interface
+            .items
+            .iter()
+            .find(|item| item.name == "create")
+            .expect("the function returning the forward resource survives");
+        let sai_wit::WitItemKind::Func(create) = &create.kind else {
+            panic!("create remains a function");
+        };
+        let Some(sai_wit::WitType::Own(reference)) = &create.result else {
+            panic!("the later resource can be returned as an owned handle");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.item, resource_index);
+        assert_eq!(reference.item_name, "handle");
     }
 
     #[test]
     fn generated_wit_omits_nonempty_resources_and_handle_consumers() {
         let source = concat!(
             "interface api {\n",
+            "  fn take(value: Handle)\n",
+            "  fn borrowed_result() -> borrow Handle\n",
             "  resource Handle {\n",
             "    fn reset(self: Self)\n",
             "  }\n",
-            "  fn take(value: Handle)\n",
             "  fn independent(value: U32)\n",
             "}\n",
         );
@@ -46110,6 +53964,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         );
         assert!(!generated.text.contains("resource handle"));
         assert!(!generated.text.contains("take:"));
+        assert!(!generated.text.contains("borrowed-result:"));
         assert!(generated.text.contains("independent: func(value: u32);"));
 
         let package_model = result.package.expect("partial WIT model loads");
@@ -47389,7 +55244,3415 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
-    fn generated_wit_emits_named_consumers_in_an_incomplete_package() {
+    fn generated_wit_preserves_supported_world_function_order() {
+        let source = concat!(
+            "interface api {}\n",
+            "interface runtime {}\n",
+            "type Count = U32\n",
+            "/// Runtime entry points.\n",
+            "world server {\n",
+            "  /// Import the public API.\n",
+            "  import api\n",
+            "  /// Export the runtime API.\n",
+            "  export runtime\n",
+            "  /// An outgoing reply.\n",
+            "  export fn reply(ok: Bool)\n",
+            "  /// A requested lookup.\n",
+            "  import fn lookup(id: U32) -> U64\n",
+            "  import fn shared(value: U32)\n",
+            "  import fn count(value: Count)\n",
+            "  import fn reveal(r#self: U32)\n",
+            "  export fn finish(value: U8)\n",
+            "  export fn shared(value: U32)\n",
+            "}\n",
+            "world empty {}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated world package query completes");
+        assert!(
+            result.failure.is_none(),
+            "generated worlds parse and resolve: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "supported worlds remain complete: {}",
+            generated.text
+        );
+        let reply_offset = generated
+            .text
+            .find("export reply:")
+            .expect("the first source export is printed");
+        let lookup_offset = generated
+            .text
+            .find("import lookup:")
+            .expect("the source import is printed");
+        let finish_offset = generated
+            .text
+            .find("export finish:")
+            .expect("the final source export is printed");
+        let shared_import_offset = generated
+            .text
+            .find("import shared:")
+            .expect("same-named import remains distinct from its export");
+        let shared_export_offset = generated
+            .text
+            .find("export shared:")
+            .expect("same-named export remains distinct from its import");
+        assert!(
+            reply_offset < lookup_offset
+                && lookup_offset < shared_import_offset
+                && shared_import_offset < finish_offset
+                && finish_offset < shared_export_offset
+        );
+        assert!(generated.text.contains("count: func(value: u32)"));
+        assert!(generated.text.contains("self: u32"));
+        assert!(generated.text.contains("/// An outgoing reply."));
+        assert!(generated.text.contains("/// A requested lookup."));
+        assert!(generated.text.contains("/// Import the public API."));
+        assert!(generated.text.contains("/// Export the runtime API."));
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let worlds = package_model.root().worlds.iter().collect::<Vec<_>>();
+        assert_eq!(worlds.len(), 2);
+        assert_eq!(worlds[0].name, "server");
+        assert_eq!(worlds[0].docs.as_deref(), Some("Runtime entry points."));
+        assert_eq!(worlds[0].imports.len(), 5);
+        assert_eq!(worlds[0].exports.len(), 4);
+        assert_eq!(
+            worlds[0].source_order,
+            [
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::export(3),
+                sai_wit::WitWorldItemOrder::export(0),
+                sai_wit::WitWorldItemOrder::import(1),
+                sai_wit::WitWorldItemOrder::import(2),
+                sai_wit::WitWorldItemOrder::import(3),
+                sai_wit::WitWorldItemOrder::import(4),
+                sai_wit::WitWorldItemOrder::export(1),
+                sai_wit::WitWorldItemOrder::export(2),
+            ]
+        );
+        let sai_wit::WitWorldItem::Interface {
+            reference: api_reference,
+            ..
+        } = &worlds[0].imports[0]
+        else {
+            panic!("the generated world import remains an interface");
+        };
+        assert_eq!(api_reference.name, "api");
+        assert_eq!(api_reference.unit, unit);
+        let api_index = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find_map(|(index, interface)| (interface.name == "api").then_some(index))
+            .expect("the imported interface is generated");
+        assert_eq!(api_reference.interface, api_index);
+        let sai_wit::WitWorldItem::Interface {
+            reference: runtime_reference,
+            ..
+        } = worlds[0]
+            .exports
+            .iter()
+            .find(|item| {
+                matches!(
+                    item,
+                    sai_wit::WitWorldItem::Interface { reference, .. }
+                        if reference.name == "runtime"
+                )
+            })
+            .expect("the generated world export remains an interface")
+        else {
+            unreachable!("the matched export is an interface");
+        };
+        assert_eq!(runtime_reference.name, "runtime");
+        let sai_wit::WitWorldItem::Func {
+            name: lookup_name,
+            func: lookup,
+            docs: lookup_docs,
+            ..
+        } = &worlds[0].imports[1]
+        else {
+            panic!("the world import remains a function");
+        };
+        assert_eq!(lookup_name, "lookup");
+        assert_eq!(lookup_docs.as_deref(), Some("A requested lookup."));
+        assert_eq!(lookup.params[0].1, sai_wit::WitType::U32);
+        assert_eq!(lookup.result, Some(sai_wit::WitType::U64));
+        let sai_wit::WitWorldItem::Func { func, .. } = &worlds[0].imports[4] else {
+            panic!("the world function with a raw self parameter remains a function");
+        };
+        assert_eq!(
+            func.params,
+            vec![("self".to_owned(), sai_wit::WitType::U32)]
+        );
+        assert_eq!(worlds[1].name, "empty");
+        assert!(worlds[1].imports.is_empty() && worlds[1].exports.is_empty());
+    }
+
+    #[test]
+    fn generated_wit_emits_external_world_includes_from_the_selected_wit_view() {
+        let source = b"world facade {\n\
+            import fn before()\n\
+            /// External base contract.\n\
+            include acme:dependency/base\n\
+            include acme:dependency/api\n\
+            include acme:dependency/missing\n\
+            include acme:dependency/unsupported\n\
+            include acme:unavailable/ghost\n\
+            export fn after()\n\
+        }\n";
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (root_package, root_tree, root_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", source)],
+        );
+        let (_, dependency_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:dependency",
+            "1.4.12",
+            b"package acme:dependency@1.4.12;\n\
+              interface api {}\n\
+              world base { import dependency-fn: func(); }\n\
+              world unsupported { type payload = u32; }",
+        );
+        let snapshot = WorkspaceSnapshot::new(root_files).expect("workspace snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge(
+                        dependency_node.key().as_str(),
+                        "acme:dependency",
+                    )],
+                ),
+                dependency_node,
+            ],
+        )
+        .expect("active package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target, &graph)
+            .expect("the selected dependency WIT view is available");
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:dependency @ ^1.4 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root Phase 1 scopes collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:root",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = WitUnit::generated(root_package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated world package query completes");
+        assert!(
+            result.failure.is_none(),
+            "the external include and recoverable omissions keep WIT parseable: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &unit);
+        assert!(!generated.complete);
+        assert!(
+            generated
+                .text
+                .contains("/// External base contract.\n  include acme:dependency/base@1.4.12;")
+        );
+        assert!(!generated.text.contains("include acme:dependency/api"));
+        assert!(!generated.text.contains("include acme:dependency/missing"));
+        assert!(
+            !generated
+                .text
+                .contains("include acme:dependency/unsupported")
+        );
+        assert!(!generated.text.contains("include acme:unavailable/ghost"));
+        let before = generated
+            .text
+            .find("import before:")
+            .expect("the direct import remains");
+        let include = generated
+            .text
+            .find("include acme:dependency/base@1.4.12;")
+            .expect("the selected external world is included");
+        let after = generated
+            .text
+            .find("export after:")
+            .expect("the direct export remains");
+        assert!(before < include && include < after);
+
+        let package = result.package.expect("generated WIT model loads");
+        let world = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "facade")
+            .expect("facade world is generated");
+        assert_eq!(world.includes.len(), 1);
+        assert_eq!(
+            world.includes[0].unit.canonical_name(),
+            "acme:dependency@1.4.12",
+            "the exact selected external package unit is retained"
+        );
+        assert_eq!(world.includes[0].name, "base");
+        assert_eq!(world.includes[0].world.raw(), 0);
+        assert_eq!(
+            world.includes[0].docs.as_deref(),
+            Some("External base contract.")
+        );
+        assert_eq!(
+            world.source_order,
+            [
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::include(0),
+                sai_wit::WitWorldItemOrder::export(0),
+            ],
+            "omitted wrong-kind and missing targets do not disturb direct-item order"
+        );
+    }
+
+    #[test]
+    fn generated_wit_emits_external_world_interfaces_from_direct_selected_views() {
+        let source = b"world facade {\n\
+            import fn before()\n\
+            /// Direct API interface.\n\
+            import acme:direct/api\n\
+            import acme:direct/api\n\
+            import acme:direct/api/extra\n\
+            import acme:direct/wrong-kind\n\
+            import acme:transitive/api\n\
+            import acme:direct/missing\n\
+            import acme:unavailable/ghost\n\
+            /// Direct service interface.\n\
+            export acme:direct/service\n\
+            export acme:direct/service\n\
+            export fn after()\n\
+        }\n";
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (root_package, root_tree, root_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", source)],
+        );
+        let (direct_package, direct_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:direct",
+            "1.4.12",
+            b"package acme:direct@1.4.12;\n\
+              interface api {}\n\
+              interface service {}\n\
+              world wrong-kind {}",
+        );
+        let direct_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:direct @ 1.4.12\n\
+              artifact component {}\n\
+              wit \"wit\"\n\
+              requires { acme:transitive @ ^1 }\n"[..],
+        );
+        database
+            .set_package_manifest(
+                direct_package,
+                direct_manifest,
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("direct package contract records its transitive dependency");
+        let direct_node = PackageGraphNode::new(
+            direct_node.key().clone(),
+            direct_node.identity(),
+            direct_node.version().clone(),
+            direct_node.form(),
+            direct_node.role(),
+            vec![graph_edge("acme:transitive#1", "acme:transitive")],
+        )
+        .expect("direct graph node includes its transitive package edge");
+        let (_, transitive_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:transitive",
+            "1.0.0",
+            b"package acme:transitive@1.0.0;\ninterface api {}",
+        );
+        let snapshot = WorkspaceSnapshot::new(root_files).expect("workspace snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:direct#1", "acme:direct")],
+                ),
+                direct_node,
+                transitive_node,
+            ],
+        )
+        .expect("active package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target, &graph)
+            .expect("the selected direct and transitive WIT views are available");
+        let expected_view = wit_views
+            .views()
+            .find(|foreign| foreign.visible_identity == "acme:direct")
+            .expect("the directly selected WIT view is available");
+        let expected_interface = expected_view
+            .view
+            .model
+            .interfaces
+            .iter_enumerated()
+            .find_map(|(index, interface)| (interface.name == "api").then_some((index, interface)))
+            .expect("the selected direct view declares api");
+        let expected_service_index = expected_view
+            .view
+            .model
+            .interfaces
+            .iter_enumerated()
+            .find_map(|(index, interface)| (interface.name == "service").then_some(index))
+            .expect("the selected direct view declares service");
+        let expected_definition = expected_view
+            .view
+            .interfaces
+            .values()
+            .find(|interface| interface.wit == expected_interface.0)
+            .expect("the interface index has an exact view definition")
+            .def;
+
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:direct @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root Phase 1 scopes collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:root",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = WitUnit::generated(root_package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated world package query completes");
+        assert!(
+            result.failure.is_none(),
+            "the exact external interfaces and recoverable omissions keep WIT parseable: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &unit);
+        assert!(!generated.complete);
+        assert!(generated.text.contains("import acme:direct/api@1.4.12;"));
+        assert!(
+            generated
+                .text
+                .contains("export acme:direct/service@1.4.12;")
+        );
+        assert!(!generated.text.contains("import acme:direct/api/extra"));
+        assert!(!generated.text.contains("import acme:direct/wrong-kind"));
+        assert!(!generated.text.contains("import acme:transitive/api"));
+        assert!(!generated.text.contains("import acme:direct/missing"));
+        assert!(!generated.text.contains("import acme:unavailable/ghost"));
+        assert_eq!(
+            generated
+                .text
+                .matches("import acme:direct/api@1.4.12;")
+                .count(),
+            1,
+            "a duplicate same-direction name is omitted"
+        );
+        assert_eq!(
+            generated
+                .text
+                .matches("export acme:direct/service@1.4.12;")
+                .count(),
+            1,
+            "export collisions are checked independently"
+        );
+        let before = generated
+            .text
+            .find("import before:")
+            .expect("the independent function import remains");
+        let api = generated
+            .text
+            .find("import acme:direct/api@1.4.12;")
+            .expect("the exact direct API import remains");
+        let service = generated
+            .text
+            .find("export acme:direct/service@1.4.12;")
+            .expect("the exact direct service export remains");
+        let after = generated
+            .text
+            .find("export after:")
+            .expect("the independent function export remains");
+        assert!(before < api && api < service && service < after);
+
+        let package = result.package.expect("generated WIT model loads");
+        let world = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "facade")
+            .expect("facade world is generated");
+        assert!(generated.text.contains("/// Direct API interface."));
+        assert!(generated.text.contains("/// Direct service interface."));
+        let sai_wit::WitWorldItem::Interface { reference, .. } = world
+            .imports
+            .iter()
+            .find(|item| {
+                matches!(
+                    item,
+                    sai_wit::WitWorldItem::Interface { reference, .. }
+                        if reference.name == "api"
+                )
+            })
+            .expect("the external API import remains")
+        else {
+            unreachable!("the matched API import is an interface");
+        };
+        assert_eq!(reference.unit, expected_view.view.unit);
+        assert_eq!(reference.interface, expected_interface.0);
+        assert_eq!(reference.name, "api");
+        assert_eq!(
+            expected_view
+                .view
+                .interfaces
+                .get("api")
+                .expect("the direct view binds api")
+                .def,
+            expected_definition
+        );
+
+        let sai_wit::WitWorldItem::Interface { reference, .. } = world
+            .exports
+            .iter()
+            .find(|item| {
+                matches!(
+                    item,
+                    sai_wit::WitWorldItem::Interface { reference, .. }
+                        if reference.name == "service"
+                )
+            })
+            .expect("the external service export remains")
+        else {
+            unreachable!("the matched service export is an interface");
+        };
+        assert_eq!(reference.unit.canonical_name(), "acme:direct@1.4.12");
+        assert_eq!(reference.interface, expected_service_index);
+        assert_eq!(reference.name, "service");
+        assert_eq!(
+            world.source_order,
+            [
+                sai_wit::WitWorldItemOrder::import(1),
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::export(1),
+                sai_wit::WitWorldItemOrder::export(0),
+            ],
+            "omitted references do not disturb import/export source order"
+        );
+    }
+
+    #[test]
+    fn generated_wit_omits_transitive_external_world_includes() {
+        let source = b"world facade {\n\
+            include acme:transitive/base\n\
+            include acme:direct/outer\n\
+        }\n";
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (root_package, root_tree, root_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[("lib.sai", source)],
+        );
+        let (direct_package, direct_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:direct",
+            "1.0.0",
+            b"package acme:direct@1.0.0;\n\
+              world outer {}",
+        );
+        let direct_manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:direct @ 1.0.0\n\
+              artifact component {}\n\
+              wit \"wit\"\n\
+              requires { acme:transitive @ ^1 }\n"[..],
+        );
+        database
+            .set_package_manifest(
+                direct_package,
+                direct_manifest,
+                PackageRole::Dependency,
+                Durability::Low,
+            )
+            .expect("direct package contract records its transitive dependency");
+        let direct_node = PackageGraphNode::new(
+            direct_node.key().clone(),
+            direct_node.identity(),
+            direct_node.version().clone(),
+            direct_node.form(),
+            direct_node.role(),
+            vec![graph_edge("acme:transitive#1", "acme:transitive")],
+        )
+        .expect("direct graph node includes its transitive package edge");
+        let (_, transitive_node) = install_external_artifact_world_package(
+            &mut database,
+            "acme:transitive",
+            "1.0.0",
+            b"package acme:transitive@1.0.0;\n\
+              world base {}",
+        );
+        let snapshot = WorkspaceSnapshot::new(root_files).expect("workspace snapshot is valid");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:direct#1", "acme:direct")],
+                ),
+                direct_node,
+                transitive_node,
+            ],
+        )
+        .expect("active package graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let wit_views = database
+            .collect_active_wit_view_scopes(&root_tree, &snapshot, &target, &graph)
+            .expect("the selected direct and transitive WIT views are available");
+        let available = wit_views.available_unit_names().collect::<Vec<_>>();
+        assert!(available.contains(&"acme:direct@1.0.0"));
+        assert!(available.contains(&"acme:transitive@1.0.0"));
+        let manifest: Arc<[u8]> = Arc::from(
+            &b"package acme:root @ 1.0.0\n\
+              source \"src\"\n\
+              requires { acme:direct @ ^1 }\n"[..],
+        );
+        database
+            .collect_phase1_package_scopes_with_manifest_and_wit_views(
+                &root_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                manifest,
+                PackageRole::Root,
+                &wit_views,
+            )
+            .expect("root Phase 1 scopes collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:root",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = WitUnit::generated(root_package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated world package query completes");
+        assert!(
+            result.failure.is_none(),
+            "omitting the transitive include keeps generated WIT parseable: {:?}",
+            result.failure
+        );
+        let generated = generated_text_for_unit(&result, &unit);
+        assert!(!generated.complete);
+        assert!(
+            !generated.text.contains("include acme:transitive/base"),
+            "a same-spelled world in a transitive package must not be captured"
+        );
+        assert!(
+            generated.text.contains("include acme:direct/outer@1.0.0;"),
+            "the exact direct package world remains representable"
+        );
+    }
+
+    #[test]
+    fn generated_wit_emits_local_world_includes_with_forward_references() {
+        let source = concat!(
+            "world facade {\n",
+            "  import fn begin()\n",
+            "  include worker\n",
+            "  export fn finish()\n",
+            "}\n",
+            "world worker { import fn run() }\n",
+        );
+        let (unit, result) = generated_wit_for_source(source.as_bytes());
+        let generated = generated_text_for_unit(&result, &unit);
+        assert!(
+            generated.complete,
+            "a representable same-package include stays complete: {}",
+            generated.text
+        );
+        let begin = generated
+            .text
+            .find("import begin:")
+            .expect("the earlier world item is printed");
+        let include = generated
+            .text
+            .find("include worker;")
+            .expect("the forward include is printed");
+        let finish = generated
+            .text
+            .find("export finish:")
+            .expect("the later world item is printed");
+        assert!(begin < include && include < finish);
+
+        let package = result.package.expect("generated WIT model loads");
+        let worlds = package.root().worlds.iter_enumerated().collect::<Vec<_>>();
+        assert_eq!(worlds.len(), 2);
+        let (_, facade) = worlds
+            .iter()
+            .find(|(_, world)| world.name == "facade")
+            .copied()
+            .expect("facade world is generated");
+        let (worker_index, _) = worlds
+            .iter()
+            .find(|(_, world)| world.name == "worker")
+            .copied()
+            .expect("included forward world is generated");
+        assert_eq!(
+            facade.source_order,
+            [
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::include(0),
+                sai_wit::WitWorldItemOrder::export(0),
+            ],
+            "include ordering remains interleaved with direct items"
+        );
+        assert_eq!(facade.includes.len(), 1);
+        assert_eq!(facade.includes[0].unit, unit);
+        assert_eq!(facade.includes[0].name, "worker");
+        assert_eq!(
+            facade.includes[0].world, worker_index,
+            "the forward include targets the final generated world index"
+        );
+    }
+
+    #[test]
+    fn generated_wit_retains_world_include_documentation() {
+        let source = concat!(
+            "world facade {\n",
+            "  /// Included worker contract.\n",
+            "  include worker\n",
+            "}\n",
+            "world worker {}\n",
+        );
+        let (unit, result) = generated_wit_for_source(source.as_bytes());
+        let generated = generated_text_for_unit(&result, &unit);
+        assert!(
+            generated.complete,
+            "a representable include with docs keeps the generated package complete"
+        );
+        assert_eq!(
+            generated.text.as_ref(),
+            concat!(
+                "package acme:phase1@1.0.0;\n\n",
+                "world facade {\n",
+                "  /// Included worker contract.\n",
+                "  include worker;\n",
+                "}\n\n",
+                "world worker {}\n"
+            )
+        );
+
+        let package = result.package.expect("generated WIT model loads");
+        let facade = package
+            .root()
+            .worlds
+            .iter()
+            .find(|world| world.name == "facade")
+            .expect("facade world remains");
+        assert_eq!(facade.includes.len(), 1);
+        assert_eq!(
+            facade.includes[0].docs.as_deref(),
+            Some("Included worker contract.")
+        );
+        assert_eq!(
+            facade.source_order,
+            [sai_wit::WitWorldItemOrder::include(0)]
+        );
+    }
+
+    #[test]
+    fn generated_wit_omits_cyclic_local_world_includes() {
+        let source = concat!(
+            "world first {\n",
+            "  import fn begin()\n",
+            "  include second\n",
+            "  export fn finish()\n",
+            "}\n",
+            "world second {\n",
+            "  include first\n",
+            "  import fn run()\n",
+            "}\n",
+            "world independent { import fn stay() }\n",
+        );
+        let (unit, result) = generated_wit_for_source(source.as_bytes());
+        let generated = generated_text_for_unit(&result, &unit);
+        assert!(
+            !generated.complete,
+            "cycle edges are omitted and reported through incomplete generation"
+        );
+        assert!(!generated.text.contains("include first;"));
+        assert!(!generated.text.contains("include second;"));
+        assert!(generated.text.contains("import begin: func();"));
+        assert!(generated.text.contains("export finish: func();"));
+        assert!(generated.text.contains("import run: func();"));
+        assert!(generated.text.contains("import stay: func();"));
+
+        let package = result.package.expect("partial generated WIT model loads");
+        let worlds = package.root().worlds.iter().collect::<Vec<_>>();
+        assert_eq!(worlds.len(), 3);
+        assert!(worlds.iter().all(|world| world.includes.is_empty()));
+        let world_named = |name: &str| {
+            worlds
+                .iter()
+                .find(|world| world.name == name)
+                .copied()
+                .unwrap_or_else(|| panic!("world `{name}` remains generated"))
+        };
+        assert_eq!(
+            world_named("first").source_order,
+            [
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::export(0),
+            ],
+            "removing a cyclic middle entry preserves surviving source order"
+        );
+        assert_eq!(
+            world_named("second").source_order,
+            [sai_wit::WitWorldItemOrder::import(0)],
+            "removing the leading cyclic entry compacts later items"
+        );
+    }
+
+    #[test]
+    fn generated_wit_drops_world_interfaces_that_are_omitted_as_cyclic() {
+        let source = concat!(
+            "interface first {\n",
+            "  type Request = second.Response\n",
+            "}\n",
+            "interface second {\n",
+            "  type Response = first.Request\n",
+            "}\n",
+            "interface stable { type Id = U32 }\n",
+            "world server {\n",
+            "  import first\n",
+            "  import stable\n",
+            "  export fn run()\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("partial generated world remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "omitting a cyclic world interface leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        assert!(!generated.text.contains("import first;"));
+        assert!(generated.text.contains("import stable;"));
+        assert!(generated.text.contains("export run: func();"));
+        let package_model = result.package.expect("the partial package model loads");
+        let world = package_model
+            .root()
+            .worlds
+            .iter()
+            .next()
+            .expect("the world remains");
+        assert_eq!(
+            world.source_order,
+            [
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::export(0),
+            ],
+            "the omitted interface is removed and later world item indices are compacted"
+        );
+        let sai_wit::WitWorldItem::Interface { reference, .. } = &world.imports[0] else {
+            panic!("the surviving import remains an interface");
+        };
+        assert_eq!(reference.name, "stable");
+        assert_eq!(reference.interface.index(), 0);
+    }
+
+    #[test]
+    fn generated_world_interface_and_function_names_collide_per_direction() {
+        let source = concat!(
+            "interface api {}\n",
+            "world server {\n",
+            "  import api\n",
+            "  import fn api()\n",
+            "  export api\n",
+            "  export fn api()\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("partially supported generated world remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "same-direction collision omission leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        assert_eq!(generated.text.matches("import api;").count(), 1);
+        assert_eq!(generated.text.matches("export api;").count(), 1);
+        assert!(!generated.text.contains("import api: func();"));
+        assert!(!generated.text.contains("export api: func();"));
+        let package_model = result.package.expect("the partial package model loads");
+        let world = package_model
+            .root()
+            .worlds
+            .iter()
+            .next()
+            .expect("the world remains");
+        assert_eq!(world.imports.len(), 1);
+        assert_eq!(world.exports.len(), 1);
+        assert_eq!(
+            world.source_order,
+            [
+                sai_wit::WitWorldItemOrder::import(0),
+                sai_wit::WitWorldItemOrder::export(0),
+            ],
+            "a name can be reused across directions, but duplicate same-direction items are omitted"
+        );
+    }
+
+    #[test]
+    fn generated_wit_omits_unsupported_world_functions_atomically() {
+        let source = concat!(
+            "interface api {\n",
+            "  type Id = U32\n",
+            "}\n",
+            "world mixed {\n",
+            "  import fn named(value: api.Id)\n",
+            "  import fn omitted(pointer: USize)\n",
+            "  import async fn asynchronous()\n",
+            "  export fn retained(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("partial generated world package remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "omitting an unsupported signature leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "omitting an unsupported world function marks the output incomplete"
+        );
+        assert!(
+            generated.text.contains("use api.{id};"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated.text.contains("named: func(value: id)"),
+            "{}",
+            generated.text
+        );
+        assert!(!generated.text.contains("omitted:"));
+        assert!(!generated.text.contains("asynchronous:"));
+        assert!(generated.text.contains("retained: func(value: u32)"));
+
+        let package_model = result.package.expect("partial WIT model loads");
+        let world = package_model
+            .root()
+            .worlds
+            .iter()
+            .next()
+            .expect("the partially supported world remains");
+        assert!(world.imports.iter().any(
+            |item| matches!(item, sai_wit::WitWorldItem::Func { name, .. } if name == "named")
+        ));
+        assert!(world.exports.iter().any(
+            |item| matches!(item, sai_wit::WitWorldItem::Func { name, .. } if name == "retained")
+        ));
+    }
+
+    #[test]
+    fn generated_wit_emits_world_functions_using_local_interface_types() {
+        let source = concat!(
+            "interface api {\n",
+            "  type Id = U32\n",
+            "}\n",
+            "world mixed {\n",
+            "  import fn typed(value: api.Id) -> api.Id\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated world package remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "generated world type references remain parseable: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(generated.complete, "all world type references are emitted");
+        assert!(
+            generated.text.contains("use api.{id};"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated.text.contains("typed: func(value: id) -> id"),
+            "{}",
+            generated.text
+        );
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let root = package_model.root();
+        let (interface_index, interface) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "api")
+            .expect("the interface is present");
+        let (item_index, _item) = interface
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the referenced type item is present");
+        let world = root.worlds.iter().next().expect("the world is present");
+        let sai_wit::WitWorldItem::Func { func, .. } = world
+            .imports
+            .iter()
+            .find(|item| {
+                matches!(
+                    item,
+                    sai_wit::WitWorldItem::Func { name, .. } if name == "typed"
+                )
+            })
+            .expect("the typed world function survives the parser round trip")
+        else {
+            panic!("the world import is the typed function");
+        };
+        let sai_wit::WitType::Named(parameter) = &func.params[0].1 else {
+            panic!("the parameter retains its interface type reference");
+        };
+        let sai_wit::WitType::Named(result) = func.result.as_ref().unwrap() else {
+            panic!("the result retains its interface type reference");
+        };
+        for reference in [parameter, result] {
+            assert_eq!(&reference.interface.unit, &unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.item, item_index);
+            assert_eq!(reference.item_name, "id");
+        }
+    }
+
+    #[test]
+    fn generated_wit_interface_functions_reference_prior_local_interfaces_only() {
+        let source = concat!(
+            "interface early {\n",
+            "  fn future(value: types.Id) -> types.Id\n",
+            "  fn future_resource(value: types.Handle, borrowed: borrow types.Handle) -> types.Handle\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+            "interface types {\n",
+            "  type Hidden = USize\n",
+            "  type Id = U32\n",
+            "  type Id = U64\n",
+            "  resource Handle {}\n",
+            "}\n",
+            "interface consumer {\n",
+            "  fn round_trip(value: types.Id) -> types.Id\n",
+            "  fn missing(value: types.Hidden)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("cross-interface function references remain queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning unsupported cross-interface references leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "pruning the omitted-type target keeps output incomplete"
+        );
+        assert!(
+            generated.text.contains("independent: func(value: u32);"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated.text.contains("future: func(value: id) -> id;"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated.text.contains(
+                "future-resource: func(value: handle, borrowed: borrow<handle>) -> handle;"
+            ),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("round-trip: func(value: id) -> id;"),
+            "{}",
+            generated.text
+        );
+        assert!(generated.text.contains("use types.{handle, id};"));
+        assert!(!generated.text.contains("missing:"), "{}", generated.text);
+        assert!(!generated.text.contains("type hidden ="));
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let root = package_model.root();
+        let (types_index, types) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "types")
+            .expect("the later interface with supported targets remains");
+        assert_eq!(
+            types
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "handle"],
+            "the unsupported earlier item is removed"
+        );
+        let (id_index, _) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the supported earlier alias remains");
+        let (handle_index, handle) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the supported later resource remains");
+        assert!(matches!(handle.kind, sai_wit::WitItemKind::Resource(_)));
+        let early = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "early")
+            .expect("the earlier interface remains");
+        let (early_index, early) = early;
+        assert!(early.items.iter().any(|item| item.name == "id"));
+        assert!(early.items.iter().any(|item| item.name == "handle"));
+        for expected_name in ["future", "future-resource", "independent"] {
+            assert!(
+                early
+                    .items
+                    .iter()
+                    .any(|item| matches!(&item.kind, sai_wit::WitItemKind::Func(_))
+                        && item.name == expected_name),
+                "the earlier interface retains `{expected_name}`"
+            );
+        }
+        let (early_id_index, early_id) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the earlier interface has a local type import");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(early_id_target)) = &early_id.kind
+        else {
+            panic!("the earlier local id import retains a named target");
+        };
+        assert_eq!(&early_id_target.interface.unit, &unit);
+        assert_eq!(early_id_target.interface.interface, types_index);
+        assert_eq!(early_id_target.item, id_index);
+        assert_eq!(early_id_target.item_name, "id");
+        let (early_handle_index, early_handle) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the earlier interface has a local resource import");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(early_handle_target)) =
+            &early_handle.kind
+        else {
+            panic!("the earlier local handle import retains its owned target");
+        };
+        assert_eq!(&early_handle_target.interface.unit, &unit);
+        assert_eq!(early_handle_target.interface.interface, types_index);
+        assert_eq!(early_handle_target.item, handle_index);
+        assert_eq!(early_handle_target.item_name, "handle");
+        let future_item = early
+            .items
+            .iter()
+            .find(|item| item.name == "future")
+            .expect("the later-alias function survives");
+        let sai_wit::WitItemKind::Func(future) = &future_item.kind else {
+            panic!("future remains a function");
+        };
+        let sai_wit::WitType::Named(future_parameter) = &future.params[0].1 else {
+            panic!("the parameter retains the local id reference");
+        };
+        let sai_wit::WitType::Named(future_result) = future
+            .result
+            .as_ref()
+            .expect("the future function result remains")
+        else {
+            panic!("the result retains the local id reference");
+        };
+        for reference in [future_parameter, future_result] {
+            assert_eq!(&reference.interface.unit, &unit);
+            assert_eq!(reference.interface.interface, early_index);
+            assert_eq!(reference.item, early_id_index);
+            assert_eq!(reference.item_name, "id");
+        }
+        let future_resource_item = early
+            .items
+            .iter()
+            .find(|item| item.name == "future-resource")
+            .expect("the later-resource function survives");
+        let sai_wit::WitItemKind::Func(future_resource) = &future_resource_item.kind else {
+            panic!("future-resource remains a function");
+        };
+        let [
+            (_, sai_wit::WitType::Own(future_owned)),
+            (_, sai_wit::WitType::Borrow(future_borrowed)),
+        ] = future_resource.params.as_slice()
+        else {
+            panic!("the future resource function keeps owned and borrowed params");
+        };
+        let Some(sai_wit::WitType::Own(future_resource_result)) = future_resource.result.as_ref()
+        else {
+            panic!("the future resource function keeps its owned result");
+        };
+        for reference in [future_owned, future_borrowed, future_resource_result] {
+            assert_eq!(&reference.interface.unit, &unit);
+            assert_eq!(reference.interface.interface, early_index);
+            assert_eq!(reference.item, early_handle_index);
+            assert_eq!(reference.item_name, "handle");
+        }
+        let consumer = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "consumer")
+            .expect("the later consumer interface remains");
+        let (consumer_index, consumer) = consumer;
+        assert_eq!(
+            consumer
+                .items
+                .iter()
+                .filter_map(|item| {
+                    matches!(&item.kind, sai_wit::WitItemKind::Func(_))
+                        .then_some(item.name.as_str())
+                })
+                .collect::<Vec<_>>(),
+            ["round-trip"],
+            "a function targeting an omitted type is pruned"
+        );
+        let (consumer_id_index, consumer_id) = consumer
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the parsed local use alias remains in the consumer interface");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(imported_id)) = &consumer_id.kind
+        else {
+            panic!("the parsed local use alias retains the referenced named type");
+        };
+        assert_eq!(&imported_id.interface.unit, &unit);
+        assert_eq!(imported_id.interface.interface, types_index);
+        assert_eq!(imported_id.item, id_index);
+        assert_eq!(imported_id.item_name, "id");
+
+        let round_trip_item = consumer
+            .items
+            .iter()
+            .find(|item| item.name == "round-trip")
+            .expect("round-trip remains the sole consumer function");
+        let sai_wit::WitItemKind::Func(round_trip) = &round_trip_item.kind else {
+            panic!("round-trip remains a function");
+        };
+        let sai_wit::WitType::Named(parameter) = &round_trip.params[0].1 else {
+            panic!("the parameter retains the prior interface type reference");
+        };
+        let sai_wit::WitType::Named(result) = round_trip
+            .result
+            .as_ref()
+            .expect("the function result is retained")
+        else {
+            panic!("the result retains the prior interface type reference");
+        };
+        for reference in [parameter, result] {
+            assert_eq!(&reference.interface.unit, &unit);
+            assert_eq!(reference.interface.interface, consumer_index);
+            assert_eq!(reference.item, consumer_id_index);
+            assert_eq!(reference.item_name, "id");
+        }
+    }
+
+    #[test]
+    fn generated_wit_variants_reference_prior_and_later_local_interfaces() {
+        let source = concat!(
+            "interface early {\n",
+            "  enum FuturePayload { Value(types.Id) }\n",
+            "  enum FutureHandlePayload { Value(types.Handle) }\n",
+            "  enum BorrowedFuturePayload { Value(borrow types.Handle) }\n",
+            "  enum Missing { Value(types.Hidden) }\n",
+            "  fn use_future_payload(value: FuturePayload)\n",
+            "  fn use_future_handle_payload(value: FutureHandlePayload)\n",
+            "  fn use_borrowed_future_payload(value: BorrowedFuturePayload)\n",
+            "  fn use_missing(value: Missing)\n",
+            "  enum Keep { Ready }\n",
+            "}\n",
+            "interface types {\n",
+            "  type Hidden = USize\n",
+            "  type Id = U32\n",
+            "  resource Handle {}\n",
+            "}\n",
+            "interface variants {\n",
+            "  enum Wrapped { Value(types.Id) }\n",
+            "  enum HandleBox { Value(types.Handle) }\n",
+            "  enum Missing { Value(types.Hidden) }\n",
+            "  fn use_wrapped(value: Wrapped)\n",
+            "  fn use_handle_box(value: HandleBox)\n",
+            "  fn use_missing(value: Missing)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("cross-interface variant payloads remain queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning unsupported variant targets leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "unsupported borrowed and omitted-type variant targets remain incomplete"
+        );
+        assert!(generated.text.contains("enum keep {"), "{}", generated.text);
+        assert!(generated.text.contains("type id = u32;"));
+        assert!(generated.text.contains("use types.{handle, id};"));
+        assert!(
+            generated.text.contains("variant future-payload {"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated.text.contains("variant future-handle-payload {"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("use-future-payload: func(value: future-payload);")
+        );
+        assert!(
+            generated
+                .text
+                .contains("use-future-handle-payload: func(value: future-handle-payload);")
+        );
+        assert!(
+            generated.text.contains("variant wrapped {"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated.text.contains("variant handle-box {"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("use-wrapped: func(value: wrapped);")
+        );
+        assert!(
+            generated
+                .text
+                .contains("use-handle-box: func(value: handle-box);")
+        );
+        assert!(generated.text.contains("resource handle;"));
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("type hidden ="));
+        assert!(!generated.text.contains("variant missing"));
+        assert!(!generated.text.contains("use-missing:"));
+        assert!(!generated.text.contains("variant borrowed-future-payload"));
+        assert!(!generated.text.contains("use-borrowed-future-payload:"));
+        let retained_source_order = [
+            generated
+                .text
+                .find("variant future-payload {")
+                .expect("the supported data payload variant remains"),
+            generated
+                .text
+                .find("variant future-handle-payload {")
+                .expect("the supported resource payload variant remains"),
+            generated
+                .text
+                .find("use-future-payload:")
+                .expect("the data variant consumer remains"),
+            generated
+                .text
+                .find("use-future-handle-payload:")
+                .expect("the resource variant consumer remains"),
+            generated
+                .text
+                .find("enum keep {")
+                .expect("the independent unit enum remains"),
+        ];
+        assert!(
+            retained_source_order
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]),
+            "retained declaration kinds keep source order: {}",
+            generated.text
+        );
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let root = package_model.root();
+        let (types_index, types) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "types")
+            .expect("the earlier interface with supported targets remains");
+        let (id_index, _) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the supported earlier alias remains");
+        let (handle_index, handle) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the earlier resource remains");
+        assert!(matches!(handle.kind, sai_wit::WitItemKind::Resource(_)));
+        assert_eq!(
+            types
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "handle"],
+            "the unsupported earlier item is removed while the resource remains"
+        );
+
+        let (early_index, early) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "early")
+            .expect("the earlier interface with an independent enum remains");
+        assert_eq!(
+            early
+                .items
+                .iter()
+                .filter(|item| matches!(&item.kind, sai_wit::WitItemKind::Variant(_)))
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["future-payload", "future-handle-payload"],
+            "supported future variants remain while unsupported variants are pruned"
+        );
+        assert_eq!(
+            early
+                .items
+                .iter()
+                .filter(|item| matches!(&item.kind, sai_wit::WitItemKind::Func(_)))
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["use-future-payload", "use-future-handle-payload"],
+            "only supported future-variant consumers remain"
+        );
+        let (future_id_index, future_id) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the later data item is represented by a local use alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(imported_id)) = &future_id.kind
+        else {
+            panic!("the local future data alias retains its named target");
+        };
+        assert_eq!(imported_id.interface.unit, unit);
+        assert_eq!(imported_id.interface.interface, types_index);
+        assert_eq!(imported_id.item, id_index);
+        assert_eq!(imported_id.item_name, "id");
+        let (future_handle_index, future_handle) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the later resource is represented by a local use alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(imported_handle)) =
+            &future_handle.kind
+        else {
+            panic!("the local future resource alias retains its owned target");
+        };
+        assert_eq!(imported_handle.interface.unit, unit);
+        assert_eq!(imported_handle.interface.interface, types_index);
+        assert_eq!(imported_handle.item, handle_index);
+        assert_eq!(imported_handle.item_name, "handle");
+        for (variant_name, import_index, import_name, is_resource) in [
+            ("future-payload", future_id_index, "id", false),
+            ("future-handle-payload", future_handle_index, "handle", true),
+        ] {
+            let (variant_index, variant) = early
+                .items
+                .iter_enumerated()
+                .find(|(_, item)| item.name == variant_name)
+                .expect("the supported future payload variant remains");
+            let sai_wit::WitItemKind::Variant(cases) = &variant.kind else {
+                panic!("{variant_name} remains a payload variant");
+            };
+            let payload = cases[0]
+                .payload
+                .as_ref()
+                .expect("the payload type is retained");
+            let payload_reference = match (is_resource, payload) {
+                (false, sai_wit::WitType::Named(reference))
+                | (true, sai_wit::WitType::Own(reference)) => reference,
+                _ => panic!("{variant_name} retains the expected payload kind"),
+            };
+            assert_eq!(payload_reference.interface.unit, unit);
+            assert_eq!(payload_reference.interface.interface, early_index);
+            assert_eq!(payload_reference.item, import_index);
+            assert_eq!(payload_reference.item_name, import_name);
+            let consumer_name = match variant_name {
+                "future-payload" => "use-future-payload",
+                "future-handle-payload" => "use-future-handle-payload",
+                _ => unreachable!(),
+            };
+            let consumer = early
+                .items
+                .iter()
+                .find(|item| item.name == consumer_name)
+                .expect("the future variant consumer remains");
+            let sai_wit::WitItemKind::Func(consumer) = &consumer.kind else {
+                panic!("{consumer_name} remains a function");
+            };
+            let sai_wit::WitType::Named(consumer_reference) = &consumer.params[0].1 else {
+                panic!("the consumer refers to its local variant");
+            };
+            assert_eq!(consumer_reference.interface.unit, unit);
+            assert_eq!(consumer_reference.interface.interface, early_index);
+            assert_eq!(consumer_reference.item, variant_index);
+            assert_eq!(consumer_reference.item_name, variant_name);
+        }
+
+        let (variants_index, variants) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "variants")
+            .expect("the consuming interface remains");
+        for (variant_name, function_name, target_index, target_name, is_resource) in [
+            ("wrapped", "use-wrapped", id_index, "id", false),
+            ("handle-box", "use-handle-box", handle_index, "handle", true),
+        ] {
+            let variant_index = variants
+                .items
+                .iter_enumerated()
+                .find_map(|(index, item)| (item.name == variant_name).then_some(index))
+                .expect("the supported payload variant has a compact parsed item index");
+            let variant = variants
+                .items
+                .iter()
+                .find(|item| item.name == variant_name)
+                .expect("the variant with a supported payload remains");
+            let sai_wit::WitItemKind::Variant(cases) = &variant.kind else {
+                panic!("{variant_name} remains a payload variant");
+            };
+            let payload = cases[0]
+                .payload
+                .as_ref()
+                .expect("the payload type is retained");
+            let payload_reference = match (is_resource, payload) {
+                (false, sai_wit::WitType::Named(reference))
+                | (true, sai_wit::WitType::Own(reference)) => reference,
+                _ => panic!("{variant_name} retains the expected named or owned payload"),
+            };
+            let (import_index, import) = variants
+                .items
+                .iter_enumerated()
+                .find(|(_, item)| item.name == target_name)
+                .expect("the parsed local use alias for the target remains");
+            assert_eq!(payload_reference.interface.unit, unit);
+            assert_eq!(payload_reference.interface.interface, variants_index);
+            assert_eq!(payload_reference.interface.name, "variants");
+            assert_eq!(payload_reference.item, import_index);
+            assert_eq!(payload_reference.item_name, target_name);
+            match (is_resource, &import.kind) {
+                (false, sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(reference)))
+                | (true, sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(reference))) => {
+                    assert_eq!(reference.interface.unit, unit);
+                    assert_eq!(reference.interface.interface, types_index);
+                    assert_eq!(reference.interface.name, "types");
+                    assert_eq!(reference.item, target_index);
+                    assert_eq!(reference.item_name, target_name);
+                }
+                _ => panic!("{target_name} use alias retains its exact target kind"),
+            }
+
+            let function = variants
+                .items
+                .iter()
+                .find(|item| item.name == function_name)
+                .expect("the variant consumer function remains");
+            let sai_wit::WitItemKind::Func(function) = &function.kind else {
+                panic!("{function_name} remains a function");
+            };
+            let sai_wit::WitType::Named(function_reference) = &function.params[0].1 else {
+                panic!("the function retains a reference to its local variant");
+            };
+            assert_eq!(function_reference.interface.unit, unit);
+            assert_eq!(function_reference.interface.interface, variants_index);
+            assert_eq!(function_reference.item_name, variant_name);
+            assert_eq!(function_reference.item, variant_index);
+            assert_eq!(cases[0].name, "value");
+        }
+    }
+
+    #[test]
+    fn generated_wit_resource_members_reference_prior_and_later_local_interfaces() {
+        fn find_item<'a>(
+            interface: &'a sai_wit::WitInterface,
+            name: &str,
+        ) -> (sai_wit::WitItemIdx, &'a sai_wit::WitItem) {
+            interface
+                .items
+                .iter_enumerated()
+                .find(|(_, item)| item.name == name)
+                .unwrap_or_else(|| panic!("the parsed `{name}` item remains"))
+        }
+
+        let source = concat!(
+            "interface early {\n",
+            "  resource Worker {\n",
+            "    fn round_trip(self: borrow Self, value: types.Id, borrowed: borrow types.Other) -> types.Payload\n",
+            "    fn new(value: types.Payload) -> Self\n",
+            "    fn from_later(handle_value: types.Other) -> types.Id\n",
+            "  }\n",
+            "  resource Broken {\n",
+            "    fn fail(self: borrow Self, value: types.Hidden)\n",
+            "  }\n",
+            "  fn take_worker(value: Worker)\n",
+            "  fn take_broken(value: Broken)\n",
+            "  resource Keep {}\n",
+            "}\n",
+            "interface types {\n",
+            "  type Hidden = USize\n",
+            "  type Id = U64\n",
+            "  type Payload { value: U32 }\n",
+            "  resource Other {}\n",
+            "}\n",
+            "interface api {\n",
+            "  resource Handle {\n",
+            "    fn round_trip(self: borrow Self, value: types.Payload, handle_value: types.Other, borrowed: borrow types.Other) -> types.Id\n",
+            "    fn new(value: types.Payload) -> Self\n",
+            "    fn from_prior(handle_value: types.Other) -> types.Id\n",
+            "  }\n",
+            "  resource Missing {\n",
+            "    fn fail(self: borrow Self, value: types.Hidden)\n",
+            "  }\n",
+            "  fn take_handle(value: Handle)\n",
+            "  fn take_missing(value: Missing)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("cross-interface resource members remain queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning unsupported resource members leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "later-interface and omitted-type resource targets remain incomplete"
+        );
+        assert!(
+            generated.text.contains("resource worker {"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated
+                .text
+                .contains("round-trip: func(value: id, borrowed: borrow<other>) -> payload;")
+        );
+        assert!(generated.text.contains("constructor(value: payload);"));
+        assert!(
+            generated
+                .text
+                .contains("from-later: static func(handle-value: other) -> id;")
+        );
+        assert!(generated.text.contains("take-worker: func(value: worker);"));
+        assert!(!generated.text.contains("resource broken"));
+        assert!(!generated.text.contains("take-broken:"));
+        assert!(generated.text.contains("resource keep;"));
+        assert!(generated.text.contains("type id = u64;"));
+        assert!(generated.text.contains("record payload {"));
+        assert!(generated.text.contains("resource other;"));
+        assert!(generated.text.contains("use types.{id, other, payload};"));
+        assert!(generated.text.contains("resource handle {"));
+        assert!(generated.text.contains("round-trip: func("));
+        assert!(generated.text.contains("constructor(value: payload);"));
+        assert!(
+            generated
+                .text
+                .contains("from-prior: static func(handle-value: other) -> id;"),
+            "{}",
+            generated.text
+        );
+        assert!(generated.text.contains("take-handle: func(value: handle);"));
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("type hidden ="));
+        assert!(!generated.text.contains("resource missing"));
+        assert!(!generated.text.contains("take-missing:"));
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let root = package_model.root();
+        let (types_index, types) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "types")
+            .expect("the earlier interface with supported targets remains");
+        let (id_index, _) = find_item(types, "id");
+        let (payload_index, _) = find_item(types, "payload");
+        let (other_index, other) = find_item(types, "other");
+        assert!(matches!(other.kind, sai_wit::WitItemKind::Resource(_)));
+        assert_eq!(
+            types
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "payload", "other"],
+            "the unsupported prior item is removed and target indices compact"
+        );
+
+        let (early_index, early) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "early")
+            .expect("the earlier interface with its forward-referencing resource remains");
+        let early_position = generated
+            .text
+            .find("interface early {")
+            .expect("the resource interface appears in generated source order");
+        let types_position = generated
+            .text
+            .find("interface types {")
+            .expect("the referenced types interface appears in generated source order");
+        assert!(
+            early_position < types_position,
+            "the referenced types interface follows the resource interface in generated source order"
+        );
+        let (early_id_index, early_id) = find_item(early, "id");
+        let (early_payload_index, early_payload) = find_item(early, "payload");
+        let (early_other_index, early_other) = find_item(early, "other");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(early_id_target)) = &early_id.kind
+        else {
+            panic!("the early interface imports the later data alias");
+        };
+        assert_eq!(early_id_target.interface.interface, types_index);
+        assert_eq!(early_id_target.item, id_index);
+        assert_eq!(early_id_target.item_name, "id");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(early_payload_target)) =
+            &early_payload.kind
+        else {
+            panic!("the early interface imports the later record");
+        };
+        assert_eq!(early_payload_target.interface.interface, types_index);
+        assert_eq!(early_payload_target.item, payload_index);
+        assert_eq!(early_payload_target.item_name, "payload");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(early_other_target)) =
+            &early_other.kind
+        else {
+            panic!("the early interface imports the later resource");
+        };
+        assert_eq!(early_other_target.interface.interface, types_index);
+        assert_eq!(early_other_target.item, other_index);
+        assert_eq!(early_other_target.item_name, "other");
+        let (worker_index, worker) = find_item(early, "worker");
+        let sai_wit::WitItemKind::Resource(worker_members) = &worker.kind else {
+            panic!("the forward-referencing resource remains");
+        };
+        let early_member_reference = |ty: &sai_wit::WitType, expected_name: &str| match ty {
+            sai_wit::WitType::Named(reference)
+            | sai_wit::WitType::Own(reference)
+            | sai_wit::WitType::Borrow(reference) => {
+                assert_eq!(reference.interface.unit, unit);
+                assert_eq!(reference.interface.interface, early_index);
+                assert_eq!(reference.interface.name, "early");
+                assert_eq!(reference.item_name, expected_name);
+                reference.item
+            }
+            _ => panic!("the member type refers to its local `{expected_name}` import"),
+        };
+        let future_method = worker_members
+            .iter()
+            .find(|member| member.name == "round-trip")
+            .expect("the forward-referencing method remains");
+        assert_eq!(future_method.kind, sai_wit::WitMemberKind::Method);
+        assert_eq!(
+            early_member_reference(&future_method.func.params[1].1, "id"),
+            early_id_index
+        );
+        assert_eq!(
+            early_member_reference(&future_method.func.params[2].1, "other"),
+            early_other_index
+        );
+        assert!(matches!(
+            future_method.func.params[2].1,
+            sai_wit::WitType::Borrow(_)
+        ));
+        assert_eq!(
+            early_member_reference(
+                future_method
+                    .func
+                    .result
+                    .as_ref()
+                    .expect("the method result remains"),
+                "payload"
+            ),
+            early_payload_index
+        );
+        let future_constructor = worker_members
+            .iter()
+            .find(|member| member.kind == sai_wit::WitMemberKind::Constructor)
+            .expect("the forward-referencing constructor remains");
+        assert_eq!(
+            early_member_reference(&future_constructor.func.params[0].1, "payload"),
+            early_payload_index
+        );
+        let future_static = worker_members
+            .iter()
+            .find(|member| member.name == "from-later")
+            .expect("the forward-referencing static member remains");
+        assert_eq!(future_static.kind, sai_wit::WitMemberKind::Static);
+        assert_eq!(
+            early_member_reference(&future_static.func.params[0].1, "other"),
+            early_other_index
+        );
+        assert_eq!(
+            early_member_reference(
+                future_static
+                    .func
+                    .result
+                    .as_ref()
+                    .expect("the static result remains"),
+                "id"
+            ),
+            early_id_index
+        );
+        let (_, take_worker) = find_item(early, "take-worker");
+        let sai_wit::WitItemKind::Func(take_worker) = &take_worker.kind else {
+            panic!("the forward-referencing resource consumer remains");
+        };
+        assert_eq!(
+            early_member_reference(&take_worker.params[0].1, "worker"),
+            worker_index
+        );
+
+        let (api_index, api) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "api")
+            .expect("the consuming interface remains");
+        let (handle_index, handle) = find_item(api, "handle");
+        let sai_wit::WitItemKind::Resource(members) = &handle.kind else {
+            panic!("the resource with supported cross-interface members remains");
+        };
+        let member_reference = |ty: &sai_wit::WitType, expected_name: &str| match ty {
+            sai_wit::WitType::Named(reference)
+            | sai_wit::WitType::Own(reference)
+            | sai_wit::WitType::Borrow(reference) => {
+                assert_eq!(reference.interface.unit, unit);
+                assert_eq!(reference.interface.interface, api_index);
+                assert_eq!(reference.interface.name, "api");
+                assert_eq!(reference.item_name, expected_name);
+                reference.item
+            }
+            _ => panic!("the member type refers to its local `{expected_name}` import"),
+        };
+        let (id_import_index, id_import) = find_item(api, "id");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(id_target)) = &id_import.kind
+        else {
+            panic!("the local id import retains a named type target");
+        };
+        assert_eq!(id_target.interface.unit, unit);
+        assert_eq!(id_target.interface.interface, types_index);
+        assert_eq!(id_target.item, id_index);
+        assert_eq!(id_target.item_name, "id");
+        let (payload_import_index, payload_import) = find_item(api, "payload");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(payload_target)) =
+            &payload_import.kind
+        else {
+            panic!("the local payload import retains a named type target");
+        };
+        assert_eq!(payload_target.interface.unit, unit);
+        assert_eq!(payload_target.interface.interface, types_index);
+        assert_eq!(payload_target.item, payload_index);
+        assert_eq!(payload_target.item_name, "payload");
+        let (other_import_index, other_import) = find_item(api, "other");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(other_target)) = &other_import.kind
+        else {
+            panic!("the local resource import retains its owned target");
+        };
+        assert_eq!(other_target.interface.unit, unit);
+        assert_eq!(other_target.interface.interface, types_index);
+        assert_eq!(other_target.item, other_index);
+        assert_eq!(other_target.item_name, "other");
+
+        let method = members
+            .iter()
+            .find(|member| member.name == "round-trip")
+            .expect("the resource method with external types remains");
+        assert_eq!(method.kind, sai_wit::WitMemberKind::Method);
+        assert_eq!(
+            member_reference(&method.func.params[0].1, "handle"),
+            handle_index,
+            "the method keeps the current resource receiver"
+        );
+        assert_eq!(
+            member_reference(&method.func.params[1].1, "payload"),
+            payload_import_index
+        );
+        assert_eq!(
+            member_reference(&method.func.params[2].1, "other"),
+            other_import_index
+        );
+        assert_eq!(
+            member_reference(&method.func.params[3].1, "other"),
+            other_import_index
+        );
+        assert_eq!(
+            member_reference(
+                method
+                    .func
+                    .result
+                    .as_ref()
+                    .expect("the method result remains"),
+                "id"
+            ),
+            id_import_index
+        );
+        assert!(matches!(
+            method.func.params[0].1,
+            sai_wit::WitType::Borrow(_)
+        ));
+        assert!(matches!(method.func.params[2].1, sai_wit::WitType::Own(_)));
+        assert!(matches!(
+            method.func.params[3].1,
+            sai_wit::WitType::Borrow(_)
+        ));
+
+        let constructor = members
+            .iter()
+            .find(|member| member.kind == sai_wit::WitMemberKind::Constructor)
+            .expect("the constructor remains");
+        assert_eq!(
+            member_reference(&constructor.func.params[0].1, "payload"),
+            payload_import_index
+        );
+        let sai_wit::WitType::Own(constructor_result) = constructor
+            .func
+            .result
+            .as_ref()
+            .expect("the constructor has its implicit owned result")
+        else {
+            panic!("the constructor still returns the current resource");
+        };
+        assert_eq!(constructor_result.interface.unit, unit);
+        assert_eq!(constructor_result.interface.interface, api_index);
+        assert_eq!(constructor_result.item, handle_index);
+        assert_eq!(constructor_result.item_name, "handle");
+
+        let static_member = members
+            .iter()
+            .find(|member| member.name == "from-prior")
+            .expect("the static member with earlier-interface types remains");
+        assert_eq!(static_member.kind, sai_wit::WitMemberKind::Static);
+        assert_eq!(
+            member_reference(&static_member.func.params[0].1, "other"),
+            other_import_index
+        );
+        assert_eq!(
+            member_reference(
+                static_member
+                    .func
+                    .result
+                    .as_ref()
+                    .expect("the static result remains"),
+                "id"
+            ),
+            id_import_index
+        );
+
+        let (_, take_handle) = find_item(api, "take-handle");
+        let sai_wit::WitItemKind::Func(take_handle) = &take_handle.kind else {
+            panic!("the handle consumer function remains");
+        };
+        assert_eq!(
+            member_reference(&take_handle.params[0].1, "handle"),
+            handle_index
+        );
+    }
+
+    #[test]
+    fn generated_wit_resource_members_reference_later_local_items_only() {
+        fn find_item<'a>(
+            interface: &'a sai_wit::WitInterface,
+            name: &str,
+        ) -> (sai_wit::WitItemIdx, &'a sai_wit::WitItem) {
+            interface
+                .items
+                .iter_enumerated()
+                .find(|(_, item)| item.name == name)
+                .unwrap_or_else(|| panic!("the parsed `{name}` item remains"))
+        }
+
+        let source = concat!(
+            "interface api {\n",
+            "  resource Worker {\n",
+            "    fn round_trip(self: borrow Self, value: api.LaterRecord, owned_handle: api.LaterResource, borrowed: borrow api.LaterResource) -> api.LaterAlias\n",
+            "    fn new(value: api.LaterAlias) -> Self\n",
+            "    fn from_later(owned_handle: api.LaterResource) -> api.LaterEnum\n",
+            "    fn state(self: borrow Self) -> api.LaterVariant\n",
+            "  }\n",
+            "  resource Broken {\n",
+            "    fn fail(self: borrow Self, value: Unsupported)\n",
+            "  }\n",
+            "  resource CycleBroken {\n",
+            "    fn fail(self: borrow Self, value: CycleAlias)\n",
+            "  }\n",
+            "  fn take_worker(value: Worker)\n",
+            "  fn take_broken(value: Broken)\n",
+            "  fn take_cycle_broken(value: CycleBroken)\n",
+            "  fn independent(value: U32)\n",
+            "  type LaterAlias = U64\n",
+            "  type LaterRecord { value: U32 }\n",
+            "  enum LaterEnum { Ready }\n",
+            "  enum LaterVariant { Ready, Count(U32) }\n",
+            "  resource LaterResource {}\n",
+            "  type Unsupported = USize\n",
+            "  type CycleAlias = CycleRecord\n",
+            "  type CycleRecord { value: CycleAlias }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("same-interface forward resource references remain queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning unsupported forward resource targets leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "unsupported and cyclic forward targets keep output incomplete"
+        );
+        assert!(
+            generated.text.contains("resource worker {"),
+            "generated WIT should retain the resource members:\n{}",
+            generated.text
+        );
+        assert!(generated.text.contains("constructor(value: later-alias);"));
+        assert!(generated.text.contains("round-trip: func("));
+        assert!(
+            generated
+                .text
+                .contains("from-later: static func(owned-handle: later-resource) -> later-enum;")
+        );
+        assert!(generated.text.contains("take-worker: func(value: worker);"));
+        assert!(generated.text.contains("type later-alias = u64;"));
+        assert!(generated.text.contains("record later-record {"));
+        assert!(generated.text.contains("resource later-resource;"));
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("resource broken"));
+        assert!(!generated.text.contains("take-broken:"));
+        assert!(!generated.text.contains("resource cycle-broken"));
+        assert!(!generated.text.contains("take-cycle-broken:"));
+        assert!(!generated.text.contains("type unsupported ="));
+        assert!(!generated.text.contains("type cycle-alias ="));
+        assert!(!generated.text.contains("record cycle-record"));
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let (api_index, api) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "api")
+            .expect("the generated interface remains");
+        let (worker_index, worker) = find_item(api, "worker");
+        let (alias_index, _) = find_item(api, "later-alias");
+        let (record_index, _) = find_item(api, "later-record");
+        let (enum_index, _) = find_item(api, "later-enum");
+        let (variant_index, variant) = find_item(api, "later-variant");
+        let (resource_index, resource) = find_item(api, "later-resource");
+        assert!(matches!(resource.kind, sai_wit::WitItemKind::Resource(_)));
+        assert!(matches!(variant.kind, sai_wit::WitItemKind::Variant(_)));
+        let sai_wit::WitItemKind::Resource(members) = &worker.kind else {
+            panic!("the resource with supported forward signatures remains");
+        };
+        let assert_reference =
+            |ty: &sai_wit::WitType, expected_index: sai_wit::WitItemIdx, expected_name: &str| {
+                let reference = match ty {
+                    sai_wit::WitType::Named(reference)
+                    | sai_wit::WitType::Own(reference)
+                    | sai_wit::WitType::Borrow(reference) => reference,
+                    _ => panic!("the type refers to the later `{expected_name}` item"),
+                };
+                assert_eq!(reference.interface.unit, unit);
+                assert_eq!(reference.interface.interface, api_index);
+                assert_eq!(reference.interface.name, "api");
+                assert_eq!(reference.item, expected_index);
+                assert_eq!(reference.item_name, expected_name);
+            };
+
+        let method = members
+            .iter()
+            .find(|member| member.name == "round-trip")
+            .expect("the forward-referencing method remains");
+        assert_eq!(method.kind, sai_wit::WitMemberKind::Method);
+        assert!(matches!(
+            method.func.params[0].1,
+            sai_wit::WitType::Borrow(_)
+        ));
+        assert_reference(&method.func.params[0].1, worker_index, "worker");
+        assert_reference(&method.func.params[1].1, record_index, "later-record");
+        assert_reference(&method.func.params[2].1, resource_index, "later-resource");
+        assert_reference(&method.func.params[3].1, resource_index, "later-resource");
+        assert!(matches!(method.func.params[2].1, sai_wit::WitType::Own(_)));
+        assert!(matches!(
+            method.func.params[3].1,
+            sai_wit::WitType::Borrow(_)
+        ));
+        assert_reference(
+            method
+                .func
+                .result
+                .as_ref()
+                .expect("the method result remains"),
+            alias_index,
+            "later-alias",
+        );
+
+        let constructor = members
+            .iter()
+            .find(|member| member.kind == sai_wit::WitMemberKind::Constructor)
+            .expect("the forward-referencing constructor remains");
+        assert_reference(&constructor.func.params[0].1, alias_index, "later-alias");
+        assert_reference(
+            constructor
+                .func
+                .result
+                .as_ref()
+                .expect("the constructor has its implicit owned result"),
+            worker_index,
+            "worker",
+        );
+
+        let static_member = members
+            .iter()
+            .find(|member| member.name == "from-later")
+            .expect("the forward-referencing static member remains");
+        assert_eq!(static_member.kind, sai_wit::WitMemberKind::Static);
+        assert_reference(
+            &static_member.func.params[0].1,
+            resource_index,
+            "later-resource",
+        );
+        assert_reference(
+            static_member
+                .func
+                .result
+                .as_ref()
+                .expect("the static result remains"),
+            enum_index,
+            "later-enum",
+        );
+
+        let variant_method = members
+            .iter()
+            .find(|member| member.name == "state")
+            .expect("the forward-referencing variant method remains");
+        assert_eq!(variant_method.kind, sai_wit::WitMemberKind::Method);
+        assert_reference(
+            variant_method
+                .func
+                .result
+                .as_ref()
+                .expect("the variant method result remains"),
+            variant_index,
+            "later-variant",
+        );
+
+        let (_, take_worker) = find_item(api, "take-worker");
+        let sai_wit::WitItemKind::Func(take_worker) = &take_worker.kind else {
+            panic!("the function consuming the forward-referencing resource remains");
+        };
+        assert_reference(&take_worker.params[0].1, worker_index, "worker");
+    }
+
+    #[test]
+    fn generated_wit_transitively_prunes_later_interface_dependents() {
+        let source = concat!(
+            "interface early {\n",
+            "  resource Worker {\n",
+            "    fn read(self: borrow Self, request: middle.Request)\n",
+            "  }\n",
+            "  fn take_worker(value: Worker)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+            "interface middle {\n",
+            "  type Request = late.Hidden\n",
+            "  fn take_request(value: Request)\n",
+            "  type MiddleKeep = U32\n",
+            "  fn keep_middle(value: MiddleKeep)\n",
+            "}\n",
+            "interface late {\n",
+            "  type Hidden = USize\n",
+            "  type LateKeep = U64\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("transitively pruned generated WIT remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning transitive dependents leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        assert!(!generated.text.contains("resource worker"));
+        assert!(!generated.text.contains("take-worker:"));
+        assert!(!generated.text.contains("type request ="));
+        assert!(!generated.text.contains("take-request:"));
+        assert!(!generated.text.contains("type hidden ="));
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(generated.text.contains("type middle-keep = u32;"));
+        assert!(
+            generated
+                .text
+                .contains("keep-middle: func(value: middle-keep);")
+        );
+        assert!(generated.text.contains("type late-keep = u64;"));
+
+        let package_model = result
+            .package
+            .expect("the partial generated WIT model loads");
+        let root = package_model.root();
+        let interface = |name: &str| {
+            root.interfaces
+                .iter()
+                .find(|interface| interface.name == name)
+                .unwrap_or_else(|| panic!("the independent `{name}` interface remains"))
+        };
+        let item_names = |name: &str| {
+            interface(name)
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(item_names("early"), ["independent"]);
+        assert_eq!(item_names("middle"), ["middle-keep", "keep-middle"]);
+        assert_eq!(item_names("late"), ["late-keep"]);
+        assert_eq!(
+            interface("middle")
+                .items
+                .iter_enumerated()
+                .find(|(_, item)| item.name == "middle-keep")
+                .expect("the supported middle type remains")
+                .0
+                .index(),
+            0,
+            "the surviving middle item index compacts after the omitted alias"
+        );
+        assert_eq!(
+            interface("late")
+                .items
+                .iter_enumerated()
+                .find(|(_, item)| item.name == "late-keep")
+                .expect("the supported later type remains")
+                .0
+                .index(),
+            0,
+            "the surviving later item index compacts after the omitted target"
+        );
+    }
+
+    #[test]
+    fn generated_wit_aliases_reference_prior_and_later_local_interfaces() {
+        let source = concat!(
+            "interface early {\n",
+            "  type Future = types.Id\n",
+            "  type FutureResource = types.Handle\n",
+            "  type Missing = types.Hidden\n",
+            "  type Keep = U32\n",
+            "  fn use_future(value: Future)\n",
+            "  fn use_future_resource(value: FutureResource)\n",
+            "  fn use_missing(value: Missing)\n",
+            "}\n",
+            "interface types {\n",
+            "  type Hidden = USize\n",
+            "  type Id = U32\n",
+            "  resource Handle {}\n",
+            "}\n",
+            "interface aliases {\n",
+            "  type Wrapped = types.Id\n",
+            "  type ResourceAlias = types.Handle\n",
+            "  type Missing = types.Hidden\n",
+            "  fn use_wrapped(value: Wrapped)\n",
+            "  fn use_resource(value: ResourceAlias)\n",
+            "  fn use_missing(value: Missing)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("cross-interface alias references remain queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning unsupported alias targets leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "the omitted-type alias target remains incomplete"
+        );
+        assert!(generated.text.contains("type keep = u32;"));
+        assert!(generated.text.contains("type %future = id;"));
+        assert!(generated.text.contains("type future-resource = handle;"));
+        assert!(generated.text.contains("type id = u32;"));
+        assert!(generated.text.contains("use types.{handle, id};"));
+        assert!(generated.text.contains("type wrapped = id;"));
+        assert!(
+            generated
+                .text
+                .contains("use-wrapped: func(value: wrapped);")
+        );
+        assert!(generated.text.contains("resource handle;"));
+        assert!(generated.text.contains("type resource-alias = handle;"));
+        assert!(generated.text.contains("use-future: func(value: %future);"));
+        assert!(
+            generated
+                .text
+                .contains("use-future-resource: func(value: future-resource);")
+        );
+        assert!(
+            generated
+                .text
+                .contains("use-resource: func(value: resource-alias);")
+        );
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("type missing ="));
+        assert!(!generated.text.contains("type hidden ="));
+        assert!(!generated.text.contains("use-missing:"));
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let root = package_model.root();
+        let (types_index, types) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "types")
+            .expect("the prior interface with the supported type remains");
+        let (id_index, _) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the supported earlier alias remains");
+        let (handle_index, handle) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the earlier resource remains");
+        assert!(matches!(handle.kind, sai_wit::WitItemKind::Resource(_)));
+        assert_eq!(
+            types
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "handle"],
+            "the unsupported earlier item is removed while the resource remains"
+        );
+
+        let (early_index, early) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "early")
+            .expect("the earlier interface remains");
+        assert_eq!(
+            early
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "handle",
+                "id",
+                "future",
+                "future-resource",
+                "keep",
+                "use-future",
+                "use-future-resource"
+            ],
+            "supported future aliases survive while the omitted target and consumer are pruned"
+        );
+
+        let (early_id_index, early_id) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the future type is available through a local use alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(early_id_target)) = &early_id.kind
+        else {
+            panic!("the local id import retains a named target");
+        };
+        assert_eq!(&early_id_target.interface.unit, &unit);
+        assert_eq!(early_id_target.interface.interface, types_index);
+        assert_eq!(early_id_target.item, id_index);
+        assert_eq!(early_id_target.item_name, "id");
+        let (early_handle_index, early_handle) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the future resource is available through a local use alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(early_handle_target)) =
+            &early_handle.kind
+        else {
+            panic!("the local handle import retains an owned target");
+        };
+        assert_eq!(&early_handle_target.interface.unit, &unit);
+        assert_eq!(early_handle_target.interface.interface, types_index);
+        assert_eq!(early_handle_target.item, handle_index);
+        assert_eq!(early_handle_target.item_name, "handle");
+        let (future_index, future) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "future")
+            .expect("the future alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(future_target)) = &future.kind
+        else {
+            panic!("the future alias retains its parsed named target");
+        };
+        assert_eq!(&future_target.interface.unit, &unit);
+        assert_eq!(future_target.interface.interface, early_index);
+        assert_eq!(future_target.item, early_id_index);
+        assert_eq!(future_target.item_name, "id");
+        let (future_resource_index, future_resource) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "future-resource")
+            .expect("the future resource alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(future_resource_target)) =
+            &future_resource.kind
+        else {
+            panic!("the future resource alias retains its parsed named target");
+        };
+        assert_eq!(&future_resource_target.interface.unit, &unit);
+        assert_eq!(future_resource_target.interface.interface, early_index);
+        assert_eq!(future_resource_target.item, early_handle_index);
+        assert_eq!(future_resource_target.item_name, "handle");
+        let use_future = early
+            .items
+            .iter()
+            .find(|item| item.name == "use-future")
+            .expect("the future alias consumer survives");
+        let sai_wit::WitItemKind::Func(use_future) = &use_future.kind else {
+            panic!("use-future remains a function");
+        };
+        assert!(matches!(
+            use_future.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == early_index
+                    && reference.item == future_index
+                    && reference.item_name == "future"
+        ));
+        let use_future_resource = early
+            .items
+            .iter()
+            .find(|item| item.name == "use-future-resource")
+            .expect("the future resource alias consumer survives");
+        let sai_wit::WitItemKind::Func(use_future_resource) = &use_future_resource.kind else {
+            panic!("use-future-resource remains a function");
+        };
+        assert!(matches!(
+            use_future_resource.params[0].1,
+            sai_wit::WitType::Own(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == early_index
+                    && reference.item == future_resource_index
+                    && reference.item_name == "future-resource"
+        ));
+
+        let (aliases_index, aliases) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "aliases")
+            .expect("the later aliases interface remains");
+        let (import_index, import) = aliases
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the parsed local use alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(imported_id)) = &import.kind else {
+            panic!("the parsed local use alias retains the referenced named type");
+        };
+        assert_eq!(&imported_id.interface.unit, &unit);
+        assert_eq!(imported_id.interface.interface, types_index);
+        assert_eq!(imported_id.item, id_index);
+        assert_eq!(imported_id.item_name, "id");
+        let (handle_import_index, handle_import) = aliases
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the parsed local resource use alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(imported_handle)) =
+            &handle_import.kind
+        else {
+            panic!("the parsed local resource use alias retains its owned handle");
+        };
+        assert_eq!(&imported_handle.interface.unit, &unit);
+        assert_eq!(imported_handle.interface.interface, types_index);
+        assert_eq!(imported_handle.item, handle_index);
+        assert_eq!(imported_handle.item_name, "handle");
+
+        let (wrapped_index, wrapped) = aliases
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "wrapped")
+            .expect("the cross-interface alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(wrapped_target)) = &wrapped.kind
+        else {
+            panic!("the alias retains its parsed named target");
+        };
+        assert_eq!(&wrapped_target.interface.unit, &unit);
+        assert_eq!(wrapped_target.interface.interface, aliases_index);
+        assert_eq!(wrapped_target.item, import_index);
+        assert_eq!(wrapped_target.item_name, "id");
+
+        let (resource_alias_index, resource_alias) = aliases
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "resource-alias")
+            .expect("the alias to the prior resource remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(resource_alias_target)) =
+            &resource_alias.kind
+        else {
+            panic!("the cross-interface resource alias retains its named use target");
+        };
+        assert_eq!(&resource_alias_target.interface.unit, &unit);
+        assert_eq!(resource_alias_target.interface.interface, aliases_index);
+        assert_eq!(resource_alias_target.item, handle_import_index);
+        assert_eq!(resource_alias_target.item_name, "handle");
+
+        let use_wrapped = aliases
+            .items
+            .iter()
+            .find(|item| item.name == "use-wrapped")
+            .expect("the function using the cross-interface alias remains");
+        let sai_wit::WitItemKind::Func(use_wrapped) = &use_wrapped.kind else {
+            panic!("use-wrapped remains a function");
+        };
+        let sai_wit::WitType::Named(function_target) = &use_wrapped.params[0].1 else {
+            panic!("the function parameter retains its local named alias");
+        };
+        assert_eq!(&function_target.interface.unit, &unit);
+        assert_eq!(function_target.interface.interface, aliases_index);
+        assert_eq!(function_target.item, wrapped_index);
+        assert_eq!(function_target.item_name, "wrapped");
+        let use_resource = aliases
+            .items
+            .iter()
+            .find(|item| item.name == "use-resource")
+            .expect("the function using the cross-interface resource alias remains");
+        let sai_wit::WitItemKind::Func(use_resource) = &use_resource.kind else {
+            panic!("use-resource remains a function");
+        };
+        assert!(matches!(
+            use_resource.params[0].1,
+            sai_wit::WitType::Own(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == aliases_index
+                    && reference.item == resource_alias_index
+                    && reference.item_name == "resource-alias"
+        ));
+    }
+
+    #[test]
+    fn generated_wit_record_fields_reference_prior_and_later_local_interfaces() {
+        let source = concat!(
+            "interface early {\n",
+            "  type Future { id: types.Id, handle: types.Handle }\n",
+            "  type BorrowedFuture { handle: borrow types.Handle }\n",
+            "  type Missing { hidden: types.Hidden }\n",
+            "  type Keep { id: U32 }\n",
+            "  fn use_future(value: Future)\n",
+            "  fn use_borrowed_future(value: BorrowedFuture)\n",
+            "  fn use_missing(value: Missing)\n",
+            "}\n",
+            "interface types {\n",
+            "  type Hidden = USize\n",
+            "  type Id = U32\n",
+            "  resource Handle {}\n",
+            "}\n",
+            "interface records {\n",
+            "  type CrossRecord { id: types.Id, handle: types.Handle }\n",
+            "  type Missing { hidden: types.Hidden }\n",
+            "  fn use_cross(value: CrossRecord)\n",
+            "  fn use_missing(value: Missing)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("cross-interface record references remain queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning unsupported record targets leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            !generated.complete,
+            "the omitted-type record target remains incomplete"
+        );
+        assert!(generated.text.contains("record keep {"));
+        assert!(generated.text.contains("record %future {"));
+        assert!(generated.text.contains("id: id,"));
+        assert!(generated.text.contains("handle: handle,"));
+        assert!(generated.text.contains("type id = u32;"));
+        assert!(generated.text.contains("resource handle;"));
+        assert!(generated.text.contains("use types.{handle, id};"));
+        assert!(generated.text.contains("record cross-record {"));
+        assert!(generated.text.contains("id: id,"));
+        assert!(generated.text.contains("handle: handle,"));
+        assert!(
+            generated
+                .text
+                .contains("use-cross: func(value: cross-record);")
+        );
+        assert!(generated.text.contains("use-future: func(value: %future);"));
+        assert!(generated.text.contains("independent: func(value: u32);"));
+        assert!(!generated.text.contains("type hidden ="));
+        assert!(!generated.text.contains("record missing {"));
+        assert!(!generated.text.contains("record borrowed-future {"));
+        assert!(!generated.text.contains("use-borrowed-future:"));
+        assert!(!generated.text.contains("use-missing:"));
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let root = package_model.root();
+        let (types_index, types) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "types")
+            .expect("the prior interface with supported items remains");
+        let (id_index, _) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the supported earlier alias remains");
+        let (handle_index, _) = types
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the earlier resource remains");
+        assert_eq!(
+            types
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["id", "handle"],
+            "the unsupported earlier item is removed"
+        );
+
+        let (early_index, early) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "early")
+            .expect("the earlier interface remains");
+        assert_eq!(
+            early
+                .items
+                .iter()
+                .filter(|item| matches!(&item.kind, sai_wit::WitItemKind::Record(_)))
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["future", "keep"],
+            "a supported future record survives while its omitted target is pruned"
+        );
+        let (early_id_index, early_id) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the later type is available through a local use alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(early_id_target)) = &early_id.kind
+        else {
+            panic!("the local id import retains a named target");
+        };
+        assert_eq!(&early_id_target.interface.unit, &unit);
+        assert_eq!(early_id_target.interface.interface, types_index);
+        assert_eq!(early_id_target.item, id_index);
+        assert_eq!(early_id_target.item_name, "id");
+        let (early_handle_index, early_handle) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the later resource is available through a local use alias");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(early_handle_target)) =
+            &early_handle.kind
+        else {
+            panic!("the local handle import retains an owned target");
+        };
+        assert_eq!(&early_handle_target.interface.unit, &unit);
+        assert_eq!(early_handle_target.interface.interface, types_index);
+        assert_eq!(early_handle_target.item, handle_index);
+        assert_eq!(early_handle_target.item_name, "handle");
+        let (future_index, future) = early
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "future")
+            .expect("the future record remains");
+        let sai_wit::WitItemKind::Record(future_fields) = &future.kind else {
+            panic!("future remains a record");
+        };
+        assert_eq!(future_fields.len(), 2);
+        assert!(matches!(
+            future_fields[0].ty,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == early_index
+                    && reference.item == early_id_index
+                    && reference.item_name == "id"
+        ));
+        assert!(matches!(
+            future_fields[1].ty,
+            sai_wit::WitType::Own(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == early_index
+                    && reference.item == early_handle_index
+                    && reference.item_name == "handle"
+        ));
+        let use_future = early
+            .items
+            .iter()
+            .find(|item| item.name == "use-future")
+            .expect("the function consuming the future record remains");
+        let sai_wit::WitItemKind::Func(use_future) = &use_future.kind else {
+            panic!("use-future remains a function");
+        };
+        assert!(matches!(
+            use_future.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == early_index
+                    && reference.item == future_index
+                    && reference.item_name == "future"
+        ));
+
+        let (records_index, records) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "records")
+            .expect("the later record interface remains");
+        let (id_import_index, id_import) = records
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "id")
+            .expect("the parsed local type use alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(imported_id)) = &id_import.kind
+        else {
+            panic!("the parsed type use alias retains the named target");
+        };
+        assert_eq!(&imported_id.interface.unit, &unit);
+        assert_eq!(imported_id.interface.interface, types_index);
+        assert_eq!(imported_id.item, id_index);
+        assert_eq!(imported_id.item_name, "id");
+
+        let (handle_import_index, handle_import) = records
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "handle")
+            .expect("the parsed local resource use alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(imported_handle)) =
+            &handle_import.kind
+        else {
+            panic!("the parsed resource use alias retains the owned target");
+        };
+        assert_eq!(&imported_handle.interface.unit, &unit);
+        assert_eq!(imported_handle.interface.interface, types_index);
+        assert_eq!(imported_handle.item, handle_index);
+        assert_eq!(imported_handle.item_name, "handle");
+
+        let (cross_record_index, cross_record) = records
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "cross-record")
+            .expect("the record using prior-interface items remains");
+        let sai_wit::WitItemKind::Record(fields) = &cross_record.kind else {
+            panic!("cross-record remains a record");
+        };
+        assert_eq!(fields.len(), 2);
+        assert!(matches!(
+            fields[0].ty,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == records_index
+                    && reference.item == id_import_index
+                    && reference.item_name == "id"
+        ));
+        assert!(matches!(
+            fields[1].ty,
+            sai_wit::WitType::Own(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == records_index
+                    && reference.item == handle_import_index
+                    && reference.item_name == "handle"
+        ));
+
+        let use_cross = records
+            .items
+            .iter()
+            .find(|item| item.name == "use-cross")
+            .expect("the function consuming the cross-interface record remains");
+        let sai_wit::WitItemKind::Func(use_cross) = &use_cross.kind else {
+            panic!("use-cross remains a function");
+        };
+        assert!(matches!(
+            use_cross.params[0].1,
+            sai_wit::WitType::Named(ref reference)
+                if reference.interface.unit == unit
+                    && reference.interface.interface == records_index
+                    && reference.item == cross_record_index
+                    && reference.item_name == "cross-record"
+        ));
+    }
+
+    #[test]
+    fn generated_wit_omits_world_functions_with_colliding_local_type_aliases() {
+        let source = concat!(
+            "interface left {\n",
+            "  type Id = U32\n",
+            "}\n",
+            "interface right {\n",
+            "  type Id = U64\n",
+            "}\n",
+            "world mixed {\n",
+            "  import fn first(value: left.Id)\n",
+            "  import fn second(value: right.Id)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated WIT with a colliding alias remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "omitting the colliding function leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+
+        assert!(
+            !generated.complete,
+            "the omitted function marks output incomplete"
+        );
+        assert!(
+            generated.text.contains("use left.{id};"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            !generated.text.contains("use right.{id};"),
+            "{}",
+            generated.text
+        );
+        assert!(
+            generated.text.contains("first: func(value: id)"),
+            "{}",
+            generated.text
+        );
+        assert!(!generated.text.contains("second:"));
+    }
+
+    #[test]
+    fn generated_wit_allows_type_uses_sharing_spelling_with_imported_interfaces() {
+        let source = concat!(
+            "interface types {\n",
+            "  type Api = U32\n",
+            "}\n",
+            "interface api {}\n",
+            "world mixed {\n",
+            "  export fn named(value: types.Api)\n",
+            "  import api\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated WIT with separate interface and name keys remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "interface imports and world use aliases occupy distinct key spaces: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+
+        assert!(generated.complete, "all representable world items survive");
+        assert!(
+            generated.text.contains("use types.{api};"),
+            "{}",
+            generated.text
+        );
+        assert!(generated.text.contains("import api;"), "{}", generated.text);
+        assert!(
+            generated.text.contains("named: func(value: api)"),
+            "{}",
+            generated.text
+        );
+    }
+
+    #[test]
+    fn generated_wit_omits_type_uses_that_collide_with_world_import_functions() {
+        let source = concat!(
+            "interface types {\n",
+            "  type Id = U32\n",
+            "}\n",
+            "world self_collision {\n",
+            "  import fn id(value: types.Id)\n",
+            "}\n",
+            "world cross_collision {\n",
+            "  import fn id(value: U32)\n",
+            "  export fn serve(value: types.Id)\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated WIT with function-name collisions remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "colliding world functions are omitted before parsing: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+
+        assert!(
+            !generated.complete,
+            "omitting colliding world functions marks output incomplete"
+        );
+        assert!(!generated.text.contains("use types.{id};"));
+        assert!(!generated.text.contains("import id: func(value: id)"));
+        assert!(!generated.text.contains("serve:"));
+        assert!(
+            generated.text.contains("import id: func(value: u32)"),
+            "{}",
+            generated.text
+        );
+
+        let package_model = result.package.expect("the remaining worlds load");
+        let root = package_model.root();
+        let self_collision = root
+            .worlds
+            .iter()
+            .find(|world| world.name == "self-collision")
+            .expect("the self-collision world remains");
+        assert!(self_collision.imports.is_empty());
+        let cross_collision = root
+            .worlds
+            .iter()
+            .find(|world| world.name == "cross-collision")
+            .expect("the cross-collision world remains");
+        assert_eq!(cross_collision.imports.len(), 1);
+        assert!(cross_collision.exports.is_empty());
+    }
+
+    #[test]
+    fn generated_wit_emits_named_consumers_and_empty_world_completely() {
         let source = concat!(
             "interface api {\n",
             "  type Count = U32\n",
@@ -47437,12 +58700,12 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .map(|(_, generated)| generated.as_ref())
             .expect("the generated root text is retained");
         assert!(
-            !generated.complete,
-            "the duplicate-name result unexpectedly claims completeness: {}",
+            generated.complete,
+            "the empty world is represented: {}",
             generated.text
         );
         assert!(!generated.text.contains("type Count"));
-        assert!(!generated.text.contains("world server"));
+        assert!(generated.text.contains("world server {}"));
         let package_model = result.package.expect("partial WIT model loads");
         let interface = package_model
             .root()
@@ -47457,16 +58720,19 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .collect::<Vec<_>>();
         assert!(
             emitted_items.contains(&"count") && emitted_items.contains(&"read"),
-            "eligible aliases and consumers survive even when a separate world keeps the package incomplete"
+            "eligible aliases and consumers retain their generated WIT names"
         );
         assert!(
             emitted_items.contains(&"write"),
             "an independent representable function survives"
         );
-        assert!(
-            package_model.root().worlds.is_empty(),
-            "world generation remains an explicitly incomplete part of this slice"
-        );
+        let world = package_model
+            .root()
+            .worlds
+            .iter()
+            .next()
+            .expect("the empty source world is generated");
+        assert_eq!(world.name, "server");
     }
 
     #[test]
@@ -47540,14 +58806,686 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
     }
 
     #[test]
-    fn generated_wit_omits_forward_named_references_and_alias_cycles() {
+    fn generated_wit_emits_acyclic_forward_alias_references_after_round_trip() {
         let source = concat!(
             "interface api {\n",
             "  type Before = After\n",
-            "  type CycleA = CycleB\n",
-            "  type CycleB = CycleA\n",
             "  type After = U32\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated forward alias reference loads");
+        assert!(
+            result.failure.is_none(),
+            "forward alias text parses and resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "a supported same-interface alias reference to a later alias is complete"
+        );
+        assert!(generated.text.contains("type before = after;"));
+        assert!(generated.text.contains("type after = u32;"));
+        assert!(
+            generated
+                .text
+                .find("type before = after;")
+                .expect("before is printed")
+                < generated
+                    .text
+                    .find("type after = u32;")
+                    .expect("after is printed"),
+            "the generated text keeps the source declaration order"
+        );
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        let after_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "after").then_some(index))
+            .expect("the target alias remains in the parsed model");
+        let before = interface
+            .items
+            .iter()
+            .find(|item| item.name == "before")
+            .expect("the forward alias remains in the parsed model");
+        let sai_wit::WitItemKind::Alias(before) = &before.kind else {
+            panic!("before remains an alias after parsing");
+        };
+        let sai_wit::WitType::Named(reference) = before else {
+            panic!("before refers to the named later alias");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.interface.name, "api");
+        assert_eq!(reference.item, after_index);
+        assert_eq!(reference.item_name, "after");
+        assert_eq!(
+            interface.items[after_index].kind,
+            sai_wit::WitItemKind::Alias(sai_wit::WitType::U32)
+        );
+    }
+
+    #[test]
+    fn generated_wit_emits_forward_alias_references_in_function_signatures_after_round_trip() {
+        let source = concat!(
+            "interface api {\n",
+            "  fn round_trip(value: Later) -> Later\n",
+            "  type Later = U32\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated forward function reference loads");
+        assert!(
+            result.failure.is_none(),
+            "forward function reference text parses and resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(
+            generated.complete,
+            "a function may refer to a supported later same-interface alias"
+        );
+        assert!(
+            generated
+                .text
+                .contains("round-trip: func(value: later) -> later;")
+        );
+        assert!(generated.text.contains("type later = u32;"));
+
+        let package_model = result.package.expect("generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        let later_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "later").then_some(index))
+            .expect("the target alias remains in the parsed model");
+        let round_trip = interface
+            .items
+            .iter()
+            .find(|item| item.name == "round-trip")
+            .expect("the function remains in the parsed model");
+        let sai_wit::WitItemKind::Func(round_trip) = &round_trip.kind else {
+            panic!("round-trip remains a function after parsing");
+        };
+        let sai_wit::WitType::Named(parameter) = &round_trip.params[0].1 else {
+            panic!("the function parameter refers to a named later alias");
+        };
+        let sai_wit::WitType::Named(result) = round_trip
+            .result
+            .as_ref()
+            .expect("the function result is retained")
+        else {
+            panic!("the function result refers to a named later alias");
+        };
+        for reference in [parameter, result] {
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.interface.name, "api");
+            assert_eq!(reference.item, later_index);
+            assert_eq!(reference.item_name, "later");
+        }
+        assert_eq!(
+            interface.items[later_index].kind,
+            sai_wit::WitItemKind::Alias(sai_wit::WitType::U32)
+        );
+    }
+
+    #[test]
+    fn generated_wit_emits_record_and_variant_references_to_later_items() {
+        let source = concat!(
+            "interface api {\n",
+            "  type Envelope { value: Later }\n",
+            "  type RejectedRecord { value: Rejected }\n",
+            "  type UsesRejectedLaterRecord { value: RejectedLaterRecord }\n",
+            "  fn use_rejected_later_record(value: RejectedLaterRecord)\n",
+            "  type RejectedLaterRecord { value: USize }\n",
+            "  type BeforeRecord { value: LaterRecord }\n",
+            "  type BeforeEnumRecord { value: LaterVariant }\n",
+            "  type BeforePayloadVariantRecord { value: LaterPayloadVariant }\n",
+            "  enum BeforeEnumPayload { Value(LaterVariant) }\n",
+            "  enum BeforePayloadVariant { Value(LaterPayloadVariant) }\n",
+            "  type AliasBeforeRecord = LaterRecord\n",
+            "  type AliasBeforeVariant = LaterPayloadVariant\n",
+            "  type AliasBeforeEnum = LaterVariant\n",
+            "  fn use_later_record(value: LaterRecord) -> LaterRecord\n",
+            "  fn use_later_variant(value: LaterVariant) -> LaterVariant\n",
+            "  fn use_later_payload_variant(value: LaterPayloadVariant) -> LaterPayloadVariant\n",
+            "  enum BeforeVariant { Value(Later) }\n",
+            "  enum VariantBeforeRecord { Value(LaterRecord) }\n",
+            "  type LaterRecord { value: U64 }\n",
+            "  enum LaterVariant { Ready }\n",
+            "  enum LaterPayloadVariant { Wrapped(U32) }\n",
+            "  type Rejected = USize\n",
+            "  type Later = U32\n",
+            "  type Independent = U64\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("generated forward record reference loads");
+        assert!(
+            result.failure.is_none(),
+            "forward record reference text parses and resolves: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        assert!(
+            generated.text.contains("record envelope {"),
+            "{}",
+            generated.text
+        );
+        assert!(generated.text.contains("value: later"));
+        assert!(!generated.text.contains("rejected-record"));
+        assert!(!generated.text.contains("uses-rejected-later-record"));
+        assert!(!generated.text.contains("use-rejected-later-record"));
+        assert!(!generated.text.contains("rejected-later-record"));
+        assert!(!generated.text.contains("alias-to-rejected-later-record"));
+        assert!(!generated.text.contains("use-rejected-later-record-alias"));
+        assert!(!generated.text.contains("alias-variant-cycle-alias"));
+        assert!(!generated.text.contains("later-variant-cycle"));
+        assert!(!generated.text.contains("uses-alias-variant-cycle"));
+        assert!(!generated.text.contains("use-alias-variant-cycle"));
+        assert!(!generated.text.contains("alias-to-rejected-later-variant"));
+        assert!(!generated.text.contains("use-rejected-later-variant-alias"));
+        assert!(!generated.text.contains("alias-to-future-resource"));
+        assert!(!generated.text.contains("alias-future-record-cycle"));
+        assert!(!generated.text.contains("future-record-cycle"));
+        assert!(!generated.text.contains("uses-future-record-cycle"));
+        assert!(!generated.text.contains("use-future-record-cycle"));
+        assert!(generated.text.contains("record before-record {"));
+        assert!(generated.text.contains("value: later-record"));
+        assert!(
+            generated
+                .text
+                .contains("type alias-before-record = later-record;")
+        );
+        assert!(
+            generated
+                .text
+                .contains("type alias-before-variant = later-payload-variant;")
+        );
+        assert!(
+            generated
+                .text
+                .contains("type alias-before-enum = later-variant;")
+        );
+        assert!(generated.text.contains("record before-enum-record {"));
+        assert!(
+            generated
+                .text
+                .contains("record before-payload-variant-record {")
+        );
+        assert!(
+            generated
+                .text
+                .contains("use-later-record: func(value: later-record) -> later-record;")
+        );
+        assert!(
+            generated
+                .text
+                .contains("use-later-variant: func(value: later-variant) -> later-variant;")
+        );
+        assert!(
+            generated.text.contains(
+                "use-later-payload-variant: func(value: later-payload-variant) -> later-payload-variant;"
+            )
+        );
+        assert!(generated.text.contains("variant before-variant {"));
+        assert!(generated.text.contains("variant variant-before-record {"));
+        assert!(generated.text.contains("variant before-enum-payload {"));
+        assert!(generated.text.contains("variant before-payload-variant {"));
+
+        let package_model = result.package.expect("partial generated WIT model loads");
+        let (interface_index, interface) = package_model
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("the local interface is generated");
+        let item_names = interface
+            .items
+            .iter()
+            .map(|item| item.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(item_names.len(), 19);
+        for name in [
+            "envelope",
+            "before-record",
+            "before-enum-record",
+            "before-payload-variant-record",
+            "before-enum-payload",
+            "before-payload-variant",
+            "alias-before-record",
+            "alias-before-variant",
+            "alias-before-enum",
+            "before-variant",
+            "variant-before-record",
+            "use-later-record",
+            "use-later-variant",
+            "use-later-payload-variant",
+            "later-record",
+            "later-variant",
+            "later-payload-variant",
+            "later",
+            "independent",
+        ] {
+            assert!(
+                item_names.contains(&name),
+                "the valid declaration {name} survives pruning"
+            );
+        }
+        assert_eq!(
+            interface
+                .items
+                .iter_enumerated()
+                .map(|(index, _)| index.index())
+                .collect::<Vec<_>>(),
+            [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+            ],
+            "surviving item references compact after omitted forward targets"
+        );
+        let later_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "later").then_some(index))
+            .expect("the target alias remains in the parsed model");
+        let envelope = interface
+            .items
+            .iter()
+            .find(|item| item.name == "envelope")
+            .expect("the valid forward record remains in the parsed model");
+        let sai_wit::WitItemKind::Record(fields) = &envelope.kind else {
+            panic!("envelope remains a record after parsing");
+        };
+        let sai_wit::WitType::Named(reference) = &fields[0].ty else {
+            panic!("the record field refers to a named later alias");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.interface.name, "api");
+        assert_eq!(reference.item, later_index);
+        assert_eq!(reference.item_name, "later");
+
+        let later_record_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "later-record").then_some(index))
+            .expect("the target record remains in the parsed model");
+        let alias_before_record = interface
+            .items
+            .iter()
+            .find(|item| item.name == "alias-before-record")
+            .expect("the alias referencing the later record remains in the model");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(reference)) =
+            &alias_before_record.kind
+        else {
+            panic!("alias-before-record remains an alias to a named target");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.interface.name, "api");
+        assert_eq!(reference.item, later_record_index);
+        assert_eq!(reference.item_name, "later-record");
+        for (alias_name, target_name) in [
+            ("alias-before-enum", "later-variant"),
+            ("alias-before-variant", "later-payload-variant"),
+        ] {
+            let target_index = interface
+                .items
+                .iter_enumerated()
+                .find_map(|(index, item)| (item.name == target_name).then_some(index))
+                .expect("the target enum item remains in the parsed model");
+            let alias = interface
+                .items
+                .iter()
+                .find(|item| item.name == alias_name)
+                .expect("the alias targeting a later enum item remains in the model");
+            let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(reference)) = &alias.kind
+            else {
+                panic!("{alias_name} remains an alias to a named target");
+            };
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.interface.name, "api");
+            assert_eq!(reference.item, target_index);
+            assert_eq!(reference.item_name, target_name);
+        }
+        for (consumer_name, target_name) in [
+            ("before-enum-record", "later-variant"),
+            ("before-payload-variant-record", "later-payload-variant"),
+            ("before-enum-payload", "later-variant"),
+            ("before-payload-variant", "later-payload-variant"),
+        ] {
+            let target_index = interface
+                .items
+                .iter_enumerated()
+                .find_map(|(index, item)| (item.name == target_name).then_some(index))
+                .expect("the later enum or variant target remains in the parsed model");
+            let consumer = interface
+                .items
+                .iter()
+                .find(|item| item.name == consumer_name)
+                .expect("the consumer referencing a later enum item remains in the model");
+            let reference = match &consumer.kind {
+                sai_wit::WitItemKind::Record(fields) => match &fields[0].ty {
+                    sai_wit::WitType::Named(reference) => reference,
+                    _ => panic!("{consumer_name} retains a named record field"),
+                },
+                sai_wit::WitItemKind::Variant(cases) => match cases[0].payload.as_ref() {
+                    Some(sai_wit::WitType::Named(reference)) => reference,
+                    _ => panic!("{consumer_name} retains a named variant payload"),
+                },
+                _ => panic!("{consumer_name} remains a record or payload variant"),
+            };
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.interface.name, "api");
+            assert_eq!(reference.item, target_index);
+            assert_eq!(reference.item_name, target_name);
+        }
+        let use_later_record = interface
+            .items
+            .iter()
+            .find(|item| item.name == "use-later-record")
+            .expect("the function referencing the later record remains in the parsed model");
+        let sai_wit::WitItemKind::Func(use_later_record) = &use_later_record.kind else {
+            panic!("use-later-record remains a function after parsing");
+        };
+        let sai_wit::WitType::Named(parameter) = &use_later_record.params[0].1 else {
+            panic!("the function parameter refers to a named later record");
+        };
+        let sai_wit::WitType::Named(result) = use_later_record
+            .result
+            .as_ref()
+            .expect("the function result is retained")
+        else {
+            panic!("the function result refers to a named later record");
+        };
+        for reference in [parameter, result] {
+            assert_eq!(reference.interface.unit, unit);
+            assert_eq!(reference.interface.interface, interface_index);
+            assert_eq!(reference.interface.name, "api");
+            assert_eq!(reference.item, later_record_index);
+            assert_eq!(reference.item_name, "later-record");
+        }
+        for (function_name, target_name) in [
+            ("use-later-variant", "later-variant"),
+            ("use-later-payload-variant", "later-payload-variant"),
+        ] {
+            let target_index = interface
+                .items
+                .iter_enumerated()
+                .find_map(|(index, item)| (item.name == target_name).then_some(index))
+                .expect("the target variant remains in the parsed model");
+            let function_item = interface
+                .items
+                .iter()
+                .find(|item| item.name == function_name)
+                .expect("the function using the later variant remains in the model");
+            let sai_wit::WitItemKind::Func(function) = &function_item.kind else {
+                panic!("{function_name} remains a function after parsing");
+            };
+            for ty in [Some(&function.params[0].1), function.result.as_ref()] {
+                let Some(sai_wit::WitType::Named(reference)) = ty else {
+                    panic!("{function_name} retains a named parameter and result");
+                };
+                assert_eq!(reference.interface.unit, unit);
+                assert_eq!(reference.interface.interface, interface_index);
+                assert_eq!(reference.interface.name, "api");
+                assert_eq!(reference.item, target_index);
+                assert_eq!(reference.item_name, target_name);
+            }
+        }
+        let variant_before_record = interface
+            .items
+            .iter()
+            .find(|item| item.name == "variant-before-record")
+            .expect("the valid forward variant remains in the parsed model");
+        let sai_wit::WitItemKind::Variant(cases) = &variant_before_record.kind else {
+            panic!("variant-before-record remains a variant after parsing");
+        };
+        let sai_wit::WitType::Named(reference) = cases[0]
+            .payload
+            .as_ref()
+            .expect("the variant case retains its record payload")
+        else {
+            panic!("the variant payload refers to a named later record");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.interface.name, "api");
+        assert_eq!(reference.item, later_record_index);
+        assert_eq!(reference.item_name, "later-record");
+
+        let before_record = interface
+            .items
+            .iter()
+            .find(|item| item.name == "before-record")
+            .expect("the valid forward record remains in the parsed model");
+        let sai_wit::WitItemKind::Record(fields) = &before_record.kind else {
+            panic!("before-record remains a record after parsing");
+        };
+        let sai_wit::WitType::Named(reference) = &fields[0].ty else {
+            panic!("the record field refers to a named later record");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.interface.name, "api");
+        assert_eq!(reference.item, later_record_index);
+        assert_eq!(reference.item_name, "later-record");
+
+        let before_variant = interface
+            .items
+            .iter()
+            .find(|item| item.name == "before-variant")
+            .expect("the valid forward variant remains in the parsed model");
+        let sai_wit::WitItemKind::Variant(cases) = &before_variant.kind else {
+            panic!("before-variant remains a variant after parsing");
+        };
+        let sai_wit::WitType::Named(reference) = cases[0]
+            .payload
+            .as_ref()
+            .expect("the variant case retains its alias payload")
+        else {
+            panic!("the variant payload refers to a named later alias");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.interface.name, "api");
+        assert_eq!(reference.item, later_index);
+        assert_eq!(reference.item_name, "later");
+    }
+
+    #[test]
+    fn generated_wit_prunes_local_type_cycles_and_omitted_targets() {
+        let source = concat!(
+            "interface api {\n",
+            "  type Before = After\n",
+            "  fn use_later(value: After) -> After\n",
+            "  fn use_rejected(value: Rejected) -> Rejected\n",
+            "  type BeforeRecord { value: LaterRecord }\n",
+            "  type AliasVariantCycleAlias = LaterVariantCycle\n",
+            "  enum LaterVariantCycle { Value(AliasVariantCycleAlias) }\n",
+            "  type UsesAliasVariantCycle { value: AliasVariantCycleAlias }\n",
+            "  fn use_alias_variant_cycle(value: AliasVariantCycleAlias)\n",
+            "  type RecordVariantForwardCycle { value: LaterVariantRecordCycle }\n",
+            "  enum LaterVariantRecordCycle { Value(RecordVariantForwardCycle) }\n",
+            "  type UsesRecordVariantForwardCycle { value: RecordVariantForwardCycle }\n",
+            "  fn use_record_variant_forward_cycle(value: RecordVariantForwardCycle)\n",
+            "  enum VariantForwardCycleA { Value(VariantForwardCycleB) }\n",
+            "  enum VariantForwardCycleB { Value(VariantForwardCycleA) }\n",
+            "  fn use_variant_forward_cycle(value: VariantForwardCycleA)\n",
+            "  type AliasToRejectedLaterVariant = RejectedLaterVariant\n",
+            "  fn use_rejected_later_variant_alias(value: AliasToRejectedLaterVariant)\n",
+            "  type AliasToFutureResource = LaterResource\n",
+            "  type AliasToRejectedFutureResource = RejectedLaterResource\n",
+            "  fn use_rejected_future_resource_alias(value: AliasToRejectedFutureResource)\n",
+            "  type RecordUsesRejectedLaterVariant { value: RejectedLaterVariant }\n",
+            "  enum VariantUsesRejectedLaterVariant { Value(RejectedLaterVariant) }\n",
+            "  type RecordUsesFutureResource { value: LaterResource }\n",
+            "  type RecordUsesRejectedFutureResource { value: RejectedLaterResource }\n",
+            "  fn use_rejected_future_resource_record(value: RecordUsesRejectedFutureResource)\n",
+            "  type AliasFutureRecordCycle = FutureRecordCycle\n",
+            "  type FutureRecordCycle { value: AliasFutureRecordCycle }\n",
+            "  type UsesFutureRecordCycle { value: FutureRecordCycle }\n",
+            "  fn use_future_record_cycle(value: AliasFutureRecordCycle)\n",
+            "  type AliasToRejectedLaterRecord = RejectedLaterRecord\n",
+            "  fn use_rejected_later_record_alias(value: AliasToRejectedLaterRecord)\n",
+            "  enum BeforeVariant { Value(After) }\n",
+            "  enum RejectedVariant { Value(RejectedVariantAlias) }\n",
+            "  fn use_rejected_variant(value: RejectedVariantAlias)\n",
+            "  enum VariantAliasCycle { Value(VariantCycleAlias) }\n",
+            "  type VariantCycleAlias = VariantAliasCycle\n",
+            "  fn use_variant_alias_cycle(value: VariantCycleAlias)\n",
+            "  enum VariantRecordCycle { Value(VariantCycleRecord) }\n",
+            "  type VariantCycleRecord { value: VariantRecordCycle }\n",
+            "  type UsesVariantRecordCycle { value: VariantCycleRecord }\n",
+            "  fn use_variant_record_cycle(value: VariantRecordCycle)\n",
+            "  enum RejectedRecordVariant { Value(RejectedVariantRecord) }\n",
+            "  type UsesRejectedVariantRecord { value: RejectedVariantRecord }\n",
+            "  enum RejectedResourceVariant { Value(LaterResource) }\n",
+            "  fn use_rejected_resource_variant(value: RejectedResourceVariant)\n",
+            "  enum RejectedFutureResourceVariant { Value(RejectedLaterResource) }\n",
+            "  fn use_rejected_future_resource_variant(value: RejectedFutureResourceVariant)\n",
+            "  enum BorrowedFutureResourceVariant { Value(borrow LaterResource) }\n",
+            "  fn use_borrowed_future_resource_variant(value: BorrowedFutureResourceVariant)\n",
+            "  fn use_rejected_later_variant(value: RejectedLaterVariant)\n",
+            "  fn use_resource(value: LaterResource)\n",
+            "  resource LaterResource {}\n",
+            "  resource RejectedLaterResource {\n",
+            "    fn reset(self: Self)\n",
+            "  }\n",
+            "  enum RejectedLaterVariant { Value(USize) }\n",
+            "  type CycleA = CycleB\n",
+            "  fn use_cycle(value: CycleA) -> CycleA\n",
+            "  type RecordCycle { value: CycleA }\n",
+            "  type CycleB = CycleA\n",
+            "  type UsesCycle = CycleA\n",
+            "  type RecordCycleA { value: RecordCycleB }\n",
+            "  type RecordCycleB { value: RecordCycleA }\n",
+            "  fn use_record_cycle(value: RecordCycleA)\n",
+            "  type RecordAliasCycle { value: AliasRecordCycle }\n",
+            "  type AliasRecordCycle = RecordAliasCycle\n",
+            "  fn use_record_alias_cycle(value: RecordAliasCycle)\n",
+            "  type RecordVariantCycle { next: LaterAlias }\n",
+            "  enum AliasVariantCycle { Value(RecordVariantCycle) }\n",
+            "  type LaterAlias = AliasVariantCycle\n",
+            "  fn use_later_alias(value: LaterAlias)\n",
+            "  type UsesRejected = Rejected\n",
+            "  type RejectedVariantAlias = USize\n",
+            "  type RejectedVariantRecord { value: USize }\n",
+            "  type Rejected = USize\n",
+            "  type UsesUsesRejected = UsesRejected\n",
+            "  type After = U32\n",
+            "  type LaterRecord { value: U64 }\n",
             "  fn independent(value: U64)\n",
+            "}\n",
+            "interface other {\n",
+            "  type CrossInterface = api.After\n",
             "}\n",
         );
         let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
@@ -47579,7 +59517,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .expect("partial generated WIT remains queryable");
         assert!(
             result.failure.is_none(),
-            "omitting forward and cyclic references leaves parseable WIT: {:?}",
+            "pruning cyclic and unsupported alias targets leaves parseable WIT: {:?}",
             result.failure
         );
         let generated = result
@@ -47590,10 +59528,10 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .expect("the generated root text is retained");
         assert!(!generated.complete);
         let package_model = result.package.expect("partial WIT model loads");
-        let interface = package_model
-            .root()
+        let root = package_model.root();
+        let (interface_index, interface) = root
             .interfaces
-            .iter()
+            .iter_enumerated()
             .next()
             .expect("the interface remains");
         let emitted_items = interface
@@ -47601,24 +59539,294 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             .iter()
             .map(|item| item.name.as_str())
             .collect::<Vec<_>>();
+        assert_eq!(emitted_items.len(), 13);
+        assert!(emitted_items.contains(&"before"));
+        assert!(emitted_items.contains(&"use-later"));
+        assert!(emitted_items.contains(&"before-record"));
+        assert!(emitted_items.contains(&"before-variant"));
+        assert!(emitted_items.contains(&"alias-to-future-resource"));
+        assert!(emitted_items.contains(&"record-uses-future-resource"));
+        assert!(emitted_items.contains(&"use-resource"));
+        assert!(emitted_items.contains(&"rejected-resource-variant"));
+        assert!(emitted_items.contains(&"use-rejected-resource-variant"));
+        assert!(emitted_items.contains(&"after"));
+        assert!(emitted_items.contains(&"later-record"));
+        assert!(emitted_items.contains(&"later-resource"));
+        assert!(emitted_items.contains(&"independent"));
         assert_eq!(
-            emitted_items,
-            ["after", "independent"],
-            "forward targets are unavailable until emitted; cyclic aliases never acquire a reference"
+            interface
+                .items
+                .iter_enumerated()
+                .map(|(index, _)| index.index())
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+            "surviving item indices compact after pruning cycles and unsupported targets"
         );
-        assert!(!generated.text.contains("before"));
+        assert!(!generated.text.contains("use-rejected: func"));
+        assert!(
+            !generated
+                .text
+                .contains("record-uses-rejected-later-variant")
+        );
+        assert!(
+            !generated
+                .text
+                .contains("variant-uses-rejected-later-variant")
+        );
+        assert!(!generated.text.contains("alias-to-rejected-future-resource"));
+        assert!(
+            !generated
+                .text
+                .contains("use-rejected-future-resource-alias")
+        );
+        assert!(
+            !generated
+                .text
+                .contains("record-uses-rejected-future-resource")
+        );
+        assert!(
+            !generated
+                .text
+                .contains("use-rejected-future-resource-record")
+        );
+        assert!(!generated.text.contains("rejected-later-resource"));
+        assert!(
+            generated
+                .text
+                .contains("record record-uses-future-resource {")
+        );
+        assert!(!generated.text.contains("record-variant-forward-cycle"));
+        assert!(!generated.text.contains("later-variant-record-cycle"));
+        assert!(!generated.text.contains("uses-record-variant-forward-cycle"));
+        assert!(!generated.text.contains("use-record-variant-forward-cycle"));
+        assert!(!generated.text.contains("variant-forward-cycle-a"));
+        assert!(!generated.text.contains("variant-forward-cycle-b"));
+        assert!(!generated.text.contains("use-variant-forward-cycle"));
+        assert!(generated.text.contains("record before-record {"));
+        assert!(generated.text.contains("variant before-variant {"));
+        assert!(!generated.text.contains("rejected-variant"));
+        assert!(!generated.text.contains("use-rejected-variant"));
+        assert!(!generated.text.contains("variant-alias-cycle"));
+        assert!(!generated.text.contains("variant-cycle-alias"));
+        assert!(!generated.text.contains("use-variant-alias-cycle"));
+        assert!(!generated.text.contains("variant-record-cycle"));
+        assert!(!generated.text.contains("variant-cycle-record"));
+        assert!(!generated.text.contains("uses-variant-record-cycle"));
+        assert!(!generated.text.contains("use-variant-record-cycle"));
+        assert!(!generated.text.contains("rejected-record-variant"));
+        assert!(!generated.text.contains("rejected-variant-record"));
+        assert!(!generated.text.contains("uses-rejected-variant-record"));
+        assert!(
+            generated
+                .text
+                .contains("variant rejected-resource-variant {")
+        );
+        assert!(
+            generated
+                .text
+                .contains("use-rejected-resource-variant: func(value: rejected-resource-variant);")
+        );
+        assert!(!generated.text.contains("rejected-future-resource-variant"));
+        assert!(
+            !generated
+                .text
+                .contains("use-rejected-future-resource-variant")
+        );
+        assert!(!generated.text.contains("borrowed-future-resource-variant"));
+        assert!(
+            !generated
+                .text
+                .contains("use-borrowed-future-resource-variant")
+        );
+        assert!(!generated.text.contains("rejected-later-variant"));
+        assert!(!generated.text.contains("use-rejected-later-variant"));
+        assert!(
+            generated
+                .text
+                .contains("use-resource: func(value: later-resource);")
+        );
+        assert!(
+            generated
+                .text
+                .contains("type alias-to-future-resource = later-resource;")
+        );
+        assert!(!generated.text.contains("use-cycle"));
+        assert!(!generated.text.contains("record-cycle"));
+        assert!(!generated.text.contains("record-cycle-a"));
+        assert!(!generated.text.contains("record-cycle-b"));
+        assert!(!generated.text.contains("use-record-cycle"));
+        assert!(!generated.text.contains("record-alias-cycle"));
+        assert!(!generated.text.contains("alias-record-cycle"));
+        assert!(!generated.text.contains("use-record-alias-cycle"));
+        assert!(!generated.text.contains("record-variant-cycle"));
+        assert!(!generated.text.contains("alias-variant-cycle"));
+        assert!(!generated.text.contains("later-alias"));
+        assert!(!generated.text.contains("use-later-alias"));
         assert!(!generated.text.contains("cycle"));
+        assert!(!generated.text.contains("uses-cycle"));
+        assert!(!generated.text.contains("type rejected ="));
+        assert!(!generated.text.contains("uses-rejected"));
+        assert!(!generated.text.contains("uses-uses-rejected"));
+        assert!(generated.text.contains("use api.{after};"));
+        assert!(generated.text.contains("type cross-interface = after;"));
         assert!(generated.text.contains("type after = u32;"));
+        assert!(generated.text.contains("type before = after;"));
+        assert!(
+            generated
+                .text
+                .contains("use-later: func(value: after) -> after;")
+        );
+        let (other_index, other) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "other")
+            .expect("the later interface with a cross-interface alias remains");
+        let (after_index, _) = interface
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "after")
+            .expect("the target alias remains in the earlier interface");
+        let (other_after_index, other_after) = other
+            .items
+            .iter_enumerated()
+            .find(|(_, item)| item.name == "after")
+            .expect("the later interface's use alias remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(other_after_target)) =
+            &other_after.kind
+        else {
+            panic!("the parsed use alias points to the exact earlier interface type");
+        };
+        assert_eq!(&other_after_target.interface.unit, &unit);
+        assert_eq!(other_after_target.interface.interface, interface_index);
+        assert_eq!(other_after_target.item, after_index);
+        assert_eq!(other_after_target.item_name, "after");
+        let cross_interface = other
+            .items
+            .iter()
+            .find(|item| item.name == "cross-interface")
+            .expect("the alias targeting the earlier interface remains");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(cross_target)) =
+            &cross_interface.kind
+        else {
+            panic!("cross-interface remains an alias");
+        };
+        assert_eq!(&cross_target.interface.unit, &unit);
+        assert_eq!(cross_target.interface.interface, other_index);
+        assert_eq!(cross_target.item, other_after_index);
+        assert_eq!(cross_target.item_name, "after");
+        let later_resource_index = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(index, item)| (item.name == "later-resource").then_some(index))
+            .expect("the later empty resource remains emitted");
+        let use_resource = interface
+            .items
+            .iter()
+            .find(|item| item.name == "use-resource")
+            .expect("the function using the later resource remains emitted");
+        let sai_wit::WitItemKind::Func(use_resource) = &use_resource.kind else {
+            panic!("use-resource remains a function");
+        };
+        let sai_wit::WitType::Own(reference) = &use_resource.params[0].1 else {
+            panic!("the function receives the later resource as an owned handle");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.item, later_resource_index);
+        assert_eq!(reference.item_name, "later-resource");
+        let alias_to_resource = interface
+            .items
+            .iter()
+            .find(|item| item.name == "alias-to-future-resource")
+            .expect("the alias to the later supported resource remains emitted");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Own(reference)) = &alias_to_resource.kind
+        else {
+            panic!("the alias targets the later resource as an owned handle");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.item, later_resource_index);
+        assert_eq!(reference.item_name, "later-resource");
+        let variant_uses_resource = interface
+            .items
+            .iter()
+            .find(|item| item.name == "rejected-resource-variant")
+            .expect("the variant that targets the later supported resource remains emitted");
+        let sai_wit::WitItemKind::Variant(cases) = &variant_uses_resource.kind else {
+            panic!("the future-resource consumer remains a variant");
+        };
+        let sai_wit::WitType::Own(reference) = cases[0].payload.as_ref().expect("resource case")
+        else {
+            panic!("the variant case owns the later resource handle");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.item, later_resource_index);
+        assert_eq!(reference.item_name, "later-resource");
+        let record_uses_resource = interface
+            .items
+            .iter()
+            .find(|item| item.name == "record-uses-future-resource")
+            .expect("the record that targets the later supported resource remains emitted");
+        let sai_wit::WitItemKind::Record(fields) = &record_uses_resource.kind else {
+            panic!("the future-resource consumer remains a record");
+        };
+        let sai_wit::WitType::Own(reference) = &fields[0].ty else {
+            panic!("the record field owns the later resource handle");
+        };
+        assert_eq!(reference.interface.unit, unit);
+        assert_eq!(reference.interface.interface, interface_index);
+        assert_eq!(reference.item, later_resource_index);
+        assert_eq!(reference.item_name, "later-resource");
         assert!(generated.text.contains("independent: func(value: u64)"));
+        let before = interface
+            .items
+            .iter()
+            .find(|item| item.name == "before")
+            .expect("the supported forward alias remains emitted");
+        let sai_wit::WitItemKind::Alias(sai_wit::WitType::Named(reference)) = &before.kind else {
+            panic!("the supported forward alias remains emitted");
+        };
+        assert_eq!(interface.items[reference.item].name, "after");
+        assert_eq!(reference.item_name, "after");
+        let use_later = interface
+            .items
+            .iter()
+            .find(|item| item.name == "use-later")
+            .expect("the supported forward function remains emitted");
+        let sai_wit::WitItemKind::Func(use_later) = &use_later.kind else {
+            panic!("use-later remains a function after parsing");
+        };
+        let sai_wit::WitType::Named(parameter) = &use_later.params[0].1 else {
+            panic!("the function parameter refers to the later alias");
+        };
+        let sai_wit::WitType::Named(result) = use_later
+            .result
+            .as_ref()
+            .expect("the forward function result remains emitted")
+        else {
+            panic!("the function result refers to the later alias");
+        };
+        assert_eq!(interface.items[parameter.item].name, "after");
+        assert_eq!(interface.items[result.item].name, "after");
     }
 
     #[test]
     fn generated_wit_omits_cyclic_interfaces_and_keeps_parseable_text() {
         let source = concat!(
+            "interface early {\n",
+            "  fn omitted(value: second.Safe)\n",
+            "  enum OmittedVariant { Value(second.Safe) }\n",
+            "  fn omitted_variant(value: OmittedVariant)\n",
+            "  type OmittedRecord { value: second.Safe }\n",
+            "  fn omitted_record(value: OmittedRecord)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
             "interface first {\n",
             "  type Request = second.Response\n",
             "}\n",
             "interface second {\n",
+            "  type Safe = U32\n",
             "  type Response = first.Request\n",
             "}\n",
             "interface stable {\n",
@@ -47675,24 +59883,35 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 .iter()
                 .map(|(name, _)| name.as_str())
                 .collect::<Vec<_>>(),
-            ["stable"],
-            "the independent interface survives after both cyclic interfaces"
+            ["early", "stable"],
+            "independent interfaces survive after both cyclic interfaces"
         );
         assert!(!generated.text.contains("interface first"));
         assert!(!generated.text.contains("interface second"));
+        assert!(!generated.text.contains("omitted:"));
+        assert!(!generated.text.contains("variant omitted-variant"));
+        assert!(!generated.text.contains("omitted-variant:"));
+        assert!(!generated.text.contains("record omitted-record"));
+        assert!(!generated.text.contains("omitted-record:"));
+        assert!(generated.text.contains("independent: func(value: u32);"));
         assert!(generated.text.contains("interface stable"));
         let package_model = result.package.expect("the package model loads");
-        let (interface_index, interface) = package_model
-            .root()
+        let root = package_model.root();
+        let (early_index, early) = root
             .interfaces
             .iter_enumerated()
             .next()
-            .expect("the independent interface remains");
-        assert_eq!(
-            interface_index.raw(),
-            0,
-            "filtered cyclic interfaces do not leave index gaps"
-        );
+            .expect("the earlier independent interface remains");
+        assert_eq!(early.name, "early");
+        assert_eq!(early.items.len(), 1);
+        assert_eq!(early.items.iter().next().unwrap().name, "independent");
+        let (interface_index, interface) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "stable")
+            .expect("the later independent interface remains");
+        assert_eq!(interface_index.raw(), early_index.raw() + 1);
+        assert_eq!(interface_index.raw(), 1);
         let items = interface.items.iter().collect::<Vec<_>>();
         assert_eq!(
             items.len(),
@@ -47712,6 +59931,151 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         assert!(
             generated.text.contains("lookup: func(value: id)"),
             "same-interface references remain valid after provisional indices are remapped"
+        );
+    }
+
+    #[test]
+    fn generated_wit_prunes_items_that_depend_on_cyclic_interfaces() {
+        let source = concat!(
+            "interface early {\n",
+            "  resource LaterWorker {\n",
+            "    fn lookup(self: borrow Self, value: first.Safe)\n",
+            "  }\n",
+            "  fn take_later_worker(value: LaterWorker)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+            "interface first {\n",
+            "  type Safe = U32\n",
+            "  type Request = second.Response\n",
+            "}\n",
+            "interface second {\n",
+            "  type Response = first.Request\n",
+            "}\n",
+            "interface public {\n",
+            "  type Handle = first.Request\n",
+            "  fn read(value: Handle)\n",
+            "  type RecordHandle { value: first.Request }\n",
+            "  fn read_record(value: RecordHandle)\n",
+            "  enum VariantHandle { Wrapped(first.Safe) }\n",
+            "  fn read_variant(value: VariantHandle)\n",
+            "  resource ResourceHandle {\n",
+            "    fn lookup(self: borrow Self, value: first.Safe)\n",
+            "  }\n",
+            "  fn read_resource(value: ResourceHandle)\n",
+            "  fn independent(value: U32)\n",
+            "}\n",
+            "world server {\n",
+            "  import first\n",
+            "  import public\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(source.as_bytes(), b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                &[],
+            )
+            .expect("Phase 1 source declarations collect");
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("selected package version is valid"),
+        )
+        .expect("selected package identity is valid");
+        let unit = sai_wit::WitUnit::generated(package, &database.packages, &selected)
+            .expect("generated WIT unit uses the active package version");
+        let result = database
+            .wit_package(&unit)
+            .expect("partial generated WIT remains queryable");
+        assert!(
+            result.failure.is_none(),
+            "pruning cyclic interface consumers leaves parseable WIT: {:?}",
+            result.failure
+        );
+        let generated = result
+            .generated_texts
+            .iter()
+            .find(|(generated_unit, _)| generated_unit == &unit)
+            .map(|(_, generated)| generated.as_ref())
+            .expect("the generated root text is retained");
+        assert!(!generated.complete);
+        assert!(!generated.text.contains("interface first"));
+        assert!(!generated.text.contains("interface second"));
+        assert!(!generated.text.contains("resource later-worker"));
+        assert!(!generated.text.contains("take-later-worker:"));
+        assert!(!generated.text.contains("type handle"));
+        assert!(!generated.text.contains("read:"));
+        assert!(!generated.text.contains("record record-handle"));
+        assert!(!generated.text.contains("read-record:"));
+        assert!(!generated.text.contains("variant variant-handle"));
+        assert!(!generated.text.contains("read-variant:"));
+        assert!(!generated.text.contains("resource resource-handle"));
+        assert!(!generated.text.contains("read-resource:"));
+        assert!(generated.text.contains("interface public"));
+        assert!(generated.text.contains("independent: func(value: u32)"));
+        assert!(!generated.text.contains("import first;"));
+        assert!(generated.text.contains("import public;"));
+
+        let package_model = result.package.expect("the partial package model loads");
+        let public = package_model
+            .root()
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "public")
+            .expect("the independent interface remains");
+        assert_eq!(
+            public
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["independent"],
+            "the omitted cross-interface type also removes its consumer"
+        );
+        let early = package_model
+            .root()
+            .interfaces
+            .iter()
+            .find(|interface| interface.name == "early")
+            .expect("the independent interface with the pruned resource remains");
+        assert_eq!(
+            early
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["independent"],
+            "a resource referencing a later cyclic interface and its consumer are pruned"
+        );
+        let world = package_model
+            .root()
+            .worlds
+            .iter()
+            .next()
+            .expect("the world remains");
+        assert_eq!(world.imports.len(), 1);
+        assert_eq!(
+            world.source_order,
+            [sai_wit::WitWorldItemOrder::import(0)],
+            "the surviving world interface import is remapped after the cyclic one is removed"
+        );
+        let sai_wit::WitWorldItem::Interface { reference, .. } = &world.imports[0] else {
+            panic!("the surviving import remains an interface");
+        };
+        assert_eq!(reference.name, "public");
+        assert_eq!(
+            reference.interface.index(),
+            1,
+            "the surviving world reference is remapped after cyclic interfaces are removed"
         );
     }
 

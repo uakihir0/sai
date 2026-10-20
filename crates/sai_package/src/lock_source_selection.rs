@@ -491,9 +491,8 @@ pub fn plan_lock_source_selection(
                 } else {
                     let mut named = edges
                         .iter()
-                        .filter_map(|edge| {
-                            (edge.requirement.requirement.minimum() == package_version.version())
-                                .then_some(edge)
+                        .filter(|edge| {
+                            edge.requirement.requirement.minimum() == package_version.version()
                         })
                         .collect::<Vec<_>>();
                     named.sort_by(|left, right| {

@@ -85,6 +85,7 @@ struct DirectoryWalker<'a> {
     cancellation: &'a CancellationToken,
     source_root: PathBuf,
     retain_capabilities: bool,
+    update_directory_files: bool,
     traversal_mode: FmtTraversalMode,
     module_tree_limits: Option<sai_package::local_source::LocalPackageSourceSnapshotLimits>,
 }
@@ -95,6 +96,13 @@ enum FmtTraversalMode {
     ExplicitPaths,
     WorkspaceSource,
     ModuleTree,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum DirectoryFileAccess {
+    #[default]
+    ReadOnly,
+    Update,
 }
 
 /// Expands explicit file and directory arguments using the `sai fmt` rules.
@@ -113,6 +121,27 @@ pub(crate) fn select_fmt_paths(
         current_directory,
         cancellation,
         true,
+        DirectoryFileAccess::Update,
+        FmtTraversalMode::ExplicitPaths,
+        None,
+    )
+}
+
+/// Expands paths for formatter checks that inspect source without replacing it.
+///
+/// File and parent handles remain retained so the selected input can be read
+/// consistently, while directory capabilities request no write access.
+pub(crate) fn select_fmt_paths_for_check(
+    paths: &[PathBuf],
+    current_directory: &Path,
+    cancellation: &CancellationToken,
+) -> FmtPathSelection {
+    select_fmt_paths_inner(
+        paths,
+        current_directory,
+        cancellation,
+        true,
+        DirectoryFileAccess::ReadOnly,
         FmtTraversalMode::ExplicitPaths,
         None,
     )
@@ -128,6 +157,7 @@ pub(crate) fn select_fmt_paths_for_comparison(
         current_directory,
         cancellation,
         false,
+        DirectoryFileAccess::ReadOnly,
         FmtTraversalMode::ExplicitPaths,
         None,
     )
@@ -147,6 +177,23 @@ pub(crate) fn select_fmt_workspace_paths(
         current_directory,
         cancellation,
         true,
+        DirectoryFileAccess::Update,
+        FmtTraversalMode::WorkspaceSource,
+        None,
+    )
+}
+
+pub(crate) fn select_fmt_workspace_paths_for_check(
+    paths: &[PathBuf],
+    current_directory: &Path,
+    cancellation: &CancellationToken,
+) -> FmtPathSelection {
+    select_fmt_paths_inner(
+        paths,
+        current_directory,
+        cancellation,
+        true,
+        DirectoryFileAccess::ReadOnly,
         FmtTraversalMode::WorkspaceSource,
         None,
     )
@@ -162,6 +209,7 @@ pub(crate) fn select_fmt_workspace_paths_for_comparison(
         current_directory,
         cancellation,
         false,
+        DirectoryFileAccess::ReadOnly,
         FmtTraversalMode::WorkspaceSource,
         None,
     )
@@ -196,6 +244,7 @@ pub(crate) fn select_fmt_module_paths_with_limits(
         current_directory,
         cancellation,
         true,
+        DirectoryFileAccess::ReadOnly,
         FmtTraversalMode::ModuleTree,
         Some(limits),
     )
@@ -206,6 +255,7 @@ fn select_fmt_paths_inner(
     current_directory: &Path,
     cancellation: &CancellationToken,
     retain_capabilities: bool,
+    directory_file_access: DirectoryFileAccess,
     mode: FmtTraversalMode,
     module_tree_limits: Option<sai_package::local_source::LocalPackageSourceSnapshotLimits>,
 ) -> FmtPathSelection {
@@ -272,6 +322,7 @@ fn select_fmt_paths_inner(
                         &mut selected_identities,
                         &mut explicit_parent_directories,
                         retain_capabilities,
+                        directory_file_access,
                     );
                 }
                 Ok(_) => {}
@@ -293,6 +344,7 @@ fn select_fmt_paths_inner(
                 &mut selected_identities,
                 &mut explicit_parent_directories,
                 retain_capabilities,
+                directory_file_access,
             );
         } else if file_type.is_dir() {
             let opened_root = match mode {
@@ -301,7 +353,7 @@ fn select_fmt_paths_inner(
                         .map(|root| (Dir::from_std_file(root), absolute_path.clone()))
                 }
                 FmtTraversalMode::ExplicitPaths | FmtTraversalMode::WorkspaceSource => {
-                    open_explicit_directory(&absolute_path)
+                    open_explicit_directory(&absolute_path, directory_file_access)
                 }
             };
             let (root_directory, root) = match opened_root {
@@ -325,6 +377,7 @@ fn select_fmt_paths_inner(
                 cancellation,
                 source_root: root.clone(),
                 retain_capabilities,
+                update_directory_files: directory_file_access == DirectoryFileAccess::Update,
                 traversal_mode: mode,
                 module_tree_limits,
             }
@@ -425,11 +478,19 @@ impl DirectoryWalker<'_> {
                         .try_clone()
                         .map(|parent| parent.into_std_file())
                         .and_then(|parent| {
-                            sai_windows_fs::open_child_directory_without_following(
-                                &parent,
-                                path.parent().unwrap_or(&path),
-                                &name,
-                            )
+                            let parent_path = path.parent().unwrap_or(&path);
+                            match self.update_directory_files {
+                                true => sai_windows_fs::open_child_directory_for_file_updates_without_following(
+                                    &parent,
+                                    parent_path,
+                                    &name,
+                                ),
+                                false => sai_windows_fs::open_child_directory_without_following(
+                                    &parent,
+                                    parent_path,
+                                    &name,
+                                ),
+                            }
                         });
                     match opened {
                         Ok(child) => (Arc::new(Dir::from_std_file(child)), path),
@@ -624,11 +685,21 @@ fn push_module_tree_entry(
     }
 }
 
-fn open_explicit_directory(path: &Path) -> io::Result<(Dir, PathBuf)> {
+fn open_explicit_directory(
+    path: &Path,
+    file_access: DirectoryFileAccess,
+) -> io::Result<(Dir, PathBuf)> {
     let name = path.file_name();
     let Some(name) = name else {
         let root_path = fs::canonicalize(path)?;
-        let root = sai_windows_fs::open_directory_path_without_following(&root_path)?;
+        let root = match file_access {
+            DirectoryFileAccess::ReadOnly => {
+                sai_windows_fs::open_directory_path_without_following(&root_path)
+            }
+            DirectoryFileAccess::Update => {
+                sai_windows_fs::open_directory_path_for_file_updates_without_following(&root_path)
+            }
+        }?;
         return Ok((Dir::from_std_file(root), root_path));
     };
     let parent_path = path.parent().ok_or_else(|| {
@@ -639,7 +710,18 @@ fn open_explicit_directory(path: &Path) -> io::Result<(Dir, PathBuf)> {
     })?;
     let parent_path = fs::canonicalize(parent_path)?;
     let parent = sai_windows_fs::open_directory_path_without_following(&parent_path)?;
-    let root = sai_windows_fs::open_child_directory_without_following(&parent, &parent_path, name)?;
+    let root = match file_access {
+        DirectoryFileAccess::ReadOnly => {
+            sai_windows_fs::open_child_directory_without_following(&parent, &parent_path, name)
+        }
+        DirectoryFileAccess::Update => {
+            sai_windows_fs::open_child_directory_for_file_updates_without_following(
+                &parent,
+                &parent_path,
+                name,
+            )
+        }
+    }?;
     let root_identity = sai_windows_fs::file_identity(&root)?;
     let root_path = fs::canonicalize(path)?;
     let canonical_root = sai_windows_fs::open_directory_path_without_following(&root_path)?;
@@ -710,6 +792,7 @@ fn push_explicit_file(
     selected_identities: &mut HashSet<SelectedPathIdentity>,
     parent_directories: &mut HashMap<PathBuf, Arc<Dir>>,
     retain_capabilities: bool,
+    directory_file_access: DirectoryFileAccess,
 ) {
     let is_package_manifest = path.file_name().is_some_and(|name| name == "sai.package");
     let canonical_path = match fs::canonicalize(path) {
@@ -754,16 +837,30 @@ fn push_explicit_file(
             if let Some(parent) = parent_directories.get(&parent_path) {
                 Arc::clone(parent)
             } else {
-                let parent = Arc::new(Dir::from_std_file(
-                    sai_windows_fs::open_directory_path_without_following(&parent_path)?,
-                ));
+                let parent = Arc::new(Dir::from_std_file(match directory_file_access {
+                    DirectoryFileAccess::ReadOnly => {
+                        sai_windows_fs::open_directory_path_without_following(&parent_path)
+                    }
+                    DirectoryFileAccess::Update => {
+                        sai_windows_fs::open_directory_path_for_file_updates_without_following(
+                            &parent_path,
+                        )
+                    }
+                }?));
                 parent_directories.insert(parent_path.clone(), Arc::clone(&parent));
                 parent
             }
         } else {
-            Arc::new(Dir::from_std_file(
-                sai_windows_fs::open_directory_path_without_following(&parent_path)?,
-            ))
+            Arc::new(Dir::from_std_file(match directory_file_access {
+                DirectoryFileAccess::ReadOnly => {
+                    sai_windows_fs::open_directory_path_without_following(&parent_path)
+                }
+                DirectoryFileAccess::Update => {
+                    sai_windows_fs::open_directory_path_for_file_updates_without_following(
+                        &parent_path,
+                    )
+                }
+            }?))
         };
         Ok::<_, io::Error>((parent_path, parent))
     })();

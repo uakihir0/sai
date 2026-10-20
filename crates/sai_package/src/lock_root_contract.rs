@@ -325,12 +325,12 @@ fn requirement_key(
                 .as_ref()
                 .map(|targets| sorted_set(&targets.value)),
             source: compare_source_and_grant
-                .then(|| requirement.source.as_ref())
+                .then_some(requirement.source.as_ref())
                 .flatten()
                 .map(|source| root_contract_source(&source.value, source.span.clone()))
                 .transpose()?,
             grant: compare_source_and_grant
-                .then(|| requirement.grant.as_ref())
+                .then_some(requirement.grant.as_ref())
                 .flatten()
                 .map(|grant| sorted_set(&grant.value)),
         },

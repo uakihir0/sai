@@ -602,6 +602,7 @@ impl TargetPredicate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetCfg {
     target_name: String,
+    pointer_width: u8,
     capabilities: BTreeSet<String>,
 }
 
@@ -626,9 +627,8 @@ impl TargetCfg {
         S: Into<String>,
     {
         let target_name = target_name.into();
-        if !known_target(&target_name) {
-            return Err(TargetCfgError::UnknownTarget);
-        }
+        let pointer_width =
+            target_pointer_width(&target_name).ok_or(TargetCfgError::UnknownTarget)?;
 
         let capabilities = capabilities
             .into_iter()
@@ -662,12 +662,19 @@ impl TargetCfg {
 
         Ok(Self {
             target_name,
+            pointer_width,
             capabilities,
         })
     }
 
     pub fn target_name(&self) -> &str {
         &self.target_name
+    }
+
+    /// Pointer width in bits for this target, including the width of `ISize`
+    /// and `USize`.
+    pub const fn pointer_width(&self) -> u8 {
+        self.pointer_width
     }
 
     pub fn capabilities(&self) -> &BTreeSet<String> {
@@ -2312,17 +2319,24 @@ fn finalize_operands(
 }
 
 fn known_target(name: &str) -> bool {
-    matches!(
-        name,
-        "wasm32-core"
-            | "wasm64-core"
-            | "wasm32-wasi"
-            | "wasm64-wasi"
-            | "x86_64-linux"
-            | "aarch64-linux"
-            | "aarch64-macos"
-            | "x86_64-windows"
-    )
+    target_pointer_width(name).is_some()
+}
+
+fn target_pointer_width(name: &str) -> Option<u8> {
+    matches!(name, "wasm32-core" | "wasm32-wasi")
+        .then_some(32)
+        .or_else(|| {
+            matches!(
+                name,
+                "wasm64-core"
+                    | "wasm64-wasi"
+                    | "x86_64-linux"
+                    | "aarch64-linux"
+                    | "aarch64-macos"
+                    | "x86_64-windows"
+            )
+            .then_some(64)
+        })
 }
 
 fn is_target_capability(name: &str) -> bool {
@@ -3550,6 +3564,24 @@ mod tests {
             TargetCfg::new("wasm32-core", ["process"]),
             Err(TargetCfgError::CapabilityUnavailable)
         );
+    }
+
+    #[test]
+    fn target_cfg_pointer_widths_follow_the_target_table() {
+        for (name, capabilities, expected_bits) in [
+            ("wasm32-core", &["host"][..], 32),
+            ("wasm32-wasi", &[][..], 32),
+            ("wasm64-core", &["memory64", "host"][..], 64),
+            ("wasm64-wasi", &["memory64"][..], 64),
+            ("x86_64-linux", &["native_ffi", "process"][..], 64),
+            ("aarch64-linux", &["native_ffi", "process"][..], 64),
+            ("aarch64-macos", &["native_ffi", "process"][..], 64),
+            ("x86_64-windows", &["native_ffi", "process"][..], 64),
+        ] {
+            let target = TargetCfg::new(name.to_owned(), capabilities.iter().copied())
+                .expect("target capabilities are valid");
+            assert_eq!(target.pointer_width(), expected_bits, "{name}");
+        }
     }
 
     #[test]

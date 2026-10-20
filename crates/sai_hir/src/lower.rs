@@ -122,10 +122,10 @@ pub fn lower_function<'hir>(
         arena,
         symbols,
         source_map,
-        false,
-        true,
-        false,
-        false,
+        LowerFunctionOptions {
+            lower_body: true,
+            ..LowerFunctionOptions::default()
+        },
     )?;
     Ok((signature, body))
 }
@@ -154,10 +154,11 @@ pub fn lower_function_with_generics<'hir>(
         arena,
         symbols,
         source_map,
-        true,
-        true,
-        false,
-        false,
+        LowerFunctionOptions {
+            lower_generics: true,
+            lower_body: true,
+            ..LowerFunctionOptions::default()
+        },
     )
 }
 
@@ -177,10 +178,10 @@ pub fn lower_function_signature_with_generics<'hir>(
         arena,
         symbols,
         source_map,
-        true,
-        false,
-        false,
-        false,
+        LowerFunctionOptions {
+            lower_generics: true,
+            ..LowerFunctionOptions::default()
+        },
     )?;
     Ok((signature, generics))
 }
@@ -209,10 +210,12 @@ pub fn lower_interface_function_recovery_body<'hir>(
         context.arena,
         context.symbols,
         &mut source_map,
-        true,
-        true,
-        false,
-        true,
+        LowerFunctionOptions {
+            lower_generics: true,
+            lower_body: true,
+            recover_interface_body: true,
+            ..LowerFunctionOptions::default()
+        },
     )?;
     Ok((body, source_map.finish()))
 }
@@ -276,10 +279,10 @@ fn lower_world_function_signature<'hir>(
         arena,
         symbols,
         source_map,
-        false,
-        false,
-        true,
-        false,
+        LowerFunctionOptions {
+            allow_nested_declaration: true,
+            ..LowerFunctionOptions::default()
+        },
     )?;
     Ok(signature)
 }
@@ -5184,15 +5187,20 @@ fn raw_attr_arg_match(current: &RawAttrArg, item_tree: &RawAttrArg) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct LowerFunctionOptions {
+    lower_generics: bool,
+    lower_body: bool,
+    allow_nested_declaration: bool,
+    recover_interface_body: bool,
+}
+
 fn lower_function_inner<'hir>(
     declaration: &ast::FnDecl,
     arena: &'hir HirArena<'hir>,
     symbols: &Interner,
     source_map: &mut HirSourceMapBuilder<'_>,
-    lower_generics: bool,
-    lower_body: bool,
-    allow_nested_declaration: bool,
-    recover_interface_body: bool,
+    options: LowerFunctionOptions,
 ) -> Result<
     (
         FnSig<'hir>,
@@ -5201,7 +5209,7 @@ fn lower_function_inner<'hir>(
     ),
     HirLoweringError,
 > {
-    if !allow_nested_declaration
+    if !options.allow_nested_declaration
         && source_map.pointer_for(declaration.syntax())?
             != source_map.pointer_for(source_map.owner_syntax())?
     {
@@ -5209,7 +5217,7 @@ fn lower_function_inner<'hir>(
             declaration.syntax().kind(),
         ));
     }
-    if lower_generics {
+    if options.lower_generics {
         ensure_supported_generics(declaration)?;
     }
     let params = declaration
@@ -5226,7 +5234,7 @@ fn lower_function_inner<'hir>(
         })
         .unwrap_or_default();
     let ret_type = declaration.ret_type().and_then(|ret| ret.ty());
-    let contracts = if lower_body {
+    let contracts = if options.lower_body {
         declaration
             .syntax()
             .children()
@@ -5241,10 +5249,11 @@ fn lower_function_inner<'hir>(
     } else {
         Vec::new()
     };
-    let body = lower_body
+    let body = options
+        .lower_body
         .then(|| {
             declaration.body().or_else(|| {
-                recover_interface_body.then(|| {
+                options.recover_interface_body.then(|| {
                     declaration
                         .syntax()
                         .children()
@@ -5273,7 +5282,7 @@ fn lower_function_inner<'hir>(
         ensure_supported_block(body)?;
     }
 
-    let pending_generic_params = if lower_generics {
+    let pending_generic_params = if options.lower_generics {
         prepare_generic_params(declaration.generic_params(), symbols, source_map)?
     } else {
         Vec::new()
@@ -5282,12 +5291,12 @@ fn lower_function_inner<'hir>(
     // Assign closure and async-block identities across the complete owner
     // before lowering any child. This also makes contracts and body expressions
     // agree on the same owner-wide preorder.
-    let async_fn_body_syntax = if lower_body && declaration.async_token().is_some() {
+    let async_fn_body_syntax = if options.lower_body && declaration.async_token().is_some() {
         body.as_ref().map(|body| body.syntax().clone())
     } else {
         None
     };
-    let async_fn_def_id = if lower_body {
+    let async_fn_def_id = if options.lower_body {
         prepare_nested_definition_ids_with_async_fn_body(
             declaration.syntax(),
             async_fn_body_syntax.as_ref(),
@@ -5326,7 +5335,9 @@ fn lower_function_inner<'hir>(
     let mut requires = Vec::new();
     let mut ensures = Vec::new();
     for child in declaration.syntax().children() {
-        if lower_generics && let Some(clause) = ast::WhereClause::cast(child.clone()) {
+        if options.lower_generics
+            && let Some(clause) = ast::WhereClause::cast(child.clone())
+        {
             lowered_where_preds.extend(lower_where_clause(&clause, arena, symbols, source_map)?);
         } else if let Some(clause) = ast::BorrowsClause::cast(child.clone()) {
             if !borrows_seen {
@@ -5340,7 +5351,9 @@ fn lower_function_inner<'hir>(
                 effects_seen = true;
                 effects = lower_function_effects(&clause, arena, symbols, source_map)?;
             }
-        } else if lower_body && let Some(clause) = ast::RequiresClause::cast(child.clone()) {
+        } else if options.lower_body
+            && let Some(clause) = ast::RequiresClause::cast(child.clone())
+        {
             let (contract, expression_hir_id) = lower_function_contract(
                 FunctionContractSyntax::Requires(clause),
                 arena,
@@ -5349,7 +5362,9 @@ fn lower_function_inner<'hir>(
             )?;
             requires.push(expression_hir_id);
             lowered_contracts.push(contract);
-        } else if lower_body && let Some(clause) = ast::EnsuresClause::cast(child) {
+        } else if options.lower_body
+            && let Some(clause) = ast::EnsuresClause::cast(child)
+        {
             let (contract, expression_hir_id) = lower_function_contract(
                 FunctionContractSyntax::Ensures(clause),
                 arena,

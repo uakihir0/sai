@@ -636,7 +636,7 @@ The text is exactly determined by the following rules (N-D-39):
 - The first line is `package ns:name@version;`, where `ns:name` and `version` come from the `package` declaration of `sai.package` (D-PKG-01, draft §42). The version is the full semantic version, including pre-release and build metadata if present.
 - Exactly one blank line separates top-level items, and the package line from the first item.
 - Inside an interface, the `use` statements come first (§13.11.3), followed by one blank line if there are any, followed by the items in source order with exactly one blank line between items.
-- Inside a world, items are printed in source order, one per line, without blank lines.
+- Inside a world, generated `use` statements come first (§13.11.3), followed by one blank line if there are any, followed by the world items in source order, one per line without blank lines.
 - Each doc-comment line of a SAI item is printed as `/// text` on its own line directly above the item, at the item's indentation. Inner doc comments are not printed.
 - Names are converted by §13.8.4 and written with `%` if they are WIT keywords.
 
@@ -660,12 +660,14 @@ The text is exactly determined by the following rules (N-D-39):
 
 ### 13.11.3 Cross-interface references
 
-For each interface `i`, the generated `use` statements are computed from the boundary types of `i`:
+For each interface `i`, the generated `use` statements are computed from the boundary types of `i`. For each world `w`, they are computed from the parameter and result types of its direct world functions (imports and exports), recursively through type constructors:
 
 - one statement per referenced interface, `use other.{a, b};` for a local interface and `use ns:pkg/other@version.{a, b};` for an external one;
 - statements sorted byte-wise by the text between `use ` and `.{`; names inside the braces sorted byte-wise.
+- world references are collected only from direct function items, not from included worlds; each statement appears at the start of the world before its direct items, with one blank line after the final statement.
+- if a type spelling in one world refers to different interface items, or a generated type alias conflicts with a world import function name, the affected generated function item is omitted and the generated text is incomplete. An imported interface key is distinct from a world-name key and does not by itself conflict with a type alias.
 
-A type of another interface is then printed by its plain WIT name.
+A type of another interface is then printed by its plain WIT name. A generated world uses the same rule; its function signatures refer to the aliases in that world's leading `use` statements.
 
 ### 13.11.4 Versions
 
