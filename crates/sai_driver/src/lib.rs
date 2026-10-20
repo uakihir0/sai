@@ -5892,6 +5892,11 @@ fn check_function_body_type(
         )? {
             return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
         }
+        if let Some(diagnostics) = check_function_body_return_constrained_primitive_local(
+            owner, sig, body, locals, type_paths, symbols, inputs, snapshot, target_cfg,
+        )? {
+            return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
+        }
     }
     let (parameter, parameter_pair) = match (sig.params, body.params) {
         ([], []) => (None, None),
@@ -6341,6 +6346,115 @@ fn check_function_body_annotated_primitive_local(
         return Ok(None);
     };
 
+    primitive_body_errors_to_diagnostics(owner, block, tail, errors, inputs, snapshot)
+}
+
+fn check_function_body_return_constrained_primitive_local(
+    owner: &HirOwner<'_>,
+    sig: sai_hir::body::FnSig<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let Some(return_ty) = sig.ret else {
+        return Ok(None);
+    };
+    let Some(FunctionDirectType::Primitive(return_type)) =
+        resolve_function_direct_type(*return_ty, type_paths, symbols, inputs)
+    else {
+        return Ok(None);
+    };
+    let ExprKind::Block(block) = body.value.kind else {
+        return Ok(None);
+    };
+    if block.safety != sai_hir::Safety::Safe || block.stmts.len() != 1 {
+        return Ok(None);
+    }
+    let StmtKind::Let {
+        pat,
+        ty: None,
+        init: _,
+        els: None,
+    } = block.stmts[0].kind
+    else {
+        return Ok(None);
+    };
+    let PatKind::Binding {
+        mode: sai_hir::patterns::BindingMode::Value,
+        name,
+        binding,
+        sub: None,
+        ..
+    } = pat.kind
+    else {
+        return Ok(None);
+    };
+    if !function_name_is_supported(name, symbols, inputs)
+        || !matches!(
+            locals.bindings.get(&binding),
+            Some(sai_resolve::owner::LocalBinding {
+                kind: sai_resolve::owner::BindingKind::Let,
+                ..
+            })
+        )
+    {
+        return Ok(None);
+    }
+    let Some(tail) = block.tail else {
+        return Ok(None);
+    };
+    let ExprKind::Path(path) = tail.kind else {
+        return Ok(None);
+    };
+    if path.root != PathRoot::Plain
+        || path.segments.len() != 1
+        || path.segments[0].args.is_some()
+        || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+    {
+        return Ok(None);
+    }
+    let local_paths = locals
+        .paths
+        .iter()
+        .filter_map(|(hir_id, resolution)| match resolution.base {
+            Res::Local(binding)
+                if resolution.resolved_segments == 1 && resolution.segment_count == 1 =>
+            {
+                Some((*hir_id, binding))
+            }
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let primitive_types = HashMap::new();
+    let check = sai_ty::typeck::body::check_return_constrained_primitive_local_body(
+        sai_ty::typeck::body::PrimitiveBodyInput {
+            body,
+            return_type,
+            primitive_types: &primitive_types,
+            local_paths: &local_paths,
+            symbols,
+            pointer_width: target_cfg.pointer_width(),
+        },
+    );
+    let sai_ty::typeck::body::PrimitiveBodyCheck::Supported { errors } = check else {
+        return Ok(None);
+    };
+
+    primitive_body_errors_to_diagnostics(owner, block, tail, errors, inputs, snapshot)
+}
+
+fn primitive_body_errors_to_diagnostics(
+    owner: &HirOwner<'_>,
+    block: &sai_hir::expressions::Block<'_>,
+    tail: &HirExpr<'_>,
+    errors: Vec<sai_ty::typeck::body::PrimitiveBodyError>,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     let mut diagnostics = Vec::with_capacity(errors.len());
     for error in errors {
         let span = block
@@ -24818,6 +24932,115 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_checks_unannotated_return_constrained_local() {
+        let root = concat!(
+            "pub fn local() -> I32 {\n    let value = 42\n    value\n}\n",
+            "pub fn float() -> F32 {\n    let value = 1.25\n    value\n}\n",
+            "pub fn bool() -> Bool {\n    let value = true\n    value\n}\n",
+            "pub fn overflow() -> I8 {\n    let value = 128\n    value\n}\n",
+            "pub fn family_mismatch() -> Bool {\n    let value = 42\n    value\n}\n",
+            "pub fn concrete_mismatch() -> I32 {\n    let value = true\n    value\n}\n",
+            "pub fn numeric_family_mismatch() -> F32 {\n    let value = 42\n    value\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 7);
+        for owner in &resolved.owners()[..3] {
+            let check = owner
+                .body_type_check()
+                .expect("unannotated local check succeeds");
+            assert!(
+                matches!(
+                    check,
+                    FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+                ),
+                "{check:?}"
+            );
+        }
+
+        for (index, expected_code, expected_message, function, token) in [
+            (
+                3,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                "integer literal is out of range for `I8`",
+                "overflow",
+                "128",
+            ),
+            (
+                4,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `Bool`, found an integer literal",
+                "family_mismatch",
+                "value",
+            ),
+            (
+                5,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `I32`, found `Bool`",
+                "concrete_mismatch",
+                "value",
+            ),
+            (
+                6,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `F32`, found an integer literal",
+                "numeric_family_mismatch",
+                "value",
+            ),
+        ] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
+                .body_type_check()
+                .expect("supported unannotated-local error is reported")
+            else {
+                panic!("a semantic error must not turn a supported body into a gate");
+            };
+            assert_eq!(diagnostics.len(), 1, "{function}: {diagnostics:?}");
+            assert_eq!(diagnostics[0].code, expected_code, "{function}");
+            assert_eq!(diagnostics[0].message, expected_message, "{function}");
+
+            let function_start = root
+                .find(&format!("pub fn {function}"))
+                .expect("function exists");
+            let function_end = root[function_start..]
+                .find("\npub fn ")
+                .map_or(root.len(), |offset| function_start + offset);
+            let function_text = &root[function_start..function_end];
+            let relative_start = if function == "overflow" {
+                function_text.find(token)
+            } else {
+                function_text.rfind(token)
+            }
+            .expect("diagnostic token exists in function");
+            let start = (function_start + relative_start) as u32;
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("body type diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + token.len() as u32),
+                )
+                .expect("diagnostic token range is ordered"),
+                "{function}"
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_checks_multiple_annotated_locals_and_copies_in_source_order() {
         let root = concat!(
             "pub fn first_local() -> U8 {\n",
@@ -24993,7 +25216,6 @@ mod tests {
         let root = concat!(
             "const ONE: I32 = 1\n",
             "type Number = I32\n",
-            "pub fn unannotated() -> I32 {\n    let value = 42\n    value\n}\n",
             "pub fn mutable() -> I32 {\n    var value: I32 = 42\n    value\n}\n",
             "pub fn mutable_let() -> I32 {\n    let var value: I32 = 42\n    value\n}\n",
             "pub fn computed() -> I32 {\n    let value: I32 = 40 + 2\n    value\n}\n",
@@ -25008,6 +25230,9 @@ mod tests {
             "pub fn nested() -> I32 {\n    let value: I32 = 42\n    { value }\n}\n",
             "pub fn camel_local() -> I32 {\n    let valueName: I32 = 42\n    valueName\n}\n",
             "pub fn raw_local() -> I32 {\n    let r#value: I32 = 42\n    r#value\n}\n",
+            "pub fn unannotated_computed() -> I32 {\n    let value = 40 + 2\n    value\n}\n",
+            "pub fn unannotated_multiple() -> I32 {\n    let first = 1\n    let second = 2\n    first\n}\n",
+            "pub fn unannotated_string() -> Str {\n    let value = \"text\"\n    value\n}\n",
             "pub fn destructured() -> I32 {\n    let (first, second): (I32, I32) = (1, 2)\n    first\n}\n",
             "pub fn alias() -> I32 {\n    let value: Number = 42\n    value\n}\n",
         );
@@ -25025,7 +25250,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 17);
+        assert_eq!(resolved.owners().len(), 19);
         for owner in resolved.owners() {
             assert!(matches!(
                 owner
