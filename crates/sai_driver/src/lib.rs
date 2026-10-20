@@ -6373,7 +6373,9 @@ fn check_function_body_primitive_local_block(
                 };
                 let supported_shape = match operator {
                     BinOp::And | BinOp::Or => is_preceding_path(left) && is_preceding_path(right),
-                    BinOp::Add => is_preceding_path(left) && is_preceding_path(right),
+                    BinOp::Add | BinOp::Sub | BinOp::Mul => {
+                        is_preceding_path(left) && is_preceding_path(right)
+                    }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         (is_preceding_path(left) && is_preceding_path(right))
                             || (is_preceding_path(left) && is_direct_function_scalar_literal(right))
@@ -6424,8 +6426,10 @@ fn check_function_body_primitive_local_block(
 }
 
 fn is_function_primitive_local_binary_operator(operator: BinOp) -> bool {
-    matches!(operator, BinOp::Add | BinOp::And | BinOp::Or)
-        || is_function_primitive_local_comparison_operator(operator)
+    matches!(
+        operator,
+        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::And | BinOp::Or
+    ) || is_function_primitive_local_comparison_operator(operator)
 }
 
 fn is_function_primitive_local_comparison_operator(operator: BinOp) -> bool {
