@@ -244,6 +244,139 @@ pub fn check_return_constrained_primitive_local_body(
     PrimitiveBodyCheck::Supported { errors }
 }
 
+/// Check a concrete annotated primitive local copied into one unannotated
+/// local whose tail read is constrained by the explicit function result.
+///
+/// The initializer of the unannotated binding is a local path, so it inherits
+/// the source binding's exact type without a coercion.
+pub fn check_unannotated_copy_of_annotated_primitive_local_body(
+    input: PrimitiveBodyInput<'_, '_>,
+) -> PrimitiveBodyCheck {
+    if !supports_primitive_literal(input.return_type) {
+        return PrimitiveBodyCheck::Unsupported;
+    }
+
+    let ExprKind::Block(block) = input.body.value.kind else {
+        return PrimitiveBodyCheck::Unsupported;
+    };
+    if block.safety != Safety::Safe || block.stmts.len() != 2 {
+        return PrimitiveBodyCheck::Unsupported;
+    }
+
+    let StmtKind::Let {
+        pat: source_pat,
+        ty: Some(source_ty),
+        init: source_init,
+        els: None,
+    } = block.stmts[0].kind
+    else {
+        return PrimitiveBodyCheck::Unsupported;
+    };
+    let PatKind::Binding {
+        mode: BindingMode::Value,
+        binding: source_binding,
+        sub: None,
+        ..
+    } = source_pat.kind
+    else {
+        return PrimitiveBodyCheck::Unsupported;
+    };
+    let Some(source_type) = input.primitive_types.get(&source_ty.hir_id).copied() else {
+        return PrimitiveBodyCheck::Unsupported;
+    };
+    if !supports_primitive_literal(source_type) {
+        return PrimitiveBodyCheck::Unsupported;
+    }
+    let ExprKind::Lit(source_literal) = source_init.kind else {
+        return PrimitiveBodyCheck::Unsupported;
+    };
+    let Some(source_literal_kind) = primitive_literal_kind(source_literal) else {
+        return PrimitiveBodyCheck::Unsupported;
+    };
+
+    let StmtKind::Let {
+        pat: copy_pat,
+        ty: None,
+        init: copy_init,
+        els: None,
+    } = block.stmts[1].kind
+    else {
+        return PrimitiveBodyCheck::Unsupported;
+    };
+    let PatKind::Binding {
+        mode: BindingMode::Value,
+        binding: copy_binding,
+        sub: None,
+        ..
+    } = copy_pat.kind
+    else {
+        return PrimitiveBodyCheck::Unsupported;
+    };
+    let ExprKind::Path(copy_path) = copy_init.kind else {
+        return PrimitiveBodyCheck::Unsupported;
+    };
+    if copy_path.root != PathRoot::Plain
+        || copy_path.segments.len() != 1
+        || copy_path.segments[0].args.is_some()
+        || input.local_paths.get(&copy_path.hir_id) != Some(&source_binding)
+    {
+        return PrimitiveBodyCheck::Unsupported;
+    }
+
+    let Some(tail) = block.tail else {
+        return PrimitiveBodyCheck::Unsupported;
+    };
+    let ExprKind::Path(tail_path) = tail.kind else {
+        return PrimitiveBodyCheck::Unsupported;
+    };
+    if tail_path.root != PathRoot::Plain
+        || tail_path.segments.len() != 1
+        || tail_path.segments[0].args.is_some()
+        || input.local_paths.get(&tail_path.hir_id) != Some(&copy_binding)
+    {
+        return PrimitiveBodyCheck::Unsupported;
+    }
+
+    let mut errors = Vec::new();
+    match check_primitive_literal(
+        source_type,
+        source_literal,
+        input.symbols,
+        input.pointer_width,
+    ) {
+        PrimitiveLiteralResult::Match => {}
+        PrimitiveLiteralResult::TypeMismatch => {
+            errors.push(PrimitiveBodyError {
+                node: source_init.hir_id,
+                kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
+                    expected: source_type,
+                    found: source_literal_kind,
+                },
+            });
+        }
+        PrimitiveLiteralResult::OutOfRange => {
+            errors.push(PrimitiveBodyError {
+                node: source_init.hir_id,
+                kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                    expected: source_type,
+                    found: source_literal_kind,
+                },
+            });
+        }
+    }
+    if source_type != input.return_type {
+        errors.push(PrimitiveBodyError {
+            node: tail.hir_id,
+            kind: PrimitiveBodyErrorKind::TypeMismatch {
+                expected: input.return_type,
+                found: source_type,
+            },
+        });
+    }
+
+    PrimitiveBodyCheck::Supported { errors }
+}
+
 fn check_concrete_literal_type(
     errors: &mut Vec<PrimitiveBodyError>,
     expected: PrimTy,
