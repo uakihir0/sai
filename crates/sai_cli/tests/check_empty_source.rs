@@ -798,6 +798,170 @@ fn unsupported_flat_unannotated_primitive_local_forms_remain_gated() {
 }
 
 #[test]
+fn primitive_add_local_initializers_accept_matching_numeric_paths() {
+    for source in [
+        "pub fn signed(left: I32, right: I32) -> I32 {\n    let sum: I32 = left + right\n    sum\n}\n",
+        "pub fn unsigned(left: U64, right: U64) -> U64 {\n    let sum = left + right\n    sum\n}\n",
+        "pub fn float32(left: F32, right: F32) -> F32 {\n    let sum: F32 = left + right\n    sum\n}\n",
+        "pub fn float64(left: F64, right: F64) -> F64 {\n    let sum = left + right\n    sum\n}\n",
+        "pub fn preceding(left: I16, right: I16) -> I16 {\n    let first: I16 = left\n    let sum = first + right\n    sum\n}\n",
+        "pub fn shadow(left: I32, right: U32) -> U32 {\n    let left: U32 = 2\n    let sum = left + right\n    sum\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_add_local_type_mismatch_points_right_and_recovers_as_left_type() {
+    let source =
+        "pub fn mismatch(left: I32, right: U32) -> I32 {\n    let sum = left + right\n    sum\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let right_start = source
+        .find("+ right")
+        .map(|start| start + "+ ".len())
+        .expect("right addition operand exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the right operand should be the only mismatch; the local should recover as I32:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a supported addition mismatch must not remain behind the body gate:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `U32`",
+        right_start,
+        right_start + "right".len(),
+    );
+}
+
+#[test]
+fn primitive_add_annotation_mismatch_points_to_initializer_and_recovers_to_annotation() {
+    let source = "pub fn mismatch(left: I32, right: I32) -> U32 {\n    let sum: U32 = left + right\n    sum\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let initializer_start = source
+        .find("left + right")
+        .expect("addition initializer exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the annotation mismatch should be reported once, with the local recovered as U32:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "an annotated addition mismatch must continue through the local tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U32`, found `I32`",
+        initializer_start,
+        initializer_start + "left + right".len(),
+    );
+}
+
+#[test]
+fn primitive_add_diagnostics_follow_source_order_after_shadowed_binding_resolution() {
+    let source = concat!(
+        "pub fn diagnostics(left: I32, right: U32, f32_value: F32, f64_value: F64) -> I32 {\n",
+        "    let left: I32 = 1\n",
+        "    let first = left + right\n",
+        "    let second = f32_value + f64_value\n",
+        "    first\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let first_right = source
+        .find("+ right")
+        .map(|start| start + "+ ".len())
+        .expect("first right operand exists");
+    let second_right = source
+        .find("+ f64_value")
+        .map(|start| start + "+ ".len())
+        .expect("second right operand exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "both supported operand mismatches should be diagnosed:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "shadowed parameter names and multiple additions should remain supported:\n{stdout}"
+    );
+    let first_message = stdout
+        .find("\"message\":\"expected `I32`, found `U32`\"")
+        .expect("first mismatch exists");
+    let second_message = stdout
+        .find("\"message\":\"expected `F32`, found `F64`\"")
+        .expect("second mismatch exists");
+    assert!(
+        first_message < second_message,
+        "diagnostics should follow source order:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `U32`",
+        first_right,
+        first_right + "right".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `F32`, found `F64`",
+        second_right,
+        second_right + "f64_value".len(),
+    );
+}
+
+#[test]
+fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
+    for source in [
+        "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = left + 1\n    sum\n}\n",
+        "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = 1 + 2\n    sum\n}\n",
+        "pub fn add(left: I32, right: I32) -> I32 {\n    let one = 1\n    let sum = one + right\n    sum\n}\n",
+        "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = (left + right) + left\n    sum\n}\n",
+        "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = left - right\n    sum\n}\n",
+        "pub fn add(left: Byte, right: Byte) -> Byte {\n    let sum = left + right\n    sum\n}\n",
+        "pub fn add(left: Char, right: Char) -> Char {\n    let sum = left + right\n    sum\n}\n",
+        "pub fn add(left: Bool, right: Bool) -> Bool {\n    let sum = left + right\n    sum\n}\n",
+        "type IntegerAlias = I32\npub fn add(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let sum = left + right\n    sum\n}\n",
+        "pub fn forward(left: I32) -> I32 {\n    let sum = later + left\n    let later: I32 = 1\n    sum\n}\n",
+        "pub fn self_reference(left: I32) -> I32 {\n    let sum = sum + left\n    sum\n}\n",
+        "pub fn add(left: I32, right: I32) -> I32 {\n    var sum = left + right\n    sum\n}\n",
+        "pub fn destructured(left: I32, right: I32) -> I32 {\n    let (first, second) = (left, right)\n    let sum = first + second\n    sum\n}\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+
+    let source = "use acme:empty/values as values\npub fn add(right: I32) -> I32 {\n    let sum = values.VALUE + right\n    sum\n}\n";
+    assert_check_stays_gated(
+        &run_check(
+            source,
+            "",
+            &[("src/values.sai", "pub const VALUE: I32 = 42\n")],
+            &[],
+        ),
+        source,
+    );
+}
+
+#[test]
 fn primitive_comparison_local_initializers_accept_all_six_operators() {
     for source in [
         "pub fn equal(left: I32, right: I32) -> Bool {\n    let result: Bool = left == right\n    result\n}\n",
@@ -885,7 +1049,7 @@ fn primitive_comparison_local_uses_shadowed_binding_and_source_order() {
 fn unsupported_primitive_comparison_local_initializer_shapes_remain_gated() {
     for source in [
         "pub fn compare(left: I32) -> Bool {\n    let inferred = 1\n    let result = inferred == left\n    result\n}\n",
-        "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left + right\n    result\n}\n",
+        "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left - right\n    result\n}\n",
         "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = (left == right) and (left < right)\n    result\n}\n",
         "pub fn compare(left: Str, right: Str) -> Bool {\n    let result = left == right\n    result\n}\n",
         "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left as I64 == right as I64\n    result\n}\n",
