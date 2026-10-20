@@ -70,7 +70,7 @@ enum PrimitiveComparisonResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PrimitiveAddResult {
+enum PrimitiveArithmeticResult {
     Type(PrimTy),
     TypeMismatch { expected: PrimTy, found: PrimTy },
     Unsupported,
@@ -111,8 +111,8 @@ struct LiteralVariable<'hir> {
 ///
 /// Direct scalar literals, plain paths to earlier bindings, comparisons
 /// between concrete primitive paths or one path and one scalar literal, one
-/// top-level logical operation between Bool paths, and addition between
-/// matching concrete numeric paths are accepted as initializers.
+/// top-level logical operation between Bool paths, and direct arithmetic
+/// between matching concrete numeric paths are accepted as initializers.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
@@ -223,8 +223,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
             }
             ExprKind::Binary(operator, left, right) => {
-                if operator == BinOp::Add {
-                    let result = self.check_add(left, right)?;
+                if matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul) {
+                    let result = self.check_arithmetic(operator, left, right)?;
                     if let Some(expected) = annotation {
                         let Some(found) = self.concrete_local_type(result) else {
                             return Err(());
@@ -300,8 +300,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(())
     }
 
-    fn check_add(
+    fn check_arithmetic(
         &mut self,
+        operator: BinOp,
         left: &'hir Expr<'hir>,
         right: &'hir Expr<'hir>,
     ) -> Result<LocalType, ()> {
@@ -316,18 +317,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             .and_then(|local_type| self.concrete_local_type(local_type))
             .ok_or(())?;
 
-        match primitive_add_result(left_type, right_type) {
-            PrimitiveAddResult::Type(result) => Ok(LocalType::Concrete(result)),
-            PrimitiveAddResult::TypeMismatch { expected, found } => {
+        match primitive_arithmetic_result(operator, left_type, right_type) {
+            PrimitiveArithmeticResult::Type(result) => Ok(LocalType::Concrete(result)),
+            PrimitiveArithmeticResult::TypeMismatch { expected, found } => {
                 self.errors.push(PrimitiveBodyError {
                     node: right.hir_id,
                     kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
                 });
-                // Addition synthesizes its result from the left operand, so
-                // later checks recover with that type after a right mismatch.
+                // Primitive arithmetic synthesizes its result from the left
+                // operand, so recover with that type after a right mismatch.
                 Ok(LocalType::Concrete(left_type))
             }
-            PrimitiveAddResult::Unsupported => Err(()),
+            PrimitiveArithmeticResult::Unsupported => Err(()),
         }
     }
 
@@ -716,21 +717,28 @@ fn primitive_comparison_result(
     PrimitiveComparisonResult::Bool
 }
 
-fn primitive_add_result(left: PrimTy, right: PrimTy) -> PrimitiveAddResult {
-    if !is_add_primitive(left) || !is_add_primitive(right) {
-        return PrimitiveAddResult::Unsupported;
+fn primitive_arithmetic_result(
+    operator: BinOp,
+    left: PrimTy,
+    right: PrimTy,
+) -> PrimitiveArithmeticResult {
+    if !matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul)
+        || !is_arithmetic_primitive(left)
+        || !is_arithmetic_primitive(right)
+    {
+        return PrimitiveArithmeticResult::Unsupported;
     }
     if left == right {
-        PrimitiveAddResult::Type(left)
+        PrimitiveArithmeticResult::Type(left)
     } else {
-        PrimitiveAddResult::TypeMismatch {
+        PrimitiveArithmeticResult::TypeMismatch {
             expected: left,
             found: right,
         }
     }
 }
 
-const fn is_add_primitive(primitive: PrimTy) -> bool {
+const fn is_arithmetic_primitive(primitive: PrimTy) -> bool {
     is_integer_primitive(primitive) || matches!(primitive, PrimTy::F32 | PrimTy::F64)
 }
 
@@ -787,12 +795,14 @@ fn literal_family_accepts(kind: PrimitiveLiteralKind, expected: PrimTy) -> bool 
 #[cfg(test)]
 mod tests {
     use super::{
-        PrimitiveAddResult, PrimitiveBoolOperandResult, PrimitiveComparisonResult,
-        primitive_add_result, primitive_bool_operand_result,
+        PrimitiveArithmeticResult, PrimitiveBoolOperandResult, PrimitiveComparisonResult,
+        primitive_arithmetic_result, primitive_bool_operand_result,
         primitive_comparison_literal_expected_type, primitive_comparison_result,
     };
     use sai_hir::expressions::BinOp;
     use sai_resolve::prelude::PrimTy;
+
+    const ARITHMETIC_OPERATORS: [BinOp; 3] = [BinOp::Add, BinOp::Sub, BinOp::Mul];
 
     const COMPARISON_OPERATORS: [BinOp; 6] = [
         BinOp::Eq,
@@ -822,8 +832,8 @@ mod tests {
     ];
 
     #[test]
-    fn addition_accepts_matching_integer_and_float_primitives_only() {
-        let add_primitives = [
+    fn arithmetic_accepts_matching_integer_and_float_primitives_only() {
+        let arithmetic_primitives = [
             PrimTy::I8,
             PrimTy::I16,
             PrimTy::I32,
@@ -837,33 +847,43 @@ mod tests {
             PrimTy::F32,
             PrimTy::F64,
         ];
-        for primitive in add_primitives {
+        for operator in ARITHMETIC_OPERATORS {
+            for primitive in arithmetic_primitives {
+                assert_eq!(
+                    primitive_arithmetic_result(operator, primitive, primitive),
+                    PrimitiveArithmeticResult::Type(primitive),
+                    "{operator:?} on {primitive:?}"
+                );
+            }
+            for (left, right) in [(PrimTy::I32, PrimTy::U32), (PrimTy::F32, PrimTy::F64)] {
+                assert_eq!(
+                    primitive_arithmetic_result(operator, left, right),
+                    PrimitiveArithmeticResult::TypeMismatch {
+                        expected: left,
+                        found: right,
+                    },
+                    "{operator:?} on {left:?} and {right:?}"
+                );
+            }
+            for primitive in [PrimTy::Bool, PrimTy::Byte, PrimTy::Char, PrimTy::Never] {
+                assert_eq!(
+                    primitive_arithmetic_result(operator, primitive, primitive),
+                    PrimitiveArithmeticResult::Unsupported,
+                    "{operator:?} on {primitive:?}"
+                );
+            }
             assert_eq!(
-                primitive_add_result(primitive, primitive),
-                PrimitiveAddResult::Type(primitive),
-                "{primitive:?}"
+                primitive_arithmetic_result(operator, PrimTy::I32, PrimTy::Byte),
+                PrimitiveArithmeticResult::Unsupported
             );
         }
-        for (left, right) in [(PrimTy::I32, PrimTy::U32), (PrimTy::F32, PrimTy::F64)] {
+        for unsupported in [BinOp::Div, BinOp::Rem, BinOp::And, BinOp::Eq] {
             assert_eq!(
-                primitive_add_result(left, right),
-                PrimitiveAddResult::TypeMismatch {
-                    expected: left,
-                    found: right,
-                }
+                primitive_arithmetic_result(unsupported, PrimTy::I32, PrimTy::I32),
+                PrimitiveArithmeticResult::Unsupported,
+                "{unsupported:?}"
             );
         }
-        for primitive in [PrimTy::Bool, PrimTy::Byte, PrimTy::Char, PrimTy::Never] {
-            assert_eq!(
-                primitive_add_result(primitive, primitive),
-                PrimitiveAddResult::Unsupported,
-                "{primitive:?}"
-            );
-        }
-        assert_eq!(
-            primitive_add_result(PrimTy::I32, PrimTy::Byte),
-            PrimitiveAddResult::Unsupported
-        );
     }
 
     #[test]
