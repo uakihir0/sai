@@ -966,6 +966,50 @@ fn primitive_comparison_local_literal_range_uses_the_selected_pointer_width() {
 }
 
 #[test]
+fn primitive_comparison_left_literal_family_mismatch_still_checks_default_range() {
+    let source = "pub fn compare(value: F32) -> Bool {\n    let result = 18446744073709551616 < value\n    result\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let literal_start = source
+        .find("18446744073709551616")
+        .expect("oversized integer literal exists");
+    let path_start = source
+        .find("value\n")
+        .expect("right comparison path exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "a mismatched literal family still reports the path type:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        1,
+        "the integer literal must also be checked against its default I64 type:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a literal-family mismatch and default range error should recover as Bool:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I64`",
+        literal_start,
+        literal_start + "18446744073709551616".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I64`, found `F32`",
+        path_start,
+        path_start + "value".len(),
+    );
+}
+
+#[test]
 fn primitive_comparison_local_literal_errors_use_operand_spans_and_recover_as_bool() {
     let source = concat!(
         "pub fn diagnostics(left: I32, float_value: F32, narrow: I8) -> Bool {\n",

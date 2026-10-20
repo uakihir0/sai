@@ -350,13 +350,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 literal_kind,
                 literal_expression.hir_id,
             ),
-            Err(expected) => self.errors.push(PrimitiveBodyError {
-                node: path.hir_id,
-                kind: PrimitiveBodyErrorKind::TypeMismatch {
+            Err(expected) => {
+                self.errors.push(PrimitiveBodyError {
+                    node: path.hir_id,
+                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                        expected,
+                        found: path_type,
+                    },
+                });
+                // Even when a left numeric literal cannot unify with the
+                // path's family, its default type can independently fail
+                // range checking. Keep that diagnostic on the literal.
+                self.check_annotated_literal(
                     expected,
-                    found: path_type,
-                },
-            }),
+                    literal,
+                    literal_kind,
+                    literal_expression.hir_id,
+                );
+            }
         }
         Ok(())
     }
