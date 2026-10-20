@@ -1,0 +1,74 @@
+use acme:turn-based-duel/model.{Action, ActionReport, Fighter}
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+pub fn print_action(out: borrow mut Stdout, result: ActionReport)
+    effects { stdio.write, alloc }
+{
+    match result.action {
+        Action.Strike => {
+            if result.damage == 0 {
+                out.write_str(
+                    f"{result.performer} cannot strike; there is not enough stamina.\n".as_str(),
+                )
+            } else if result.blocked {
+                out.write_str(
+                    f"{result.performer} strikes {result.target}, but the guard reduces the hit to {result.damage} damage.\n".as_str(),
+                )
+            } else {
+                out.write_str(
+                    f"{result.performer} strikes {result.target} for {result.damage} damage.\n".as_str(),
+                )
+            }
+        }
+        Action.Guard => {
+            out.write_str(
+                f"{result.performer} braces and prepares to block, restoring {result.recovered_stamina} stamina.\n".as_str(),
+            )
+        }
+        Action.Recover => {
+            if result.recovered_health > 0 and result.recovered_stamina > 0 {
+                out.write_str(
+                    f"{result.performer} recovers {result.recovered_health} health and {result.recovered_stamina} stamina.\n".as_str(),
+                )
+            } else if result.recovered_health > 0 {
+                out.write_str(
+                    f"{result.performer} recovers {result.recovered_health} health.\n".as_str(),
+                )
+            } else if result.recovered_stamina > 0 {
+                out.write_str(
+                    f"{result.performer} recovers {result.recovered_stamina} stamina.\n".as_str(),
+                )
+            } else {
+                out.write_str(
+                    f"{result.performer} takes a breath, but is already at full health and stamina.\n".as_str(),
+                )
+            }
+        }
+    }
+}
+
+pub fn print_status(out: borrow mut Stdout, player: Fighter, guardian: Fighter)
+    effects { stdio.write, alloc }
+{
+    out.write_str(
+        f"  {player.name}: {player.health}/{player.max_health} HP, {player.stamina}/{player.max_stamina} stamina\n".as_str(),
+    )
+    out.write_str(
+        f"  {guardian.name}: {guardian.health}/{guardian.max_health} HP, {guardian.stamina}/{guardian.max_stamina} stamina\n".as_str(),
+    )
+}
+
+pub fn print_outcome(out: borrow mut Stdout, player: Fighter, guardian: Fighter)
+    effects { stdio.write, alloc }
+{
+    if player.health == 0 and guardian.health == 0 {
+        out.write_str("The sparring match ends in a draw.\n")
+    } else if guardian.health == 0 {
+        out.write_str(f"{player.name} wins the sparring match.\n".as_str())
+    } else if player.health == 0 {
+        out.write_str(f"{guardian.name} wins the sparring match.\n".as_str())
+    } else {
+        out.write_str("The sparring match ends with no winner.\n")
+    }
+}

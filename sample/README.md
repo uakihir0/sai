@@ -21,3 +21,6 @@ every project builds today.
 - [`event-planner`](event-planner/README.md) tracks event sessions, attendee
   registrations, capacity-based waitlists, open seats, and confirmed schedule
   conflicts across several modules.
+- [`turn-based-duel`](turn-based-duel/README.md) narrates a deterministic
+  turn-based match and demonstrates enum-driven actions, mutable state,
+  stamina rules, a simple opponent strategy, and early termination.

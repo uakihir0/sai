@@ -1,0 +1,23 @@
+use acme:turn-based-duel/duel
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        out.write_str("usage: turn-based-duel demo\n")
+        return process.ExitCode.failure()
+    }
+
+    let command = args[1].as_str()
+    if command == "demo" {
+        duel.play(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    out.write_str("usage: turn-based-duel demo\n")
+    process.ExitCode.failure()
+}

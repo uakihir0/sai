@@ -1,0 +1,89 @@
+use acme:turn-based-duel/model.{Action, ActionReport, Fighter}
+
+pub fn perform(
+    action: Action,
+    attacker: borrow mut Fighter,
+    target: borrow mut Fighter,
+) -> ActionReport {
+    let actor_name = attacker.name
+    let target_name = target.name
+
+    match action {
+        Action.Strike => {
+            if attacker.stamina < 2 {
+                ActionReport(
+                    performer: actor_name,
+                    target: target_name,
+                    action: action,
+                    damage: 0,
+                    recovered_health: 0,
+                    recovered_stamina: 0,
+                    blocked: false,
+                )
+            } else {
+                attacker.stamina -= 2
+                let blocked = target.guarding
+                let damage = if blocked {
+                    1
+                } else {
+                    3
+                }
+                if blocked {
+                    target.guarding = false
+                }
+                if target.health > damage {
+                    target.health -= damage
+                } else {
+                    target.health = 0
+                }
+                ActionReport(
+                    performer: actor_name,
+                    target: target_name,
+                    action: action,
+                    damage: damage,
+                    recovered_health: 0,
+                    recovered_stamina: 0,
+                    blocked: blocked,
+                )
+            }
+        }
+        Action.Guard => {
+            let old_stamina = attacker.stamina
+            if attacker.stamina < attacker.max_stamina {
+                attacker.stamina += 1
+            }
+            attacker.guarding = true
+            ActionReport(
+                performer: actor_name,
+                target: target_name,
+                action: action,
+                damage: 0,
+                recovered_health: 0,
+                recovered_stamina: attacker.stamina - old_stamina,
+                blocked: false,
+            )
+        }
+        Action.Recover => {
+            let old_health = attacker.health
+            if attacker.health < attacker.max_health {
+                attacker.health += 1
+            }
+            let old_stamina = attacker.stamina
+            let desired_stamina = attacker.stamina + 2
+            if desired_stamina > attacker.max_stamina {
+                attacker.stamina = attacker.max_stamina
+            } else {
+                attacker.stamina = desired_stamina
+            }
+            ActionReport(
+                performer: actor_name,
+                target: target_name,
+                action: action,
+                damage: 0,
+                recovered_health: attacker.health - old_health,
+                recovered_stamina: attacker.stamina - old_stamina,
+                blocked: false,
+            )
+        }
+    }
+}
