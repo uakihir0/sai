@@ -70,6 +70,13 @@ enum PrimitiveComparisonResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimitiveAddResult {
+    Type(PrimTy),
+    TypeMismatch { expected: PrimTy, found: PrimTy },
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrimitiveBoolOperandResult {
     Bool,
     TypeMismatch { found: PrimTy },
@@ -103,9 +110,9 @@ struct LiteralVariable<'hir> {
 /// Check a flat sequence of immutable primitive locals and a local-path tail.
 ///
 /// Direct scalar literals, plain paths to earlier bindings, comparisons
-/// between concrete primitive paths or one path and one scalar literal, and
-/// one top-level logical operation between Bool paths are accepted as
-/// initializers.
+/// between concrete primitive paths or one path and one scalar literal, one
+/// top-level logical operation between Bool paths, and addition between
+/// matching concrete numeric paths are accepted as initializers.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
@@ -216,22 +223,43 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
             }
             ExprKind::Binary(operator, left, right) => {
-                let result = match operator {
-                    BinOp::And | BinOp::Or => self.check_logical(operator, left, right)?,
-                    _ => self.check_comparison(operator, left, right)?,
-                };
-                if let Some(expected) = annotation {
-                    if expected != PrimTy::Bool {
-                        self.errors.push(PrimitiveBodyError {
-                            node: init.hir_id,
-                            kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                expected,
-                                found: PrimTy::Bool,
-                            },
-                        });
+                if operator == BinOp::Add {
+                    let result = self.check_add(left, right)?;
+                    if let Some(expected) = annotation {
+                        let Some(found) = self.concrete_local_type(result) else {
+                            return Err(());
+                        };
+                        if expected != found {
+                            self.errors.push(PrimitiveBodyError {
+                                node: init.hir_id,
+                                kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                            });
+                        }
+                        // The annotation determines the local's recovered
+                        // type after the coercion-site mismatch, as it does
+                        // for the existing annotated path initializer.
+                        LocalType::Concrete(expected)
+                    } else {
+                        result
                     }
+                } else {
+                    let result = match operator {
+                        BinOp::And | BinOp::Or => self.check_logical(operator, left, right)?,
+                        _ => self.check_comparison(operator, left, right)?,
+                    };
+                    if let Some(expected) = annotation {
+                        if expected != PrimTy::Bool {
+                            self.errors.push(PrimitiveBodyError {
+                                node: init.hir_id,
+                                kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                    expected,
+                                    found: PrimTy::Bool,
+                                },
+                            });
+                        }
+                    }
+                    result
                 }
-                result
             }
             ExprKind::Unary(UnOp::Not, operand) => {
                 let operand_type = self
@@ -270,6 +298,37 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
 
         self.known_bindings.insert(binding, local_type);
         Ok(())
+    }
+
+    fn check_add(
+        &mut self,
+        left: &'hir Expr<'hir>,
+        right: &'hir Expr<'hir>,
+    ) -> Result<LocalType, ()> {
+        let left_type = self
+            .check_local_path(left)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .ok_or(())?;
+        let right_type = self
+            .check_local_path(right)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .ok_or(())?;
+
+        match primitive_add_result(left_type, right_type) {
+            PrimitiveAddResult::Type(result) => Ok(LocalType::Concrete(result)),
+            PrimitiveAddResult::TypeMismatch { expected, found } => {
+                self.errors.push(PrimitiveBodyError {
+                    node: right.hir_id,
+                    kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                });
+                // Addition synthesizes its result from the left operand, so
+                // later checks recover with that type after a right mismatch.
+                Ok(LocalType::Concrete(left_type))
+            }
+            PrimitiveAddResult::Unsupported => Err(()),
+        }
     }
 
     fn check_comparison(
@@ -657,6 +716,24 @@ fn primitive_comparison_result(
     PrimitiveComparisonResult::Bool
 }
 
+fn primitive_add_result(left: PrimTy, right: PrimTy) -> PrimitiveAddResult {
+    if !is_add_primitive(left) || !is_add_primitive(right) {
+        return PrimitiveAddResult::Unsupported;
+    }
+    if left == right {
+        PrimitiveAddResult::Type(left)
+    } else {
+        PrimitiveAddResult::TypeMismatch {
+            expected: left,
+            found: right,
+        }
+    }
+}
+
+const fn is_add_primitive(primitive: PrimTy) -> bool {
+    is_integer_primitive(primitive) || matches!(primitive, PrimTy::F32 | PrimTy::F64)
+}
+
 fn primitive_comparison_literal_expected_type(
     kind: PrimitiveLiteralKind,
     path_type: PrimTy,
@@ -710,7 +787,8 @@ fn literal_family_accepts(kind: PrimitiveLiteralKind, expected: PrimTy) -> bool 
 #[cfg(test)]
 mod tests {
     use super::{
-        PrimitiveBoolOperandResult, PrimitiveComparisonResult, primitive_bool_operand_result,
+        PrimitiveAddResult, PrimitiveBoolOperandResult, PrimitiveComparisonResult,
+        primitive_add_result, primitive_bool_operand_result,
         primitive_comparison_literal_expected_type, primitive_comparison_result,
     };
     use sai_hir::expressions::BinOp;
@@ -742,6 +820,51 @@ mod tests {
         PrimTy::Byte,
         PrimTy::Char,
     ];
+
+    #[test]
+    fn addition_accepts_matching_integer_and_float_primitives_only() {
+        let add_primitives = [
+            PrimTy::I8,
+            PrimTy::I16,
+            PrimTy::I32,
+            PrimTy::I64,
+            PrimTy::U8,
+            PrimTy::U16,
+            PrimTy::U32,
+            PrimTy::U64,
+            PrimTy::ISize,
+            PrimTy::USize,
+            PrimTy::F32,
+            PrimTy::F64,
+        ];
+        for primitive in add_primitives {
+            assert_eq!(
+                primitive_add_result(primitive, primitive),
+                PrimitiveAddResult::Type(primitive),
+                "{primitive:?}"
+            );
+        }
+        for (left, right) in [(PrimTy::I32, PrimTy::U32), (PrimTy::F32, PrimTy::F64)] {
+            assert_eq!(
+                primitive_add_result(left, right),
+                PrimitiveAddResult::TypeMismatch {
+                    expected: left,
+                    found: right,
+                }
+            );
+        }
+        for primitive in [PrimTy::Bool, PrimTy::Byte, PrimTy::Char, PrimTy::Never] {
+            assert_eq!(
+                primitive_add_result(primitive, primitive),
+                PrimitiveAddResult::Unsupported,
+                "{primitive:?}"
+            );
+        }
+        assert_eq!(
+            primitive_add_result(PrimTy::I32, PrimTy::Byte),
+            PrimitiveAddResult::Unsupported
+        );
+    }
 
     #[test]
     fn every_comparison_operator_accepts_each_supported_primitive_type() {
