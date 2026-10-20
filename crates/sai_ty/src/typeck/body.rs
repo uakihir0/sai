@@ -113,8 +113,8 @@ struct LiteralVariable<'hir> {
 /// between concrete primitive paths or one path and one scalar literal, one
 /// top-level logical operation between Bool paths, and direct arithmetic
 /// between matching concrete numeric paths are accepted as initializers. A
-/// direct numeric literal is also accepted as the right operand of `+` when
-/// the left operand is an eligible concrete numeric path.
+/// Direct numeric literals are also accepted as right operands of `+`, `-`,
+/// and `*` when the left operand is an eligible concrete numeric path.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
