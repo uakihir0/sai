@@ -70,6 +70,7 @@ fn run_build(source: &str) -> Output {
 }
 
 fn source_block(markdown: &str, section: &str) -> String {
+    let markdown = markdown.replace("\r\n", "\n");
     let heading = format!("## {section}\n");
     let section = markdown
         .split_once(&heading)
@@ -84,6 +85,16 @@ fn source_block(markdown: &str, section: &str) -> String {
         .expect("SAI code fence is closed")
         .0;
     format!("{source}\n")
+}
+
+#[test]
+fn source_block_normalizes_windows_line_endings() {
+    let markdown = "## Example\r\n\r\n```sai\r\npub fn main() {\r\n    42\r\n}\r\n```\r\n";
+
+    assert_eq!(
+        source_block(markdown, "Example"),
+        "pub fn main() {\n    42\n}\n"
+    );
 }
 
 fn json_string(value: &str) -> String {
