@@ -353,6 +353,8 @@ fn public_parameter_local_copy_emits_check_result() {
     for source in [
         "pub fn copy_annotated(source: I32) -> I32 {\n    let copied: I32 = source\n    copied\n}\n",
         "pub fn copy_unannotated(source: I32) -> I32 {\n    let copied = source\n    copied\n}\n",
+        "pub fn parameter_tail(source: I32) -> I32 {\n    let copied: I32 = source\n    source\n}\n",
+        "pub fn parameter_tail_second(first: I32, second: Bool) -> Bool {\n    let copied: I32 = first\n    second\n}\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -370,6 +372,11 @@ fn parameter_local_copy_reports_semantic_errors_without_a_feature_gate() {
             "pub fn return_mismatch(source: I32) -> Bool {\n    let copied: I32 = source\n    copied\n}\n",
             "expected `Bool`, found `I32`",
             "copied",
+        ),
+        (
+            "pub fn parameter_tail_mismatch(source: I32) -> Bool {\n    let copied: I32 = source\n    source\n}\n",
+            "expected `Bool`, found `I32`",
+            "source",
         ),
     ] {
         let output = run_check(source, "", &[], &[]);
@@ -392,11 +399,42 @@ fn parameter_local_copy_reports_semantic_errors_without_a_feature_gate() {
 }
 
 #[test]
+fn shadowed_parameter_initializer_uses_parameter_and_tail_uses_local_binding() {
+    let source =
+        "pub fn shadow(source: I32) -> Bool {\n    let source: Bool = source\n    source\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let initializer_start = source
+        .find("= source\n")
+        .map(|start| start + "= ".len())
+        .expect("shadowing initializer exists");
+    let initializer_end = initializer_start + "source".len();
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "supported shadowing mismatch must not be hidden by a feature gate:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        initializer_start,
+        initializer_end,
+    );
+}
+
+#[test]
 fn unsupported_parameter_local_copy_forms_remain_gated() {
     for source in [
         "pub fn copy(var source: I32) -> I32 {\n    let copied: I32 = source\n    copied\n}\n",
         "pub fn copy(self: I32) -> I32 {\n    let copied: I32 = self\n    copied\n}\n",
-        "pub fn parameter_tail(source: I32) -> I32 {\n    let copied: I32 = source\n    source\n}\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }

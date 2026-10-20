@@ -6298,7 +6298,6 @@ fn check_function_body_primitive_local_block(
 
     let mut primitive_types = HashMap::new();
     let mut preceding_bindings = initial_bindings.keys().copied().collect::<HashSet<_>>();
-    let mut local_bindings = HashSet::with_capacity(block.stmts.len());
     for stmt in block.stmts {
         let StmtKind::Let {
             pat,
@@ -6353,9 +6352,8 @@ fn check_function_body_primitive_local_block(
             _ => return Ok(None),
         }
         preceding_bindings.insert(binding);
-        local_bindings.insert(binding);
     }
-    if !local_bindings.contains(&tail_binding) {
+    if !preceding_bindings.contains(&tail_binding) {
         return Ok(None);
     }
 
