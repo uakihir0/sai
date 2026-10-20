@@ -1,0 +1,78 @@
+use acme:event-planner/model.{Attendee, Registration, Session}
+
+pub fn sessions() -> Array<Session, 4> {
+    [
+        Session(
+            id: 1,
+            title: "Welcome to SAI",
+            room: "Main Hall",
+            start_time: "09:00",
+            end_time: "09:45",
+            start_minute: 540,
+            end_minute: 585,
+            capacity: 3,
+        ),
+        Session(
+            id: 2,
+            title: "Parser lab",
+            room: "Lab A",
+            start_time: "10:00",
+            end_time: "11:00",
+            start_minute: 600,
+            end_minute: 660,
+            capacity: 2,
+        ),
+        Session(
+            id: 3,
+            title: "Design clinic",
+            room: "Lab B",
+            start_time: "10:30",
+            end_time: "11:15",
+            start_minute: 630,
+            end_minute: 675,
+            capacity: 2,
+        ),
+        Session(
+            id: 4,
+            title: "Career Q&A",
+            room: "Main Hall",
+            start_time: "11:30",
+            end_time: "12:00",
+            start_minute: 690,
+            end_minute: 720,
+            capacity: 4,
+        ),
+    ]
+}
+
+pub fn attendees() -> Array<Attendee, 8> {
+    [
+        Attendee(id: 1, name: "Mina"),
+        Attendee(id: 2, name: "Ari"),
+        Attendee(id: 3, name: "Nao"),
+        Attendee(id: 4, name: "Emi"),
+        Attendee(id: 5, name: "Ren"),
+        Attendee(id: 6, name: "Kai"),
+        Attendee(id: 7, name: "Yui"),
+        Attendee(id: 8, name: "Jun"),
+    ]
+}
+
+// Sequence is the first-come-first-served order used to fill each session.
+pub fn registrations() -> Array<Registration, 13> {
+    [
+        Registration(sequence: 1, session_id: 1, attendee_id: 1),
+        Registration(sequence: 2, session_id: 1, attendee_id: 2),
+        Registration(sequence: 3, session_id: 1, attendee_id: 3),
+        Registration(sequence: 4, session_id: 1, attendee_id: 4),
+        Registration(sequence: 5, session_id: 2, attendee_id: 1),
+        Registration(sequence: 6, session_id: 2, attendee_id: 5),
+        Registration(sequence: 7, session_id: 2, attendee_id: 6),
+        Registration(sequence: 8, session_id: 3, attendee_id: 5),
+        Registration(sequence: 9, session_id: 3, attendee_id: 6),
+        Registration(sequence: 10, session_id: 3, attendee_id: 7),
+        Registration(sequence: 11, session_id: 4, attendee_id: 2),
+        Registration(sequence: 12, session_id: 4, attendee_id: 4),
+        Registration(sequence: 13, session_id: 4, attendee_id: 8),
+    ]
+}

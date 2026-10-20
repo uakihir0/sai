@@ -1,0 +1,124 @@
+use acme:event-planner/data
+use acme:event-planner/model.{Attendee, Registration, Session}
+
+pub fn find_session(id: U32) -> Option<Session> {
+    for session in data.sessions() {
+        if session.id == id {
+            return Some(session)
+        }
+    }
+    None
+}
+
+pub fn find_attendee(id: U32) -> Option<Attendee> {
+    for attendee in data.attendees() {
+        if attendee.id == id {
+            return Some(attendee)
+        }
+    }
+    None
+}
+
+pub fn registration_count(session_id: U32) -> U32 {
+    var count: U32 = 0
+    for registration in data.registrations() {
+        if registration.session_id == session_id {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn is_confirmed(registration: Registration) -> Bool {
+    match find_session(registration.session_id) {
+        Some(session) => {
+            var position: U32 = 0
+            for candidate in data.registrations() {
+                if (
+                    candidate.session_id == registration.session_id
+                    and candidate.sequence <= registration.sequence
+                ) {
+                    position += 1
+                }
+            }
+            position <= session.capacity
+        }
+        None => false
+    }
+}
+
+pub fn confirmed_count(session_id: U32) -> U32 {
+    let registered = registration_count(session_id)
+    match find_session(session_id) {
+        Some(session) => {
+            if registered < session.capacity {
+                registered
+            } else {
+                session.capacity
+            }
+        }
+        None => 0
+    }
+}
+
+pub fn waitlisted_count(session_id: U32) -> U32 {
+    let registered = registration_count(session_id)
+    match find_session(session_id) {
+        Some(session) => {
+            if registered > session.capacity {
+                registered - session.capacity
+            } else {
+                0
+            }
+        }
+        None => 0
+    }
+}
+
+pub fn open_seats(session_id: U32) -> U32 {
+    let registered = registration_count(session_id)
+    match find_session(session_id) {
+        Some(session) => {
+            if registered < session.capacity {
+                session.capacity - registered
+            } else {
+                0
+            }
+        }
+        None => 0
+    }
+}
+
+pub fn overlaps(first: Session, second: Session) -> Bool {
+    first.start_minute < second.end_minute and second.start_minute < first.end_minute
+}
+
+pub fn confirmed_conflict_count() -> U32 {
+    var conflicts: U32 = 0
+    for first in data.registrations() {
+        for second in data.registrations() {
+            if (
+                first.sequence < second.sequence
+                and first.attendee_id == second.attendee_id
+                and first.session_id != second.session_id
+                and is_confirmed(first)
+                and is_confirmed(second)
+            ) {
+                match find_session(first.session_id) {
+                    Some(first_session) => {
+                        match find_session(second.session_id) {
+                            Some(second_session) => {
+                                if overlaps(first_session, second_session) {
+                                    conflicts += 1
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    conflicts
+}

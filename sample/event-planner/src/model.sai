@@ -1,0 +1,24 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Session {
+    pub id: U32
+    pub title: Str
+    pub room: Str
+    pub start_time: Str
+    pub end_time: Str
+    pub start_minute: U32
+    pub end_minute: U32
+    pub capacity: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Attendee {
+    pub id: U32
+    pub name: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Registration {
+    pub sequence: U32
+    pub session_id: U32
+    pub attendee_id: U32
+}
