@@ -69,6 +69,13 @@ enum PrimitiveComparisonResult {
     Unsupported,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimitiveLogicalOperandResult {
+    Bool,
+    TypeMismatch { found: PrimTy },
+    Unsupported,
+}
+
 /// Scalar literal classes supported by the primitive literal kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrimitiveLiteralKind {
@@ -95,8 +102,9 @@ struct LiteralVariable<'hir> {
 
 /// Check a flat sequence of immutable primitive locals and a local-path tail.
 ///
-/// Direct scalar literals, plain paths to earlier bindings, and comparisons
-/// between concrete primitive paths are accepted as initializers.
+/// Direct scalar literals, plain paths to earlier bindings, comparisons
+/// between concrete primitive paths, and one top-level logical operation
+/// between Bool paths are accepted as initializers.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
@@ -207,7 +215,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
             }
             ExprKind::Binary(operator, left, right) => {
-                let result = self.check_comparison(operator, left, right)?;
+                let result = match operator {
+                    BinOp::And | BinOp::Or => self.check_logical(operator, left, right)?,
+                    _ => self.check_comparison(operator, left, right)?,
+                };
                 if let Some(expected) = annotation {
                     if expected != PrimTy::Bool {
                         self.errors.push(PrimitiveBodyError {
@@ -259,6 +270,44 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         // A failed operand comparison still has Bool as its recovered result,
         // so later statements and the tail are checked against the expression
         // type instead of inheriting either operand's type.
+        Ok(LocalType::Concrete(PrimTy::Bool))
+    }
+
+    fn check_logical(
+        &mut self,
+        operator: BinOp,
+        left: &'hir Expr<'hir>,
+        right: &'hir Expr<'hir>,
+    ) -> Result<LocalType, ()> {
+        if !matches!(operator, BinOp::And | BinOp::Or) {
+            return Err(());
+        }
+
+        // Typecheck in written order without lowering or reordering the
+        // operands, preserving the source operator's short-circuit behavior.
+        for operand in [left, right] {
+            let operand_type = self
+                .check_local_path(operand)
+                .ok()
+                .and_then(|local_type| self.concrete_local_type(local_type))
+                .ok_or(())?;
+            match primitive_logical_operand_result(operand_type) {
+                PrimitiveLogicalOperandResult::Bool => {}
+                PrimitiveLogicalOperandResult::TypeMismatch { found } => {
+                    self.errors.push(PrimitiveBodyError {
+                        node: operand.hir_id,
+                        kind: PrimitiveBodyErrorKind::TypeMismatch {
+                            expected: PrimTy::Bool,
+                            found,
+                        },
+                    });
+                }
+                PrimitiveLogicalOperandResult::Unsupported => return Err(()),
+            }
+        }
+
+        // Both `and` and `or` have Bool result type, including after an
+        // operand mismatch, so downstream local and tail checks can recover.
         Ok(LocalType::Concrete(PrimTy::Bool))
     }
 
@@ -509,6 +558,16 @@ fn primitive_comparison_result(
     PrimitiveComparisonResult::Bool
 }
 
+fn primitive_logical_operand_result(found: PrimTy) -> PrimitiveLogicalOperandResult {
+    if found == PrimTy::Bool {
+        PrimitiveLogicalOperandResult::Bool
+    } else if supports_primitive_literal(found) {
+        PrimitiveLogicalOperandResult::TypeMismatch { found }
+    } else {
+        PrimitiveLogicalOperandResult::Unsupported
+    }
+}
+
 fn literal_family_accepts(kind: PrimitiveLiteralKind, expected: PrimTy) -> bool {
     match kind {
         PrimitiveLiteralKind::Integer => is_integer_primitive(expected),
@@ -521,7 +580,10 @@ fn literal_family_accepts(kind: PrimitiveLiteralKind, expected: PrimTy) -> bool 
 
 #[cfg(test)]
 mod tests {
-    use super::{PrimitiveComparisonResult, primitive_comparison_result};
+    use super::{
+        PrimitiveComparisonResult, PrimitiveLogicalOperandResult, primitive_comparison_result,
+        primitive_logical_operand_result,
+    };
     use sai_hir::expressions::BinOp;
     use sai_resolve::prelude::PrimTy;
 
@@ -583,6 +645,28 @@ mod tests {
         assert_eq!(
             primitive_comparison_result(BinOp::Eq, PrimTy::Never, PrimTy::Never),
             PrimitiveComparisonResult::Unsupported
+        );
+    }
+
+    #[test]
+    fn logical_operands_require_bool_and_reject_unsupported_types() {
+        assert_eq!(
+            primitive_logical_operand_result(PrimTy::Bool),
+            PrimitiveLogicalOperandResult::Bool
+        );
+        for primitive in SUPPORTED_PRIMITIVES
+            .into_iter()
+            .filter(|ty| *ty != PrimTy::Bool)
+        {
+            assert_eq!(
+                primitive_logical_operand_result(primitive),
+                PrimitiveLogicalOperandResult::TypeMismatch { found: primitive },
+                "{primitive:?}"
+            );
+        }
+        assert_eq!(
+            primitive_logical_operand_result(PrimTy::Never),
+            PrimitiveLogicalOperandResult::Unsupported
         );
     }
 }
