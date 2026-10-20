@@ -5,7 +5,7 @@ use super::literal::{
     supports_primitive_literal,
 };
 use sai_hir::body::Body;
-use sai_hir::expressions::{Block, Expr, ExprKind, Stmt, StmtKind};
+use sai_hir::expressions::{BinOp, Block, Expr, ExprKind, Stmt, StmtKind};
 use sai_hir::literals::Lit;
 use sai_hir::patterns::{BindingMode, PatKind};
 use sai_hir::types::PathRoot;
@@ -62,6 +62,13 @@ pub enum PrimitiveBodyErrorKind {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrimitiveComparisonResult {
+    Bool,
+    TypeMismatch { expected: PrimTy, found: PrimTy },
+    Unsupported,
+}
+
 /// Scalar literal classes supported by the primitive literal kernel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrimitiveLiteralKind {
@@ -88,11 +95,11 @@ struct LiteralVariable<'hir> {
 
 /// Check a flat sequence of immutable primitive locals and a local-path tail.
 ///
-/// Direct scalar literals and plain paths to earlier locals are accepted as
-/// initializers. Unannotated numeric literals retain one inference variable
-/// across copies until a coercion site or the tail constrains it. Other body
-/// forms remain unsupported until their own type-checking slices are
-/// implemented.
+/// Direct scalar literals, plain paths to earlier bindings, and comparisons
+/// between concrete primitive paths are accepted as initializers.
+/// Unannotated numeric literals retain one inference variable across copies
+/// until a coercion site or the tail constrains it. Other body forms remain
+/// unsupported until their own type-checking slices are implemented.
 pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> PrimitiveBodyCheck {
     if !supports_primitive_literal(input.return_type) {
         return PrimitiveBodyCheck::Unsupported;
@@ -199,11 +206,68 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     source_type
                 }
             }
+            ExprKind::Binary(operator, left, right) => {
+                let result = self.check_comparison(operator, left, right)?;
+                if let Some(expected) = annotation {
+                    if expected != PrimTy::Bool {
+                        self.errors.push(PrimitiveBodyError {
+                            node: init.hir_id,
+                            kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                expected,
+                                found: PrimTy::Bool,
+                            },
+                        });
+                    }
+                }
+                result
+            }
             _ => return Err(()),
         };
 
         self.known_bindings.insert(binding, local_type);
         Ok(())
+    }
+
+    fn check_comparison(
+        &mut self,
+        operator: BinOp,
+        left: &'hir Expr<'hir>,
+        right: &'hir Expr<'hir>,
+    ) -> Result<LocalType, ()> {
+        let left_type = self
+            .check_local_path(left)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .ok_or(())?;
+        let right_type = self
+            .check_local_path(right)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .ok_or(())?;
+
+        match primitive_comparison_result(operator, left_type, right_type) {
+            PrimitiveComparisonResult::Bool => {}
+            PrimitiveComparisonResult::TypeMismatch { expected, found } => {
+                self.errors.push(PrimitiveBodyError {
+                    node: right.hir_id,
+                    kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                });
+            }
+            PrimitiveComparisonResult::Unsupported => return Err(()),
+        }
+
+        // A failed operand comparison still has Bool as its recovered result,
+        // so later statements and the tail are checked against the expression
+        // type instead of inheriting either operand's type.
+        Ok(LocalType::Concrete(PrimTy::Bool))
+    }
+
+    fn concrete_local_type(&self, local_type: LocalType) -> Option<PrimTy> {
+        let primitive = match local_type {
+            LocalType::Concrete(primitive) => primitive,
+            LocalType::LiteralVariable(id) => self.literal_variables.get(id)?.resolved?,
+        };
+        supports_primitive_literal(primitive).then_some(primitive)
     }
 
     fn check_annotated_literal(
@@ -423,6 +487,28 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 }
 
+fn primitive_comparison_result(
+    operator: BinOp,
+    left: PrimTy,
+    right: PrimTy,
+) -> PrimitiveComparisonResult {
+    if !matches!(
+        operator,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+    ) || !supports_primitive_literal(left)
+        || !supports_primitive_literal(right)
+    {
+        return PrimitiveComparisonResult::Unsupported;
+    }
+    if left != right {
+        return PrimitiveComparisonResult::TypeMismatch {
+            expected: left,
+            found: right,
+        };
+    }
+    PrimitiveComparisonResult::Bool
+}
+
 fn literal_family_accepts(kind: PrimitiveLiteralKind, expected: PrimTy) -> bool {
     match kind {
         PrimitiveLiteralKind::Integer => is_integer_primitive(expected),
@@ -430,6 +516,74 @@ fn literal_family_accepts(kind: PrimitiveLiteralKind, expected: PrimTy) -> bool 
         PrimitiveLiteralKind::Bool
         | PrimitiveLiteralKind::Byte
         | PrimitiveLiteralKind::Character => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PrimitiveComparisonResult, primitive_comparison_result};
+    use sai_hir::expressions::BinOp;
+    use sai_resolve::prelude::PrimTy;
+
+    const COMPARISON_OPERATORS: [BinOp; 6] = [
+        BinOp::Eq,
+        BinOp::Ne,
+        BinOp::Lt,
+        BinOp::Le,
+        BinOp::Gt,
+        BinOp::Ge,
+    ];
+
+    const SUPPORTED_PRIMITIVES: [PrimTy; 15] = [
+        PrimTy::I8,
+        PrimTy::I16,
+        PrimTy::I32,
+        PrimTy::I64,
+        PrimTy::U8,
+        PrimTy::U16,
+        PrimTy::U32,
+        PrimTy::U64,
+        PrimTy::ISize,
+        PrimTy::USize,
+        PrimTy::F32,
+        PrimTy::F64,
+        PrimTy::Bool,
+        PrimTy::Byte,
+        PrimTy::Char,
+    ];
+
+    #[test]
+    fn every_comparison_operator_accepts_each_supported_primitive_type() {
+        for operator in COMPARISON_OPERATORS {
+            for primitive in SUPPORTED_PRIMITIVES {
+                assert_eq!(
+                    primitive_comparison_result(operator, primitive, primitive),
+                    PrimitiveComparisonResult::Bool,
+                    "{operator:?} on {primitive:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn primitive_comparison_rejects_mismatched_types_and_non_comparison_operators() {
+        for operator in COMPARISON_OPERATORS {
+            assert_eq!(
+                primitive_comparison_result(operator, PrimTy::I32, PrimTy::U32),
+                PrimitiveComparisonResult::TypeMismatch {
+                    expected: PrimTy::I32,
+                    found: PrimTy::U32,
+                }
+            );
+        }
+        assert_eq!(
+            primitive_comparison_result(BinOp::Add, PrimTy::I32, PrimTy::I32),
+            PrimitiveComparisonResult::Unsupported
+        );
+        assert_eq!(
+            primitive_comparison_result(BinOp::Eq, PrimTy::Never, PrimTy::Never),
+            PrimitiveComparisonResult::Unsupported
+        );
     }
 }
 

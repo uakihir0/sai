@@ -6349,6 +6349,23 @@ fn check_function_body_primitive_local_block(
                     return Ok(None);
                 }
             }
+            ExprKind::Binary(operator, left, right)
+                if is_function_primitive_comparison_operator(operator) =>
+            {
+                for operand in [left, right] {
+                    let ExprKind::Path(path) = operand.kind else {
+                        return Ok(None);
+                    };
+                    let Some(source_binding) =
+                        resolved_plain_local_path_binding(path, locals, inputs)
+                    else {
+                        return Ok(None);
+                    };
+                    if !preceding_bindings.contains(&source_binding) {
+                        return Ok(None);
+                    }
+                }
+            }
             _ => return Ok(None),
         }
         preceding_bindings.insert(binding);
@@ -6387,6 +6404,13 @@ fn check_function_body_primitive_local_block(
     primitive_body_errors_to_diagnostics(owner, block, tail, errors, inputs, snapshot)
 }
 
+fn is_function_primitive_comparison_operator(operator: BinOp) -> bool {
+    matches!(
+        operator,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+    )
+}
+
 fn resolved_plain_local_path_binding(
     path: HirPath<'_>,
     locals: &LocalResolution,
@@ -6423,7 +6447,7 @@ fn primitive_body_errors_to_diagnostics(
             .stmts
             .iter()
             .find_map(|stmt| match stmt.kind {
-                StmtKind::Let { init, .. } if init.hir_id == error.node => Some(init.span),
+                StmtKind::Let { init, .. } => primitive_body_error_span(init, error.node),
                 _ => None,
             })
             .or_else(|| (error.node == tail.hir_id).then_some(tail.span));
@@ -6491,6 +6515,24 @@ fn primitive_body_errors_to_diagnostics(
         diagnostics.push(diagnostic);
     }
     Ok(Some(diagnostics))
+}
+
+fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sai_hir::Span> {
+    if expression.hir_id == node {
+        return Some(expression.span);
+    }
+    match expression.kind {
+        ExprKind::Binary(_, left, right) => {
+            if left.hir_id == node {
+                Some(left.span)
+            } else if right.hir_id == node {
+                Some(right.span)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 fn function_if_condition_uses_parameter_binding(
