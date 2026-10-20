@@ -1037,6 +1037,140 @@ fn unsupported_primitive_logical_local_initializer_shapes_remain_gated() {
 }
 
 #[test]
+fn primitive_local_not_accepts_bool_parameters_and_preceding_locals() {
+    for source in [
+        "pub fn parameter(flag: Bool) -> Bool {\n    let result: Bool = not flag\n    result\n}\n",
+        "pub fn local(flag: Bool) -> Bool {\n    let source: Bool = flag\n    let result = not source\n    result\n}\n",
+        "pub fn shadow(source: I32) -> Bool {\n    let source: Bool = true\n    let result = not source\n    result\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_local_not_reports_operand_mismatch_and_recovers_as_bool() {
+    let source =
+        "pub fn negated(value: I32) -> Bool {\n    let result = not value\n    result\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let operand_start = source
+        .find("not value")
+        .map(|start| start + "not ".len())
+        .expect("not operand exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the invalid operand should recover to Bool for the tail:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a supported non-Bool operand should produce a type diagnostic, not a gate:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        operand_start,
+        operand_start + "value".len(),
+    );
+}
+
+#[test]
+fn primitive_local_not_diagnostics_follow_initializer_source_order() {
+    let source = concat!(
+        "pub fn ordered(non_bool: I32, bool_value: Bool) -> Bool {\n",
+        "    let first = not non_bool\n",
+        "    let second: I32 = not bool_value\n",
+        "    second\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let operand_start = source
+        .find("not non_bool")
+        .map(|start| start + "not ".len())
+        .expect("first not operand exists");
+    let initializer_start = source
+        .find("not bool_value")
+        .expect("second not initializer exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "both the operand and annotation errors should be reported, with Bool recovery through the tail:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "diagnosed not initializers and their Bool recovery should remain supported:\n{stdout}"
+    );
+    let operand_diagnostic = stdout
+        .find("\"message\":\"expected `Bool`, found `I32`\"")
+        .expect("first initializer's operand error exists");
+    let annotation_diagnostic = stdout
+        .find("\"message\":\"expected `I32`, found `Bool`\"")
+        .expect("second initializer's annotation error exists");
+    assert!(
+        operand_diagnostic < annotation_diagnostic,
+        "initializer diagnostics should follow source order:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        operand_start,
+        operand_start + "non_bool".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        initializer_start,
+        initializer_start + "not bool_value".len(),
+    );
+}
+
+#[test]
+fn unsupported_primitive_local_not_shapes_remain_gated() {
+    for source in [
+        "pub fn logical(flag: Bool) -> Bool {\n    let result = not not flag\n    result\n}\n",
+        "pub fn logical(flag: Bool) -> Bool {\n    let result = not true\n    result\n}\n",
+        "pub fn logical() -> Bool {\n    let inferred = 1\n    let result = not inferred\n    result\n}\n",
+        "pub fn logical(left: I32, right: I32) -> Bool {\n    let result = not (left == right)\n    result\n}\n",
+        "pub fn logical(left: Bool, right: Bool) -> Bool {\n    let result = not (left and right)\n    result\n}\n",
+        "pub fn logical(left: I32, right: I32) -> Bool {\n    let result = not (left + right)\n    result\n}\n",
+        "pub fn logical(flag: Bool) -> Bool {\n    let result = not missing\n    result\n}\n",
+        "pub fn logical(flag: Bool) -> Bool {\n    let result = not later\n    let later: Bool = flag\n    result\n}\n",
+        "pub fn logical(flag: Bool) -> Bool {\n    let result = not result\n    result\n}\n",
+        "type Flag = Bool\npub fn logical(flag: Flag) -> Bool {\n    let result = not flag\n    result\n}\n",
+        "const READY: Bool = true\npub fn logical(flag: Bool) -> Bool {\n    let result = not READY\n    result\n}\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+
+    let source = concat!(
+        "use acme:empty/values as values\n",
+        "pub fn logical(flag: Bool) -> Bool {\n",
+        "    let result = not values.READY\n",
+        "    result\n",
+        "}\n",
+    );
+    assert_check_stays_gated(
+        &run_check(
+            source,
+            "",
+            &[("src/values.sai", "pub const READY: Bool = true\n")],
+            &[],
+        ),
+        source,
+    );
+}
+
+#[test]
 fn public_unannotated_primitive_literal_local_emits_check_result() {
     for source in [
         "pub fn answer() -> I32 {\n    let value = 42\n    value\n}\n",
