@@ -6272,8 +6272,8 @@ fn check_function_body_annotated_primitive_local(
         let StmtKind::Let {
             pat,
             ty: Some(ty),
+            init,
             els: None,
-            ..
         } = stmt.kind
         else {
             return Ok(None);
@@ -6289,6 +6289,14 @@ fn check_function_body_annotated_primitive_local(
             return Ok(None);
         };
         if !function_name_is_supported(name, symbols, inputs) {
+            return Ok(None);
+        }
+        if let ExprKind::Path(path) = init.kind
+            && (path.root != PathRoot::Plain
+                || path.segments.len() != 1
+                || path.segments[0].args.is_some()
+                || !is_plain_ascii_identifier(path.segments[0].name, inputs))
+        {
             return Ok(None);
         }
         if !matches!(
@@ -24810,7 +24818,7 @@ mod tests {
     }
 
     #[test]
-    fn function_body_type_check_checks_multiple_annotated_locals_in_source_order() {
+    fn function_body_type_check_checks_multiple_annotated_locals_and_copies_in_source_order() {
         let root = concat!(
             "pub fn first_local() -> U8 {\n",
             "    let first: U8 = 7\n",
@@ -24827,6 +24835,17 @@ mod tests {
             "    let second: I8 = 128\n",
             "    first\n",
             "}\n",
+            "pub fn copy_chain() -> I32 {\n",
+            "    let first: I32 = 21\n",
+            "    let second: I32 = first\n",
+            "    let third: I32 = second\n",
+            "    third\n",
+            "}\n",
+            "pub fn copy_type_mismatch() -> Bool {\n",
+            "    let first: U8 = 7\n",
+            "    let second: I32 = first\n",
+            "    second\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -24842,7 +24861,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 3);
+        assert_eq!(resolved.owners().len(), 5);
         for owner in &resolved.owners()[..2] {
             assert!(matches!(
                 owner
@@ -24850,6 +24869,64 @@ mod tests {
                     .expect("supported multi-local body check succeeds"),
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
+        }
+
+        assert!(matches!(
+            resolved.owners()[3]
+                .body_type_check()
+                .expect("direct local copies are supported"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
+
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: copy_diagnostics,
+        } = resolved.owners()[4]
+            .body_type_check()
+            .expect("local-copy type errors are reported")
+        else {
+            panic!("local-copy type errors must not turn a supported body into a gate");
+        };
+        assert_eq!(
+            copy_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+            ]
+        );
+        assert_eq!(
+            copy_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["expected `I32`, found `U8`", "expected `Bool`, found `I32`",]
+        );
+        let copy_function_start = root
+            .find("pub fn copy_type_mismatch")
+            .expect("copy mismatch function exists");
+        let copy_function_end = root[copy_function_start..]
+            .find("\npub fn ")
+            .map_or(root.len(), |offset| copy_function_start + offset);
+        let copy_function_text = &root[copy_function_start..copy_function_end];
+        for (diagnostic, token) in copy_diagnostics.iter().zip(["first", "second"]) {
+            let relative_start = copy_function_text
+                .rfind(token)
+                .expect("copy diagnostic token exists in function");
+            let start = (copy_function_start + relative_start) as u32;
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("body type diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + token.len() as u32),
+                )
+                .expect("diagnostic token range is ordered")
+            );
         }
 
         let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[2]
@@ -24914,6 +24991,7 @@ mod tests {
     #[test]
     fn function_body_type_check_keeps_other_local_forms_unsupported() {
         let root = concat!(
+            "const ONE: I32 = 1\n",
             "type Number = I32\n",
             "pub fn unannotated() -> I32 {\n    let value = 42\n    value\n}\n",
             "pub fn mutable() -> I32 {\n    var value: I32 = 42\n    value\n}\n",
@@ -24923,6 +25001,10 @@ mod tests {
             "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second: I32 = 2\n    first\n}\n",
             "pub fn multiple_computed() -> I32 {\n    let first: I32 = 1\n    let second: I32 = 40 + 2\n    first\n}\n",
             "pub fn multiple_expr_stmt() -> I32 {\n    let first: I32 = 1\n    first\n    first\n}\n",
+            "pub fn raw_copy() -> I32 {\n    let value: I32 = 42\n    let copy: I32 = r#value\n    copy\n}\n",
+            "pub fn forward_copy() -> I32 {\n    let first: I32 = second\n    let second: I32 = 2\n    first\n}\n",
+            "pub fn self_copy() -> I32 {\n    let value: I32 = value\n    value\n}\n",
+            "pub fn constant_copy() -> I32 {\n    let copy: I32 = ONE\n    copy\n}\n",
             "pub fn nested() -> I32 {\n    let value: I32 = 42\n    { value }\n}\n",
             "pub fn camel_local() -> I32 {\n    let valueName: I32 = 42\n    valueName\n}\n",
             "pub fn raw_local() -> I32 {\n    let r#value: I32 = 42\n    r#value\n}\n",
@@ -24943,7 +25025,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 13);
+        assert_eq!(resolved.owners().len(), 17);
         for owner in resolved.owners() {
             assert!(matches!(
                 owner
