@@ -6373,6 +6373,9 @@ fn check_function_body_primitive_local_block(
                 };
                 let supported_shape = match operator {
                     BinOp::And | BinOp::Or => is_preceding_path(left) && is_preceding_path(right),
+                    BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
+                        is_preceding_path(left) && is_preceding_path(right)
+                    }
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                         (is_preceding_path(left) && is_preceding_path(right))
                             || (is_preceding_path(left)
@@ -6432,7 +6435,16 @@ fn check_function_body_primitive_local_block(
 fn is_function_primitive_local_binary_operator(operator: BinOp) -> bool {
     matches!(
         operator,
-        BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem | BinOp::And | BinOp::Or
+        BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::WrapAdd
+            | BinOp::WrapSub
+            | BinOp::WrapMul
+            | BinOp::And
+            | BinOp::Or
     ) || is_function_primitive_local_comparison_operator(operator)
 }
 
@@ -6487,7 +6499,7 @@ fn primitive_body_errors_to_diagnostics(
             return Ok(None);
         };
         use sai_ty::typeck::body::{
-            PrimitiveBodyErrorKind, PrimitiveLiteralKind, PrimitiveRemainderOperand,
+            PrimitiveBodyErrorKind, PrimitiveLiteralKind, PrimitiveOperatorOperand,
         };
         let diagnostic = match error.kind {
             PrimitiveBodyErrorKind::LiteralTypeMismatch { expected, found } => {
@@ -6545,15 +6557,29 @@ fn primitive_body_errors_to_diagnostics(
                 ),
                 "type mismatch",
             )?,
-            PrimitiveBodyErrorKind::OperatorNotSupported { operand } => {
+            PrimitiveBodyErrorKind::OperatorNotSupported { operator, operand } => {
+                let operator_text = match operator {
+                    BinOp::Rem => "%",
+                    BinOp::WrapAdd => "+%",
+                    BinOp::WrapSub => "-%",
+                    BinOp::WrapMul => "*%",
+                    _ => return Ok(None),
+                };
                 let message = match operand {
-                    PrimitiveRemainderOperand::Concrete(operand) => format!(
-                        "operator `%` is not defined for `{}`",
+                    PrimitiveOperatorOperand::Concrete(operand) => format!(
+                        "operator `{operator_text}` is not defined for `{}`",
                         const_primitive_name(operand)
                     ),
-                    PrimitiveRemainderOperand::FloatingPointLiteral => {
-                        "operator `%` is not defined for floating-point values".to_owned()
+                    PrimitiveOperatorOperand::FloatingPointLiteral => {
+                        format!(
+                            "operator `{operator_text}` is not defined for floating-point values"
+                        )
                     }
+                };
+                let label = if operator == BinOp::Rem {
+                    "floating-point remainder is not supported"
+                } else {
+                    "wrapping arithmetic is not supported for this primitive"
                 };
                 let mut diagnostic = const_literal_diagnostic(
                     owner.id,
@@ -6562,19 +6588,21 @@ fn primitive_body_errors_to_diagnostics(
                     span,
                     sai_diagnostics::Code::OperatorNotSupported,
                     message,
-                    "floating-point remainder is not supported",
+                    label,
                 )?;
-                diagnostic
-                    .push_child(Child {
-                        kind: ChildKind::Help,
-                        message:
-                            "use the floating-point `rem` method (for example, `left.rem(right)`)"
-                                .to_owned(),
-                        location: None,
-                    })
-                    .map_err(|_| {
-                        OwnerControlFlowResolutionError::InvalidSourceLocation(owner.id)
-                    })?;
+                if operator == BinOp::Rem {
+                    diagnostic
+                        .push_child(Child {
+                            kind: ChildKind::Help,
+                            message:
+                                "use the floating-point `rem` method (for example, `left.rem(right)`)"
+                                    .to_owned(),
+                            location: None,
+                        })
+                        .map_err(|_| {
+                            OwnerControlFlowResolutionError::InvalidSourceLocation(owner.id)
+                        })?;
+                }
                 diagnostic
             }
         };

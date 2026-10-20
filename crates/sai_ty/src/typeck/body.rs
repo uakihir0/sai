@@ -61,15 +61,16 @@ pub enum PrimitiveBodyErrorKind {
         found: PrimTy,
     },
     OperatorNotSupported {
-        operand: PrimitiveRemainderOperand,
+        operator: BinOp,
+        operand: PrimitiveOperatorOperand,
     },
 }
 
-/// An operand description for the unsupported floating-point remainder
-/// diagnostic. Float literals can still be unresolved when the operator is
-/// checked, so they must not be reported as a concrete `F64` prematurely.
+/// An operand description for an unsupported primitive operator diagnostic.
+/// Float literals can still be unresolved when checked, so they must not be
+/// reported as a concrete `F64` prematurely.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PrimitiveRemainderOperand {
+pub enum PrimitiveOperatorOperand {
     Concrete(PrimTy),
     FloatingPointLiteral,
 }
@@ -240,7 +241,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             ExprKind::Binary(operator, left, right) => {
                 if matches!(
                     operator,
-                    BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
+                    BinOp::Add
+                        | BinOp::Sub
+                        | BinOp::Mul
+                        | BinOp::Div
+                        | BinOp::Rem
+                        | BinOp::WrapAdd
+                        | BinOp::WrapSub
+                        | BinOp::WrapMul
                 ) {
                     let result = self.check_arithmetic(operator, left, right, init.hir_id)?;
                     if let Some(expected) = annotation {
@@ -319,6 +327,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     ) -> Result<LocalType, ()> {
         if operator == BinOp::Rem {
             return self.check_remainder(left, right, expression);
+        }
+        if matches!(operator, BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul) {
+            return self.check_wrapping(operator, left, right, expression);
         }
 
         if let ExprKind::Lit(literal) = left.kind {
@@ -449,7 +460,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     self.errors.push(PrimitiveBodyError {
                         node: expression,
                         kind: PrimitiveBodyErrorKind::OperatorNotSupported {
-                            operand: PrimitiveRemainderOperand::FloatingPointLiteral,
+                            operator: BinOp::Rem,
+                            operand: PrimitiveOperatorOperand::FloatingPointLiteral,
                         },
                     });
                 }
@@ -504,11 +516,64 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn report_unsupported_float_remainder(&mut self, node: HirId, operand: PrimTy) {
+        self.report_operator_not_supported(
+            node,
+            BinOp::Rem,
+            PrimitiveOperatorOperand::Concrete(operand),
+        );
+    }
+
+    fn check_wrapping(
+        &mut self,
+        operator: BinOp,
+        left: &'hir Expr<'hir>,
+        right: &'hir Expr<'hir>,
+        expression: HirId,
+    ) -> Result<LocalType, ()> {
+        let left_type = self
+            .check_local_path(left)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .filter(|primitive| supports_primitive_literal(*primitive))
+            .ok_or(())?;
+        let right_type = self
+            .check_local_path(right)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .filter(|primitive| supports_primitive_literal(*primitive))
+            .ok_or(())?;
+
+        // Operand typing for primitive numeric, Byte, and Bool left sides is
+        // left-directed. Char reaches the missing-trait operator diagnostic
+        // without a synthetic right-type mismatch.
+        if left_type != right_type && left_type != PrimTy::Char {
+            self.errors.push(PrimitiveBodyError {
+                node: right.hir_id,
+                kind: PrimitiveBodyErrorKind::TypeMismatch {
+                    expected: left_type,
+                    found: right_type,
+                },
+            });
+        }
+        if !is_integer_primitive(left_type) {
+            self.report_operator_not_supported(
+                expression,
+                operator,
+                PrimitiveOperatorOperand::Concrete(left_type),
+            );
+        }
+        Ok(LocalType::Concrete(left_type))
+    }
+
+    fn report_operator_not_supported(
+        &mut self,
+        node: HirId,
+        operator: BinOp,
+        operand: PrimitiveOperatorOperand,
+    ) {
         self.errors.push(PrimitiveBodyError {
             node,
-            kind: PrimitiveBodyErrorKind::OperatorNotSupported {
-                operand: PrimitiveRemainderOperand::Concrete(operand),
-            },
+            kind: PrimitiveBodyErrorKind::OperatorNotSupported { operator, operand },
         });
     }
 
