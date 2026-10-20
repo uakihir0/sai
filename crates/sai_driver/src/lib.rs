@@ -6754,25 +6754,24 @@ fn check_const_literal_leaf(
             Lit::Str(_) => Vec::new(),
             literal => vec![mismatch("Str", const_literal_found_type(literal))?],
         },
-        ConstLiteralType::Primitive(primitive) => match (primitive, literal) {
-            (sai_resolve::prelude::PrimTy::Bool, Lit::Bool(_)) => Vec::new(),
-            (sai_resolve::prelude::PrimTy::Char, Lit::Char(_))
-            | (sai_resolve::prelude::PrimTy::Byte, Lit::Byte(_)) => Vec::new(),
-            (
+        ConstLiteralType::Primitive(primitive) => {
+            match sai_ty::typeck::literal::check_primitive_literal(
                 primitive,
-                Lit::Int {
-                    value: number,
-                    negated,
-                },
-            ) if is_integer_primitive(primitive) => {
-                if const_integer_literal_fits(
-                    primitive,
-                    number,
-                    negated,
-                    target_cfg.pointer_width(),
-                ) {
-                    Vec::new()
-                } else {
+                literal,
+                symbols,
+                target_cfg.pointer_width(),
+            ) {
+                sai_ty::typeck::literal::PrimitiveLiteralResult::Match => Vec::new(),
+                sai_ty::typeck::literal::PrimitiveLiteralResult::TypeMismatch => vec![mismatch(
+                    const_primitive_name(primitive),
+                    const_literal_found_type(literal),
+                )?],
+                sai_ty::typeck::literal::PrimitiveLiteralResult::OutOfRange => {
+                    let label = if matches!(literal, Lit::Int { .. }) {
+                        "integer"
+                    } else {
+                        "floating-point"
+                    };
                     vec![const_literal_diagnostic(
                         owner.id,
                         inputs,
@@ -6780,43 +6779,14 @@ fn check_const_literal_leaf(
                         value.span,
                         sai_diagnostics::Code::LiteralOutOfRange,
                         format!(
-                            "integer literal is out of range for `{}`",
+                            "{label} literal is out of range for `{}`",
                             const_primitive_name(primitive)
                         ),
                         "literal out of range",
                     )?]
                 }
             }
-            (primitive, Lit::Float { text, negated })
-                if is_fixed_width_float_primitive(primitive) =>
-            {
-                let text = symbols.resolve(text).ok();
-                if text
-                    .as_deref()
-                    .and_then(|text| round_const_float_literal(primitive, text, negated))
-                    .is_some_and(ConstFloatValue::is_finite)
-                {
-                    Vec::new()
-                } else {
-                    vec![const_literal_diagnostic(
-                        owner.id,
-                        inputs,
-                        snapshot,
-                        value.span,
-                        sai_diagnostics::Code::LiteralOutOfRange,
-                        format!(
-                            "floating-point literal is out of range for `{}`",
-                            const_primitive_name(primitive)
-                        ),
-                        "literal out of range",
-                    )?]
-                }
-            }
-            (primitive, literal) => vec![mismatch(
-                const_primitive_name(primitive),
-                const_literal_found_type(literal),
-            )?],
-        },
+        }
     };
     Ok(Some(diagnostics))
 }
@@ -6874,115 +6844,11 @@ fn is_supported_const_name_convention(name: &str, written_name: &str) -> bool {
 }
 
 fn is_supported_const_literal_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
-    matches!(
-        primitive,
-        sai_resolve::prelude::PrimTy::Bool
-            | sai_resolve::prelude::PrimTy::Char
-            | sai_resolve::prelude::PrimTy::Byte
-            | sai_resolve::prelude::PrimTy::F32
-            | sai_resolve::prelude::PrimTy::F64
-    ) || is_integer_primitive(primitive)
-}
-
-fn is_fixed_width_float_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
-    matches!(
-        primitive,
-        sai_resolve::prelude::PrimTy::F32 | sai_resolve::prelude::PrimTy::F64
-    )
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum ConstFloatValue {
-    F32(f32),
-    F64(f64),
-}
-
-impl ConstFloatValue {
-    fn is_finite(self) -> bool {
-        match self {
-            Self::F32(value) => value.is_finite(),
-            Self::F64(value) => value.is_finite(),
-        }
-    }
-}
-
-fn round_const_float_literal(
-    primitive: sai_resolve::prelude::PrimTy,
-    text: &str,
-    negated: bool,
-) -> Option<ConstFloatValue> {
-    match primitive {
-        sai_resolve::prelude::PrimTy::F32 => {
-            let value = text.parse::<f32>().ok()?;
-            Some(ConstFloatValue::F32(if negated { -value } else { value }))
-        }
-        sai_resolve::prelude::PrimTy::F64 => {
-            let value = text.parse::<f64>().ok()?;
-            Some(ConstFloatValue::F64(if negated { -value } else { value }))
-        }
-        _ => None,
-    }
-}
-
-fn is_fixed_width_integer_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
-    matches!(
-        primitive,
-        sai_resolve::prelude::PrimTy::I8
-            | sai_resolve::prelude::PrimTy::I16
-            | sai_resolve::prelude::PrimTy::I32
-            | sai_resolve::prelude::PrimTy::I64
-            | sai_resolve::prelude::PrimTy::U8
-            | sai_resolve::prelude::PrimTy::U16
-            | sai_resolve::prelude::PrimTy::U32
-            | sai_resolve::prelude::PrimTy::U64
-    )
+    sai_ty::typeck::literal::supports_primitive_literal(primitive)
 }
 
 fn is_integer_primitive(primitive: sai_resolve::prelude::PrimTy) -> bool {
-    is_fixed_width_integer_primitive(primitive)
-        || matches!(
-            primitive,
-            sai_resolve::prelude::PrimTy::ISize | sai_resolve::prelude::PrimTy::USize
-        )
-}
-
-fn const_integer_literal_fits(
-    primitive: sai_resolve::prelude::PrimTy,
-    value: Option<u128>,
-    negated: bool,
-    pointer_width: u8,
-) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    let (signed, width) = match primitive {
-        sai_resolve::prelude::PrimTy::I8 => (true, 8),
-        sai_resolve::prelude::PrimTy::I16 => (true, 16),
-        sai_resolve::prelude::PrimTy::I32 => (true, 32),
-        sai_resolve::prelude::PrimTy::I64 => (true, 64),
-        sai_resolve::prelude::PrimTy::U8 => (false, 8),
-        sai_resolve::prelude::PrimTy::U16 => (false, 16),
-        sai_resolve::prelude::PrimTy::U32 => (false, 32),
-        sai_resolve::prelude::PrimTy::U64 => (false, 64),
-        sai_resolve::prelude::PrimTy::ISize => (true, pointer_width),
-        sai_resolve::prelude::PrimTy::USize => (false, pointer_width),
-        _ => return false,
-    };
-    if !matches!(width, 8 | 16 | 32 | 64) {
-        return false;
-    }
-    if signed {
-        let negative_limit = 1u128 << (width - 1);
-        if negated {
-            value <= negative_limit
-        } else {
-            value < negative_limit
-        }
-    } else if negated {
-        value == 0
-    } else {
-        value <= (1u128 << width) - 1
-    }
+    sai_ty::typeck::literal::is_integer_primitive(primitive)
 }
 
 fn const_primitive_name(primitive: sai_resolve::prelude::PrimTy) -> &'static str {
@@ -26894,68 +26760,6 @@ mod tests {
     }
 
     #[test]
-    fn const_integer_literal_range_covers_every_fixed_width_integer_primitive() {
-        use sai_resolve::prelude::PrimTy;
-
-        for (primitive, sign_bit) in [
-            (PrimTy::I8, 7),
-            (PrimTy::I16, 15),
-            (PrimTy::I32, 31),
-            (PrimTy::I64, 63),
-        ] {
-            let boundary = 1u128 << sign_bit;
-            assert!(const_integer_literal_fits(
-                primitive,
-                Some(boundary),
-                true,
-                64
-            ));
-            assert!(!const_integer_literal_fits(
-                primitive,
-                Some(boundary + 1),
-                true,
-                64
-            ));
-            assert!(const_integer_literal_fits(
-                primitive,
-                Some(boundary - 1),
-                false,
-                64
-            ));
-            assert!(!const_integer_literal_fits(
-                primitive,
-                Some(boundary),
-                false,
-                64
-            ));
-        }
-        for (primitive, width) in [
-            (PrimTy::U8, 8),
-            (PrimTy::U16, 16),
-            (PrimTy::U32, 32),
-            (PrimTy::U64, 64),
-        ] {
-            let maximum = (1u128 << width) - 1;
-            assert!(const_integer_literal_fits(
-                primitive,
-                Some(maximum),
-                false,
-                64
-            ));
-            assert!(!const_integer_literal_fits(
-                primitive,
-                Some(maximum + 1),
-                false,
-                64
-            ));
-            assert!(const_integer_literal_fits(primitive, Some(0), true, 64));
-            assert!(!const_integer_literal_fits(primitive, Some(1), true, 64));
-        }
-        assert!(!const_integer_literal_fits(PrimTy::I64, None, false, 64));
-        assert!(!const_integer_literal_fits(PrimTy::U64, None, false, 64));
-    }
-
-    #[test]
     fn const_pointer_sized_integer_literals_use_the_selected_target_width() {
         use sai_resolve::prelude::PrimTy;
 
@@ -27602,58 +27406,6 @@ mod tests {
             assert!(diagnostics[0].has_workspace_snapshot());
             assert!(diagnostics[0].primary().is_some());
         }
-    }
-
-    #[test]
-    fn const_float_literal_rounding_is_ties_to_even_and_never_double_rounds_f32() {
-        use sai_resolve::prelude::PrimTy;
-
-        assert_eq!(
-            round_const_float_literal(PrimTy::F32, "1.000000059604644775390625", false),
-            Some(ConstFloatValue::F32(1.0)),
-            "the exact f32 midpoint rounds to the even lower significand"
-        );
-        assert_eq!(
-            round_const_float_literal(PrimTy::F32, "1.000000059604644775390626", false),
-            Some(ConstFloatValue::F32(f32::from_bits(1.0f32.to_bits() + 1))),
-            "direct f32 parsing retains the decimal value above the midpoint"
-        );
-        assert_eq!(
-            round_const_float_literal(
-                PrimTy::F64,
-                "1.00000000000000011102230246251565404236316680908203125",
-                false
-            ),
-            Some(ConstFloatValue::F64(1.0)),
-            "the exact f64 midpoint rounds to the even lower significand"
-        );
-        assert_eq!(
-            round_const_float_literal(PrimTy::F32, "1.25", true),
-            Some(ConstFloatValue::F32(-1.25)),
-            "the direct negative sign is retained"
-        );
-        assert_eq!(
-            round_const_float_literal(PrimTy::F32, "1e-50", false),
-            Some(ConstFloatValue::F32(0.0)),
-            "a nonzero value may round to positive zero"
-        );
-        assert_eq!(
-            round_const_float_literal(PrimTy::F64, "1e-400", false),
-            Some(ConstFloatValue::F64(0.0)),
-            "a nonzero value may round to positive zero"
-        );
-        assert!(
-            !round_const_float_literal(PrimTy::F32, "3.4028236e38", false)
-                .expect("valid F32 decimal parses")
-                .is_finite(),
-            "rounding a finite decimal to infinity is diagnosed"
-        );
-        assert!(
-            !round_const_float_literal(PrimTy::F64, "1.7976931348623159e308", false)
-                .expect("valid F64 decimal parses")
-                .is_finite(),
-            "rounding a finite decimal to infinity is diagnosed"
-        );
     }
 
     #[test]
