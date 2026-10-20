@@ -1,0 +1,20 @@
+pub fn applied_discount(subtotal_cents: U32, requested_cents: U32) -> U32 {
+    if requested_cents > subtotal_cents {
+        subtotal_cents
+    } else {
+        requested_cents
+    }
+}
+
+pub fn tax_cents(taxable_cents: U32) -> U32 {
+    // This sample uses an 8% rate and rounds down to a whole cent.
+    taxable_cents * 8 / 100
+}
+
+pub fn total_cents(
+    subtotal_cents: U32,
+    discount_cents: U32,
+    tax_cents: U32
+) -> U32 {
+    subtotal_cents - discount_cents + tax_cents
+}
