@@ -243,6 +243,142 @@ fn annotated_primitive_local_reports_semantic_errors_without_a_feature_gate() {
 }
 
 #[test]
+fn public_unannotated_primitive_literal_local_emits_check_result() {
+    for source in [
+        "pub fn answer() -> I32 {\n    let value = 42\n    value\n}\n",
+        "pub fn ratio() -> F32 {\n    let value = 1.25\n    value\n}\n",
+        "pub fn ready() -> Bool {\n    let value = true\n    value\n}\n",
+        "pub fn marker() -> Byte {\n    let value = b'z'\n    value\n}\n",
+        "pub fn letter() -> Char {\n    let value = 'z'\n    value\n}\n",
+        "pub fn pointer_max() -> USize {\n    let value = 4294967295\n    value\n}\n",
+        "pub fn pointer_min() -> ISize {\n    let value = -2147483648\n    value\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+
+    assert_success_result(
+        run_check(
+            "pub fn pointer_size() -> USize {\n    let value = 4294967296\n    value\n}\n",
+            "targets { wasm32-core, wasm64-core }\n",
+            &[],
+            &["--target", "wasm64-core"],
+        ),
+        "wasm64-core",
+        "dev",
+    );
+}
+
+#[test]
+fn unannotated_primitive_literal_local_reports_semantic_errors_without_a_feature_gate() {
+    for (source, code, message, token) in [
+        (
+            "pub fn overflow() -> I8 {\n    let value = 128\n    value\n}\n",
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `I8`",
+            "128",
+        ),
+        (
+            "pub fn mismatch() -> Bool {\n    let value = 42\n    value\n}\n",
+            "TYPE_MISMATCH",
+            "expected `Bool`, found an integer literal",
+            "value",
+        ),
+        (
+            "pub fn mismatch() -> F32 {\n    let value = 42\n    value\n}\n",
+            "TYPE_MISMATCH",
+            "expected `F32`, found an integer literal",
+            "value",
+        ),
+        (
+            "pub fn mismatch() -> I32 {\n    let value = 1.25\n    value\n}\n",
+            "TYPE_MISMATCH",
+            "expected `I32`, found a floating-point literal",
+            "value",
+        ),
+        (
+            "pub fn mismatch() -> I32 {\n    let value = true\n    value\n}\n",
+            "TYPE_MISMATCH",
+            "expected `I32`, found `Bool`",
+            "value",
+        ),
+        (
+            "pub fn overflow() -> F32 {\n    let value = 3.4028236e38\n    value\n}\n",
+            "LITERAL_OUT_OF_RANGE",
+            "floating-point literal is out of range for `F32`",
+            "3.4028236e38",
+        ),
+        (
+            "pub fn overflow() -> USize {\n    let value = 4294967296\n    value\n}\n",
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `USize`",
+            "4294967296",
+        ),
+        (
+            "pub fn overflow() -> ISize {\n    let value = -2147483649\n    value\n}\n",
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `ISize`",
+            "-2147483649",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let start = if code == "LITERAL_OUT_OF_RANGE" {
+            source.find(token)
+        } else {
+            source.rfind(token)
+        }
+        .expect("diagnostic token exists");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\""))
+                && stdout.contains(message)
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\"")
+                && stdout.contains(&format!("\"start\":{{\"byte\":{start},")),
+            "supported unannotated-local error should use its specification span:\n{stdout}"
+        );
+    }
+
+    let source = "pub fn mismatch_and_default_overflow() -> Bool {\n    let value = 340282366920938463463374607431768211456\n    value\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let initializer_start = source
+        .find("340282366920938463463374607431768211456")
+        .expect("large initializer exists");
+    let tail_start = source.rfind("value").expect("tail path exists");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"message\":\"expected `Bool`, found an integer literal\"")
+            && stdout.contains("\"message\":\"integer literal is out of range for `I64`\"")
+            && stdout.contains(&format!("\"start\":{{\"byte\":{initializer_start},"))
+            && stdout.contains(&format!("\"start\":{{\"byte\":{tail_start},"))
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the tail mismatch and defaulting range error must retain their own spans:\n{stdout}"
+    );
+
+    let source = "pub fn mismatch_and_default_float_overflow() -> I32 {\n    let value = 1e309\n    value\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let initializer_start = source
+        .find("1e309")
+        .expect("large float initializer exists");
+    let tail_start = source.rfind("value").expect("tail path exists");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && stdout.contains("\"message\":\"expected `I32`, found a floating-point literal\"")
+            && stdout.contains("\"message\":\"floating-point literal is out of range for `F64`\"")
+            && stdout.contains(&format!("\"start\":{{\"byte\":{initializer_start},"))
+            && stdout.contains(&format!("\"start\":{{\"byte\":{tail_start},"))
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the floating-point defaulting range error and tail mismatch must retain their spans:\n{stdout}"
+    );
+}
+
+#[test]
 fn public_zero_parameter_explicit_unit_function_emits_check_result() {
     for source in ["pub fn empty() -> () {}\n", "pub fn unit() -> () { () }\n"] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
@@ -1047,7 +1183,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
     for source in [
         "pub fn add(value: I32) -> I32 { value + 1 }\n",
         "pub fn local(value: I32) -> I32 { let next = value; next }\n",
-        "pub fn local() -> I32 {\nlet value = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nvar value: I32 = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet var value: I32 = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 40 + 2\nvalue\n}\n",
@@ -1064,6 +1199,13 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local() -> I32 {\nlet valueName: I32 = 42\nvalueName\n}\n",
         "pub fn local() -> I32 {\nlet r#value: I32 = 42\nr#value\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nr#value\n}\n",
+        "pub fn local() -> I32 {\nlet value = 40 + 2\nvalue\n}\n",
+        "pub fn local() -> I32 {\nlet first = 1\nlet second = 2\nfirst\n}\n",
+        "pub fn local() -> I32 {\nlet valueName = 42\nvalueName\n}\n",
+        "pub fn local() -> I32 {\nlet r#value = 42\nr#value\n}\n",
+        "pub fn local() -> I32 {\nlet value = 42\nr#value\n}\n",
+        "const ONE: I32 = 1\npub fn local() -> I32 {\nlet value = 42\nONE\n}\n",
+        "pub fn local() -> Str {\nlet value = \"text\"\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet (first, second): (I32, I32) = (1, 2)\nfirst\n}\n",
         "pub fn local() -> I32 { let 0: I32 = 42 else { return 0 }\n1\n}\n",
         "pub fn local() -> I32 { let value: I32 = \"text\"\nvalue\n}\n",
