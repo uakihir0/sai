@@ -1,0 +1,163 @@
+use acme:profile-check/model.{ConfigError, Profile, ProfileDraft, Visibility}
+
+fn parse_number(field: Str, value: Str) -> Result<U16, ConfigError> {
+    match U16.parse(value) { Ok(parsed) => Ok(parsed), Err(_) => Err(ConfigError.BadNumber(field)) }
+}
+
+fn parse_visibility(value: Str) -> Result<Visibility, ConfigError>
+    borrows { value }
+{
+    if value == "public" {
+        Ok(Visibility.Public)
+    } else if value == "private" {
+        Ok(Visibility.Private)
+    } else if value == "unlisted" {
+        Ok(Visibility.Unlisted)
+    } else {
+        Err(ConfigError.UnknownVisibility(value))
+    }
+}
+
+pub fn parse(text: Str) -> Result<Profile, ConfigError>
+    borrows { text }
+{
+    var name: Option<Str> = None
+    var email: Option<Str> = None
+    var age: Option<U16> = None
+    var visibility: Option<Visibility> = None
+    var daily_goal: Option<U16> = None
+    var line_number: USize = 1
+
+    for raw_line in text.lines() {
+        let line = raw_line.trim()
+        if not line.is_empty() and not line.starts_with("#") {
+            let (key, value) = match line.split_once("=") {
+                Some(pair) => pair
+                None => return Err(ConfigError.MalformedLine(line_number))
+            }
+            let trimmed_key = key.trim()
+            let trimmed_value = value.trim()
+
+            if trimmed_key == "name" {
+                match name {
+                    None => {
+                        name = Some(trimmed_value)
+                    }
+                    Some(_) => return Err(ConfigError.DuplicateKey("name"))
+                }
+            } else if trimmed_key == "email" {
+                match email {
+                    None => {
+                        email = Some(trimmed_value)
+                    }
+                    Some(_) => return Err(ConfigError.DuplicateKey("email"))
+                }
+            } else if trimmed_key == "age" {
+                match age {
+                    None => {
+                        age = Some(parse_number("age", trimmed_value)?)
+                    }
+                    Some(_) => return Err(ConfigError.DuplicateKey("age"))
+                }
+            } else if trimmed_key == "visibility" {
+                match visibility {
+                    None => {
+                        visibility = Some(parse_visibility(trimmed_value)?)
+                    }
+                    Some(_) => return Err(ConfigError.DuplicateKey("visibility"))
+                }
+            } else if trimmed_key == "daily_goal" {
+                match daily_goal {
+                    None => {
+                        daily_goal = Some(parse_number("daily_goal", trimmed_value)?)
+                    }
+                    Some(_) => return Err(ConfigError.DuplicateKey("daily_goal"))
+                }
+            } else {
+                return Err(ConfigError.UnknownKey(trimmed_key))
+            }
+        }
+        line_number += 1
+    }
+
+    let parsed_name = match name {
+        Some(value) => value
+        None => return Err(ConfigError.MissingName)
+    }
+    let parsed_email = match email {
+        Some(value) => value
+        None => return Err(ConfigError.MissingEmail)
+    }
+    let parsed_age = match age { Some(value) => value, None => return Err(ConfigError.MissingAge) }
+    let parsed_visibility = match visibility {
+        Some(value) => value
+        None => return Err(ConfigError.MissingVisibility)
+    }
+    let parsed_daily_goal = match daily_goal {
+        Some(value) => value
+        None => return Err(ConfigError.MissingDailyGoal)
+    }
+
+    validate(
+        ProfileDraft(
+            name: Some(parsed_name),
+            email: Some(parsed_email),
+            age: Some(parsed_age),
+            visibility: Some(parsed_visibility),
+            daily_goal: Some(parsed_daily_goal),
+        ),
+    )
+}
+
+fn plausible_email(email: Str) -> Bool {
+    match email.split_once("@") {
+        Some((local, domain)) => {
+            (
+                not local.is_empty()
+                and not domain.is_empty()
+                and not domain.contains("@")
+                and domain.contains(".")
+                and not domain.starts_with(".")
+                and not domain.ends_with(".")
+            )
+        }
+        None => false
+    }
+}
+
+pub fn validate(draft: ProfileDraft) -> Result<Profile, ConfigError>
+    borrows { draft }
+{
+    let name = match draft.name {
+        Some(value) => value
+        None => return Err(ConfigError.MissingName)
+    }
+    let email = match draft.email {
+        Some(value) => value
+        None => return Err(ConfigError.MissingEmail)
+    }
+    let age = match draft.age { Some(value) => value, None => return Err(ConfigError.MissingAge) }
+    let visibility = match draft.visibility {
+        Some(value) => value
+        None => return Err(ConfigError.MissingVisibility)
+    }
+    let daily_goal = match draft.daily_goal {
+        Some(value) => value
+        None => return Err(ConfigError.MissingDailyGoal)
+    }
+
+    if name.trim().is_empty() {
+        return Err(ConfigError.EmptyName)
+    }
+    if not plausible_email(email) {
+        return Err(ConfigError.InvalidEmail)
+    }
+    if age < 13 or age > 120 {
+        return Err(ConfigError.AgeOutOfRange(age))
+    }
+    if daily_goal < 1 or daily_goal > 12 {
+        return Err(ConfigError.DailyGoalOutOfRange(daily_goal))
+    }
+
+    Ok(Profile(name: name, email: email, age: age, visibility: visibility, daily_goal: daily_goal))
+}

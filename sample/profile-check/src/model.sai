@@ -1,0 +1,39 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Visibility {
+    Public
+    Private
+    Unlisted
+}
+
+pub enum ConfigError {
+    MalformedLine(USize)
+    DuplicateKey(Str)
+    UnknownKey(Str)
+    MissingName
+    MissingEmail
+    MissingAge
+    MissingVisibility
+    MissingDailyGoal
+    BadNumber(Str)
+    UnknownVisibility(Str)
+    EmptyName
+    InvalidEmail
+    AgeOutOfRange(U16)
+    DailyGoalOutOfRange(U16)
+}
+
+pub type ProfileDraft {
+    pub name: Option<Str>
+    pub email: Option<Str>
+    pub age: Option<U16>
+    pub visibility: Option<Visibility>
+    pub daily_goal: Option<U16>
+}
+
+pub type Profile {
+    pub name: Str
+    pub email: Str
+    pub age: U16
+    pub visibility: Visibility
+    pub daily_goal: U16
+}
