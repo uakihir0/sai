@@ -2273,7 +2273,7 @@ pub enum OpRes {
 }
 ```
 
-`TypeckResults::op_res[e]` records it. Whether a built-in arithmetic operation is checked for overflow is not decided here: [impl/04](04-mir.md) §4.9 emits the checks for every built-in operation by its type.
+`TypeckResults::op_res[e]` records it. This chapter does not decide whether a built-in arithmetic operation is checked for overflow; [impl/04](04-mir.md) §4.9 specifies the MIR checks required for each built-in operation by type.
 
 The **IR-765 flat-local addition slice** is narrower than general operator checking: it accepts one direct `+` in an immutable single-name local initializer only when both operands are plain paths resolved to parameters or preceding locals by binding identity. Both resolved operand types must be the same primitive integer type or the same `F32`/`F64` type. A right-operand mismatch points to the right path and recovers with the left type; a bad annotation points to the whole initializer and leaves the local at its declared type. At IR-765, literal operands, nested expressions, nonnumeric primitives, custom aliases, and other forms were gated; IR-767/768 later added one direct numeric literal on the right for `+` and for `-`/`*`. Nested expressions, nonnumeric primitives, custom aliases, and other unsupported forms remain gated.
 
