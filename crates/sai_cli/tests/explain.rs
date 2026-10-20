@@ -175,7 +175,7 @@ fn explain_type_mismatch_serializes_the_exact_json_record() {
 }
 
 #[test]
-fn explanation_example_and_fix_compile_with_the_documented_result() {
+fn explanation_example_is_rejected_and_fix_is_semantically_checked() {
     let example = source_block(TYPE_MISMATCH_MARKDOWN, "Example");
     let fix = source_block(TYPE_MISMATCH_MARKDOWN, "Fix");
 
