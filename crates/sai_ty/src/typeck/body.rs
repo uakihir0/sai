@@ -68,7 +68,8 @@ pub enum PrimitiveLiteralKind {
     Character,
 }
 
-/// Check one immutable, annotated primitive local followed by a tail read.
+/// Check one or more immutable, annotated primitive locals followed by a tail
+/// read.
 ///
 /// Statements and expressions are checked in order. The local becomes
 /// available to the tail expression only after its initializer has been
@@ -107,7 +108,7 @@ struct FnCtxt<'a, 'hir> {
 
 impl FnCtxt<'_, '_> {
     fn check_block(&mut self, block: &Block<'_>) -> Result<(), ()> {
-        if block.safety != Safety::Safe || block.stmts.len() != 1 {
+        if block.safety != Safety::Safe || block.stmts.is_empty() {
             return Err(());
         }
 

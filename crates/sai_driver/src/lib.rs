@@ -6250,45 +6250,9 @@ fn check_function_body_annotated_primitive_local(
     let ExprKind::Block(block) = body.value.kind else {
         return Ok(None);
     };
-    let [stmt] = block.stmts else {
-        return Ok(None);
-    };
-    let StmtKind::Let {
-        pat,
-        ty: Some(ty),
-        els: None,
-        ..
-    } = stmt.kind
-    else {
-        return Ok(None);
-    };
-    let PatKind::Binding {
-        mode: sai_hir::patterns::BindingMode::Value,
-        name,
-        binding,
-        sub: None,
-        ..
-    } = pat.kind
-    else {
-        return Ok(None);
-    };
-    if !function_name_is_supported(name, symbols, inputs) {
+    if block.stmts.is_empty() {
         return Ok(None);
     }
-    if !matches!(
-        locals.bindings.get(&binding),
-        Some(sai_resolve::owner::LocalBinding {
-            kind: sai_resolve::owner::BindingKind::Let,
-            ..
-        })
-    ) {
-        return Ok(None);
-    }
-    let Some(FunctionDirectType::Primitive(local_type)) =
-        resolve_function_direct_type(*ty, type_paths, symbols, inputs)
-    else {
-        return Ok(None);
-    };
     let Some(tail) = block.tail else {
         return Ok(None);
     };
@@ -6303,7 +6267,46 @@ fn check_function_body_annotated_primitive_local(
         return Ok(None);
     }
 
-    let primitive_types = HashMap::from([(ty.hir_id, local_type)]);
+    let mut primitive_types = HashMap::new();
+    for stmt in block.stmts {
+        let StmtKind::Let {
+            pat,
+            ty: Some(ty),
+            els: None,
+            ..
+        } = stmt.kind
+        else {
+            return Ok(None);
+        };
+        let PatKind::Binding {
+            mode: sai_hir::patterns::BindingMode::Value,
+            name,
+            binding,
+            sub: None,
+            ..
+        } = pat.kind
+        else {
+            return Ok(None);
+        };
+        if !function_name_is_supported(name, symbols, inputs) {
+            return Ok(None);
+        }
+        if !matches!(
+            locals.bindings.get(&binding),
+            Some(sai_resolve::owner::LocalBinding {
+                kind: sai_resolve::owner::BindingKind::Let,
+                ..
+            })
+        ) {
+            return Ok(None);
+        }
+        let Some(FunctionDirectType::Primitive(local_type)) =
+            resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+        else {
+            return Ok(None);
+        };
+        primitive_types.insert(ty.hir_id, local_type);
+    }
     let local_paths = locals
         .paths
         .iter()
@@ -6329,17 +6332,18 @@ fn check_function_body_annotated_primitive_local(
     let sai_ty::typeck::body::PrimitiveBodyCheck::Supported { errors } = check else {
         return Ok(None);
     };
-    let StmtKind::Let { init, .. } = stmt.kind else {
-        return Ok(None);
-    };
 
     let mut diagnostics = Vec::with_capacity(errors.len());
     for error in errors {
-        let span = if error.node == init.hir_id {
-            init.span
-        } else if error.node == tail.hir_id {
-            tail.span
-        } else {
+        let span = block
+            .stmts
+            .iter()
+            .find_map(|stmt| match stmt.kind {
+                StmtKind::Let { init, .. } if init.hir_id == error.node => Some(init.span),
+                _ => None,
+            })
+            .or_else(|| (error.node == tail.hir_id).then_some(tail.span));
+        let Some(span) = span else {
             return Ok(None);
         };
         use sai_ty::typeck::body::{PrimitiveBodyErrorKind, PrimitiveLiteralKind};
@@ -24806,6 +24810,108 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_checks_multiple_annotated_locals_in_source_order() {
+        let root = concat!(
+            "pub fn first_local() -> U8 {\n",
+            "    let first: U8 = 7\n",
+            "    let second: I32 = 42\n",
+            "    first\n",
+            "}\n",
+            "pub fn last_local() -> I32 {\n",
+            "    let first: U8 = 7\n",
+            "    let second: I32 = 42\n",
+            "    second\n",
+            "}\n",
+            "pub fn mixed_errors() -> Bool {\n",
+            "    let first: I32 = true\n",
+            "    let second: I8 = 128\n",
+            "    first\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 3);
+        for owner in &resolved.owners()[..2] {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("supported multi-local body check succeeds"),
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ));
+        }
+
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[2]
+            .body_type_check()
+            .expect("supported multi-local errors are reported")
+        else {
+            panic!("semantic errors must not turn a supported multi-local body into a gate");
+        };
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                sai_diagnostics::Code::TypeMismatch,
+            ]
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "expected `I32`, found a Bool literal",
+                "integer literal is out of range for `I8`",
+                "expected `Bool`, found `I32`",
+            ]
+        );
+
+        let function_start = root
+            .find("pub fn mixed_errors")
+            .expect("mixed-error function exists");
+        let function_end = root[function_start..]
+            .find("\npub fn ")
+            .map_or(root.len(), |offset| function_start + offset);
+        let function_text = &root[function_start..function_end];
+        for (diagnostic, token) in diagnostics.iter().zip(["true", "128", "first"]) {
+            let relative_start = if token == "first" {
+                function_text.rfind(token)
+            } else {
+                function_text.find(token)
+            }
+            .expect("diagnostic token exists in function");
+            let start = (function_start + relative_start) as u32;
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("body type diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + token.len() as u32),
+                )
+                .expect("diagnostic token range is ordered")
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_keeps_other_local_forms_unsupported() {
         let root = concat!(
             "type Number = I32\n",
@@ -24813,7 +24919,10 @@ mod tests {
             "pub fn mutable() -> I32 {\n    var value: I32 = 42\n    value\n}\n",
             "pub fn mutable_let() -> I32 {\n    let var value: I32 = 42\n    value\n}\n",
             "pub fn computed() -> I32 {\n    let value: I32 = 40 + 2\n    value\n}\n",
-            "pub fn multiple() -> I32 {\n    let first: I32 = 1\n    let second: I32 = 2\n    first\n}\n",
+            "pub fn multiple_unannotated() -> I32 {\n    let first: I32 = 1\n    let second = 2\n    first\n}\n",
+            "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second: I32 = 2\n    first\n}\n",
+            "pub fn multiple_computed() -> I32 {\n    let first: I32 = 1\n    let second: I32 = 40 + 2\n    first\n}\n",
+            "pub fn multiple_expr_stmt() -> I32 {\n    let first: I32 = 1\n    first\n    first\n}\n",
             "pub fn nested() -> I32 {\n    let value: I32 = 42\n    { value }\n}\n",
             "pub fn camel_local() -> I32 {\n    let valueName: I32 = 42\n    valueName\n}\n",
             "pub fn raw_local() -> I32 {\n    let r#value: I32 = 42\n    r#value\n}\n",
@@ -24834,7 +24943,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 10);
+        assert_eq!(resolved.owners().len(), 13);
         for owner in resolved.owners() {
             assert!(matches!(
                 owner
