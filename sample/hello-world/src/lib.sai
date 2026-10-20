@@ -1,0 +1,4 @@
+pub fn answer() -> I32 {
+    let answer: I32 = 42
+    answer
+}
