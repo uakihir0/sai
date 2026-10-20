@@ -1,0 +1,35 @@
+use acme:event-planner/report
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        report.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    let command = args[1].as_str()
+    if command == "sessions" {
+        report.print_sessions(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "registrations" {
+        report.print_registrations(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "summary" {
+        report.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "conflicts" {
+        report.print_conflicts(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    out.write_str("usage: event-planner [sessions|registrations|summary|conflicts]\n")
+    process.ExitCode.failure()
+}

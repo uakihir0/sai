@@ -18,3 +18,6 @@ every project builds today.
 - [`market-checkout`](market-checkout/README.md) models a small market's
   catalog, orders, stock checks, discounts, tax, and operator reports across
   several modules.
+- [`event-planner`](event-planner/README.md) tracks event sessions, attendee
+  registrations, capacity-based waitlists, open seats, and confirmed schedule
+  conflicts across several modules.
