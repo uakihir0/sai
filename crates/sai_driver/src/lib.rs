@@ -5886,9 +5886,7 @@ fn check_function_body_type(
     {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     }
-    if (sig.params.is_empty() && body.params.is_empty())
-        || (sig.params.len() == 1 && body.params.len() == 1)
-    {
+    if sig.params.len() == body.params.len() {
         if let Some(diagnostics) = check_function_body_primitive_local_block(
             owner, sig, body, locals, type_paths, symbols, inputs, snapshot, target_cfg,
         )? {
@@ -6242,35 +6240,36 @@ fn check_function_body_primitive_local_block(
     target_cfg: &TargetCfg,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     let mut initial_bindings = HashMap::new();
-    match (sig.params, body.params) {
-        ([], []) => {}
-        ([parameter], [body_parameter])
-            if !parameter.is_self
-                && !parameter.mutable
-                && !body_parameter.mutable
-                && parameter
-                    .name
-                    .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
-                && parameter.name == body_parameter.name
-                && matches!(
-                    locals.bindings.get(&body_parameter.binding),
-                    Some(sai_resolve::owner::LocalBinding {
-                        kind: sai_resolve::owner::BindingKind::Param,
-                        ..
-                    })
-                ) =>
+    if sig.params.len() != body.params.len() {
+        return Ok(None);
+    }
+    for (parameter, body_parameter) in sig.params.iter().zip(body.params) {
+        if parameter.is_self
+            || parameter.mutable
+            || body_parameter.mutable
+            || !parameter
+                .name
+                .is_some_and(|name| function_name_is_supported(name, symbols, inputs))
+            || parameter.name != body_parameter.name
+            || !matches!(
+                locals.bindings.get(&body_parameter.binding),
+                Some(sai_resolve::owner::LocalBinding {
+                    kind: sai_resolve::owner::BindingKind::Param,
+                    ..
+                })
+            )
         {
-            let Some(FunctionDirectType::Primitive(parameter_type)) =
-                resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
-            else {
-                return Ok(None);
-            };
-            if !sai_ty::typeck::literal::supports_primitive_literal(parameter_type) {
-                return Ok(None);
-            }
-            initial_bindings.insert(body_parameter.binding, parameter_type);
+            return Ok(None);
         }
-        _ => return Ok(None),
+        let Some(FunctionDirectType::Primitive(parameter_type)) =
+            resolve_function_direct_type(*parameter.ty, type_paths, symbols, inputs)
+        else {
+            return Ok(None);
+        };
+        if !sai_ty::typeck::literal::supports_primitive_literal(parameter_type) {
+            return Ok(None);
+        }
+        initial_bindings.insert(body_parameter.binding, parameter_type);
     }
 
     let Some(return_ty) = sig.ret else {
@@ -6299,7 +6298,6 @@ fn check_function_body_primitive_local_block(
 
     let mut primitive_types = HashMap::new();
     let mut preceding_bindings = initial_bindings.keys().copied().collect::<HashSet<_>>();
-    let mut local_bindings = HashSet::with_capacity(block.stmts.len());
     for stmt in block.stmts {
         let StmtKind::Let {
             pat,
@@ -6354,9 +6352,8 @@ fn check_function_body_primitive_local_block(
             _ => return Ok(None),
         }
         preceding_bindings.insert(binding);
-        local_bindings.insert(binding);
     }
-    if !local_bindings.contains(&tail_binding) {
+    if !preceding_bindings.contains(&tail_binding) {
         return Ok(None);
     }
 
