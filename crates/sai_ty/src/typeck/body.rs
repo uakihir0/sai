@@ -536,6 +536,20 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             .and_then(|local_type| self.concrete_local_type(local_type))
             .filter(|primitive| supports_primitive_literal(*primitive))
             .ok_or(())?;
+        if let ExprKind::Lit(literal) = right.kind {
+            if !is_integer_primitive(left_type)
+                || primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer)
+            {
+                return Err(());
+            }
+            self.check_annotated_literal(
+                left_type,
+                literal,
+                PrimitiveLiteralKind::Integer,
+                right.hir_id,
+            );
+            return Ok(LocalType::Concrete(left_type));
+        }
         let right_type = self
             .check_local_path(right)
             .ok()

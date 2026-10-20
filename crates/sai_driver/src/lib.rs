@@ -6374,7 +6374,9 @@ fn check_function_body_primitive_local_block(
                 let supported_shape = match operator {
                     BinOp::And | BinOp::Or => is_preceding_path(left) && is_preceding_path(right),
                     BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
-                        is_preceding_path(left) && is_preceding_path(right)
+                        (is_preceding_path(left) && is_preceding_path(right))
+                            || (is_preceding_path(left)
+                                && is_direct_function_integer_literal(right))
                     }
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                         (is_preceding_path(left) && is_preceding_path(right))
@@ -6985,6 +6987,10 @@ fn is_direct_function_numeric_literal(expression: &HirExpr<'_>) -> bool {
         expression.kind,
         ExprKind::Lit(Lit::Int { .. } | Lit::Float { .. })
     )
+}
+
+fn is_direct_function_integer_literal(expression: &HirExpr<'_>) -> bool {
+    matches!(expression.kind, ExprKind::Lit(Lit::Int { .. }))
 }
 
 fn function_name_is_supported(name: Name, symbols: &Interner, inputs: &CurrentOwnerInputs) -> bool {
