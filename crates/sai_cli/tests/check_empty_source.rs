@@ -798,6 +798,116 @@ fn unsupported_flat_unannotated_primitive_local_forms_remain_gated() {
 }
 
 #[test]
+fn primitive_comparison_local_initializers_accept_all_six_operators() {
+    for source in [
+        "pub fn equal(left: I32, right: I32) -> Bool {\n    let result: Bool = left == right\n    result\n}\n",
+        "pub fn not_equal(left: I32, right: I32) -> Bool {\n    let result: Bool = right != left\n    result\n}\n",
+        "pub fn less(left: I32, right: I32) -> Bool {\n    let left_value: I32 = left\n    let right_value: I32 = right\n    let result: Bool = left_value < right_value\n    result\n}\n",
+        "pub fn less_equal(left: I32, right: I32) -> Bool {\n    let left_value: I32 = left\n    let right_value: I32 = right\n    let result: Bool = right_value <= left_value\n    result\n}\n",
+        "pub fn greater(left: I32, right: I32) -> Bool {\n    let result: Bool = left > right\n    result\n}\n",
+        "pub fn greater_equal(left: I32, right: I32) -> Bool {\n    let left_value: I32 = left\n    let right_value: I32 = right\n    let result: Bool = left_value >= right_value\n    result\n}\n",
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_comparison_local_reports_operand_mismatch_on_the_right_path() {
+    let source = "pub fn compare(left: I32, right: U32) -> Bool {\n    let result = left == right\n    result\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let right_start = source
+        .find("== right")
+        .map(|start| start + "== ".len())
+        .expect("right comparison operand exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a type-mismatched supported comparison must not be hidden by a feature gate:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `U32`",
+        right_start,
+        right_start + "right".len(),
+    );
+}
+
+#[test]
+fn primitive_comparison_non_bool_annotation_reports_and_recovers_as_bool() {
+    let source = "pub fn compare(left: I32, right: I32) -> Bool {\n    let result: I32 = left < right\n    result\n}\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let initializer_start = source.find("left < right").expect("comparison exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the invalid annotation should produce one diagnostic and the local should recover to Bool:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the comparison initializer must be checked without a feature gate:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        initializer_start,
+        initializer_start + "left < right".len(),
+    );
+}
+
+#[test]
+fn primitive_comparison_local_uses_shadowed_binding_and_source_order() {
+    let source = "pub fn shadow(left: I32, right: Bool) -> Bool {\n    let left: Bool = true\n    let result = left == right\n    result\n}\n";
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+
+    for gated in [
+        "pub fn forward(left: I32, right: I32) -> Bool {\n    let result = later == right\n    let later: I32 = left\n    result\n}\n",
+        "pub fn self_reference(right: I32) -> Bool {\n    let result = result == right\n    result\n}\n",
+    ] {
+        assert_check_stays_gated(&run_check(gated, "", &[], &[]), gated);
+    }
+}
+
+#[test]
+fn unsupported_primitive_comparison_local_initializer_shapes_remain_gated() {
+    for source in [
+        "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left == 1\n    result\n}\n",
+        "pub fn compare(left: I32) -> Bool {\n    let inferred = 1\n    let result = inferred == left\n    result\n}\n",
+        "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left + right\n    result\n}\n",
+        "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = (left == right) and (left < right)\n    result\n}\n",
+        "pub fn compare(left: Str, right: Str) -> Bool {\n    let result = left == right\n    result\n}\n",
+        "pub fn compare(left: I32, right: I32) -> Bool {\n    let result = left as I64 == right as I64\n    result\n}\n",
+        "type IntegerAlias = I32\npub fn compare(left: IntegerAlias, right: IntegerAlias) -> Bool {\n    let result = left == right\n    result\n}\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+
+    let source = "use acme:empty/values as values\npub fn compare(right: I32) -> Bool {\n    let result = values.VALUE == right\n    result\n}\n";
+    assert_check_stays_gated(
+        &run_check(
+            source,
+            "",
+            &[("src/values.sai", "pub const VALUE: I32 = 42\n")],
+            &[],
+        ),
+        source,
+    );
+}
+
+#[test]
 fn public_unannotated_primitive_literal_local_emits_check_result() {
     for source in [
         "pub fn answer() -> I32 {\n    let value = 42\n    value\n}\n",
