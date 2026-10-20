@@ -1,6 +1,6 @@
+use acme:mini-task-board/board
 use sai:core/fmt.{Writer}
 use sai:process
-use acme:mini-task-board/board
 
 pub fn main(env: owned process.Env) -> process.ExitCode
     effects { env.read, stdio.write, alloc }

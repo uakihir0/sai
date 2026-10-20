@@ -1,0 +1,40 @@
+use acme:turn-based-duel/data
+use acme:turn-based-duel/model.{Fighter}
+use acme:turn-based-duel/report
+use acme:turn-based-duel/rules
+use acme:turn-based-duel/strategy
+use sai:process.{Stdout}
+
+pub fn play(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    var player: Fighter = data.player()
+    var guardian: Fighter = data.guardian()
+    var round: U32 = 0
+
+    out.write_str(
+        "Asha enters the practice ring. The clockwork guardian lowers its shield and squares up.\n\n",
+    )
+    for player_action in data.demo_actions() {
+        if player.health == 0 or guardian.health == 0 {
+            break
+        }
+
+        round += 1
+        out.write_str(f"Round {round}\n".as_str())
+        let player_result = rules.perform(player_action, borrow mut player, borrow mut guardian)
+        report.print_action(borrow mut out, player_result)
+
+        if guardian.health > 0 {
+            let guardian_action = strategy.choose_action(guardian)
+            let guardian_result =
+                rules.perform(guardian_action, borrow mut guardian, borrow mut player)
+            report.print_action(borrow mut out, guardian_result)
+        }
+
+        report.print_status(borrow mut out, player, guardian)
+        out.write_str("\n")
+    }
+
+    report.print_outcome(borrow mut out, player, guardian)
+}

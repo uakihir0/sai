@@ -1,0 +1,9 @@
+use acme:turn-based-duel/model.{Action, Fighter}
+
+pub fn choose_action(fighter: Fighter) -> Action {
+    if fighter.health <= 3 or fighter.stamina < 2 {
+        Action.Recover
+    } else {
+        Action.Strike
+    }
+}

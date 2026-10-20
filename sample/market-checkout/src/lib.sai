@@ -1,6 +1,6 @@
+use acme:market-checkout/report
 use sai:core/fmt.{Writer}
 use sai:process
-use acme:market-checkout/report
 
 pub fn main(env: owned process.Env) -> process.ExitCode
     effects { env.read, stdio.write, alloc }

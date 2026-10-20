@@ -1,0 +1,20 @@
+use acme:turn-based-duel/model.{Action, Fighter}
+
+pub fn player() -> Fighter {
+    Fighter(name: "Asha", health: 10, max_health: 10, stamina: 4, max_stamina: 4, guarding: false)
+}
+
+pub fn guardian() -> Fighter {
+    Fighter(
+        name: "Clockwork Guardian",
+        health: 6,
+        max_health: 6,
+        stamina: 4,
+        max_stamina: 4,
+        guarding: false,
+    )
+}
+
+pub fn demo_actions() -> Array<Action, 5> {
+    [Action.Strike, Action.Guard, Action.Strike, Action.Recover, Action.Strike]
+}

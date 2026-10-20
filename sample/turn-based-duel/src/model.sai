@@ -1,0 +1,27 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Action {
+    Strike
+    Guard
+    Recover
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Fighter {
+    pub name: Str
+    pub health: U32
+    pub max_health: U32
+    pub stamina: U32
+    pub max_stamina: U32
+    pub guarding: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ActionReport {
+    pub performer: Str
+    pub target: Str
+    pub action: Action
+    pub damage: U32
+    pub recovered_health: U32
+    pub recovered_stamina: U32
+    pub blocked: Bool
+}

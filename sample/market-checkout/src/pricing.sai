@@ -11,10 +11,6 @@ pub fn tax_cents(taxable_cents: U32) -> U32 {
     taxable_cents * 8 / 100
 }
 
-pub fn total_cents(
-    subtotal_cents: U32,
-    discount_cents: U32,
-    tax_cents: U32
-) -> U32 {
+pub fn total_cents(subtotal_cents: U32, discount_cents: U32, tax_cents: U32) -> U32 {
     subtotal_cents - discount_cents + tax_cents
 }
