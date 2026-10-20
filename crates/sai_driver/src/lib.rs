@@ -6375,8 +6375,7 @@ fn check_function_body_primitive_local_block(
                     BinOp::And | BinOp::Or => is_preceding_path(left) && is_preceding_path(right),
                     BinOp::Add | BinOp::Sub | BinOp::Mul => {
                         (is_preceding_path(left) && is_preceding_path(right))
-                            || (operator == BinOp::Add
-                                && is_preceding_path(left)
+                            || (is_preceding_path(left)
                                 && is_direct_function_numeric_literal(right))
                     }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -25535,7 +25534,7 @@ mod tests {
             "pub fn raw_local() -> I32 {\n    let r#value: I32 = 42\n    r#value\n}\n",
             "pub fn unannotated_computed() -> I32 {\n    let value = 40 + 2\n    value\n}\n",
             "pub fn unannotated_copy_from_constant() -> I32 {\n    let copy = ONE\n    copy\n}\n",
-            "pub fn unannotated_copy_computed() -> I32 {\n    let source: I32 = 42\n    let copy = source - 1\n    copy\n}\n",
+            "pub fn unannotated_copy_computed() -> I32 {\n    let source: I32 = 42\n    let copy = source / 1\n    copy\n}\n",
             "pub fn unannotated_raw_copy() -> I32 {\n    let source: I32 = 42\n    let copy = r#source\n    copy\n}\n",
             "pub fn mutable_unannotated_copy() -> I32 {\n    let source: I32 = 42\n    var copy = source\n    copy\n}\n",
             "pub fn mutable_source_copy() -> I32 {\n    var source: I32 = 42\n    let copy = source\n    copy\n}\n",
