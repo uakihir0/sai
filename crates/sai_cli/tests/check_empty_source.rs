@@ -323,6 +323,10 @@ fn public_negated_mixed_bool_comparison_conditions_emit_check_results() {
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and value >= 18) { 1 } else { 2 } }\n",
         "pub fn choose(value: I32, enabled: Bool) -> I32 { if not (value < 20 or enabled) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: U8) -> I32 { if not (enabled and 18 <= value) { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and not (value >= 18) { 1 } else { 2 } }\n",
+        "pub fn choose(value: U8, enabled: Bool) -> I32 { if not (18 <= value) and enabled { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or not (value < 20) { 1 } else { 2 } }\n",
+        "pub fn choose(value: I32, enabled: Bool) -> I32 { if not (value < 20) or enabled { 1 } else { 2 } }\n",
     ] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
     }
@@ -331,10 +335,8 @@ fn public_negated_mixed_bool_comparison_conditions_emit_check_results() {
 #[test]
 fn unsupported_mixed_bool_logical_comparison_conditions_remain_gated() {
     for source in [
-        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and not (value >= 18) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and (value > 0 and value < 10) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and enabled >= 18 { 1 } else { 2 } }\n",
-        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or not (value >= 18) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or (value > 0 or value < 10) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: I32, value: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled or value >= 18 { 1 } else { 2 } }\n",
@@ -342,10 +344,12 @@ fn unsupported_mixed_bool_logical_comparison_conditions_remain_gated() {
         "pub fn choose(enabled: Bool, value: I32, extra: I32) -> I32 { if enabled and value >= 18 { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and value >= 18 { 1 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled or value >= 18 { 1 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if enabled and not (not (value >= 18)) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not not (enabled and value >= 18) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not not (enabled or value >= 18) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and not (value >= 18)) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (not enabled and value >= 18) { 1 } else { 2 } }\n",
+        "pub fn choose(enabled: Bool, value: I32) -> I32 { if not enabled and value >= 18 { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and (value > 0 and value < 10)) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled or (value > 0 or value < 10)) { 1 } else { 2 } }\n",
         "pub fn choose(enabled: Bool, value: I32) -> I32 { if not (enabled and enabled >= 18) { 1 } else { 2 } }\n",
@@ -573,6 +577,53 @@ fn comparison_literal_errors_report_condition_spans_before_branch_errors() {
             && !stdout.contains("\"type\":\"result\"")
             && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
         "mixed condition and then/else errors must retain source order without a feature gate:\n{stdout}"
+    );
+}
+
+#[test]
+fn negated_mixed_comparison_errors_are_checked_before_branch_errors() {
+    let source = "pub fn choose(enabled: Bool, value: I8) -> I8 { if enabled and not (value < 128) { 128 } else { 129 } }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let condition_start = source.find("128").expect("condition integer exists");
+    let then_start = source[condition_start + "128".len()..]
+        .find("128")
+        .map(|offset| condition_start + "128".len() + offset)
+        .expect("then-branch integer exists");
+    let else_start = source.find("129").expect("else-branch integer exists");
+    let condition_position = stdout
+        .find(&format!("\"start\":{{\"byte\":{condition_start},"))
+        .expect("condition diagnostic span exists");
+    let then_position = stdout
+        .find(&format!("\"start\":{{\"byte\":{then_start},"))
+        .expect("then-branch diagnostic span exists");
+    let else_position = stdout
+        .find(&format!("\"start\":{{\"byte\":{else_start},"))
+        .expect("else-branch diagnostic span exists");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count() == 3
+            && condition_position < then_position
+            && then_position < else_position
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "negated mixed comparison and then/else errors must retain source order:\n{stdout}"
+    );
+
+    let source = "pub fn choose(enabled: Bool, value: I8) -> I32 { if enabled and not (1.5 < value) { 1 } else { 2 } }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let condition_start = source.rfind("value").expect("comparison parameter exists");
+    let condition_end = condition_start + "value".len();
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && stdout.contains("\"message\":\"expected `F64`, found `I8`\"")
+            && !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && stdout.contains(&format!("\"start\":{{\"byte\":{condition_start},"))
+            && stdout.contains(&format!("\"end\":{{\"byte\":{condition_end},")),
+        "negated comparison operands must retain literal type diagnostics at the parameter:\n{stdout}"
     );
 }
 
