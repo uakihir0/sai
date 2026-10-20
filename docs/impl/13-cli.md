@@ -1361,7 +1361,7 @@ sai explain --list
 
 Prints the explanation of a diagnostic code or a lint, as defined by [11-diagnostics.md](11-diagnostics.md) §11.13. Stage 0. The command needs no package, accepts none of the options of §13.4, and reads no file. The human output is the Markdown text of 11 §11.13.2. JSON: kind `explain` (11 §11.13.2), or, with `--list`, one record of kind `explain.list` with `{"codes":[{"code":…,"class":"hard","summary":…}]}` in byte order. Exit codes: 0 if the code is registered; 1 for `UNKNOWN_DIAGNOSTIC_CODE`. `sai explain` without an argument and without `--list` is `MISSING_ARGUMENT`.
 
-**Current implementation slice.** `sai explain --list` is implemented for all 493 registered codes in human and JSON output. An unknown code reports `UNKNOWN_DIAGNOSTIC_CODE` with ranked candidates. A known code still reports `FEATURE_NOT_IMPLEMENTED` until its complete metadata and Markdown explanation record are available.
+**Current implementation slice.** `sai explain --list` is implemented for all 493 registered codes in human and JSON output. `sai explain TYPE_MISMATCH` emits its complete metadata and Markdown record in human or JSON output. All other known individual codes still report `FEATURE_NOT_IMPLEMENTED` until their complete metadata and Markdown explanation records are available. An unknown code reports `UNKNOWN_DIAGNOSTIC_CODE` with ranked candidates.
 
 ### 13.6.21 `sai lsp`
 
@@ -1661,7 +1661,9 @@ Every result record that a command of this chapter writes MUST validate against 
       "type": "object", "required": ["code", "class", "severity", "default_level", "stage", "owner", "since", "status", "superseded_by", "summary", "markdown"], "additionalProperties": false,
       "properties": { "code": { "type": "string" }, "class": { "enum": ["hard", "lint"] }, "severity": { "enum": ["error", "warning", "info", null] },
         "default_level": { "enum": ["allow", "info", "warn", "deny", null] }, "stage": { "type": "integer", "minimum": 0, "maximum": 7 }, "owner": { "type": "string" },
-        "since": { "type": "string" }, "status": { "enum": ["active", "deprecated", "removed"] }, "superseded_by": { "type": ["string", "null"] }, "summary": { "type": "string" }, "markdown": { "type": "string" } }
+        "since": { "type": "string" }, "status": { "enum": ["active", "deprecated", "removed"] },
+        "superseded_by": { "oneOf": [{ "type": "array", "minItems": 1, "items": { "type": "string" } }, { "type": "null" }] },
+        "summary": { "type": "string" }, "markdown": { "type": "string" } }
     },
     "explain_list": {
       "type": "object", "required": ["codes"], "additionalProperties": false,
