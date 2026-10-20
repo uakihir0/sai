@@ -1757,6 +1757,8 @@ fn primitive_wrapping_integer_literals_check_ranges_and_recover_annotations() {
     let range_source = concat!(
         "pub fn wrapping_literal_ranges(signed: I8, unsigned: U8) -> I8 {\n",
         "    let signed_minimum = signed +% -128\n",
+        "    let signed_maximum = signed -% 127\n",
+        "    let unsigned_maximum = unsigned +% 255\n",
         "    let unsigned_negative_zero = unsigned -% -0\n",
         "    let signed_out_of_range = signed +% -129\n",
         "    let unsigned_negative = unsigned *% -1\n",
