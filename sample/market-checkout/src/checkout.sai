@@ -29,19 +29,12 @@ pub fn quote(order: SalesOrder) -> Quote {
         }
     }
 
-    let discount_cents = pricing.applied_discount(
-        subtotal_cents,
-        order.requested_discount_cents
-    )
+    let discount_cents = pricing.applied_discount(subtotal_cents, order.requested_discount_cents)
     let taxable_cents = subtotal_cents - discount_cents
     let tax_cents = pricing.tax_cents(taxable_cents)
-    let total_cents = pricing.total_cents(
-        subtotal_cents,
-        discount_cents,
-        tax_cents
-    )
+    let total_cents = pricing.total_cents(subtotal_cents, discount_cents, tax_cents)
 
-    let hold_reason = if unknown_product && insufficient_stock {
+    let hold_reason = if unknown_product and insufficient_stock {
         HoldReason.MultipleIssues
     } else if unknown_product {
         HoldReason.UnknownProduct
@@ -58,6 +51,6 @@ pub fn quote(order: SalesOrder) -> Quote {
         discount_cents: discount_cents,
         tax_cents: tax_cents,
         total_cents: total_cents,
-        hold_reason: hold_reason
+        hold_reason: hold_reason,
     )
 }
