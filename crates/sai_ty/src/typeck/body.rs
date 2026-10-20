@@ -113,8 +113,8 @@ struct LiteralVariable<'hir> {
 /// between concrete primitive paths or one path and one scalar literal, one
 /// top-level logical operation between Bool paths, and direct arithmetic
 /// between matching concrete numeric paths are accepted as initializers. A
-/// Direct numeric literals are also accepted as right operands of `+`, `-`,
-/// and `*` when the left operand is an eligible concrete numeric path.
+/// Direct numeric literals are accepted on either side of `+`, `-`, and `*`
+/// when paired with an eligible concrete numeric path.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
@@ -228,15 +228,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 if matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul) {
                     let result = self.check_arithmetic(operator, left, right)?;
                     if let Some(expected) = annotation {
-                        let Some(found) = self.concrete_local_type(result) else {
-                            return Err(());
-                        };
-                        if expected != found {
-                            self.errors.push(PrimitiveBodyError {
-                                node: init.hir_id,
-                                kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
-                            });
-                        }
+                        self.check_annotated_path(result, expected, init.hir_id)?;
                         // The annotation determines the local's recovered
                         // type after the coercion-site mismatch, as it does
                         // for the existing annotated path initializer.
@@ -308,6 +300,41 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         left: &'hir Expr<'hir>,
         right: &'hir Expr<'hir>,
     ) -> Result<LocalType, ()> {
+        if let ExprKind::Lit(literal) = left.kind {
+            let Some(kind) = primitive_literal_kind(literal) else {
+                return Err(());
+            };
+            let right_type = self
+                .check_local_path(right)
+                .ok()
+                .and_then(|local_type| self.concrete_local_type(local_type))
+                .ok_or(())?;
+
+            return match primitive_arithmetic_literal_left_result(operator, kind, right_type) {
+                PrimitiveArithmeticResult::Type(expected) => {
+                    let local_type =
+                        self.local_type_for_unannotated_literal(literal, kind, left.hir_id);
+                    let LocalType::LiteralVariable(id) = local_type else {
+                        return Err(());
+                    };
+                    self.resolve_literal_variable(id, expected)?;
+                    Ok(local_type)
+                }
+                PrimitiveArithmeticResult::TypeMismatch { expected, found } => {
+                    let local_type =
+                        self.local_type_for_unannotated_literal(literal, kind, left.hir_id);
+                    self.errors.push(PrimitiveBodyError {
+                        node: right.hir_id,
+                        kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                    });
+                    // A failed family constraint leaves the synthesized left
+                    // literal variable available to an annotation or tail.
+                    Ok(local_type)
+                }
+                PrimitiveArithmeticResult::Unsupported => Err(()),
+            };
+        }
+
         let left_type = self
             .check_local_path(left)
             .ok()
@@ -774,6 +801,38 @@ fn primitive_arithmetic_literal_expected_type(
     .then_some(left)
 }
 
+fn primitive_arithmetic_literal_left_result(
+    operator: BinOp,
+    literal: PrimitiveLiteralKind,
+    right: PrimTy,
+) -> PrimitiveArithmeticResult {
+    if !matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul)
+        || !is_arithmetic_primitive(right)
+        || !matches!(
+            literal,
+            PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+        )
+    {
+        return PrimitiveArithmeticResult::Unsupported;
+    }
+
+    if literal_family_accepts(literal, right) {
+        PrimitiveArithmeticResult::Type(right)
+    } else {
+        let expected = match literal {
+            PrimitiveLiteralKind::Integer => PrimTy::I64,
+            PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
+            PrimitiveLiteralKind::Bool
+            | PrimitiveLiteralKind::Byte
+            | PrimitiveLiteralKind::Character => unreachable!(),
+        };
+        PrimitiveArithmeticResult::TypeMismatch {
+            expected,
+            found: right,
+        }
+    }
+}
+
 fn primitive_comparison_literal_expected_type(
     kind: PrimitiveLiteralKind,
     path_type: PrimTy,
@@ -829,8 +888,9 @@ mod tests {
     use super::{
         PrimitiveArithmeticResult, PrimitiveBoolOperandResult, PrimitiveComparisonResult,
         PrimitiveLiteralKind, primitive_arithmetic_literal_expected_type,
-        primitive_arithmetic_result, primitive_bool_operand_result,
-        primitive_comparison_literal_expected_type, primitive_comparison_result,
+        primitive_arithmetic_literal_left_result, primitive_arithmetic_result,
+        primitive_bool_operand_result, primitive_comparison_literal_expected_type,
+        primitive_comparison_result,
     };
     use sai_hir::expressions::BinOp;
     use sai_resolve::prelude::PrimTy;
@@ -988,6 +1048,101 @@ mod tests {
                 ),
                 None,
                 "numeric literals remain gated for {operator:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn arithmetic_left_literals_unify_with_concrete_paths_by_family() {
+        let integer_types = [
+            PrimTy::I8,
+            PrimTy::I16,
+            PrimTy::I32,
+            PrimTy::I64,
+            PrimTy::U8,
+            PrimTy::U16,
+            PrimTy::U32,
+            PrimTy::U64,
+            PrimTy::ISize,
+            PrimTy::USize,
+        ];
+        for operator in ARITHMETIC_OPERATORS {
+            for primitive in integer_types {
+                assert_eq!(
+                    primitive_arithmetic_literal_left_result(
+                        operator,
+                        PrimitiveLiteralKind::Integer,
+                        primitive
+                    ),
+                    PrimitiveArithmeticResult::Type(primitive),
+                    "integer literal on the left of {primitive:?} {operator:?}"
+                );
+            }
+            for primitive in [PrimTy::F32, PrimTy::F64] {
+                assert_eq!(
+                    primitive_arithmetic_literal_left_result(
+                        operator,
+                        PrimitiveLiteralKind::FloatingPoint,
+                        primitive
+                    ),
+                    PrimitiveArithmeticResult::Type(primitive),
+                    "float literal on the left of {primitive:?} {operator:?}"
+                );
+            }
+            assert_eq!(
+                primitive_arithmetic_literal_left_result(
+                    operator,
+                    PrimitiveLiteralKind::Integer,
+                    PrimTy::F32
+                ),
+                PrimitiveArithmeticResult::TypeMismatch {
+                    expected: PrimTy::I64,
+                    found: PrimTy::F32,
+                }
+            );
+            assert_eq!(
+                primitive_arithmetic_literal_left_result(
+                    operator,
+                    PrimitiveLiteralKind::FloatingPoint,
+                    PrimTy::U8
+                ),
+                PrimitiveArithmeticResult::TypeMismatch {
+                    expected: PrimTy::F64,
+                    found: PrimTy::U8,
+                }
+            );
+            for literal in [
+                PrimitiveLiteralKind::Bool,
+                PrimitiveLiteralKind::Byte,
+                PrimitiveLiteralKind::Character,
+            ] {
+                assert_eq!(
+                    primitive_arithmetic_literal_left_result(operator, literal, PrimTy::I32),
+                    PrimitiveArithmeticResult::Unsupported,
+                    "{literal:?} literal on the left of {operator:?}"
+                );
+            }
+            for primitive in [PrimTy::Bool, PrimTy::Byte, PrimTy::Char, PrimTy::Never] {
+                assert_eq!(
+                    primitive_arithmetic_literal_left_result(
+                        operator,
+                        PrimitiveLiteralKind::Integer,
+                        primitive
+                    ),
+                    PrimitiveArithmeticResult::Unsupported,
+                    "non-numeric {primitive:?} path on the right of {operator:?}"
+                );
+            }
+        }
+        for operator in [BinOp::Div, BinOp::Rem, BinOp::And, BinOp::Eq] {
+            assert_eq!(
+                primitive_arithmetic_literal_left_result(
+                    operator,
+                    PrimitiveLiteralKind::Integer,
+                    PrimTy::I32
+                ),
+                PrimitiveArithmeticResult::Unsupported,
+                "left literals remain gated for {operator:?}"
             );
         }
     }
