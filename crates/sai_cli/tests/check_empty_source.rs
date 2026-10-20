@@ -190,6 +190,52 @@ fn public_zero_parameter_direct_scalar_function_emits_check_result() {
 }
 
 #[test]
+fn public_function_with_one_annotated_primitive_local_emits_check_result() {
+    assert_success_result(
+        run_check(
+            "pub fn answer() -> I32 {\n    let value: I32 = 42\n    value\n}\n",
+            "",
+            &[],
+            &[],
+        ),
+        "wasm32-core",
+        "dev",
+    );
+}
+
+#[test]
+fn annotated_primitive_local_reports_semantic_errors_without_a_feature_gate() {
+    for (source, code, message) in [
+        (
+            "pub fn mismatch() -> I32 {\n    let value: I32 = true\n    value\n}\n",
+            "TYPE_MISMATCH",
+            "expected `I32`, found a Bool literal",
+        ),
+        (
+            "pub fn overflow() -> I8 {\n    let value: I8 = 128\n    value\n}\n",
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `I8`",
+        ),
+        (
+            "pub fn mismatch() -> Bool {\n    let value: I32 = 42\n    value\n}\n",
+            "TYPE_MISMATCH",
+            "expected `Bool`, found `I32`",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\""))
+                && stdout.contains(message)
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "a supported local type error must be reported without a gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn public_zero_parameter_explicit_unit_function_emits_check_result() {
     for source in ["pub fn empty() -> () {}\n", "pub fn unit() -> () { () }\n"] {
         assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
@@ -994,6 +1040,22 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
     for source in [
         "pub fn add(value: I32) -> I32 { value + 1 }\n",
         "pub fn local(value: I32) -> I32 { let next = value; next }\n",
+        "pub fn local() -> I32 {\nlet value = 42\nvalue\n}\n",
+        "pub fn local() -> I32 {\nvar value: I32 = 42\nvalue\n}\n",
+        "pub fn local() -> I32 {\nlet var value: I32 = 42\nvalue\n}\n",
+        "pub fn local() -> I32 {\nlet value: I32 = 40 + 2\nvalue\n}\n",
+        "pub fn local() -> I32 {\nlet value: I32 = 42\n{ value }\n}\n",
+        "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = 2\nfirst\n}\n",
+        "pub fn local() -> I32 {\nlet valueName: I32 = 42\nvalueName\n}\n",
+        "pub fn local() -> I32 {\nlet r#value: I32 = 42\nr#value\n}\n",
+        "pub fn local() -> I32 {\nlet value: I32 = 42\nr#value\n}\n",
+        "pub fn local() -> I32 {\nlet (first, second): (I32, I32) = (1, 2)\nfirst\n}\n",
+        "pub fn local() -> I32 { let 0: I32 = 42 else { return 0 }\n1\n}\n",
+        "pub fn local() -> I32 { let value: I32 = \"text\"\nvalue\n}\n",
+        "pub fn local() -> I32 {\nlet value: Missing = 42\nvalue\n}\n",
+        "pub fn local() -> I32 {\nlet value: I32 = 42\nmissing\n}\n",
+        "pub fn local() -> I32 {\nlet value: I32 = b\"text\"\nvalue\n}\n",
+        "type Number = I32\npub fn local() -> I32 {\nlet value: Number = 42\nvalue\n}\n",
         "pub fn generic<T>(value: T) -> T { value }\n",
         "fn private(value: I32) -> I32 { value }\n",
         "pub fn identityValue(value: I32) -> I32 { value }\n",

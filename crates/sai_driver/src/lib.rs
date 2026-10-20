@@ -5886,6 +5886,13 @@ fn check_function_body_type(
     {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     }
+    if sig.params.is_empty() && body.params.is_empty() {
+        if let Some(diagnostics) = check_function_body_annotated_primitive_local(
+            owner, sig, body, locals, type_paths, symbols, inputs, snapshot, target_cfg,
+        )? {
+            return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
+        }
+    }
     let (parameter, parameter_pair) = match (sig.params, body.params) {
         ([], []) => (None, None),
         ([parameter], [body_parameter])
@@ -6219,6 +6226,183 @@ fn check_function_body_type(
         }
     };
     Ok(FunctionBodyTypeCheck::Supported { diagnostics })
+}
+
+fn check_function_body_annotated_primitive_local(
+    owner: &HirOwner<'_>,
+    sig: sai_hir::body::FnSig<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let Some(return_ty) = sig.ret else {
+        return Ok(None);
+    };
+    let Some(FunctionDirectType::Primitive(return_type)) =
+        resolve_function_direct_type(*return_ty, type_paths, symbols, inputs)
+    else {
+        return Ok(None);
+    };
+    let ExprKind::Block(block) = body.value.kind else {
+        return Ok(None);
+    };
+    let [stmt] = block.stmts else {
+        return Ok(None);
+    };
+    let StmtKind::Let {
+        pat,
+        ty: Some(ty),
+        els: None,
+        ..
+    } = stmt.kind
+    else {
+        return Ok(None);
+    };
+    let PatKind::Binding {
+        mode: sai_hir::patterns::BindingMode::Value,
+        name,
+        binding,
+        sub: None,
+        ..
+    } = pat.kind
+    else {
+        return Ok(None);
+    };
+    if !function_name_is_supported(name, symbols, inputs) {
+        return Ok(None);
+    }
+    if !matches!(
+        locals.bindings.get(&binding),
+        Some(sai_resolve::owner::LocalBinding {
+            kind: sai_resolve::owner::BindingKind::Let,
+            ..
+        })
+    ) {
+        return Ok(None);
+    }
+    let Some(FunctionDirectType::Primitive(local_type)) =
+        resolve_function_direct_type(*ty, type_paths, symbols, inputs)
+    else {
+        return Ok(None);
+    };
+    let Some(tail) = block.tail else {
+        return Ok(None);
+    };
+    let ExprKind::Path(path) = tail.kind else {
+        return Ok(None);
+    };
+    if path.root != PathRoot::Plain
+        || path.segments.len() != 1
+        || path.segments[0].args.is_some()
+        || !is_plain_ascii_identifier(path.segments[0].name, inputs)
+    {
+        return Ok(None);
+    }
+
+    let primitive_types = HashMap::from([(ty.hir_id, local_type)]);
+    let local_paths = locals
+        .paths
+        .iter()
+        .filter_map(|(hir_id, resolution)| match resolution.base {
+            Res::Local(binding)
+                if resolution.resolved_segments == 1 && resolution.segment_count == 1 =>
+            {
+                Some((*hir_id, binding))
+            }
+            _ => None,
+        })
+        .collect::<HashMap<_, _>>();
+    let check = sai_ty::typeck::body::check_annotated_primitive_local_body(
+        sai_ty::typeck::body::PrimitiveBodyInput {
+            body,
+            return_type,
+            primitive_types: &primitive_types,
+            local_paths: &local_paths,
+            symbols,
+            pointer_width: target_cfg.pointer_width(),
+        },
+    );
+    let sai_ty::typeck::body::PrimitiveBodyCheck::Supported { errors } = check else {
+        return Ok(None);
+    };
+    let StmtKind::Let { init, .. } = stmt.kind else {
+        return Ok(None);
+    };
+
+    let mut diagnostics = Vec::with_capacity(errors.len());
+    for error in errors {
+        let span = if error.node == init.hir_id {
+            init.span
+        } else if error.node == tail.hir_id {
+            tail.span
+        } else {
+            return Ok(None);
+        };
+        use sai_ty::typeck::body::{PrimitiveBodyErrorKind, PrimitiveLiteralKind};
+        let diagnostic = match error.kind {
+            PrimitiveBodyErrorKind::LiteralTypeMismatch { expected, found } => {
+                let found = match found {
+                    PrimitiveLiteralKind::Integer => "an integer literal",
+                    PrimitiveLiteralKind::FloatingPoint => "a floating-point literal",
+                    PrimitiveLiteralKind::Bool => "a Bool literal",
+                    PrimitiveLiteralKind::Byte => "a byte literal",
+                    PrimitiveLiteralKind::Character => "a character literal",
+                };
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::TypeMismatch,
+                    format!(
+                        "expected `{}`, found {found}",
+                        const_primitive_name(expected)
+                    ),
+                    "type mismatch",
+                )?
+            }
+            PrimitiveBodyErrorKind::LiteralOutOfRange { expected, found } => {
+                let label = match found {
+                    PrimitiveLiteralKind::Integer => "integer",
+                    PrimitiveLiteralKind::FloatingPoint => "floating-point",
+                    PrimitiveLiteralKind::Bool
+                    | PrimitiveLiteralKind::Byte
+                    | PrimitiveLiteralKind::Character => return Ok(None),
+                };
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    format!(
+                        "{label} literal is out of range for `{}`",
+                        const_primitive_name(expected)
+                    ),
+                    "literal out of range",
+                )?
+            }
+            PrimitiveBodyErrorKind::TypeMismatch { expected, found } => const_literal_diagnostic(
+                owner.id,
+                inputs,
+                snapshot,
+                span,
+                sai_diagnostics::Code::TypeMismatch,
+                format!(
+                    "expected `{}`, found `{}`",
+                    const_primitive_name(expected),
+                    const_primitive_name(found)
+                ),
+                "type mismatch",
+            )?,
+        };
+        diagnostics.push(diagnostic);
+    }
+    Ok(Some(diagnostics))
 }
 
 fn function_if_condition_uses_parameter_binding(
@@ -24524,6 +24708,141 @@ mod tests {
                 .any(|path| matches!(path.base, Res::Def(DefKind::Alias, _))),
             "the gated return type must resolve to a user-defined alias"
         );
+    }
+
+    #[test]
+    fn function_body_type_check_checks_one_annotated_primitive_local() {
+        let root = concat!(
+            "pub fn local() -> I32 {\n    let value: I32 = 42\n    value\n}\n",
+            "pub fn initializer_mismatch() -> I32 {\n    let value: I32 = true\n    value\n}\n",
+            "pub fn initializer_overflow() -> I8 {\n    let value: I8 = 128\n    value\n}\n",
+            "pub fn return_mismatch() -> Bool {\n    let value: I32 = 42\n    value\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 4);
+        let local_check = resolved.owners()[0]
+            .body_type_check()
+            .expect("supported local body check succeeds");
+        assert!(
+            matches!(
+                local_check,
+                FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+            ),
+            "{local_check:?}"
+        );
+
+        for (index, expected_code, expected_message, function, token) in [
+            (
+                1,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `I32`, found a Bool literal",
+                "initializer_mismatch",
+                "true",
+            ),
+            (
+                2,
+                sai_diagnostics::Code::LiteralOutOfRange,
+                "integer literal is out of range for `I8`",
+                "initializer_overflow",
+                "128",
+            ),
+            (
+                3,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `Bool`, found `I32`",
+                "return_mismatch",
+                "value",
+            ),
+        ] {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
+                .body_type_check()
+                .expect("supported local error is reported")
+            else {
+                panic!("a semantic error must not turn a supported local body into a gate");
+            };
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].code, expected_code);
+            assert_eq!(diagnostics[0].message, expected_message);
+            let function_start = root
+                .find(&format!("pub fn {function}"))
+                .expect("function exists");
+            let function_end = root[function_start..]
+                .find("\npub fn ")
+                .map_or(root.len(), |offset| function_start + offset);
+            let function_text = &root[function_start..function_end];
+            let relative_start = if function == "return_mismatch" {
+                function_text.rfind(token)
+            } else {
+                function_text.find(token)
+            }
+            .expect("diagnostic token exists in function");
+            let start = (function_start + relative_start) as u32;
+            assert_eq!(
+                diagnostics[0]
+                    .primary()
+                    .expect("body type diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + token.len() as u32),
+                )
+                .expect("diagnostic token range is ordered")
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_keeps_other_local_forms_unsupported() {
+        let root = concat!(
+            "type Number = I32\n",
+            "pub fn unannotated() -> I32 {\n    let value = 42\n    value\n}\n",
+            "pub fn mutable() -> I32 {\n    var value: I32 = 42\n    value\n}\n",
+            "pub fn mutable_let() -> I32 {\n    let var value: I32 = 42\n    value\n}\n",
+            "pub fn computed() -> I32 {\n    let value: I32 = 40 + 2\n    value\n}\n",
+            "pub fn multiple() -> I32 {\n    let first: I32 = 1\n    let second: I32 = 2\n    first\n}\n",
+            "pub fn nested() -> I32 {\n    let value: I32 = 42\n    { value }\n}\n",
+            "pub fn camel_local() -> I32 {\n    let valueName: I32 = 42\n    valueName\n}\n",
+            "pub fn raw_local() -> I32 {\n    let r#value: I32 = 42\n    r#value\n}\n",
+            "pub fn destructured() -> I32 {\n    let (first, second): (I32, I32) = (1, 2)\n    first\n}\n",
+            "pub fn alias() -> I32 {\n    let value: Number = 42\n    value\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 10);
+        for owner in resolved.owners() {
+            assert!(matches!(
+                owner
+                    .body_type_check()
+                    .expect("unsupported local form is gated"),
+                FunctionBodyTypeCheck::Unsupported
+            ));
+        }
     }
 
     #[test]
