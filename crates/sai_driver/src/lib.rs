@@ -6349,6 +6349,18 @@ fn check_function_body_primitive_local_block(
                     return Ok(None);
                 }
             }
+            ExprKind::Unary(UnOp::Not, operand) => {
+                let ExprKind::Path(path) = operand.kind else {
+                    return Ok(None);
+                };
+                let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
+                else {
+                    return Ok(None);
+                };
+                if !preceding_bindings.contains(&source_binding) {
+                    return Ok(None);
+                }
+            }
             ExprKind::Binary(operator, left, right)
                 if is_function_primitive_local_binary_operator(operator) =>
             {
@@ -6529,6 +6541,7 @@ fn primitive_body_error_span(expression: &HirExpr<'_>, node: HirId) -> Option<sa
         return Some(expression.span);
     }
     match expression.kind {
+        ExprKind::Unary(_, operand) if operand.hir_id == node => Some(operand.span),
         ExprKind::Binary(_, left, right) => {
             if left.hir_id == node {
                 Some(left.span)

@@ -5,7 +5,7 @@ use super::literal::{
     supports_primitive_literal,
 };
 use sai_hir::body::Body;
-use sai_hir::expressions::{BinOp, Block, Expr, ExprKind, Stmt, StmtKind};
+use sai_hir::expressions::{BinOp, Block, Expr, ExprKind, Stmt, StmtKind, UnOp};
 use sai_hir::literals::Lit;
 use sai_hir::patterns::{BindingMode, PatKind};
 use sai_hir::types::PathRoot;
@@ -70,7 +70,7 @@ enum PrimitiveComparisonResult {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PrimitiveLogicalOperandResult {
+enum PrimitiveBoolOperandResult {
     Bool,
     TypeMismatch { found: PrimTy },
     Unsupported,
@@ -232,6 +232,38 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 result
             }
+            ExprKind::Unary(UnOp::Not, operand) => {
+                let operand_type = self
+                    .check_local_path(operand)
+                    .ok()
+                    .and_then(|local_type| self.concrete_local_type(local_type))
+                    .ok_or(())?;
+                match primitive_bool_operand_result(operand_type) {
+                    PrimitiveBoolOperandResult::Bool => {}
+                    PrimitiveBoolOperandResult::TypeMismatch { found } => {
+                        self.errors.push(PrimitiveBodyError {
+                            node: operand.hir_id,
+                            kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                expected: PrimTy::Bool,
+                                found,
+                            },
+                        });
+                    }
+                    PrimitiveBoolOperandResult::Unsupported => return Err(()),
+                }
+                if let Some(expected) = annotation {
+                    if expected != PrimTy::Bool {
+                        self.errors.push(PrimitiveBodyError {
+                            node: init.hir_id,
+                            kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                expected,
+                                found: PrimTy::Bool,
+                            },
+                        });
+                    }
+                }
+                LocalType::Concrete(PrimTy::Bool)
+            }
             _ => return Err(()),
         };
 
@@ -291,9 +323,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .ok()
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .ok_or(())?;
-            match primitive_logical_operand_result(operand_type) {
-                PrimitiveLogicalOperandResult::Bool => {}
-                PrimitiveLogicalOperandResult::TypeMismatch { found } => {
+            match primitive_bool_operand_result(operand_type) {
+                PrimitiveBoolOperandResult::Bool => {}
+                PrimitiveBoolOperandResult::TypeMismatch { found } => {
                     self.errors.push(PrimitiveBodyError {
                         node: operand.hir_id,
                         kind: PrimitiveBodyErrorKind::TypeMismatch {
@@ -302,7 +334,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         },
                     });
                 }
-                PrimitiveLogicalOperandResult::Unsupported => return Err(()),
+                PrimitiveBoolOperandResult::Unsupported => return Err(()),
             }
         }
 
@@ -558,13 +590,13 @@ fn primitive_comparison_result(
     PrimitiveComparisonResult::Bool
 }
 
-fn primitive_logical_operand_result(found: PrimTy) -> PrimitiveLogicalOperandResult {
+fn primitive_bool_operand_result(found: PrimTy) -> PrimitiveBoolOperandResult {
     if found == PrimTy::Bool {
-        PrimitiveLogicalOperandResult::Bool
+        PrimitiveBoolOperandResult::Bool
     } else if supports_primitive_literal(found) {
-        PrimitiveLogicalOperandResult::TypeMismatch { found }
+        PrimitiveBoolOperandResult::TypeMismatch { found }
     } else {
-        PrimitiveLogicalOperandResult::Unsupported
+        PrimitiveBoolOperandResult::Unsupported
     }
 }
 
@@ -581,8 +613,8 @@ fn literal_family_accepts(kind: PrimitiveLiteralKind, expected: PrimTy) -> bool 
 #[cfg(test)]
 mod tests {
     use super::{
-        PrimitiveComparisonResult, PrimitiveLogicalOperandResult, primitive_comparison_result,
-        primitive_logical_operand_result,
+        PrimitiveBoolOperandResult, PrimitiveComparisonResult, primitive_bool_operand_result,
+        primitive_comparison_result,
     };
     use sai_hir::expressions::BinOp;
     use sai_resolve::prelude::PrimTy;
@@ -649,24 +681,24 @@ mod tests {
     }
 
     #[test]
-    fn logical_operands_require_bool_and_reject_unsupported_types() {
+    fn logical_and_not_operands_require_bool_and_reject_unsupported_types() {
         assert_eq!(
-            primitive_logical_operand_result(PrimTy::Bool),
-            PrimitiveLogicalOperandResult::Bool
+            primitive_bool_operand_result(PrimTy::Bool),
+            PrimitiveBoolOperandResult::Bool
         );
         for primitive in SUPPORTED_PRIMITIVES
             .into_iter()
             .filter(|ty| *ty != PrimTy::Bool)
         {
             assert_eq!(
-                primitive_logical_operand_result(primitive),
-                PrimitiveLogicalOperandResult::TypeMismatch { found: primitive },
+                primitive_bool_operand_result(primitive),
+                PrimitiveBoolOperandResult::TypeMismatch { found: primitive },
                 "{primitive:?}"
             );
         }
         assert_eq!(
-            primitive_logical_operand_result(PrimTy::Never),
-            PrimitiveLogicalOperandResult::Unsupported
+            primitive_bool_operand_result(PrimTy::Never),
+            PrimitiveBoolOperandResult::Unsupported
         );
     }
 }
