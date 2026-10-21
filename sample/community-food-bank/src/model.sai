@@ -1,0 +1,44 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Household {
+    pub id: U32
+    pub name: Str
+    // Lower values are served first; ties use ascending household ID.
+    pub priority: U32
+    pub plant_based: Bool
+    pub dairy_free: Bool
+    pub gluten_free: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PantryItem {
+    pub id: U32
+    pub name: Str
+    pub contains_animal_product: Bool
+    pub contains_dairy: Bool
+    pub contains_gluten: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type StockLot {
+    pub lot_id: U32
+    pub item_id: U32
+    pub units: U32
+    pub best_before_day: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Request {
+    // Sequence is unique per household and item and orders repeated requests.
+    pub sequence: U32
+    pub household_id: U32
+    pub item_id: U32
+    pub units: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Allocation {
+    pub request: Request
+    pub eligible: Bool
+    pub requested_units: U32
+    pub allocated_units: U32
+}

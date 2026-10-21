@@ -1,0 +1,9 @@
+use acme:community-food-bank/model.{Household, PantryItem}
+
+pub fn is_eligible(household: Household, item: PantryItem) -> Bool {
+    (
+        (not household.plant_based or not item.contains_animal_product)
+        and (not household.dairy_free or not item.contains_dairy)
+        and (not household.gluten_free or not item.contains_gluten)
+    )
+}

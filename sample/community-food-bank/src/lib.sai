@@ -1,0 +1,31 @@
+use acme:community-food-bank/report
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        report.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    let command = args[1].as_str()
+    if command == "allocations" {
+        report.print_allocations(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "stock" {
+        report.print_stock(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "summary" {
+        report.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    out.write_str("usage: community-food-bank [allocations|stock|summary]\n")
+    process.ExitCode.failure()
+}

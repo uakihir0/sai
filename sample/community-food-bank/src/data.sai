@@ -1,0 +1,120 @@
+use acme:community-food-bank/model.{Household, PantryItem, Request, StockLot}
+
+pub fn distribution_day() -> U32 {
+    5
+}
+
+pub fn households() -> Array<Household, 5> {
+    [
+        Household(
+            id: 1,
+            name: "Aki Sato",
+            priority: 1,
+            plant_based: true,
+            dairy_free: true,
+            gluten_free: true,
+        ),
+        Household(
+            id: 2,
+            name: "Ben Ito",
+            priority: 2,
+            plant_based: false,
+            dairy_free: true,
+            gluten_free: false,
+        ),
+        Household(
+            id: 3,
+            name: "Chika Mori",
+            priority: 2,
+            plant_based: false,
+            dairy_free: false,
+            gluten_free: false,
+        ),
+        Household(
+            id: 4,
+            name: "Daisuke Kato",
+            priority: 3,
+            plant_based: false,
+            dairy_free: false,
+            gluten_free: false,
+        ),
+        Household(
+            id: 5,
+            name: "Emi Watanabe",
+            priority: 3,
+            plant_based: false,
+            dairy_free: true,
+            gluten_free: false,
+        ),
+    ]
+}
+
+pub fn items() -> Array<PantryItem, 4> {
+    [
+        PantryItem(
+            id: 1,
+            name: "rice",
+            contains_animal_product: false,
+            contains_dairy: false,
+            contains_gluten: false,
+        ),
+        PantryItem(
+            id: 2,
+            name: "pinto beans",
+            contains_animal_product: false,
+            contains_dairy: false,
+            contains_gluten: false,
+        ),
+        PantryItem(
+            id: 3,
+            name: "shelf-stable milk",
+            contains_animal_product: true,
+            contains_dairy: true,
+            contains_gluten: false,
+        ),
+        PantryItem(
+            id: 4,
+            name: "wheat pasta",
+            contains_animal_product: false,
+            contains_dairy: false,
+            contains_gluten: true,
+        ),
+    ]
+}
+
+pub fn stock_lots() -> Array<StockLot, 6> {
+    [
+        StockLot(lot_id: 101, item_id: 1, units: 6, best_before_day: 8),
+        StockLot(lot_id: 201, item_id: 2, units: 3, best_before_day: 6),
+        StockLot(lot_id: 202, item_id: 2, units: 2, best_before_day: 6),
+        StockLot(lot_id: 203, item_id: 2, units: 2, best_before_day: 4),
+        StockLot(lot_id: 301, item_id: 3, units: 3, best_before_day: 6),
+        StockLot(lot_id: 401, item_id: 4, units: 4, best_before_day: 9),
+    ]
+}
+
+// Requests are ordered by priority, then household ID; item order is stable.
+pub fn requests() -> Array<Request, 20> {
+    [
+        Request(sequence: 1, household_id: 1, item_id: 1, units: 2),
+        Request(sequence: 2, household_id: 1, item_id: 2, units: 2),
+        Request(sequence: 3, household_id: 1, item_id: 3, units: 1),
+        Request(sequence: 4, household_id: 1, item_id: 4, units: 1),
+        Request(sequence: 5, household_id: 2, item_id: 1, units: 1),
+        Request(sequence: 6, household_id: 2, item_id: 2, units: 1),
+        Request(sequence: 7, household_id: 2, item_id: 3, units: 1),
+        Request(sequence: 8, household_id: 2, item_id: 4, units: 2),
+        Request(sequence: 9, household_id: 3, item_id: 1, units: 1),
+        Request(sequence: 10, household_id: 3, item_id: 2, units: 2),
+        Request(sequence: 11, household_id: 3, item_id: 3, units: 1),
+        Request(sequence: 12, household_id: 3, item_id: 4, units: 1),
+        Request(sequence: 13, household_id: 4, item_id: 1, units: 2),
+        Request(sequence: 14, household_id: 4, item_id: 2, units: 1),
+        Request(sequence: 15, household_id: 4, item_id: 3, units: 2),
+        Request(sequence: 16, household_id: 4, item_id: 4, units: 2),
+        Request(sequence: 17, household_id: 5, item_id: 1, units: 1),
+        Request(sequence: 18, household_id: 5, item_id: 2, units: 1),
+        Request(sequence: 19, household_id: 5, item_id: 3, units: 1),
+        Request(sequence: 20, household_id: 5, item_id: 4, units: 2),
+    ]
+}
