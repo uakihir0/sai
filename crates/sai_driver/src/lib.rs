@@ -6032,10 +6032,12 @@ fn check_function_body_type(
                 }
                 None => FunctionDirectType::Unit,
             };
-            if expected == FunctionDirectType::Str || found == FunctionDirectType::Str {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            }
-            if expected == found || expected == FunctionDirectType::Unit {
+            if found == FunctionDirectType::Str || expected == FunctionDirectType::Str {
+                if found != FunctionDirectType::Str || expected != FunctionDirectType::Str {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+                Vec::new()
+            } else if expected == found || expected == FunctionDirectType::Unit {
                 Vec::new()
             } else {
                 vec![const_literal_diagnostic(
@@ -24858,9 +24860,29 @@ mod tests {
             "pub fn discard_explicit(value: I32) -> () { value }\n",
             "pub fn computed(value: I32) -> I32 { value + 1 }\n",
             "pub fn self_param(self: I32) -> I32 { self }\n",
-            "pub fn string_identity(value: Str) -> Str { value }\n",
             "pub fn string_parameter_return(value: Str) -> Str { \"text\" }\n",
             "pub fn local_str_return() -> Str {\n    let value = \"text\"\n    value\n}\n",
+            "pub fn str_param_to_integer(value: Str) -> I32 { value }\n",
+            "pub fn integer_param_to_str(value: I32) -> Str { value }\n",
+            "pub fn str_param_to_unit(value: Str) -> () { value }\n",
+            "pub fn str_param_without_return(value: Str) { value }\n",
+            "pub fn mutable_str_identity(var value: Str) -> Str { value }\n",
+            "pub fn self_str_identity(self: Str) -> Str { self }\n",
+            "pub fn multi_str_identity(value: Str, other: Str) -> Str { other }\n",
+            "type Text = Str\n",
+            "pub fn alias_str_identity(value: Text) -> Text { value }\n",
+            "pub fn raw_str_identity(value: r#Str) -> r#Str { value }\n",
+            "type Str = I32\n",
+            "pub fn shadowed_str_identity(value: Str) -> Str { value }\n",
+            "pub fn local_str_copy(value: Str) -> Str {\n    let copied = value\n    copied\n}\n",
+            "pub fn computed_str(value: Str) -> Str { value + \"\" }\n",
+            "pub fn generic_str_identity<T>(value: Str) -> Str { value }\n",
+            concat!(
+                "type StrOwner { marker: Bool }\n",
+                "impl StrOwner {\n",
+                "    fn string_identity(self: borrow Self) -> Str { \"text\" }\n",
+                "}\n",
+            ),
             "pub fn mutable_identity(var value: I32) -> I32 { value }\n",
             "pub fn identityValue(value: I32) -> I32 { value }\n",
             "pub fn parameter_case(valueItem: I32) -> I32 { valueItem }\n",
@@ -24885,7 +24907,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 18);
+        assert_eq!(resolved.owners().len(), 30);
         assert!(matches!(
             resolved.owners()[0]
                 .body_type_check()
@@ -24936,6 +24958,32 @@ mod tests {
                 FunctionBodyTypeCheck::Unsupported
             ));
         }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_canonical_str_parameter_identity() {
+        let root = "pub fn string_identity(value: Str) -> Str { value }\n";
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 1);
+        assert!(matches!(
+            resolved.owners()[0]
+                .body_type_check()
+                .expect("canonical Str identity body check succeeds"),
+            FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
+        ));
     }
 
     #[test]

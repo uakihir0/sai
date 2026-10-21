@@ -244,6 +244,17 @@ fn canonical_str_literal_return_mismatch_reports_the_literal_span() {
 }
 
 #[test]
+fn public_canonical_str_parameter_identity_emits_check_result() {
+    let output = run_check(
+        "pub fn string_identity(value: Str) -> Str { value }\n",
+        "",
+        &[],
+        &[],
+    );
+    assert_success_result(output, "wasm32-core", "dev");
+}
+
+#[test]
 fn public_zero_parameter_direct_scalar_function_emits_check_result() {
     for source in [
         "pub fn string_return() -> Str { \"text\" }\n",
@@ -4640,6 +4651,18 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local_str_return() -> Str {\n    let value = \"text\"\n    value\n}\n",
         "pub fn parameter_str_return(value: I32) -> Str { \"text\" }\n",
         "pub fn string_parameter_return(value: Str) -> Str { \"text\" }\n",
+        "pub fn str_param_to_integer(value: Str) -> I32 { value }\n",
+        "pub fn integer_param_to_str(value: I32) -> Str { value }\n",
+        "pub fn str_param_to_unit(value: Str) -> () { value }\n",
+        "pub fn str_param_without_return(value: Str) { value }\n",
+        "pub fn mutable_str_identity(var value: Str) -> Str { value }\n",
+        "pub fn self_str_identity(self: Str) -> Str { self }\n",
+        "pub fn multi_str_identity(value: Str, other: Str) -> Str { other }\n",
+        "type Text = Str\npub fn alias_str_identity(value: Text) -> Text { value }\n",
+        "pub fn raw_str_identity(value: r#Str) -> r#Str { value }\n",
+        "pub fn local_str_copy(value: Str) -> Str {\n    let copied = value\n    copied\n}\n",
+        "pub fn computed_str(value: Str) -> Str { value + \"\" }\n",
+        "pub fn generic_str_identity<T>(value: Str) -> Str { value }\n",
         "pub fn byte_string_return() -> Str { b\"text\" }\n",
         "pub fn string_expression() -> Str { \"a\" + \"b\" }\n",
         "pub fn format_string_return() -> Str { f\"hello {1}\" }\n",
@@ -4671,7 +4694,13 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn raw_tail(value: I32) -> I32 { r#value }\n",
         "pub fn raw_type(value: r#I32) -> r#I32 { value }\n",
         "pub fn identity(var value: I32) -> I32 { value }\n",
-        "pub fn identity(value: Str) -> Str { value }\n",
+        "type Str = I32\npub fn shadowed_str_identity(value: Str) -> Str { value }\n",
+        concat!(
+            "type StrOwner { marker: Bool }\n",
+            "impl StrOwner {\n",
+            "    fn string_identity(self: borrow Self) -> Str { \"text\" }\n",
+            "}\n",
+        ),
         concat!(
             "pub fn first(value: I32) -> I32 { value }\n",
             "pub fn second(value: I32) -> I32 { value }\n",
