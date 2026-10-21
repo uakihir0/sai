@@ -553,6 +553,8 @@ Locked dependency-source regressions verify dependency syntax and Phase 1 diagno
 
 **IR-787 direct `Byte` literal for flat-local bitwise operators.** Extend `&`, `|`, and `^` to a direct byte literal on the left and an eligible preceding/parameter path on the right. A `Byte` path succeeds; another supported primitive path reports a mismatch at the RHS and the expression recovers to `Byte`. A differing supported annotation reports on the full initializer and recovers to the annotation. Literal RHSs and pairs, byte strings, aliases, unresolved/self/forward paths, nested/computed expressions, and unsupported owners remain gated. This is type checking only; bitwise lowering and runtime behavior are not implemented.
 
+**IR-788 direct `Byte` literal pairs for flat-local bitwise operators.** Accept `b'a' & b'b'`, `b'a' | b'b'`, and `b'a' ^ b'b'` as concrete-`Byte` operations. Omitted or `Byte` annotations succeed; another supported annotation reports a full-initializer mismatch and recovers to that annotation. Integer-literal pairs, mixed Byte/non-Byte literal pairs, other literal kinds, byte strings, nested/computed expressions, aliases, unresolved/self/forward paths, and unsupported owners remain gated. No lowering or runtime bitwise behavior is implemented.
+
 ### 13.6.3 `sai build`
 
 ```text

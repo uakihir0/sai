@@ -724,6 +724,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     ) -> Result<LocalType, ()> {
         if let ExprKind::Lit(literal) = left.kind {
             if primitive_literal_kind(literal) == Some(PrimitiveLiteralKind::Byte) {
+                if let ExprKind::Lit(right_literal) = right.kind {
+                    let Some(kind) = primitive_literal_kind(right_literal) else {
+                        return Err(());
+                    };
+                    return match primitive_bitwise_byte_literal_pair_result(operator, kind) {
+                        PrimitiveArithmeticResult::Type(result) => Ok(LocalType::Concrete(result)),
+                        PrimitiveArithmeticResult::TypeMismatch { .. }
+                        | PrimitiveArithmeticResult::Unsupported => Err(()),
+                    };
+                }
+
                 let right_type = self
                     .check_local_path(right)
                     .ok()
@@ -1455,6 +1466,17 @@ fn primitive_bitwise_byte_literal_left_result(
     }
 }
 
+fn primitive_bitwise_byte_literal_pair_result(
+    operator: BinOp,
+    right: PrimitiveLiteralKind,
+) -> PrimitiveArithmeticResult {
+    if right != PrimitiveLiteralKind::Byte {
+        return PrimitiveArithmeticResult::Unsupported;
+    }
+
+    primitive_bitwise_byte_literal_left_result(operator, PrimTy::Byte)
+}
+
 const fn is_bitwise_primitive(primitive: PrimTy) -> bool {
     is_integer_primitive(primitive) || matches!(primitive, PrimTy::Byte)
 }
@@ -1565,9 +1587,9 @@ mod tests {
         PrimitiveArithmeticResult, PrimitiveBoolOperandResult, PrimitiveComparisonResult,
         PrimitiveLiteralKind, primitive_arithmetic_literal_expected_type,
         primitive_arithmetic_literal_left_result, primitive_arithmetic_result,
-        primitive_bitwise_byte_literal_left_result, primitive_bool_operand_result,
-        primitive_comparison_literal_expected_type, primitive_comparison_result,
-        primitive_shift_left_literal_supported,
+        primitive_bitwise_byte_literal_left_result, primitive_bitwise_byte_literal_pair_result,
+        primitive_bool_operand_result, primitive_comparison_literal_expected_type,
+        primitive_comparison_result, primitive_shift_left_literal_supported,
     };
     use sai_hir::expressions::BinOp;
     use sai_resolve::prelude::PrimTy;
@@ -2010,6 +2032,34 @@ mod tests {
         );
         assert_eq!(
             primitive_bitwise_byte_literal_left_result(BinOp::BitXor, PrimTy::Never),
+            PrimitiveArithmeticResult::Unsupported
+        );
+    }
+
+    #[test]
+    fn byte_literal_bitwise_pairs_require_byte_literals_on_both_sides() {
+        for operator in [BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor] {
+            assert_eq!(
+                primitive_bitwise_byte_literal_pair_result(operator, PrimitiveLiteralKind::Byte),
+                PrimitiveArithmeticResult::Type(PrimTy::Byte),
+                "{operator:?} accepts a direct Byte/Byte pair"
+            );
+            for right in [
+                PrimitiveLiteralKind::Integer,
+                PrimitiveLiteralKind::FloatingPoint,
+                PrimitiveLiteralKind::Bool,
+                PrimitiveLiteralKind::Character,
+            ] {
+                assert_eq!(
+                    primitive_bitwise_byte_literal_pair_result(operator, right),
+                    PrimitiveArithmeticResult::Unsupported,
+                    "{operator:?} keeps Byte/{right:?} literal pairs gated"
+                );
+            }
+        }
+
+        assert_eq!(
+            primitive_bitwise_byte_literal_pair_result(BinOp::Add, PrimitiveLiteralKind::Byte),
             PrimitiveArithmeticResult::Unsupported
         );
     }

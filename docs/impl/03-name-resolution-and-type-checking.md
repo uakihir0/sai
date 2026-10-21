@@ -2323,6 +2323,8 @@ The **IR-765 flat-local addition slice** is narrower than general operator check
 
 **IR-787 direct `Byte` left literal for flat-local bitwise operators.** Extend one `&`, `|`, or `^` local initializer to accept a direct byte literal on the left and an eligible preceding/parameter path on the right. Treat the left operand as concrete `Byte`; a `Byte` RHS succeeds, while a different supported primitive reports `TYPE_MISMATCH` at the RHS path and the expression recovers to `Byte`. A differing supported annotation reports on the full initializer and recovers the local to that annotation. Keep byte literals on the right, literal pairs, byte strings, aliases, unresolved/self/forward paths, nested/computed operands, and unsupported owners gated. This is type checking only; bitwise lowering and runtime behavior remain unimplemented (spec/06 §§6.3.3, 6.8.2, 6.8.5; spec/16 §16.6.1).
 
+**IR-788 direct `Byte` literal pairs for flat-local bitwise operators.** Extend `&`, `|`, and `^` to accept two direct byte literals. Both operands have concrete type `Byte`, and the result is `Byte`; an omitted or `Byte` local annotation succeeds, while a differing supported annotation reports a full-initializer mismatch and recovers the local to the annotation. Keep integer-literal pairs, mixed Byte/non-Byte literal pairs, all other literal combinations, byte strings, nested/computed forms, aliases, unresolved/self/forward paths, and unsupported owners gated. This is type checking only; bitwise lowering and runtime behavior remain unimplemented (spec/06 §§6.3.3, 6.8.2, 6.8.5; spec/16 §16.6.1).
+
 ### 3.10.2 Coercions and adjustments
 
 ```rust
