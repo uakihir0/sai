@@ -122,10 +122,17 @@ enum LocalType {
 }
 
 #[derive(Clone, Copy, Debug)]
+struct LiteralSite<'hir> {
+    literal: Lit<'hir>,
+    origin: HirId,
+}
+
+#[derive(Clone, Debug)]
 struct LiteralVariable<'hir> {
     literal: Lit<'hir>,
     kind: PrimitiveLiteralKind,
     origin: HirId,
+    additional_site: Option<LiteralSite<'hir>>,
     resolved: Option<PrimTy>,
 }
 
@@ -781,6 +788,26 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer) {
                 return Err(());
             }
+            if let ExprKind::Lit(right_literal) = right.kind {
+                let Some(right_kind) = primitive_literal_kind(right_literal) else {
+                    return Err(());
+                };
+                if !primitive_bitwise_integer_literal_pair_supported(operator, right_kind) {
+                    return Err(());
+                }
+
+                let local_type = self.local_type_for_unannotated_literal(
+                    literal,
+                    PrimitiveLiteralKind::Integer,
+                    left.hir_id,
+                );
+                let LocalType::LiteralVariable(id) = local_type else {
+                    return Err(());
+                };
+                self.add_integer_literal_constraint(id, right_literal, right.hir_id)?;
+                return Ok(local_type);
+            }
+
             let right_type = self
                 .check_local_path(right)
                 .ok()
@@ -1274,6 +1301,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     literal,
                     kind,
                     origin,
+                    additional_site: None,
                     resolved: None,
                 });
                 LocalType::LiteralVariable(id)
@@ -1299,10 +1327,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             LocalType::Concrete(_) => {}
             LocalType::LiteralVariable(id) => {
-                let Some(variable) = self.literal_variables.get(id).copied() else {
+                let Some((resolved, kind)) = self
+                    .literal_variables
+                    .get(id)
+                    .map(|variable| (variable.resolved, variable.kind))
+                else {
                     return Err(());
                 };
-                match variable.resolved {
+                match resolved {
                     Some(found) if found != expected => {
                         self.errors.push(PrimitiveBodyError {
                             node,
@@ -1310,7 +1342,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         });
                     }
                     Some(_) => {}
-                    None if literal_family_accepts(variable.kind, expected) => {
+                    None if literal_family_accepts(kind, expected) => {
                         self.resolve_literal_variable(id, expected)?;
                     }
                     None => {
@@ -1318,7 +1350,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             node,
                             kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
                                 expected,
-                                found: variable.kind,
+                                found: kind,
                             },
                         });
                     }
@@ -1335,12 +1367,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 self.check_concrete_tail_type(found, expression.hir_id);
             }
             LocalType::LiteralVariable(id) => {
-                let Some(variable) = self.literal_variables.get(id).copied() else {
+                let Some((resolved, kind)) = self
+                    .literal_variables
+                    .get(id)
+                    .map(|variable| (variable.resolved, variable.kind))
+                else {
                     return Err(());
                 };
-                match variable.resolved {
+                match resolved {
                     Some(found) => self.check_concrete_tail_type(found, expression.hir_id),
-                    None if literal_family_accepts(variable.kind, self.input.return_type) => {
+                    None if literal_family_accepts(kind, self.input.return_type) => {
                         self.resolve_literal_variable(id, self.input.return_type)?;
                     }
                     None => {
@@ -1348,7 +1384,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             node: expression.hir_id,
                             kind: PrimitiveBodyErrorKind::LiteralTypeMismatch {
                                 expected: self.input.return_type,
-                                found: variable.kind,
+                                found: kind,
                             },
                         });
                     }
@@ -1370,7 +1406,32 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
     }
 
+    fn add_integer_literal_constraint(
+        &mut self,
+        id: usize,
+        literal: Lit<'hir>,
+        origin: HirId,
+    ) -> Result<(), ()> {
+        if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer) {
+            return Err(());
+        }
+        let Some(variable) = self.literal_variables.get_mut(id) else {
+            return Err(());
+        };
+        if variable.kind != PrimitiveLiteralKind::Integer
+            || variable.resolved.is_some()
+            || variable.additional_site.is_some()
+        {
+            return Err(());
+        }
+        variable.additional_site = Some(LiteralSite { literal, origin });
+        Ok(())
+    }
+
     fn resolve_literal_variable(&mut self, id: usize, expected: PrimTy) -> Result<(), ()> {
+        let symbols = self.input.symbols;
+        let pointer_width = self.input.pointer_width;
+        let errors = &mut self.errors;
         let Some(variable) = self.literal_variables.get_mut(id) else {
             return Err(());
         };
@@ -1378,14 +1439,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         }
         variable.resolved = Some(expected);
-        if check_primitive_literal(
-            expected,
-            variable.literal,
-            self.input.symbols,
-            self.input.pointer_width,
-        ) == PrimitiveLiteralResult::OutOfRange
+        if check_primitive_literal(expected, variable.literal, symbols, pointer_width)
+            == PrimitiveLiteralResult::OutOfRange
         {
-            self.errors.push(PrimitiveBodyError {
+            errors.push(PrimitiveBodyError {
                 node: variable.origin,
                 kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
                     expected,
@@ -1393,12 +1450,27 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 },
             });
         }
+        if let Some(site) = variable.additional_site {
+            if check_primitive_literal(expected, site.literal, symbols, pointer_width)
+                == PrimitiveLiteralResult::OutOfRange
+            {
+                errors.push(PrimitiveBodyError {
+                    node: site.origin,
+                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                        expected,
+                        found: variable.kind,
+                    },
+                });
+            }
+        }
         Ok(())
     }
 
     fn default_unresolved_literals(&mut self) {
-        for id in 0..self.literal_variables.len() {
-            let variable = self.literal_variables[id];
+        let symbols = self.input.symbols;
+        let pointer_width = self.input.pointer_width;
+        let errors = &mut self.errors;
+        for variable in &mut self.literal_variables {
             if variable.resolved.is_some() {
                 continue;
             }
@@ -1409,21 +1481,30 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 | PrimitiveLiteralKind::Byte
                 | PrimitiveLiteralKind::Character => unreachable!(),
             };
-            self.literal_variables[id].resolved = Some(expected);
-            if check_primitive_literal(
-                expected,
-                variable.literal,
-                self.input.symbols,
-                self.input.pointer_width,
-            ) == PrimitiveLiteralResult::OutOfRange
+            variable.resolved = Some(expected);
+            if check_primitive_literal(expected, variable.literal, symbols, pointer_width)
+                == PrimitiveLiteralResult::OutOfRange
             {
-                self.errors.push(PrimitiveBodyError {
+                errors.push(PrimitiveBodyError {
                     node: variable.origin,
                     kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
                         expected,
                         found: variable.kind,
                     },
                 });
+            }
+            if let Some(site) = variable.additional_site {
+                if check_primitive_literal(expected, site.literal, symbols, pointer_width)
+                    == PrimitiveLiteralResult::OutOfRange
+                {
+                    errors.push(PrimitiveBodyError {
+                        node: site.origin,
+                        kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                            expected,
+                            found: variable.kind,
+                        },
+                    });
+                }
             }
         }
     }
@@ -1532,6 +1613,14 @@ fn primitive_bitwise_literal_left_result(
             found: right,
         }
     }
+}
+
+fn primitive_bitwise_integer_literal_pair_supported(
+    operator: BinOp,
+    right: PrimitiveLiteralKind,
+) -> bool {
+    matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)
+        && right == PrimitiveLiteralKind::Integer
 }
 
 fn primitive_bitwise_byte_literal_left_result(
@@ -1680,7 +1769,8 @@ mod tests {
         PrimitiveLiteralKind, primitive_arithmetic_literal_expected_type,
         primitive_arithmetic_literal_left_result, primitive_arithmetic_result,
         primitive_bitwise_byte_literal_left_result, primitive_bitwise_byte_literal_pair_result,
-        primitive_bitwise_char_float_literal_rhs_type, primitive_bool_operand_result,
+        primitive_bitwise_char_float_literal_rhs_type,
+        primitive_bitwise_integer_literal_pair_supported, primitive_bool_operand_result,
         primitive_comparison_literal_expected_type, primitive_comparison_result,
         primitive_shift_left_literal_supported,
     };
@@ -2155,6 +2245,40 @@ mod tests {
             primitive_bitwise_byte_literal_pair_result(BinOp::Add, PrimitiveLiteralKind::Byte),
             PrimitiveArithmeticResult::Unsupported
         );
+    }
+
+    #[test]
+    fn integer_literal_bitwise_pairs_accept_only_integer_literals_for_bitwise_operators() {
+        for operator in [BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor] {
+            assert!(
+                primitive_bitwise_integer_literal_pair_supported(
+                    operator,
+                    PrimitiveLiteralKind::Integer
+                ),
+                "{operator:?} accepts an integer/integer literal pair"
+            );
+            for right in [
+                PrimitiveLiteralKind::FloatingPoint,
+                PrimitiveLiteralKind::Bool,
+                PrimitiveLiteralKind::Byte,
+                PrimitiveLiteralKind::Character,
+            ] {
+                assert!(
+                    !primitive_bitwise_integer_literal_pair_supported(operator, right),
+                    "{operator:?} keeps integer/{right:?} literal pairs gated"
+                );
+            }
+        }
+
+        for operator in [BinOp::Add, BinOp::Shl, BinOp::Shr, BinOp::Eq] {
+            assert!(
+                !primitive_bitwise_integer_literal_pair_supported(
+                    operator,
+                    PrimitiveLiteralKind::Integer
+                ),
+                "{operator:?} integer literal pairs remain unsupported"
+            );
+        }
     }
 
     #[test]
