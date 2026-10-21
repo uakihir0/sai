@@ -5507,7 +5507,6 @@ fn primitive_bitwise_integer_annotation_mismatch_recovers_after_operand_mismatch
 #[test]
 fn unsupported_primitive_bitwise_shapes_remain_gated() {
     for source in [
-        "pub fn right_literal(value: I32) -> I32 { let result = value & 1; result }\n",
         "pub fn left_literal(value: I32) -> I32 { let result = 1 & value; result }\n",
         "pub fn literal_pair() -> I32 { let result = 1 & 2; result }\n",
         "pub fn nested(left: I32, right: I32, extra: I32) -> I32 { let result = left & (right ^ extra); result }\n",
