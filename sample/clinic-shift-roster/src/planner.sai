@@ -1,0 +1,206 @@
+use acme:clinic-shift-roster/data
+use acme:clinic-shift-roster/model.{Assignment, Clinician, Credential, Position, Shift}
+
+pub fn find_clinician(id: U32) -> Option<Clinician> {
+    for clinician in data.clinicians() {
+        if clinician.id == id {
+            return Some(clinician)
+        }
+    }
+    None
+}
+
+pub fn find_shift(id: U32) -> Option<Shift> {
+    for shift in data.shifts() {
+        if shift.id == id {
+            return Some(shift)
+        }
+    }
+    None
+}
+
+pub fn required_rest_minutes() -> U32 {
+    600
+}
+
+fn is_available(clinician: Clinician, shift: Shift) -> Bool {
+    match shift.id {
+        1 => clinician.available_day_one_early
+        2 => clinician.available_day_one_late
+        3 => clinician.available_day_two_early
+        _ => false
+    }
+}
+
+fn is_qualified(clinician: Clinician, shift: Shift, position: Position) -> Bool {
+    match position {
+        Position.ChargeNurse => clinician.credential == Credential.ChargeNurse
+        Position.Physician => clinician.credential == shift.required_physician_credential
+    }
+}
+
+fn proposed_shift_count(clinician_id: U32) -> U32 {
+    var count: U32 = 0
+    for assignment in data.assignments() {
+        if assignment.clinician_id == clinician_id {
+            count += 1
+        }
+    }
+    count
+}
+
+fn position_proposal_count(shift_id: U32, position: Position) -> U32 {
+    var count: U32 = 0
+    for assignment in data.assignments() {
+        if assignment.shift_id == shift_id and assignment.position == position {
+            count += 1
+        }
+    }
+    count
+}
+
+fn rest_minutes_between(first: Shift, second: Shift) -> U32 {
+    if first.end_minute <= second.start_minute {
+        second.start_minute - first.end_minute
+    } else if second.end_minute <= first.start_minute {
+        first.start_minute - second.end_minute
+    } else {
+        0
+    }
+}
+
+fn assignment_has_sufficient_rest(assignment: Assignment, shift: Shift) -> Bool {
+    var enough_rest = true
+    for other in data.assignments() {
+        if other.id != assignment.id and other.clinician_id == assignment.clinician_id {
+            match find_shift(other.shift_id) {
+                Some(other_shift) => {
+                    if rest_minutes_between(shift, other_shift) < required_rest_minutes() {
+                        enough_rest = false
+                    }
+                }
+                None => {
+                    enough_rest = false
+                }
+            }
+        }
+    }
+    enough_rest
+}
+
+pub fn assignment_is_valid(assignment: Assignment) -> Bool {
+    match find_clinician(assignment.clinician_id) {
+        Some(clinician) => {
+            match find_shift(assignment.shift_id) {
+                Some(shift) => {
+                    (
+                        is_qualified(clinician, shift, assignment.position)
+                        and is_available(clinician, shift)
+                        and proposed_shift_count(clinician.id) <= clinician.max_shifts
+                        and position_proposal_count(shift.id, assignment.position) == 1
+                        and assignment_has_sufficient_rest(assignment, shift)
+                    )
+                }
+                None => false
+            }
+        }
+        None => false
+    }
+}
+
+pub fn valid_assignment_count() -> U32 {
+    var count: U32 = 0
+    for assignment in data.assignments() {
+        if assignment_is_valid(assignment) {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn invalid_assignment_count() -> U32 {
+    var count: U32 = 0
+    for assignment in data.assignments() {
+        if not assignment_is_valid(assignment) {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn covered_position_count() -> U32 {
+    var covered: U32 = 0
+    for shift in data.shifts() {
+        for position in [Position.ChargeNurse, Position.Physician] {
+            var valid_count: U32 = 0
+            for assignment in data.assignments() {
+                if (
+                    assignment.shift_id == shift.id
+                    and assignment.position == position
+                    and assignment_is_valid(assignment)
+                ) {
+                    valid_count += 1
+                }
+            }
+            if valid_count == 1 {
+                covered += 1
+            }
+        }
+    }
+    covered
+}
+
+fn trial_rest_minutes(clinician_id: U32, proposed_shift: Shift) -> U32 {
+    var found_existing = false
+    var shortest_rest = 4294967295
+    for assignment in data.assignments() {
+        if assignment.clinician_id == clinician_id {
+            match find_shift(assignment.shift_id) {
+                Some(existing_shift) => {
+                    let rest = rest_minutes_between(proposed_shift, existing_shift)
+                    if not found_existing or rest < shortest_rest {
+                        shortest_rest = rest
+                    }
+                    found_existing = true
+                }
+                None => {}
+            }
+        }
+    }
+    if found_existing {
+        shortest_rest
+    } else {
+        required_rest_minutes()
+    }
+}
+
+pub fn standby_rejection_reason() -> Str {
+    match find_clinician(data.standby_clinician_id()) {
+        Some(clinician) => {
+            match find_shift(data.standby_shift_id()) {
+                Some(shift) => {
+                    if not is_qualified(clinician, shift, data.standby_position()) {
+                        "credential mismatch"
+                    } else if not is_available(clinician, shift) {
+                        "unavailable"
+                    } else if proposed_shift_count(clinician.id) >= clinician.max_shifts {
+                        "shift cap reached"
+                    } else if trial_rest_minutes(clinician.id, shift) < required_rest_minutes() {
+                        "rest below minimum"
+                    } else {
+                        "eligible"
+                    }
+                }
+                None => "unknown shift"
+            }
+        }
+        None => "unknown clinician"
+    }
+}
+
+pub fn standby_rest_minutes() -> U32 {
+    match find_shift(data.standby_shift_id()) {
+        Some(shift) => trial_rest_minutes(data.standby_clinician_id(), shift)
+        None => 0
+    }
+}

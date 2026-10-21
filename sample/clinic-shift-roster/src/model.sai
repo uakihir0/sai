@@ -1,0 +1,42 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Credential {
+    ChargeNurse
+    EmergencyPhysician
+    TraumaPhysician
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Position {
+    ChargeNurse
+    Physician
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Clinician {
+    pub id: U32
+    pub name: Str
+    pub credential: Credential
+    pub max_shifts: U32
+    pub available_day_one_early: Bool
+    pub available_day_one_late: Bool
+    pub available_day_two_early: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Shift {
+    pub id: U32
+    pub name: Str
+    pub time: Str
+    // Minutes from Day 1 midnight; Day 2 begins at minute 1,440.
+    pub start_minute: U32
+    pub end_minute: U32
+    pub required_physician_credential: Credential
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Assignment {
+    pub id: U32
+    pub shift_id: U32
+    pub clinician_id: U32
+    pub position: Position
+}

@@ -1,0 +1,32 @@
+use acme:clinic-shift-roster/report
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        report.print_roster(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    if args[1].as_str() == "roster" {
+        report.print_roster(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    if args[1].as_str() == "coverage" {
+        report.print_coverage(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    if args[1].as_str() == "summary" {
+        report.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    out.write_str("usage: clinic-shift-roster [roster|coverage|summary]\n")
+    process.ExitCode.failure()
+}

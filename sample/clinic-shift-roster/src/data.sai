@@ -1,0 +1,109 @@
+use acme:clinic-shift-roster/model.{Assignment, Clinician, Credential, Position, Shift}
+
+pub fn clinicians() -> Array<Clinician, 5> {
+    [
+        Clinician(
+            id: 1,
+            name: "Mina",
+            credential: Credential.ChargeNurse,
+            max_shifts: 2,
+            available_day_one_early: true,
+            available_day_one_late: false,
+            available_day_two_early: true,
+        ),
+        Clinician(
+            id: 2,
+            name: "Ren",
+            credential: Credential.ChargeNurse,
+            max_shifts: 1,
+            available_day_one_early: false,
+            available_day_one_late: true,
+            available_day_two_early: false,
+        ),
+        Clinician(
+            id: 3,
+            name: "Dr. Hara",
+            credential: Credential.TraumaPhysician,
+            max_shifts: 1,
+            available_day_one_early: true,
+            available_day_one_late: false,
+            available_day_two_early: false,
+        ),
+        Clinician(
+            id: 4,
+            name: "Dr. Mori",
+            credential: Credential.EmergencyPhysician,
+            max_shifts: 2,
+            available_day_one_early: false,
+            available_day_one_late: true,
+            available_day_two_early: true,
+        ),
+        Clinician(
+            id: 5,
+            name: "Dr. Sato",
+            credential: Credential.EmergencyPhysician,
+            max_shifts: 1,
+            available_day_one_early: false,
+            available_day_one_late: false,
+            available_day_two_early: true,
+        ),
+    ]
+}
+
+pub fn shifts() -> Array<Shift, 3> {
+    [
+        Shift(
+            id: 1,
+            name: "Day 1 early",
+            time: "06:00-14:00",
+            start_minute: 360,
+            end_minute: 840,
+            required_physician_credential: Credential.TraumaPhysician,
+        ),
+        Shift(
+            id: 2,
+            name: "Day 1 late",
+            time: "14:00-22:00",
+            start_minute: 840,
+            end_minute: 1320,
+            required_physician_credential: Credential.EmergencyPhysician,
+        ),
+        Shift(
+            id: 3,
+            name: "Day 2 early",
+            time: "06:00-14:00",
+            start_minute: 1800,
+            end_minute: 2280,
+            required_physician_credential: Credential.EmergencyPhysician,
+        ),
+    ]
+}
+
+// These rows are the proposed rota to validate, not output from an optimizer.
+pub fn assignments() -> Array<Assignment, 6> {
+    [
+        Assignment(id: 1, shift_id: 1, clinician_id: 1, position: Position.ChargeNurse),
+        Assignment(id: 2, shift_id: 1, clinician_id: 3, position: Position.Physician),
+        Assignment(id: 3, shift_id: 2, clinician_id: 2, position: Position.ChargeNurse),
+        Assignment(id: 4, shift_id: 2, clinician_id: 4, position: Position.Physician),
+        Assignment(id: 5, shift_id: 3, clinician_id: 1, position: Position.ChargeNurse),
+        Assignment(id: 6, shift_id: 3, clinician_id: 5, position: Position.Physician),
+    ]
+}
+
+// This counterfactual replaces the incumbent Day 2 early physician proposal.
+pub fn standby_clinician_id() -> U32 {
+    4
+}
+
+pub fn standby_replaced_clinician_id() -> U32 {
+    5
+}
+
+pub fn standby_shift_id() -> U32 {
+    3
+}
+
+pub fn standby_position() -> Position {
+    Position.Physician
+}

@@ -1,0 +1,74 @@
+use acme:community-food-bank/data
+use acme:community-food-bank/model.{Request}
+use acme:community-food-bank/planner
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn household_name(id: U32) -> Str {
+    match planner.find_household(id) {
+        Some(household) => household.name
+        None => "(unknown household)"
+    }
+}
+
+fn item_name(id: U32) -> Str {
+    match planner.find_item(id) { Some(item) => item.name, None => "(unknown item)" }
+}
+
+fn allocation_status(request: Request) -> Str {
+    if not planner.is_request_eligible(request) {
+        "not eligible"
+    } else {
+        let supplied = planner.allocate(request).allocated_units
+        if supplied == request.units {
+            "allocated"
+        } else if supplied == 0 {
+            "unfilled"
+        } else {
+            "partial"
+        }
+    }
+}
+
+pub fn print_allocations(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str(
+        f"Harbor Pantry allocation plan — distribution day {data.distribution_day()}\n".as_str(),
+    )
+    out.write_str("Allocation order: priority 1, then 2, then 3; ties use household ID\n\n")
+    for request in data.requests() {
+        let result = planner.allocate(request)
+        out.write_str(
+            f"{household_name(request.household_id)} | {item_name(request.item_id)} | {result.requested_units} requested, {result.allocated_units} allocated ({allocation_status(request)})\n".as_str(),
+        )
+    }
+}
+
+pub fn print_stock(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str(f"Stock for distribution day {data.distribution_day()}\n")
+    for item in data.items() {
+        out.write_str(
+            f"{item.name}: {planner.usable_stock_for(item.id)} usable, {planner.expired_stock_for(item.id)} expired\n".as_str(),
+        )
+    }
+}
+
+pub fn print_summary(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    var requested: U32 = 0
+    for request in data.requests() {
+        requested += request.units
+    }
+    out.write_str("Harbor Pantry allocation summary\n")
+    out.write_str(f"Requested: {requested} units\n".as_str())
+    out.write_str(f"Eligible demand: {planner.eligible_demand_units()} units\n".as_str())
+    out.write_str(f"Allocated: {planner.allocated_units()} units\n".as_str())
+    out.write_str(f"Unfilled eligible demand: {planner.unfilled_eligible_units()} units\n".as_str())
+    out.write_str(f"Dietary exclusions: {planner.dietary_excluded_units()} units\n".as_str())
+    out.write_str(f"Available stock: {planner.total_usable_stock()} units\n".as_str())
+    out.write_str(f"Expired stock excluded: {planner.total_expired_stock()} units\n".as_str())
+}

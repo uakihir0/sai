@@ -1,0 +1,179 @@
+use acme:community-food-bank/data
+use acme:community-food-bank/model.{Allocation, Household, PantryItem, Request}
+use acme:community-food-bank/policy
+
+pub fn find_household(id: U32) -> Option<Household> {
+    for household in data.households() {
+        if household.id == id {
+            return Some(household)
+        }
+    }
+    None
+}
+
+pub fn find_item(id: U32) -> Option<PantryItem> {
+    for item in data.items() {
+        if item.id == id {
+            return Some(item)
+        }
+    }
+    None
+}
+
+pub fn usable_stock_for(item_id: U32) -> U32 {
+    var units: U32 = 0
+    for lot in data.stock_lots() {
+        if lot.item_id == item_id and lot.best_before_day >= data.distribution_day() {
+            units += lot.units
+        }
+    }
+    units
+}
+
+pub fn expired_stock_for(item_id: U32) -> U32 {
+    var units: U32 = 0
+    for lot in data.stock_lots() {
+        if lot.item_id == item_id and lot.best_before_day < data.distribution_day() {
+            units += lot.units
+        }
+    }
+    units
+}
+
+pub fn is_request_eligible(request: Request) -> Bool {
+    match find_household(request.household_id) {
+        Some(household) => {
+            match find_item(request.item_id) {
+                Some(item) => policy.is_eligible(household, item)
+                None => false
+            }
+        }
+        None => false
+    }
+}
+
+fn precedes(candidate: Request, request: Request) -> Bool {
+    match find_household(candidate.household_id) {
+        Some(candidate_household) => {
+            match find_household(request.household_id) {
+                Some(request_household) => {
+                    (
+                        candidate_household.priority < request_household.priority
+                        or (
+                            candidate_household.priority == request_household.priority
+                            and (
+                                candidate_household.id < request_household.id
+                                or (
+                                    candidate_household.id == request_household.id
+                                    and candidate.sequence < request.sequence
+                                )
+                            )
+                        )
+                    )
+                }
+                None => false
+            }
+        }
+        None => false
+    }
+}
+
+fn prior_eligible_demand(request: Request) -> U32 {
+    var units: U32 = 0
+    for candidate in data.requests() {
+        if (
+            candidate.item_id == request.item_id
+            and precedes(candidate, request)
+            and is_request_eligible(candidate)
+        ) {
+            units += candidate.units
+        }
+    }
+    units
+}
+
+pub fn allocate(request: Request) -> Allocation {
+    let eligible = is_request_eligible(request)
+    if eligible {
+        let stock = usable_stock_for(request.item_id)
+        let already_requested = prior_eligible_demand(request)
+        let remaining = if already_requested < stock {
+            stock - already_requested
+        } else {
+            0
+        }
+        let supplied = if request.units < remaining {
+            request.units
+        } else {
+            remaining
+        }
+        Allocation(
+            request: request,
+            eligible: true,
+            requested_units: request.units,
+            allocated_units: supplied,
+        )
+    } else {
+        Allocation(
+            request: request,
+            eligible: false,
+            requested_units: request.units,
+            allocated_units: 0,
+        )
+    }
+}
+
+pub fn eligible_demand_units() -> U32 {
+    var units: U32 = 0
+    for request in data.requests() {
+        if is_request_eligible(request) {
+            units += request.units
+        }
+    }
+    units
+}
+
+pub fn dietary_excluded_units() -> U32 {
+    var units: U32 = 0
+    for request in data.requests() {
+        if not is_request_eligible(request) {
+            units += request.units
+        }
+    }
+    units
+}
+
+pub fn allocated_units() -> U32 {
+    var units: U32 = 0
+    for request in data.requests() {
+        units += allocate(request).allocated_units
+    }
+    units
+}
+
+pub fn unfilled_eligible_units() -> U32 {
+    var units: U32 = 0
+    for request in data.requests() {
+        if is_request_eligible(request) {
+            let result = allocate(request)
+            units += request.units - result.allocated_units
+        }
+    }
+    units
+}
+
+pub fn total_usable_stock() -> U32 {
+    var units: U32 = 0
+    for item in data.items() {
+        units += usable_stock_for(item.id)
+    }
+    units
+}
+
+pub fn total_expired_stock() -> U32 {
+    var units: U32 = 0
+    for item in data.items() {
+        units += expired_stock_for(item.id)
+    }
+    units
+}
