@@ -882,6 +882,29 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     | PrimitiveLiteralKind::Character
                     | PrimitiveLiteralKind::FloatingPoint),
                 ) => {
+                    if left_type == PrimTy::Char
+                        && matches!(
+                            kind,
+                            PrimitiveLiteralKind::Bool | PrimitiveLiteralKind::Character
+                        )
+                    {
+                        let right_type = match kind {
+                            PrimitiveLiteralKind::Bool => PrimTy::Bool,
+                            PrimitiveLiteralKind::Character => PrimTy::Char,
+                            PrimitiveLiteralKind::Integer
+                            | PrimitiveLiteralKind::Byte
+                            | PrimitiveLiteralKind::FloatingPoint => unreachable!(),
+                        };
+                        self.errors.push(PrimitiveBodyError {
+                            node: expression,
+                            kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
+                                operator,
+                                left: left_type,
+                                right: right_type,
+                            },
+                        });
+                        return Ok(LocalType::Concrete(left_type));
+                    }
                     if left_type != PrimTy::Bool
                         && left_type != PrimTy::Byte
                         && !is_integer_primitive(left_type)

@@ -26951,6 +26951,157 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_reports_char_path_scalar_trait_failures() {
+        let cases = [
+            ("&", "and", "true", "bool", "BitAnd", "Bool"),
+            ("&", "and", "'a'", "char", "BitAnd", "Char"),
+            ("|", "or", "false", "bool", "BitOr", "Bool"),
+            ("|", "or", "'b'", "char", "BitOr", "Char"),
+            ("^", "xor", "true", "bool", "BitXor", "Bool"),
+            ("^", "xor", "'c'", "char", "BitXor", "Char"),
+        ];
+        let mut root = String::from("pub fn char_path_scalar_rhs(left: Char) -> Char {\n");
+        root.push_str("    let prior: Char = left\n");
+        let mut expected_messages = Vec::new();
+        let mut expected_tokens = Vec::new();
+        for (operator, operation, literal, suffix, trait_name, right_type) in cases {
+            for (left_kind, left) in [("parameter", "left"), ("local", "prior")] {
+                let local = format!("{operation}_{suffix}_{left_kind}");
+                let expression = format!("{left} {operator} {literal}");
+                root.push_str(&format!("    let {local} = {expression}\n"));
+                expected_messages.push(format!(
+                    "operator `{operator}` has no `{trait_name}<{right_type}>` implementation for `Char`"
+                ));
+                expected_tokens.push(expression);
+            }
+        }
+        root.push_str(
+            "    let recovered: Char = xor_char_local\n    recovered\n}\n\
+             pub fn char_path_annotation_recovery(left: Char) -> I32 {\n\
+                 let value: I32 = left & true\n\
+                 let recovered: I32 = value\n\
+                 recovered\n\
+             }\n",
+        );
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 2);
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[0]
+            .body_type_check()
+            .expect("concrete trait failures are reported")
+        else {
+            panic!("Char path literal trait failures must not gate the body");
+        };
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            vec![sai_diagnostics::Code::OperatorNotSupported; 12]
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            expected_messages
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        let function_start = root
+            .find("pub fn char_path_scalar_rhs")
+            .expect("matrix function exists");
+        let function_end = root[function_start..]
+            .find("\npub fn ")
+            .map_or(root.len(), |offset| function_start + offset);
+        let function_text = &root[function_start..function_end];
+        let body_offset = function_text.find('{').expect("function body opens") + 1;
+        let body = &function_text[body_offset..];
+        for (diagnostic, token) in diagnostics.iter().zip(expected_tokens) {
+            let relative_start = body
+                .find(&token)
+                .expect("diagnostic expression is in the body");
+            let start = (function_start + body_offset + relative_start) as u32;
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("body diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + token.len() as u32),
+                )
+                .expect("diagnostic token range is ordered"),
+                "Char path trait diagnostic for {token}"
+            );
+        }
+
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: annotation_diagnostics,
+        } = resolved.owners()[1]
+            .body_type_check()
+            .expect("annotation recovery diagnostics are reported")
+        else {
+            panic!("Char path annotation recovery must not gate the body");
+        };
+        assert_eq!(
+            annotation_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::OperatorNotSupported,
+                sai_diagnostics::Code::TypeMismatch,
+            ]
+        );
+        assert_eq!(
+            annotation_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "operator `&` has no `BitAnd<Bool>` implementation for `Char`",
+                "expected `I32`, found `Char`",
+            ]
+        );
+        let annotation_expression = "left & true";
+        let annotation_start = root
+            .rfind(annotation_expression)
+            .expect("annotation expression exists") as u32;
+        for diagnostic in annotation_diagnostics {
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("annotation diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(annotation_start),
+                    sai_diagnostics::TextSize::new(
+                        annotation_start + annotation_expression.len() as u32,
+                    ),
+                )
+                .expect("annotation expression range is ordered")
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_keeps_unsupported_bitwise_forms_gated() {
         let root = concat!(
             "type Word = I32\n",
@@ -26965,11 +27116,20 @@ mod tests {
             "pub fn f64_path_char_rhs(left: F64) -> F64 {\n    let value = left | 'y'\n    value\n}\n",
             "pub fn byte_alias_path_scalar_rhs(left: ByteAlias) -> ByteAlias {\n    let value = left ^ true\n    value\n}\n",
             "pub fn generic_path_scalar_rhs<T>(left: Byte) -> Byte {\n    let value = left & 'x'\n    value\n}\n",
+            "pub fn generic_char_path_scalar_rhs<T>(left: Char) -> Char {\n    let value = left & true\n    value\n}\n",
             "type PathScalarBitOwner { marker: Bool }\n",
             "impl PathScalarBitOwner {\n",
             "    fn path_scalar_method(self: borrow Self, left: Bool) -> Bool {\n",
             "        let prior: Bool = left\n",
             "        let value = prior ^ 1.0\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
+            "type CharPathScalarBitOwner { marker: Char }\n",
+            "impl CharPathScalarBitOwner {\n",
+            "    fn char_path_scalar_method(self: borrow Self, left: Char) -> Char {\n",
+            "        let prior: Char = left\n",
+            "        let value = prior | 'x'\n",
             "        value\n",
             "    }\n",
             "}\n",
@@ -27000,7 +27160,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 21);
+        assert_eq!(resolved.owners().len(), 22);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()
