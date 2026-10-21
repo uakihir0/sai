@@ -138,7 +138,7 @@ struct LiteralVariable<'hir> {
 /// Direct numeric literals are accepted on either side of `+`, `-`, `*`, and
 /// `/` when paired with an eligible concrete numeric path. `%` accepts integer
 /// paths and direct integer literals; float `%` returns an operator diagnostic.
-/// Unary `~` accepts a direct concrete integer or Byte path.
+/// Unary `~` accepts a direct integer literal or concrete integer/Byte path.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
@@ -330,34 +330,55 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 LocalType::Concrete(PrimTy::Bool)
             }
             ExprKind::Unary(UnOp::BitNot, operand) => {
-                let operand_type = self
-                    .check_local_path(operand)
-                    .ok()
-                    .and_then(|local_type| self.concrete_local_type(local_type))
-                    .filter(|primitive| supports_primitive_literal(*primitive))
-                    .ok_or(())?;
-                if !is_bitwise_primitive(operand_type) {
-                    self.errors.push(PrimitiveBodyError {
-                        node: init.hir_id,
-                        kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
-                            operator: UnOp::BitNot,
-                            operand: operand_type,
-                        },
-                    });
-                }
-                if let Some(expected) = annotation {
-                    if expected != operand_type {
+                if let ExprKind::Lit(literal) = operand.kind {
+                    if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer) {
+                        return Err(());
+                    }
+                    if let Some(expected) = annotation {
+                        self.check_annotated_literal(
+                            expected,
+                            literal,
+                            PrimitiveLiteralKind::Integer,
+                            operand.hir_id,
+                        );
+                        LocalType::Concrete(expected)
+                    } else {
+                        self.local_type_for_unannotated_literal(
+                            literal,
+                            PrimitiveLiteralKind::Integer,
+                            operand.hir_id,
+                        )
+                    }
+                } else {
+                    let operand_type = self
+                        .check_local_path(operand)
+                        .ok()
+                        .and_then(|local_type| self.concrete_local_type(local_type))
+                        .filter(|primitive| supports_primitive_literal(*primitive))
+                        .ok_or(())?;
+                    if !is_bitwise_primitive(operand_type) {
                         self.errors.push(PrimitiveBodyError {
                             node: init.hir_id,
-                            kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                expected,
-                                found: operand_type,
+                            kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                                operator: UnOp::BitNot,
+                                operand: operand_type,
                             },
                         });
                     }
-                    LocalType::Concrete(expected)
-                } else {
-                    LocalType::Concrete(operand_type)
+                    if let Some(expected) = annotation {
+                        if expected != operand_type {
+                            self.errors.push(PrimitiveBodyError {
+                                node: init.hir_id,
+                                kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                    expected,
+                                    found: operand_type,
+                                },
+                            });
+                        }
+                        LocalType::Concrete(expected)
+                    } else {
+                        LocalType::Concrete(operand_type)
+                    }
                 }
             }
             _ => return Err(()),

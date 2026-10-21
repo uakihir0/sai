@@ -6362,15 +6362,18 @@ fn check_function_body_primitive_local_block(
                 }
             }
             ExprKind::Unary(UnOp::BitNot, operand) => {
-                let ExprKind::Path(path) = operand.kind else {
-                    return Ok(None);
-                };
-                let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
-                else {
-                    return Ok(None);
-                };
-                if !preceding_bindings.contains(&source_binding) {
-                    return Ok(None);
+                if !is_direct_function_integer_literal(operand) {
+                    let ExprKind::Path(path) = operand.kind else {
+                        return Ok(None);
+                    };
+                    let Some(source_binding) =
+                        resolved_plain_local_path_binding(path, locals, inputs)
+                    else {
+                        return Ok(None);
+                    };
+                    if !preceding_bindings.contains(&source_binding) {
+                        return Ok(None);
+                    }
                 }
             }
             ExprKind::Binary(operator, left, right)
@@ -25838,6 +25841,40 @@ mod tests {
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
                 "function owner {:?} (index {index}) unexpectedly failed the supported bit-not slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_bit_not_for_direct_integer_literals() {
+        let root = concat!(
+            "pub fn annotated() -> I8 {\n    let result: I8 = ~-128\n    result\n}\n",
+            "pub fn tail_inferred() -> I16 {\n    let result = ~42\n    result\n}\n",
+            "pub fn defaulted() -> I64 {\n    let result = ~1\n    let output: I64 = 0\n    output\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 3);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("direct integer literal bit-not body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the direct bit-not literal slice: {check:?}",
                 owner.owner()
             );
         }
