@@ -1,0 +1,12 @@
+package acme:incident-response-console @ 0.1.0
+compiler ^0.1
+source "src"
+
+requires {
+    sai:process @ ^0.1
+        from git "https://github.com/sai-lang/process"
+}
+
+targets { wasm32-wasi }
+allow { alloc, wasi:cli }
+description "A fixed-data incident triage and response SLA console"

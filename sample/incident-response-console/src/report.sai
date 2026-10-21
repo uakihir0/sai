@@ -1,0 +1,177 @@
+use acme:incident-response-console/data
+use acme:incident-response-console/model.{Impact, Incident, Priority, Severity}
+use acme:incident-response-console/policy
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn severity_name(severity: Severity) -> Str {
+    match severity {
+        Severity.Critical => "critical"
+        Severity.High => "high"
+        Severity.Medium => "medium"
+        Severity.Low => "low"
+    }
+}
+
+fn impact_name(impact: Impact) -> Str {
+    match impact {
+        Impact.Widespread => "widespread"
+        Impact.ManyCustomers => "many customers"
+        Impact.SingleCustomer => "single customer"
+        Impact.InternalOnly => "internal only"
+    }
+}
+
+fn priority_name(priority: Priority) -> Str {
+    match priority {
+        Priority.P1 => "P1"
+        Priority.P2 => "P2"
+        Priority.P3 => "P3"
+        Priority.P4 => "P4"
+    }
+}
+
+fn print_response(out: borrow mut Stdout, incident: Incident)
+    effects { stdio.write, alloc }
+{
+    let target = policy.response_target_minutes(policy.priority(incident))
+    match incident.first_response_minutes {
+        Some(response_minutes) => {
+            if response_minutes > target {
+                out.write_str(
+                    f"  first response: late at {response_minutes} min (target {target} min; exceeded by {response_minutes - target} min)\n".as_str(),
+                )
+            } else {
+                out.write_str(
+                    f"  first response: met in {response_minutes} min (target {target} min)\n".as_str(),
+                )
+            }
+        }
+        None => {
+            if incident.detected_minutes_ago > target {
+                out.write_str(
+                    f"  first response: pending; target {target} min; overdue by {incident.detected_minutes_ago - target} min\n".as_str(),
+                )
+            } else {
+                out.write_str(
+                    f"  first response: pending; target {target} min; due in {target - incident.detected_minutes_ago} min\n".as_str(),
+                )
+            }
+        }
+    }
+}
+
+fn print_escalation(out: borrow mut Stdout, incident: Incident)
+    effects { stdio.write, alloc }
+{
+    if policy.needs_escalation(incident) {
+        let priority = policy.priority(incident)
+        let target = policy.response_target_minutes(priority)
+        if priority == Priority.P1 {
+            out.write_str(
+                f"  escalation: {policy.escalation_target(incident)} (P1, immediate)\n".as_str(),
+            )
+        } else {
+            out.write_str(
+                f"  escalation: {policy.escalation_target(incident)} ({priority_name(priority)}, {incident.detected_minutes_ago - target} min overdue)\n".as_str(),
+            )
+        }
+    }
+}
+
+pub fn print_incidents(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Incident triage\n")
+    for incident in data.incidents() {
+        let priority = policy.priority(incident)
+        out.write_str(
+            f"{incident.id} [{priority_name(priority)} score {policy.score(incident)}] {severity_name(incident.severity)} / {impact_name(incident.impact)} — {incident.service}: {incident.summary}\n".as_str(),
+        )
+        print_response(borrow mut out, incident)
+        print_escalation(borrow mut out, incident)
+    }
+}
+
+pub fn print_escalations(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Active escalations\n")
+    var count: USize = 0
+    for incident in data.incidents() {
+        if policy.needs_escalation(incident) {
+            let priority = policy.priority(incident)
+            let target = policy.response_target_minutes(priority)
+            if priority == Priority.P1 {
+                out.write_str(
+                    f"{incident.id} -> {policy.escalation_target(incident)} ({priority_name(priority)}, immediate)\n".as_str(),
+                )
+            } else {
+                out.write_str(
+                    f"{incident.id} -> {policy.escalation_target(incident)} ({priority_name(priority)}, {incident.detected_minutes_ago - target} min overdue)\n".as_str(),
+                )
+            }
+            count += 1
+        }
+    }
+    if count == 0 {
+        out.write_str("No active escalations.\n")
+    }
+}
+
+pub fn print_summary(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    var total: USize = 0
+    var p1: USize = 0
+    var p2: USize = 0
+    var p3: USize = 0
+    var p4: USize = 0
+    var awaiting_response: USize = 0
+    var breached: USize = 0
+    var commander_escalations: USize = 0
+    var manager_escalations: USize = 0
+
+    for incident in data.incidents() {
+        total += 1
+        match policy.priority(incident) {
+            Priority.P1 => {
+                p1 += 1
+            }
+            Priority.P2 => {
+                p2 += 1
+            }
+            Priority.P3 => {
+                p3 += 1
+            }
+            Priority.P4 => {
+                p4 += 1
+            }
+        }
+        match incident.first_response_minutes {
+            Some(_) => {}
+            None => {
+                awaiting_response += 1
+            }
+        }
+        if policy.response_sla_breached(incident) {
+            breached += 1
+        }
+        if policy.needs_escalation(incident) {
+            if policy.priority(incident) == Priority.P1 {
+                commander_escalations += 1
+            } else {
+                manager_escalations += 1
+            }
+        }
+    }
+
+    out.write_str("Triage summary\n")
+    out.write_str(f"{total} incidents: {p1} P1, {p2} P2, {p3} P3, {p4} P4\n".as_str())
+    out.write_str(
+        f"{awaiting_response} incidents awaiting a first response; {breached} response SLA breaches\n".as_str(),
+    )
+    out.write_str(
+        f"{commander_escalations + manager_escalations} active escalations: {commander_escalations} incident commander, {manager_escalations} duty manager\n".as_str(),
+    )
+}

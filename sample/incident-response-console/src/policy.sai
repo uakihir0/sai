@@ -1,0 +1,65 @@
+use acme:incident-response-console/model.{Impact, Incident, Priority, Severity}
+
+fn severity_weight(severity: Severity) -> U32 {
+    match severity {
+        Severity.Critical => 40
+        Severity.High => 30
+        Severity.Medium => 20
+        Severity.Low => 10
+    }
+}
+
+fn impact_weight(impact: Impact) -> U32 {
+    match impact {
+        Impact.Widespread => 30
+        Impact.ManyCustomers => 20
+        Impact.SingleCustomer => 10
+        Impact.InternalOnly => 0
+    }
+}
+
+pub fn score(incident: Incident) -> U32 {
+    severity_weight(incident.severity) + impact_weight(incident.impact)
+}
+
+pub fn priority(incident: Incident) -> Priority {
+    let incident_score = score(incident)
+    if incident_score >= 60 {
+        Priority.P1
+    } else if incident_score >= 45 {
+        Priority.P2
+    } else if incident_score >= 25 {
+        Priority.P3
+    } else {
+        Priority.P4
+    }
+}
+
+pub fn response_target_minutes(priority: Priority) -> U32 {
+    match priority { Priority.P1 => 15, Priority.P2 => 30, Priority.P3 => 60, Priority.P4 => 240 }
+}
+
+pub fn response_sla_breached(incident: Incident) -> Bool {
+    let target = response_target_minutes(priority(incident))
+    match incident.first_response_minutes {
+        Some(response_minutes) => response_minutes > target
+        None => incident.detected_minutes_ago > target
+    }
+}
+
+pub fn needs_escalation(incident: Incident) -> Bool {
+    match incident.first_response_minutes {
+        Some(_) => false
+        None => {
+            priority(incident) == Priority.P1 or response_sla_breached(incident)
+        }
+    }
+}
+
+pub fn escalation_target(incident: Incident) -> Str {
+    if priority(incident) == Priority.P1 {
+        "incident commander"
+    } else {
+        "duty manager"
+    }
+}

@@ -1,0 +1,51 @@
+use acme:incident-response-console/model.{Impact, Incident, Severity}
+
+pub fn incidents() -> Array<Incident, 5> {
+    [
+        Incident(
+            id: "INC-2401",
+            service: "Payments API",
+            summary: "checkout requests time out",
+            severity: Severity.Critical,
+            impact: Impact.Widespread,
+            detected_minutes_ago: 22,
+            first_response_minutes: None,
+        ),
+        Incident(
+            id: "INC-2402",
+            service: "Identity",
+            summary: "login retries are rising",
+            severity: Severity.High,
+            impact: Impact.ManyCustomers,
+            detected_minutes_ago: 18,
+            first_response_minutes: Some(12),
+        ),
+        Incident(
+            id: "INC-2403",
+            service: "Search",
+            summary: "one tenant sees stale results",
+            severity: Severity.Medium,
+            impact: Impact.SingleCustomer,
+            detected_minutes_ago: 55,
+            first_response_minutes: None,
+        ),
+        Incident(
+            id: "INC-2404",
+            service: "Notifications",
+            summary: "delivery is delayed",
+            severity: Severity.High,
+            impact: Impact.SingleCustomer,
+            detected_minutes_ago: 90,
+            first_response_minutes: Some(75),
+        ),
+        Incident(
+            id: "INC-2405",
+            service: "Build pipeline",
+            summary: "nightly jobs are queued",
+            severity: Severity.Low,
+            impact: Impact.InternalOnly,
+            detected_minutes_ago: 260,
+            first_response_minutes: None,
+        ),
+    ]
+}
