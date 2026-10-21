@@ -807,6 +807,31 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     );
                     return Ok(LocalType::Concrete(PrimTy::Bool));
                 }
+                if primitive_literal_kind(literal) == Some(PrimitiveLiteralKind::Character) {
+                    let ExprKind::Lit(right_literal) = right.kind else {
+                        return Err(());
+                    };
+                    let Some(right_kind) = primitive_literal_kind(right_literal) else {
+                        return Err(());
+                    };
+                    if !primitive_bitwise_char_literal_pair_supported(operator, right_kind) {
+                        return Err(());
+                    }
+
+                    // Char bitwise operators use trait selection. No
+                    // BitAnd<Char>, BitOr<Char>, or BitXor<Char>
+                    // implementation exists, so retain the Char result for
+                    // annotation and later-use recovery.
+                    self.errors.push(PrimitiveBodyError {
+                        node: expression,
+                        kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
+                            operator,
+                            left: PrimTy::Char,
+                            right: PrimTy::Char,
+                        },
+                    });
+                    return Ok(LocalType::Concrete(PrimTy::Char));
+                }
                 return Err(());
             }
             if let ExprKind::Lit(right_literal) = right.kind {
@@ -1652,6 +1677,14 @@ fn primitive_bitwise_bool_literal_pair_supported(
         && right == PrimitiveLiteralKind::Bool
 }
 
+fn primitive_bitwise_char_literal_pair_supported(
+    operator: BinOp,
+    right: PrimitiveLiteralKind,
+) -> bool {
+    matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)
+        && right == PrimitiveLiteralKind::Character
+}
+
 fn primitive_bitwise_byte_literal_left_result(
     operator: BinOp,
     right: PrimTy,
@@ -1799,6 +1832,7 @@ mod tests {
         primitive_arithmetic_literal_left_result, primitive_arithmetic_result,
         primitive_bitwise_bool_literal_pair_supported, primitive_bitwise_byte_literal_left_result,
         primitive_bitwise_byte_literal_pair_result, primitive_bitwise_char_float_literal_rhs_type,
+        primitive_bitwise_char_literal_pair_supported,
         primitive_bitwise_integer_literal_pair_supported, primitive_bool_operand_result,
         primitive_comparison_literal_expected_type, primitive_comparison_result,
         primitive_shift_left_literal_supported,
@@ -2337,6 +2371,40 @@ mod tests {
                     PrimitiveLiteralKind::Bool
                 ),
                 "{operator:?} Bool literal pairs remain unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn char_literal_bitwise_pairs_accept_only_char_literals_for_bitwise_operators() {
+        for operator in [BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor] {
+            assert!(
+                primitive_bitwise_char_literal_pair_supported(
+                    operator,
+                    PrimitiveLiteralKind::Character
+                ),
+                "{operator:?} accepts a Char/Char literal pair for trait diagnostics"
+            );
+            for right in [
+                PrimitiveLiteralKind::Integer,
+                PrimitiveLiteralKind::FloatingPoint,
+                PrimitiveLiteralKind::Bool,
+                PrimitiveLiteralKind::Byte,
+            ] {
+                assert!(
+                    !primitive_bitwise_char_literal_pair_supported(operator, right),
+                    "{operator:?} keeps Char/{right:?} literal pairs gated"
+                );
+            }
+        }
+
+        for operator in [BinOp::Add, BinOp::Shl, BinOp::Shr, BinOp::Eq] {
+            assert!(
+                !primitive_bitwise_char_literal_pair_supported(
+                    operator,
+                    PrimitiveLiteralKind::Character
+                ),
+                "{operator:?} Char literal pairs remain unsupported"
             );
         }
     }
