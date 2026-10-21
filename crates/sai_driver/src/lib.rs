@@ -6396,6 +6396,9 @@ fn check_function_body_primitive_local_block(
                                 || is_direct_function_integer_literal(right)))
                             || (is_direct_function_integer_literal(left)
                                 && is_preceding_path(right))
+                            || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
+                                && (is_preceding_path(right)
+                                    || is_direct_function_integer_literal(right)))
                     }
                     BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                         (is_preceding_path(left) && is_preceding_path(right))
@@ -25828,6 +25831,45 @@ mod tests {
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
                 "function owner {:?} (index {index}) unexpectedly failed the supported shift literal slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_byte_literals_on_flat_local_shift_left() {
+        let mut root = String::new();
+        for (operator, suffix) in [("<<", "left"), (">>", "right")] {
+            root.push_str(&format!(
+                "pub fn byte_path_{suffix}(amount: U32) -> Byte {{\n    let value = b'a' {operator} amount\n    value\n}}\n"
+            ));
+            root.push_str(&format!(
+                "pub fn byte_literal_{suffix}(amount: U32) -> Byte {{\n    let value: Byte = b'a' {operator} 1\n    value\n}}\n"
+            ));
+        }
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 4);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("supported primitive shift body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the Byte shift literal slice: {check:?}",
                 owner.owner()
             );
         }

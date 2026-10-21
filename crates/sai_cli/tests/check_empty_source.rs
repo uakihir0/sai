@@ -5429,6 +5429,163 @@ fn primitive_shift_left_integer_literals_infer_from_annotations_and_function_tai
 }
 
 #[test]
+fn primitive_shift_byte_literal_left_accepts_u32_paths_and_integer_literals() {
+    for operator in ["<<", ">>"] {
+        for (suffix, right, annotation) in [
+            ("parameter", "raw_amount", ""),
+            ("local", "amount", ": Byte"),
+            ("zero", "0", ""),
+            ("maximum", "4294967295", ": Byte"),
+        ] {
+            let source = format!(
+                concat!(
+                    "pub fn byte_shift_{suffix}(raw_amount: U32) -> Byte {{\n",
+                    "    let amount: U32 = raw_amount\n",
+                    "    let shifted{annotation} = b'a' {operator} {right}\n",
+                    "    let recovered: Byte = shifted\n",
+                    "    recovered\n",
+                    "}}\n",
+                ),
+                suffix = suffix,
+                annotation = annotation,
+                operator = operator,
+                right = right,
+            );
+            let output = run_check(&source, "", &[], &[]);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "Byte literal left shifts should accept {right} with {operator}:\n{source}\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_success_result(output, "wasm32-core", "dev");
+        }
+    }
+}
+
+#[test]
+fn primitive_shift_byte_literal_left_rhs_path_mismatches_recover_to_byte() {
+    for right_type in ["I32", "Byte", "Bool", "Char", "F32"] {
+        let source = format!(
+            concat!(
+                "pub fn mismatch(amount: {right_type}) -> Byte {{\n",
+                "    let shifted = b'a' << amount\n",
+                "    let recovered: Byte = shifted\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            right_type = right_type,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let right_start = source
+            .find("<< amount")
+            .map(|start| start + "<< ".len())
+            .expect("shift count path exists");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"TYPE_MISMATCH\""),
+            "non-U32 path {right_type} should report a type mismatch:\n{stdout}"
+        );
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "the non-U32 path should produce one type mismatch:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "the invalid count should recover through a Byte local and tail:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            &format!("expected `U32`, found `{right_type}`"),
+            right_start,
+            right_start + "amount".len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_shift_byte_literal_left_count_ranges_use_u32_and_recover_to_byte() {
+    for operator in ["<<", ">>"] {
+        for literal in ["-1", "4294967296"] {
+            let source = format!(
+                concat!(
+                    "pub fn out_of_range() -> Byte {{\n",
+                    "    let shifted = b'a' {operator} {literal}\n",
+                    "    let recovered: Byte = shifted\n",
+                    "    recovered\n",
+                    "}}\n",
+                ),
+                operator = operator,
+                literal = literal,
+            );
+            let output = run_check(&source, "", &[], &[]);
+            let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+            let literal_start = source.find(literal).expect("shift count literal exists");
+
+            assert_eq!(output.status.code(), Some(1), "{stdout}");
+            assert_eq!(
+                stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+                1,
+                "each invalid U32 count should produce one range diagnostic:\n{stdout}"
+            );
+            assert!(
+                !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                    && !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                    && !stdout.contains("\"type\":\"result\""),
+                "the invalid count should recover to Byte through the later local and tail:\n{stdout}"
+            );
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "LITERAL_OUT_OF_RANGE",
+                "integer literal is out of range for `U32`",
+                literal_start,
+                literal_start + literal.len(),
+            );
+        }
+    }
+}
+
+#[test]
+fn primitive_shift_byte_literal_left_annotation_mismatch_recovers_to_annotation() {
+    let source = concat!(
+        "pub fn annotation_recovery(amount: U32) -> I8 {\n",
+        "    let shifted: I8 = b'a' << amount\n",
+        "    let recovered: I8 = shifted\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression_start = source
+        .find("b'a' << amount")
+        .expect("annotated Byte shift expression exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the incompatible annotation should produce one mismatch:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the local should recover to I8 and reach the following local and tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I8`, found `Byte`",
+        expression_start,
+        expression_start + "b'a' << amount".len(),
+    );
+}
+
+#[test]
 fn primitive_shift_left_integer_literal_right_path_mismatch_recovers() {
     let source = concat!(
         "pub fn mismatch(amount: I16) -> I32 {\n",
@@ -6314,8 +6471,19 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
 #[test]
 fn unsupported_primitive_shift_shapes_and_owners_remain_gated() {
     for source in [
-        "pub fn byte_literal_left(amount: U32) -> Byte { let result = b'a' << amount; result }\n",
         "pub fn byte_literal_right(left: Byte) -> Byte { let result = left >> b'a'; result }\n",
+        "pub fn byte_literal_pair(amount: U32) -> Byte { let result = b'a' << b'b'; result }\n",
+        "pub fn byte_literal_bool_right(amount: U32) -> Byte { let result = b'a' << true; result }\n",
+        "pub fn byte_literal_char_right(amount: U32) -> Byte { let result = b'a' >> 'a'; result }\n",
+        "pub fn byte_literal_float_right(amount: U32) -> Byte { let result = b'a' << 1.0; result }\n",
+        "pub fn byte_string_left(amount: U32) -> Byte { let result = b\"text\" << amount; result }\n",
+        "type ShiftCount = U32\npub fn aliased_byte_literal_left(amount: ShiftCount) -> Byte { let result = b'a' << amount; result }\n",
+        "pub fn unresolved_byte_literal_left() -> Byte { let result = b'a' << missing; result }\n",
+        "pub fn self_reference_byte_literal_left() -> Byte { let result = b'a' << result; result }\n",
+        "pub fn forward_reference_byte_literal_left() -> Byte { let result = b'a' << later; let later: U32 = 1; result }\n",
+        "pub fn nested_byte_literal_left(amount: U32) -> Byte { let result = (b'a' << amount) >> amount; result }\n",
+        "pub fn nested_byte_literal_right(amount: U32, extra: U32) -> Byte { let result = b'a' << (amount >> extra); result }\n",
+        "pub fn computed_byte_literal_left(amount: U32) -> Byte { let result = (~b'a') << amount; result }\n",
         "pub fn bool_literal_right(left: I32) -> I32 { let result = left << true; result }\n",
         "pub fn char_literal_right(left: I32) -> I32 { let result = left >> 'a'; result }\n",
         "pub fn float_literal_right(left: I32) -> I32 { let result = left << 1.0; result }\n",
