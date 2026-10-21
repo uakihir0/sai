@@ -1,0 +1,38 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Priority {
+    Critical
+    Essential
+    Flexible
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Load {
+    // IDs are unique within a GridSnapshot; the fixed fixture satisfies this.
+    pub id: Str
+    pub name: Str
+    pub priority: Priority
+    pub demand_kw: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type GridSnapshot {
+    pub name: Str
+    pub solar_forecast_kw: U32
+    pub wind_forecast_kw: U32
+    pub battery_charge_kwh: U32
+    pub reserve_kwh: U32
+    pub loads: Array<Load, 6>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DispatchSummary {
+    pub renewable_kw: U32
+    pub battery_headroom_kwh: U32
+    pub demand_kw: U32
+    pub served_kw: U32
+    pub deferred_kw: U32
+    pub deferred_blocks: U32
+    pub unused_capacity_kw: U32
+    pub battery_used_kwh: U32
+    pub battery_ending_kwh: U32
+}

@@ -886,12 +886,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         right: &'hir Expr<'hir>,
         expression: HirId,
     ) -> Result<LocalType, ()> {
-        let left_type = self
-            .check_local_path(left)
-            .ok()
-            .and_then(|local_type| self.concrete_local_type(local_type))
-            .filter(|primitive| supports_primitive_literal(*primitive))
-            .ok_or(())?;
+        let left_type = if let ExprKind::Lit(literal) = left.kind {
+            if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer) {
+                return Err(());
+            }
+            self.local_type_for_unannotated_literal(
+                literal,
+                PrimitiveLiteralKind::Integer,
+                left.hir_id,
+            )
+        } else {
+            let local_type = self
+                .check_local_path(left)
+                .ok()
+                .and_then(|local_type| self.concrete_local_type(local_type))
+                .filter(|primitive| supports_primitive_literal(*primitive))
+                .ok_or(())?;
+            LocalType::Concrete(local_type)
+        };
+
         if let ExprKind::Lit(literal) = right.kind {
             if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer) {
                 return Err(());
@@ -909,7 +922,6 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 .and_then(|local_type| self.concrete_local_type(local_type))
                 .filter(|primitive| supports_primitive_literal(*primitive))
                 .ok_or(())?;
-
             if right_type != PrimTy::U32 {
                 self.errors.push(PrimitiveBodyError {
                     node: right.hir_id,
@@ -920,7 +932,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 });
             }
         }
-        if !is_bitwise_primitive(left_type) {
+
+        if let Some(left_type) = self.concrete_local_type(left_type)
+            && !is_bitwise_primitive(left_type)
+        {
             self.report_operator_not_supported(
                 expression,
                 operator,
@@ -928,9 +943,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             );
         }
 
-        // A failed shift still recovers to the left operand type so later
-        // locals and the function tail can be checked.
-        Ok(LocalType::Concrete(left_type))
+        // Integer literal left operands remain unresolved until an annotation
+        // or the function tail supplies their type. Unlike the shift count,
+        // the left operand is not constrained by the U32 right operand.
+        Ok(left_type)
     }
 
     fn report_operator_not_supported(

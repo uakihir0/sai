@@ -1,0 +1,58 @@
+use acme:island-grid-dispatch/data
+use acme:island-grid-dispatch/model.{GridSnapshot, Load, Priority}
+use acme:island-grid-dispatch/planner
+use acme:island-grid-dispatch/supply
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn priority_name(priority: Priority) -> Str {
+    match priority {
+        Priority.Critical => "critical"
+        Priority.Essential => "essential"
+        Priority.Flexible => "flexible"
+    }
+}
+
+fn print_load(out: borrow mut Stdout, grid: GridSnapshot, load: Load)
+    effects { stdio.write, alloc }
+{
+    if planner.can_serve(grid, load) {
+        out.write_str(
+            f"  serve [{priority_name(load.priority)}] {load.name} — {load.demand_kw} kW\n".as_str(),
+        )
+    } else {
+        out.write_str(
+            f"  defer [{priority_name(load.priority)}] {load.name} — {load.demand_kw} kW (whole block does not fit)\n".as_str(),
+        )
+    }
+}
+
+pub fn print_plan(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let grid = data.storm_watch()
+    let summary = planner.summarize(grid)
+
+    out.write_str(f"One-hour islanded plan: {grid.name}\n".as_str())
+    out.write_str(
+        f"Renewable generation: {summary.renewable_kw} kW (solar {grid.solar_forecast_kw}, wind {grid.wind_forecast_kw})\n".as_str(),
+    )
+    out.write_str(
+        f"Battery headroom: {summary.battery_headroom_kwh} kWh above the {grid.reserve_kwh} kWh reserve\n".as_str(),
+    )
+    out.write_str(
+        f"Demand: {summary.demand_kw} kW across {grid.loads.len()} service blocks\n\nDispatch\n".as_str(),
+    )
+
+    for load in grid.loads {
+        print_load(borrow mut out, grid, load)
+    }
+
+    out.write_str(
+        f"\nServed: {summary.served_kw} kW; deferred: {summary.deferred_kw} kW across {summary.deferred_blocks} blocks\n".as_str(),
+    )
+    out.write_str(f"Unused dispatch capacity: {summary.unused_capacity_kw} kW\n".as_str())
+    out.write_str(
+        f"Battery dispatch: {summary.battery_used_kwh} kWh; ending charge: {summary.battery_ending_kwh} kWh ({summary.battery_ending_kwh - grid.reserve_kwh} kWh above reserve)\n".as_str(),
+    )
+}

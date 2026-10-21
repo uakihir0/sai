@@ -1,0 +1,29 @@
+use acme:island-grid-dispatch/model.{GridSnapshot, Load, Priority}
+
+pub fn storm_watch() -> GridSnapshot {
+    GridSnapshot(
+        name: "North Pier storm watch",
+        solar_forecast_kw: 520,
+        wind_forecast_kw: 180,
+        battery_charge_kwh: 420,
+        reserve_kwh: 280,
+        loads: [
+            Load(id: "clinic", name: "Harbor clinic", priority: Priority.Critical, demand_kw: 300),
+            Load(id: "water", name: "Water pumps", priority: Priority.Essential, demand_kw: 180),
+            Load(
+                id: "shelter",
+                name: "Emergency shelter",
+                priority: Priority.Essential,
+                demand_kw: 170,
+            ),
+            Load(
+                id: "cold-room",
+                name: "Vaccine cold room",
+                priority: Priority.Essential,
+                demand_kw: 130,
+            ),
+            Load(id: "lighting", name: "Pier lighting", priority: Priority.Flexible, demand_kw: 90),
+            Load(id: "workshop", name: "Workshop", priority: Priority.Flexible, demand_kw: 110),
+        ],
+    )
+}

@@ -1,0 +1,63 @@
+use acme:island-grid-dispatch/model.{DispatchSummary, GridSnapshot, Load, Priority}
+use acme:island-grid-dispatch/supply
+
+pub fn can_serve(grid: GridSnapshot, requested: Load) -> Bool {
+    let ceiling_kw = supply.dispatch_ceiling_kw(grid)
+    var committed_kw: U32 = 0
+    var blocked = false
+
+    for tier in [Priority.Critical, Priority.Essential, Priority.Flexible] {
+        for load in grid.loads {
+            if load.priority == tier {
+                if not blocked and load.demand_kw <= ceiling_kw - committed_kw {
+                    if load.id == requested.id {
+                        return true
+                    }
+                    committed_kw += load.demand_kw
+                } else {
+                    blocked = true
+                }
+            }
+        }
+    }
+    false
+}
+
+pub fn summarize(grid: GridSnapshot) -> DispatchSummary {
+    let renewable = supply.renewable_kw(grid)
+    let headroom = supply.battery_headroom_kwh(grid)
+    let ceiling_kw = supply.dispatch_ceiling_kw(grid)
+    var demand_kw: U32 = 0
+    var served_kw: U32 = 0
+    var deferred_kw: U32 = 0
+    var deferred_blocks: U32 = 0
+
+    for load in grid.loads {
+        demand_kw += load.demand_kw
+        if can_serve(grid, load) {
+            served_kw += load.demand_kw
+        } else {
+            deferred_kw += load.demand_kw
+            deferred_blocks += 1
+        }
+    }
+
+    let battery_used = if served_kw > renewable {
+        served_kw - renewable
+    } else {
+        0
+    }
+    let battery_ending = grid.battery_charge_kwh - battery_used
+
+    DispatchSummary(
+        renewable_kw: renewable,
+        battery_headroom_kwh: headroom,
+        demand_kw: demand_kw,
+        served_kw: served_kw,
+        deferred_kw: deferred_kw,
+        deferred_blocks: deferred_blocks,
+        unused_capacity_kw: ceiling_kw - served_kw,
+        battery_used_kwh: battery_used,
+        battery_ending_kwh: battery_ending,
+    )
+}
