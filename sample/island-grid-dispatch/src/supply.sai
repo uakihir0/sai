@@ -1,0 +1,17 @@
+use acme:island-grid-dispatch/model.{GridSnapshot}
+
+pub fn renewable_kw(grid: GridSnapshot) -> U32 {
+    grid.solar_forecast_kw + grid.wind_forecast_kw
+}
+
+pub fn battery_headroom_kwh(grid: GridSnapshot) -> U32 {
+    if grid.battery_charge_kwh > grid.reserve_kwh {
+        grid.battery_charge_kwh - grid.reserve_kwh
+    } else {
+        0
+    }
+}
+
+pub fn dispatch_ceiling_kw(grid: GridSnapshot) -> U32 {
+    renewable_kw(grid) + battery_headroom_kwh(grid)
+}

@@ -1,0 +1,22 @@
+use acme:island-grid-dispatch/report
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        report.print_plan(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    if args[1].as_str() == "plan" {
+        report.print_plan(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    out.write_str("usage: island-grid-dispatch [plan]\n")
+    process.ExitCode.failure()
+}
