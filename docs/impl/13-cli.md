@@ -576,6 +576,8 @@ Locked dependency-source regressions verify dependency syntax and Phase 1 diagno
 
 **IR-801 direct Bool literal pairs for flat-local bitwise operators.** `sai check` accepts a supported flat-local initializer whose two direct operands are Bool literals joined by `&`, `|`, or `^` as a diagnostic and recovery shape. It reports `OPERATOR_NOT_SUPPORTED` on the full expression because Bool has no bitwise operators and retains Bool as the expression result for subsequent local and tail checking. A mismatched supported annotation reports `TYPE_MISMATCH` on the complete initializer and recovers the local to the annotation. Mixed literal pairs, nested/chained forms, byte strings, shifts, aliases, generic or method owners, and unsupported body shapes remain gated. This does not add Bool bitwise semantics, code generation, or runtime behavior.
 
+**IR-802 direct Char literal pairs for flat-local bitwise operators.** `sai check` accepts a supported flat-local initializer with direct Char literals on both sides of `&`, `|`, or `^` as a diagnostic and recovery shape. It reports `OPERATOR_NOT_SUPPORTED` on the full expression, naming the missing `BitAnd<Char>`, `BitOr<Char>`, or `BitXor<Char>` implementation, and recovers the expression as Char so later locals and the tail are checked. A mismatched supported annotation reports `TYPE_MISMATCH` on the complete initializer and recovers the local to its annotation. Existing Char-path-left literal behavior remains unchanged; mixed literal pairs, Char-literal-left/path forms, nested/chained forms, aliases, generic or method owners, and unsupported body shapes remain gated. This does not add Char bitwise semantics, lowering, or runtime behavior.
+
 ### 13.6.3 `sai build`
 
 ```text
