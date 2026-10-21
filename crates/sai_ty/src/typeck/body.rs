@@ -882,10 +882,20 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     | PrimitiveLiteralKind::Character
                     | PrimitiveLiteralKind::FloatingPoint),
                 ) => {
-                    if left_type != PrimTy::Byte && !is_integer_primitive(left_type) {
+                    if left_type != PrimTy::Bool
+                        && left_type != PrimTy::Byte
+                        && !is_integer_primitive(left_type)
+                    {
                         return Err(());
                     }
                     self.check_annotated_literal(left_type, literal, kind, right.hir_id);
+                    if left_type == PrimTy::Bool {
+                        self.report_operator_not_supported(
+                            expression,
+                            operator,
+                            PrimitiveOperatorOperand::Concrete(left_type),
+                        );
+                    }
                     return Ok(LocalType::Concrete(left_type));
                 }
                 _ => return Err(()),

@@ -6564,8 +6564,8 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let result = b'a' & (1 + 0)",
         ),
         fixture(
-            "pub fn bool_path_char_rhs(left: Bool) -> Bool",
-            "let result = left | 'x'",
+            "pub fn bool_path_byte_string_rhs(left: Bool) -> Bool",
+            "let result = left & b\"text\"",
         ),
         fixture(
             "pub fn char_path_float_rhs(left: Char) -> Char",
@@ -6585,6 +6585,37 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
                 "pub fn byte_alias_path_scalar_rhs(left: ByteAlias) -> ByteAlias",
                 "let result = left ^ true"
             )
+        ),
+        format!(
+            "type BoolAlias = Bool\n{}",
+            fixture(
+                "pub fn bool_alias_path_scalar_rhs(left: BoolAlias) -> BoolAlias",
+                "let result = left ^ true"
+            )
+        ),
+        fixture(
+            "pub fn bool_unresolved_path_scalar_rhs() -> Bool",
+            "let result = missing & true",
+        ),
+        fixture(
+            "pub fn bool_self_reference_scalar_rhs() -> Bool",
+            "let result = result & true",
+        ),
+        fixture(
+            "pub fn bool_forward_reference_scalar_rhs() -> Bool",
+            "let result = later & false\n    let later: Bool = true",
+        ),
+        fixture(
+            "pub fn bool_nested_rhs_scalar() -> Bool",
+            "let result = true & (false | true)",
+        ),
+        fixture(
+            "pub fn bool_nested_left_scalar_rhs(left: Bool, right: Bool) -> Bool",
+            "let result = (left & right) ^ true",
+        ),
+        fixture(
+            "pub fn bool_computed_rhs_scalar(left: Bool) -> Bool",
+            "let result = left & (true and false)",
         ),
         fixture(
             "pub fn nested(left: I32, right: I32, extra: I32) -> I32",
@@ -6629,6 +6660,10 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn generic_path_scalar_rhs<T>(left: Byte) -> Byte",
             "let result = left & 'x'",
         ),
+        fixture(
+            "pub fn generic_bool_path_scalar_rhs<T>(left: Bool) -> Bool",
+            "let result = left & true",
+        ),
         concat!(
             "type BitOwner { marker: Byte }\n",
             "impl BitOwner {\n",
@@ -6652,8 +6687,8 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         concat!(
             "type PathScalarBitOwner { marker: Byte }\n",
             "impl PathScalarBitOwner {\n",
-            "    fn path_scalar_method(self: borrow Self, left: Byte) -> Byte {\n",
-            "        let prior: Byte = left\n",
+            "    fn path_scalar_method(self: borrow Self, left: Bool) -> Bool {\n",
+            "        let prior: Bool = left\n",
             "        let result = prior ^ 1.0\n",
             "        result\n",
             "    }\n",
@@ -7467,6 +7502,132 @@ fn primitive_bitwise_byte_path_scalar_rhs_mismatches_recover_to_byte() {
             end,
         );
     }
+}
+
+#[test]
+fn primitive_bitwise_bool_path_scalar_rhs_diagnostics_recover_to_bool() {
+    let cases = [
+        ("&", "and", "true", "bool", None),
+        ("&", "and", "'x'", "char", Some("a character literal")),
+        ("&", "and", "1.0", "float", Some("a floating-point literal")),
+        ("|", "or", "false", "bool", None),
+        ("|", "or", "'y'", "char", Some("a character literal")),
+        ("|", "or", "2.0", "float", Some("a floating-point literal")),
+        ("^", "xor", "true", "bool", None),
+        ("^", "xor", "'z'", "char", Some("a character literal")),
+        ("^", "xor", "3.0", "float", Some("a floating-point literal")),
+    ];
+    let mut source = String::from("pub fn bool_path_scalar_rhs(left: Bool) -> Bool {\n");
+    source.push_str("    let prior: Bool = left\n");
+    let mut operator_spans = Vec::new();
+    let mut mismatch_spans = Vec::new();
+    for (operator, operation, literal, suffix, mismatch_description) in cases {
+        for (left_kind, left) in [("parameter", "left"), ("local", "prior")] {
+            let local = format!("{operation}_{suffix}_{left_kind}");
+            let expression = format!("{left} {operator} {literal}");
+            let line = format!("    let {local} = {expression}\n");
+            let expression_start =
+                source.len() + line.find(&expression).expect("expression exists");
+            let expression_end = expression_start + expression.len();
+            let literal_start = expression_start + format!("{left} {operator} ").len();
+            operator_spans.push((operator, expression_start, expression_end));
+            if let Some(description) = mismatch_description {
+                mismatch_spans.push((description, literal_start, literal_start + literal.len()));
+            }
+            source.push_str(&line);
+        }
+    }
+    source.push_str("    let recovered: Bool = xor_float_local\n    recovered\n}\n");
+
+    let output = run_check(&source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        cases.len() * 2,
+        "each Bool-left bitwise expression should report one unsupported-operator diagnostic:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        mismatch_spans.len(),
+        "only Char and floating-point literal RHSs should mismatch Bool:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "every expression should recover as Bool, without float default/range errors:\n{stdout}"
+    );
+    for (operator, start, end) in operator_spans {
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` is not defined for `Bool`"),
+            start,
+            end,
+        );
+    }
+    for (description, start, end) in mismatch_spans {
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            &format!("expected `Bool`, found {description}"),
+            start,
+            end,
+        );
+    }
+}
+
+#[test]
+fn primitive_bitwise_bool_path_scalar_rhs_recovers_to_different_annotation() {
+    let source = concat!(
+        "pub fn bool_path_scalar_annotation_recovery(left: Bool) -> I32 {\n",
+        "    let value: I32 = left & true\n",
+        "    let recovered: I32 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression = source
+        .find("left & true")
+        .expect("Bool bitwise expression exists");
+    let end = expression + "left & true".len();
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the Bool bitwise operator should remain unsupported:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the annotation should mismatch the recovered Bool expression once:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the local should recover to its I32 annotation for the following use and tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `&` is not defined for `Bool`",
+        expression,
+        end,
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        expression,
+        end,
+    );
 }
 
 #[test]
