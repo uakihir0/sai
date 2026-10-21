@@ -131,6 +131,8 @@ test "missing references do not mask a separate known cycle" {
 
 test "duplicate package IDs invalidate ordering and make cycle status unknown" {
     let report = audit_duplicate_id_fixture()
+    assert report.missing_reference_count == 2
+    assert report.incompatible_range_count == 1
     assert report.duplicate_id_pair_count == 1
     assert report.has_cycle == None
     assert report.build_order.length == 0

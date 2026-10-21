@@ -46,7 +46,7 @@ build order: unavailable (lock is invalid)
 
 duplicate ID fixture
 missing package references: 2
-version range conflicts: 0
+version range conflicts: 1
 duplicate package ID pairs: 1
 dependency cycle: unknown (package IDs are ambiguous)
 build order: unavailable (lock is invalid)
@@ -76,7 +76,9 @@ detection, so a missing package does not hide a cycle elsewhere in the known
 graph. Repeated package-ID pairs invalidate the lock and make cycle status
 unknown because the graph nodes cannot be resolved unambiguously. If a unique,
 fully referenced graph cannot be completely ordered, the remaining graph
-contains a cycle. Any missing endpoint, range conflict, duplicate ID, or cycle
+contains a cycle. Package lookup uses the first matching entry in fixture
+order, so the duplicate-ID fixture also reports the incompatible range against
+that entry. Any missing endpoint, range conflict, duplicate ID, or cycle
 withholds the order.
 
 This is a read-only auditor over in-memory fixtures. It does not parse a
