@@ -759,35 +759,63 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             .ok_or(())?;
 
         if let ExprKind::Lit(literal) = right.kind {
-            let Some(PrimitiveLiteralKind::Integer) = primitive_literal_kind(literal) else {
-                return Err(());
-            };
+            match primitive_literal_kind(literal) {
+                Some(PrimitiveLiteralKind::Integer) => {
+                    if is_integer_primitive(left_type)
+                        || matches!(
+                            left_type,
+                            PrimTy::Byte | PrimTy::Bool | PrimTy::F32 | PrimTy::F64
+                        )
+                    {
+                        self.check_annotated_literal(
+                            left_type,
+                            literal,
+                            PrimitiveLiteralKind::Integer,
+                            right.hir_id,
+                        );
+                        if matches!(left_type, PrimTy::Bool | PrimTy::F32 | PrimTy::F64) {
+                            self.report_operator_not_supported(
+                                expression,
+                                operator,
+                                PrimitiveOperatorOperand::Concrete(left_type),
+                            );
+                        }
+                        return Ok(LocalType::Concrete(left_type));
+                    }
 
-            if is_integer_primitive(left_type)
-                || matches!(
-                    left_type,
-                    PrimTy::Byte | PrimTy::Bool | PrimTy::F32 | PrimTy::F64
-                )
-            {
-                self.check_annotated_literal(
-                    left_type,
-                    literal,
-                    PrimitiveLiteralKind::Integer,
-                    right.hir_id,
-                );
-                if matches!(left_type, PrimTy::Bool | PrimTy::F32 | PrimTy::F64) {
-                    self.report_operator_not_supported(
-                        expression,
-                        operator,
-                        PrimitiveOperatorOperand::Concrete(left_type),
-                    );
+                    // Keep Char's bitwise rule gated until operator-trait inference is
+                    // available for an integer literal right operand.
+                    return Err(());
                 }
-                return Ok(LocalType::Concrete(left_type));
+                Some(PrimitiveLiteralKind::Byte) => {
+                    if left_type == PrimTy::Char {
+                        self.errors.push(PrimitiveBodyError {
+                            node: expression,
+                            kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
+                                operator,
+                                left: left_type,
+                                right: PrimTy::Byte,
+                            },
+                        });
+                    } else {
+                        self.check_annotated_literal(
+                            left_type,
+                            literal,
+                            PrimitiveLiteralKind::Byte,
+                            right.hir_id,
+                        );
+                        if matches!(left_type, PrimTy::Bool | PrimTy::F32 | PrimTy::F64) {
+                            self.report_operator_not_supported(
+                                expression,
+                                operator,
+                                PrimitiveOperatorOperand::Concrete(left_type),
+                            );
+                        }
+                    }
+                    return Ok(LocalType::Concrete(left_type));
+                }
+                _ => return Err(()),
             }
-
-            // Keep Char's bitwise rule gated until operator-trait inference is
-            // available for an integer literal right operand.
-            return Err(());
         }
 
         let right_type = self

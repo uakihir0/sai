@@ -6394,6 +6394,8 @@ fn check_function_body_primitive_local_block(
                         (is_preceding_path(left) && is_preceding_path(right))
                             || (is_preceding_path(left)
                                 && is_direct_function_integer_literal(right))
+                            || (is_preceding_path(left)
+                                && matches!(right.kind, ExprKind::Lit(Lit::Byte(_))))
                             || (is_direct_function_integer_literal(left)
                                 && is_preceding_path(right))
                     }
@@ -25760,6 +25762,40 @@ mod tests {
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
                 "function owner {:?} (index {index}) unexpectedly failed the supported body slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_flat_local_bitwise_right_byte_literals() {
+        let root = concat!(
+            "pub fn byte_and(left: Byte) -> Byte {\n    let value = left & b'a'\n    value\n}\n",
+            "pub fn byte_or(left: Byte) -> Byte {\n    let value = left | b'b'\n    value\n}\n",
+            "pub fn byte_xor(left: Byte) -> Byte {\n    let value = left ^ b'c'\n    value\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 3);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("supported primitive body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the supported Byte bitwise literal slice: {check:?}",
                 owner.owner()
             );
         }
