@@ -27102,6 +27102,207 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_reports_char_path_integer_rhs_defaulting_and_recovery() {
+        let mut root = String::from("pub fn char_path_integer_rhs(left: Char) -> Char {\n");
+        root.push_str("    let prior: Char = left\n");
+        let cases = [
+            ("&", "and", "1", "BitAnd"),
+            ("|", "or", "-2", "BitOr"),
+            ("^", "xor", "3", "BitXor"),
+        ];
+        let mut expected_messages = Vec::new();
+        let mut expected_tokens = Vec::new();
+        for (operator, operation, literal, trait_name) in cases {
+            for (left_kind, left) in [("parameter", "left"), ("local", "prior")] {
+                let local = format!("{operation}_integer_{left_kind}");
+                let expression = format!("{left} {operator} {literal}");
+                root.push_str(&format!("    let {local} = {expression}\n"));
+                expected_messages.push(format!(
+                    "operator `{operator}` has no `{trait_name}<I64>` implementation for `Char`"
+                ));
+                expected_tokens.push(expression);
+            }
+        }
+        root.push_str(
+            "    let recovered: Char = xor_integer_local\n    recovered\n}\n\
+             pub fn char_path_integer_range(left: Char) -> Char {\n\
+                 let value = left ^ -9223372036854775809\n\
+                 let recovered: Char = value\n\
+                 recovered\n\
+             }\n\
+             pub fn char_path_integer_annotation_recovery(left: Char) -> I32 {\n\
+                 let value: I32 = left & 1\n\
+                 let recovered: I32 = value\n\
+                 recovered\n\
+             }\n",
+        );
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 3);
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[0]
+            .body_type_check()
+            .expect("Char path integer literal trait failures are reported")
+        else {
+            panic!("Char path integer literals must not gate the body");
+        };
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            vec![sai_diagnostics::Code::OperatorNotSupported; 6]
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            expected_messages
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        let function_start = root
+            .find("pub fn char_path_integer_rhs")
+            .expect("matrix function exists");
+        let function_end = root[function_start..]
+            .find("\npub fn ")
+            .map_or(root.len(), |offset| function_start + offset);
+        let function_text = &root[function_start..function_end];
+        let body_offset = function_text.find('{').expect("function body opens") + 1;
+        let body = &function_text[body_offset..];
+        for (diagnostic, token) in diagnostics.iter().zip(expected_tokens) {
+            let relative_start = body
+                .find(&token)
+                .expect("diagnostic expression is in the body");
+            let start = (function_start + body_offset + relative_start) as u32;
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("body diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + token.len() as u32),
+                )
+                .expect("diagnostic token range is ordered"),
+                "Char-path trait diagnostic for {token}"
+            );
+        }
+
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: range_diagnostics,
+        } = resolved.owners()[1]
+            .body_type_check()
+            .expect("default I64 range diagnostic is reported")
+        else {
+            panic!("Char path integer range recovery must not gate the body");
+        };
+        assert_eq!(range_diagnostics.len(), 2);
+        let range_expression = root
+            .find("left ^ -9223372036854775809")
+            .expect("out-of-range Char expression exists");
+        let range_literal = range_expression + "left ^ ".len();
+        for (code, message, start, end) in [
+            (
+                sai_diagnostics::Code::OperatorNotSupported,
+                "operator `^` has no `BitXor<I64>` implementation for `Char`",
+                range_expression,
+                range_expression + "left ^ -9223372036854775809".len(),
+            ),
+            (
+                sai_diagnostics::Code::LiteralOutOfRange,
+                "integer literal is out of range for `I64`",
+                range_literal,
+                range_literal + "-9223372036854775809".len(),
+            ),
+        ] {
+            let span = sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(start as u32),
+                sai_diagnostics::TextSize::new(end as u32),
+            )
+            .expect("expected diagnostic span is ordered");
+            assert_eq!(
+                range_diagnostics
+                    .iter()
+                    .filter(|diagnostic| {
+                        diagnostic.code == code
+                            && diagnostic.message == message
+                            && diagnostic
+                                .primary()
+                                .is_some_and(|primary| primary.span.range == span)
+                    })
+                    .count(),
+                1,
+                "missing {code:?} diagnostic {message:?} at {start}..{end}"
+            );
+        }
+
+        let FunctionBodyTypeCheck::Supported {
+            diagnostics: annotation_diagnostics,
+        } = resolved.owners()[2]
+            .body_type_check()
+            .expect("annotation recovery diagnostic is reported")
+        else {
+            panic!("Char path integer annotation recovery must not gate the body");
+        };
+        assert_eq!(
+            annotation_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::OperatorNotSupported,
+                sai_diagnostics::Code::TypeMismatch,
+            ]
+        );
+        assert_eq!(
+            annotation_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+                "expected `I32`, found `Char`",
+            ]
+        );
+        let annotation_expression = "left & 1";
+        let annotation_start = root
+            .rfind(annotation_expression)
+            .expect("annotation expression exists") as u32;
+        for diagnostic in annotation_diagnostics {
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("annotation diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(annotation_start),
+                    sai_diagnostics::TextSize::new(
+                        annotation_start + annotation_expression.len() as u32,
+                    ),
+                )
+                .expect("annotation expression range is ordered")
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_reports_float_path_scalar_literal_diagnostics() {
         let cases = [
             ("&", "and", "true", "bool", Some("a Bool literal")),
@@ -27349,16 +27550,17 @@ mod tests {
             "type Word = I32\n",
             "type ShiftCount = U32\n",
             "type ByteAlias = Byte\n",
+            "type CharAlias = Char\n",
             "type F32Alias = F32\n",
             "type F64Alias = F64\n",
             "pub fn float_literal_left(left: I32) -> I32 {\n    let value = 1.0 & left\n    value\n}\n",
             "pub fn literal_pair() -> I32 {\n    let value = 1 ^ 2\n    value\n}\n",
-            "pub fn char_integer_literal(left: Char) -> Char {\n    let value = left & 1\n    value\n}\n",
             "pub fn bool_path_byte_string_rhs(left: Bool) -> Bool {\n    let value = left & b\"text\"\n    value\n}\n",
             "pub fn char_path_float_rhs(left: Char) -> Char {\n    let value = left ^ 1.0\n    value\n}\n",
             "pub fn f64_path_byte_string_rhs(left: F64) -> F64 {\n    let value = left | b\"text\"\n    value\n}\n",
             "pub fn f32_alias_path_float_rhs(left: F32Alias) -> F32Alias {\n    let value = left ^ 1.0\n    value\n}\n",
             "pub fn f64_alias_path_bool_rhs(left: F64Alias) -> F64Alias {\n    let value = left & true\n    value\n}\n",
+            "pub fn char_alias_path_integer_rhs(left: CharAlias) -> CharAlias {\n    let value = left & 1\n    value\n}\n",
             "pub fn f32_unresolved_path_float_rhs() -> F32 {\n    let value = missing & 1.0\n    value\n}\n",
             "pub fn f64_self_reference_path_float_rhs(left: F64) -> F64 {\n    let value = value | 1.0\n    value\n}\n",
             "pub fn f32_forward_reference_path_float_rhs() -> F32 {\n    let value = later ^ 1.0\n    let later: F32 = 2.0\n    value\n}\n",
@@ -27367,7 +27569,7 @@ mod tests {
             "pub fn f32_computed_rhs_float(left: F32, right: F32) -> F32 {\n    let value = left ^ (right + 1.0)\n    value\n}\n",
             "pub fn byte_alias_path_scalar_rhs(left: ByteAlias) -> ByteAlias {\n    let value = left ^ true\n    value\n}\n",
             "pub fn generic_path_scalar_rhs<T>(left: Byte) -> Byte {\n    let value = left & 'x'\n    value\n}\n",
-            "pub fn generic_char_path_scalar_rhs<T>(left: Char) -> Char {\n    let value = left & true\n    value\n}\n",
+            "pub fn generic_char_path_scalar_rhs<T>(left: Char) -> Char {\n    let value = left & 1\n    value\n}\n",
             "pub fn generic_f32_path_scalar_rhs<T>(left: F32) -> F32 {\n    let value = left & 1.0\n    value\n}\n",
             "type PathScalarBitOwner { marker: Bool }\n",
             "impl PathScalarBitOwner {\n",
@@ -27381,7 +27583,7 @@ mod tests {
             "impl CharPathScalarBitOwner {\n",
             "    fn char_path_scalar_method(self: borrow Self, left: Char) -> Char {\n",
             "        let prior: Char = left\n",
-            "        let value = prior | 'x'\n",
+            "        let value = prior | 1\n",
             "        value\n",
             "    }\n",
             "}\n",

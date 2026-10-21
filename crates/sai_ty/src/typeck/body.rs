@@ -846,8 +846,27 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         return Ok(LocalType::Concrete(left_type));
                     }
 
-                    // Keep Char's bitwise rule gated until operator-trait inference is
-                    // available for an integer literal right operand.
+                    if left_type == PrimTy::Char {
+                        // Char follows the trait-selection rule for bitwise operators.
+                        // No Char implementation can constrain this synthesized integer
+                        // literal, so it defaults to I64 and is range-checked there.
+                        self.check_annotated_literal(
+                            PrimTy::I64,
+                            literal,
+                            PrimitiveLiteralKind::Integer,
+                            right.hir_id,
+                        );
+                        self.errors.push(PrimitiveBodyError {
+                            node: expression,
+                            kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
+                                operator,
+                                left: PrimTy::Char,
+                                right: PrimTy::I64,
+                            },
+                        });
+                        return Ok(LocalType::Concrete(PrimTy::Char));
+                    }
+
                     return Err(());
                 }
                 Some(PrimitiveLiteralKind::Byte) => {
