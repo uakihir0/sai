@@ -8551,6 +8551,184 @@ fn char_literal_resolved_computed_alias_chains_report_concrete_rhs_traits() {
 }
 
 #[test]
+fn char_literal_integer_bitwise_pair_alias_chains_defer_traits_and_check_both_literals() {
+    let check = |source: &str| {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "the supported diagnostic slice recovers without a feature gate:\n{stdout}"
+        );
+        stdout
+    };
+    let defaults_source = concat!(
+        "pub fn char_computed_bitwise_alias_chain_defaults() -> Char {\n",
+        "    let computed = 1 & 2\n",
+        "    let alias1 = computed\n",
+        "    let alias2 = alias1\n",
+        "    let alias3 = alias2\n",
+        "    let and_value = 'a' & alias3\n",
+        "    let or_value = 'b' | alias3\n",
+        "    let xor_value = 'c' ^ alias3\n",
+        "    let recovered: Char = xor_value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let defaults_stdout = check(defaults_source);
+    assert_eq!(
+        defaults_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        3,
+        "each defaulted Char bitwise use reports one deferred trait error:\n{defaults_stdout}"
+    );
+    for (operator, expression, trait_name) in [
+        ("&", "'a' & alias3", "BitAnd"),
+        ("|", "'b' | alias3", "BitOr"),
+        ("^", "'c' ^ alias3", "BitXor"),
+    ] {
+        let start = defaults_source
+            .find(expression)
+            .expect("computed integer alias Char expression exists");
+        assert_json_diagnostic_primary_span(
+            &defaults_stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<I64>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+
+    let late_constraint_source = concat!(
+        "pub fn char_computed_bitwise_alias_chain_late_constraint() -> Char {\n",
+        "    let computed = 3 | 4\n",
+        "    let alias1 = computed\n",
+        "    let alias2 = alias1\n",
+        "    let alias3 = alias2\n",
+        "    let and_value = 'd' & alias3\n",
+        "    let or_value = 'e' | alias3\n",
+        "    let xor_value = 'f' ^ alias3\n",
+        "    let narrowed: I32 = alias3\n",
+        "    let recovered: Char = xor_value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let late_constraint_stdout = check(late_constraint_source);
+    assert_eq!(
+        late_constraint_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        3,
+        "all Char uses see the later I32 constraint:\n{late_constraint_stdout}"
+    );
+    for (operator, expression, trait_name) in [
+        ("&", "'d' & alias3", "BitAnd"),
+        ("|", "'e' | alias3", "BitOr"),
+        ("^", "'f' ^ alias3", "BitXor"),
+    ] {
+        let start = late_constraint_source
+            .find(expression)
+            .expect("late-constrained integer alias Char expression exists");
+        assert_json_diagnostic_primary_span(
+            &late_constraint_stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<I32>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+
+    let range_source = concat!(
+        "pub fn char_computed_bitwise_alias_chain_i8_range() -> Char {\n",
+        "    let computed = 128 ^ 256\n",
+        "    let alias1 = computed\n",
+        "    let alias2 = alias1\n",
+        "    let alias3 = alias2\n",
+        "    let narrowed: I8 = alias3\n",
+        "    let and_value = 'g' & alias3\n",
+        "    let or_value = 'h' | alias3\n",
+        "    let xor_value = 'i' ^ alias3\n",
+        "    let mismatch: I32 = 'j' & alias3\n",
+        "    let recovered: Char = xor_value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let range_stdout = check(range_source);
+    assert_eq!(
+        range_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        4,
+        "each constrained Char bitwise use reports one trait error:\n{range_stdout}"
+    );
+    assert_eq!(
+        range_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        2,
+        "both literals in the computed bitwise pair are checked under I8:\n{range_stdout}"
+    );
+    assert_eq!(
+        range_stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the mismatched result annotation reports once:\n{range_stdout}"
+    );
+
+    for literal in ["128", "256"] {
+        let start = range_source
+            .find(literal)
+            .expect("out-of-range bitwise source literal exists");
+        assert_json_diagnostic_primary_span(
+            &range_stdout,
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `I8`",
+            start,
+            start + literal.len(),
+        );
+    }
+    for (operator, expression, trait_name) in [("&", "'g' & alias3", "BitAnd")] {
+        let start = range_source
+            .find(expression)
+            .expect("computed integer alias Char expression exists");
+        assert_json_diagnostic_primary_span(
+            &range_stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<I8>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+    for (operator, expression, trait_name) in [
+        ("|", "'h' | alias3", "BitOr"),
+        ("^", "'i' ^ alias3", "BitXor"),
+        ("&", "'j' & alias3", "BitAnd"),
+    ] {
+        let start = range_source
+            .find(expression)
+            .expect("computed integer alias Char expression exists");
+        assert_json_diagnostic_primary_span(
+            &range_stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<I8>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+    let mismatch = range_source
+        .find("'j' & alias3")
+        .expect("mismatched Char expression exists");
+    assert_json_diagnostic_primary_span(
+        &range_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Char`",
+        mismatch,
+        mismatch + "'j' & alias3".len(),
+    );
+}
+
+#[test]
 fn unsupported_primitive_bitwise_shapes_remain_gated() {
     let fixture = |signature: &str, statements: &str| {
         format!("{signature} {{\n    {statements}\n    result\n}}\n")
@@ -8656,10 +8834,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         fixture(
             "pub fn char_literal_computed_integer_path_rhs() -> Char",
             "let right = 1 + 2\n    let result = 'a' & right",
-        ),
-        fixture(
-            "pub fn char_literal_integer_variable_additional_site_alias_chain_rhs() -> Char",
-            "let computed = 1 & 2\n    let alias1 = computed\n    let alias2 = alias1\n    let alias3 = alias2\n    let narrowed: I32 = alias3\n    let result = 'a' & alias3",
         ),
         fixture(
             "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char",
