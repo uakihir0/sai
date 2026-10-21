@@ -814,7 +814,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     let Some(right_kind) = primitive_literal_kind(right_literal) else {
                         return Err(());
                     };
-                    if !primitive_bitwise_char_literal_pair_supported(operator, right_kind) {
+                    if !primitive_bitwise_char_literal_pair_supported(operator, right_kind)
+                        || matches!(right_literal, Lit::Float { negated: true, .. })
+                    {
                         return Err(());
                     }
 
@@ -831,15 +833,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             );
                             PrimTy::I64
                         }
-                        PrimitiveLiteralKind::FloatingPoint => unreachable!(),
+                        PrimitiveLiteralKind::FloatingPoint => {
+                            let expected =
+                                primitive_bitwise_char_float_literal_rhs_type(operator).ok_or(())?;
+                            self.check_annotated_literal(
+                                expected,
+                                right_literal,
+                                PrimitiveLiteralKind::FloatingPoint,
+                                right.hir_id,
+                            );
+                            expected
+                        }
                     };
 
                     // Char bitwise operators use trait selection. No
                     // BitAnd, BitOr, or BitXor implementation exists for
-                    // these pairs. A Char-left integer literal cannot be
-                    // constrained by the failed trait obligation, so it
-                    // defaults to I64 and is range-checked before retaining
-                    // Char as the recovery result.
+                    // these pairs. Char-left numeric literals cannot be
+                    // constrained by the failed trait obligation, so they
+                    // default to I64 or F64 and are range-checked before
+                    // retaining Char as the recovery result.
                     self.errors.push(PrimitiveBodyError {
                         node: expression,
                         kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
@@ -1706,6 +1718,7 @@ fn primitive_bitwise_char_literal_pair_supported(
                 | PrimitiveLiteralKind::Bool
                 | PrimitiveLiteralKind::Byte
                 | PrimitiveLiteralKind::Integer
+                | PrimitiveLiteralKind::FloatingPoint
         )
 }
 
@@ -2400,7 +2413,7 @@ mod tests {
     }
 
     #[test]
-    fn char_literal_bitwise_pairs_accept_char_bool_byte_or_integer_for_bitwise_operators() {
+    fn char_literal_bitwise_pairs_accept_all_direct_scalar_literals_for_bitwise_operators() {
         for operator in [BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor] {
             assert!(
                 primitive_bitwise_char_literal_pair_supported(
@@ -2425,11 +2438,11 @@ mod tests {
                 "{operator:?} accepts a Char/integer literal pair for trait diagnostics"
             );
             assert!(
-                !primitive_bitwise_char_literal_pair_supported(
+                primitive_bitwise_char_literal_pair_supported(
                     operator,
                     PrimitiveLiteralKind::FloatingPoint
                 ),
-                "{operator:?} keeps Char/float literal pairs gated"
+                "{operator:?} accepts a Char/float literal pair for trait diagnostics"
             );
         }
 
@@ -2439,6 +2452,7 @@ mod tests {
                 PrimitiveLiteralKind::Bool,
                 PrimitiveLiteralKind::Byte,
                 PrimitiveLiteralKind::Integer,
+                PrimitiveLiteralKind::FloatingPoint,
             ] {
                 assert!(
                     !primitive_bitwise_char_literal_pair_supported(operator, right),
