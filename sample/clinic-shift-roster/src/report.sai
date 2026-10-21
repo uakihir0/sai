@@ -1,0 +1,121 @@
+use acme:clinic-shift-roster/data
+use acme:clinic-shift-roster/model.{Assignment, Credential, Position, Shift}
+use acme:clinic-shift-roster/planner
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn clinician_name(id: U32) -> Str {
+    match planner.find_clinician(id) {
+        Some(clinician) => clinician.name
+        None => "(unknown clinician)"
+    }
+}
+
+fn position_name(position: Position) -> Str {
+    match position { Position.ChargeNurse => "charge nurse", Position.Physician => "physician" }
+}
+
+fn physician_credential_name(shift: Shift) -> Str {
+    match shift.required_physician_credential {
+        Credential.TraumaPhysician => "trauma"
+        Credential.EmergencyPhysician => "emergency"
+        Credential.ChargeNurse => "invalid"
+    }
+}
+
+fn print_assignment(out: borrow mut Stdout, assignment: Assignment)
+    effects { stdio.write, alloc }
+{
+    match planner.find_shift(assignment.shift_id) {
+        Some(shift) => {
+            if planner.assignment_is_valid(assignment) {
+                if assignment.position == Position.Physician {
+                    out.write_str(
+                        f"  physician ({physician_credential_name(shift)}): {clinician_name(assignment.clinician_id)}\n".as_str(),
+                    )
+                } else {
+                    out.write_str(
+                        f"  {position_name(assignment.position)}: {clinician_name(assignment.clinician_id)}\n".as_str(),
+                    )
+                }
+            } else {
+                out.write_str(
+                    f"  INVALID {position_name(assignment.position)} proposal: {clinician_name(assignment.clinician_id)}\n".as_str(),
+                )
+            }
+        }
+        None => {
+            out.write_str(
+                f"  INVALID {position_name(assignment.position)} proposal: {clinician_name(assignment.clinician_id)}\n".as_str(),
+            )
+        }
+    }
+}
+
+fn print_standby_review(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    match planner.find_shift(data.standby_shift_id()) {
+        Some(shift) => {
+            out.write_str(
+                f"  {clinician_name(data.standby_clinician_id())} replacing {clinician_name(data.standby_replaced_clinician_id())} for {shift.name} {position_name(data.standby_position())}: rejected ({planner.standby_rejection_reason()}; {planner.standby_rest_minutes()} min rest; minimum {planner.required_rest_minutes()})\n".as_str(),
+            )
+        }
+        None => {
+            out.write_str("  Standby proposal references an unknown shift.\n")
+        }
+    }
+}
+
+pub fn print_roster(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Clinic roster proposal — Northside\n\n")
+    for shift in data.shifts() {
+        out.write_str(f"{shift.name} ({shift.time})\n".as_str())
+        for assignment in data.assignments() {
+            if assignment.shift_id == shift.id {
+                print_assignment(borrow mut out, assignment)
+            }
+        }
+    }
+    out.write_str("\nStandby review\n")
+    print_standby_review(borrow mut out)
+}
+
+pub fn print_coverage(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Required position coverage\n")
+    for shift in data.shifts() {
+        var nurses: U32 = 0
+        var physicians: U32 = 0
+        for assignment in data.assignments() {
+            if planner.assignment_is_valid(assignment) and assignment.shift_id == shift.id {
+                match assignment.position {
+                    Position.ChargeNurse => {
+                        nurses += 1
+                    }
+                    Position.Physician => {
+                        physicians += 1
+                    }
+                }
+            }
+        }
+        out.write_str(f"{shift.name}: charge nurse {nurses}/1, physician {physicians}/1\n".as_str())
+    }
+    out.write_str(f"Covered required positions: {planner.covered_position_count()}/6\n".as_str())
+}
+
+pub fn print_summary(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Roster summary\n")
+    out.write_str(
+        f"{data.shifts().len()} shifts; {data.assignments().len()} proposed assignments; {planner.invalid_assignment_count()} invalid assignments\n".as_str(),
+    )
+    out.write_str(f"{planner.covered_position_count()} of 6 required positions covered\n")
+    out.write_str(
+        f"minimum rest: {planner.required_rest_minutes()} min; standby {clinician_name(data.standby_clinician_id())} has {planner.standby_rest_minutes()} min before Day 2 early\n",
+    )
+}
