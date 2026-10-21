@@ -6459,8 +6459,8 @@ fn unsupported_primitive_bitwise_not_noninteger_literal_and_computed_operands_re
     for source in [
         "pub fn float_literal() -> I32 { let result = ~1.0; result }\n",
         "pub fn bool_literal() -> Bool { let result = ~true; result }\n",
-        "pub fn byte_literal() -> Byte { let result = ~b'a'; result }\n",
         "pub fn char_literal() -> Char { let result = ~'a'; result }\n",
+        "pub fn byte_string() -> Byte { let result = ~b\"text\"; result }\n",
         "pub fn nested(left: I32, right: I32) -> I32 { let result = ~(left ^ right); result }\n",
         "pub fn computed(left: I32, right: I32) -> I32 { let result = ~(left + right); result }\n",
         "pub fn unresolved() -> I64 { let bits = 1; let result = ~bits; result }\n",
@@ -6470,6 +6470,57 @@ fn unsupported_primitive_bitwise_not_noninteger_literal_and_computed_operands_re
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
+}
+
+#[test]
+fn primitive_bitwise_not_accepts_direct_byte_literals_and_preserves_byte_type() {
+    let source = concat!(
+        "pub fn byte_literals() -> Byte {\n",
+        "    let inferred = ~b'a'\n",
+        "    let inferred_recovered: Byte = inferred\n",
+        "    let annotated: Byte = ~b'z'\n",
+        "    let annotated_recovered: Byte = annotated\n",
+        "    annotated_recovered\n",
+        "}\n",
+    );
+
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn primitive_bitwise_not_byte_literal_annotation_mismatch_recovers_to_annotation() {
+    let source = concat!(
+        "pub fn annotation_recovery() -> I8 {\n",
+        "    let invalid: I8 = ~b'a'\n",
+        "    let recovered: I8 = invalid\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression_start = source
+        .find("~b'a'")
+        .expect("annotated byte literal expression exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the incompatible annotation should be reported once:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the local should recover to I8 and reach the following local and tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I8`, found `Byte`",
+        expression_start,
+        expression_start + "~b'a'".len(),
+    );
 }
 
 #[test]
