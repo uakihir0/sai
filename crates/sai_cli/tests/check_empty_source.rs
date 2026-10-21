@@ -5512,7 +5512,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         "pub fn computed(left: I32, right: I32) -> I32 { let result = (left + right) & right; result }\n",
         "pub fn unresolved(left: I32) -> I32 { let bits = 1; let result = bits & left; result }\n",
         "type Word = I32\npub fn alias(left: Word, right: Word) -> Word { let result = left & right; result }\n",
-        "pub fn bit_not(left: I32) -> I32 { let result = ~left; result }\n",
         "pub fn shift(left: I32) -> I32 { let result = left << 1; result }\n",
         "pub fn self_reference(left: I32) -> I32 { let result = result & left; result }\n",
         "pub fn forward_reference(left: I32) -> I32 { let result = later & left; let later: I32 = 1; result }\n",
@@ -6316,9 +6315,157 @@ fn unsupported_primitive_bitwise_right_integer_literal_forms_remain_gated() {
         "pub fn char_literal(value: I32) -> I32 { let result = value ^ 'a'; result }\n",
         "pub fn byte_literal(value: Byte) -> Byte { let result = value & b'a'; result }\n",
         "pub fn shift(value: I32) -> I32 { let result = value << 1; result }\n",
-        "pub fn bit_not(value: I32) -> I32 { let result = ~value; result }\n",
         "pub fn self_reference(value: I32) -> I32 { let result = result & value; result }\n",
         "pub fn forward_reference(value: I32) -> I32 { let result = later & value; let later: I32 = 1; result }\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn primitive_bitwise_not_accepts_all_integer_and_byte_paths() {
+    let supported_types = [
+        ("I8", "i8_value"),
+        ("I16", "i16_value"),
+        ("I32", "i32_value"),
+        ("I64", "i64_value"),
+        ("U8", "u8_value"),
+        ("U16", "u16_value"),
+        ("U32", "u32_value"),
+        ("U64", "u64_value"),
+        ("ISize", "isize_value"),
+        ("USize", "usize_value"),
+        ("Byte", "byte_value"),
+    ];
+    let mut source = String::from("pub fn bitwise_not(");
+    for (index, (primitive, parameter)) in supported_types.iter().enumerate() {
+        if index > 0 {
+            source.push_str(", ");
+        }
+        source.push_str(&format!("{parameter}: {primitive}"));
+    }
+    source.push_str(") -> I8 {\n");
+    for (_, parameter) in supported_types {
+        source.push_str(&format!("    let inverted_{parameter} = ~{parameter}\n"));
+    }
+    source.push_str("    inverted_i8_value\n}\n");
+
+    assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn primitive_bitwise_not_resolves_preceding_and_shadowed_paths() {
+    for source in [
+        concat!(
+            "pub fn preceding(value: I16) -> I16 {\n",
+            "    let earlier: I16 = value\n",
+            "    let inverted = ~earlier\n",
+            "    inverted\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn shadow(value: U32, right: I32) -> I32 {\n",
+            "    let value: I32 = right\n",
+            "    let inverted: I32 = ~value\n",
+            "    inverted\n",
+            "}\n",
+        ),
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_bitwise_not_reports_unsupported_types_and_recovers_the_local() {
+    for primitive in ["Bool", "Char", "F32", "F64"] {
+        let source = format!(
+            concat!(
+                "pub fn unsupported(value: {primitive}) -> {primitive} {{\n",
+                "    let inverted: {primitive} = ~value\n",
+                "    let recovered: {primitive} = inverted\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            primitive = primitive,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression_start = source
+            .find("~value")
+            .expect("unsupported unary expression exists");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout
+                .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                .count(),
+            1,
+            "unsupported `~` should produce one operator diagnostic:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "the unsupported unary expression should recover to its operand type:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `~` has no `BitNot` implementation for `{primitive}`"),
+            expression_start,
+            expression_start + "~value".len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_bitwise_not_annotation_mismatch_recovers_to_the_annotation() {
+    let source = concat!(
+        "pub fn annotation_recovery(value: I8) -> U8 {\n",
+        "    let inverted: U8 = ~value\n",
+        "    let recovered: U8 = inverted\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression_start = source
+        .find("~value")
+        .expect("annotated unary expression exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the incompatible local annotation should be reported once:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the local should recover to U8 and reach the following local and tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `I8`",
+        expression_start,
+        expression_start + "~value".len(),
+    );
+}
+
+#[test]
+fn unsupported_primitive_bitwise_not_literal_and_computed_operands_remain_gated() {
+    for source in [
+        "pub fn integer_literal() -> I32 { let result = ~1; result }\n",
+        "pub fn float_literal() -> I32 { let result = ~1.0; result }\n",
+        "pub fn bool_literal() -> Bool { let result = ~true; result }\n",
+        "pub fn nested(left: I32, right: I32) -> I32 { let result = ~(left ^ right); result }\n",
+        "pub fn computed(left: I32, right: I32) -> I32 { let result = ~(left + right); result }\n",
+        "pub fn unresolved() -> I64 { let bits = 1; let result = ~bits; result }\n",
+        "type Word = I32\npub fn alias(value: Word) -> Word { let result = ~value; result }\n",
+        "pub fn self_reference(value: I32) -> I32 { let result = ~result; result }\n",
+        "pub fn forward_reference(value: I32) -> I32 { let result = ~later; let later: I32 = value; result }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
