@@ -877,6 +877,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     }
                     return Ok(LocalType::Concrete(left_type));
                 }
+                Some(
+                    kind @ (PrimitiveLiteralKind::Bool
+                    | PrimitiveLiteralKind::Character
+                    | PrimitiveLiteralKind::FloatingPoint),
+                ) => {
+                    if left_type != PrimTy::Byte {
+                        return Err(());
+                    }
+                    self.check_annotated_literal(left_type, literal, kind, right.hir_id);
+                    return Ok(LocalType::Concrete(left_type));
+                }
                 _ => return Err(()),
             }
         }
