@@ -639,6 +639,43 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         right: &'hir Expr<'hir>,
         expression: HirId,
     ) -> Result<LocalType, ()> {
+        if let ExprKind::Lit(literal) = left.kind {
+            if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer) {
+                return Err(());
+            }
+            let right_type = self
+                .check_local_path(right)
+                .ok()
+                .and_then(|local_type| self.concrete_local_type(local_type))
+                .filter(|primitive| supports_primitive_literal(*primitive))
+                .ok_or(())?;
+            let local_type = self.local_type_for_unannotated_literal(
+                literal,
+                PrimitiveLiteralKind::Integer,
+                left.hir_id,
+            );
+            let LocalType::LiteralVariable(id) = local_type else {
+                return Err(());
+            };
+
+            return match primitive_bitwise_literal_left_result(operator, right_type) {
+                PrimitiveArithmeticResult::Type(expected) => {
+                    self.resolve_literal_variable(id, expected)?;
+                    Ok(local_type)
+                }
+                PrimitiveArithmeticResult::TypeMismatch { expected, found } => {
+                    self.errors.push(PrimitiveBodyError {
+                        node: right.hir_id,
+                        kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                    });
+                    // Keep the left integer literal unresolved so a later
+                    // annotation or tail can still constrain its type.
+                    Ok(local_type)
+                }
+                PrimitiveArithmeticResult::Unsupported => Err(()),
+            };
+        }
+
         let left_type = self
             .check_local_path(left)
             .ok()
@@ -1156,6 +1193,26 @@ fn primitive_wrapping_literal_left_result(
 ) -> PrimitiveArithmeticResult {
     if !matches!(operator, BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul)
         || literal != PrimitiveLiteralKind::Integer
+        || !supports_primitive_literal(right)
+    {
+        return PrimitiveArithmeticResult::Unsupported;
+    }
+
+    if is_integer_primitive(right) {
+        PrimitiveArithmeticResult::Type(right)
+    } else {
+        PrimitiveArithmeticResult::TypeMismatch {
+            expected: PrimTy::I64,
+            found: right,
+        }
+    }
+}
+
+fn primitive_bitwise_literal_left_result(
+    operator: BinOp,
+    right: PrimTy,
+) -> PrimitiveArithmeticResult {
+    if !matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)
         || !supports_primitive_literal(right)
     {
         return PrimitiveArithmeticResult::Unsupported;
