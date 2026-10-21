@@ -6643,6 +6643,190 @@ fn primitive_bitwise_bool_literal_pairs_report_operator_errors_and_recover_annot
 }
 
 #[test]
+fn primitive_bitwise_char_literal_pairs_report_trait_errors_and_recover_annotations() {
+    for (name, operator, left, right, trait_name) in [
+        ("and", "&", "'a'", "'b'", "BitAnd"),
+        ("or", "|", "'c'", "'d'", "BitOr"),
+        ("xor", "^", "'e'", "'f'", "BitXor"),
+    ] {
+        let source = format!(
+            "pub fn char_{name}() -> Char {{\n    let value = {left} {operator} {right}\n    let recovered: Char = value\n    recovered\n}}\n"
+        );
+        let expression = format!("{left} {operator} {right}");
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout
+                .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                .count(),
+            1,
+            "{operator} should have one unsupported Char trait diagnostic:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "Char pair should recover through the following local and tail:\n{stdout}"
+        );
+        let start = source
+            .find(&expression)
+            .expect("Char literal-pair expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<Char>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+
+    let annotation_source = concat!(
+        "pub fn char_annotation_recovery() -> I32 {\n",
+        "    let value: I32 = 'a' ^ 'b'\n",
+        "    let recovered: I32 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let annotation_output = run_check(annotation_source, "", &[], &[]);
+    let annotation_stdout =
+        String::from_utf8(annotation_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        annotation_output.status.code(),
+        Some(1),
+        "{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "annotated Char pair should have one unsupported operator diagnostic:\n{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "the incompatible annotation should report one mismatch:\n{annotation_stdout}"
+    );
+    assert!(
+        !annotation_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !annotation_stdout.contains("\"type\":\"result\""),
+        "annotated Char pair should recover through the following local and tail:\n{annotation_stdout}"
+    );
+    let annotation = annotation_source
+        .find("'a' ^ 'b'")
+        .expect("annotated Char pair exists");
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Char`",
+        annotation,
+        annotation + "'a' ^ 'b'".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `^` has no `BitXor<Char>` implementation for `Char`",
+        annotation,
+        annotation + "'a' ^ 'b'".len(),
+    );
+}
+
+#[test]
+fn primitive_bitwise_char_bool_literal_pairs_report_trait_errors_and_recover_annotations() {
+    for (name, operator, bool_literal, trait_name) in [
+        ("and", "&", "true", "BitAnd"),
+        ("or", "|", "false", "BitOr"),
+        ("xor", "^", "true", "BitXor"),
+    ] {
+        let source = format!(
+            "pub fn char_bool_{name}() -> Char {{\n    let value = 'x' {operator} {bool_literal}\n    let recovered: Char = value\n    recovered\n}}\n"
+        );
+        let expression = format!("'x' {operator} {bool_literal}");
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout
+                .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                .count(),
+            1,
+            "{operator} should have one unsupported Char/Bool trait diagnostic:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "Char/Bool pair should recover through the following local and tail:\n{stdout}"
+        );
+        let start = source
+            .find(&expression)
+            .expect("Char/Bool literal-pair expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<Bool>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+
+    let annotation_source = concat!(
+        "pub fn char_bool_annotation_recovery() -> I32 {\n",
+        "    let value: I32 = 'x' ^ false\n",
+        "    let recovered: I32 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let annotation_output = run_check(annotation_source, "", &[], &[]);
+    let annotation_stdout =
+        String::from_utf8(annotation_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        annotation_output.status.code(),
+        Some(1),
+        "{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "annotated Char/Bool pair should have one unsupported operator diagnostic:\n{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "the incompatible annotation should report one mismatch:\n{annotation_stdout}"
+    );
+    assert!(
+        !annotation_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !annotation_stdout.contains("\"type\":\"result\""),
+        "annotated Char/Bool pair should recover through the following local and tail:\n{annotation_stdout}"
+    );
+    let annotation = annotation_source
+        .find("'x' ^ false")
+        .expect("annotated Char/Bool pair exists");
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Char`",
+        annotation,
+        annotation + "'x' ^ false".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `^` has no `BitXor<Bool>` implementation for `Char`",
+        annotation,
+        annotation + "'x' ^ false".len(),
+    );
+}
+
+#[test]
 fn unsupported_primitive_bitwise_shapes_remain_gated() {
     let fixture = |signature: &str, statements: &str| {
         format!("{signature} {{\n    {statements}\n    result\n}}\n")
@@ -6719,16 +6903,73 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let result = 'a' | 1",
         ),
         fixture(
+            "pub fn char_byte_literal_pair() -> Char",
+            "let result = 'a' | b'b'",
+        ),
+        fixture(
+            "pub fn char_float_literal_pair() -> Char",
+            "let result = 'a' ^ 1.0",
+        ),
+        fixture(
+            "pub fn char_literal_left_path(right: Char) -> Char",
+            "let result = 'a' & right",
+        ),
+        format!(
+            "type CharAlias = Char\n{}",
+            fixture(
+                "pub fn char_bool_alias_annotation() -> CharAlias",
+                "let result: CharAlias = 'a' & false"
+            )
+        ),
+        fixture(
+            "pub fn char_literal_byte_string_pair() -> Char",
+            "let result = 'a' & b\"text\"",
+        ),
+        fixture(
+            "pub fn nested_char_literal_pair_rhs() -> Char",
+            "let result = 'a' & ('b' | 'c')",
+        ),
+        fixture(
+            "pub fn nested_char_literal_pair_left() -> Char",
+            "let result = ('a' & 'b') ^ 'c'",
+        ),
+        fixture(
+            "pub fn chained_char_literal_pairs() -> Char",
+            "let result = 'a' & 'b' | 'c'",
+        ),
+        fixture(
+            "pub fn computed_char_literal_pair_rhs() -> Char",
+            "let result = 'a' & ('b' + 'c')",
+        ),
+        fixture(
+            "pub fn generic_char_literal_pair<T>() -> Char",
+            "let result = 'a' ^ 'b'",
+        ),
+        fixture(
+            "pub fn generic_char_bool_literal_pair<T>() -> Char",
+            "let result = 'a' ^ false",
+        ),
+        concat!(
+            "type CharLiteralPairOwner { marker: Char }\n",
+            "impl CharLiteralPairOwner {\n",
+            "    fn char_literal_pair(self: borrow Self) -> Char {\n",
+            "        let result = 'a' ^ 'b'\n",
+            "        result\n",
+            "    }\n",
+            "    fn char_bool_literal_pair(self: borrow Self) -> Char {\n",
+            "        let result = 'a' ^ false\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        )
+        .to_owned(),
+        fixture(
             "pub fn float_integer_literal_pair() -> F32",
             "let result = 1.0 ^ 2",
         ),
         fixture(
             "pub fn integer_float_literal_pair() -> F32",
             "let result = 1.0 & 2.0",
-        ),
-        fixture(
-            "pub fn char_literal_pair() -> Char",
-            "let result = 'a' ^ 'b'",
         ),
         fixture(
             "pub fn char_byte_literal_pair() -> Char",
