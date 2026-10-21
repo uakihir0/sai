@@ -94,6 +94,34 @@ fn assert_check_stays_gated(output: &Output, context: &str) {
     );
 }
 
+fn assert_check_stays_gated_without_syntax_errors(output: &Output, context: &str) {
+    assert_check_stays_gated(output, context);
+    let stdout = std::str::from_utf8(&output.stdout).expect("CLI stdout is UTF-8");
+    for code in [
+        "EXPECTED_EXPRESSION",
+        "EXPECTED_PATTERN",
+        "EXPECTED_TOKEN",
+        "EXPECTED_VALUE_FOUND_TYPE",
+        "FILE_HAS_SYNTAX_ERRORS",
+        "INVALID_CHAR_LITERAL",
+        "INVALID_ESCAPE",
+        "MALFORMED_MULTILINE_STRING",
+        "MALFORMED_NUMBER",
+        "MALFORMED_RAW_STRING",
+        "NO_SEMICOLON",
+        "UNEXPECTED_CHARACTER",
+        "UNEXPECTED_NEWLINE",
+        "UNTERMINATED_CHAR",
+        "UNTERMINATED_COMMENT",
+        "UNTERMINATED_STRING",
+    ] {
+        assert!(
+            !stdout.contains(&format!("\"code\":\"{code}\"")),
+            "{context}: gate fixture must not contain lexer or parser diagnostics ({code}):\n{stdout}"
+        );
+    }
+}
+
 fn assert_json_diagnostic_primary_span(
     stdout: &str,
     code: &str,
@@ -6455,34 +6483,129 @@ fn primitive_bitwise_integer_annotation_mismatch_recovers_after_operand_mismatch
 
 #[test]
 fn unsupported_primitive_bitwise_shapes_remain_gated() {
+    let fixture = |signature: &str, statements: &str| {
+        format!("{signature} {{\n    {statements}\n    result\n}}\n")
+    };
     for source in [
-        "pub fn literal_pair() -> I32 { let result = 1 & 2; result }\n",
-        "pub fn byte_integer_literal_pair() -> Byte { let result = b'a' ^ 1; result }\n",
-        "pub fn integer_byte_literal_pair() -> I32 { let result = 1 & b'a'; result }\n",
-        "pub fn integer_float_literal_pair() -> F32 { let result = 1.0 & 2.0; result }\n",
-        "pub fn bool_literal_pair() -> Bool { let result = true & false; result }\n",
-        "pub fn char_literal_pair() -> Char { let result = 'a' ^ 'b'; result }\n",
-        "pub fn bool_byte_literal_pair() -> Bool { let result = true & b'a'; result }\n",
-        "pub fn char_byte_literal_pair() -> Char { let result = 'a' ^ b'b'; result }\n",
-        "pub fn float_byte_literal_pair() -> F32 { let result = 1.0 & b'a'; result }\n",
-        "pub fn byte_float_literal_rhs(right: Byte) -> Byte { let result = b'a' | 1.0; result }\n",
-        "pub fn byte_bool_literal_rhs(right: Byte) -> Byte { let result = b'a' & true; result }\n",
-        "pub fn byte_char_literal_rhs(right: Byte) -> Byte { let result = b'a' ^ 'b'; result }\n",
-        "pub fn byte_string_left(right: Byte) -> Byte { let result = b\"text\" & right; result }\n",
-        "type ByteAlias = Byte\npub fn byte_alias_rhs(right: ByteAlias) -> Byte { let result = b'a' & right; result }\n",
-        "pub fn byte_unresolved_rhs() -> Byte { let result = b'a' & missing; result }\n",
-        "pub fn byte_self_reference() -> Byte { let result = b'a' & result; result }\n",
-        "pub fn byte_forward_reference() -> Byte { let result = b'a' & later; let later: Byte = b'b'; result }\n",
-        "pub fn byte_nested_rhs(left: Byte, right: Byte) -> Byte { let result = b'a' & (left & right); result }\n",
-        "pub fn byte_nested_left(right: Byte, right2: Byte) -> Byte { let result = (b'a' & right) ^ right2; result }\n",
-        "pub fn byte_computed_left(right: Byte) -> Byte { let result = (~b'a') & right; result }\n",
-        "pub fn nested(left: I32, right: I32, extra: I32) -> I32 { let result = left & (right ^ extra); result }\n",
-        "pub fn computed(left: I32, right: I32) -> I32 { let result = (left + right) & right; result }\n",
-        "pub fn unresolved(left: I32) -> I32 { let bits = 1; let result = bits & left; result }\n",
-        "type Word = I32\npub fn alias(left: Word, right: Word) -> Word { let result = left & right; result }\n",
-        "pub fn self_reference(left: I32) -> I32 { let result = result & left; result }\n",
-        "pub fn forward_reference(left: I32) -> I32 { let result = later & left; let later: I32 = 1; result }\n",
-        "pub fn generic<T>(unused: I32) -> Byte { let result = b'a' & b'b'; result }\n",
+        fixture("pub fn literal_pair() -> I32", "let result = 1 & 2"),
+        fixture(
+            "pub fn integer_byte_literal_pair() -> I32",
+            "let result = 1 & b'a'",
+        ),
+        fixture(
+            "pub fn integer_float_literal_pair() -> F32",
+            "let result = 1.0 & 2.0",
+        ),
+        fixture(
+            "pub fn bool_literal_pair() -> Bool",
+            "let result = true & false",
+        ),
+        fixture(
+            "pub fn char_literal_pair() -> Char",
+            "let result = 'a' ^ 'b'",
+        ),
+        fixture(
+            "pub fn bool_byte_literal_pair() -> Bool",
+            "let result = true & b'a'",
+        ),
+        fixture(
+            "pub fn char_byte_literal_pair() -> Char",
+            "let result = 'a' ^ b'b'",
+        ),
+        fixture(
+            "pub fn float_byte_literal_pair() -> F32",
+            "let result = 1.0 & b'a'",
+        ),
+        fixture(
+            "pub fn byte_float_literal_rhs() -> Byte",
+            "let result = b'a' | 1.0",
+        ),
+        fixture(
+            "pub fn byte_bool_literal_rhs() -> Byte",
+            "let result = b'a' & true",
+        ),
+        fixture(
+            "pub fn byte_char_literal_rhs() -> Byte",
+            "let result = b'a' ^ 'b'",
+        ),
+        fixture(
+            "pub fn byte_string_left(right: Byte) -> Byte",
+            "let result = b\"text\" & right",
+        ),
+        format!(
+            "type ByteAlias = Byte\n{}",
+            fixture(
+                "pub fn byte_alias_rhs(right: ByteAlias) -> Byte",
+                "let result = b'a' & right"
+            )
+        ),
+        fixture(
+            "pub fn byte_unresolved_rhs() -> Byte",
+            "let result = b'a' & missing",
+        ),
+        fixture(
+            "pub fn byte_unresolved_integer_rhs() -> Byte",
+            "let integer = 1\n    let result = b'a' & integer",
+        ),
+        fixture(
+            "pub fn byte_self_reference() -> Byte",
+            "let result = b'a' & result",
+        ),
+        fixture(
+            "pub fn byte_forward_reference() -> Byte",
+            "let result = b'a' & later\n    let later: Byte = b'b'",
+        ),
+        fixture(
+            "pub fn byte_nested_rhs(left: Byte, right: Byte) -> Byte",
+            "let result = b'a' & (left & right)",
+        ),
+        fixture(
+            "pub fn byte_nested_left(right: Byte, right2: Byte) -> Byte",
+            "let result = (b'a' & right) ^ right2",
+        ),
+        fixture(
+            "pub fn byte_computed_left(right: Byte) -> Byte",
+            "let result = (~b'a') & right",
+        ),
+        fixture(
+            "pub fn byte_computed_rhs() -> Byte",
+            "let result = b'a' & (1 + 0)",
+        ),
+        fixture(
+            "pub fn nested(left: I32, right: I32, extra: I32) -> I32",
+            "let result = left & (right ^ extra)",
+        ),
+        fixture(
+            "pub fn computed(left: I32, right: I32) -> I32",
+            "let result = (left + right) & right",
+        ),
+        fixture(
+            "pub fn unresolved(left: I32) -> I32",
+            "let bits = 1\n    let result = bits & left",
+        ),
+        format!(
+            "type Word = I32\n{}",
+            fixture(
+                "pub fn alias(left: Word, right: Word) -> Word",
+                "let result = left & right"
+            )
+        ),
+        fixture(
+            "pub fn self_reference(left: I32) -> I32",
+            "let result = result & left",
+        ),
+        fixture(
+            "pub fn forward_reference(left: I32) -> I32",
+            "let result = later & left\n    let later: I32 = 1",
+        ),
+        fixture(
+            "pub fn generic<T>(unused: I32) -> Byte",
+            "let result = b'a' & b'b'",
+        ),
+        fixture(
+            "pub fn generic_integer_rhs<T>(unused: I32) -> Byte",
+            "let result = b'a' & 1",
+        ),
         concat!(
             "type BitOwner { marker: Byte }\n",
             "impl BitOwner {\n",
@@ -6491,9 +6614,20 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "        result\n",
             "    }\n",
             "}\n",
-        ),
+        )
+        .to_owned(),
+        concat!(
+            "type IntegerBitOwner { marker: Byte }\n",
+            "impl IntegerBitOwner {\n",
+            "    fn integer_method(self: borrow Self) -> Byte {\n",
+            "        let result = b'a' & 1\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        )
+        .to_owned(),
     ] {
-        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+        assert_check_stays_gated_without_syntax_errors(&run_check(&source, "", &[], &[]), &source);
     }
 }
 
@@ -7088,6 +7222,94 @@ fn primitive_bitwise_byte_literal_pair_annotation_mismatch_recovers_to_annotatio
         "expected `U8`, found `Byte`",
         expression_start,
         expression_start + expression.len(),
+    );
+}
+
+#[test]
+fn primitive_bitwise_byte_literal_left_integer_rhs_mismatches_and_recovers_to_byte() {
+    for operator in ["&", "|", "^"] {
+        let source = format!(
+            concat!(
+                "pub fn byte_integer_rhs() -> Byte {{\n",
+                "    let value = b'a' {operator} -1\n",
+                "    let recovered: Byte = value\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            operator = operator,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression = format!("b'a' {operator} -1");
+        let expression_start = source
+            .find(&expression)
+            .expect("Byte literal-left integer expression exists");
+        let literal_start = expression_start + format!("b'a' {operator} ").len();
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "an integer RHS should produce one Byte literal mismatch:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+                && !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "the expression should recover as Byte through the following local and tail:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            "expected `Byte`, found an integer literal",
+            literal_start,
+            literal_start + "-1".len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_bitwise_byte_literal_left_integer_rhs_recovers_to_different_annotation() {
+    let source = concat!(
+        "pub fn annotation_recovery() -> U8 {\n",
+        "    let value: U8 = b'a' ^ 1\n",
+        "    let recovered: U8 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression = "b'a' ^ 1";
+    let expression_start = source
+        .find(expression)
+        .expect("annotated Byte literal-left integer expression exists");
+    let literal_start = expression_start + "b'a' ^ ".len();
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the RHS mismatch and annotation mismatch should both be reported:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the local should recover to U8 and reach the following local and tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Byte`",
+        expression_start,
+        expression_start + expression.len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Byte`, found an integer literal",
+        literal_start,
+        literal_start + "1".len(),
     );
 }
 

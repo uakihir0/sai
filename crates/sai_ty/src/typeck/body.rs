@@ -728,6 +728,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     let Some(kind) = primitive_literal_kind(right_literal) else {
                         return Err(());
                     };
+                    if kind == PrimitiveLiteralKind::Integer {
+                        self.check_annotated_literal(
+                            PrimTy::Byte,
+                            right_literal,
+                            PrimitiveLiteralKind::Integer,
+                            right.hir_id,
+                        );
+                        return Ok(LocalType::Concrete(PrimTy::Byte));
+                    }
                     return match primitive_bitwise_byte_literal_pair_result(operator, kind) {
                         PrimitiveArithmeticResult::Type(result) => Ok(LocalType::Concrete(result)),
                         PrimitiveArithmeticResult::TypeMismatch { .. }

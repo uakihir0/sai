@@ -6410,6 +6410,7 @@ fn check_function_body_primitive_local_block(
                                 && is_preceding_path(right))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
                                 && (is_preceding_path(right)
+                                    || is_direct_function_integer_literal(right)
                                     || matches!(right.kind, ExprKind::Lit(Lit::Byte(_)))))
                     }
                     BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
@@ -26029,6 +26030,70 @@ mod tests {
                 matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
                 "function owner {:?} (index {index}) unexpectedly failed the Byte literal-pair slice: {check:?}",
                 owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_reports_byte_left_integer_literal_mismatches() {
+        let root = concat!(
+            "pub fn byte_integer_rhs() -> Byte {\n",
+            "    let and_value: Byte = b'a' & -1\n",
+            "    let or_value: Byte = b'b' | 2\n",
+            "    let xor_value: Byte = b'c' ^ 3\n",
+            "    xor_value\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 1);
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[0]
+            .body_type_check()
+            .expect("direct Byte-left integer RHS remains in the supported body slice")
+        else {
+            panic!("the direct Byte-left integer RHS shape must remain supported");
+        };
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch; 3]
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["expected `Byte`, found an integer literal"; 3]
+        );
+
+        for (diagnostic, literal) in diagnostics.iter().zip(["-1", "2", "3"]) {
+            let start = root.find(literal).expect("RHS integer literal exists") as u32;
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("integer literal mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(start + literal.len() as u32),
+                )
+                .expect("integer literal span is ordered"),
+                "the complete signed literal span should be diagnosed"
             );
         }
     }
