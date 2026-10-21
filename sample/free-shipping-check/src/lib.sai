@@ -1,0 +1,3 @@
+pub fn qualifies_for_free_shipping(subtotal_yen: U32) -> Bool {
+    subtotal_yen >= 5000
+}

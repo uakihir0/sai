@@ -1,0 +1,5 @@
+pub fn fahrenheit(celsius: F32) -> F32 {
+    let scaled: F32 = celsius * 1.8
+    let result: F32 = scaled + 32.0
+    result
+}
