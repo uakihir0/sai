@@ -818,16 +818,24 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         return Err(());
                     }
 
+                    let right_type = match right_kind {
+                        PrimitiveLiteralKind::Character => PrimTy::Char,
+                        PrimitiveLiteralKind::Bool => PrimTy::Bool,
+                        PrimitiveLiteralKind::Integer
+                        | PrimitiveLiteralKind::FloatingPoint
+                        | PrimitiveLiteralKind::Byte => unreachable!(),
+                    };
+
                     // Char bitwise operators use trait selection. No
-                    // BitAnd<Char>, BitOr<Char>, or BitXor<Char>
-                    // implementation exists, so retain the Char result for
-                    // annotation and later-use recovery.
+                    // BitAnd, BitOr, or BitXor implementation exists for
+                    // these Char/Char and Char/Bool pairs, so retain the Char
+                    // result for annotation and later-use recovery.
                     self.errors.push(PrimitiveBodyError {
                         node: expression,
                         kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
                             operator,
                             left: PrimTy::Char,
-                            right: PrimTy::Char,
+                            right: right_type,
                         },
                     });
                     return Ok(LocalType::Concrete(PrimTy::Char));
@@ -1682,7 +1690,10 @@ fn primitive_bitwise_char_literal_pair_supported(
     right: PrimitiveLiteralKind,
 ) -> bool {
     matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor)
-        && right == PrimitiveLiteralKind::Character
+        && matches!(
+            right,
+            PrimitiveLiteralKind::Character | PrimitiveLiteralKind::Bool
+        )
 }
 
 fn primitive_bitwise_byte_literal_left_result(
@@ -2376,7 +2387,7 @@ mod tests {
     }
 
     #[test]
-    fn char_literal_bitwise_pairs_accept_only_char_literals_for_bitwise_operators() {
+    fn char_literal_bitwise_pairs_accept_only_char_or_bool_literals_for_bitwise_operators() {
         for operator in [BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor] {
             assert!(
                 primitive_bitwise_char_literal_pair_supported(
@@ -2385,10 +2396,13 @@ mod tests {
                 ),
                 "{operator:?} accepts a Char/Char literal pair for trait diagnostics"
             );
+            assert!(
+                primitive_bitwise_char_literal_pair_supported(operator, PrimitiveLiteralKind::Bool),
+                "{operator:?} accepts a Char/Bool literal pair for trait diagnostics"
+            );
             for right in [
                 PrimitiveLiteralKind::Integer,
                 PrimitiveLiteralKind::FloatingPoint,
-                PrimitiveLiteralKind::Bool,
                 PrimitiveLiteralKind::Byte,
             ] {
                 assert!(
@@ -2399,13 +2413,12 @@ mod tests {
         }
 
         for operator in [BinOp::Add, BinOp::Shl, BinOp::Shr, BinOp::Eq] {
-            assert!(
-                !primitive_bitwise_char_literal_pair_supported(
-                    operator,
-                    PrimitiveLiteralKind::Character
-                ),
-                "{operator:?} Char literal pairs remain unsupported"
-            );
+            for right in [PrimitiveLiteralKind::Character, PrimitiveLiteralKind::Bool] {
+                assert!(
+                    !primitive_bitwise_char_literal_pair_supported(operator, right),
+                    "{operator:?} Char/{right:?} literal pairs remain unsupported"
+                );
+            }
         }
     }
 
