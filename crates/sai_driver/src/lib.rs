@@ -6377,6 +6377,8 @@ fn check_function_body_primitive_local_block(
                         (is_preceding_path(left) && is_preceding_path(right))
                             || (is_preceding_path(left)
                                 && is_direct_function_integer_literal(right))
+                            || (is_direct_function_integer_literal(left)
+                                && is_preceding_path(right))
                     }
                     BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
                         (is_preceding_path(left) && is_preceding_path(right))
@@ -25729,6 +25731,104 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_accepts_flat_local_bitwise_left_integer_literals() {
+        let integer_types = [
+            "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
+        ];
+        let operators = [("&", "and"), ("|", "or"), ("^", "xor")];
+        let mut root = String::new();
+        for ty in integer_types {
+            for (operator, name) in operators {
+                root.push_str(&format!(
+                    "pub fn {name}_{}(right: {ty}) -> {ty} {{\n    let value = 1 {operator} right\n    value\n}}\n",
+                    ty.to_ascii_lowercase()
+                ));
+            }
+        }
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 30);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("supported primitive body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the supported body slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_retains_left_bitwise_integer_literals_after_family_mismatches() {
+        let root = concat!(
+            "pub fn byte(right: Byte) -> I32 {\n    let value: I32 = 1 & right\n    value\n}\n",
+            "pub fn bool(right: Bool) -> I32 {\n    let value: I32 = 1 | right\n    value\n}\n",
+            "pub fn f32(right: F32) -> I32 {\n    let value: I32 = 1 ^ right\n    value\n}\n",
+            "pub fn f64(right: F64) -> I32 {\n    let value: I32 = 1 & right\n    value\n}\n",
+            "pub fn char(right: Char) -> I32 {\n    let value: I32 = 1 | right\n    value\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 5);
+        for (index, (owner, found)) in resolved
+            .owners()
+            .iter()
+            .zip(["Byte", "Bool", "F32", "F64", "Char"])
+            .enumerate()
+        {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("supported operand mismatch is reported")
+            else {
+                panic!("non-integer bitwise path {found} unexpectedly gated");
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                [sai_diagnostics::Code::TypeMismatch],
+                "non-integer bitwise path case {index}"
+            );
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .collect::<Vec<_>>(),
+                vec![format!("expected `I64`, found `{found}`")],
+                "non-integer bitwise path case {index}"
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_reports_flat_local_bitwise_operand_errors() {
         let root = concat!(
             "pub fn integer_mismatch(left: I32, right: U8) -> I32 {\n    let value = left & right\n    value\n}\n",
@@ -25893,7 +25993,7 @@ mod tests {
     fn function_body_type_check_keeps_unsupported_bitwise_forms_gated() {
         let root = concat!(
             "type Word = I32\n",
-            "pub fn left_literal(left: I32) -> I32 {\n    let value = 1 & left\n    value\n}\n",
+            "pub fn float_literal_left(left: I32) -> I32 {\n    let value = 1.0 & left\n    value\n}\n",
             "pub fn literal_pair() -> I32 {\n    let value = 1 ^ 2\n    value\n}\n",
             "pub fn non_integer_literal(left: I32) -> I32 {\n    let value = left & 1.0\n    value\n}\n",
             "pub fn char_integer_literal(left: Char) -> Char {\n    let value = left & 1\n    value\n}\n",
