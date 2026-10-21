@@ -5220,6 +5220,310 @@ fn const_forms_outside_literal_slice_remain_gated() {
 }
 
 #[test]
+fn primitive_bitwise_path_pairs_accept_matching_integer_and_byte_types() {
+    let integer_types = [
+        "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
+    ];
+    for primitive in integer_types {
+        let source = format!(
+            concat!(
+                "pub fn bitwise_{}(left: {primitive}, right: {primitive}) -> {primitive} {{\n",
+                "    let and_value = left & right\n",
+                "    let or_value = left | right\n",
+                "    let xor_value = and_value ^ or_value\n",
+                "    xor_value\n",
+                "}}\n",
+            ),
+            primitive.to_ascii_lowercase(),
+            primitive = primitive,
+        );
+        assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+    }
+    let byte_source = concat!(
+        "pub fn byte_bitwise(left: Byte, right: Byte) -> Byte {\n",
+        "    let and_value = left & right\n",
+        "    let or_value = left | right\n",
+        "    let xor_value = and_value ^ or_value\n",
+        "    xor_value\n",
+        "}\n",
+    );
+    assert_success_result(run_check(byte_source, "", &[], &[]), "wasm32-core", "dev");
+
+    for source in [
+        concat!(
+            "pub fn preceding_locals(left: I32, right: I32) -> I32 {\n",
+            "    let first = left\n",
+            "    let second = right\n",
+            "    let value = first ^ second\n",
+            "    value\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn shadow(left: U32, right: I32) -> I32 {\n",
+            "    let left: I32 = right\n",
+            "    let value = left | right\n",
+            "    value\n",
+            "}\n",
+        ),
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_bitwise_path_rhs_mismatches_recover_to_the_left_type() {
+    for (name, left_type, right_type, operator) in
+        [("integer", "I32", "U8", "&"), ("byte", "Byte", "Char", "|")]
+    {
+        let source = format!(
+            concat!(
+                "pub fn {name}_mismatch(left: {left_type}, right: {right_type}) -> {left_type} {{\n",
+                "    let value = left {operator} right\n",
+                "    let recovered: {left_type} = value\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            name = name,
+            left_type = left_type,
+            right_type = right_type,
+            operator = operator,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression = source
+            .find(&format!("left {operator} right"))
+            .expect("mismatch expression exists");
+        let right = expression + format!("left {operator} ").len();
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "mismatched right path should report one type mismatch:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "integer and Byte right-path mismatches are supported errors and recover to the left type:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            &format!("expected `{left_type}`, found `{right_type}`"),
+            right,
+            right + "right".len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_bitwise_bool_float_and_char_diagnostics_have_exact_spans_and_order() {
+    let cases = [
+        (
+            "bool_mismatch",
+            "Bool",
+            "I32",
+            "^",
+            "Bool",
+            "operator `^` is not defined for `Bool`",
+        ),
+        (
+            "bool_same",
+            "Bool",
+            "Bool",
+            "&",
+            "Bool",
+            "operator `&` is not defined for `Bool`",
+        ),
+        (
+            "float_mismatch",
+            "F64",
+            "F32",
+            "|",
+            "F64",
+            "operator `|` is not defined for `F64`",
+        ),
+        (
+            "float_same",
+            "F32",
+            "F32",
+            "^",
+            "F32",
+            "operator `^` is not defined for `F32`",
+        ),
+        (
+            "char_and",
+            "Char",
+            "U8",
+            "&",
+            "Char",
+            "operator `&` has no `BitAnd<U8>` implementation for `Char`",
+        ),
+        (
+            "char_or",
+            "Char",
+            "Char",
+            "|",
+            "Char",
+            "operator `|` has no `BitOr<Char>` implementation for `Char`",
+        ),
+        (
+            "char_xor",
+            "Char",
+            "I32",
+            "^",
+            "Char",
+            "operator `^` has no `BitXor<I32>` implementation for `Char`",
+        ),
+    ];
+
+    for (name, left_type, right_type, operator, return_type, operator_message) in cases {
+        let source = format!(
+            concat!(
+                "pub fn {name}(left: {left_type}, right: {right_type}) -> {return_type} {{\n",
+                "    let value = left {operator} right\n",
+                "    value\n",
+                "}}\n",
+            ),
+            name = name,
+            left_type = left_type,
+            right_type = right_type,
+            return_type = return_type,
+            operator = operator,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression = source
+            .find(&format!("left {operator} right"))
+            .expect("operator expression exists");
+        let expression_end = expression + format!("left {operator} right").len();
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout
+                .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                .count(),
+            1,
+            "{name} should report one unsupported-operator diagnostic:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "these primitive operand combinations have supported diagnostics:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            operator_message,
+            expression,
+            expression_end,
+        );
+        let mismatch_position = stdout.find("\"code\":\"TYPE_MISMATCH\"");
+        if left_type == "Bool" && right_type != left_type
+            || matches!(left_type, "F32" | "F64") && right_type != left_type
+        {
+            assert!(mismatch_position.is_some(), "{stdout}");
+            assert_eq!(
+                stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+                1,
+                "{stdout}"
+            );
+            assert!(
+                stdout
+                    .find(&format!("\"message\":\"{operator_message}\""))
+                    .expect("operator diagnostic precedes its mismatch")
+                    < mismatch_position.unwrap(),
+                "CLI output should sort the whole-expression error before the RHS mismatch:\n{stdout}"
+            );
+            let right = expression + format!("left {operator} ").len();
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                &format!("expected `{left_type}`, found `{right_type}`"),
+                right,
+                right + "right".len(),
+            );
+        } else {
+            assert!(mismatch_position.is_none(), "{stdout}");
+        }
+    }
+}
+
+#[test]
+fn primitive_bitwise_integer_annotation_mismatch_recovers_after_operand_mismatch() {
+    let source = concat!(
+        "pub fn annotation_recovery(left: I32, right: U8) -> Bool {\n",
+        "    let value: Bool = left & right\n",
+        "    let recovered: Bool = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression = source
+        .find("left & right")
+        .expect("annotated initializer expression exists");
+    let right = expression + "left & ".len();
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the operand mismatch and annotation mismatch should both be reported:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the initializer should recover to its Bool annotation and reach the following local:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        expression,
+        expression + "left & right".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `U8`",
+        right,
+        right + "right".len(),
+    );
+
+    let annotation_position = stdout
+        .find("\"message\":\"expected `Bool`, found `I32`\"")
+        .expect("annotation mismatch exists");
+    let operand_position = stdout
+        .find("\"message\":\"expected `I32`, found `U8`\"")
+        .expect("right operand mismatch exists");
+    assert!(
+        annotation_position < operand_position,
+        "CLI output should sort the full initializer span before its nested RHS span:\n{stdout}"
+    );
+}
+
+#[test]
+fn unsupported_primitive_bitwise_shapes_remain_gated() {
+    for source in [
+        "pub fn right_literal(value: I32) -> I32 { let result = value & 1; result }\n",
+        "pub fn left_literal(value: I32) -> I32 { let result = 1 & value; result }\n",
+        "pub fn literal_pair() -> I32 { let result = 1 & 2; result }\n",
+        "pub fn nested(left: I32, right: I32, extra: I32) -> I32 { let result = left & (right ^ extra); result }\n",
+        "pub fn computed(left: I32, right: I32) -> I32 { let result = (left + right) & right; result }\n",
+        "pub fn unresolved(left: I32) -> I32 { let bits = 1; let result = bits & left; result }\n",
+        "type Word = I32\npub fn alias(left: Word, right: Word) -> Word { let result = left & right; result }\n",
+        "pub fn bit_not(left: I32) -> I32 { let result = ~left; result }\n",
+        "pub fn shift(left: I32) -> I32 { let result = left << 1; result }\n",
+        "pub fn self_reference(left: I32) -> I32 { let result = result & left; result }\n",
+        "pub fn forward_reference(left: I32) -> I32 { let result = later & left; let later: I32 = 1; result }\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
 fn primitive_const_success_stays_limited_to_the_default_unlocked_check() {
     let source = "pub const VALUE: I8 = 1\n";
     let cases: &[(&str, &[&str])] = &[

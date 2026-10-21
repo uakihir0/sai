@@ -6373,6 +6373,9 @@ fn check_function_body_primitive_local_block(
                 };
                 let supported_shape = match operator {
                     BinOp::And | BinOp::Or => is_preceding_path(left) && is_preceding_path(right),
+                    BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                        is_preceding_path(left) && is_preceding_path(right)
+                    }
                     BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
                         (is_preceding_path(left) && is_preceding_path(right))
                             || (is_preceding_path(left)
@@ -6447,6 +6450,9 @@ fn is_function_primitive_local_binary_operator(operator: BinOp) -> bool {
             | BinOp::WrapAdd
             | BinOp::WrapSub
             | BinOp::WrapMul
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor
             | BinOp::And
             | BinOp::Or
     ) || is_function_primitive_local_comparison_operator(operator)
@@ -6567,6 +6573,9 @@ fn primitive_body_errors_to_diagnostics(
                     BinOp::WrapAdd => "+%",
                     BinOp::WrapSub => "-%",
                     BinOp::WrapMul => "*%",
+                    BinOp::BitAnd => "&",
+                    BinOp::BitOr => "|",
+                    BinOp::BitXor => "^",
                     _ => return Ok(None),
                 };
                 let message = match operand {
@@ -6580,10 +6589,15 @@ fn primitive_body_errors_to_diagnostics(
                         )
                     }
                 };
-                let label = if operator == BinOp::Rem {
-                    "floating-point remainder is not supported"
-                } else {
-                    "wrapping arithmetic is not supported for this primitive"
+                let label = match operator {
+                    BinOp::Rem => "floating-point remainder is not supported",
+                    BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
+                        "wrapping arithmetic is not supported for this primitive"
+                    }
+                    BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                        "bitwise operator is not supported for this primitive"
+                    }
+                    _ => return Ok(None),
                 };
                 let mut diagnostic = const_literal_diagnostic(
                     owner.id,
@@ -6608,6 +6622,31 @@ fn primitive_body_errors_to_diagnostics(
                         })?;
                 }
                 diagnostic
+            }
+            PrimitiveBodyErrorKind::OperatorTraitNotSupported {
+                operator,
+                left,
+                right,
+            } => {
+                let (operator_text, trait_name) = match operator {
+                    BinOp::BitAnd => ("&", "BitAnd"),
+                    BinOp::BitOr => ("|", "BitOr"),
+                    BinOp::BitXor => ("^", "BitXor"),
+                    _ => return Ok(None),
+                };
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    format!(
+                        "operator `{operator_text}` has no `{trait_name}<{}>` implementation for `{}`",
+                        const_primitive_name(right),
+                        const_primitive_name(left)
+                    ),
+                    "operator trait implementation is not available",
+                )?
             }
         };
         diagnostics.push(diagnostic);
@@ -25582,6 +25621,265 @@ mod tests {
                     sai_diagnostics::TextSize::new(start + token.len() as u32),
                 )
                 .expect("diagnostic token range is ordered")
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_flat_local_bitwise_paths() {
+        let integer_types = [
+            "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
+        ];
+        let operators = [("&", "and"), ("|", "or"), ("^", "xor")];
+        let mut root = String::new();
+        for ty in integer_types {
+            for (operator, name) in operators {
+                root.push_str(&format!(
+                    "pub fn {name}_{}(left: {ty}, right: {ty}) -> {ty} {{\n    let value = left {operator} right\n    value\n}}\n",
+                    ty.to_ascii_lowercase()
+                ));
+            }
+        }
+        for (operator, name) in operators {
+            root.push_str(&format!(
+                "pub fn byte_{name}(left: Byte, right: Byte) -> Byte {{\n    let value = left {operator} right\n    value\n}}\n"
+            ));
+        }
+        root.push_str(concat!(
+            "pub fn logical_and(left: Bool, right: Bool) -> Bool {\n    let value = left and right\n    value\n}\n",
+            "pub fn logical_or(left: Bool, right: Bool) -> Bool {\n    let value = left or right\n    value\n}\n",
+            "pub fn preceding_locals(left: I32, right: I32) -> I32 {\n",
+            "    let first = left\n",
+            "    let second = right\n",
+            "    let value = first ^ second\n",
+            "    value\n",
+            "}\n",
+        ));
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 36);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("supported primitive body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the supported body slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_reports_flat_local_bitwise_operand_errors() {
+        let root = concat!(
+            "pub fn integer_mismatch(left: I32, right: U8) -> I32 {\n    let value = left & right\n    value\n}\n",
+            "pub fn byte_mismatch(left: Byte, right: Char) -> Byte {\n    let value = left | right\n    value\n}\n",
+            "pub fn bool_mismatch(left: Bool, right: I32) -> Bool {\n    let value = left ^ right\n    value\n}\n",
+            "pub fn bool_same(left: Bool, right: Bool) -> Bool {\n    let value = left & right\n    value\n}\n",
+            "pub fn float_mismatch(left: F64, right: F32) -> F64 {\n    let value = left | right\n    value\n}\n",
+            "pub fn float_same(left: F32, right: F32) -> F32 {\n    let value = left ^ right\n    value\n}\n",
+            "pub fn char_and(left: Char, right: U8) -> Char {\n    let value = left & right\n    value\n}\n",
+            "pub fn char_or(left: Char, right: Char) -> Char {\n    let value = left | right\n    value\n}\n",
+            "pub fn char_xor(left: Char, right: I32) -> Char {\n    let value = left ^ right\n    value\n}\n",
+            "pub fn annotation_recovery(left: I32, right: U8) -> Bool {\n    let value: Bool = left & right\n    value\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let cases: [(&str, &[sai_diagnostics::Code], &[&str], &[&str]); 10] = [
+            (
+                "integer_mismatch",
+                &[sai_diagnostics::Code::TypeMismatch],
+                &["expected `I32`, found `U8`"],
+                &["right"],
+            ),
+            (
+                "byte_mismatch",
+                &[sai_diagnostics::Code::TypeMismatch],
+                &["expected `Byte`, found `Char`"],
+                &["right"],
+            ),
+            (
+                "bool_mismatch",
+                &[
+                    sai_diagnostics::Code::TypeMismatch,
+                    sai_diagnostics::Code::OperatorNotSupported,
+                ],
+                &[
+                    "expected `Bool`, found `I32`",
+                    "operator `^` is not defined for `Bool`",
+                ],
+                &["right", "left ^ right"],
+            ),
+            (
+                "bool_same",
+                &[sai_diagnostics::Code::OperatorNotSupported],
+                &["operator `&` is not defined for `Bool`"],
+                &["left & right"],
+            ),
+            (
+                "float_mismatch",
+                &[
+                    sai_diagnostics::Code::TypeMismatch,
+                    sai_diagnostics::Code::OperatorNotSupported,
+                ],
+                &[
+                    "expected `F64`, found `F32`",
+                    "operator `|` is not defined for `F64`",
+                ],
+                &["right", "left | right"],
+            ),
+            (
+                "float_same",
+                &[sai_diagnostics::Code::OperatorNotSupported],
+                &["operator `^` is not defined for `F32`"],
+                &["left ^ right"],
+            ),
+            (
+                "char_and",
+                &[sai_diagnostics::Code::OperatorNotSupported],
+                &["operator `&` has no `BitAnd<U8>` implementation for `Char`"],
+                &["left & right"],
+            ),
+            (
+                "char_or",
+                &[sai_diagnostics::Code::OperatorNotSupported],
+                &["operator `|` has no `BitOr<Char>` implementation for `Char`"],
+                &["left | right"],
+            ),
+            (
+                "char_xor",
+                &[sai_diagnostics::Code::OperatorNotSupported],
+                &["operator `^` has no `BitXor<I32>` implementation for `Char`"],
+                &["left ^ right"],
+            ),
+            (
+                "annotation_recovery",
+                &[
+                    sai_diagnostics::Code::TypeMismatch,
+                    sai_diagnostics::Code::TypeMismatch,
+                ],
+                &["expected `I32`, found `U8`", "expected `Bool`, found `I32`"],
+                &["right", "left & right"],
+            ),
+        ];
+
+        assert_eq!(resolved.owners().len(), cases.len());
+        for (index, (function, expected_codes, expected_messages, expected_tokens)) in
+            cases.into_iter().enumerate()
+        {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
+                .body_type_check()
+                .expect("supported operand error is reported")
+            else {
+                panic!("{function}: operand error must not gate the body");
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                expected_codes,
+                "{function}"
+            );
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>(),
+                expected_messages,
+                "{function}"
+            );
+
+            let function_start = root
+                .find(&format!("pub fn {function}"))
+                .expect("function exists");
+            let function_end = root[function_start..]
+                .find("\npub fn ")
+                .map_or(root.len(), |offset| function_start + offset);
+            let function_text = &root[function_start..function_end];
+            let body_offset = function_text.find('{').expect("function body opens") + 1;
+            let body = &function_text[body_offset..];
+            for (diagnostic, token) in diagnostics.iter().zip(expected_tokens) {
+                let relative_start = body.find(token).expect("diagnostic token is in the body");
+                let start = (function_start + body_offset + relative_start) as u32;
+                assert_eq!(
+                    diagnostic
+                        .primary()
+                        .expect("body diagnostic has a primary span")
+                        .span
+                        .range,
+                    sai_diagnostics::TextRange::new(
+                        sai_diagnostics::TextSize::new(start),
+                        sai_diagnostics::TextSize::new(start + token.len() as u32),
+                    )
+                    .expect("diagnostic token range is ordered"),
+                    "{function}: {token}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_keeps_unsupported_bitwise_forms_gated() {
+        let root = concat!(
+            "type Word = I32\n",
+            "pub fn literal(left: I32) -> I32 {\n    let value = left & 1\n    value\n}\n",
+            "pub fn nested(left: I32, right: I32, extra: I32) -> I32 {\n    let value = left & (right ^ extra)\n    value\n}\n",
+            "pub fn computed(left: I32, right: I32) -> I32 {\n    let value = (left + right) & right\n    value\n}\n",
+            "pub fn unresolved(left: I32) -> I32 {\n    let bits = 1\n    let value = bits & left\n    value\n}\n",
+            "pub fn alias(left: Word, right: Word) -> Word {\n    let value = left & right\n    value\n}\n",
+            "pub fn bit_not(left: I32) -> I32 {\n    let value = ~left\n    value\n}\n",
+            "pub fn shift(left: I32) -> I32 {\n    let value = left << 1\n    value\n}\n",
+            "pub fn self_reference(left: I32) -> I32 {\n    let value = value & left\n    value\n}\n",
+            "pub fn forward_reference(left: I32) -> I32 {\n    let value = future & left\n    let future: I32 = 1\n    value\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 9);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported bitwise body check is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "function owner {index} unexpectedly passed the bounded bitwise slice: {check:?}"
             );
         }
     }
