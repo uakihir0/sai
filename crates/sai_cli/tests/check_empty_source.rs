@@ -6564,10 +6564,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let result = b'a' & (1 + 0)",
         ),
         fixture(
-            "pub fn i32_path_bool_rhs(left: I32) -> I32",
-            "let result = left & true",
-        ),
-        fixture(
             "pub fn bool_path_char_rhs(left: Bool) -> Bool",
             "let result = left | 'x'",
         ),
@@ -7471,6 +7467,118 @@ fn primitive_bitwise_byte_path_scalar_rhs_mismatches_recover_to_byte() {
             end,
         );
     }
+}
+
+#[test]
+fn primitive_bitwise_integer_path_scalar_rhs_mismatches_recover_to_integer() {
+    let primitive_types = [
+        ("i8_value", "I8"),
+        ("i16_value", "I16"),
+        ("i32_value", "I32"),
+        ("i64_value", "I64"),
+        ("u8_value", "U8"),
+        ("u16_value", "U16"),
+        ("u32_value", "U32"),
+        ("u64_value", "U64"),
+        ("isize_value", "ISize"),
+        ("usize_value", "USize"),
+    ];
+    let cases = [
+        ("&", "and", "true", "bool", "a Bool literal"),
+        ("&", "and", "'x'", "char", "a character literal"),
+        ("&", "and", "1.0", "float", "a floating-point literal"),
+        ("|", "or", "false", "bool", "a Bool literal"),
+        ("|", "or", "'y'", "char", "a character literal"),
+        ("|", "or", "2.0", "float", "a floating-point literal"),
+        ("^", "xor", "true", "bool", "a Bool literal"),
+        ("^", "xor", "'z'", "char", "a character literal"),
+        ("^", "xor", "3.0", "float", "a floating-point literal"),
+    ];
+    for (_, ty) in primitive_types {
+        let mut source = format!("pub fn integer_path_scalar_rhs(value: {ty}) -> {ty} {{\n");
+        source.push_str(&format!("    let prior: {ty} = value\n"));
+        let mut literal_spans = Vec::new();
+        for (operator, operation, literal, suffix, description) in cases {
+            for (left_kind, left) in [("parameter", "value"), ("local", "prior")] {
+                let local = format!("{operation}_{suffix}_{left_kind}");
+                source.push_str(&format!("    let {local} = {left} {operator} {literal}\n"));
+                let start = source.len() - literal.len() - 1;
+                literal_spans.push((ty, description, start, start + literal.len()));
+            }
+        }
+        source.push_str("    xor_float_local\n}\n");
+
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{ty}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            cases.len() * 2,
+            "{ty}: each scalar RHS should mismatch for parameter and local paths:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+                && !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{ty}: expressions should recover to their integer left type and reach the tail:\n{stdout}"
+        );
+        for (primitive, description, start, end) in literal_spans {
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                &format!("expected `{primitive}`, found {description}"),
+                start,
+                end,
+            );
+        }
+    }
+}
+
+#[test]
+fn primitive_bitwise_integer_path_scalar_rhs_recovers_to_different_annotation() {
+    let source = concat!(
+        "pub fn annotation_recovery(left: I32) -> U8 {\n",
+        "    let value: U8 = left ^ 'x'\n",
+        "    let recovered: U8 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression = "left ^ 'x'";
+    let expression_start = source
+        .find(expression)
+        .expect("annotated integer-path scalar expression exists");
+    let literal_start = expression_start + "left ^ ".len();
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the RHS mismatch and annotation mismatch should both be reported:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the expression should recover to U8 and reach later checks:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found a character literal",
+        literal_start,
+        literal_start + "'x'".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `I32`",
+        expression_start,
+        expression_start + expression.len(),
+    );
 }
 
 #[test]

@@ -882,7 +882,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     | PrimitiveLiteralKind::Character
                     | PrimitiveLiteralKind::FloatingPoint),
                 ) => {
-                    if left_type != PrimTy::Byte {
+                    if left_type != PrimTy::Byte && !is_integer_primitive(left_type) {
                         return Err(());
                     }
                     self.check_annotated_literal(left_type, literal, kind, right.hir_id);

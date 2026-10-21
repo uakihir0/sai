@@ -26291,6 +26291,108 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_reports_integer_path_nonbyte_scalar_literal_mismatches() {
+        let primitive_types = [
+            ("i8_value", "I8"),
+            ("i16_value", "I16"),
+            ("i32_value", "I32"),
+            ("i64_value", "I64"),
+            ("u8_value", "U8"),
+            ("u16_value", "U16"),
+            ("u32_value", "U32"),
+            ("u64_value", "U64"),
+            ("isize_value", "ISize"),
+            ("usize_value", "USize"),
+        ];
+        let cases = [
+            ("&", "and", "true", "bool", "a Bool literal"),
+            ("&", "and", "'x'", "char", "a character literal"),
+            ("&", "and", "1.0", "float", "a floating-point literal"),
+            ("|", "or", "false", "bool", "a Bool literal"),
+            ("|", "or", "'y'", "char", "a character literal"),
+            ("|", "or", "2.0", "float", "a floating-point literal"),
+            ("^", "xor", "true", "bool", "a Bool literal"),
+            ("^", "xor", "'z'", "char", "a character literal"),
+            ("^", "xor", "3.0", "float", "a floating-point literal"),
+        ];
+        let mut root = String::from("pub fn integer_path_scalar_rhs(");
+        for (index, (name, ty)) in primitive_types.iter().enumerate() {
+            if index != 0 {
+                root.push_str(", ");
+            }
+            root.push_str(&format!("{name}: {ty}"));
+        }
+        root.push_str(") -> USize {\n");
+        for (name, ty) in primitive_types {
+            root.push_str(&format!("    let prior_{name}: {ty} = {name}\n"));
+        }
+
+        let mut literal_spans = Vec::new();
+        for (name, ty) in primitive_types {
+            for (operator, operation, literal, suffix, description) in cases {
+                for (left_kind, left) in [
+                    ("parameter", name.to_owned()),
+                    ("local", format!("prior_{name}")),
+                ] {
+                    let local = format!("{operation}_{suffix}_{name}_{left_kind}");
+                    root.push_str(&format!("    let {local} = {left} {operator} {literal}\n"));
+                    let start = root.len() - literal.len() - 1;
+                    literal_spans.push((ty, description, start, start + literal.len()));
+                }
+            }
+        }
+        root.push_str("    xor_float_usize_value_local\n}\n");
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 1);
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[0]
+            .body_type_check()
+            .expect("integer path scalar RHSs remain in the supported body slice")
+        else {
+            panic!("integer path scalar RHSs must remain supported");
+        };
+        assert_eq!(diagnostics.len(), primitive_types.len() * cases.len() * 2);
+        for (diagnostic, (primitive, description, start, end)) in
+            diagnostics.iter().zip(literal_spans)
+        {
+            assert_eq!(
+                diagnostic.code,
+                sai_diagnostics::Code::TypeMismatch,
+                "a scalar RHS should produce only a type mismatch"
+            );
+            assert_eq!(
+                diagnostic.message,
+                format!("expected `{primitive}`, found {description}")
+            );
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("literal mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new(end as u32),
+                )
+                .expect("literal span is ordered"),
+                "each diagnostic should use the complete RHS literal span"
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_accepts_flat_local_bitwise_left_integer_literals() {
         let integer_types = [
             "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
@@ -26718,9 +26820,7 @@ mod tests {
             "type ByteAlias = Byte\n",
             "pub fn float_literal_left(left: I32) -> I32 {\n    let value = 1.0 & left\n    value\n}\n",
             "pub fn literal_pair() -> I32 {\n    let value = 1 ^ 2\n    value\n}\n",
-            "pub fn non_integer_literal(left: I32) -> I32 {\n    let value = left & 1.0\n    value\n}\n",
             "pub fn char_integer_literal(left: Char) -> Char {\n    let value = left & 1\n    value\n}\n",
-            "pub fn i32_path_bool_rhs(left: I32) -> I32 {\n    let value = left & true\n    value\n}\n",
             "pub fn bool_path_char_rhs(left: Bool) -> Bool {\n    let value = left | 'x'\n    value\n}\n",
             "pub fn char_path_float_rhs(left: Char) -> Char {\n    let value = left ^ 1.0\n    value\n}\n",
             "pub fn f32_path_bool_rhs(left: F32) -> F32 {\n    let value = left & false\n    value\n}\n",
@@ -26762,7 +26862,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 23);
+        assert_eq!(resolved.owners().len(), 21);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()
