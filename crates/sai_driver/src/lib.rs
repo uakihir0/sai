@@ -27738,6 +27738,12 @@ mod tests {
             "    let recovered: Char = value\n",
             "    recovered\n",
             "}\n",
+            "pub fn char_concrete_computed_float_path_keeps_ir807_support(left: F32) -> Char {\n",
+            "    let computed = left + 1.0\n",
+            "    let value = 'q' & computed\n",
+            "    let recovered: Char = value\n",
+            "    recovered\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -27753,7 +27759,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 5);
+        assert_eq!(owners.len(), 6);
 
         let expected_diagnostics = [
             (
@@ -27837,6 +27843,13 @@ mod tests {
                     ),
                 ],
             ),
+            (
+                5,
+                vec![(
+                    "operator `&` has no `BitAnd<F32>` implementation for `Char`",
+                    "'q' & computed",
+                )],
+            ),
         ];
 
         for (index, expected) in expected_diagnostics {
@@ -27899,6 +27912,192 @@ mod tests {
                     diagnostic.code, expected_code,
                     "wrong diagnostic code for {message:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_tracks_one_unannotated_float_literal_copy() {
+        let root = concat!(
+            "pub fn char_float_alias_defaults() -> Char {\n",
+            "    let rhs = 1.5\n",
+            "    let default_alias = rhs\n",
+            "    let and_value = 'a' & default_alias\n",
+            "    let or_value = 'b' | default_alias\n",
+            "    let xor_value = 'c' ^ default_alias\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_float_alias_constrained() -> Char {\n",
+            "    let rhs = 1.25\n",
+            "    let constrained_alias = rhs\n",
+            "    let and_value = 'a' & constrained_alias\n",
+            "    let or_value = 'b' | constrained_alias\n",
+            "    let xor_value = 'c' ^ constrained_alias\n",
+            "    let narrowed: F32 = constrained_alias\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_float_alias_f32_range() -> Char {\n",
+            "    let rhs = 1e39\n",
+            "    let range_alias = rhs\n",
+            "    let value = 'x' ^ range_alias\n",
+            "    let narrowed: F32 = range_alias\n",
+            "    let recovered: Char = value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_float_alias_annotation_recovery() -> F32 {\n",
+            "    let rhs = 1.0\n",
+            "    let annotation_alias = rhs\n",
+            "    let value: F32 = 'z' ^ annotation_alias\n",
+            "    let recovered: F32 = value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_float_typed_copy_keeps_concrete_path_support() -> Char {\n",
+            "    let rhs = 1.0\n",
+            "    let typed_alias: F32 = rhs\n",
+            "    let value = 'a' & typed_alias\n",
+            "    let recovered: Char = value\n",
+            "    recovered\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 5);
+
+        let expected_diagnostics = [
+            (
+                0,
+                vec![
+                    (
+                        "operator `&` has no `BitAnd<F64>` implementation for `Char`",
+                        "'a' & default_alias",
+                    ),
+                    (
+                        "operator `|` has no `BitOr<F64>` implementation for `Char`",
+                        "'b' | default_alias",
+                    ),
+                    (
+                        "operator `^` has no `BitXor<F64>` implementation for `Char`",
+                        "'c' ^ default_alias",
+                    ),
+                ],
+            ),
+            (
+                1,
+                vec![
+                    (
+                        "operator `&` has no `BitAnd<F32>` implementation for `Char`",
+                        "'a' & constrained_alias",
+                    ),
+                    (
+                        "operator `|` has no `BitOr<F32>` implementation for `Char`",
+                        "'b' | constrained_alias",
+                    ),
+                    (
+                        "operator `^` has no `BitXor<F32>` implementation for `Char`",
+                        "'c' ^ constrained_alias",
+                    ),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    ("floating-point literal is out of range for `F32`", "1e39"),
+                    (
+                        "operator `^` has no `BitXor<F32>` implementation for `Char`",
+                        "'x' ^ range_alias",
+                    ),
+                ],
+            ),
+            (
+                3,
+                vec![
+                    (
+                        "operator `^` has no `BitXor<F64>` implementation for `Char`",
+                        "'z' ^ annotation_alias",
+                    ),
+                    ("expected `F32`, found `Char`", "'z' ^ annotation_alias"),
+                ],
+            ),
+            (
+                4,
+                vec![(
+                    "operator `&` has no `BitAnd<F32>` implementation for `Char`",
+                    "'a' & typed_alias",
+                )],
+            ),
+        ];
+
+        for (index, expected) in expected_diagnostics {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
+                .body_type_check()
+                .expect("one-hop float alias Char bitwise pair is checked")
+            else {
+                panic!("owner {index} must remain in the supported body-checking slice");
+            };
+            assert_eq!(
+                diagnostics.len(),
+                expected.len(),
+                "function owner {index}: {diagnostics:?}"
+            );
+            let diagnostic_starts = diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    diagnostic
+                        .primary()
+                        .expect("diagnostic has primary span")
+                        .span
+                        .range
+                        .start()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                diagnostic_starts.windows(2).all(|pair| pair[0] <= pair[1]),
+                "function owner {index} diagnostics must retain source order: {diagnostics:?}"
+            );
+            for (message, span_source) in expected {
+                let start = root
+                    .find(span_source)
+                    .expect("the expected diagnostic source span exists");
+                let expected_span = sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + span_source.len()) as u32),
+                )
+                .expect("expected diagnostic span is ordered");
+                let diagnostic = diagnostics
+                    .iter()
+                    .find(|diagnostic| {
+                        diagnostic.message == message
+                            && diagnostic
+                                .primary()
+                                .is_some_and(|primary| primary.span.range == expected_span)
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "function owner {index} lacks {message:?} at {span_source:?}: {diagnostics:?}"
+                        )
+                    });
+                let expected_code = if message.starts_with("floating-point literal") {
+                    sai_diagnostics::Code::LiteralOutOfRange
+                } else if message.starts_with("expected") {
+                    sai_diagnostics::Code::TypeMismatch
+                } else {
+                    sai_diagnostics::Code::OperatorNotSupported
+                };
+                assert_eq!(diagnostic.code, expected_code);
             }
         }
     }
@@ -29531,12 +29730,12 @@ mod tests {
             "pub fn char_literal_alias_path_rhs(right: ByteAlias) -> Char {\n    let value = 'a' & right\n    value\n}\n",
             "pub fn generic_char_literal_path_rhs<T>(right: T) -> Char {\n    let value = 'a' & right\n    value\n}\n",
             "pub fn char_literal_unresolved_path_rhs() -> Char {\n    let value = 'a' & missing\n    value\n}\n",
-            "pub fn char_literal_float_alias_path_rhs() -> Char {\n    let right = 1.0\n    let alias = right\n    let constrained: F32 = right\n    let value = 'a' & alias\n    value\n}\n",
+            "pub fn char_literal_float_alias_path_rhs() -> Char {\n    let right = 1.0\n    let alias = right\n    let second_alias = alias\n    let constrained: F32 = right\n    let value = 'a' & second_alias\n    value\n}\n",
             "pub fn char_literal_computed_float_local_rhs() -> Char {\n    let right = 1.0 + 2.0\n    let value = 'a' & right\n    value\n}\n",
             "pub fn char_literal_integer_alias_path_rhs() -> Char {\n    let right = 1\n    let alias = right\n    let constrained: I32 = right\n    let value = 'a' & alias\n    value\n}\n",
             "pub fn char_literal_computed_integer_path_rhs() -> Char {\n    let right = 1 + 2\n    let value = 'a' & right\n    value\n}\n",
             "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char {\n    let right = 1\n    let value = 'a' & right\n    value\n}\n",
-            "pub fn generic_char_literal_untyped_float_path_rhs<T>() -> Char {\n    let right = 1.0\n    let value = 'a' & right\n    value\n}\n",
+            "pub fn generic_char_literal_untyped_float_path_rhs<T>() -> Char {\n    let right = 1.0\n    let alias = right\n    let value = 'a' & alias\n    value\n}\n",
             "pub fn char_literal_self_reference_path_rhs() -> Char {\n    let value = 'a' & value\n    value\n}\n",
             "pub fn char_literal_forward_reference_path_rhs() -> Char {\n    let value = 'a' & later\n    let later: Bool = true\n    value\n}\n",
             "pub fn char_literal_multisegment_path_rhs() -> Char {\n    let value = 'a' & package.flag\n    value\n}\n",
@@ -29590,7 +29789,8 @@ mod tests {
             "impl CharUntypedFloatPathOwner {\n",
             "    fn char_untyped_float_path_method(self: borrow Self) -> Char {\n",
             "        let right = 1.0\n",
-            "        let value = 'a' & right\n",
+            "        let alias = right\n",
+            "        let value = 'a' & alias\n",
             "        value\n",
             "    }\n",
             "}\n",

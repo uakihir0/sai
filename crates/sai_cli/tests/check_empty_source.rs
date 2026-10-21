@@ -7861,6 +7861,310 @@ fn primitive_bitwise_char_untyped_float_local_rhs_defaults_constrains_range_and_
 }
 
 #[test]
+fn primitive_bitwise_char_one_hop_untyped_float_alias_rhs_reuses_literal_inference() {
+    let default_source = concat!(
+        "pub fn char_float_alias_defaults() -> Char {\n",
+        "    let rhs = 1.5\n",
+        "    let alias = rhs\n",
+        "    let and_value = 'a' & alias\n",
+        "    let or_value = 'b' | alias\n",
+        "    let xor_value = 'c' ^ alias\n",
+        "    let recovered: Char = xor_value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let default_output = run_check(default_source, "", &[], &[]);
+    let default_stdout = String::from_utf8(default_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(default_output.status.code(), Some(1), "{default_stdout}");
+    assert_eq!(
+        default_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        3,
+        "the one-hop alias should share the defaulted F64 variable:\n{default_stdout}"
+    );
+    assert!(
+        !default_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !default_stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !default_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !default_stdout.contains("\"type\":\"result\""),
+        "one-hop alias should recover as Char:\n{default_stdout}"
+    );
+    for (operator, expression, trait_name) in [
+        ("&", "'a' & alias", "BitAnd"),
+        ("|", "'b' | alias", "BitOr"),
+        ("^", "'c' ^ alias", "BitXor"),
+    ] {
+        let start = default_source
+            .find(expression)
+            .expect("defaulted one-hop alias expression exists");
+        assert_json_diagnostic_primary_span(
+            &default_stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<F64>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+
+    let constrained_source = concat!(
+        "pub fn char_float_alias_constrained() -> Char {\n",
+        "    let rhs = 1.25\n",
+        "    let alias = rhs\n",
+        "    let and_value = 'a' & alias\n",
+        "    let or_value = 'b' | alias\n",
+        "    let xor_value = 'c' ^ alias\n",
+        "    let narrowed: F32 = alias\n",
+        "    let recovered: Char = xor_value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let constrained_output = run_check(constrained_source, "", &[], &[]);
+    let constrained_stdout =
+        String::from_utf8(constrained_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        constrained_output.status.code(),
+        Some(1),
+        "{constrained_stdout}"
+    );
+    assert_eq!(
+        constrained_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        3,
+        "repeated alias uses should use the later F32 constraint:\n{constrained_stdout}"
+    );
+    assert!(
+        !constrained_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !constrained_stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !constrained_stdout.contains("\"type\":\"result\""),
+        "later constraint should narrow the shared literal without losing Char recovery:\n{constrained_stdout}"
+    );
+    for (operator, expression, trait_name) in [
+        ("&", "'a' & alias", "BitAnd"),
+        ("|", "'b' | alias", "BitOr"),
+        ("^", "'c' ^ alias", "BitXor"),
+    ] {
+        let start = constrained_source
+            .find(expression)
+            .expect("F32-constrained one-hop alias expression exists");
+        assert_json_diagnostic_primary_span(
+            &constrained_stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<F32>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+
+    let range_source = concat!(
+        "pub fn char_float_alias_f32_range() -> Char {\n",
+        "    let rhs = 1e39\n",
+        "    let alias = rhs\n",
+        "    let value = 'x' ^ alias\n",
+        "    let narrowed: F32 = alias\n",
+        "    let negative_rhs = -1e999\n",
+        "    let negative_alias = negative_rhs\n",
+        "    let negative_value = 'b' | negative_alias\n",
+        "    let recovered: Char = value\n",
+        "    let recovered_negative: Char = negative_value\n",
+        "    recovered_negative\n",
+        "}\n",
+    );
+    let range_output = run_check(range_source, "", &[], &[]);
+    let range_stdout = String::from_utf8(range_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(range_output.status.code(), Some(1), "{range_stdout}");
+    assert_eq!(
+        range_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        2,
+        "operators use the final F32 constraint or defaulted F64 type:\n{range_stdout}"
+    );
+    assert_eq!(
+        range_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        2,
+        "both original literal declarations are range checked:\n{range_stdout}"
+    );
+    assert!(
+        !range_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !range_stdout.contains("\"type\":\"result\""),
+        "range failure preserves Char recovery:\n{range_stdout}"
+    );
+    let expression = range_source
+        .find("'x' ^ alias")
+        .expect("ranged one-hop alias expression exists");
+    assert_json_diagnostic_primary_span(
+        &range_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `^` has no `BitXor<F32>` implementation for `Char`",
+        expression,
+        expression + "'x' ^ alias".len(),
+    );
+    let literal = range_source
+        .find("1e39")
+        .expect("source float literal exists");
+    assert_json_diagnostic_primary_span(
+        &range_stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "floating-point literal is out of range for `F32`",
+        literal,
+        literal + "1e39".len(),
+    );
+    let negative_expression = range_source
+        .find("'b' | negative_alias")
+        .expect("negative ranged alias expression exists");
+    assert_json_diagnostic_primary_span(
+        &range_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `|` has no `BitOr<F64>` implementation for `Char`",
+        negative_expression,
+        negative_expression + "'b' | negative_alias".len(),
+    );
+    let signed_literal = range_source
+        .find("-1e999")
+        .expect("signed source float literal exists");
+    assert_json_diagnostic_primary_span(
+        &range_stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "floating-point literal is out of range for `F64`",
+        signed_literal,
+        signed_literal + "-1e999".len(),
+    );
+
+    let annotation_source = concat!(
+        "pub fn char_float_alias_annotation_recovery() -> F32 {\n",
+        "    let rhs = 1.0\n",
+        "    let alias = rhs\n",
+        "    let value: F32 = 'z' ^ alias\n",
+        "    let recovered: F32 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let annotation_output = run_check(annotation_source, "", &[], &[]);
+    let annotation_stdout =
+        String::from_utf8(annotation_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        annotation_output.status.code(),
+        Some(1),
+        "{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the unannotated alias defaults independently of the result annotation:\n{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "the differing F32 annotation reports one mismatch:\n{annotation_stdout}"
+    );
+    assert!(
+        !annotation_stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !annotation_stdout.contains("\"type\":\"result\""),
+        "following use and tail should recover to F32:\n{annotation_stdout}"
+    );
+    let expression = annotation_source
+        .find("'z' ^ alias")
+        .expect("annotated one-hop alias expression exists");
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `^` has no `BitXor<F64>` implementation for `Char`",
+        expression,
+        expression + "'z' ^ alias".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "TYPE_MISMATCH",
+        "expected `F32`, found `Char`",
+        expression,
+        expression + "'z' ^ alias".len(),
+    );
+
+    let typed_copy_source = concat!(
+        "pub fn char_float_typed_copy_keeps_concrete_path_support() -> Char {\n",
+        "    let rhs = 1.0\n",
+        "    let alias: F32 = rhs\n",
+        "    let value = 'a' & alias\n",
+        "    let recovered: Char = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let typed_copy_output = run_check(typed_copy_source, "", &[], &[]);
+    let typed_copy_stdout =
+        String::from_utf8(typed_copy_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        typed_copy_output.status.code(),
+        Some(1),
+        "{typed_copy_stdout}"
+    );
+    assert_eq!(
+        typed_copy_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the annotated alias remains accepted through concrete path support:\n{typed_copy_stdout}"
+    );
+    assert!(
+        !typed_copy_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !typed_copy_stdout.contains("\"type\":\"result\""),
+        "the typed copy should retain existing concrete-local behavior:\n{typed_copy_stdout}"
+    );
+    let expression = typed_copy_source
+        .find("'a' & alias")
+        .expect("typed concrete alias expression exists");
+    assert_json_diagnostic_primary_span(
+        &typed_copy_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `&` has no `BitAnd<F32>` implementation for `Char`",
+        expression,
+        expression + "'a' & alias".len(),
+    );
+
+    let computed_source = concat!(
+        "pub fn char_concrete_computed_float_path_keeps_ir807_support(left: F32) -> Char {\n",
+        "    let computed = left + 1.0\n",
+        "    let value = 'q' & computed\n",
+        "    let recovered: Char = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let computed_output = run_check(computed_source, "", &[], &[]);
+    let computed_stdout = String::from_utf8(computed_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(computed_output.status.code(), Some(1), "{computed_stdout}");
+    assert_eq!(
+        computed_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "a computed local with a concrete primitive type remains supported by IR-807:\n{computed_stdout}"
+    );
+    assert!(
+        !computed_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !computed_stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !computed_stdout.contains("\"type\":\"result\""),
+        "concrete computed path retains ordinary Char recovery:\n{computed_stdout}"
+    );
+    let expression = computed_source
+        .find("'q' & computed")
+        .expect("concrete computed Char-path expression exists");
+    assert_json_diagnostic_primary_span(
+        &computed_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `&` has no `BitAnd<F32>` implementation for `Char`",
+        expression,
+        expression + "'q' & computed".len(),
+    );
+}
+
+#[test]
 fn primitive_bitwise_char_literal_left_local_path_rhs_reports_traits_and_recovers() {
     let source = concat!(
         "pub fn char_literal_path_rhs(bool_rhs: Bool, byte_rhs: Byte, char_rhs: Char, integer_rhs: I32, f32_rhs: F32, f64_rhs: F64) -> Char {\n",
@@ -8072,7 +8376,7 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         ),
         fixture(
             "pub fn char_literal_float_alias_path_rhs() -> Char",
-            "let right = 1.0\n    let alias = right\n    let constrained: F32 = right\n    let result = 'a' & alias",
+            "let right = 1.0\n    let alias = right\n    let second_alias = alias\n    let constrained: F32 = right\n    let result = 'a' & second_alias",
         ),
         fixture(
             "pub fn char_literal_computed_float_local_rhs() -> Char",
@@ -8092,7 +8396,7 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         ),
         fixture(
             "pub fn generic_char_literal_untyped_float_path_rhs<T>() -> Char",
-            "let right = 1.0\n    let result = 'a' & right",
+            "let right = 1.0\n    let alias = right\n    let result = 'a' & alias",
         ),
         concat!(
             "type CharUntypedIntegerPathOwner { marker: Char }\n",
@@ -8110,7 +8414,8 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "impl CharUntypedFloatPathOwner {\n",
             "    fn char_untyped_float_path_method(self: borrow Self) -> Char {\n",
             "        let right = 1.0\n",
-            "        let result = 'a' & right\n",
+            "        let alias = right\n",
+            "        let result = 'a' & alias\n",
             "        result\n",
             "    }\n",
             "}\n",
