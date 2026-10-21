@@ -571,6 +571,8 @@ Locked dependency-source regressions verify dependency syntax and Phase 1 diagno
 
 **IR-798 direct ordinary string-literal function tail.** `sai check` accepts a safe, synchronous, non-generic public free function with no parameters or local statements when it explicitly returns the canonical prelude `Str` and its tail is one direct ordinary string literal, for example `pub fn greeting() -> Str { "hello" }`. A direct literal from another scalar family is checked against `Str` and reports `TYPE_MISMATCH` at the complete tail span without a feature gate. Byte strings, f-strings, string expressions, local statements, parameters, generic or method owners, aliases, raw or shadowed `Str` paths, other return types, and unsupported body shapes remain gated. No general string-expression checking is implied.
 
+**IR-799 canonical `Str` parameter identity.** `sai check` also accepts `pub fn identity(value: Str) -> Str { value }` when it is a safe, statement-free public free function with exactly one named immutable, non-`self` parameter; both signature types resolve to canonical prelude `Str`; and the tail path resolves by `BindingId` to that parameter. A `Str` input region outlives the output region by the signature's default rule, and reading the exact parameter path copies the shared view while preserving its region (spec/07 §§7.7.1–7.7.2 and 7.8.1). Alias/raw/shadowed types, mismatched `Str`/non-`Str` types, multiple/mutable/`self` parameters, parameter-to-local copies, omitted/unit results, generic or method owners, and expression or different-binding tails remain gated. This does not enable general view or region checking.
+
 ### 13.6.3 `sai build`
 
 ```text
