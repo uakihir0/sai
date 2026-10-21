@@ -1,0 +1,163 @@
+use acme:warehouse-fulfillment/model.{FulfillmentOrder, OrderLine, ShippingRoute, Sku, StockLot, Warehouse}
+
+pub fn fulfillment_day() -> U32 {
+    40
+}
+
+pub fn skus() -> Array<Sku, 3> {
+    [
+        Sku(
+            code: "COLD-MEAL",
+            name: "Chilled meal pack",
+            unit_weight_grams: 500,
+            minimum_shelf_life_days: 5,
+            best_before_tracked: true,
+            cold_chain_required: true,
+        ),
+        Sku(
+            code: "LANTERN",
+            name: "Rechargeable lantern",
+            unit_weight_grams: 900,
+            minimum_shelf_life_days: 0,
+            best_before_tracked: false,
+            cold_chain_required: false,
+        ),
+        Sku(
+            code: "TAPE",
+            name: "Packing tape",
+            unit_weight_grams: 250,
+            minimum_shelf_life_days: 0,
+            best_before_tracked: false,
+            cold_chain_required: false,
+        ),
+    ]
+}
+
+pub fn warehouses() -> Array<Warehouse, 3> {
+    [
+        Warehouse(id: 1, name: "North Cold Hub", region: "North", cold_chain: true),
+        Warehouse(id: 2, name: "North Ambient Annex", region: "North", cold_chain: false),
+        Warehouse(id: 3, name: "Coast Cold Hub", region: "Coast", cold_chain: true),
+    ]
+}
+
+pub fn stock_lots() -> Array<StockLot, 9> {
+    [
+        // Day 44 is too soon for the chilled meal's five-day shelf-life rule.
+        StockLot(lot_id: 101, warehouse_id: 1, sku: "COLD-MEAL", units: 1, best_before_day: 44),
+        StockLot(lot_id: 102, warehouse_id: 1, sku: "COLD-MEAL", units: 4, best_before_day: 48),
+        StockLot(lot_id: 103, warehouse_id: 1, sku: "LANTERN", units: 3, best_before_day: 0),
+        StockLot(lot_id: 104, warehouse_id: 1, sku: "TAPE", units: 5, best_before_day: 0),
+        StockLot(lot_id: 202, warehouse_id: 2, sku: "LANTERN", units: 8, best_before_day: 0),
+        StockLot(lot_id: 203, warehouse_id: 2, sku: "TAPE", units: 8, best_before_day: 0),
+        StockLot(lot_id: 301, warehouse_id: 3, sku: "COLD-MEAL", units: 2, best_before_day: 50),
+        StockLot(lot_id: 302, warehouse_id: 3, sku: "LANTERN", units: 2, best_before_day: 0),
+        StockLot(lot_id: 303, warehouse_id: 3, sku: "TAPE", units: 10, best_before_day: 0),
+    ]
+}
+
+// Data order is also readable as the intended priority order; the planner
+// applies the comparator explicitly so shuffled fixtures retain stable policy.
+pub fn orders() -> Array<FulfillmentOrder, 4> {
+    [
+        FulfillmentOrder(
+            id: 8101,
+            customer: "Jun",
+            destination_region: "North",
+            priority: 1,
+            requested_delivery_by_day: 41,
+            max_transit_days: 1,
+            lines: [
+                OrderLine(sku: "COLD-MEAL", quantity: 2),
+                OrderLine(sku: "LANTERN", quantity: 1),
+                OrderLine(sku: "TAPE", quantity: 0),
+            ],
+        ),
+        FulfillmentOrder(
+            id: 8102,
+            customer: "Emi",
+            destination_region: "Coast",
+            priority: 1,
+            requested_delivery_by_day: 41,
+            max_transit_days: 1,
+            lines: [
+                OrderLine(sku: "LANTERN", quantity: 3),
+                OrderLine(sku: "TAPE", quantity: 1),
+                OrderLine(sku: "TAPE", quantity: 0),
+            ],
+        ),
+        FulfillmentOrder(
+            id: 8103,
+            customer: "Kai",
+            destination_region: "North",
+            priority: 2,
+            requested_delivery_by_day: 42,
+            max_transit_days: 2,
+            lines: [
+                OrderLine(sku: "COLD-MEAL", quantity: 2),
+                OrderLine(sku: "LANTERN", quantity: 2),
+                OrderLine(sku: "TAPE", quantity: 0),
+            ],
+        ),
+        FulfillmentOrder(
+            id: 8104,
+            customer: "Ren",
+            destination_region: "Coast",
+            priority: 3,
+            requested_delivery_by_day: 43,
+            max_transit_days: 1,
+            lines: [
+                OrderLine(sku: "LANTERN", quantity: 1),
+                OrderLine(sku: "TAPE", quantity: 2),
+                OrderLine(sku: "TAPE", quantity: 0),
+            ],
+        ),
+    ]
+}
+
+pub fn routes() -> Array<ShippingRoute, 6> {
+    [
+        ShippingRoute(
+            warehouse_id: 1,
+            destination_region: "North",
+            transit_days: 1,
+            daily_weight_limit_grams: 4000,
+            freight_cents_per_kg: 900,
+        ),
+        ShippingRoute(
+            warehouse_id: 2,
+            destination_region: "North",
+            transit_days: 2,
+            daily_weight_limit_grams: 7000,
+            freight_cents_per_kg: 700,
+        ),
+        ShippingRoute(
+            warehouse_id: 1,
+            destination_region: "Coast",
+            transit_days: 4,
+            daily_weight_limit_grams: 6000,
+            freight_cents_per_kg: 600,
+        ),
+        ShippingRoute(
+            warehouse_id: 2,
+            destination_region: "Coast",
+            transit_days: 3,
+            daily_weight_limit_grams: 6000,
+            freight_cents_per_kg: 650,
+        ),
+        ShippingRoute(
+            warehouse_id: 3,
+            destination_region: "Coast",
+            transit_days: 1,
+            daily_weight_limit_grams: 5000,
+            freight_cents_per_kg: 1100,
+        ),
+        ShippingRoute(
+            warehouse_id: 3,
+            destination_region: "North",
+            transit_days: 4,
+            daily_weight_limit_grams: 4000,
+            freight_cents_per_kg: 1000,
+        ),
+    ]
+}

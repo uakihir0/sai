@@ -1,0 +1,70 @@
+use acme:warehouse-fulfillment/inventory
+use acme:warehouse-fulfillment/model.{FulfillmentOrder, Warehouse}
+
+pub fn precedes(candidate: FulfillmentOrder, current: FulfillmentOrder) -> Bool {
+    (
+        candidate.priority < current.priority
+        or (
+            candidate.priority == current.priority
+            and (
+                candidate.requested_delivery_by_day < current.requested_delivery_by_day
+                or (
+                    candidate.requested_delivery_by_day == current.requested_delivery_by_day
+                    and candidate.id < current.id
+                )
+            )
+        )
+    )
+}
+
+pub fn demanded_units(order: FulfillmentOrder, code: Str) -> U32 {
+    var units: U32 = 0
+    for line in order.lines {
+        if line.sku == code {
+            units += line.quantity
+        }
+    }
+    units
+}
+
+pub fn total_units(order: FulfillmentOrder) -> U32 {
+    var units: U32 = 0
+    for line in order.lines {
+        units += line.quantity
+    }
+    units
+}
+
+pub fn order_weight_grams(order: FulfillmentOrder) -> U32 {
+    var grams: U32 = 0
+    for line in order.lines {
+        if line.quantity > 0 {
+            match inventory.find_sku(line.sku) {
+                Some(sku) => {
+                    grams += sku.unit_weight_grams * line.quantity
+                }
+                None => {}
+            }
+        }
+    }
+    grams
+}
+
+pub fn can_handle(order: FulfillmentOrder, warehouse: Warehouse) -> Bool {
+    var supported = true
+    for line in order.lines {
+        if line.quantity > 0 {
+            match inventory.find_sku(line.sku) {
+                Some(sku) => {
+                    if sku.cold_chain_required and not warehouse.cold_chain {
+                        supported = false
+                    }
+                }
+                None => {
+                    supported = false
+                }
+            }
+        }
+    }
+    supported
+}

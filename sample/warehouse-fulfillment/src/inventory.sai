@@ -1,0 +1,65 @@
+use acme:warehouse-fulfillment/data
+use acme:warehouse-fulfillment/model.{Sku, Warehouse}
+
+pub fn find_sku(code: Str) -> Option<Sku> {
+    for sku in data.skus() {
+        if sku.code == code {
+            return Some(sku)
+        }
+    }
+    None
+}
+
+pub fn find_warehouse(id: U32) -> Option<Warehouse> {
+    for warehouse in data.warehouses() {
+        if warehouse.id == id {
+            return Some(warehouse)
+        }
+    }
+    None
+}
+
+pub fn eligible_units(warehouse_id: U32, code: Str) -> U32 {
+    match find_sku(code) {
+        Some(sku) => {
+            let earliest_best_before =
+                data.fulfillment_day() + sku.minimum_shelf_life_days
+            var units: U32 = 0
+            for lot in data.stock_lots() {
+                if (
+                    lot.warehouse_id == warehouse_id
+                    and lot.sku == code
+                    and (
+                        not sku.best_before_tracked
+                        or lot.best_before_day >= earliest_best_before
+                    )
+                ) {
+                    units += lot.units
+                }
+            }
+            units
+        }
+        None => 0
+    }
+}
+
+pub fn excluded_units(warehouse_id: U32, code: Str) -> U32 {
+    match find_sku(code) {
+        Some(sku) => {
+            var units: U32 = 0
+            for lot in data.stock_lots() {
+                if (
+                    lot.warehouse_id == warehouse_id
+                    and lot.sku == code
+                    and sku.best_before_tracked
+                    and lot.best_before_day < data.fulfillment_day() + sku.minimum_shelf_life_days
+                ) {
+                    units += lot.units
+                }
+            }
+            units
+        }
+        None => 0
+    }
+}
+

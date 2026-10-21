@@ -1,0 +1,312 @@
+use acme:warehouse-fulfillment/data
+use acme:warehouse-fulfillment/inventory
+use acme:warehouse-fulfillment/model.{FulfillmentOrder, HoldReason, ShippingRoute, Shipment, Sku, Warehouse}
+use acme:warehouse-fulfillment/policy
+
+fn demanded_units(order: FulfillmentOrder, code: Str) -> U32 {
+    policy.demanded_units(order, code)
+}
+
+fn prior_units_reserved(warehouse_id: U32, code: Str, current: FulfillmentOrder) -> U32 {
+    var units: U32 = 0
+    for earlier in data.orders() {
+        if policy.precedes(earlier, current) {
+            match fulfillment_for(earlier) {
+                Some(shipment) => {
+                    if shipment.warehouse_id == warehouse_id {
+                        units += demanded_units(earlier, code)
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    units
+}
+
+fn stock_remaining(warehouse_id: U32, code: Str, current: FulfillmentOrder) -> U32 {
+    let available = inventory.eligible_units(warehouse_id, code)
+    let reserved = prior_units_reserved(warehouse_id, code, current)
+    if reserved < available {
+        available - reserved
+    } else {
+        0
+    }
+}
+
+fn prior_lane_weight(route: ShippingRoute, current: FulfillmentOrder) -> U32 {
+    var grams: U32 = 0
+    for earlier in data.orders() {
+        if policy.precedes(earlier, current) {
+            match fulfillment_for(earlier) {
+                Some(shipment) => {
+                    if (
+                        shipment.warehouse_id == route.warehouse_id
+                        and shipment.destination_region == route.destination_region
+                    ) {
+                        grams += shipment.weight_grams
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    grams
+}
+
+fn order_has_unknown_sku(order: FulfillmentOrder) -> Bool {
+    var unknown = false
+    for line in order.lines {
+        if line.quantity > 0 {
+            match inventory.find_sku(line.sku) {
+                Some(_) => {}
+                None => {
+                    unknown = true
+                }
+            }
+        }
+    }
+    unknown
+}
+
+fn order_has_items(order: FulfillmentOrder) -> Bool {
+    var has_items = false
+    for line in order.lines {
+        if line.quantity > 0 {
+            has_items = true
+        }
+    }
+    has_items
+}
+
+fn inventory_covers(order: FulfillmentOrder, warehouse: Warehouse) -> Bool {
+    var covered = true
+    for line in order.lines {
+        if line.quantity > 0 {
+            let requested = demanded_units(order, line.sku)
+            if requested > stock_remaining(warehouse.id, line.sku, order) {
+                covered = false
+            }
+        }
+    }
+    covered
+}
+
+fn route_has_capacity(order: FulfillmentOrder, route: ShippingRoute) -> Bool {
+    let requested_weight = policy.order_weight_grams(order)
+    let already_reserved = prior_lane_weight(route, order)
+    if already_reserved > route.daily_weight_limit_grams {
+        false
+    } else {
+        requested_weight <= route.daily_weight_limit_grams - already_reserved
+    }
+}
+
+fn can_ship_on(order: FulfillmentOrder, route: ShippingRoute) -> Bool {
+    let arrival_day = data.fulfillment_day() + route.transit_days
+    if (
+        route.destination_region == order.destination_region
+        and route.transit_days <= order.max_transit_days
+        and arrival_day <= order.requested_delivery_by_day
+    ) {
+        match inventory.find_warehouse(route.warehouse_id) {
+            Some(warehouse) => {
+                (
+                    policy.can_handle(order, warehouse)
+                    and inventory_covers(order, warehouse)
+                    and route_has_capacity(order, route)
+                )
+            }
+            None => false
+        }
+    } else {
+        false
+    }
+}
+
+fn shipping_cents(order: FulfillmentOrder, route: ShippingRoute) -> U32 {
+    let grams = policy.order_weight_grams(order)
+    // Integer division rounds the illustrative per-kilogram charge down.
+    grams * route.freight_cents_per_kg / 1000
+}
+
+fn is_better(candidate: Shipment, current: Shipment) -> Bool {
+    (
+        candidate.transit_days < current.transit_days
+        or (
+            candidate.transit_days == current.transit_days
+            and (
+                candidate.freight_cents < current.freight_cents
+                or (
+                    candidate.freight_cents == current.freight_cents
+                    and candidate.warehouse_id < current.warehouse_id
+                )
+            )
+        )
+    )
+}
+
+pub fn fulfillment_for(order: FulfillmentOrder) -> Option<Shipment> {
+    if not order_has_items(order) {
+        return None
+    }
+
+    var best: Option<Shipment> = None
+    for route in data.routes() {
+        if can_ship_on(order, route) {
+            let candidate = Shipment(
+                order_id: order.id,
+                warehouse_id: route.warehouse_id,
+                destination_region: route.destination_region,
+                transit_days: route.transit_days,
+                weight_grams: policy.order_weight_grams(order),
+                freight_cents: shipping_cents(order, route),
+            )
+            match best {
+                Some(current) => {
+                    if is_better(candidate, current) {
+                        best = Some(candidate)
+                    }
+                }
+                None => {
+                    best = Some(candidate)
+                }
+            }
+        }
+    }
+    best
+}
+
+fn route_can_handle(order: FulfillmentOrder, route: ShippingRoute) -> Bool {
+    match inventory.find_warehouse(route.warehouse_id) {
+        Some(warehouse) => policy.can_handle(order, warehouse)
+        None => false
+    }
+}
+
+fn route_has_stock(order: FulfillmentOrder, route: ShippingRoute) -> Bool {
+    match inventory.find_warehouse(route.warehouse_id) {
+        Some(warehouse) => inventory_covers(order, warehouse)
+        None => false
+    }
+}
+
+pub fn rejection_reason(order: FulfillmentOrder) -> HoldReason {
+    if not order_has_items(order) {
+        return HoldReason.EmptyOrder
+    }
+    if order_has_unknown_sku(order) {
+        return HoldReason.UnknownSku
+    }
+
+    var has_route = false
+    var has_timely_route = false
+    var has_deadline_route = false
+    var has_handling = false
+    var has_complete_stock = false
+    var has_lane_capacity = false
+
+    for route in data.routes() {
+        if route.destination_region == order.destination_region {
+            has_route = true
+            if route.transit_days <= order.max_transit_days {
+                has_timely_route = true
+                if data.fulfillment_day() + route.transit_days <= order.requested_delivery_by_day {
+                    has_deadline_route = true
+                    if route_can_handle(order, route) {
+                        has_handling = true
+                        if route_has_stock(order, route) {
+                            has_complete_stock = true
+                            if route_has_capacity(order, route) {
+                                has_lane_capacity = true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if not has_route {
+        HoldReason.NoRoute
+    } else if not has_timely_route {
+        HoldReason.TransitTooSlow
+    } else if not has_deadline_route {
+        HoldReason.DeliveryTooLate
+    } else if not has_handling {
+        HoldReason.ColdChainUnavailable
+    } else if not has_complete_stock {
+        HoldReason.InventoryShortfall
+    } else if not has_lane_capacity {
+        HoldReason.LaneCapacity
+    } else {
+        // fulfillment_for and this diagnostic use the same predicates. This
+        // is a defensive label for malformed or internally inconsistent data.
+        HoldReason.NoFeasibleRoute
+    }
+}
+
+pub fn used_lane_weight(route: ShippingRoute) -> U32 {
+    var grams: U32 = 0
+    for order in data.orders() {
+        match fulfillment_for(order) {
+            Some(shipment) => {
+                if (
+                    shipment.warehouse_id == route.warehouse_id
+                    and shipment.destination_region == route.destination_region
+                ) {
+                    grams += shipment.weight_grams
+                }
+            }
+            None => {}
+        }
+    }
+    grams
+}
+
+pub fn planned_order_count() -> U32 {
+    var count: U32 = 0
+    for order in data.orders() {
+        match fulfillment_for(order) {
+            Some(_) => {
+                count += 1
+            }
+            None => {}
+        }
+    }
+    count
+}
+
+pub fn planned_units() -> U32 {
+    var units: U32 = 0
+    for order in data.orders() {
+        match fulfillment_for(order) {
+            Some(_) => {
+                units += policy.total_units(order)
+            }
+            None => {}
+        }
+    }
+    units
+}
+
+pub fn requested_units() -> U32 {
+    var units: U32 = 0
+    for order in data.orders() {
+        units += policy.total_units(order)
+    }
+    units
+}
+
+pub fn total_freight_cents() -> U32 {
+    var cents: U32 = 0
+    for order in data.orders() {
+        match fulfillment_for(order) {
+            Some(shipment) => {
+                cents += shipment.freight_cents
+            }
+            None => {}
+        }
+    }
+    cents
+}
