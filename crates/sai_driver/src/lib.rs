@@ -6408,6 +6408,8 @@ fn check_function_body_primitive_local_block(
                                 && matches!(right.kind, ExprKind::Lit(Lit::Byte(_))))
                             || (is_direct_function_integer_literal(left)
                                 && is_preceding_path(right))
+                            || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
+                                && is_preceding_path(right))
                     }
                     BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
                         (is_preceding_path(left) && is_preceding_path(right))
@@ -25947,6 +25949,45 @@ mod tests {
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
                 "function owner {:?} (index {index}) unexpectedly failed the supported Byte bitwise literal slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_byte_literals_on_flat_local_bitwise_left() {
+        let mut root = String::new();
+        for (operator, name) in [("&", "and"), ("|", "or"), ("^", "xor")] {
+            root.push_str(&format!(
+                "pub fn byte_{name}_parameter(right: Byte) -> Byte {{\n    let value = b'a' {operator} right\n    value\n}}\n"
+            ));
+            root.push_str(&format!(
+                "pub fn byte_{name}_local(right: Byte) -> Byte {{\n    let prior: Byte = right\n    let value = b'b' {operator} prior\n    value\n}}\n"
+            ));
+        }
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 6);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("supported primitive body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the Byte bitwise literal-left slice: {check:?}",
                 owner.owner()
             );
         }
