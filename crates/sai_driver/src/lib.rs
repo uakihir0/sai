@@ -6577,6 +6577,12 @@ fn primitive_body_errors_to_diagnostics(
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
 ) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
+    let sort_by_source_span = errors.iter().any(|error| {
+        matches!(
+            error.kind,
+            sai_ty::typeck::body::PrimitiveBodyErrorKind::DeferredOperatorTraitNotSupported { .. }
+        )
+    });
     let mut diagnostics = Vec::with_capacity(errors.len());
     for error in errors {
         let span = block
@@ -6712,6 +6718,11 @@ fn primitive_body_errors_to_diagnostics(
                 operator,
                 left,
                 right,
+            }
+            | PrimitiveBodyErrorKind::DeferredOperatorTraitNotSupported {
+                operator,
+                left,
+                right,
             } => {
                 let (operator_text, trait_name) = match operator {
                     BinOp::BitAnd => ("&", "BitAnd"),
@@ -6753,6 +6764,9 @@ fn primitive_body_errors_to_diagnostics(
             }
         };
         diagnostics.push(diagnostic);
+    }
+    if sort_by_source_span {
+        sort_phase1_diagnostics(&mut diagnostics);
     }
     Ok(Some(diagnostics))
 }
@@ -27478,6 +27492,207 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_reports_char_literal_untyped_integer_path_rhs_after_defaulting() {
+        let root = concat!(
+            "pub fn char_untyped_integer_path_defaults() -> Char {\n",
+            "    let and_rhs = 1\n",
+            "    let or_rhs = -2\n",
+            "    let xor_rhs = 3\n",
+            "    let and_value = 'a' & and_rhs\n",
+            "    let or_value = 'b' | or_rhs\n",
+            "    let xor_value = 'c' ^ xor_rhs\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_untyped_integer_path_constrained() -> Char {\n",
+            "    let rhs = 1\n",
+            "    let and_value = 'a' & rhs\n",
+            "    let or_value = 'b' | rhs\n",
+            "    let constrained: I32 = rhs\n",
+            "    let recovered: Char = or_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_untyped_integer_path_annotation_recovery() -> I32 {\n",
+            "    let rhs = -1\n",
+            "    let value: I32 = 'z' ^ rhs\n",
+            "    let recovered: I32 = value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_untyped_integer_path_range_recovery() -> Char {\n",
+            "    let high = 9223372036854775808\n",
+            "    let high_value = 'a' & high\n",
+            "    let low = -9223372036854775809\n",
+            "    let low_value = 'b' | low\n",
+            "    let recovered: Char = low_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_untyped_integer_path_boundaries() -> Char {\n",
+            "    let high = 9223372036854775807\n",
+            "    let low = -9223372036854775808\n",
+            "    let high_value = 'a' ^ high\n",
+            "    let low_value = 'b' & low\n",
+            "    let recovered: Char = low_value\n",
+            "    recovered\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let owners = resolved.owners();
+        assert_eq!(owners.len(), 5);
+
+        let expected_diagnostics = [
+            (
+                0,
+                vec![
+                    (
+                        "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+                        "'a' & and_rhs",
+                    ),
+                    (
+                        "operator `|` has no `BitOr<I64>` implementation for `Char`",
+                        "'b' | or_rhs",
+                    ),
+                    (
+                        "operator `^` has no `BitXor<I64>` implementation for `Char`",
+                        "'c' ^ xor_rhs",
+                    ),
+                ],
+            ),
+            (
+                1,
+                vec![
+                    (
+                        "operator `&` has no `BitAnd<I32>` implementation for `Char`",
+                        "'a' & rhs",
+                    ),
+                    (
+                        "operator `|` has no `BitOr<I32>` implementation for `Char`",
+                        "'b' | rhs",
+                    ),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    (
+                        "operator `^` has no `BitXor<I64>` implementation for `Char`",
+                        "'z' ^ rhs",
+                    ),
+                    ("expected `I32`, found `Char`", "'z' ^ rhs"),
+                ],
+            ),
+            (
+                3,
+                vec![
+                    (
+                        "integer literal is out of range for `I64`",
+                        "9223372036854775808",
+                    ),
+                    (
+                        "integer literal is out of range for `I64`",
+                        "-9223372036854775809",
+                    ),
+                    (
+                        "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+                        "'a' & high",
+                    ),
+                    (
+                        "operator `|` has no `BitOr<I64>` implementation for `Char`",
+                        "'b' | low",
+                    ),
+                ],
+            ),
+            (
+                4,
+                vec![
+                    (
+                        "operator `^` has no `BitXor<I64>` implementation for `Char`",
+                        "'a' ^ high",
+                    ),
+                    (
+                        "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+                        "'b' & low",
+                    ),
+                ],
+            ),
+        ];
+
+        for (index, expected) in expected_diagnostics {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
+                .body_type_check()
+                .expect("untyped integer local Char bitwise pair is checked")
+            else {
+                panic!("owner {index} must remain in the supported body-checking slice");
+            };
+            assert_eq!(
+                diagnostics.len(),
+                expected.len(),
+                "function owner {index}: {diagnostics:?}"
+            );
+            let diagnostic_starts = diagnostics
+                .iter()
+                .map(|diagnostic| {
+                    diagnostic
+                        .primary()
+                        .expect("diagnostic has primary span")
+                        .span
+                        .range
+                        .start()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                diagnostic_starts.windows(2).all(|pair| pair[0] <= pair[1]),
+                "function owner {index} diagnostics must retain source order: {diagnostics:?}"
+            );
+            for (message, span_source) in expected {
+                let start = root
+                    .find(span_source)
+                    .expect("the expected diagnostic source span exists");
+                let expected_span = sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + span_source.len()) as u32),
+                )
+                .expect("expected diagnostic span is ordered");
+                let diagnostic = diagnostics
+                    .iter()
+                    .find(|diagnostic| {
+                        diagnostic.message == message
+                            && diagnostic
+                                .primary()
+                                .is_some_and(|primary| primary.span.range == expected_span)
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "function owner {index} lacks {message:?} at {span_source:?}: {diagnostics:?}"
+                        )
+                    });
+                let expected_code = if message.starts_with("integer literal") {
+                    sai_diagnostics::Code::LiteralOutOfRange
+                } else if message.starts_with("expected") {
+                    sai_diagnostics::Code::TypeMismatch
+                } else {
+                    sai_diagnostics::Code::OperatorNotSupported
+                };
+                assert_eq!(
+                    diagnostic.code, expected_code,
+                    "wrong diagnostic code for {message:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn function_body_type_check_reports_char_literal_local_path_rhs_pairs_and_recovers_annotations()
     {
         let root = concat!(
@@ -29105,7 +29320,10 @@ mod tests {
             "pub fn char_literal_alias_path_rhs(right: ByteAlias) -> Char {\n    let value = 'a' & right\n    value\n}\n",
             "pub fn generic_char_literal_path_rhs<T>(right: T) -> Char {\n    let value = 'a' & right\n    value\n}\n",
             "pub fn char_literal_unresolved_path_rhs() -> Char {\n    let value = 'a' & missing\n    value\n}\n",
-            "pub fn char_literal_unresolved_numeric_path_rhs() -> Char {\n    let right = 1\n    let value = 'a' & right\n    value\n}\n",
+            "pub fn char_literal_untyped_float_path_rhs() -> Char {\n    let right = 1.0\n    let value = 'a' & right\n    value\n}\n",
+            "pub fn char_literal_integer_alias_path_rhs() -> Char {\n    let right = 1\n    let alias = right\n    let constrained: I32 = right\n    let value = 'a' & alias\n    value\n}\n",
+            "pub fn char_literal_computed_integer_path_rhs() -> Char {\n    let right = 1 + 2\n    let value = 'a' & right\n    value\n}\n",
+            "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char {\n    let right = 1\n    let value = 'a' & right\n    value\n}\n",
             "pub fn char_literal_self_reference_path_rhs() -> Char {\n    let value = 'a' & value\n    value\n}\n",
             "pub fn char_literal_forward_reference_path_rhs() -> Char {\n    let value = 'a' & later\n    let later: Bool = true\n    value\n}\n",
             "pub fn char_literal_multisegment_path_rhs() -> Char {\n    let value = 'a' & package.flag\n    value\n}\n",
@@ -29144,6 +29362,14 @@ mod tests {
             "impl CharFloatLiteralPairOwner {\n",
             "    fn char_float_literal_pair(self: borrow Self) -> Char {\n",
             "        let value = 'a' ^ 1.0\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
+            "type CharUntypedIntegerPathOwner { marker: Char }\n",
+            "impl CharUntypedIntegerPathOwner {\n",
+            "    fn char_untyped_integer_path_method(self: borrow Self) -> Char {\n",
+            "        let right = 1\n",
+            "        let value = 'a' & right\n",
             "        value\n",
             "    }\n",
             "}\n",
@@ -29257,7 +29483,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 80);
+        assert_eq!(resolved.owners().len(), 83);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()

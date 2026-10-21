@@ -12,7 +12,7 @@ use sai_hir::types::PathRoot;
 use sai_hir::{BindingId, HirId, Safety};
 use sai_intern::Interner;
 use sai_resolve::prelude::PrimTy;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Facts resolved by the owner-aware driver before body checking.
 ///
@@ -65,6 +65,11 @@ pub enum PrimitiveBodyErrorKind {
         operand: PrimitiveOperatorOperand,
     },
     OperatorTraitNotSupported {
+        operator: BinOp,
+        left: PrimTy,
+        right: PrimTy,
+    },
+    DeferredOperatorTraitNotSupported {
         operator: BinOp,
         left: PrimTy,
         right: PrimTy,
@@ -127,6 +132,13 @@ struct LiteralSite<'hir> {
     origin: HirId,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PendingOperatorTraitSite {
+    operator: BinOp,
+    expression: HirId,
+    diagnostic_index: usize,
+}
+
 #[derive(Clone, Debug)]
 struct LiteralVariable<'hir> {
     literal: Lit<'hir>,
@@ -134,6 +146,7 @@ struct LiteralVariable<'hir> {
     origin: HirId,
     additional_site: Option<LiteralSite<'hir>>,
     resolved: Option<PrimTy>,
+    pending_operator_traits: Vec<PendingOperatorTraitSite>,
 }
 
 /// Check a flat sequence of immutable primitive locals and a local-path tail.
@@ -161,6 +174,8 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
     let mut context = FnCtxt {
         input,
         known_bindings,
+        direct_unannotated_integer_literals: HashSet::new(),
+        pending_operator_trait_count: 0,
         literal_variables: Vec::new(),
         errors: Vec::new(),
     };
@@ -178,6 +193,8 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
 struct FnCtxt<'a, 'hir> {
     input: PrimitiveBodyInput<'a, 'hir>,
     known_bindings: HashMap<BindingId, LocalType>,
+    direct_unannotated_integer_literals: HashSet<BindingId>,
+    pending_operator_trait_count: usize,
     literal_variables: Vec<LiteralVariable<'hir>>,
     errors: Vec<PrimitiveBodyError>,
 }
@@ -417,6 +434,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             _ => return Err(()),
         };
 
+        if annotation.is_none()
+            && matches!(
+                init.kind,
+                ExprKind::Lit(literal)
+                    if primitive_literal_kind(literal)
+                        == Some(PrimitiveLiteralKind::Integer)
+            )
+        {
+            self.direct_unannotated_integer_literals.insert(binding);
+        }
         self.known_bindings.insert(binding, local_type);
         Ok(())
     }
@@ -809,12 +836,46 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 if primitive_literal_kind(literal) == Some(PrimitiveLiteralKind::Character) {
                     let ExprKind::Lit(right_literal) = right.kind else {
+                        let right_local_type = self.check_local_path(right)?;
+                        let direct_integer_literal_path =
+                            self.is_direct_unannotated_integer_literal_path(right);
+                        if matches!(right_local_type, LocalType::LiteralVariable(_))
+                            && !direct_integer_literal_path
+                        {
+                            return Err(());
+                        }
                         let right_type = self
-                            .check_local_path(right)
-                            .ok()
-                            .and_then(|local_type| self.concrete_local_type(local_type))
-                            .filter(|primitive| supports_primitive_literal(*primitive))
-                            .ok_or(())?;
+                            .concrete_local_type(right_local_type)
+                            .filter(|primitive| supports_primitive_literal(*primitive));
+                        let Some(right_type) = right_type else {
+                            if !direct_integer_literal_path {
+                                return Err(());
+                            }
+                            let LocalType::LiteralVariable(id) = right_local_type else {
+                                return Err(());
+                            };
+                            let diagnostic_index =
+                                self.errors.len() + self.pending_operator_trait_count;
+                            self.pending_operator_trait_count += 1;
+                            let Some(variable) = self.literal_variables.get_mut(id) else {
+                                return Err(());
+                            };
+                            if !can_defer_char_literal_path_trait(
+                                variable.kind,
+                                variable.additional_site.is_some(),
+                                direct_integer_literal_path,
+                            ) {
+                                return Err(());
+                            }
+                            variable
+                                .pending_operator_traits
+                                .push(PendingOperatorTraitSite {
+                                    operator,
+                                    expression,
+                                    diagnostic_index,
+                                });
+                            return Ok(LocalType::Concrete(PrimTy::Char));
+                        };
                         self.errors.push(PrimitiveBodyError {
                             node: expression,
                             kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
@@ -1391,6 +1452,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     origin,
                     additional_site: None,
                     resolved: None,
+                    pending_operator_traits: Vec::new(),
                 });
                 LocalType::LiteralVariable(id)
             }
@@ -1557,43 +1619,65 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     fn default_unresolved_literals(&mut self) {
         let symbols = self.input.symbols;
         let pointer_width = self.input.pointer_width;
-        let errors = &mut self.errors;
+        let mut deferred_errors = Vec::new();
+        let mut deferred_operator_errors = Vec::new();
         for variable in &mut self.literal_variables {
-            if variable.resolved.is_some() {
-                continue;
-            }
-            let expected = match variable.kind {
-                PrimitiveLiteralKind::Integer => PrimTy::I64,
-                PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
-                PrimitiveLiteralKind::Bool
-                | PrimitiveLiteralKind::Byte
-                | PrimitiveLiteralKind::Character => unreachable!(),
-            };
-            variable.resolved = Some(expected);
-            if check_primitive_literal(expected, variable.literal, symbols, pointer_width)
-                == PrimitiveLiteralResult::OutOfRange
-            {
-                errors.push(PrimitiveBodyError {
-                    node: variable.origin,
-                    kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
-                        expected,
-                        found: variable.kind,
-                    },
-                });
-            }
-            if let Some(site) = variable.additional_site {
-                if check_primitive_literal(expected, site.literal, symbols, pointer_width)
+            if variable.resolved.is_none() {
+                let expected = match variable.kind {
+                    PrimitiveLiteralKind::Integer => PrimTy::I64,
+                    PrimitiveLiteralKind::FloatingPoint => PrimTy::F64,
+                    PrimitiveLiteralKind::Bool
+                    | PrimitiveLiteralKind::Byte
+                    | PrimitiveLiteralKind::Character => unreachable!(),
+                };
+                variable.resolved = Some(expected);
+                if check_primitive_literal(expected, variable.literal, symbols, pointer_width)
                     == PrimitiveLiteralResult::OutOfRange
                 {
-                    errors.push(PrimitiveBodyError {
-                        node: site.origin,
+                    deferred_errors.push(PrimitiveBodyError {
+                        node: variable.origin,
                         kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
                             expected,
                             found: variable.kind,
                         },
                     });
                 }
+                if let Some(site) = variable.additional_site {
+                    if check_primitive_literal(expected, site.literal, symbols, pointer_width)
+                        == PrimitiveLiteralResult::OutOfRange
+                    {
+                        deferred_errors.push(PrimitiveBodyError {
+                            node: site.origin,
+                            kind: PrimitiveBodyErrorKind::LiteralOutOfRange {
+                                expected,
+                                found: variable.kind,
+                            },
+                        });
+                    }
+                }
             }
+            if let Some(right) = variable.resolved {
+                deferred_operator_errors.extend(variable.pending_operator_traits.iter().map(
+                    |site| {
+                        (
+                            site.diagnostic_index,
+                            PrimitiveBodyError {
+                                node: site.expression,
+                                kind: PrimitiveBodyErrorKind::DeferredOperatorTraitNotSupported {
+                                    operator: site.operator,
+                                    left: PrimTy::Char,
+                                    right,
+                                },
+                            },
+                        )
+                    },
+                ));
+            }
+        }
+        self.errors.extend(deferred_errors);
+        deferred_operator_errors.sort_by_key(|(index, _)| *index);
+        for (index, error) in deferred_operator_errors {
+            self.errors.insert(index.min(self.errors.len()), error);
         }
     }
 
@@ -1615,6 +1699,22 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         };
         Ok(local_type)
+    }
+
+    fn is_direct_unannotated_integer_literal_path(&self, expression: &Expr<'hir>) -> bool {
+        let ExprKind::Path(path) = expression.kind else {
+            return false;
+        };
+        if path.root != PathRoot::Plain
+            || path.segments.len() != 1
+            || path.segments[0].args.is_some()
+        {
+            return false;
+        }
+        self.input
+            .local_paths
+            .get(&path.hir_id)
+            .is_some_and(|binding| self.direct_unannotated_integer_literals.contains(binding))
     }
 }
 
@@ -1769,6 +1869,16 @@ fn primitive_bitwise_char_float_literal_rhs_type(operator: BinOp) -> Option<Prim
     matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor).then_some(PrimTy::F64)
 }
 
+fn can_defer_char_literal_path_trait(
+    kind: PrimitiveLiteralKind,
+    has_additional_site: bool,
+    is_direct_unannotated_integer_literal: bool,
+) -> bool {
+    kind == PrimitiveLiteralKind::Integer
+        && !has_additional_site
+        && is_direct_unannotated_integer_literal
+}
+
 const fn is_bitwise_primitive(primitive: PrimTy) -> bool {
     is_integer_primitive(primitive) || matches!(primitive, PrimTy::Byte)
 }
@@ -1877,10 +1987,11 @@ fn literal_family_accepts(kind: PrimitiveLiteralKind, expected: PrimTy) -> bool 
 mod tests {
     use super::{
         PrimitiveArithmeticResult, PrimitiveBoolOperandResult, PrimitiveComparisonResult,
-        PrimitiveLiteralKind, primitive_arithmetic_literal_expected_type,
-        primitive_arithmetic_literal_left_result, primitive_arithmetic_result,
-        primitive_bitwise_bool_literal_pair_supported, primitive_bitwise_byte_literal_left_result,
-        primitive_bitwise_byte_literal_pair_result, primitive_bitwise_char_float_literal_rhs_type,
+        PrimitiveLiteralKind, can_defer_char_literal_path_trait,
+        primitive_arithmetic_literal_expected_type, primitive_arithmetic_literal_left_result,
+        primitive_arithmetic_result, primitive_bitwise_bool_literal_pair_supported,
+        primitive_bitwise_byte_literal_left_result, primitive_bitwise_byte_literal_pair_result,
+        primitive_bitwise_char_float_literal_rhs_type,
         primitive_bitwise_char_literal_pair_supported,
         primitive_bitwise_integer_literal_pair_supported, primitive_bool_operand_result,
         primitive_comparison_literal_expected_type, primitive_comparison_result,
@@ -2486,6 +2597,34 @@ mod tests {
         assert_eq!(
             primitive_bitwise_char_float_literal_rhs_type(BinOp::Add),
             None
+        );
+    }
+
+    #[test]
+    fn char_path_trait_deferral_requires_a_direct_unannotated_integer_literal_local() {
+        assert!(can_defer_char_literal_path_trait(
+            PrimitiveLiteralKind::Integer,
+            false,
+            true
+        ));
+        for kind in [
+            PrimitiveLiteralKind::FloatingPoint,
+            PrimitiveLiteralKind::Bool,
+            PrimitiveLiteralKind::Byte,
+            PrimitiveLiteralKind::Character,
+        ] {
+            assert!(
+                !can_defer_char_literal_path_trait(kind, false, true),
+                "{kind:?} literal locals remain gated"
+            );
+        }
+        assert!(
+            !can_defer_char_literal_path_trait(PrimitiveLiteralKind::Integer, false, false),
+            "an integer alias or other inferred binding is not a direct literal local"
+        );
+        assert!(
+            !can_defer_char_literal_path_trait(PrimitiveLiteralKind::Integer, true, true),
+            "computed integer literal variables with another source site remain gated"
         );
     }
 }

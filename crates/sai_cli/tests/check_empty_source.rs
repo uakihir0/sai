@@ -7368,6 +7368,223 @@ fn primitive_bitwise_char_negative_float_literal_rhs_defaults_checks_range_and_r
 }
 
 #[test]
+fn primitive_bitwise_char_untyped_integer_local_rhs_defaults_checks_range_and_recovers() {
+    let source = concat!(
+        "pub fn char_untyped_integer_local_rhs() -> Char {\n",
+        "    let and_rhs = 1\n",
+        "    let or_rhs = -2\n",
+        "    let xor_rhs = 3\n",
+        "    let high = 9223372036854775807\n",
+        "    let low = -9223372036854775808\n",
+        "    let and_value = 'a' & and_rhs\n",
+        "    let or_value = 'b' | or_rhs\n",
+        "    let xor_value = 'c' ^ xor_rhs\n",
+        "    let high_value = 'd' ^ high\n",
+        "    let low_value = 'e' & low\n",
+        "    let recovered: Char = low_value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        5,
+        "each Char/untyped-integer-path pair should report one missing trait:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "in-range integer locals should default to I64 and recover as Char:\n{stdout}"
+    );
+    for (operator, expression, trait_name) in [
+        ("&", "'a' & and_rhs", "BitAnd"),
+        ("|", "'b' | or_rhs", "BitOr"),
+        ("^", "'c' ^ xor_rhs", "BitXor"),
+        ("^", "'d' ^ high", "BitXor"),
+        ("&", "'e' & low", "BitAnd"),
+    ] {
+        let start = source
+            .find(expression)
+            .expect("Char/untyped-integer-path expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<I64>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+
+    let constrained_source = concat!(
+        "pub fn char_untyped_integer_path_later_constraint() -> Char {\n",
+        "    let rhs = 1\n",
+        "    let and_value = 'a' & rhs\n",
+        "    let or_value = 'b' | rhs\n",
+        "    let constrained: I32 = rhs\n",
+        "    let recovered: Char = or_value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let constrained_output = run_check(constrained_source, "", &[], &[]);
+    let constrained_stdout =
+        String::from_utf8(constrained_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        constrained_output.status.code(),
+        Some(1),
+        "{constrained_stdout}"
+    );
+    assert_eq!(
+        constrained_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        2,
+        "both operators should be diagnosed after RHS inference:\n{constrained_stdout}"
+    );
+    assert!(
+        !constrained_stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !constrained_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !constrained_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !constrained_stdout.contains("\"type\":\"result\""),
+        "the later I32 use should constrain the shared integer literal:\n{constrained_stdout}"
+    );
+    for (operator, expression, trait_name) in
+        [("&", "'a' & rhs", "BitAnd"), ("|", "'b' | rhs", "BitOr")]
+    {
+        let start = constrained_source
+            .find(expression)
+            .expect("later-constrained Char/integer expression exists");
+        assert_json_diagnostic_primary_span(
+            &constrained_stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<I32>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+
+    let annotation_source = concat!(
+        "pub fn char_untyped_integer_path_annotation_recovery() -> I32 {\n",
+        "    let rhs = -1\n",
+        "    let value: I32 = 'z' ^ rhs\n",
+        "    let recovered: I32 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let annotation_output = run_check(annotation_source, "", &[], &[]);
+    let annotation_stdout =
+        String::from_utf8(annotation_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        annotation_output.status.code(),
+        Some(1),
+        "{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the Char trait failure should be reported once:\n{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "the differing annotation should report one mismatch:\n{annotation_stdout}"
+    );
+    assert!(
+        !annotation_stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !annotation_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !annotation_stdout.contains("\"type\":\"result\""),
+        "the local should recover to I32 for the following use and tail:\n{annotation_stdout}"
+    );
+    let expression = annotation_source
+        .find("'z' ^ rhs")
+        .expect("annotated Char/untyped-integer-path expression exists");
+    let end = expression + "'z' ^ rhs".len();
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `^` has no `BitXor<I64>` implementation for `Char`",
+        expression,
+        end,
+    );
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Char`",
+        expression,
+        end,
+    );
+
+    let range_source = concat!(
+        "pub fn char_untyped_integer_path_range_recovery() -> Char {\n",
+        "    let high = 9223372036854775808\n",
+        "    let high_value = 'a' & high\n",
+        "    let low = -9223372036854775809\n",
+        "    let low_value = 'b' | low\n",
+        "    let recovered: Char = low_value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let range_output = run_check(range_source, "", &[], &[]);
+    let range_stdout = String::from_utf8(range_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(range_output.status.code(), Some(1), "{range_stdout}");
+    assert_eq!(
+        range_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        2,
+        "both operators should use the final defaulted I64 type:\n{range_stdout}"
+    );
+    assert_eq!(
+        range_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        2,
+        "both declaration literals should be range checked:\n{range_stdout}"
+    );
+    assert!(
+        !range_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !range_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !range_stdout.contains("\"type\":\"result\""),
+        "range errors should coexist with Char recovery:\n{range_stdout}"
+    );
+    for (operator, expression, trait_name) in
+        [("&", "'a' & high", "BitAnd"), ("|", "'b' | low", "BitOr")]
+    {
+        let start = range_source
+            .find(expression)
+            .expect("out-of-range Char/integer expression exists");
+        assert_json_diagnostic_primary_span(
+            &range_stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<I64>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+    for literal in ["9223372036854775808", "-9223372036854775809"] {
+        let start = range_source
+            .find(literal)
+            .expect("out-of-range local integer literal exists");
+        assert_json_diagnostic_primary_span(
+            &range_stdout,
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `I64`",
+            start,
+            start + literal.len(),
+        );
+    }
+}
+
+#[test]
 fn primitive_bitwise_char_literal_left_local_path_rhs_reports_traits_and_recovers() {
     let source = concat!(
         "pub fn char_literal_path_rhs(bool_rhs: Bool, byte_rhs: Byte, char_rhs: Char, integer_rhs: I32, f32_rhs: F32, f64_rhs: F64) -> Char {\n",
@@ -7578,9 +7795,32 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let result = 'a' & missing",
         ),
         fixture(
-            "pub fn char_literal_unresolved_numeric_path_rhs() -> Char",
+            "pub fn char_literal_untyped_float_path_rhs() -> Char",
+            "let right = 1.0\n    let result = 'a' & right",
+        ),
+        fixture(
+            "pub fn char_literal_integer_alias_path_rhs() -> Char",
+            "let right = 1\n    let alias = right\n    let constrained: I32 = right\n    let result = 'a' & alias",
+        ),
+        fixture(
+            "pub fn char_literal_computed_integer_path_rhs() -> Char",
+            "let right = 1 + 2\n    let result = 'a' & right",
+        ),
+        fixture(
+            "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char",
             "let right = 1\n    let result = 'a' & right",
         ),
+        concat!(
+            "type CharUntypedIntegerPathOwner { marker: Char }\n",
+            "impl CharUntypedIntegerPathOwner {\n",
+            "    fn char_untyped_integer_path_method(self: borrow Self) -> Char {\n",
+            "        let right = 1\n",
+            "        let result = 'a' & right\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        )
+        .to_owned(),
         fixture(
             "pub fn char_literal_self_reference_path_rhs() -> Char",
             "let result = 'a' & result",
