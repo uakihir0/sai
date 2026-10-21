@@ -1,0 +1,77 @@
+use acme:library-loan-policy/model.{
+    BookCopy
+    CopyStatus
+    Loan
+    LoanError
+    Member
+    MemberStatus
+    RenewalError
+}
+
+fn issue_loan(member: Member, copy: BookCopy, today: U32) -> Result<Loan, LoanError> {
+    if today > 4294967274 {
+        Err(LoanError.DateOutOfRange)
+    } else {
+        Ok(
+            Loan(
+                member_id: member.id,
+                copy_id: copy.id,
+                checked_out_day: today,
+                due_day: today + 21,
+                renewals: 0,
+                returned_day: None,
+            ),
+        )
+    }
+}
+
+pub fn checkout(member: Member, copy: BookCopy, today: U32) -> Result<Loan, LoanError> {
+    if member.status == MemberStatus.Suspended {
+        Err(LoanError.MemberSuspended)
+    } else if member.overdue_loans > 0 {
+        Err(LoanError.MemberHasOverdueLoan)
+    } else if member.open_loans >= member.loan_limit {
+        Err(LoanError.LoanLimitReached)
+    } else if copy.status != CopyStatus.Available {
+        Err(LoanError.CopyUnavailable)
+    } else {
+        match copy.held_for_member {
+            Some(member_id) => {
+                if member_id == member.id {
+                    issue_loan(member, copy, today)
+                } else {
+                    Err(LoanError.ReservedForAnotherMember(member_id))
+                }
+            }
+            None => issue_loan(member, copy, today)
+        }
+    }
+}
+
+pub fn renew(loan: Loan, today: U32, waiting_hold_count: U32) -> Result<Loan, RenewalError> {
+    match loan.returned_day {
+        Some(_) => Err(RenewalError.AlreadyReturned)
+        None => {
+            if today > loan.due_day {
+                Err(RenewalError.LoanOverdue)
+            } else if loan.renewals >= 1 {
+                Err(RenewalError.RenewalLimitReached)
+            } else if waiting_hold_count > 0 {
+                Err(RenewalError.WaitingMember)
+            } else if loan.due_day > 4294967274 {
+                Err(RenewalError.DateOutOfRange)
+            } else {
+                Ok(
+                    Loan(
+                        member_id: loan.member_id,
+                        copy_id: loan.copy_id,
+                        checked_out_day: loan.checked_out_day,
+                        due_day: loan.due_day + 21,
+                        renewals: loan.renewals + 1,
+                        returned_day: None,
+                    ),
+                )
+            }
+        }
+    }
+}

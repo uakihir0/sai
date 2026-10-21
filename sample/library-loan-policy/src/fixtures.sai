@@ -1,0 +1,81 @@
+use acme:library-loan-policy/model.{BookCopy, CopyStatus, Loan, Member, MemberStatus}
+
+pub fn active_member() -> Member {
+    Member(id: 1, status: MemberStatus.Active, open_loans: 1, overdue_loans: 0, loan_limit: 3)
+}
+
+pub fn suspended_member() -> Member {
+    Member(id: 2, status: MemberStatus.Suspended, open_loans: 0, overdue_loans: 0, loan_limit: 3)
+}
+
+pub fn member_at_limit() -> Member {
+    Member(id: 3, status: MemberStatus.Active, open_loans: 3, overdue_loans: 0, loan_limit: 3)
+}
+
+pub fn member_with_overdue_loan() -> Member {
+    Member(id: 4, status: MemberStatus.Active, open_loans: 1, overdue_loans: 1, loan_limit: 3)
+}
+
+pub fn another_active_member() -> Member {
+    Member(id: 5, status: MemberStatus.Active, open_loans: 0, overdue_loans: 0, loan_limit: 2)
+}
+
+pub fn available_copy() -> BookCopy {
+    BookCopy(id: 101, status: CopyStatus.Available, held_for_member: None)
+}
+
+pub fn copy_held_for_member_one() -> BookCopy {
+    BookCopy(id: 102, status: CopyStatus.Available, held_for_member: Some(1))
+}
+
+pub fn copy_on_loan() -> BookCopy {
+    BookCopy(id: 103, status: CopyStatus.OnLoan, held_for_member: None)
+}
+
+pub fn copy_on_loan_held_for_member_one() -> BookCopy {
+    BookCopy(id: 104, status: CopyStatus.OnLoan, held_for_member: Some(1))
+}
+
+pub fn loan_due_on_day_31() -> Loan {
+    Loan(
+        member_id: 1,
+        copy_id: 101,
+        checked_out_day: 10,
+        due_day: 31,
+        renewals: 0,
+        returned_day: None,
+    )
+}
+
+pub fn overdue_loan() -> Loan {
+    Loan(
+        member_id: 1,
+        copy_id: 101,
+        checked_out_day: 1,
+        due_day: 18,
+        renewals: 0,
+        returned_day: None,
+    )
+}
+
+pub fn returned_loan() -> Loan {
+    Loan(
+        member_id: 1,
+        copy_id: 101,
+        checked_out_day: 1,
+        due_day: 18,
+        renewals: 0,
+        returned_day: Some(19),
+    )
+}
+
+pub fn renewed_loan() -> Loan {
+    Loan(
+        member_id: 1,
+        copy_id: 101,
+        checked_out_day: 1,
+        due_day: 39,
+        renewals: 1,
+        returned_day: None,
+    )
+}

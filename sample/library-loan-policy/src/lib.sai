@@ -1,0 +1,230 @@
+use acme:library-loan-policy/fixtures.{
+    active_member
+    another_active_member
+    available_copy
+    copy_held_for_member_one
+    copy_on_loan
+    copy_on_loan_held_for_member_one
+    loan_due_on_day_31
+    member_at_limit
+    member_with_overdue_loan
+    overdue_loan
+    renewed_loan
+    returned_loan
+    suspended_member
+}
+use acme:library-loan-policy/model.{Loan, LoanError, Member, MemberStatus, RenewalError}
+use acme:library-loan-policy/policy.{checkout, renew}
+use sai:core/num.{U32_MAX}
+
+test "checkout creates a loan with a 21 day term" {
+    match checkout(active_member(), available_copy(), 20) {
+        Ok(loan) => {
+            assert loan.member_id == 1
+            assert loan.copy_id == 101
+            assert loan.checked_out_day == 20
+            assert loan.due_day == 41
+            assert loan.renewals == 0
+            assert loan.returned_day == None
+        }
+        Err(_) => {
+            assert false, "an eligible member should be able to borrow an available copy"
+        }
+    }
+}
+
+test "checkout returns the first account policy failure" {
+    match checkout(suspended_member(), available_copy(), 20) {
+        Err(LoanError.MemberSuspended) => {}
+        _ => {
+            assert false, "suspended members should be rejected first"
+        }
+    }
+    match checkout(member_with_overdue_loan(), available_copy(), 20) {
+        Err(LoanError.MemberHasOverdueLoan) => {}
+        _ => {
+            assert false, "an overdue loan should block another checkout"
+        }
+    }
+    match checkout(member_at_limit(), available_copy(), 20) {
+        Err(LoanError.LoanLimitReached) => {}
+        _ => {
+            assert false, "members at their loan limit should be rejected"
+        }
+    }
+
+    let suspended_and_overdue = Member(
+        id: 6,
+        status: MemberStatus.Suspended,
+        open_loans: 3,
+        overdue_loans: 1,
+        loan_limit: 3,
+    )
+    match checkout(suspended_and_overdue, available_copy(), 20) {
+        Err(LoanError.MemberSuspended) => {}
+        _ => {
+            assert false, "suspension should precede overdue and loan-limit failures"
+        }
+    }
+
+    let overdue_and_at_limit =
+        Member(id: 7, status: MemberStatus.Active, open_loans: 3, overdue_loans: 1, loan_limit: 3)
+    match checkout(overdue_and_at_limit, available_copy(), 20) {
+        Err(LoanError.MemberHasOverdueLoan) => {}
+        _ => {
+            assert false, "an overdue loan should precede the loan-limit failure"
+        }
+    }
+
+    match checkout(member_at_limit(), copy_on_loan(), 20) {
+        Err(LoanError.LoanLimitReached) => {}
+        _ => {
+            assert false, "the loan limit should precede copy availability"
+        }
+    }
+}
+
+test "checkout respects copy state and reservation ownership" {
+    match checkout(active_member(), copy_on_loan(), 20) {
+        Err(LoanError.CopyUnavailable) => {}
+        _ => {
+            assert false, "a copy already on loan should be unavailable"
+        }
+    }
+    match checkout(another_active_member(), copy_on_loan_held_for_member_one(), 4294967275) {
+        Err(LoanError.CopyUnavailable) => {}
+        _ => {
+            assert false, "copy state should precede the hold and date failures"
+        }
+    }
+    match checkout(another_active_member(), copy_held_for_member_one(), 20) {
+        Err(LoanError.ReservedForAnotherMember(1)) => {}
+        _ => {
+            assert false, "a waiting member should keep their reservation"
+        }
+    }
+    match checkout(another_active_member(), copy_held_for_member_one(), 4294967275) {
+        Err(LoanError.ReservedForAnotherMember(1)) => {}
+        _ => {
+            assert false, "the hold should be reported before an invalid due date"
+        }
+    }
+    match checkout(active_member(), copy_held_for_member_one(), 20) {
+        Ok(loan) => {
+            assert loan.due_day == 41
+        }
+        _ => {
+            assert false, "the member holding the reservation should be eligible"
+        }
+    }
+}
+
+test "checkout rejects dates whose due day would overflow" {
+    match checkout(active_member(), available_copy(), 4294967275) {
+        Err(LoanError.DateOutOfRange) => {}
+        _ => {
+            assert false, "the due date must remain in the U32 day range"
+        }
+    }
+}
+
+test "checkout accepts the last day whose due date fits in U32" {
+    match checkout(active_member(), available_copy(), 4294967274) {
+        Ok(loan) => {
+            assert loan.due_day == U32_MAX
+        }
+        _ => {
+            assert false, "a due day equal to U32_MAX should be accepted"
+        }
+    }
+}
+
+test "renew extends the due date once when no hold is waiting" {
+    match renew(loan_due_on_day_31(), 20, 0) {
+        Ok(loan) => {
+            assert loan.due_day == 52
+            assert loan.renewals == 1
+        }
+        _ => {
+            assert false, "an eligible loan should renew from its current due day"
+        }
+    }
+    match renew(loan_due_on_day_31(), 31, 0) {
+        Ok(loan) => {
+            assert loan.due_day == 52
+        }
+        _ => {
+            assert false, "renewal should still be allowed on the due day"
+        }
+    }
+    match renew(loan_due_on_day_31(), 20, 1) {
+        Err(RenewalError.WaitingMember) => {}
+        _ => {
+            assert false, "a waiting hold should block renewal"
+        }
+    }
+}
+
+test "renew rejects returned overdue and previously renewed loans" {
+    match renew(returned_loan(), 20, 0) {
+        Err(RenewalError.AlreadyReturned) => {}
+        _ => {
+            assert false, "a returned loan cannot be renewed"
+        }
+    }
+    match renew(overdue_loan(), 20, 0) {
+        Err(RenewalError.LoanOverdue) => {}
+        _ => {
+            assert false, "an overdue loan cannot be renewed"
+        }
+    }
+    match renew(loan_due_on_day_31(), 32, 0) {
+        Err(RenewalError.LoanOverdue) => {}
+        _ => {
+            assert false, "a loan one day past due cannot be renewed"
+        }
+    }
+    match renew(renewed_loan(), 20, 0) {
+        Err(RenewalError.RenewalLimitReached) => {}
+        _ => {
+            assert false, "the policy permits one renewal"
+        }
+    }
+}
+
+test "renew rejects a due date whose extension would overflow" {
+    let loan = loan_due_on_day_31()
+    let near_limit = Loan(
+        member_id: loan.member_id,
+        copy_id: loan.copy_id,
+        checked_out_day: loan.checked_out_day,
+        due_day: 4294967275,
+        renewals: 0,
+        returned_day: None,
+    )
+    match renew(near_limit, 20, 0) {
+        Err(RenewalError.DateOutOfRange) => {}
+        _ => {
+            assert false, "the extended due date must remain in the U32 day range"
+        }
+    }
+}
+
+test "renew accepts an extension that ends exactly at U32_MAX" {
+    let loan = Loan(
+        member_id: 1,
+        copy_id: 101,
+        checked_out_day: 1,
+        due_day: 4294967274,
+        renewals: 0,
+        returned_day: None,
+    )
+    match renew(loan, 20, 0) {
+        Ok(renewed) => {
+            assert renewed.due_day == U32_MAX
+        }
+        _ => {
+            assert false, "a renewed due day equal to U32_MAX should be accepted"
+        }
+    }
+}
