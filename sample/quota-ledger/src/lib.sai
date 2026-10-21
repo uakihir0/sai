@@ -1,0 +1,103 @@
+use acme:quota-ledger/ledger.{Ledger, available, release, reserve}
+use sai:core/num.{U32_MAX}
+
+test "available units respect the quota" {
+    let ledger = Ledger(capacity: 12, reserved: 9)
+    assert available(ledger) == 3
+}
+
+test "reserve accepts an exact fit and rejects an excess" {
+    let ledger = Ledger(capacity: 12, reserved: 9)
+    match reserve(ledger, 3) {
+        Some(updated) => {
+            assert updated.reserved == 12
+        }
+        None => {
+            assert false, "an exact fit should be accepted"
+        }
+    }
+    match reserve(ledger, 4) {
+        Some(_) => {
+            assert false, "an over-capacity request should be rejected"
+        }
+        None => {}
+    }
+}
+
+test "release rejects more units than are reserved" {
+    let ledger = Ledger(capacity: 12, reserved: 3)
+    match release(ledger, 4) {
+        Some(_) => {
+            assert false, "release must not create unreserved units"
+        }
+        None => {}
+    }
+}
+
+test "release accepts an exact balance" {
+    let ledger = Ledger(capacity: 12, reserved: 3)
+    match release(ledger, 3) {
+        Some(updated) => {
+            assert updated.reserved == 0
+            assert updated.capacity == 12
+        }
+        None => {
+            assert false, "an exact release should be accepted"
+        }
+    }
+}
+
+test "reserve then release restores the starting ledger" {
+    let ledger = Ledger(capacity: 12, reserved: 9)
+    match reserve(ledger, 3) {
+        Some(after_reserve) => {
+            match release(after_reserve, 3) {
+                Some(after_release) => {
+                    assert after_release == ledger
+                }
+                None => {
+                    assert false, "a matching release should succeed"
+                }
+            }
+        }
+        None => {
+            assert false, "the exact-fit reservation should succeed"
+        }
+    }
+}
+
+@cases(500)
+property "accepted reservations remain within capacity" (reserved: U32, units: U32) {
+    let ledger = Ledger(capacity: U32_MAX, reserved: reserved)
+    match reserve(ledger, units) {
+        Some(updated) => updated.reserved <= updated.capacity
+        None => true
+    }
+}
+
+@cases(500)
+property "accepted reservations account for every unit" (reserved: U32, units: U32) {
+    let ledger = Ledger(capacity: U32_MAX, reserved: reserved)
+    match reserve(ledger, units) {
+        Some(updated) => updated.reserved == reserved + units
+        None => true
+    }
+}
+
+@cases(500)
+property "releases never increase reserved units" (reserved: U32, units: U32) {
+    let ledger = Ledger(capacity: reserved, reserved: reserved)
+    match release(ledger, units) { Some(updated) => updated.reserved <= reserved, None => true }
+}
+
+@cases(500)
+property "a matching release restores the starting ledger" (reserved: U32, units: U32) {
+    let ledger = Ledger(capacity: U32_MAX, reserved: reserved)
+    match reserve(ledger, units) {
+        Some(after_reserve) => match release(after_reserve, units) {
+            Some(after_release) => after_release == ledger
+            None => false
+        }
+        None => true
+    }
+}

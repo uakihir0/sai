@@ -1,0 +1,47 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Ledger {
+    pub capacity: U32
+    pub reserved: U32
+}
+
+pub fn available(ledger: Ledger) -> U32
+    requires ledger.reserved <= ledger.capacity
+    ensures result == ledger.capacity - ledger.reserved
+{
+    ledger.capacity - ledger.reserved
+}
+
+pub fn reserve(ledger: Ledger, units: U32) -> Option<Ledger>
+    requires ledger.reserved <= ledger.capacity
+    ensures match result {
+        Some(updated) => (
+            updated.capacity == ledger.capacity
+            and updated.reserved == old(ledger.reserved) + units
+            and updated.reserved <= updated.capacity
+        )
+        None => units > ledger.capacity - old(ledger.reserved)
+    }
+{
+    let remaining = ledger.capacity - ledger.reserved
+    if units <= remaining {
+        Some(Ledger(capacity: ledger.capacity, reserved: ledger.reserved + units))
+    } else {
+        None
+    }
+}
+
+pub fn release(ledger: Ledger, units: U32) -> Option<Ledger>
+    requires ledger.reserved <= ledger.capacity
+    ensures match result {
+        Some(updated) => (
+            updated.capacity == ledger.capacity and updated.reserved + units == old(ledger.reserved)
+        )
+        None => units > old(ledger.reserved)
+    }
+{
+    if units <= ledger.reserved {
+        Some(Ledger(capacity: ledger.capacity, reserved: ledger.reserved - units))
+    } else {
+        None
+    }
+}
