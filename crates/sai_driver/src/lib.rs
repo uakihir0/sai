@@ -6032,6 +6032,9 @@ fn check_function_body_type(
                 }
                 None => FunctionDirectType::Unit,
             };
+            if expected == FunctionDirectType::Str || found == FunctionDirectType::Str {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            }
             if expected == found || expected == FunctionDirectType::Unit {
                 Vec::new()
             } else {
@@ -6221,6 +6224,23 @@ fn check_function_body_type(
                     };
                     diagnostics
                 }
+            }
+            Some(FunctionDirectType::Str) => {
+                let Some(tail) = block.tail else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                if !matches!(tail.kind, ExprKind::Lit(Lit::Str(_)))
+                    && !is_direct_function_scalar_literal(tail)
+                {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                }
+                let Some(diagnostics) = check_const_literal_leaf(
+                    owner, *return_ty, tail, type_paths, symbols, inputs, snapshot, target_cfg,
+                )?
+                else {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
+                };
+                diagnostics
             }
             None => return Ok(FunctionBodyTypeCheck::Unsupported),
         }
@@ -7115,6 +7135,7 @@ fn is_plain_ascii_identifier(name: Name, inputs: &CurrentOwnerInputs) -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FunctionDirectType {
     Primitive(sai_resolve::prelude::PrimTy),
+    Str,
     Unit,
 }
 
@@ -7126,14 +7147,15 @@ fn resolve_function_direct_type(
 ) -> Option<FunctionDirectType> {
     match resolve_const_literal_type(ty, type_paths, symbols, inputs)? {
         ConstLiteralType::Primitive(primitive) => Some(FunctionDirectType::Primitive(primitive)),
+        ConstLiteralType::Str => Some(FunctionDirectType::Str),
         ConstLiteralType::Unit => Some(FunctionDirectType::Unit),
-        ConstLiteralType::Str => None,
     }
 }
 
 fn function_direct_type_name(ty: FunctionDirectType) -> &'static str {
     match ty {
         FunctionDirectType::Primitive(primitive) => const_primitive_name(primitive),
+        FunctionDirectType::Str => "Str",
         FunctionDirectType::Unit => "()",
     }
 }
@@ -24837,6 +24859,8 @@ mod tests {
             "pub fn computed(value: I32) -> I32 { value + 1 }\n",
             "pub fn self_param(self: I32) -> I32 { self }\n",
             "pub fn string_identity(value: Str) -> Str { value }\n",
+            "pub fn string_parameter_return(value: Str) -> Str { \"text\" }\n",
+            "pub fn local_str_return() -> Str {\n    let value = \"text\"\n    value\n}\n",
             "pub fn mutable_identity(var value: I32) -> I32 { value }\n",
             "pub fn identityValue(value: I32) -> I32 { value }\n",
             "pub fn parameter_case(valueItem: I32) -> I32 { valueItem }\n",
@@ -24861,7 +24885,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 16);
+        assert_eq!(resolved.owners().len(), 18);
         assert!(matches!(
             resolved.owners()[0]
                 .body_type_check()
@@ -24932,6 +24956,7 @@ mod tests {
             "pub fn omitted_return() { 1 }\n",
             "pub fn unit_return() -> () { () }\n",
             "pub fn string_return() -> Str { \"text\" }\n",
+            "pub fn string_mismatch() -> Str { 42 }\n",
             "pub fn byte_string_return() -> Byte { b\"text\" }\n",
             "pub fn expression() -> I32 { 40 + 2 }\n",
             "type Number = I32\n",
@@ -24957,7 +24982,7 @@ mod tests {
             .expect("function owner analyses succeed");
 
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 23);
+        assert_eq!(owners.len(), 24);
         for owner in &owners[..9] {
             assert!(matches!(
                 owner
@@ -24966,7 +24991,7 @@ mod tests {
                 FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()
             ));
         }
-        for index in [13, 18] {
+        for index in [13, 14, 19] {
             assert!(matches!(
                 owners[index]
                     .body_type_check()
@@ -24996,6 +25021,13 @@ mod tests {
                 "integer literal is out of range for `USize`",
                 "pointer_overflow",
                 "4294967296",
+            ),
+            (
+                15,
+                sai_diagnostics::Code::TypeMismatch,
+                "expected `Str`, found an integer literal",
+                "string_mismatch",
+                "42",
             ),
         ] {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
@@ -25030,8 +25062,8 @@ mod tests {
 
         for owner in owners[12..13]
             .iter()
-            .chain(owners[14..18].iter())
-            .chain(owners[19..].iter())
+            .chain(owners[16..19].iter())
+            .chain(owners[20..].iter())
         {
             assert!(matches!(
                 owner
@@ -25041,7 +25073,7 @@ mod tests {
             ));
         }
         assert!(
-            owners[17]
+            owners[18]
                 .type_path_resolution()
                 .expect("user-defined alias path resolution succeeds")
                 .expect("user-defined alias owner has type-path results")
