@@ -222,8 +222,32 @@ fn direct_parameter_return_type_mismatch_suppresses_check_result() {
 }
 
 #[test]
+fn canonical_str_literal_return_mismatch_reports_the_literal_span() {
+    let source = "pub fn string_mismatch() -> Str { 42 }\n";
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a supported return mismatch must not be hidden by a feature gate:\n{stdout}"
+    );
+    let start = source.find("42").expect("mismatched literal exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Str`, found an integer literal",
+        start,
+        start + "42".len(),
+    );
+}
+
+#[test]
 fn public_zero_parameter_direct_scalar_function_emits_check_result() {
     for source in [
+        "pub fn string_return() -> Str { \"text\" }\n",
+        "pub fn raw_string_return() -> Str { r#\"text\"# }\n",
         "pub fn answer() -> I32 { 42 }\n",
         "pub fn ready() -> Bool { true }\n",
         "pub fn letter() -> Char { 'z' }\n",
@@ -4332,7 +4356,6 @@ fn zero_parameter_direct_scalar_type_errors_suppress_check_result() {
 fn unsupported_zero_parameter_function_shapes_remain_gated() {
     for source in [
         "pub fn answer() { 42 }\n",
-        "pub fn answer() -> Str { \"text\" }\n",
         "pub fn answer() -> Byte { b\"text\" }\n",
         "pub fn answer() -> I32 { 40 + 2 }\n",
         "pub fn answer() -> I32 { let value = 42; value }\n",
@@ -4614,6 +4637,23 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local() -> I32 {\nlet value = 42\nr#value\n}\n",
         "const ONE: I32 = 1\npub fn local() -> I32 {\nlet value = 42\nONE\n}\n",
         "pub fn local() -> Str {\nlet value = \"text\"\nvalue\n}\n",
+        "pub fn local_str_return() -> Str {\n    let value = \"text\"\n    value\n}\n",
+        "pub fn parameter_str_return(value: I32) -> Str { \"text\" }\n",
+        "pub fn string_parameter_return(value: Str) -> Str { \"text\" }\n",
+        "pub fn byte_string_return() -> Str { b\"text\" }\n",
+        "pub fn string_expression() -> Str { \"a\" + \"b\" }\n",
+        "pub fn format_string_return() -> Str { f\"hello {1}\" }\n",
+        "pub fn generic_str_return<T>() -> Str { \"text\" }\n",
+        "pub fn raw_str_return() -> r#Str { \"text\" }\n",
+        "type Text = Str\npub fn alias_str_return() -> Text { \"text\" }\n",
+        "type Str = I32\npub fn shadowed_str_return() -> Str { \"text\" }\n",
+        "pub fn non_str_return() -> I32 { \"text\" }\n",
+        concat!(
+            "type StringOwner { marker: Bool }\n",
+            "impl StringOwner {\n",
+            "    fn string_method(self: borrow Self) -> Str { \"text\" }\n",
+            "}\n",
+        ),
         "pub fn local() -> I32 {\nlet (first, second): (I32, I32) = (1, 2)\nfirst\n}\n",
         "pub fn local() -> I32 { let 0: I32 = 42 else { return 0 }\n1\n}\n",
         "pub fn local() -> I32 { let value: I32 = \"text\"\nvalue\n}\n",
