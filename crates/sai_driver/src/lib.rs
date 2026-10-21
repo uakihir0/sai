@@ -6435,6 +6435,10 @@ fn check_function_body_primitive_local_block(
                                 ))
                             || (is_direct_function_integer_literal(left)
                                 && is_preceding_path(right))
+                            || (is_direct_function_integer_literal(left)
+                                && is_direct_function_integer_literal(right))
+                            || (matches!(left.kind, ExprKind::Lit(Lit::Bool(_)))
+                                && matches!(right.kind, ExprKind::Lit(Lit::Bool(_))))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
                                 && (is_preceding_path(right)
                                     || is_direct_function_scalar_literal(right)))
@@ -26509,6 +26513,119 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_reports_bool_literal_pairs_and_recovers_annotations() {
+        let root = concat!(
+            "pub fn bool_literal_pairs() -> Bool {\n",
+            "    let and_value = true & false\n",
+            "    let or_value = false | true\n",
+            "    let xor_value = true ^ false\n",
+            "    let recovered: Bool = xor_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn bool_literal_annotation_recovery() -> I32 {\n",
+            "    let value: I32 = false ^ true\n",
+            "    let recovered: I32 = value\n",
+            "    recovered\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 2);
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[0]
+            .body_type_check()
+            .expect("direct Bool literal pairs remain in the supported diagnostic slice")
+        else {
+            panic!("direct Bool literal pairs must report an operator diagnostic");
+        };
+        assert_eq!(diagnostics.len(), 3);
+        for (diagnostic, (operator, expression)) in diagnostics.iter().zip([
+            ("&", "true & false"),
+            ("|", "false | true"),
+            ("^", "true ^ false"),
+        ]) {
+            assert_eq!(diagnostic.code, sai_diagnostics::Code::OperatorNotSupported);
+            assert_eq!(
+                diagnostic.message,
+                format!("operator `{operator}` is not defined for `Bool`")
+            );
+            let start = root
+                .find(expression)
+                .expect("Bool literal pair expression exists");
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("unsupported operator has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + expression.len()) as u32),
+                )
+                .expect("expression span is ordered")
+            );
+        }
+
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[1]
+            .body_type_check()
+            .expect("a mismatched annotation recovers through the supported diagnostic slice")
+        else {
+            panic!("Bool literal-pair annotation mismatch should recover");
+        };
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::OperatorNotSupported,
+                sai_diagnostics::Code::TypeMismatch,
+            ]
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "operator `^` is not defined for `Bool`",
+                "expected `I32`, found `Bool`",
+            ]
+        );
+        let expression = "false ^ true";
+        let start = root
+            .find("let value: I32 = false ^ true")
+            .expect("annotated Bool pair exists")
+            + "let value: I32 = ".len();
+        let span = sai_diagnostics::TextRange::new(
+            sai_diagnostics::TextSize::new(start as u32),
+            sai_diagnostics::TextSize::new((start + expression.len()) as u32),
+        )
+        .expect("annotated expression span is ordered");
+        for diagnostic in diagnostics {
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("annotation recovery diagnostic has a primary span")
+                    .span
+                    .range,
+                span
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_reports_integer_path_nonbyte_scalar_literal_mismatches() {
         let primitive_types = [
             ("i8_value", "I8"),
@@ -26651,6 +26768,159 @@ mod tests {
                 owner.owner()
             );
         }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_integer_literal_pairs_with_shared_inference() {
+        let integer_types = [
+            "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
+        ];
+        let operators = [("&", "and"), ("|", "or"), ("^", "xor")];
+        let mut root = String::new();
+        for ty in integer_types {
+            for (operator, name) in operators {
+                root.push_str(&format!(
+                    "pub fn {name}_{}_annotated() -> I32 {{\n    let value: {ty} = 1 {operator} 2\n    let recovered: {ty} = value\n    let output: I32 = 0\n    output\n}}\n",
+                    ty.to_ascii_lowercase()
+                ));
+            }
+        }
+        for (operator, name) in operators {
+            root.push_str(&format!(
+                "pub fn {name}_tail_inferred() -> U16 {{\n    let value = 65535 {operator} 0\n    value\n}}\n"
+            ));
+        }
+        root.push_str(
+            "pub fn annotation_after_copy() -> U8 {\n\
+                 let value = 255 ^ 0\n\
+                 let selected: U8 = value\n\
+                 selected\n\
+             }\n\
+             pub fn both_literals_default_to_i64() -> I32 {\n\
+                 let unused = -9223372036854775808 & 0\n\
+                 let output: I32 = 0\n\
+                 output\n\
+             }\n",
+        );
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 35);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("supported literal-pair body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the integer literal-pair slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_checks_each_integer_literal_pair_range_at_its_literal() {
+        let root = concat!(
+            "pub fn out_of_range() -> I32 {\n",
+            "    let value: I8 = 128 ^ -129\n",
+            "    let recovered: I8 = value\n",
+            "    let output: I32 = 0\n",
+            "    output\n",
+            "}\n",
+            "pub fn incompatible_annotation() -> Bool {\n",
+            "    let value: Bool = 1 & 2\n",
+            "    let recovered: Bool = value\n",
+            "    recovered\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 2);
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[0]
+            .body_type_check()
+            .expect("both out-of-range operands remain supported")
+        else {
+            panic!("integer literal pair range errors must not gate the body");
+        };
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        for (literal, message) in [
+            ("128", "integer literal is out of range for `I8`"),
+            ("-129", "integer literal is out of range for `I8`"),
+        ] {
+            let start = root.find(literal).expect("out-of-range literal exists");
+            let span = sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(start as u32),
+                sai_diagnostics::TextSize::new((start + literal.len()) as u32),
+            )
+            .expect("literal span is ordered");
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|diagnostic| {
+                        diagnostic.code == sai_diagnostics::Code::LiteralOutOfRange
+                            && diagnostic.message == message
+                            && diagnostic
+                                .primary()
+                                .is_some_and(|primary| primary.span.range == span)
+                    })
+                    .count(),
+                1,
+                "expected range error for {literal} at {start}..{}: {diagnostics:?}",
+                start + literal.len()
+            );
+        }
+
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[1]
+            .body_type_check()
+            .expect("incompatible annotation recovers the integer literal pair")
+        else {
+            panic!("a non-integer annotation must produce a diagnostic, not gate");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::TypeMismatch);
+        assert_eq!(
+            diagnostics[0].message,
+            "expected `Bool`, found an integer literal"
+        );
+        let expression_start = root
+            .find("1 & 2")
+            .expect("incompatible annotated expression exists");
+        assert_eq!(
+            diagnostics[0]
+                .primary()
+                .expect("annotation mismatch points at the initializer")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(expression_start as u32),
+                sai_diagnostics::TextSize::new((expression_start + "1 & 2".len()) as u32),
+            )
+            .expect("initializer span is ordered")
+        );
     }
 
     #[test]
@@ -27835,7 +28105,24 @@ mod tests {
             "type F32Alias = F32\n",
             "type F64Alias = F64\n",
             "pub fn float_literal_left(left: I32) -> I32 {\n    let value = 1.0 & left\n    value\n}\n",
-            "pub fn literal_pair() -> I32 {\n    let value = 1 ^ 2\n    value\n}\n",
+            "pub fn integer_byte_literal_pair() -> I32 {\n    let value = 1 & b'a'\n    value\n}\n",
+            "pub fn integer_bool_literal_pair() -> I32 {\n    let value = 1 & true\n    value\n}\n",
+            "pub fn integer_char_literal_pair() -> I32 {\n    let value = 1 | 'a'\n    value\n}\n",
+            "pub fn integer_float_literal_pair() -> I32 {\n    let value = 1 ^ 2.0\n    value\n}\n",
+            "pub fn bool_integer_literal_pair() -> Bool {\n    let value = true & 1\n    value\n}\n",
+            "pub fn bool_byte_literal_pair() -> Bool {\n    let value = true | b'a'\n    value\n}\n",
+            "pub fn bool_char_literal_pair() -> Bool {\n    let value = true ^ 'a'\n    value\n}\n",
+            "pub fn bool_float_literal_pair() -> Bool {\n    let value = false & 2.0\n    value\n}\n",
+            "pub fn bool_literal_byte_string_rhs() -> Bool {\n    let value = true & b\"text\"\n    value\n}\n",
+            "pub fn bool_literal_shift_pair() -> Bool {\n    let value = true << false\n    value\n}\n",
+            "pub fn nested_bool_literal_pair_rhs() -> Bool {\n    let value = true & (false | true)\n    value\n}\n",
+            "pub fn nested_bool_literal_pair_left() -> Bool {\n    let value = (true & false) ^ true\n    value\n}\n",
+            "pub fn chained_bool_literal_pairs() -> Bool {\n    let value = true & false | true\n    value\n}\n",
+            "pub fn generic_bool_literal_pair<T>() -> Bool {\n    let value = true ^ false\n    value\n}\n",
+            "pub fn nested_integer_literal_pair_rhs() -> I32 {\n    let value = 1 & (2 ^ 3)\n    value\n}\n",
+            "pub fn nested_integer_literal_pair_left() -> I32 {\n    let value = (1 & 2) ^ 3\n    value\n}\n",
+            "pub fn chained_integer_literal_pairs() -> I32 {\n    let value = 1 & 2 | 3\n    value\n}\n",
+            "pub fn generic_integer_literal_pair<T>() -> I32 {\n    let value = 1 ^ 2\n    value\n}\n",
             "pub fn bool_path_byte_string_rhs(left: Bool) -> Bool {\n    let value = left & b\"text\"\n    value\n}\n",
             "pub fn f64_path_byte_string_rhs(left: F64) -> F64 {\n    let value = left | b\"text\"\n    value\n}\n",
             "pub fn char_path_byte_string_rhs(left: Char) -> Char {\n    let value = left | b\"text\"\n    value\n}\n",
@@ -27866,6 +28153,13 @@ mod tests {
             "        value\n",
             "    }\n",
             "}\n",
+            "type BoolLiteralPairOwner { marker: Bool }\n",
+            "impl BoolLiteralPairOwner {\n",
+            "    fn bool_literal_pair(self: borrow Self) -> Bool {\n",
+            "        let value = true ^ false\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
             "type CharPathScalarBitOwner { marker: Char }\n",
             "impl CharPathScalarBitOwner {\n",
             "    fn char_path_scalar_method(self: borrow Self, left: Char) -> Char {\n",
@@ -27884,6 +28178,13 @@ mod tests {
             "    fn float_path_scalar_method(self: borrow Self, left: F64) -> F64 {\n",
             "        let prior: F64 = left\n",
             "        let value = prior ^ 1.0\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
+            "type IntegerLiteralPairOwner { marker: I32 }\n",
+            "impl IntegerLiteralPairOwner {\n",
+            "    fn integer_literal_pair(self: borrow Self) -> I32 {\n",
+            "        let value = 1 ^ 2\n",
             "        value\n",
             "    }\n",
             "}\n",
@@ -27914,7 +28215,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 36);
+        assert_eq!(resolved.owners().len(), 53);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()

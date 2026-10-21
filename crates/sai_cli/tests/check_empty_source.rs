@@ -6551,31 +6551,184 @@ fn primitive_bitwise_integer_annotation_mismatch_recovers_after_operand_mismatch
 }
 
 #[test]
+fn primitive_bitwise_bool_literal_pairs_report_operator_errors_and_recover_annotations() {
+    for (name, operator, left, right) in [
+        ("and", "&", "true", "false"),
+        ("or", "|", "false", "true"),
+        ("xor", "^", "true", "false"),
+    ] {
+        let source = format!(
+            "pub fn bool_{name}() -> Bool {{\n    let value = {left} {operator} {right}\n    let recovered: Bool = value\n    recovered\n}}\n"
+        );
+        let expression = format!("{left} {operator} {right}");
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout
+                .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                .count(),
+            1,
+            "{operator} should have one unsupported Bool operator diagnostic:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "Bool pair should recover through the following local and tail:\n{stdout}"
+        );
+        let start = source
+            .find(&expression)
+            .expect("Bool literal-pair expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` is not defined for `Bool`"),
+            start,
+            start + expression.len(),
+        );
+    }
+
+    let annotation_source = concat!(
+        "pub fn bool_annotation_recovery() -> I32 {\n",
+        "    let value: I32 = false ^ true\n",
+        "    let recovered: I32 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let annotation_output = run_check(annotation_source, "", &[], &[]);
+    let annotation_stdout =
+        String::from_utf8(annotation_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        annotation_output.status.code(),
+        Some(1),
+        "{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "annotated Bool pair should have one unsupported operator diagnostic:\n{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "the incompatible annotation should report one mismatch:\n{annotation_stdout}"
+    );
+    assert!(
+        !annotation_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !annotation_stdout.contains("\"type\":\"result\""),
+        "annotated Bool pair should recover through the following local and tail:\n{annotation_stdout}"
+    );
+    let annotation = annotation_source
+        .find("false ^ true")
+        .expect("annotated Bool pair exists");
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Bool`",
+        annotation,
+        annotation + "false ^ true".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `^` is not defined for `Bool`",
+        annotation,
+        annotation + "false ^ true".len(),
+    );
+}
+
+#[test]
 fn unsupported_primitive_bitwise_shapes_remain_gated() {
     let fixture = |signature: &str, statements: &str| {
         format!("{signature} {{\n    {statements}\n    result\n}}\n")
     };
     for source in [
-        fixture("pub fn literal_pair() -> I32", "let result = 1 & 2"),
         fixture(
             "pub fn integer_byte_literal_pair() -> I32",
             "let result = 1 & b'a'",
+        ),
+        fixture(
+            "pub fn integer_bool_literal_pair() -> I32",
+            "let result = 1 & true",
+        ),
+        fixture(
+            "pub fn integer_char_literal_pair() -> I32",
+            "let result = 1 | 'a'",
+        ),
+        fixture(
+            "pub fn integer_float_literal_pair() -> I32",
+            "let result = 1 ^ 2.0",
+        ),
+        fixture(
+            "pub fn bool_integer_literal_pair() -> Bool",
+            "let result = true & 1",
+        ),
+        fixture(
+            "pub fn bool_byte_literal_pair() -> Bool",
+            "let result = true | b'a'",
+        ),
+        fixture(
+            "pub fn bool_char_literal_pair() -> Bool",
+            "let result = true ^ 'a'",
+        ),
+        fixture(
+            "pub fn bool_float_literal_pair() -> Bool",
+            "let result = false & 2.0",
+        ),
+        fixture(
+            "pub fn bool_literal_byte_string_rhs() -> Bool",
+            "let result = true & b\"text\"",
+        ),
+        fixture(
+            "pub fn bool_literal_shift_pair() -> Bool",
+            "let result = true << false",
+        ),
+        fixture(
+            "pub fn nested_bool_literal_pair_rhs() -> Bool",
+            "let result = true & (false | true)",
+        ),
+        fixture(
+            "pub fn nested_bool_literal_pair_left() -> Bool",
+            "let result = (true & false) ^ true",
+        ),
+        fixture(
+            "pub fn chained_bool_literal_pairs() -> Bool",
+            "let result = true & false | true",
+        ),
+        fixture(
+            "pub fn generic_bool_literal_pair<T>() -> Bool",
+            "let result = true ^ false",
+        ),
+        concat!(
+            "type BoolLiteralPairOwner { marker: Bool }\n",
+            "impl BoolLiteralPairOwner {\n",
+            "    fn bool_literal_pair(self: borrow Self) -> Bool {\n",
+            "        let result = true ^ false\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        )
+        .to_owned(),
+        fixture(
+            "pub fn char_integer_literal_pair() -> Char",
+            "let result = 'a' | 1",
+        ),
+        fixture(
+            "pub fn float_integer_literal_pair() -> F32",
+            "let result = 1.0 ^ 2",
         ),
         fixture(
             "pub fn integer_float_literal_pair() -> F32",
             "let result = 1.0 & 2.0",
         ),
         fixture(
-            "pub fn bool_literal_pair() -> Bool",
-            "let result = true & false",
-        ),
-        fixture(
             "pub fn char_literal_pair() -> Char",
             "let result = 'a' ^ 'b'",
-        ),
-        fixture(
-            "pub fn bool_byte_literal_pair() -> Bool",
-            "let result = true & b'a'",
         ),
         fixture(
             "pub fn char_byte_literal_pair() -> Char",
@@ -6585,6 +6738,43 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn float_byte_literal_pair() -> F32",
             "let result = 1.0 & b'a'",
         ),
+        fixture(
+            "pub fn nested_integer_literal_pair_rhs() -> I32",
+            "let result = 1 & (2 ^ 3)",
+        ),
+        fixture(
+            "pub fn nested_integer_literal_pair_left() -> I32",
+            "let result = (1 & 2) ^ 3",
+        ),
+        fixture(
+            "pub fn chained_integer_literal_pairs() -> I32",
+            "let result = 1 & 2 | 3",
+        ),
+        fixture(
+            "pub fn integer_literal_shift_pair() -> I32",
+            "let result = 1 << 2",
+        ),
+        fixture(
+            "pub fn generic_integer_literal_pair<T>() -> I32",
+            "let result = 1 ^ 2",
+        ),
+        format!(
+            "type Word = I32\n{}",
+            fixture(
+                "pub fn integer_literal_pair_alias_annotation() -> Word",
+                "let result: Word = 1 ^ 2",
+            )
+        ),
+        concat!(
+            "type IntegerPairOwner { marker: I32 }\n",
+            "impl IntegerPairOwner {\n",
+            "    fn integer_literal_pair(self: borrow Self) -> I32 {\n",
+            "        let result = 1 ^ 2\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        )
+        .to_owned(),
         fixture(
             "pub fn byte_string_left(right: Byte) -> Byte",
             "let result = b\"text\" & right",
@@ -7438,6 +7628,128 @@ fn primitive_bitwise_byte_literal_pairs_accept_all_operators_and_byte_annotation
     );
 
     assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn primitive_bitwise_integer_literal_pairs_follow_integer_annotations_and_tail_types() {
+    let source = concat!(
+        "pub fn integer_pairs() -> U16 {\n",
+        "    let and_annotated: I8 = -128 & 127\n",
+        "    let or_annotated: U8 = 0 | 255\n",
+        "    let xor_unannotated = 65535 ^ 0\n",
+        "    let xor_selected: U16 = xor_unannotated\n",
+        "    let tail_pair = 1 & 2\n",
+        "    tail_pair\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn primitive_bitwise_integer_literal_pairs_default_both_operands_to_i64() {
+    let source = concat!(
+        "pub fn default_i64() -> I32 {\n",
+        "    let unused = -9223372036854775808 ^ 0\n",
+        "    let output: I32 = 0\n",
+        "    output\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn primitive_bitwise_integer_literal_pairs_range_check_both_operands_and_recover() {
+    let source = concat!(
+        "pub fn out_of_range() -> I32 {\n",
+        "    let signed: I8 = 128 & -129\n",
+        "    let unsigned: U8 = 256 | -1\n",
+        "    let recovered: U8 = unsigned\n",
+        "    let output: I32 = 0\n",
+        "    output\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let literal_spans = [
+        (
+            source.find("128 & -129").expect("signed pair exists"),
+            "128",
+            "integer literal is out of range for `I8`",
+        ),
+        (
+            source.find("128 & -129").expect("signed pair exists") + "128 & ".len(),
+            "-129",
+            "integer literal is out of range for `I8`",
+        ),
+        (
+            source.find("256 | -1").expect("unsigned pair exists"),
+            "256",
+            "integer literal is out of range for `U8`",
+        ),
+        (
+            source.find("256 | -1").expect("unsigned pair exists") + "256 | ".len(),
+            "-1",
+            "integer literal is out of range for `U8`",
+        ),
+    ];
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        literal_spans.len(),
+        "both operands must be checked against their shared selected type:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "range errors should recover through the following local and tail:\n{stdout}"
+    );
+    for (start, literal, message) in literal_spans {
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "LITERAL_OUT_OF_RANGE",
+            message,
+            start,
+            start + literal.len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_bitwise_integer_literal_pair_annotation_mismatch_recovers() {
+    let source = concat!(
+        "pub fn mismatch() -> Bool {\n",
+        "    let value: Bool = 1 & 2\n",
+        "    let recovered: Bool = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression = "1 & 2";
+    let expression_start = source
+        .find(expression)
+        .expect("incompatible annotated pair exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the incompatible annotation should produce one mismatch:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the pair should recover to Bool and reach the following local and tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found an integer literal",
+        expression_start,
+        expression_start + expression.len(),
+    );
 }
 
 #[test]
