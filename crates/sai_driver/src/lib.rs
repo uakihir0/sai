@@ -6377,6 +6377,8 @@ fn check_function_body_primitive_local_block(
                         (is_preceding_path(left) && is_preceding_path(right))
                             || (is_preceding_path(left)
                                 && is_direct_function_integer_literal(right))
+                            || (is_direct_function_integer_literal(left)
+                                && is_preceding_path(right))
                     }
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                         (is_preceding_path(left) && is_preceding_path(right))
