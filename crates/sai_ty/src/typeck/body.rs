@@ -828,9 +828,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     let Some(right_kind) = primitive_literal_kind(right_literal) else {
                         return Err(());
                     };
-                    if !primitive_bitwise_char_literal_pair_supported(operator, right_kind)
-                        || matches!(right_literal, Lit::Float { negated: true, .. })
-                    {
+                    if !primitive_bitwise_char_literal_pair_supported(operator, right_kind) {
                         return Err(());
                     }
 

@@ -423,16 +423,17 @@ mod tests {
                 "{primitive:?} {text}"
             );
         }
-        for (primitive, text) in [
-            (PrimTy::F32, "3.4028236e38"),
-            (PrimTy::F64, "1.7976931348623159e308"),
+        for (primitive, text, negated) in [
+            (PrimTy::F32, "3.4028236e38", false),
+            (PrimTy::F64, "1.7976931348623159e308", false),
+            (PrimTy::F64, "1e999", true),
         ] {
             assert_eq!(
                 check_primitive_literal(
                     primitive,
                     Lit::Float {
                         text: symbols.intern(text).unwrap(),
-                        negated: false
+                        negated
                     },
                     &symbols,
                     64
@@ -441,6 +442,19 @@ mod tests {
                 "{primitive:?} {text}"
             );
         }
+        assert_eq!(
+            check_primitive_literal(
+                PrimTy::F64,
+                Lit::Float {
+                    text: symbols.intern("1e-400").unwrap(),
+                    negated: true,
+                },
+                &symbols,
+                64,
+            ),
+            PrimitiveLiteralResult::Match,
+            "a negative nonzero literal that rounds to zero is accepted per spec/06 §6.3.2"
+        );
         for text in [
             symbols.intern("not a decimal").unwrap(),
             sai_intern::Symbol::ERROR,
