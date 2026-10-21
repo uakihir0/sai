@@ -532,6 +532,8 @@ CLI regression tests also verify active Git contract mismatches, offline cache m
 
 Locked dependency-source regressions verify dependency syntax and Phase 1 diagnostics with `dep:<identity>@<version>/...` paths, including when the root source directory is missing or the root package is artifact-only.
 
+**IR-776 flat-local bitwise path pairs.** A local initializer may use one direct `&`, `|`, or `^` between plain paths to eligible parameters or preceding locals. Resolve both by `BindingId`; matching concrete integer and `Byte` pairs are accepted without widening. For an integer or `Byte` left operand, another supported primitive on the right reports `TYPE_MISMATCH` at that path and recovers the expression to the left type. For `Bool`, `F32`, or `F64` on the left, report a right-path mismatch first when types differ and then `OPERATOR_NOT_SUPPORTED` on the expression; matching operands get only the unsupported-operator diagnostic. For `Char`, report rule-3 `OPERATOR_NOT_SUPPORTED` naming the trait and both types, with no synthetic mismatch. A local annotation is checked against the recovered expression type; preserve the operator, and leave `and`/`or` behavior unchanged. Literal operands, unresolved numeric locals, unary `~`, shifts, aliases, nonlocal/qualified paths, self/forward references, computed/nested operands, and unsupported owners remain gated. No bitwise lowering or runtime execution is implemented here.
+
 ### 13.6.3 `sai build`
 
 ```text
