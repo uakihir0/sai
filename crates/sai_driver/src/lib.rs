@@ -6391,9 +6391,11 @@ fn check_function_body_primitive_local_block(
                 let supported_shape = match operator {
                     BinOp::And | BinOp::Or => is_preceding_path(left) && is_preceding_path(right),
                     BinOp::Shl | BinOp::Shr => {
-                        is_preceding_path(left)
+                        (is_preceding_path(left)
                             && (is_preceding_path(right)
-                                || is_direct_function_integer_literal(right))
+                                || is_direct_function_integer_literal(right)))
+                            || (is_direct_function_integer_literal(left)
+                                && is_preceding_path(right))
                     }
                     BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                         (is_preceding_path(left) && is_preceding_path(right))
@@ -26332,6 +26334,7 @@ mod tests {
     fn function_body_type_check_keeps_unsupported_bitwise_forms_gated() {
         let root = concat!(
             "type Word = I32\n",
+            "type ShiftCount = U32\n",
             "pub fn float_literal_left(left: I32) -> I32 {\n    let value = 1.0 & left\n    value\n}\n",
             "pub fn literal_pair() -> I32 {\n    let value = 1 ^ 2\n    value\n}\n",
             "pub fn non_integer_literal(left: I32) -> I32 {\n    let value = left & 1.0\n    value\n}\n",
@@ -26341,7 +26344,11 @@ mod tests {
             "pub fn unresolved(left: I32) -> I32 {\n    let bits = 1\n    let value = bits & left\n    value\n}\n",
             "pub fn alias(left: Word, right: Word) -> Word {\n    let value = left & right\n    value\n}\n",
             "pub fn nested_bit_not(left: I32) -> I32 {\n    let value = ~(~left)\n    value\n}\n",
-            "pub fn shift(amount: U32) -> I32 {\n    let value = 1 << amount\n    value\n}\n",
+            "pub fn shift_literal_pair() -> I32 {\n    let value = 1 << 2\n    value\n}\n",
+            "pub fn aliased_shift_count(amount: ShiftCount) -> I32 {\n    let value = 1 << amount\n    value\n}\n",
+            "pub fn unresolved_shift_count() -> I32 {\n    let amount = 1\n    let value = 1 << amount\n    value\n}\n",
+            "pub fn self_referenced_shift_count() -> I32 {\n    let value = 1 << value\n    value\n}\n",
+            "pub fn forward_shift_count() -> I32 {\n    let value = 1 << future\n    let future: U32 = 1\n    value\n}\n",
             "pub fn self_reference(left: I32) -> I32 {\n    let value = value & left\n    value\n}\n",
             "pub fn forward_reference(left: I32) -> I32 {\n    let value = future & left\n    let future: I32 = 1\n    value\n}\n",
         );
@@ -26359,7 +26366,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 12);
+        assert_eq!(resolved.owners().len(), 16);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()
