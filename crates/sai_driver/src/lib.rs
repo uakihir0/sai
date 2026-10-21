@@ -27534,6 +27534,48 @@ mod tests {
             "    let recovered: Char = low_value\n",
             "    recovered\n",
             "}\n",
+            "pub fn char_integer_alias_chain_defaults() -> Char {\n",
+            "    let rhs = -2\n",
+            "    let alias1 = rhs\n",
+            "    let alias2 = alias1\n",
+            "    let alias3 = alias2\n",
+            "    let and_value = 'a' & alias3\n",
+            "    let or_value = 'b' | alias3\n",
+            "    let xor_value = 'c' ^ alias3\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_integer_alias_chain_constrained() -> Char {\n",
+            "    let rhs = 1\n",
+            "    let alias1 = rhs\n",
+            "    let alias2 = alias1\n",
+            "    let alias3 = alias2\n",
+            "    let and_value = 'd' & alias3\n",
+            "    let or_value = 'e' | alias3\n",
+            "    let xor_value = 'f' ^ alias3\n",
+            "    let narrowed: I32 = alias3\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_integer_alias_chain_i8_range() -> Char {\n",
+            "    let rhs = -129\n",
+            "    let alias1 = rhs\n",
+            "    let alias2 = alias1\n",
+            "    let alias3 = alias2\n",
+            "    let value = 'g' & alias3\n",
+            "    let narrowed: I8 = alias3\n",
+            "    let recovered: Char = value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_integer_alias_chain_annotation_recovery() -> I32 {\n",
+            "    let rhs = -1\n",
+            "    let alias1 = rhs\n",
+            "    let alias2 = alias1\n",
+            "    let alias3 = alias2\n",
+            "    let value: I32 = 'h' ^ alias3\n",
+            "    let recovered: I32 = value\n",
+            "    recovered\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -27549,7 +27591,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 5);
+        assert_eq!(owners.len(), 9);
 
         let expected_diagnostics = [
             (
@@ -27626,12 +27668,66 @@ mod tests {
                     ),
                 ],
             ),
+            (
+                5,
+                vec![
+                    (
+                        "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+                        "'a' & alias3",
+                    ),
+                    (
+                        "operator `|` has no `BitOr<I64>` implementation for `Char`",
+                        "'b' | alias3",
+                    ),
+                    (
+                        "operator `^` has no `BitXor<I64>` implementation for `Char`",
+                        "'c' ^ alias3",
+                    ),
+                ],
+            ),
+            (
+                6,
+                vec![
+                    (
+                        "operator `&` has no `BitAnd<I32>` implementation for `Char`",
+                        "'d' & alias3",
+                    ),
+                    (
+                        "operator `|` has no `BitOr<I32>` implementation for `Char`",
+                        "'e' | alias3",
+                    ),
+                    (
+                        "operator `^` has no `BitXor<I32>` implementation for `Char`",
+                        "'f' ^ alias3",
+                    ),
+                ],
+            ),
+            (
+                7,
+                vec![
+                    ("integer literal is out of range for `I8`", "-129"),
+                    (
+                        "operator `&` has no `BitAnd<I8>` implementation for `Char`",
+                        "'g' & alias3",
+                    ),
+                ],
+            ),
+            (
+                8,
+                vec![
+                    (
+                        "operator `^` has no `BitXor<I64>` implementation for `Char`",
+                        "'h' ^ alias3",
+                    ),
+                    ("expected `I32`, found `Char`", "'h' ^ alias3"),
+                ],
+            ),
         ];
 
         for (index, expected) in expected_diagnostics {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
-                .expect("untyped integer local Char bitwise pair is checked")
+                .expect("untyped integer local or alias-chain Char bitwise pair is checked")
             else {
                 panic!("owner {index} must remain in the supported body-checking slice");
             };
@@ -29759,9 +29855,10 @@ mod tests {
             "pub fn char_literal_unresolved_path_rhs() -> Char {\n    let value = 'a' & missing\n    value\n}\n",
             "pub fn char_computed_float_alias_chain_path_rhs(base: F32) -> Char {\n    let computed = 1.0 + base\n    let alias1 = computed\n    let alias2 = alias1\n    let value = 'a' & alias2\n    value\n}\n",
             "pub fn char_literal_computed_float_local_rhs() -> Char {\n    let right = 1.0 + 2.0\n    let value = 'a' & right\n    value\n}\n",
-            "pub fn char_literal_integer_alias_path_rhs() -> Char {\n    let right = 1\n    let alias1 = right\n    let alias2 = alias1\n    let constrained: I32 = right\n    let value = 'a' & alias2\n    value\n}\n",
             "pub fn char_literal_computed_integer_path_rhs() -> Char {\n    let right = 1 + 2\n    let value = 'a' & right\n    value\n}\n",
-            "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char {\n    let right = 1\n    let value = 'a' & right\n    value\n}\n",
+            "pub fn char_literal_computed_integer_alias_chain_path_rhs(base: I32) -> Char {\n    let computed = 1 + base\n    let alias1 = computed\n    let alias2 = alias1\n    let alias3 = alias2\n    let value = 'a' & alias3\n    value\n}\n",
+            "pub fn char_literal_integer_variable_additional_site_alias_chain_rhs() -> Char {\n    let computed = 1 & 2\n    let alias1 = computed\n    let alias2 = alias1\n    let value = 'a' & alias2\n    value\n}\n",
+            "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char {\n    let right = 1\n    let alias1 = right\n    let alias2 = alias1\n    let alias3 = alias2\n    let value = 'a' & alias3\n    value\n}\n",
             "pub fn generic_char_literal_untyped_float_path_rhs<T>() -> Char {\n    let right = 1.0\n    let alias1 = right\n    let alias2 = alias1\n    let alias3 = alias2\n    let value = 'a' & alias3\n    value\n}\n",
             "pub fn char_literal_self_reference_path_rhs() -> Char {\n    let value = 'a' & value\n    value\n}\n",
             "pub fn char_literal_forward_reference_path_rhs() -> Char {\n    let value = 'a' & later\n    let later: Bool = true\n    value\n}\n",
@@ -29809,7 +29906,10 @@ mod tests {
             "impl CharUntypedIntegerPathOwner {\n",
             "    fn char_untyped_integer_path_method(self: borrow Self) -> Char {\n",
             "        let right = 1\n",
-            "        let value = 'a' & right\n",
+            "        let alias1 = right\n",
+            "        let alias2 = alias1\n",
+            "        let alias3 = alias2\n",
+            "        let value = 'a' & alias3\n",
             "        value\n",
             "    }\n",
             "}\n",
@@ -29934,7 +30034,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 86);
+        assert_eq!(resolved.owners().len(), 87);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()

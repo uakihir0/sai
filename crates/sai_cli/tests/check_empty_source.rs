@@ -7393,7 +7393,7 @@ fn primitive_bitwise_char_untyped_integer_local_rhs_defaults_checks_range_and_re
             .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
             .count(),
         5,
-        "each Char/untyped-integer-path pair should report one missing trait:\n{stdout}"
+        "each direct Char/untyped-integer-path pair should report one missing trait:\n{stdout}"
     );
     assert!(
         !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
@@ -7421,13 +7421,69 @@ fn primitive_bitwise_char_untyped_integer_local_rhs_defaults_checks_range_and_re
         );
     }
 
+    let alias_chain_source = concat!(
+        "pub fn char_integer_alias_chain_defaults() -> Char {\n",
+        "    let rhs = -2\n",
+        "    let alias1 = rhs\n",
+        "    let alias2 = alias1\n",
+        "    let alias3 = alias2\n",
+        "    let and_value = 'a' & alias3\n",
+        "    let or_value = 'b' | alias3\n",
+        "    let xor_value = 'c' ^ alias3\n",
+        "    let recovered: Char = xor_value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let alias_chain_output = run_check(alias_chain_source, "", &[], &[]);
+    let alias_chain_stdout =
+        String::from_utf8(alias_chain_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        alias_chain_output.status.code(),
+        Some(1),
+        "{alias_chain_stdout}"
+    );
+    assert_eq!(
+        alias_chain_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        3,
+        "each alias-chain Char operator should report one missing trait:\n{alias_chain_stdout}"
+    );
+    assert!(
+        !alias_chain_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !alias_chain_stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !alias_chain_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !alias_chain_stdout.contains("\"type\":\"result\""),
+        "unconstrained integer alias chains should default to I64 and recover as Char:\n{alias_chain_stdout}"
+    );
+    for (operator, expression, trait_name) in [
+        ("&", "'a' & alias3", "BitAnd"),
+        ("|", "'b' | alias3", "BitOr"),
+        ("^", "'c' ^ alias3", "BitXor"),
+    ] {
+        let start = alias_chain_source
+            .find(expression)
+            .expect("alias-chain Char expression exists");
+        assert_json_diagnostic_primary_span(
+            &alias_chain_stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<I64>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+
     let constrained_source = concat!(
         "pub fn char_untyped_integer_path_later_constraint() -> Char {\n",
         "    let rhs = 1\n",
-        "    let and_value = 'a' & rhs\n",
-        "    let or_value = 'b' | rhs\n",
-        "    let constrained: I32 = rhs\n",
-        "    let recovered: Char = or_value\n",
+        "    let alias1 = rhs\n",
+        "    let alias2 = alias1\n",
+        "    let alias3 = alias2\n",
+        "    let and_value = 'a' & alias3\n",
+        "    let or_value = 'b' | alias3\n",
+        "    let xor_value = 'c' ^ alias3\n",
+        "    let constrained: I32 = alias3\n",
+        "    let recovered: Char = xor_value\n",
         "    recovered\n",
         "}\n",
     );
@@ -7443,7 +7499,7 @@ fn primitive_bitwise_char_untyped_integer_local_rhs_defaults_checks_range_and_re
         constrained_stdout
             .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
             .count(),
-        2,
+        3,
         "both operators should be diagnosed after RHS inference:\n{constrained_stdout}"
     );
     assert!(
@@ -7453,9 +7509,11 @@ fn primitive_bitwise_char_untyped_integer_local_rhs_defaults_checks_range_and_re
             && !constrained_stdout.contains("\"type\":\"result\""),
         "the later I32 use should constrain the shared integer literal:\n{constrained_stdout}"
     );
-    for (operator, expression, trait_name) in
-        [("&", "'a' & rhs", "BitAnd"), ("|", "'b' | rhs", "BitOr")]
-    {
+    for (operator, expression, trait_name) in [
+        ("&", "'a' & alias3", "BitAnd"),
+        ("|", "'b' | alias3", "BitOr"),
+        ("^", "'c' ^ alias3", "BitXor"),
+    ] {
         let start = constrained_source
             .find(expression)
             .expect("later-constrained Char/integer expression exists");
@@ -7468,10 +7526,63 @@ fn primitive_bitwise_char_untyped_integer_local_rhs_defaults_checks_range_and_re
         );
     }
 
+    let narrow_source = concat!(
+        "pub fn char_untyped_integer_alias_chain_i8_range() -> Char {\n",
+        "    let rhs = -129\n",
+        "    let alias1 = rhs\n",
+        "    let alias2 = alias1\n",
+        "    let alias3 = alias2\n",
+        "    let value = 'a' & alias3\n",
+        "    let narrowed: I8 = alias3\n",
+        "    let recovered: Char = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let narrow_output = run_check(narrow_source, "", &[], &[]);
+    let narrow_stdout = String::from_utf8(narrow_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(narrow_output.status.code(), Some(1), "{narrow_stdout}");
+    assert_eq!(
+        narrow_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the constrained alias should retain one Char trait diagnostic:\n{narrow_stdout}"
+    );
+    assert_eq!(
+        narrow_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        1,
+        "the original signed literal should be checked as I8:\n{narrow_stdout}"
+    );
+    let rhs_start = narrow_source
+        .find("-129")
+        .expect("narrowed signed source literal exists");
+    assert_json_diagnostic_primary_span(
+        &narrow_stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        rhs_start,
+        rhs_start + "-129".len(),
+    );
+    let expression = narrow_source
+        .find("'a' & alias3")
+        .expect("I8-constrained alias expression exists");
+    assert_json_diagnostic_primary_span(
+        &narrow_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `&` has no `BitAnd<I8>` implementation for `Char`",
+        expression,
+        expression + "'a' & alias3".len(),
+    );
+
     let annotation_source = concat!(
         "pub fn char_untyped_integer_path_annotation_recovery() -> I32 {\n",
         "    let rhs = -1\n",
-        "    let value: I32 = 'z' ^ rhs\n",
+        "    let alias1 = rhs\n",
+        "    let alias2 = alias1\n",
+        "    let alias3 = alias2\n",
+        "    let value: I32 = 'z' ^ alias3\n",
         "    let recovered: I32 = value\n",
         "    recovered\n",
         "}\n",
@@ -7505,9 +7616,9 @@ fn primitive_bitwise_char_untyped_integer_local_rhs_defaults_checks_range_and_re
         "the local should recover to I32 for the following use and tail:\n{annotation_stdout}"
     );
     let expression = annotation_source
-        .find("'z' ^ rhs")
+        .find("'z' ^ alias3")
         .expect("annotated Char/untyped-integer-path expression exists");
-    let end = expression + "'z' ^ rhs".len();
+    let end = expression + "'z' ^ alias3".len();
     assert_json_diagnostic_primary_span(
         &annotation_stdout,
         "OPERATOR_NOT_SUPPORTED",
@@ -7526,9 +7637,15 @@ fn primitive_bitwise_char_untyped_integer_local_rhs_defaults_checks_range_and_re
     let range_source = concat!(
         "pub fn char_untyped_integer_path_range_recovery() -> Char {\n",
         "    let high = 9223372036854775808\n",
-        "    let high_value = 'a' & high\n",
+        "    let high_alias1 = high\n",
+        "    let high_alias2 = high_alias1\n",
+        "    let high_alias3 = high_alias2\n",
+        "    let high_value = 'a' & high_alias3\n",
         "    let low = -9223372036854775809\n",
-        "    let low_value = 'b' | low\n",
+        "    let low_alias1 = low\n",
+        "    let low_alias2 = low_alias1\n",
+        "    let low_alias3 = low_alias2\n",
+        "    let low_value = 'b' | low_alias3\n",
         "    let recovered: Char = low_value\n",
         "    recovered\n",
         "}\n",
@@ -7556,9 +7673,10 @@ fn primitive_bitwise_char_untyped_integer_local_rhs_defaults_checks_range_and_re
             && !range_stdout.contains("\"type\":\"result\""),
         "range errors should coexist with Char recovery:\n{range_stdout}"
     );
-    for (operator, expression, trait_name) in
-        [("&", "'a' & high", "BitAnd"), ("|", "'b' | low", "BitOr")]
-    {
+    for (operator, expression, trait_name) in [
+        ("&", "'a' & high_alias3", "BitAnd"),
+        ("|", "'b' | low_alias3", "BitOr"),
+    ] {
         let start = range_source
             .find(expression)
             .expect("out-of-range Char/integer expression exists");
@@ -8393,16 +8511,20 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let right = 1.0 + 2.0\n    let result = 'a' & right",
         ),
         fixture(
-            "pub fn char_literal_integer_alias_path_rhs() -> Char",
-            "let right = 1\n    let alias1 = right\n    let alias2 = alias1\n    let constrained: I32 = right\n    let result = 'a' & alias2",
-        ),
-        fixture(
             "pub fn char_literal_computed_integer_path_rhs() -> Char",
             "let right = 1 + 2\n    let result = 'a' & right",
         ),
         fixture(
+            "pub fn char_literal_computed_integer_alias_chain_path_rhs(base: I32) -> Char",
+            "let computed = 1 + base\n    let alias1 = computed\n    let alias2 = alias1\n    let alias3 = alias2\n    let result = 'a' & alias3",
+        ),
+        fixture(
+            "pub fn char_literal_integer_variable_additional_site_alias_chain_rhs() -> Char",
+            "let computed = 1 & 2\n    let alias1 = computed\n    let alias2 = alias1\n    let result = 'a' & alias2",
+        ),
+        fixture(
             "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char",
-            "let right = 1\n    let result = 'a' & right",
+            "let right = 1\n    let alias1 = right\n    let alias2 = alias1\n    let alias3 = alias2\n    let result = 'a' & alias3",
         ),
         fixture(
             "pub fn generic_char_literal_untyped_float_path_rhs<T>() -> Char",
@@ -8413,7 +8535,10 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "impl CharUntypedIntegerPathOwner {\n",
             "    fn char_untyped_integer_path_method(self: borrow Self) -> Char {\n",
             "        let right = 1\n",
-            "        let result = 'a' & right\n",
+            "        let alias1 = right\n",
+            "        let alias2 = alias1\n",
+            "        let alias3 = alias2\n",
+            "        let result = 'a' & alias3\n",
             "        result\n",
             "    }\n",
             "}\n",
