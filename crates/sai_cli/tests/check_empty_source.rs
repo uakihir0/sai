@@ -7219,6 +7219,155 @@ fn primitive_bitwise_char_float_literal_rhs_defaults_checks_range_and_recovers()
 }
 
 #[test]
+fn primitive_bitwise_char_negative_float_literal_rhs_defaults_checks_range_and_recovers() {
+    let source = concat!(
+        "pub fn char_negative_float_literal_rhs() -> Char {\n",
+        "    let and_value = 'a' & -1.0\n",
+        "    let or_value = 'b' | -2.5\n",
+        "    let xor_value = 'c' ^ -1e-400\n",
+        "    let recovered: Char = xor_value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        3,
+        "each negative Char/float pair should report its missing trait:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"LITERAL_TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "finite negative floats should default to F64 and recover as Char:\n{stdout}"
+    );
+    for (operator, expression, trait_name) in [
+        ("&", "'a' & -1.0", "BitAnd"),
+        ("|", "'b' | -2.5", "BitOr"),
+        ("^", "'c' ^ -1e-400", "BitXor"),
+    ] {
+        let start = source
+            .find(expression)
+            .expect("negative Char/float expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<F64>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+
+    let range_source = concat!(
+        "pub fn char_negative_float_literal_range() -> Char {\n",
+        "    let value = 'z' ^ -1e999\n",
+        "    let recovered: Char = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let range_output = run_check(range_source, "", &[], &[]);
+    let range_stdout = String::from_utf8(range_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(range_output.status.code(), Some(1), "{range_stdout}");
+    assert_eq!(
+        range_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the Char trait failure should be reported once:\n{range_stdout}"
+    );
+    assert_eq!(
+        range_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        1,
+        "the default F64 range should be checked once:\n{range_stdout}"
+    );
+    assert!(
+        !range_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !range_stdout.contains("\"type\":\"result\""),
+        "the expression should recover to Char after both diagnostics:\n{range_stdout}"
+    );
+    let expression = range_source
+        .find("'z' ^ -1e999")
+        .expect("negative out-of-range Char/float expression exists");
+    let literal = expression + "'z' ^ ".len();
+    assert_json_diagnostic_primary_span(
+        &range_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `^` has no `BitXor<F64>` implementation for `Char`",
+        expression,
+        expression + "'z' ^ -1e999".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &range_stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "floating-point literal is out of range for `F64`",
+        literal,
+        literal + "-1e999".len(),
+    );
+
+    let annotation_source = concat!(
+        "pub fn char_negative_float_annotation_recovery() -> F32 {\n",
+        "    let value: F32 = 'a' ^ -1.0\n",
+        "    let recovered: F32 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let annotation_output = run_check(annotation_source, "", &[], &[]);
+    let annotation_stdout =
+        String::from_utf8(annotation_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        annotation_output.status.code(),
+        Some(1),
+        "{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the Char trait failure should be reported once:\n{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "the differing F32 annotation should report one mismatch:\n{annotation_stdout}"
+    );
+    assert!(
+        !annotation_stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !annotation_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !annotation_stdout.contains("\"type\":\"result\""),
+        "the local should recover to F32 for its following use and tail:\n{annotation_stdout}"
+    );
+    let expression = annotation_source
+        .find("'a' ^ -1.0")
+        .expect("annotated negative Char/float expression exists");
+    let end = expression + "'a' ^ -1.0".len();
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `^` has no `BitXor<F64>` implementation for `Char`",
+        expression,
+        end,
+    );
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "TYPE_MISMATCH",
+        "expected `F32`, found `Char`",
+        expression,
+        end,
+    );
+}
+
+#[test]
 fn primitive_bitwise_char_literal_left_local_path_rhs_reports_traits_and_recovers() {
     let source = concat!(
         "pub fn char_literal_path_rhs(bool_rhs: Bool, byte_rhs: Byte, char_rhs: Char, integer_rhs: I32, f32_rhs: F32, f64_rhs: F64) -> Char {\n",
@@ -7402,12 +7551,16 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         )
         .to_owned(),
         fixture(
-            "pub fn char_unary_float_literal_rhs() -> Char",
-            "let result = 'a' & -1.0",
+            "pub fn char_unary_float_path_rhs(rhs: F64) -> Char",
+            "let result = 'a' & -rhs",
         ),
         fixture(
             "pub fn char_computed_float_literal_rhs() -> Char",
             "let result = 'a' & (1.0 + 1.0)",
+        ),
+        fixture(
+            "pub fn char_nested_negative_float_literal_rhs() -> Char",
+            "let result = ('a' & -1.0) ^ 'b'",
         ),
         format!(
             "type BoolAlias = Bool\n{}",
@@ -7520,6 +7673,10 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn generic_char_float_literal_pair<T>() -> Char",
             "let result = 'a' ^ 1.0",
         ),
+        fixture(
+            "pub fn generic_char_negative_float_literal_pair<T>() -> Char",
+            "let result = 'a' ^ -1.0",
+        ),
         concat!(
             "type CharLiteralPairOwner { marker: Char }\n",
             "impl CharLiteralPairOwner {\n",
@@ -7541,6 +7698,10 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "    }\n",
             "    fn char_float_literal_pair(self: borrow Self) -> Char {\n",
             "        let result = 'a' ^ 1.0\n",
+            "        result\n",
+            "    }\n",
+            "    fn char_negative_float_literal_pair(self: borrow Self) -> Char {\n",
+            "        let result = 'a' ^ -1.0\n",
             "        result\n",
             "    }\n",
             "}\n",
