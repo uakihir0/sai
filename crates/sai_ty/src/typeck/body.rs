@@ -809,7 +809,21 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
                 if primitive_literal_kind(literal) == Some(PrimitiveLiteralKind::Character) {
                     let ExprKind::Lit(right_literal) = right.kind else {
-                        return Err(());
+                        let right_type = self
+                            .check_local_path(right)
+                            .ok()
+                            .and_then(|local_type| self.concrete_local_type(local_type))
+                            .filter(|primitive| supports_primitive_literal(*primitive))
+                            .ok_or(())?;
+                        self.errors.push(PrimitiveBodyError {
+                            node: expression,
+                            kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
+                                operator,
+                                left: PrimTy::Char,
+                                right: right_type,
+                            },
+                        });
+                        return Ok(LocalType::Concrete(PrimTy::Char));
                     };
                     let Some(right_kind) = primitive_literal_kind(right_literal) else {
                         return Err(());

@@ -6451,6 +6451,8 @@ fn check_function_body_primitive_local_block(
                                 ))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Char(_)))
                                 && is_direct_function_integer_literal(right))
+                            || (matches!(left.kind, ExprKind::Lit(Lit::Char(_)))
+                                && is_preceding_path(right))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
                                 && (is_preceding_path(right)
                                     || is_direct_function_scalar_literal(right)))
@@ -27305,6 +27307,134 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_reports_char_literal_local_path_rhs_pairs_and_recovers_annotations()
+    {
+        let root = concat!(
+            "pub fn char_literal_path_rhs(bool_rhs: Bool, byte_rhs: Byte, char_rhs: Char, integer_rhs: I32, f32_rhs: F32, f64_rhs: F64) -> Char {\n",
+            "    let prior_byte: Byte = byte_rhs\n",
+            "    let prior_integer: I32 = integer_rhs\n",
+            "    let prior_f64: F64 = f64_rhs\n",
+            "    let bool_and_parameter = 'a' & bool_rhs\n",
+            "    let byte_and_local = 'b' & prior_byte\n",
+            "    let char_or_parameter = 'c' | char_rhs\n",
+            "    let integer_or_local = 'd' | prior_integer\n",
+            "    let f32_xor_parameter = 'e' ^ f32_rhs\n",
+            "    let f64_xor_local = 'f' ^ prior_f64\n",
+            "    let recovered: Char = f64_xor_local\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_literal_path_annotation_recovery(bool_rhs: Bool) -> I32 {\n",
+            "    let value: I32 = 'a' ^ bool_rhs\n",
+            "    let recovered: I32 = value\n",
+            "    recovered\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 2);
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[0]
+            .body_type_check()
+            .expect("Char-literal/local-path pairs remain in the supported diagnostic slice")
+        else {
+            panic!("Char-literal/local-path pairs must report operator diagnostics");
+        };
+        let cases = [
+            ("&", "'a' & bool_rhs", "BitAnd", "Bool"),
+            ("&", "'b' & prior_byte", "BitAnd", "Byte"),
+            ("|", "'c' | char_rhs", "BitOr", "Char"),
+            ("|", "'d' | prior_integer", "BitOr", "I32"),
+            ("^", "'e' ^ f32_rhs", "BitXor", "F32"),
+            ("^", "'f' ^ prior_f64", "BitXor", "F64"),
+        ];
+        assert_eq!(diagnostics.len(), cases.len());
+        for (diagnostic, (operator, expression, trait_name, right_type)) in
+            diagnostics.iter().zip(cases)
+        {
+            assert_eq!(diagnostic.code, sai_diagnostics::Code::OperatorNotSupported);
+            assert_eq!(
+                diagnostic.message,
+                format!(
+                    "operator `{operator}` has no `{trait_name}<{right_type}>` implementation for `Char`"
+                )
+            );
+            let start = root
+                .find(expression)
+                .expect("Char-literal/local-path expression exists");
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("unsupported operator has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + expression.len()) as u32),
+                )
+                .expect("expression span is ordered")
+            );
+        }
+
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[1]
+            .body_type_check()
+            .expect("Char recovery is compared against the mismatched local annotation")
+        else {
+            panic!("the Char-literal/local-path annotation mismatch must not gate the body");
+        };
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::OperatorNotSupported,
+                sai_diagnostics::Code::TypeMismatch,
+            ]
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "operator `^` has no `BitXor<Bool>` implementation for `Char`",
+                "expected `I32`, found `Char`",
+            ]
+        );
+        let expression = "'a' ^ bool_rhs";
+        let start = root
+            .find("let value: I32 = 'a' ^ bool_rhs")
+            .expect("annotated Char-literal/local-path pair exists")
+            + "let value: I32 = ".len();
+        let span = sai_diagnostics::TextRange::new(
+            sai_diagnostics::TextSize::new(start as u32),
+            sai_diagnostics::TextSize::new((start + expression.len()) as u32),
+        )
+        .expect("annotated expression span is ordered");
+        for diagnostic in diagnostics {
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("annotation recovery diagnostic has a primary span")
+                    .span
+                    .range,
+                span
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_reports_integer_path_nonbyte_scalar_literal_mismatches() {
         let primitive_types = [
             ("i8_value", "I8"),
@@ -28798,9 +28928,17 @@ mod tests {
             "pub fn nested_bool_literal_pair_left() -> Bool {\n    let value = (true & false) ^ true\n    value\n}\n",
             "pub fn chained_bool_literal_pairs() -> Bool {\n    let value = true & false | true\n    value\n}\n",
             "pub fn generic_bool_literal_pair<T>() -> Bool {\n    let value = true ^ false\n    value\n}\n",
-            "pub fn char_literal_left_path(right: Char) -> Char {\n    let value = 'a' & right\n    value\n}\n",
             "pub fn char_unary_float_literal_rhs() -> Char {\n    let value = 'a' & -1.0\n    value\n}\n",
             "pub fn char_computed_float_literal_rhs() -> Char {\n    let value = 'a' & (1.0 + 1.0)\n    value\n}\n",
+            "pub fn char_literal_alias_path_rhs(right: ByteAlias) -> Char {\n    let value = 'a' & right\n    value\n}\n",
+            "pub fn generic_char_literal_path_rhs<T>(right: T) -> Char {\n    let value = 'a' & right\n    value\n}\n",
+            "pub fn char_literal_unresolved_path_rhs() -> Char {\n    let value = 'a' & missing\n    value\n}\n",
+            "pub fn char_literal_unresolved_numeric_path_rhs() -> Char {\n    let right = 1\n    let value = 'a' & right\n    value\n}\n",
+            "pub fn char_literal_self_reference_path_rhs() -> Char {\n    let value = 'a' & value\n    value\n}\n",
+            "pub fn char_literal_forward_reference_path_rhs() -> Char {\n    let value = 'a' & later\n    let later: Bool = true\n    value\n}\n",
+            "pub fn char_literal_multisegment_path_rhs() -> Char {\n    let value = 'a' & package.flag\n    value\n}\n",
+            "pub fn char_literal_generic_path_rhs(right: I32) -> Char {\n    let value = 'a' & right<I32>\n    value\n}\n",
+            "pub fn char_literal_computed_path_rhs(left: Bool, right: Bool) -> Char {\n    let value = 'a' & (left ^ right)\n    value\n}\n",
             "pub fn char_literal_byte_string_pair() -> Char {\n    let value = 'a' & b\"text\"\n    value\n}\n",
             "pub fn char_bool_alias_annotation() -> CharAlias {\n    let value: CharAlias = 'a' & false\n    value\n}\n",
             "pub fn nested_char_literal_pair_rhs() -> Char {\n    let value = 'a' & ('b' | 'c')\n    value\n}\n",
@@ -28812,6 +28950,13 @@ mod tests {
             "pub fn generic_char_byte_literal_pair<T>() -> Char {\n    let value = 'a' ^ b'b'\n    value\n}\n",
             "pub fn generic_char_integer_literal_pair<T>() -> Char {\n    let value = 'a' ^ -2\n    value\n}\n",
             "pub fn generic_char_float_literal_pair<T>() -> Char {\n    let value = 'a' ^ 1.0\n    value\n}\n",
+            "type CharLiteralPathOwner { marker: Char }\n",
+            "impl CharLiteralPathOwner {\n",
+            "    fn char_literal_path_method(self: borrow Self, right: Byte) -> Char {\n",
+            "        let value = 'a' ^ right\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
             "pub fn char_byte_alias_annotation() -> CharAlias {\n    let value: CharAlias = 'a' ^ b'b'\n    value\n}\n",
             "pub fn char_integer_alias_annotation() -> CharAlias {\n    let value: CharAlias = 'a' ^ 1\n    value\n}\n",
             "pub fn char_float_alias_annotation() -> CharAlias {\n    let value: CharAlias = 'a' ^ 1.0\n    value\n}\n",
@@ -28932,7 +29077,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 70);
+        assert_eq!(resolved.owners().len(), 78);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()

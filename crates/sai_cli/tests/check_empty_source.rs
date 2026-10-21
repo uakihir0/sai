@@ -7219,6 +7219,117 @@ fn primitive_bitwise_char_float_literal_rhs_defaults_checks_range_and_recovers()
 }
 
 #[test]
+fn primitive_bitwise_char_literal_left_local_path_rhs_reports_traits_and_recovers() {
+    let source = concat!(
+        "pub fn char_literal_path_rhs(bool_rhs: Bool, byte_rhs: Byte, char_rhs: Char, integer_rhs: I32, f32_rhs: F32, f64_rhs: F64) -> Char {\n",
+        "    let prior_byte: Byte = byte_rhs\n",
+        "    let prior_integer: I32 = integer_rhs\n",
+        "    let prior_f64: F64 = f64_rhs\n",
+        "    let bool_and_parameter = 'a' & bool_rhs\n",
+        "    let byte_and_local = 'b' & prior_byte\n",
+        "    let char_or_parameter = 'c' | char_rhs\n",
+        "    let integer_or_local = 'd' | prior_integer\n",
+        "    let f32_xor_parameter = 'e' ^ f32_rhs\n",
+        "    let f64_xor_local = 'f' ^ prior_f64\n",
+        "    let recovered: Char = f64_xor_local\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        6,
+        "each Char-literal/local-path pair should report one missing trait:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"LITERAL_TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "concrete path types should report trait failures and recover as Char:\n{stdout}"
+    );
+    for (operator, expression, trait_name, right_type) in [
+        ("&", "'a' & bool_rhs", "BitAnd", "Bool"),
+        ("&", "'b' & prior_byte", "BitAnd", "Byte"),
+        ("|", "'c' | char_rhs", "BitOr", "Char"),
+        ("|", "'d' | prior_integer", "BitOr", "I32"),
+        ("^", "'e' ^ f32_rhs", "BitXor", "F32"),
+        ("^", "'f' ^ prior_f64", "BitXor", "F64"),
+    ] {
+        let start = source
+            .find(expression)
+            .expect("Char-literal/local-path expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!(
+                "operator `{operator}` has no `{trait_name}<{right_type}>` implementation for `Char`"
+            ),
+            start,
+            start + expression.len(),
+        );
+    }
+
+    let annotation_source = concat!(
+        "pub fn char_literal_path_annotation_recovery(bool_rhs: Bool) -> I32 {\n",
+        "    let value: I32 = 'a' ^ bool_rhs\n",
+        "    let recovered: I32 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let annotation_output = run_check(annotation_source, "", &[], &[]);
+    let annotation_stdout =
+        String::from_utf8(annotation_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        annotation_output.status.code(),
+        Some(1),
+        "{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the Char/Bool trait failure should be reported once:\n{annotation_stdout}"
+    );
+    assert_eq!(
+        annotation_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "the differing annotation should report one mismatch:\n{annotation_stdout}"
+    );
+    assert!(
+        !annotation_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !annotation_stdout.contains("\"type\":\"result\""),
+        "the local should recover to I32 for its following use and tail:\n{annotation_stdout}"
+    );
+    let expression = annotation_source
+        .find("'a' ^ bool_rhs")
+        .expect("annotated Char-literal/local-path expression exists");
+    let end = expression + "'a' ^ bool_rhs".len();
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `^` has no `BitXor<Bool>` implementation for `Char`",
+        expression,
+        end,
+    );
+    assert_json_diagnostic_primary_span(
+        &annotation_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Char`",
+        expression,
+        end,
+    );
+}
+
+#[test]
 fn unsupported_primitive_bitwise_shapes_remain_gated() {
     let fixture = |signature: &str, statements: &str| {
         format!("{signature} {{\n    {statements}\n    result\n}}\n")
@@ -7291,16 +7402,55 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         )
         .to_owned(),
         fixture(
-            "pub fn char_literal_left_path(right: Char) -> Char",
-            "let result = 'a' & right",
-        ),
-        fixture(
             "pub fn char_unary_float_literal_rhs() -> Char",
             "let result = 'a' & -1.0",
         ),
         fixture(
             "pub fn char_computed_float_literal_rhs() -> Char",
             "let result = 'a' & (1.0 + 1.0)",
+        ),
+        format!(
+            "type BoolAlias = Bool\n{}",
+            fixture(
+                "pub fn char_literal_alias_path_rhs(right: BoolAlias) -> Char",
+                "let result = 'a' & right"
+            )
+        ),
+        fixture(
+            "pub fn generic_char_literal_path_rhs<T>(right: T) -> Char",
+            "let result = 'a' & right",
+        ),
+        fixture(
+            "pub fn char_literal_unresolved_path_rhs() -> Char",
+            "let result = 'a' & missing",
+        ),
+        fixture(
+            "pub fn char_literal_unresolved_numeric_path_rhs() -> Char",
+            "let right = 1\n    let result = 'a' & right",
+        ),
+        fixture(
+            "pub fn char_literal_self_reference_path_rhs() -> Char",
+            "let result = 'a' & result",
+        ),
+        fixture(
+            "pub fn char_literal_forward_reference_path_rhs() -> Char",
+            "let result = 'a' & later\n    let later: Bool = true",
+        ),
+        fixture(
+            "pub fn char_literal_multisegment_path_rhs() -> Char",
+            "let result = 'a' & package.flag",
+        ),
+        fixture(
+            "pub fn char_literal_generic_path_rhs(right: I32) -> Char",
+            "let result = 'a' & right<I32>",
+        ),
+        fixture(
+            "pub fn char_literal_computed_path_rhs(left: I32, right: I32) -> Char",
+            "let result = 'a' & (left + right)",
+        ),
+        fixture(
+            "pub fn char_literal_nested_path_rhs(left: I32, right: I32) -> Char",
+            "let result = 'a' & (left ^ right)",
         ),
         format!(
             "type CharAlias = Char\n{}",
@@ -7391,6 +7541,16 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "    }\n",
             "    fn char_float_literal_pair(self: borrow Self) -> Char {\n",
             "        let result = 'a' ^ 1.0\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        )
+        .to_owned(),
+        concat!(
+            "type CharLiteralPathOwner { marker: Char }\n",
+            "impl CharLiteralPathOwner {\n",
+            "    fn char_literal_path_method(self: borrow Self, right: Byte) -> Char {\n",
+            "        let result = 'a' ^ right\n",
             "        result\n",
             "    }\n",
             "}\n",
