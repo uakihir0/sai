@@ -1,0 +1,144 @@
+use acme:package-lock-auditor/model.{Lockfile, Package, Requirement, Version}
+
+pub fn clean_lock() -> Lockfile {
+    Lockfile(
+        packages: [
+            Some(Package(id: 0, name: "app", version: Version(major: 2, minor: 0, patch: 4))),
+            Some(Package(id: 10, name: "ui", version: Version(major: 1, minor: 8, patch: 2))),
+            Some(Package(id: 20, name: "renderer", version: Version(major: 2, minor: 4, patch: 1))),
+            Some(Package(id: 30, name: "glyphs", version: Version(major: 0, minor: 7, patch: 9))),
+            Some(Package(id: 40, name: "palette", version: Version(major: 1, minor: 6, patch: 3))),
+            Some(Package(id: 50, name: "audit", version: Version(major: 1, minor: 3, patch: 0))),
+        ],
+        requirements: [
+            Requirement(
+                requester_id: 0,
+                dependency_id: 10,
+                required_major: 1,
+                minimum_minor: 7,
+                maximum_minor_exclusive: 9,
+            ),
+            Requirement(
+                requester_id: 0,
+                dependency_id: 20,
+                required_major: 2,
+                minimum_minor: 3,
+                maximum_minor_exclusive: 5,
+            ),
+            Requirement(
+                requester_id: 0,
+                dependency_id: 50,
+                required_major: 1,
+                minimum_minor: 2,
+                maximum_minor_exclusive: 4,
+            ),
+            Requirement(
+                requester_id: 10,
+                dependency_id: 20,
+                required_major: 2,
+                minimum_minor: 3,
+                maximum_minor_exclusive: 5,
+            ),
+            Requirement(
+                requester_id: 10,
+                dependency_id: 40,
+                required_major: 1,
+                minimum_minor: 4,
+                maximum_minor_exclusive: 7,
+            ),
+            Requirement(
+                requester_id: 20,
+                dependency_id: 30,
+                required_major: 0,
+                minimum_minor: 5,
+                maximum_minor_exclusive: 9,
+            ),
+            Requirement(
+                requester_id: 30,
+                dependency_id: 40,
+                required_major: 1,
+                minimum_minor: 3,
+                maximum_minor_exclusive: 7,
+            ),
+            Requirement(
+                requester_id: 50,
+                dependency_id: 40,
+                required_major: 1,
+                minimum_minor: 2,
+                maximum_minor_exclusive: 4,
+            ),
+        ],
+    )
+}
+
+pub fn missing_target_lock() -> Lockfile {
+    var lock = clean_lock()
+    lock.requirements[0].dependency_id = 99
+    lock
+}
+
+pub fn missing_both_endpoints_lock() -> Lockfile {
+    var lock = clean_lock()
+    lock.requirements[0].requester_id = 98
+    lock.requirements[0].dependency_id = 99
+    lock
+}
+
+pub fn incompatible_range_lock() -> Lockfile {
+    var lock = clean_lock()
+    lock.requirements[0].minimum_minor = 9
+    lock.requirements[0].maximum_minor_exclusive = 10
+    lock
+}
+
+pub fn missing_requester_incompatible_range_lock() -> Lockfile {
+    var lock = clean_lock()
+    lock.requirements[0].requester_id = 98
+    lock.requirements[0].required_major = 2
+    lock
+}
+
+pub fn inclusive_minimum_lock() -> Lockfile {
+    var lock = clean_lock()
+    lock.requirements[0].minimum_minor = 8
+    lock.requirements[0].maximum_minor_exclusive = 9
+    lock
+}
+
+pub fn exclusive_maximum_lock() -> Lockfile {
+    var lock = clean_lock()
+    lock.requirements[0].minimum_minor = 8
+    lock.requirements[0].maximum_minor_exclusive = 8
+    lock
+}
+
+pub fn incompatible_major_lock() -> Lockfile {
+    var lock = clean_lock()
+    lock.requirements[0].required_major = 2
+    lock
+}
+
+pub fn cyclic_lock() -> Lockfile {
+    var lock = clean_lock()
+    // renderer already depends on glyphs, so this creates a two-package cycle.
+    lock.requirements[6].dependency_id = 20
+    lock.requirements[6].required_major = 2
+    lock.requirements[6].minimum_minor = 3
+    lock.requirements[6].maximum_minor_exclusive = 5
+    lock
+}
+
+pub fn missing_and_cyclic_lock() -> Lockfile {
+    var lock = missing_target_lock()
+    lock.requirements[6].dependency_id = 20
+    lock.requirements[6].required_major = 2
+    lock.requirements[6].minimum_minor = 3
+    lock.requirements[6].maximum_minor_exclusive = 5
+    lock
+}
+
+pub fn duplicate_id_lock() -> Lockfile {
+    var lock = clean_lock()
+    lock.packages[5].id = 40
+    lock
+}

@@ -1,0 +1,64 @@
+use acme:package-lock-auditor/model.{Lockfile, Package}
+
+pub fn find_package(lock: Lockfile, id: U32) -> Option<Package> {
+    for entry in lock.packages {
+        match entry {
+            Some(package) => {
+                if package.id == id {
+                    return Some(package)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+pub fn package_count(lock: Lockfile) -> USize {
+    var count: USize = 0
+    for entry in lock.packages {
+        match entry {
+            Some(_) => {
+                count += 1
+            }
+            None => {}
+        }
+    }
+    count
+}
+
+pub fn index_of_package(lock: Lockfile, id: U32) -> Option<USize> {
+    for index in 0..lock.packages.len() {
+        match lock.packages[index] {
+            Some(package) => {
+                if package.id == id {
+                    return Some(index)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+pub fn duplicate_id_pair_count(lock: Lockfile) -> USize {
+    var count: USize = 0
+    for left_index in 0..lock.packages.len() {
+        match lock.packages[left_index] {
+            Some(left) => {
+                for right_index in left_index + 1..lock.packages.len() {
+                    match lock.packages[right_index] {
+                        Some(right) => {
+                            if left.id == right.id {
+                                count += 1
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    count
+}

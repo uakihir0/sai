@@ -1,0 +1,48 @@
+use acme:telemetry-frame-decoder/decoder
+use acme:telemetry-frame-decoder/fixtures
+use acme:telemetry-frame-decoder/model.{FrameError}
+
+fn has_error(frame: Slice<Byte>, expected: FrameError) -> Bool {
+    match decoder.decode(frame) { Ok(_) => false, Err(actual) => actual == expected }
+}
+
+test "a valid frame decodes its fields and flags" {
+    let frame = fixtures.valid_frame()
+    match decoder.decode(frame.as_slice()) {
+        Ok(reading) => {
+            assert reading.sensor_id == 7
+            assert reading.channel == 2
+            assert reading.raw_value == 0x1234
+            assert reading.calibrated
+            assert reading.alarm
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "the declared frame length is checked before reading fields" {
+    let frame = fixtures.valid_frame()
+    assert has_error(frame[0..7], FrameError.WrongLength)
+}
+
+test "the sync byte is checked before the version and checksum" {
+    let frame = fixtures.bad_magic_and_version_frame()
+    assert has_error(frame.as_slice(), FrameError.BadMagic)
+}
+
+test "the version is checked before reserved flags and checksum" {
+    let frame = fixtures.unsupported_version_frame()
+    assert has_error(frame.as_slice(), FrameError.UnsupportedVersion)
+}
+
+test "reserved flag bits are rejected before checksum mismatches" {
+    let frame = fixtures.reserved_flags_frame()
+    assert has_error(frame.as_slice(), FrameError.ReservedFlags)
+}
+
+test "a corrupted checksum is rejected" {
+    let frame = fixtures.bad_checksum_frame()
+    assert has_error(frame.as_slice(), FrameError.ChecksumMismatch)
+}

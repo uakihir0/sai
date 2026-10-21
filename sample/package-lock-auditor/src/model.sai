@@ -1,0 +1,43 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Version {
+    pub major: U32
+    pub minor: U32
+    pub patch: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Package {
+    pub id: U32
+    pub name: Str
+    pub version: Version
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Requirement {
+    pub requester_id: U32
+    pub dependency_id: U32
+    pub required_major: U32
+    pub minimum_minor: U32
+    pub maximum_minor_exclusive: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Lockfile {
+    pub packages: Array<Option<Package>, 6>
+    pub requirements: Array<Requirement, 8>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BuildOrder {
+    pub package_ids: Array<Option<U32>, 6>
+    pub length: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditReport {
+    pub missing_reference_count: USize
+    pub incompatible_range_count: USize
+    pub duplicate_id_pair_count: USize
+    pub has_cycle: Option<Bool>
+    pub build_order: BuildOrder
+}

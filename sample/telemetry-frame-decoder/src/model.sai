@@ -1,0 +1,17 @@
+@derive(Copy, Clone)
+pub type Reading {
+    pub sensor_id: U8
+    pub channel: U8
+    pub raw_value: U16
+    pub calibrated: Bool
+    pub alarm: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum FrameError {
+    WrongLength
+    BadMagic
+    UnsupportedVersion
+    ReservedFlags
+    ChecksumMismatch
+}

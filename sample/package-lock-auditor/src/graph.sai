@@ -1,0 +1,67 @@
+use acme:package-lock-auditor/lookup
+use acme:package-lock-auditor/model.{BuildOrder, Lockfile}
+
+fn dependencies_are_built(lock: Lockfile, requester_id: U32, built: Array<Bool, 6>) -> Bool {
+    for requirement in lock.requirements {
+        if requirement.requester_id == requester_id {
+            match lookup.index_of_package(lock, requirement.dependency_id) {
+                Some(index) => {
+                    if not built[index] {
+                        return false
+                    }
+                }
+                // Missing endpoints are reported separately. Ignore them so a
+                // known cycle can still be detected elsewhere in the graph.
+                None => {}
+            }
+        }
+    }
+    true
+}
+
+fn first_ready_package(lock: Lockfile, built: Array<Bool, 6>) -> Option<USize> {
+    for index in 0..lock.packages.len() {
+        match lock.packages[index] {
+            Some(package) => {
+                if not built[index] and dependencies_are_built(lock, package.id, built) {
+                    return Some(index)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+pub fn partial_order(lock: Lockfile) -> BuildOrder {
+    var built = Array<Bool, 6>.filled(false)
+    var package_ids = Array<Option<U32>, 6>.filled(None)
+    var length: USize = 0
+    var stuck = false
+
+    while length < lookup.package_count(lock) and not stuck {
+        match first_ready_package(lock, built) {
+            Some(index) => {
+                match lock.packages[index] {
+                    Some(package) => {
+                        built[index] = true
+                        package_ids[length] = Some(package.id)
+                        length += 1
+                    }
+                    None => {
+                        stuck = true
+                    }
+                }
+            }
+            None => {
+                stuck = true
+            }
+        }
+    }
+
+    BuildOrder(package_ids: package_ids, length: length)
+}
+
+pub fn empty_order() -> BuildOrder {
+    BuildOrder(package_ids: Array<Option<U32>, 6>.filled(None), length: 0)
+}
