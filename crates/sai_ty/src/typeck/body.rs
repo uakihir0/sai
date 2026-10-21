@@ -908,11 +908,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     if left_type != PrimTy::Bool
                         && left_type != PrimTy::Byte
                         && !is_integer_primitive(left_type)
+                        && !matches!(left_type, PrimTy::F32 | PrimTy::F64)
                     {
                         return Err(());
                     }
                     self.check_annotated_literal(left_type, literal, kind, right.hir_id);
-                    if left_type == PrimTy::Bool {
+                    if matches!(left_type, PrimTy::Bool | PrimTy::F32 | PrimTy::F64) {
                         self.report_operator_not_supported(
                             expression,
                             operator,

@@ -27102,21 +27102,273 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_reports_float_path_scalar_literal_diagnostics() {
+        let cases = [
+            ("&", "and", "true", "bool", Some("a Bool literal")),
+            ("&", "and", "'x'", "char", Some("a character literal")),
+            ("&", "and", "1.0", "float", None),
+            ("|", "or", "false", "bool", Some("a Bool literal")),
+            ("|", "or", "'y'", "char", Some("a character literal")),
+            ("|", "or", "2.0", "float", None),
+            ("^", "xor", "true", "bool", Some("a Bool literal")),
+            ("^", "xor", "'z'", "char", Some("a character literal")),
+            ("^", "xor", "3.0", "float", None),
+        ];
+        let mut root =
+            String::from("pub fn float_path_scalar_rhs(left32: F32, left64: F64) -> F64 {\n");
+        root.push_str("    let prior32: F32 = left32\n    let prior64: F64 = left64\n");
+        let mut expected = Vec::new();
+        for (primitive, parameter, prior) in
+            [("F32", "left32", "prior32"), ("F64", "left64", "prior64")]
+        {
+            for (operator, operation, literal, suffix, mismatch_description) in cases {
+                for (left_kind, left) in [("parameter", parameter), ("local", prior)] {
+                    let local = format!(
+                        "{}_{}_{}_{}",
+                        operation,
+                        suffix,
+                        primitive.to_ascii_lowercase(),
+                        left_kind
+                    );
+                    let expression = format!("{left} {operator} {literal}");
+                    let line = format!("    let {local} = {expression}\n");
+                    let expression_start =
+                        root.len() + line.find(&expression).expect("expression exists");
+                    let expression_end = expression_start + expression.len();
+                    if let Some(description) = mismatch_description {
+                        let literal_start = expression_start + format!("{left} {operator} ").len();
+                        expected.push((
+                            sai_diagnostics::Code::TypeMismatch,
+                            format!("expected `{primitive}`, found {description}"),
+                            literal_start,
+                            literal_start + literal.len(),
+                        ));
+                    }
+                    expected.push((
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        format!("operator `{operator}` is not defined for `{primitive}`"),
+                        expression_start,
+                        expression_end,
+                    ));
+                    root.push_str(&line);
+                }
+            }
+        }
+        root.push_str("    xor_float_f64_local\n}\n");
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 1);
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[0]
+            .body_type_check()
+            .expect("F32/F64 path scalar RHS diagnostics are reported")
+        else {
+            panic!("direct F32/F64 path scalar RHS forms must be supported");
+        };
+        assert_eq!(diagnostics.len(), expected.len());
+        for (code, message, start, end) in expected {
+            let span = sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(start as u32),
+                sai_diagnostics::TextSize::new(end as u32),
+            )
+            .expect("expected diagnostic span is ordered");
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .filter(|diagnostic| {
+                        diagnostic.code == code
+                            && diagnostic.message == message
+                            && diagnostic
+                                .primary()
+                                .is_some_and(|primary| primary.span.range == span)
+                    })
+                    .count(),
+                1,
+                "missing unique {code:?} diagnostic {message:?} at {start}..{end}: {diagnostics:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_recovers_float_path_annotation_and_range_errors() {
+        let root = concat!(
+            "pub fn f32_annotation_recovery(left: F32) -> I32 {\n",
+            "    let value: I32 = left & true\n",
+            "    let recovered: I32 = value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn f64_annotation_recovery(left: F64) -> Bool {\n",
+            "    let value: Bool = left ^ 'x'\n",
+            "    let recovered: Bool = value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn f32_out_of_range_rhs(left: F32) -> F32 {\n",
+            "    let value = left | 1e39\n",
+            "    let recovered: F32 = value\n",
+            "    recovered\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 3);
+        let f32_expression = root
+            .find("left & true")
+            .expect("F32 annotated expression exists");
+        let f32_rhs = f32_expression + "left & ".len();
+        let f32_end = f32_expression + "left & true".len();
+        let f64_expression = root
+            .find("left ^ 'x'")
+            .expect("F64 annotated expression exists");
+        let f64_rhs = f64_expression + "left ^ ".len();
+        let f64_end = f64_expression + "left ^ 'x'".len();
+        let f32_range_expression = root
+            .find("left | 1e39")
+            .expect("F32 out-of-range expression exists");
+        let f32_range_literal = f32_range_expression + "left | ".len();
+        let f32_range_end = f32_range_expression + "left | 1e39".len();
+
+        let expected_by_owner = [
+            vec![
+                (
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    "operator `&` is not defined for `F32`",
+                    f32_expression,
+                    f32_end,
+                ),
+                (
+                    sai_diagnostics::Code::TypeMismatch,
+                    "expected `I32`, found `F32`",
+                    f32_expression,
+                    f32_end,
+                ),
+                (
+                    sai_diagnostics::Code::TypeMismatch,
+                    "expected `F32`, found a Bool literal",
+                    f32_rhs,
+                    f32_rhs + "true".len(),
+                ),
+            ],
+            vec![
+                (
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    "operator `^` is not defined for `F64`",
+                    f64_expression,
+                    f64_end,
+                ),
+                (
+                    sai_diagnostics::Code::TypeMismatch,
+                    "expected `Bool`, found `F64`",
+                    f64_expression,
+                    f64_end,
+                ),
+                (
+                    sai_diagnostics::Code::TypeMismatch,
+                    "expected `F64`, found a character literal",
+                    f64_rhs,
+                    f64_rhs + "'x'".len(),
+                ),
+            ],
+            vec![
+                (
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    "operator `|` is not defined for `F32`",
+                    f32_range_expression,
+                    f32_range_end,
+                ),
+                (
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    "floating-point literal is out of range for `F32`",
+                    f32_range_literal,
+                    f32_range_literal + "1e39".len(),
+                ),
+            ],
+        ];
+        for (index, expected) in expected_by_owner.into_iter().enumerate() {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
+                .body_type_check()
+                .expect("float-path annotation and range diagnostics are reported")
+            else {
+                panic!("float-path annotation and range errors must recover");
+            };
+            assert_eq!(
+                diagnostics.len(),
+                expected.len(),
+                "function owner {index}: {diagnostics:?}"
+            );
+            for (code, message, start, end) in expected {
+                let span = sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new(end as u32),
+                )
+                .expect("expected diagnostic span is ordered");
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .filter(|diagnostic| {
+                            diagnostic.code == code
+                                && diagnostic.message == message
+                                && diagnostic
+                                    .primary()
+                                    .is_some_and(|primary| primary.span.range == span)
+                        })
+                        .count(),
+                    1,
+                    "function owner {index} lacks unique {code:?} diagnostic {message:?} at {start}..{end}: {diagnostics:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn function_body_type_check_keeps_unsupported_bitwise_forms_gated() {
         let root = concat!(
             "type Word = I32\n",
             "type ShiftCount = U32\n",
             "type ByteAlias = Byte\n",
+            "type F32Alias = F32\n",
+            "type F64Alias = F64\n",
             "pub fn float_literal_left(left: I32) -> I32 {\n    let value = 1.0 & left\n    value\n}\n",
             "pub fn literal_pair() -> I32 {\n    let value = 1 ^ 2\n    value\n}\n",
             "pub fn char_integer_literal(left: Char) -> Char {\n    let value = left & 1\n    value\n}\n",
             "pub fn bool_path_byte_string_rhs(left: Bool) -> Bool {\n    let value = left & b\"text\"\n    value\n}\n",
             "pub fn char_path_float_rhs(left: Char) -> Char {\n    let value = left ^ 1.0\n    value\n}\n",
-            "pub fn f32_path_bool_rhs(left: F32) -> F32 {\n    let value = left & false\n    value\n}\n",
-            "pub fn f64_path_char_rhs(left: F64) -> F64 {\n    let value = left | 'y'\n    value\n}\n",
+            "pub fn f64_path_byte_string_rhs(left: F64) -> F64 {\n    let value = left | b\"text\"\n    value\n}\n",
+            "pub fn f32_alias_path_float_rhs(left: F32Alias) -> F32Alias {\n    let value = left ^ 1.0\n    value\n}\n",
+            "pub fn f64_alias_path_bool_rhs(left: F64Alias) -> F64Alias {\n    let value = left & true\n    value\n}\n",
+            "pub fn f32_unresolved_path_float_rhs() -> F32 {\n    let value = missing & 1.0\n    value\n}\n",
+            "pub fn f64_self_reference_path_float_rhs(left: F64) -> F64 {\n    let value = value | 1.0\n    value\n}\n",
+            "pub fn f32_forward_reference_path_float_rhs() -> F32 {\n    let value = later ^ 1.0\n    let later: F32 = 2.0\n    value\n}\n",
+            "pub fn f32_nested_rhs_float(left: F32) -> F32 {\n    let value = left & (1.0 + 1.0)\n    value\n}\n",
+            "pub fn f64_nested_left_float(left: F64) -> F64 {\n    let value = (left | 1.0) ^ 2.0\n    value\n}\n",
+            "pub fn f32_computed_rhs_float(left: F32, right: F32) -> F32 {\n    let value = left ^ (right + 1.0)\n    value\n}\n",
             "pub fn byte_alias_path_scalar_rhs(left: ByteAlias) -> ByteAlias {\n    let value = left ^ true\n    value\n}\n",
             "pub fn generic_path_scalar_rhs<T>(left: Byte) -> Byte {\n    let value = left & 'x'\n    value\n}\n",
             "pub fn generic_char_path_scalar_rhs<T>(left: Char) -> Char {\n    let value = left & true\n    value\n}\n",
+            "pub fn generic_f32_path_scalar_rhs<T>(left: F32) -> F32 {\n    let value = left & 1.0\n    value\n}\n",
             "type PathScalarBitOwner { marker: Bool }\n",
             "impl PathScalarBitOwner {\n",
             "    fn path_scalar_method(self: borrow Self, left: Bool) -> Bool {\n",
@@ -27130,6 +27382,14 @@ mod tests {
             "    fn char_path_scalar_method(self: borrow Self, left: Char) -> Char {\n",
             "        let prior: Char = left\n",
             "        let value = prior | 'x'\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
+            "type FloatPathBitOwner { marker: F64 }\n",
+            "impl FloatPathBitOwner {\n",
+            "    fn float_path_scalar_method(self: borrow Self, left: F64) -> F64 {\n",
+            "        let prior: F64 = left\n",
+            "        let value = prior ^ 1.0\n",
             "        value\n",
             "    }\n",
             "}\n",
@@ -27160,7 +27420,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 22);
+        assert_eq!(resolved.owners().len(), 30);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()
