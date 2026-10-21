@@ -1,0 +1,52 @@
+use acme:telemetry-frame-decoder/model.{FrameError, Reading}
+
+const FRAME_LENGTH: USize = 8
+const CHECKSUM_END: USize = 7
+const FRAME_MAGIC: Byte = b'\xA5'
+const FRAME_VERSION: Byte = b'\x01'
+const RESERVED_FLAGS: Byte = b'\xFC'
+const CALIBRATED_FLAG: Byte = b'\x01'
+const ALARM_FLAG: Byte = b'\x02'
+
+fn checksum(frame: Slice<Byte>) -> Byte {
+    var value = b'\0'
+    var index: USize = 0
+    while index < CHECKSUM_END {
+        value ^= frame[index]
+        index += 1
+    }
+    value
+}
+
+pub fn decode(frame: Slice<Byte>) -> Result<Reading, FrameError> {
+    if frame.len() != FRAME_LENGTH {
+        return Err(FrameError.WrongLength)
+    }
+
+    if frame[0] != FRAME_MAGIC {
+        return Err(FrameError.BadMagic)
+    }
+
+    if frame[1] != FRAME_VERSION {
+        return Err(FrameError.UnsupportedVersion)
+    }
+
+    let flags = frame[2]
+    if flags & RESERVED_FLAGS != b'\0' {
+        return Err(FrameError.ReservedFlags)
+    }
+
+    if checksum(frame) != frame[CHECKSUM_END] {
+        return Err(FrameError.ChecksumMismatch)
+    }
+
+    Ok(
+        Reading(
+            sensor_id: U8.from(frame[3]),
+            channel: U8.from(frame[4]),
+            raw_value: U16.from_le_bytes([frame[5], frame[6]]),
+            calibrated: flags & CALIBRATED_FLAG != b'\0',
+            alarm: flags & ALARM_FLAG != b'\0',
+        ),
+    )
+}

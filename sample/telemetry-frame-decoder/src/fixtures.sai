@@ -1,0 +1,29 @@
+pub fn valid_frame() -> Array<Byte, 8> {
+    [b'\xA5', b'\x01', b'\x03', b'\x07', b'\x02', b'\x34', b'\x12', b'\x84']
+}
+
+pub fn bad_magic_and_version_frame() -> Array<Byte, 8> {
+    var frame = valid_frame()
+    frame[0] = b'\xA4'
+    frame[1] = b'\x02'
+    frame
+}
+
+pub fn unsupported_version_frame() -> Array<Byte, 8> {
+    var frame = valid_frame()
+    frame[1] = b'\x02'
+    frame[2] = b'\x80'
+    frame
+}
+
+pub fn reserved_flags_frame() -> Array<Byte, 8> {
+    var frame = valid_frame()
+    frame[2] = b'\x80'
+    frame
+}
+
+pub fn bad_checksum_frame() -> Array<Byte, 8> {
+    var frame = valid_frame()
+    frame[7] = b'\x85'
+    frame
+}

@@ -1,0 +1,5 @@
+package acme:telemetry-frame-decoder @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Decode and validate a fixed telemetry frame"
