@@ -176,7 +176,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         known_bindings,
         direct_unannotated_integer_literals: HashSet::new(),
         direct_unannotated_float_literals: HashSet::new(),
-        one_hop_unannotated_float_literal_aliases: HashSet::new(),
+        unannotated_float_literal_aliases: HashSet::new(),
         pending_operator_trait_count: 0,
         literal_variables: Vec::new(),
         errors: Vec::new(),
@@ -197,7 +197,7 @@ struct FnCtxt<'a, 'hir> {
     known_bindings: HashMap<BindingId, LocalType>,
     direct_unannotated_integer_literals: HashSet<BindingId>,
     direct_unannotated_float_literals: HashSet<BindingId>,
-    one_hop_unannotated_float_literal_aliases: HashSet<BindingId>,
+    unannotated_float_literal_aliases: HashSet<BindingId>,
     pending_operator_trait_count: usize,
     literal_variables: Vec<LiteralVariable<'hir>>,
     errors: Vec<PrimitiveBodyError>,
@@ -457,14 +457,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         }
         if let Some(source_binding) = self.plain_local_path_binding(init) {
-            if can_track_one_hop_unannotated_float_literal_alias(
-                self.direct_unannotated_float_literals
-                    .contains(&source_binding),
+            let source_has_float_literal_provenance = self
+                .direct_unannotated_float_literals
+                .contains(&source_binding)
+                || self
+                    .unannotated_float_literal_aliases
+                    .contains(&source_binding);
+            if can_track_unannotated_float_literal_alias(
+                source_has_float_literal_provenance,
                 matches!(init.kind, ExprKind::Path(_)),
                 annotation.is_some(),
             ) {
-                self.one_hop_unannotated_float_literal_aliases
-                    .insert(binding);
+                self.unannotated_float_literal_aliases.insert(binding);
             }
         }
         self.known_bindings.insert(binding, local_type);
@@ -1729,9 +1733,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             .is_some_and(|binding| {
                 self.direct_unannotated_integer_literals.contains(&binding)
                     || self.direct_unannotated_float_literals.contains(&binding)
-                    || self
-                        .one_hop_unannotated_float_literal_aliases
-                        .contains(&binding)
+                    || self.unannotated_float_literal_aliases.contains(&binding)
             })
     }
 
@@ -1749,12 +1751,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 }
 
-fn can_track_one_hop_unannotated_float_literal_alias(
-    source_is_direct_unannotated_float_literal: bool,
+fn can_track_unannotated_float_literal_alias(
+    source_has_float_literal_provenance: bool,
     initializer_is_plain_path: bool,
     alias_has_annotation: bool,
 ) -> bool {
-    source_is_direct_unannotated_float_literal && initializer_is_plain_path && !alias_has_annotation
+    source_has_float_literal_provenance && initializer_is_plain_path && !alias_has_annotation
 }
 
 fn primitive_comparison_result(
@@ -2029,11 +2031,10 @@ mod tests {
     use super::{
         PrimitiveArithmeticResult, PrimitiveBoolOperandResult, PrimitiveComparisonResult,
         PrimitiveLiteralKind, can_defer_char_literal_path_trait,
-        can_track_one_hop_unannotated_float_literal_alias,
-        primitive_arithmetic_literal_expected_type, primitive_arithmetic_literal_left_result,
-        primitive_arithmetic_result, primitive_bitwise_bool_literal_pair_supported,
-        primitive_bitwise_byte_literal_left_result, primitive_bitwise_byte_literal_pair_result,
-        primitive_bitwise_char_float_literal_rhs_type,
+        can_track_unannotated_float_literal_alias, primitive_arithmetic_literal_expected_type,
+        primitive_arithmetic_literal_left_result, primitive_arithmetic_result,
+        primitive_bitwise_bool_literal_pair_supported, primitive_bitwise_byte_literal_left_result,
+        primitive_bitwise_byte_literal_pair_result, primitive_bitwise_char_float_literal_rhs_type,
         primitive_bitwise_char_literal_pair_supported,
         primitive_bitwise_integer_literal_pair_supported, primitive_bool_operand_result,
         primitive_comparison_literal_expected_type, primitive_comparison_result,
@@ -2679,20 +2680,21 @@ mod tests {
     }
 
     #[test]
-    fn float_literal_alias_tracking_is_limited_to_one_unannotated_plain_copy() {
-        assert!(can_track_one_hop_unannotated_float_literal_alias(
-            true, true, false
-        ));
+    fn float_literal_alias_tracking_propagates_only_unannotated_plain_paths() {
         assert!(
-            !can_track_one_hop_unannotated_float_literal_alias(true, true, true),
+            can_track_unannotated_float_literal_alias(true, true, false),
+            "a direct literal or already tracked alias can source provenance"
+        );
+        assert!(
+            !can_track_unannotated_float_literal_alias(true, true, true),
             "an annotated concrete copy follows the existing concrete-path route"
         );
         assert!(
-            !can_track_one_hop_unannotated_float_literal_alias(false, true, false),
-            "an alias source is not itself a direct unannotated float literal"
+            !can_track_unannotated_float_literal_alias(false, true, false),
+            "a source without literal provenance cannot start an alias chain"
         );
         assert!(
-            !can_track_one_hop_unannotated_float_literal_alias(true, false, false),
+            !can_track_unannotated_float_literal_alias(true, false, false),
             "computed initializers do not propagate literal provenance"
         );
     }

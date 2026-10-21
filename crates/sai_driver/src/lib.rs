@@ -27917,39 +27917,47 @@ mod tests {
     }
 
     #[test]
-    fn function_body_type_check_tracks_one_unannotated_float_literal_copy() {
+    fn function_body_type_check_tracks_unannotated_float_literal_alias_chains() {
         let root = concat!(
             "pub fn char_float_alias_defaults() -> Char {\n",
             "    let rhs = 1.5\n",
-            "    let default_alias = rhs\n",
-            "    let and_value = 'a' & default_alias\n",
-            "    let or_value = 'b' | default_alias\n",
-            "    let xor_value = 'c' ^ default_alias\n",
+            "    let default_alias1 = rhs\n",
+            "    let default_alias2 = default_alias1\n",
+            "    let default_alias3 = default_alias2\n",
+            "    let and_value = 'a' & default_alias3\n",
+            "    let or_value = 'b' | default_alias3\n",
+            "    let xor_value = 'c' ^ default_alias3\n",
             "    let recovered: Char = xor_value\n",
             "    recovered\n",
             "}\n",
             "pub fn char_float_alias_constrained() -> Char {\n",
             "    let rhs = 1.25\n",
-            "    let constrained_alias = rhs\n",
-            "    let and_value = 'a' & constrained_alias\n",
-            "    let or_value = 'b' | constrained_alias\n",
-            "    let xor_value = 'c' ^ constrained_alias\n",
-            "    let narrowed: F32 = constrained_alias\n",
+            "    let constrained_alias1 = rhs\n",
+            "    let constrained_alias2 = constrained_alias1\n",
+            "    let constrained_alias3 = constrained_alias2\n",
+            "    let and_value = 'a' & constrained_alias3\n",
+            "    let or_value = 'b' | constrained_alias3\n",
+            "    let xor_value = 'c' ^ constrained_alias3\n",
+            "    let narrowed: F32 = constrained_alias3\n",
             "    let recovered: Char = xor_value\n",
             "    recovered\n",
             "}\n",
             "pub fn char_float_alias_f32_range() -> Char {\n",
             "    let rhs = 1e39\n",
-            "    let range_alias = rhs\n",
-            "    let value = 'x' ^ range_alias\n",
-            "    let narrowed: F32 = range_alias\n",
+            "    let range_alias1 = rhs\n",
+            "    let range_alias2 = range_alias1\n",
+            "    let range_alias3 = range_alias2\n",
+            "    let value = 'x' ^ range_alias3\n",
+            "    let narrowed: F32 = range_alias3\n",
             "    let recovered: Char = value\n",
             "    recovered\n",
             "}\n",
             "pub fn char_float_alias_annotation_recovery() -> F32 {\n",
             "    let rhs = 1.0\n",
-            "    let annotation_alias = rhs\n",
-            "    let value: F32 = 'z' ^ annotation_alias\n",
+            "    let annotation_alias1 = rhs\n",
+            "    let annotation_alias2 = annotation_alias1\n",
+            "    let annotation_alias3 = annotation_alias2\n",
+            "    let value: F32 = 'z' ^ annotation_alias3\n",
             "    let recovered: F32 = value\n",
             "    recovered\n",
             "}\n",
@@ -27957,6 +27965,15 @@ mod tests {
             "    let rhs = 1.0\n",
             "    let typed_alias: F32 = rhs\n",
             "    let value = 'a' & typed_alias\n",
+            "    let recovered: Char = value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_float_alias_f64_signed_range() -> Char {\n",
+            "    let rhs = -1e999\n",
+            "    let signed_alias1 = rhs\n",
+            "    let signed_alias2 = signed_alias1\n",
+            "    let signed_alias3 = signed_alias2\n",
+            "    let value = 'b' | signed_alias3\n",
             "    let recovered: Char = value\n",
             "    recovered\n",
             "}\n",
@@ -27975,7 +27992,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 5);
+        assert_eq!(owners.len(), 6);
 
         let expected_diagnostics = [
             (
@@ -27983,15 +28000,15 @@ mod tests {
                 vec![
                     (
                         "operator `&` has no `BitAnd<F64>` implementation for `Char`",
-                        "'a' & default_alias",
+                        "'a' & default_alias3",
                     ),
                     (
                         "operator `|` has no `BitOr<F64>` implementation for `Char`",
-                        "'b' | default_alias",
+                        "'b' | default_alias3",
                     ),
                     (
                         "operator `^` has no `BitXor<F64>` implementation for `Char`",
-                        "'c' ^ default_alias",
+                        "'c' ^ default_alias3",
                     ),
                 ],
             ),
@@ -28000,15 +28017,15 @@ mod tests {
                 vec![
                     (
                         "operator `&` has no `BitAnd<F32>` implementation for `Char`",
-                        "'a' & constrained_alias",
+                        "'a' & constrained_alias3",
                     ),
                     (
                         "operator `|` has no `BitOr<F32>` implementation for `Char`",
-                        "'b' | constrained_alias",
+                        "'b' | constrained_alias3",
                     ),
                     (
                         "operator `^` has no `BitXor<F32>` implementation for `Char`",
-                        "'c' ^ constrained_alias",
+                        "'c' ^ constrained_alias3",
                     ),
                 ],
             ),
@@ -28018,7 +28035,7 @@ mod tests {
                     ("floating-point literal is out of range for `F32`", "1e39"),
                     (
                         "operator `^` has no `BitXor<F32>` implementation for `Char`",
-                        "'x' ^ range_alias",
+                        "'x' ^ range_alias3",
                     ),
                 ],
             ),
@@ -28027,9 +28044,9 @@ mod tests {
                 vec![
                     (
                         "operator `^` has no `BitXor<F64>` implementation for `Char`",
-                        "'z' ^ annotation_alias",
+                        "'z' ^ annotation_alias3",
                     ),
-                    ("expected `F32`, found `Char`", "'z' ^ annotation_alias"),
+                    ("expected `F32`, found `Char`", "'z' ^ annotation_alias3"),
                 ],
             ),
             (
@@ -28039,12 +28056,22 @@ mod tests {
                     "'a' & typed_alias",
                 )],
             ),
+            (
+                5,
+                vec![
+                    ("floating-point literal is out of range for `F64`", "-1e999"),
+                    (
+                        "operator `|` has no `BitOr<F64>` implementation for `Char`",
+                        "'b' | signed_alias3",
+                    ),
+                ],
+            ),
         ];
 
         for (index, expected) in expected_diagnostics {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
-                .expect("one-hop float alias Char bitwise pair is checked")
+                .expect("multi-hop float alias chain Char bitwise pairs are checked")
             else {
                 panic!("owner {index} must remain in the supported body-checking slice");
             };
@@ -29730,18 +29757,19 @@ mod tests {
             "pub fn char_literal_alias_path_rhs(right: ByteAlias) -> Char {\n    let value = 'a' & right\n    value\n}\n",
             "pub fn generic_char_literal_path_rhs<T>(right: T) -> Char {\n    let value = 'a' & right\n    value\n}\n",
             "pub fn char_literal_unresolved_path_rhs() -> Char {\n    let value = 'a' & missing\n    value\n}\n",
-            "pub fn char_literal_float_alias_path_rhs() -> Char {\n    let right = 1.0\n    let alias = right\n    let second_alias = alias\n    let constrained: F32 = right\n    let value = 'a' & second_alias\n    value\n}\n",
+            "pub fn char_computed_float_alias_chain_path_rhs(base: F32) -> Char {\n    let computed = 1.0 + base\n    let alias1 = computed\n    let alias2 = alias1\n    let value = 'a' & alias2\n    value\n}\n",
             "pub fn char_literal_computed_float_local_rhs() -> Char {\n    let right = 1.0 + 2.0\n    let value = 'a' & right\n    value\n}\n",
-            "pub fn char_literal_integer_alias_path_rhs() -> Char {\n    let right = 1\n    let alias = right\n    let constrained: I32 = right\n    let value = 'a' & alias\n    value\n}\n",
+            "pub fn char_literal_integer_alias_path_rhs() -> Char {\n    let right = 1\n    let alias1 = right\n    let alias2 = alias1\n    let constrained: I32 = right\n    let value = 'a' & alias2\n    value\n}\n",
             "pub fn char_literal_computed_integer_path_rhs() -> Char {\n    let right = 1 + 2\n    let value = 'a' & right\n    value\n}\n",
             "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char {\n    let right = 1\n    let value = 'a' & right\n    value\n}\n",
-            "pub fn generic_char_literal_untyped_float_path_rhs<T>() -> Char {\n    let right = 1.0\n    let alias = right\n    let value = 'a' & alias\n    value\n}\n",
+            "pub fn generic_char_literal_untyped_float_path_rhs<T>() -> Char {\n    let right = 1.0\n    let alias1 = right\n    let alias2 = alias1\n    let alias3 = alias2\n    let value = 'a' & alias3\n    value\n}\n",
             "pub fn char_literal_self_reference_path_rhs() -> Char {\n    let value = 'a' & value\n    value\n}\n",
             "pub fn char_literal_forward_reference_path_rhs() -> Char {\n    let value = 'a' & later\n    let later: Bool = true\n    value\n}\n",
             "pub fn char_literal_multisegment_path_rhs() -> Char {\n    let value = 'a' & package.flag\n    value\n}\n",
             "pub fn char_literal_generic_path_rhs(right: I32) -> Char {\n    let value = 'a' & right<I32>\n    value\n}\n",
             "pub fn char_literal_computed_path_rhs(left: Bool, right: Bool) -> Char {\n    let value = 'a' & (left ^ right)\n    value\n}\n",
             "pub fn char_literal_byte_string_pair() -> Char {\n    let value = 'a' & b\"text\"\n    value\n}\n",
+            "pub fn char_literal_byte_string_alias_chain_rhs() -> Char {\n    let bytes = b\"text\"\n    let alias1 = bytes\n    let alias2 = alias1\n    let value = 'a' & alias2\n    value\n}\n",
             "pub fn char_bool_alias_annotation() -> CharAlias {\n    let value: CharAlias = 'a' & false\n    value\n}\n",
             "pub fn nested_char_literal_pair_rhs() -> Char {\n    let value = 'a' & ('b' | 'c')\n    value\n}\n",
             "pub fn nested_char_literal_pair_left() -> Char {\n    let value = ('a' & 'b') ^ 'c'\n    value\n}\n",
@@ -29789,8 +29817,10 @@ mod tests {
             "impl CharUntypedFloatPathOwner {\n",
             "    fn char_untyped_float_path_method(self: borrow Self) -> Char {\n",
             "        let right = 1.0\n",
-            "        let alias = right\n",
-            "        let value = 'a' & alias\n",
+            "        let alias1 = right\n",
+            "        let alias2 = alias1\n",
+            "        let alias3 = alias2\n",
+            "        let value = 'a' & alias3\n",
             "        value\n",
             "    }\n",
             "}\n",
@@ -29904,7 +29934,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 85);
+        assert_eq!(resolved.owners().len(), 86);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()
