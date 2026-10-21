@@ -176,6 +176,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         known_bindings,
         direct_unannotated_integer_literals: HashSet::new(),
         direct_unannotated_float_literals: HashSet::new(),
+        one_hop_unannotated_float_literal_aliases: HashSet::new(),
         pending_operator_trait_count: 0,
         literal_variables: Vec::new(),
         errors: Vec::new(),
@@ -196,6 +197,7 @@ struct FnCtxt<'a, 'hir> {
     known_bindings: HashMap<BindingId, LocalType>,
     direct_unannotated_integer_literals: HashSet<BindingId>,
     direct_unannotated_float_literals: HashSet<BindingId>,
+    one_hop_unannotated_float_literal_aliases: HashSet<BindingId>,
     pending_operator_trait_count: usize,
     literal_variables: Vec<LiteralVariable<'hir>>,
     errors: Vec<PrimitiveBodyError>,
@@ -452,6 +454,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     )
                     | None => {}
                 }
+            }
+        }
+        if let Some(source_binding) = self.plain_local_path_binding(init) {
+            if can_track_one_hop_unannotated_float_literal_alias(
+                self.direct_unannotated_float_literals
+                    .contains(&source_binding),
+                matches!(init.kind, ExprKind::Path(_)),
+                annotation.is_some(),
+            ) {
+                self.one_hop_unannotated_float_literal_aliases
+                    .insert(binding);
             }
         }
         self.known_bindings.insert(binding, local_type);
@@ -847,10 +860,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 if primitive_literal_kind(literal) == Some(PrimitiveLiteralKind::Character) {
                     let ExprKind::Lit(right_literal) = right.kind else {
                         let right_local_type = self.check_local_path(right)?;
-                        let direct_unannotated_literal_path =
-                            self.is_direct_unannotated_literal_path(right);
+                        let eligible_unannotated_literal_path =
+                            self.is_eligible_unannotated_literal_path(right);
                         if matches!(right_local_type, LocalType::LiteralVariable(_))
-                            && !direct_unannotated_literal_path
+                            && !eligible_unannotated_literal_path
                         {
                             return Err(());
                         }
@@ -858,7 +871,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             .concrete_local_type(right_local_type)
                             .filter(|primitive| supports_primitive_literal(*primitive));
                         let Some(right_type) = right_type else {
-                            if !direct_unannotated_literal_path {
+                            if !eligible_unannotated_literal_path {
                                 return Err(());
                             }
                             let LocalType::LiteralVariable(id) = right_local_type else {
@@ -873,7 +886,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             if !can_defer_char_literal_path_trait(
                                 variable.kind,
                                 variable.additional_site.is_some(),
-                                direct_unannotated_literal_path,
+                                eligible_unannotated_literal_path,
                             ) {
                                 return Err(());
                             }
@@ -1702,7 +1715,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             return Err(());
         }
 
-        let Some(binding) = self.input.local_paths.get(&path.hir_id).copied() else {
+        let Some(binding) = self.plain_local_path_binding(expression) else {
             return Err(());
         };
         let Some(local_type) = self.known_bindings.get(&binding).copied() else {
@@ -1711,24 +1724,37 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(local_type)
     }
 
-    fn is_direct_unannotated_literal_path(&self, expression: &Expr<'hir>) -> bool {
+    fn is_eligible_unannotated_literal_path(&self, expression: &Expr<'hir>) -> bool {
+        self.plain_local_path_binding(expression)
+            .is_some_and(|binding| {
+                self.direct_unannotated_integer_literals.contains(&binding)
+                    || self.direct_unannotated_float_literals.contains(&binding)
+                    || self
+                        .one_hop_unannotated_float_literal_aliases
+                        .contains(&binding)
+            })
+    }
+
+    fn plain_local_path_binding(&self, expression: &Expr<'hir>) -> Option<BindingId> {
         let ExprKind::Path(path) = expression.kind else {
-            return false;
+            return None;
         };
         if path.root != PathRoot::Plain
             || path.segments.len() != 1
             || path.segments[0].args.is_some()
         {
-            return false;
+            return None;
         }
-        self.input
-            .local_paths
-            .get(&path.hir_id)
-            .is_some_and(|binding| {
-                self.direct_unannotated_integer_literals.contains(binding)
-                    || self.direct_unannotated_float_literals.contains(binding)
-            })
+        self.input.local_paths.get(&path.hir_id).copied()
     }
+}
+
+fn can_track_one_hop_unannotated_float_literal_alias(
+    source_is_direct_unannotated_float_literal: bool,
+    initializer_is_plain_path: bool,
+    alias_has_annotation: bool,
+) -> bool {
+    source_is_direct_unannotated_float_literal && initializer_is_plain_path && !alias_has_annotation
 }
 
 fn primitive_comparison_result(
@@ -1885,13 +1911,13 @@ fn primitive_bitwise_char_float_literal_rhs_type(operator: BinOp) -> Option<Prim
 fn can_defer_char_literal_path_trait(
     kind: PrimitiveLiteralKind,
     has_additional_site: bool,
-    is_direct_unannotated_numeric_literal: bool,
+    is_eligible_unannotated_numeric_literal_path: bool,
 ) -> bool {
     matches!(
         kind,
         PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
     ) && !has_additional_site
-        && is_direct_unannotated_numeric_literal
+        && is_eligible_unannotated_numeric_literal_path
 }
 
 const fn is_bitwise_primitive(primitive: PrimTy) -> bool {
@@ -2003,6 +2029,7 @@ mod tests {
     use super::{
         PrimitiveArithmeticResult, PrimitiveBoolOperandResult, PrimitiveComparisonResult,
         PrimitiveLiteralKind, can_defer_char_literal_path_trait,
+        can_track_one_hop_unannotated_float_literal_alias,
         primitive_arithmetic_literal_expected_type, primitive_arithmetic_literal_left_result,
         primitive_arithmetic_result, primitive_bitwise_bool_literal_pair_supported,
         primitive_bitwise_byte_literal_left_result, primitive_bitwise_byte_literal_pair_result,
@@ -2648,6 +2675,25 @@ mod tests {
         assert!(
             !can_defer_char_literal_path_trait(PrimitiveLiteralKind::FloatingPoint, true, true),
             "float literal variables with another source site remain gated"
+        );
+    }
+
+    #[test]
+    fn float_literal_alias_tracking_is_limited_to_one_unannotated_plain_copy() {
+        assert!(can_track_one_hop_unannotated_float_literal_alias(
+            true, true, false
+        ));
+        assert!(
+            !can_track_one_hop_unannotated_float_literal_alias(true, true, true),
+            "an annotated concrete copy follows the existing concrete-path route"
+        );
+        assert!(
+            !can_track_one_hop_unannotated_float_literal_alias(false, true, false),
+            "an alias source is not itself a direct unannotated float literal"
+        );
+        assert!(
+            !can_track_one_hop_unannotated_float_literal_alias(true, false, false),
+            "computed initializers do not propagate literal provenance"
         );
     }
 }
