@@ -6457,8 +6457,14 @@ fn primitive_bitwise_integer_annotation_mismatch_recovers_after_operand_mismatch
 fn unsupported_primitive_bitwise_shapes_remain_gated() {
     for source in [
         "pub fn literal_pair() -> I32 { let result = 1 & 2; result }\n",
-        "pub fn byte_literal_pair() -> Byte { let result = b'a' & b'b'; result }\n",
         "pub fn byte_integer_literal_pair() -> Byte { let result = b'a' ^ 1; result }\n",
+        "pub fn integer_byte_literal_pair() -> I32 { let result = 1 & b'a'; result }\n",
+        "pub fn integer_float_literal_pair() -> F32 { let result = 1.0 & 2.0; result }\n",
+        "pub fn bool_literal_pair() -> Bool { let result = true & false; result }\n",
+        "pub fn char_literal_pair() -> Char { let result = 'a' ^ 'b'; result }\n",
+        "pub fn bool_byte_literal_pair() -> Bool { let result = true & b'a'; result }\n",
+        "pub fn char_byte_literal_pair() -> Char { let result = 'a' ^ b'b'; result }\n",
+        "pub fn float_byte_literal_pair() -> F32 { let result = 1.0 & b'a'; result }\n",
         "pub fn byte_float_literal_rhs(right: Byte) -> Byte { let result = b'a' | 1.0; result }\n",
         "pub fn byte_bool_literal_rhs(right: Byte) -> Byte { let result = b'a' & true; result }\n",
         "pub fn byte_char_literal_rhs(right: Byte) -> Byte { let result = b'a' ^ 'b'; result }\n",
@@ -6476,12 +6482,12 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         "type Word = I32\npub fn alias(left: Word, right: Word) -> Word { let result = left & right; result }\n",
         "pub fn self_reference(left: I32) -> I32 { let result = result & left; result }\n",
         "pub fn forward_reference(left: I32) -> I32 { let result = later & left; let later: I32 = 1; result }\n",
-        "pub fn generic<T>(right: Byte) -> Byte { let result = b'a' & right; result }\n",
+        "pub fn generic<T>(unused: I32) -> Byte { let result = b'a' & b'b'; result }\n",
         concat!(
             "type BitOwner { marker: Byte }\n",
             "impl BitOwner {\n",
-            "    fn method(self: borrow Self, right: Byte) -> Byte {\n",
-            "        let result = b'a' & right\n",
+            "    fn method(self: borrow Self) -> Byte {\n",
+            "        let result = b'a' & b'b'\n",
             "        result\n",
             "    }\n",
             "}\n",
@@ -7011,6 +7017,59 @@ fn primitive_bitwise_byte_literal_left_annotation_mismatch_recovers_to_annotatio
     let expression_start = source
         .find(expression)
         .expect("annotated Byte literal-left expression exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the incompatible annotation should produce one mismatch:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the local should recover to U8 and reach the following local and tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Byte`",
+        expression_start,
+        expression_start + expression.len(),
+    );
+}
+
+#[test]
+fn primitive_bitwise_byte_literal_pairs_accept_all_operators_and_byte_annotations() {
+    let source = concat!(
+        "pub fn byte_pairs() -> Byte {\n",
+        "    let and_inferred = b'a' & b'b'\n",
+        "    let and_annotated: Byte = b'c' & b'd'\n",
+        "    let or_inferred = b'e' | b'f'\n",
+        "    let or_annotated: Byte = b'g' | b'h'\n",
+        "    let xor_inferred = b'i' ^ b'j'\n",
+        "    let xor_annotated: Byte = b'k' ^ b'l'\n",
+        "    xor_annotated\n",
+        "}\n",
+    );
+
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn primitive_bitwise_byte_literal_pair_annotation_mismatch_recovers_to_annotation() {
+    let source = concat!(
+        "pub fn annotation_recovery() -> U8 {\n",
+        "    let value: U8 = b'a' ^ b'b'\n",
+        "    let recovered: U8 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression = "b'a' ^ b'b'";
+    let expression_start = source
+        .find(expression)
+        .expect("annotated Byte literal pair exists");
 
     assert_eq!(output.status.code(), Some(1), "{stdout}");
     assert_eq!(
@@ -7630,8 +7689,6 @@ fn unsupported_primitive_bitwise_right_integer_literal_forms_remain_gated() {
 #[test]
 fn unsupported_primitive_bitwise_right_byte_literal_shapes_remain_gated() {
     for source in [
-        "pub fn byte_literal_left(value: Byte) -> Byte { let result = b'a' & value; result }\n",
-        "pub fn byte_literal_pair() -> Byte { let result = b'a' ^ b'b'; result }\n",
         "pub fn byte_string(value: Byte) -> Byte { let result = value & b\"text\"; result }\n",
         "pub fn computed_left(value: Byte) -> Byte { let result = (value & value) | b'a'; result }\n",
     ] {
