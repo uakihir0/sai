@@ -6572,12 +6572,46 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let result = left ^ 1.0",
         ),
         fixture(
-            "pub fn f32_path_bool_rhs(left: F32) -> F32",
-            "let result = left & false",
+            "pub fn f64_path_byte_string_rhs(left: F64) -> F64",
+            "let result = left | b\"text\"",
+        ),
+        format!(
+            "type F32Alias = F32\n{}",
+            fixture(
+                "pub fn f32_alias_path_float_rhs(left: F32Alias) -> F32Alias",
+                "let result = left ^ 1.0"
+            )
+        ),
+        format!(
+            "type F64Alias = F64\n{}",
+            fixture(
+                "pub fn f64_alias_path_bool_rhs(left: F64Alias) -> F64Alias",
+                "let result = left & true"
+            )
         ),
         fixture(
-            "pub fn f64_path_char_rhs(left: F64) -> F64",
-            "let result = left | 'y'",
+            "pub fn f32_unresolved_path_float_rhs() -> F32",
+            "let result = missing & 1.0",
+        ),
+        fixture(
+            "pub fn f64_self_reference_path_float_rhs() -> F64",
+            "let result = result | 1.0",
+        ),
+        fixture(
+            "pub fn f32_forward_reference_path_float_rhs() -> F32",
+            "let result = later ^ 1.0\n    let later: F32 = 2.0",
+        ),
+        fixture(
+            "pub fn f32_nested_rhs_float(left: F32) -> F32",
+            "let result = left & (1.0 + 1.0)",
+        ),
+        fixture(
+            "pub fn f64_nested_left_float(left: F64) -> F64",
+            "let result = (left | 1.0) ^ 2.0",
+        ),
+        fixture(
+            "pub fn f32_computed_rhs_float(left: F32, right: F32) -> F32",
+            "let result = left ^ (right + 1.0)",
         ),
         format!(
             "type ByteAlias = Byte\n{}",
@@ -6668,6 +6702,10 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn generic_char_path_scalar_rhs<T>(left: Char) -> Char",
             "let result = left & true",
         ),
+        fixture(
+            "pub fn generic_f32_path_scalar_rhs<T>(left: F32) -> F32",
+            "let result = left & 1.0",
+        ),
         concat!(
             "type BitOwner { marker: Byte }\n",
             "impl BitOwner {\n",
@@ -6705,6 +6743,17 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "    fn char_path_scalar_method(self: borrow Self, left: Char) -> Char {\n",
             "        let prior: Char = left\n",
             "        let result = prior | 'x'\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        )
+        .to_owned(),
+        concat!(
+            "type FloatPathBitOwner { marker: F64 }\n",
+            "impl FloatPathBitOwner {\n",
+            "    fn float_path_scalar_method(self: borrow Self, left: F64) -> F64 {\n",
+            "        let prior: F64 = left\n",
+            "        let result = prior ^ 1.0\n",
             "        result\n",
             "    }\n",
             "}\n",
@@ -7642,6 +7691,253 @@ fn primitive_bitwise_bool_path_scalar_rhs_recovers_to_different_annotation() {
         "expected `I32`, found `Bool`",
         expression,
         end,
+    );
+}
+
+#[test]
+fn primitive_bitwise_float_path_scalar_rhs_diagnostics_use_operand_context_and_recover() {
+    let cases = [
+        ("&", "and", "true", "bool", Some("a Bool literal")),
+        ("&", "and", "'x'", "char", Some("a character literal")),
+        ("&", "and", "1.0", "float", None),
+        ("|", "or", "false", "bool", Some("a Bool literal")),
+        ("|", "or", "'y'", "char", Some("a character literal")),
+        ("|", "or", "2.0", "float", None),
+        ("^", "xor", "true", "bool", Some("a Bool literal")),
+        ("^", "xor", "'z'", "char", Some("a character literal")),
+        ("^", "xor", "3.0", "float", None),
+    ];
+    for (primitive, parameter, prior) in
+        [("F32", "left32", "prior32"), ("F64", "left64", "prior64")]
+    {
+        let mut source =
+            format!("pub fn float_path_scalar_rhs({parameter}: {primitive}) -> {primitive} {{\n");
+        source.push_str(&format!("    let {prior}: {primitive} = {parameter}\n"));
+        let mut operator_spans = Vec::new();
+        let mut mismatch_spans = Vec::new();
+        for (operator, operation, literal, suffix, mismatch_description) in cases {
+            for (left_kind, left) in [("parameter", parameter), ("local", prior)] {
+                let local = format!(
+                    "{}_{}_{}_{}",
+                    operation,
+                    suffix,
+                    primitive.to_ascii_lowercase(),
+                    left_kind
+                );
+                let expression = format!("{left} {operator} {literal}");
+                let line = format!("    let {local} = {expression}\n");
+                let expression_start =
+                    source.len() + line.find(&expression).expect("expression exists");
+                let expression_end = expression_start + expression.len();
+                let literal_start = expression_start + format!("{left} {operator} ").len();
+                operator_spans.push((operator, expression_start, expression_end));
+                if let Some(description) = mismatch_description {
+                    mismatch_spans.push((
+                        description,
+                        literal_start,
+                        literal_start + literal.len(),
+                    ));
+                }
+                source.push_str(&line);
+            }
+        }
+        source.push_str(&format!(
+            "    xor_float_{}_local\n}}\n",
+            primitive.to_ascii_lowercase()
+        ));
+
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout
+                .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                .count(),
+            operator_spans.len(),
+            "each {primitive} path-left bitwise expression should report one unsupported operator:\n{stdout}"
+        );
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            mismatch_spans.len(),
+            "only Bool and Char RHS literals should mismatch the {primitive} left path:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "representable float literals should use the left path type, and every expression should recover:\n{stdout}"
+        );
+        for (operator, start, end) in operator_spans {
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "OPERATOR_NOT_SUPPORTED",
+                &format!("operator `{operator}` is not defined for `{primitive}`"),
+                start,
+                end,
+            );
+        }
+        for (description, start, end) in mismatch_spans {
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                &format!("expected `{primitive}`, found {description}"),
+                start,
+                end,
+            );
+        }
+    }
+}
+
+#[test]
+fn primitive_bitwise_float_path_annotation_and_f32_range_errors_recover() {
+    let run_recovering_check = |source: &str| {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "supported recovery should reach later locals and tails:\n{stdout}"
+        );
+        stdout
+    };
+
+    let f32_annotation_source = concat!(
+        "pub fn f32_annotation_recovery(left: F32) -> I32 {\n",
+        "    let value: I32 = left & true\n",
+        "    let recovered: I32 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let stdout = run_recovering_check(f32_annotation_source);
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the F32 operator should remain unsupported:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the initializer annotation and Bool RHS should each mismatch once:\n{stdout}"
+    );
+    let f32_expression = f32_annotation_source
+        .find("left & true")
+        .expect("F32 annotated expression exists");
+    let f32_expression_end = f32_expression + "left & true".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `&` is not defined for `F32`",
+        f32_expression,
+        f32_expression_end,
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `F32`",
+        f32_expression,
+        f32_expression_end,
+    );
+    let f32_bool_rhs = f32_expression + "left & ".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `F32`, found a Bool literal",
+        f32_bool_rhs,
+        f32_bool_rhs + "true".len(),
+    );
+
+    let f64_annotation_source = concat!(
+        "pub fn f64_annotation_recovery(left: F64) -> Bool {\n",
+        "    let value: Bool = left ^ 'x'\n",
+        "    let recovered: Bool = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let stdout = run_recovering_check(f64_annotation_source);
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the F64 operator should remain unsupported:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the initializer annotation and Char RHS should each mismatch once:\n{stdout}"
+    );
+    let f64_expression = f64_annotation_source
+        .find("left ^ 'x'")
+        .expect("F64 annotated expression exists");
+    let f64_expression_end = f64_expression + "left ^ 'x'".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `^` is not defined for `F64`",
+        f64_expression,
+        f64_expression_end,
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `F64`",
+        f64_expression,
+        f64_expression_end,
+    );
+    let f64_char_rhs = f64_expression + "left ^ ".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `F64`, found a character literal",
+        f64_char_rhs,
+        f64_char_rhs + "'x'".len(),
+    );
+
+    let f32_range_source = concat!(
+        "pub fn f32_out_of_range_rhs(left: F32) -> F32 {\n",
+        "    let value = left | 1e39\n",
+        "    let recovered: F32 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let stdout = run_recovering_check(f32_range_source);
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the F32 operator should remain unsupported:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        0,
+        "a contextualized out-of-range float should not produce a type mismatch:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        1,
+        "the F32-contextualized RHS should retain its range diagnostic:\n{stdout}"
+    );
+    let f32_range_expression = f32_range_source
+        .find("left | 1e39")
+        .expect("F32 out-of-range expression exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `|` is not defined for `F32`",
+        f32_range_expression,
+        f32_range_expression + "left | 1e39".len(),
+    );
+    let f32_range_literal = f32_range_expression + "left | ".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "floating-point literal is out of range for `F32`",
+        f32_range_literal,
+        f32_range_literal + "1e39".len(),
     );
 }
 
