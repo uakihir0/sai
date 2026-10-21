@@ -6457,12 +6457,35 @@ fn primitive_bitwise_integer_annotation_mismatch_recovers_after_operand_mismatch
 fn unsupported_primitive_bitwise_shapes_remain_gated() {
     for source in [
         "pub fn literal_pair() -> I32 { let result = 1 & 2; result }\n",
+        "pub fn byte_literal_pair() -> Byte { let result = b'a' & b'b'; result }\n",
+        "pub fn byte_integer_literal_pair() -> Byte { let result = b'a' ^ 1; result }\n",
+        "pub fn byte_float_literal_rhs(right: Byte) -> Byte { let result = b'a' | 1.0; result }\n",
+        "pub fn byte_bool_literal_rhs(right: Byte) -> Byte { let result = b'a' & true; result }\n",
+        "pub fn byte_char_literal_rhs(right: Byte) -> Byte { let result = b'a' ^ 'b'; result }\n",
+        "pub fn byte_string_left(right: Byte) -> Byte { let result = b\"text\" & right; result }\n",
+        "type ByteAlias = Byte\npub fn byte_alias_rhs(right: ByteAlias) -> Byte { let result = b'a' & right; result }\n",
+        "pub fn byte_unresolved_rhs() -> Byte { let result = b'a' & missing; result }\n",
+        "pub fn byte_self_reference() -> Byte { let result = b'a' & result; result }\n",
+        "pub fn byte_forward_reference() -> Byte { let result = b'a' & later; let later: Byte = b'b'; result }\n",
+        "pub fn byte_nested_rhs(left: Byte, right: Byte) -> Byte { let result = b'a' & (left & right); result }\n",
+        "pub fn byte_nested_left(right: Byte, right2: Byte) -> Byte { let result = (b'a' & right) ^ right2; result }\n",
+        "pub fn byte_computed_left(right: Byte) -> Byte { let result = (~b'a') & right; result }\n",
         "pub fn nested(left: I32, right: I32, extra: I32) -> I32 { let result = left & (right ^ extra); result }\n",
         "pub fn computed(left: I32, right: I32) -> I32 { let result = (left + right) & right; result }\n",
         "pub fn unresolved(left: I32) -> I32 { let bits = 1; let result = bits & left; result }\n",
         "type Word = I32\npub fn alias(left: Word, right: Word) -> Word { let result = left & right; result }\n",
         "pub fn self_reference(left: I32) -> I32 { let result = result & left; result }\n",
         "pub fn forward_reference(left: I32) -> I32 { let result = later & left; let later: I32 = 1; result }\n",
+        "pub fn generic<T>(right: Byte) -> Byte { let result = b'a' & right; result }\n",
+        concat!(
+            "type BitOwner { marker: Byte }\n",
+            "impl BitOwner {\n",
+            "    fn method(self: borrow Self, right: Byte) -> Byte {\n",
+            "        let result = b'a' & right\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
@@ -6903,6 +6926,110 @@ fn primitive_bitwise_right_byte_literals_accept_byte_paths_and_tail_expressions(
     );
 
     assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn primitive_bitwise_byte_literal_left_accepts_byte_parameter_and_local_paths() {
+    let source = concat!(
+        "pub fn byte_literal_lefts(right: Byte) -> Byte {\n",
+        "    let and_parameter = b'a' & right\n",
+        "    let and_local = b'b' & and_parameter\n",
+        "    let or_parameter = b'c' | right\n",
+        "    let or_local = b'd' | or_parameter\n",
+        "    let xor_parameter = b'e' ^ right\n",
+        "    let xor_local = b'f' ^ xor_parameter\n",
+        "    let annotated: Byte = b'g' & xor_local\n",
+        "    annotated\n",
+        "}\n",
+    );
+
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn primitive_bitwise_byte_literal_left_rhs_mismatches_recover_to_byte() {
+    for (operator, right_type) in [
+        ("&", "I16"),
+        ("|", "Bool"),
+        ("^", "Char"),
+        ("&", "F32"),
+        ("|", "F64"),
+    ] {
+        let source = format!(
+            concat!(
+                "pub fn byte_mismatch(right: {right_type}) -> Byte {{\n",
+                "    let value = b'a' {operator} right\n",
+                "    let recovered: Byte = value\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            operator = operator,
+            right_type = right_type,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression = format!("b'a' {operator} right");
+        let expression_start = source
+            .find(&expression)
+            .expect("Byte literal left expression exists");
+        let right_start = expression_start + format!("b'a' {operator} ").len();
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "each non-Byte path should produce one mismatch:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "the Byte operator mismatch should recover through the later local and tail:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            &format!("expected `Byte`, found `{right_type}`"),
+            right_start,
+            right_start + "right".len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_bitwise_byte_literal_left_annotation_mismatch_recovers_to_annotation() {
+    let source = concat!(
+        "pub fn annotation_recovery(right: Byte) -> U8 {\n",
+        "    let value: U8 = b'a' ^ right\n",
+        "    let recovered: U8 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression = "b'a' ^ right";
+    let expression_start = source
+        .find(expression)
+        .expect("annotated Byte literal-left expression exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the incompatible annotation should produce one mismatch:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the local should recover to U8 and reach the following local and tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Byte`",
+        expression_start,
+        expression_start + expression.len(),
+    );
 }
 
 #[test]
