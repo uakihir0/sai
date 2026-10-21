@@ -138,7 +138,7 @@ struct LiteralVariable<'hir> {
 /// Direct numeric literals are accepted on either side of `+`, `-`, `*`, and
 /// `/` when paired with an eligible concrete numeric path. `%` accepts integer
 /// paths and direct integer literals; float `%` returns an operator diagnostic.
-/// Unary `~` accepts a direct integer literal or concrete integer/Byte path.
+/// Unary `~` accepts direct integer/Byte literals and concrete integer/Byte paths.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
 /// unsupported until their own type-checking slices are implemented.
@@ -331,23 +331,41 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             ExprKind::Unary(UnOp::BitNot, operand) => {
                 if let ExprKind::Lit(literal) = operand.kind {
-                    if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer) {
-                        return Err(());
-                    }
-                    if let Some(expected) = annotation {
-                        self.check_annotated_literal(
-                            expected,
-                            literal,
-                            PrimitiveLiteralKind::Integer,
-                            operand.hir_id,
-                        );
-                        LocalType::Concrete(expected)
-                    } else {
-                        self.local_type_for_unannotated_literal(
-                            literal,
-                            PrimitiveLiteralKind::Integer,
-                            operand.hir_id,
-                        )
+                    match primitive_literal_kind(literal) {
+                        Some(PrimitiveLiteralKind::Integer) => {
+                            if let Some(expected) = annotation {
+                                self.check_annotated_literal(
+                                    expected,
+                                    literal,
+                                    PrimitiveLiteralKind::Integer,
+                                    operand.hir_id,
+                                );
+                                LocalType::Concrete(expected)
+                            } else {
+                                self.local_type_for_unannotated_literal(
+                                    literal,
+                                    PrimitiveLiteralKind::Integer,
+                                    operand.hir_id,
+                                )
+                            }
+                        }
+                        Some(PrimitiveLiteralKind::Byte) => {
+                            if let Some(expected) = annotation {
+                                if expected != PrimTy::Byte {
+                                    self.errors.push(PrimitiveBodyError {
+                                        node: init.hir_id,
+                                        kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                            expected,
+                                            found: PrimTy::Byte,
+                                        },
+                                    });
+                                }
+                                LocalType::Concrete(expected)
+                            } else {
+                                LocalType::Concrete(PrimTy::Byte)
+                            }
+                        }
+                        _ => return Err(()),
                     }
                 } else {
                     let operand_type = self

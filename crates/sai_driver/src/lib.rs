@@ -6362,7 +6362,9 @@ fn check_function_body_primitive_local_block(
                 }
             }
             ExprKind::Unary(UnOp::BitNot, operand) => {
-                if !is_direct_function_integer_literal(operand) {
+                if !is_direct_function_integer_literal(operand)
+                    && !matches!(operand.kind, ExprKind::Lit(Lit::Byte(_)))
+                {
                     let ExprKind::Path(path) = operand.kind else {
                         return Ok(None);
                     };
@@ -25875,6 +25877,39 @@ mod tests {
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
                 "function owner {:?} (index {index}) unexpectedly failed the direct bit-not literal slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_bit_not_for_direct_byte_literals() {
+        let root = concat!(
+            "pub fn inferred() -> Byte {\n    let result = ~b'a'\n    result\n}\n",
+            "pub fn annotated() -> Byte {\n    let result: Byte = ~b'z'\n    let copied: Byte = result\n    copied\n}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 2);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("direct Byte literal bit-not body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the direct Byte bit-not literal slice: {check:?}",
                 owner.owner()
             );
         }
