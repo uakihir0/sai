@@ -27,8 +27,11 @@ source repository before a package resolver can fetch them.
 | Advanced | [`island-grid-dispatch`](island-grid-dispatch/README.md) | Allocate a constrained one-hour power budget by criticality while preserving a battery reserve. |
 | Advanced | [`clinic-shift-roster`](clinic-shift-roster/README.md) | Validate clinician credentials, availability, shift caps, rest periods, and required coverage. |
 | Advanced | [`community-food-bank`](community-food-bank/README.md) | Allocate expiring pantry stock across household requests with dietary eligibility and priority rules. |
+| Advanced | [`quota-ledger`](quota-ledger/README.md) | Model capacity-bounded reserve/release operations with contracts and property tests. |
 
-The more involved examples use fixed fixtures and in-memory calculations to
-cover practical workflows without external services or persistent state.
-Each project README lists the language features it illustrates and the
-compiler stages that are still needed to build and run it.
+Most of the more involved examples use fixed fixtures and in-memory
+calculations to cover practical workflows without external services or
+persistent state. `quota-ledger` is a pure library with generated property
+cases instead of a command-line workflow. Each project README lists the
+language features it illustrates and the compiler stages that are still
+needed to build and run it.
