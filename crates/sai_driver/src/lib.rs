@@ -26291,6 +26291,144 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_reports_bool_path_scalar_literal_rhs_diagnostics() {
+        let cases = [
+            ("&", "and", "true", "bool", None),
+            ("&", "and", "'x'", "char", Some("a character literal")),
+            ("&", "and", "1.0", "float", Some("a floating-point literal")),
+            ("|", "or", "false", "bool", None),
+            ("|", "or", "'y'", "char", Some("a character literal")),
+            ("|", "or", "2.0", "float", Some("a floating-point literal")),
+            ("^", "xor", "true", "bool", None),
+            ("^", "xor", "'z'", "char", Some("a character literal")),
+            ("^", "xor", "3.0", "float", Some("a floating-point literal")),
+        ];
+        let mut root = String::from("pub fn bool_path_scalar_rhs(left: Bool) -> Bool {\n");
+        root.push_str("    let prior: Bool = left\n");
+        let mut expected = Vec::new();
+        for (operator, operation, literal, suffix, mismatch_description) in cases {
+            for (left_kind, left) in [("parameter", "left"), ("local", "prior")] {
+                let local = format!("{operation}_{suffix}_{left_kind}");
+                let expression = format!("{left} {operator} {literal}");
+                let line = format!("    let {local} = {expression}\n");
+                let expression_start =
+                    root.len() + line.find(&expression).expect("expression exists");
+                let expression_end = expression_start + expression.len();
+                if let Some(description) = mismatch_description {
+                    let literal_start = expression_start + format!("{left} {operator} ").len();
+                    expected.push((
+                        sai_diagnostics::Code::TypeMismatch,
+                        format!("expected `Bool`, found {description}"),
+                        literal_start,
+                        literal_start + literal.len(),
+                    ));
+                }
+                expected.push((
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    format!("operator `{operator}` is not defined for `Bool`"),
+                    expression_start,
+                    expression_end,
+                ));
+                root.push_str(&line);
+            }
+        }
+        root.push_str("    let recovered: Bool = xor_float_local\n    recovered\n}\n");
+        root.push_str(concat!(
+            "pub fn bool_path_scalar_annotation_recovery(left: Bool) -> I32 {\n",
+            "    let value: I32 = left & true\n",
+            "    let recovered: I32 = value\n",
+            "    recovered\n",
+            "}\n",
+        ));
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 2);
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[0]
+            .body_type_check()
+            .expect("Bool path scalar RHSs remain in the supported body slice")
+        else {
+            panic!("Bool path scalar RHSs must remain supported");
+        };
+        assert_eq!(diagnostics.len(), expected.len());
+        for (diagnostic, (code, message, start, end)) in diagnostics.iter().zip(expected) {
+            assert_eq!(diagnostic.code, code);
+            assert_eq!(diagnostic.message, message);
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("scalar RHS diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new(end as u32),
+                )
+                .expect("scalar RHS diagnostic span is ordered")
+            );
+        }
+
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[1]
+            .body_type_check()
+            .expect("Bool annotation mismatch recovers through the supported body slice")
+        else {
+            panic!("Bool path annotation mismatch should recover");
+        };
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::OperatorNotSupported,
+                sai_diagnostics::Code::TypeMismatch,
+            ]
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "operator `&` is not defined for `Bool`",
+                "expected `I32`, found `Bool`",
+            ]
+        );
+        let annotation_initializer = root
+            .find("let value: I32 = left & true")
+            .expect("annotated initializer exists");
+        let annotation_expression = annotation_initializer + "let value: I32 = ".len();
+        let annotation_expression_end = annotation_expression + "left & true".len();
+        for diagnostic in diagnostics {
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("annotation diagnostic has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(annotation_expression as u32),
+                    sai_diagnostics::TextSize::new(annotation_expression_end as u32),
+                )
+                .expect("annotation expression span is ordered")
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_reports_integer_path_nonbyte_scalar_literal_mismatches() {
         let primitive_types = [
             ("i8_value", "I8"),
@@ -26821,16 +26959,16 @@ mod tests {
             "pub fn float_literal_left(left: I32) -> I32 {\n    let value = 1.0 & left\n    value\n}\n",
             "pub fn literal_pair() -> I32 {\n    let value = 1 ^ 2\n    value\n}\n",
             "pub fn char_integer_literal(left: Char) -> Char {\n    let value = left & 1\n    value\n}\n",
-            "pub fn bool_path_char_rhs(left: Bool) -> Bool {\n    let value = left | 'x'\n    value\n}\n",
+            "pub fn bool_path_byte_string_rhs(left: Bool) -> Bool {\n    let value = left & b\"text\"\n    value\n}\n",
             "pub fn char_path_float_rhs(left: Char) -> Char {\n    let value = left ^ 1.0\n    value\n}\n",
             "pub fn f32_path_bool_rhs(left: F32) -> F32 {\n    let value = left & false\n    value\n}\n",
             "pub fn f64_path_char_rhs(left: F64) -> F64 {\n    let value = left | 'y'\n    value\n}\n",
             "pub fn byte_alias_path_scalar_rhs(left: ByteAlias) -> ByteAlias {\n    let value = left ^ true\n    value\n}\n",
             "pub fn generic_path_scalar_rhs<T>(left: Byte) -> Byte {\n    let value = left & 'x'\n    value\n}\n",
-            "type PathScalarBitOwner { marker: Byte }\n",
+            "type PathScalarBitOwner { marker: Bool }\n",
             "impl PathScalarBitOwner {\n",
-            "    fn path_scalar_method(self: borrow Self, left: Byte) -> Byte {\n",
-            "        let prior: Byte = left\n",
+            "    fn path_scalar_method(self: borrow Self, left: Bool) -> Bool {\n",
+            "        let prior: Bool = left\n",
             "        let value = prior ^ 1.0\n",
             "        value\n",
             "    }\n",
