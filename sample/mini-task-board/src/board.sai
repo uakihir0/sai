@@ -37,10 +37,12 @@ pub fn print_all(out: borrow mut Stdout)
 pub fn print_summary(out: borrow mut Stdout)
     effects { stdio.write, alloc }
 {
+    var total: USize = 0
     var todo: USize = 0
     var doing: USize = 0
     var done: USize = 0
     for task in sample_tasks() {
+        total += 1
         match task.status {
             Status.Todo => {
                 todo += 1
@@ -53,5 +55,5 @@ pub fn print_summary(out: borrow mut Stdout)
             }
         }
     }
-    out.write_str(f"3 tasks: {todo} todo, {doing} doing, {done} done\n".as_str())
+    out.write_str(f"{total} tasks: {todo} todo, {doing} doing, {done} done\n".as_str())
 }
