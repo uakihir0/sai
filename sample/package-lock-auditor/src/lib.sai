@@ -18,6 +18,10 @@ pub fn audit_incompatible_range_fixture() -> AuditReport {
     audit.audit(fixtures.incompatible_range_lock())
 }
 
+pub fn audit_missing_requester_incompatible_range_fixture() -> AuditReport {
+    audit.audit(fixtures.missing_requester_incompatible_range_lock())
+}
+
 pub fn audit_inclusive_minimum_fixture() -> AuditReport {
     audit.audit(fixtures.inclusive_minimum_lock())
 }
@@ -76,6 +80,14 @@ test "missing requester and dependency endpoints are both counted" {
 test "a range conflict blocks a valid graph plan" {
     let report = audit_incompatible_range_fixture()
     assert report.missing_reference_count == 0
+    assert report.incompatible_range_count == 1
+    assert report.has_cycle == Some(false)
+    assert report.build_order.length == 0
+}
+
+test "an existing target range is checked when its requester is missing" {
+    let report = audit_missing_requester_incompatible_range_fixture()
+    assert report.missing_reference_count == 1
     assert report.incompatible_range_count == 1
     assert report.has_cycle == Some(false)
     assert report.build_order.length == 0

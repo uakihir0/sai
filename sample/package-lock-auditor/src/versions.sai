@@ -34,15 +34,10 @@ pub fn missing_reference_count(lock: Lockfile) -> USize {
 pub fn incompatible_range_count(lock: Lockfile) -> USize {
     var count: USize = 0
     for requirement in lock.requirements {
-        match lookup.find_package(lock, requirement.requester_id) {
+        match lookup.find_package(lock, requirement.dependency_id) {
             Some(_) => {
-                match lookup.find_package(lock, requirement.dependency_id) {
-                    Some(_) => {
-                        if not range_accepts(lock, requirement) {
-                            count += 1
-                        }
-                    }
-                    None => {}
+                if not range_accepts(lock, requirement) {
+                    count += 1
                 }
             }
             None => {}

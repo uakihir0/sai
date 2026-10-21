@@ -23,6 +23,13 @@ duplicate package ID pairs: 0
 dependency cycle: no
 build order: unavailable (lock is invalid)
 
+missing requester with incompatible target
+missing package references: 1
+version range conflicts: 1
+duplicate package ID pairs: 0
+dependency cycle: no
+build order: unavailable (lock is invalid)
+
 missing target fixture
 missing package references: 1
 version range conflicts: 0
@@ -58,7 +65,9 @@ and a half-open minor window: `minimum_minor <= locked.minor <
 maximum_minor_exclusive`. This is an intentionally small teaching constraint,
 not full Semantic Versioning compatibility. Patch versions are recorded but
 do not affect this range check. Both requester and target IDs are checked;
-each missing endpoint contributes one to the reported count.
+each missing endpoint contributes one to the reported count. When the target
+exists, its version is checked against the requirement even if the requester
+is missing.
 
 The order is stable: on each pass, choose the first not-yet-built package in
 fixture order whose known dependencies are already built. A shared dependency

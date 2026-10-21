@@ -91,6 +91,13 @@ pub fn incompatible_range_lock() -> Lockfile {
     lock
 }
 
+pub fn missing_requester_incompatible_range_lock() -> Lockfile {
+    var lock = clean_lock()
+    lock.requirements[0].requester_id = 98
+    lock.requirements[0].required_major = 2
+    lock
+}
+
 pub fn inclusive_minimum_lock() -> Lockfile {
     var lock = clean_lock()
     lock.requirements[0].minimum_minor = 8
