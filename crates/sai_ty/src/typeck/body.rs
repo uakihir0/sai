@@ -158,6 +158,8 @@ struct LiteralVariable<'hir> {
 /// Direct numeric literals are accepted on either side of `+`, `-`, `*`, and
 /// `/` when paired with an eligible concrete numeric path. `%` accepts integer
 /// paths and direct integer literals; float `%` returns an operator diagnostic.
+/// Char-left bitwise diagnostics accept resolved numeric literal computations
+/// through unannotated plain-path copies when no additional literal site exists.
 /// Unary `~` accepts direct integer/Byte literals and concrete integer/Byte paths.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
@@ -176,6 +178,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         known_bindings,
         direct_unannotated_integer_literals: HashSet::new(),
         unannotated_integer_literal_aliases: HashSet::new(),
+        resolved_computed_literal_paths: HashSet::new(),
         direct_unannotated_float_literals: HashSet::new(),
         unannotated_float_literal_aliases: HashSet::new(),
         pending_operator_trait_count: 0,
@@ -198,6 +201,7 @@ struct FnCtxt<'a, 'hir> {
     known_bindings: HashMap<BindingId, LocalType>,
     direct_unannotated_integer_literals: HashSet<BindingId>,
     unannotated_integer_literal_aliases: HashSet<BindingId>,
+    resolved_computed_literal_paths: HashSet<BindingId>,
     direct_unannotated_float_literals: HashSet<BindingId>,
     unannotated_float_literal_aliases: HashSet<BindingId>,
     pending_operator_trait_count: usize,
@@ -440,6 +444,25 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             _ => return Err(()),
         };
 
+        if annotation.is_none()
+            && matches!(
+                init.kind,
+                ExprKind::Binary(BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div, _, _)
+            )
+        {
+            if let LocalType::LiteralVariable(id) = local_type {
+                if self.literal_variables.get(id).is_some_and(|variable| {
+                    matches!(
+                        variable.kind,
+                        PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+                    ) && variable.resolved.is_some()
+                        && variable.additional_site.is_none()
+                }) {
+                    self.resolved_computed_literal_paths.insert(binding);
+                }
+            }
+        }
+
         if annotation.is_none() {
             if let ExprKind::Lit(literal) = init.kind {
                 match primitive_literal_kind(literal) {
@@ -459,6 +482,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         }
         if let Some(source_binding) = self.plain_local_path_binding(init) {
+            let source_has_resolved_computed_literal_provenance = self
+                .resolved_computed_literal_paths
+                .contains(&source_binding);
+            if can_track_resolved_computed_literal_alias(
+                source_has_resolved_computed_literal_provenance,
+                matches!(init.kind, ExprKind::Path(_)),
+                annotation.is_some(),
+            ) {
+                self.resolved_computed_literal_paths.insert(binding);
+            }
+
             let source_has_integer_literal_provenance = self
                 .direct_unannotated_integer_literals
                 .contains(&source_binding)
@@ -881,51 +915,55 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         let right_local_type = self.check_local_path(right)?;
                         let eligible_unannotated_literal_path =
                             self.is_eligible_unannotated_literal_path(right);
-                        if matches!(right_local_type, LocalType::LiteralVariable(_))
-                            && !eligible_unannotated_literal_path
-                        {
-                            return Err(());
-                        }
+                        let eligible_resolved_computed_literal_path =
+                            self.is_eligible_resolved_computed_literal_path(right);
                         let right_type = self
                             .concrete_local_type(right_local_type)
                             .filter(|primitive| supports_primitive_literal(*primitive));
-                        let Some(right_type) = right_type else {
-                            if !eligible_unannotated_literal_path {
+                        if let Some(right_type) = right_type {
+                            if matches!(right_local_type, LocalType::LiteralVariable(_))
+                                && !eligible_unannotated_literal_path
+                                && !eligible_resolved_computed_literal_path
+                            {
                                 return Err(());
                             }
-                            let LocalType::LiteralVariable(id) = right_local_type else {
-                                return Err(());
-                            };
-                            let diagnostic_index =
-                                self.errors.len() + self.pending_operator_trait_count;
-                            self.pending_operator_trait_count += 1;
-                            let Some(variable) = self.literal_variables.get_mut(id) else {
-                                return Err(());
-                            };
-                            if !can_defer_char_literal_path_trait(
-                                variable.kind,
-                                variable.additional_site.is_some(),
-                                eligible_unannotated_literal_path,
-                            ) {
-                                return Err(());
-                            }
-                            variable
-                                .pending_operator_traits
-                                .push(PendingOperatorTraitSite {
+                            self.errors.push(PrimitiveBodyError {
+                                node: expression,
+                                kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
                                     operator,
-                                    expression,
-                                    diagnostic_index,
-                                });
+                                    left: PrimTy::Char,
+                                    right: right_type,
+                                },
+                            });
                             return Ok(LocalType::Concrete(PrimTy::Char));
+                        }
+
+                        if !eligible_unannotated_literal_path {
+                            return Err(());
+                        }
+                        let LocalType::LiteralVariable(id) = right_local_type else {
+                            return Err(());
                         };
-                        self.errors.push(PrimitiveBodyError {
-                            node: expression,
-                            kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
+                        let diagnostic_index =
+                            self.errors.len() + self.pending_operator_trait_count;
+                        self.pending_operator_trait_count += 1;
+                        let Some(variable) = self.literal_variables.get_mut(id) else {
+                            return Err(());
+                        };
+                        if !can_defer_char_literal_path_trait(
+                            variable.kind,
+                            variable.additional_site.is_some(),
+                            eligible_unannotated_literal_path,
+                        ) {
+                            return Err(());
+                        }
+                        variable
+                            .pending_operator_traits
+                            .push(PendingOperatorTraitSite {
                                 operator,
-                                left: PrimTy::Char,
-                                right: right_type,
-                            },
-                        });
+                                expression,
+                                diagnostic_index,
+                            });
                         return Ok(LocalType::Concrete(PrimTy::Char));
                     };
                     let Some(right_kind) = primitive_literal_kind(right_literal) else {
@@ -1753,6 +1791,11 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             })
     }
 
+    fn is_eligible_resolved_computed_literal_path(&self, expression: &Expr<'hir>) -> bool {
+        self.plain_local_path_binding(expression)
+            .is_some_and(|binding| self.resolved_computed_literal_paths.contains(&binding))
+    }
+
     fn plain_local_path_binding(&self, expression: &Expr<'hir>) -> Option<BindingId> {
         let ExprKind::Path(path) = expression.kind else {
             return None;
@@ -1781,6 +1824,16 @@ fn can_track_unannotated_integer_literal_alias(
     alias_has_annotation: bool,
 ) -> bool {
     source_has_integer_literal_provenance && initializer_is_plain_path && !alias_has_annotation
+}
+
+fn can_track_resolved_computed_literal_alias(
+    source_has_resolved_computed_literal_provenance: bool,
+    initializer_is_plain_path: bool,
+    alias_has_annotation: bool,
+) -> bool {
+    source_has_resolved_computed_literal_provenance
+        && initializer_is_plain_path
+        && !alias_has_annotation
 }
 
 fn primitive_comparison_result(
@@ -2055,11 +2108,11 @@ mod tests {
     use super::{
         PrimitiveArithmeticResult, PrimitiveBoolOperandResult, PrimitiveComparisonResult,
         PrimitiveLiteralKind, can_defer_char_literal_path_trait,
-        can_track_unannotated_float_literal_alias, can_track_unannotated_integer_literal_alias,
-        primitive_arithmetic_literal_expected_type, primitive_arithmetic_literal_left_result,
-        primitive_arithmetic_result, primitive_bitwise_bool_literal_pair_supported,
-        primitive_bitwise_byte_literal_left_result, primitive_bitwise_byte_literal_pair_result,
-        primitive_bitwise_char_float_literal_rhs_type,
+        can_track_resolved_computed_literal_alias, can_track_unannotated_float_literal_alias,
+        can_track_unannotated_integer_literal_alias, primitive_arithmetic_literal_expected_type,
+        primitive_arithmetic_literal_left_result, primitive_arithmetic_result,
+        primitive_bitwise_bool_literal_pair_supported, primitive_bitwise_byte_literal_left_result,
+        primitive_bitwise_byte_literal_pair_result, primitive_bitwise_char_float_literal_rhs_type,
         primitive_bitwise_char_literal_pair_supported,
         primitive_bitwise_integer_literal_pair_supported, primitive_bool_operand_result,
         primitive_comparison_literal_expected_type, primitive_comparison_result,
@@ -2741,6 +2794,26 @@ mod tests {
         assert!(
             !can_track_unannotated_integer_literal_alias(true, false, false),
             "computed initializers do not propagate integer-literal provenance"
+        );
+    }
+
+    #[test]
+    fn resolved_computed_literal_alias_tracking_requires_provenance_and_plain_paths() {
+        assert!(
+            can_track_resolved_computed_literal_alias(true, true, false),
+            "an eligible resolved computation can source unannotated path copies"
+        );
+        assert!(
+            !can_track_resolved_computed_literal_alias(true, true, true),
+            "annotated copies use the existing concrete-path behavior"
+        );
+        assert!(
+            !can_track_resolved_computed_literal_alias(false, true, false),
+            "other resolved literal variables do not gain computed provenance"
+        );
+        assert!(
+            !can_track_resolved_computed_literal_alias(true, false, false),
+            "computed expressions do not propagate path-alias provenance"
         );
     }
 }

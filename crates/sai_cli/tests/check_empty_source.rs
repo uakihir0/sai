@@ -8404,6 +8404,153 @@ fn primitive_bitwise_char_literal_left_local_path_rhs_reports_traits_and_recover
 }
 
 #[test]
+fn char_literal_resolved_computed_alias_chains_report_concrete_rhs_traits() {
+    let integer_source = concat!(
+        "pub fn char_computed_integer_alias_chain(base: I8) -> Char {\n",
+        "    let computed = 128 + base\n",
+        "    let alias1 = computed\n",
+        "    let alias2 = alias1\n",
+        "    let alias3 = alias2\n",
+        "    let and_value = 'i' & alias3\n",
+        "    let or_value = 'j' | alias3\n",
+        "    let xor_value = 'k' ^ alias3\n",
+        "    let mismatch: I32 = 'o' & alias3\n",
+        "    let recovered: Char = xor_value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let integer_output = run_check(integer_source, "", &[], &[]);
+    let integer_stdout = String::from_utf8(integer_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(integer_output.status.code(), Some(1), "{integer_stdout}");
+    assert_eq!(
+        integer_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        4,
+        "each resolved computed integer alias use reports one trait error:\n{integer_stdout}"
+    );
+    assert_eq!(
+        integer_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        1,
+        "the computed integer source literal is range-checked at its initializer:\n{integer_stdout}"
+    );
+    assert_eq!(
+        integer_stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the mismatched result annotation reports once:\n{integer_stdout}"
+    );
+    assert!(
+        !integer_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !integer_stdout.contains("\"type\":\"result\""),
+        "the resolved integer type is diagnosed and Char recovery remains usable:\n{integer_stdout}"
+    );
+    let integer_literal = integer_source
+        .find("128")
+        .expect("computed integer source literal exists");
+    assert_json_diagnostic_primary_span(
+        &integer_stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        integer_literal,
+        integer_literal + "128".len(),
+    );
+    for (operator, expression, trait_name, right_type) in [
+        ("&", "'i' & alias3", "BitAnd", "I8"),
+        ("|", "'j' | alias3", "BitOr", "I8"),
+        ("^", "'k' ^ alias3", "BitXor", "I8"),
+        ("&", "'o' & alias3", "BitAnd", "I8"),
+    ] {
+        let start = integer_source
+            .find(expression)
+            .expect("resolved computed integer alias expression exists");
+        assert_json_diagnostic_primary_span(
+            &integer_stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!(
+                "operator `{operator}` has no `{trait_name}<{right_type}>` implementation for `Char`"
+            ),
+            start,
+            start + expression.len(),
+        );
+    }
+    let mismatch = integer_source
+        .find("'o' & alias3")
+        .expect("mismatched Char expression exists");
+    assert_json_diagnostic_primary_span(
+        &integer_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Char`",
+        mismatch,
+        mismatch + "'o' & alias3".len(),
+    );
+
+    let float_source = concat!(
+        "pub fn char_computed_float_alias_chain(base: F32) -> Char {\n",
+        "    let computed = 1e39 + base\n",
+        "    let alias1 = computed\n",
+        "    let alias2 = alias1\n",
+        "    let alias3 = alias2\n",
+        "    let and_value = 'l' & alias3\n",
+        "    let or_value = 'm' | alias3\n",
+        "    let xor_value = 'n' ^ alias3\n",
+        "    let recovered: Char = xor_value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let float_output = run_check(float_source, "", &[], &[]);
+    let float_stdout = String::from_utf8(float_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(float_output.status.code(), Some(1), "{float_stdout}");
+    assert_eq!(
+        float_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        3,
+        "each resolved computed float alias use reports one trait error:\n{float_stdout}"
+    );
+    assert_eq!(
+        float_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        1,
+        "the computed float source literal is range-checked at its initializer:\n{float_stdout}"
+    );
+    assert!(
+        !float_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !float_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !float_stdout.contains("\"type\":\"result\""),
+        "the resolved float type is diagnosed and Char recovery remains usable:\n{float_stdout}"
+    );
+    let float_literal = float_source
+        .find("1e39")
+        .expect("computed float source literal exists");
+    assert_json_diagnostic_primary_span(
+        &float_stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "floating-point literal is out of range for `F32`",
+        float_literal,
+        float_literal + "1e39".len(),
+    );
+    for (operator, expression, trait_name) in [
+        ("&", "'l' & alias3", "BitAnd"),
+        ("|", "'m' | alias3", "BitOr"),
+        ("^", "'n' ^ alias3", "BitXor"),
+    ] {
+        let start = float_source
+            .find(expression)
+            .expect("resolved computed float alias expression exists");
+        assert_json_diagnostic_primary_span(
+            &float_stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<F32>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+}
+
+#[test]
 fn unsupported_primitive_bitwise_shapes_remain_gated() {
     let fixture = |signature: &str, statements: &str| {
         format!("{signature} {{\n    {statements}\n    result\n}}\n")
@@ -8503,10 +8650,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let result = 'a' & missing",
         ),
         fixture(
-            "pub fn char_computed_float_alias_chain_path_rhs(base: F32) -> Char",
-            "let computed = 1.0 + base\n    let alias1 = computed\n    let alias2 = alias1\n    let result = 'a' & alias2",
-        ),
-        fixture(
             "pub fn char_literal_computed_float_local_rhs() -> Char",
             "let right = 1.0 + 2.0\n    let result = 'a' & right",
         ),
@@ -8515,12 +8658,8 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let right = 1 + 2\n    let result = 'a' & right",
         ),
         fixture(
-            "pub fn char_literal_computed_integer_alias_chain_path_rhs(base: I32) -> Char",
-            "let computed = 1 + base\n    let alias1 = computed\n    let alias2 = alias1\n    let alias3 = alias2\n    let result = 'a' & alias3",
-        ),
-        fixture(
             "pub fn char_literal_integer_variable_additional_site_alias_chain_rhs() -> Char",
-            "let computed = 1 & 2\n    let alias1 = computed\n    let alias2 = alias1\n    let result = 'a' & alias2",
+            "let computed = 1 & 2\n    let alias1 = computed\n    let alias2 = alias1\n    let alias3 = alias2\n    let narrowed: I32 = alias3\n    let result = 'a' & alias3",
         ),
         fixture(
             "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char",

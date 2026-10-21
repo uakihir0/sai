@@ -27576,6 +27576,28 @@ mod tests {
             "    let recovered: I32 = value\n",
             "    recovered\n",
             "}\n",
+            "pub fn char_computed_integer_alias_chain(base: I32) -> Char {\n",
+            "    let computed = 1 + base\n",
+            "    let alias1 = computed\n",
+            "    let alias2 = alias1\n",
+            "    let alias3 = alias2\n",
+            "    let and_value = 'i' & alias3\n",
+            "    let or_value = 'j' | alias3\n",
+            "    let xor_value = 'k' ^ alias3\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_computed_float_alias_chain(base: F32) -> Char {\n",
+            "    let computed = 1.0 + base\n",
+            "    let alias1 = computed\n",
+            "    let alias2 = alias1\n",
+            "    let alias3 = alias2\n",
+            "    let and_value = 'l' & alias3\n",
+            "    let or_value = 'm' | alias3\n",
+            "    let xor_value = 'n' ^ alias3\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -27591,7 +27613,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 9);
+        assert_eq!(owners.len(), 11);
 
         let expected_diagnostics = [
             (
@@ -27722,12 +27744,46 @@ mod tests {
                     ("expected `I32`, found `Char`", "'h' ^ alias3"),
                 ],
             ),
+            (
+                9,
+                vec![
+                    (
+                        "operator `&` has no `BitAnd<I32>` implementation for `Char`",
+                        "'i' & alias3",
+                    ),
+                    (
+                        "operator `|` has no `BitOr<I32>` implementation for `Char`",
+                        "'j' | alias3",
+                    ),
+                    (
+                        "operator `^` has no `BitXor<I32>` implementation for `Char`",
+                        "'k' ^ alias3",
+                    ),
+                ],
+            ),
+            (
+                10,
+                vec![
+                    (
+                        "operator `&` has no `BitAnd<F32>` implementation for `Char`",
+                        "'l' & alias3",
+                    ),
+                    (
+                        "operator `|` has no `BitOr<F32>` implementation for `Char`",
+                        "'m' | alias3",
+                    ),
+                    (
+                        "operator `^` has no `BitXor<F32>` implementation for `Char`",
+                        "'n' ^ alias3",
+                    ),
+                ],
+            ),
         ];
 
         for (index, expected) in expected_diagnostics {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
-                .expect("untyped integer local or alias-chain Char bitwise pair is checked")
+                .expect("integer and float local or alias-chain Char bitwise pair is checked")
             else {
                 panic!("owner {index} must remain in the supported body-checking slice");
             };
@@ -29853,11 +29909,9 @@ mod tests {
             "pub fn char_literal_alias_path_rhs(right: ByteAlias) -> Char {\n    let value = 'a' & right\n    value\n}\n",
             "pub fn generic_char_literal_path_rhs<T>(right: T) -> Char {\n    let value = 'a' & right\n    value\n}\n",
             "pub fn char_literal_unresolved_path_rhs() -> Char {\n    let value = 'a' & missing\n    value\n}\n",
-            "pub fn char_computed_float_alias_chain_path_rhs(base: F32) -> Char {\n    let computed = 1.0 + base\n    let alias1 = computed\n    let alias2 = alias1\n    let value = 'a' & alias2\n    value\n}\n",
             "pub fn char_literal_computed_float_local_rhs() -> Char {\n    let right = 1.0 + 2.0\n    let value = 'a' & right\n    value\n}\n",
             "pub fn char_literal_computed_integer_path_rhs() -> Char {\n    let right = 1 + 2\n    let value = 'a' & right\n    value\n}\n",
-            "pub fn char_literal_computed_integer_alias_chain_path_rhs(base: I32) -> Char {\n    let computed = 1 + base\n    let alias1 = computed\n    let alias2 = alias1\n    let alias3 = alias2\n    let value = 'a' & alias3\n    value\n}\n",
-            "pub fn char_literal_integer_variable_additional_site_alias_chain_rhs() -> Char {\n    let computed = 1 & 2\n    let alias1 = computed\n    let alias2 = alias1\n    let value = 'a' & alias2\n    value\n}\n",
+            "pub fn char_literal_integer_variable_additional_site_alias_chain_rhs() -> Char {\n    let computed = 1 & 2\n    let alias1 = computed\n    let alias2 = alias1\n    let alias3 = alias2\n    let narrowed: I32 = alias3\n    let value = 'a' & alias3\n    value\n}\n",
             "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char {\n    let right = 1\n    let alias1 = right\n    let alias2 = alias1\n    let alias3 = alias2\n    let value = 'a' & alias3\n    value\n}\n",
             "pub fn generic_char_literal_untyped_float_path_rhs<T>() -> Char {\n    let right = 1.0\n    let alias1 = right\n    let alias2 = alias1\n    let alias3 = alias2\n    let value = 'a' & alias3\n    value\n}\n",
             "pub fn char_literal_self_reference_path_rhs() -> Char {\n    let value = 'a' & value\n    value\n}\n",
@@ -30034,7 +30088,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 87);
+        assert_eq!(resolved.owners().len(), 85);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()
