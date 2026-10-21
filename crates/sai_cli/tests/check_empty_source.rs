@@ -6455,11 +6455,12 @@ fn primitive_bitwise_not_annotation_mismatch_recovers_to_the_annotation() {
 }
 
 #[test]
-fn unsupported_primitive_bitwise_not_literal_and_computed_operands_remain_gated() {
+fn unsupported_primitive_bitwise_not_noninteger_literal_and_computed_operands_remain_gated() {
     for source in [
-        "pub fn integer_literal() -> I32 { let result = ~1; result }\n",
         "pub fn float_literal() -> I32 { let result = ~1.0; result }\n",
         "pub fn bool_literal() -> Bool { let result = ~true; result }\n",
+        "pub fn byte_literal() -> Byte { let result = ~b'a'; result }\n",
+        "pub fn char_literal() -> Char { let result = ~'a'; result }\n",
         "pub fn nested(left: I32, right: I32) -> I32 { let result = ~(left ^ right); result }\n",
         "pub fn computed(left: I32, right: I32) -> I32 { let result = ~(left + right); result }\n",
         "pub fn unresolved() -> I64 { let bits = 1; let result = ~bits; result }\n",
@@ -6468,6 +6469,163 @@ fn unsupported_primitive_bitwise_not_literal_and_computed_operands_remain_gated(
         "pub fn forward_reference(value: I32) -> I32 { let result = ~later; let later: I32 = value; result }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn primitive_bitwise_not_accepts_direct_integer_literals_with_annotation_and_tail_inference() {
+    let source = concat!(
+        "pub fn literal_inference() -> I16 {\n",
+        "    let annotated: I8 = ~-128\n",
+        "    let inferred = ~42\n",
+        "    inferred\n",
+        "}\n",
+    );
+
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn primitive_bitwise_not_defaults_unannotated_integer_literals_to_i64() {
+    let source = concat!(
+        "pub fn defaulting() -> I64 {\n",
+        "    let defaulted = ~9223372036854775808\n",
+        "    let tail: I64 = 0\n",
+        "    tail\n",
+        "}\n",
+    );
+
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let literal_start = source
+        .find("9223372036854775808")
+        .expect("I64 out-of-range literal exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        1,
+        "an unconstrained unary integer literal should default to I64 and be range-checked:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "I64 defaulting should recover through the following local and tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I64`",
+        literal_start,
+        literal_start + "9223372036854775808".len(),
+    );
+}
+
+#[test]
+fn primitive_bitwise_not_rejects_integer_literals_for_noninteger_annotations_and_recovers() {
+    for primitive in ["F64", "Byte"] {
+        let source = format!(
+            concat!(
+                "pub fn annotation_mismatch() -> {primitive} {{\n",
+                "    let invalid: {primitive} = ~1\n",
+                "    let recovered: {primitive} = invalid\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            primitive = primitive,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let literal_start = source.find("~1").expect("integer literal operand exists") + 1;
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "integer literal family mismatch should be reported once:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "the annotation mismatch should recover to `{primitive}`:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            &format!("expected `{primitive}`, found an integer literal"),
+            literal_start,
+            literal_start + 1,
+        );
+    }
+}
+
+#[test]
+fn primitive_bitwise_not_integer_literal_range_errors_use_full_span_and_recover() {
+    let source = concat!(
+        "pub fn literal_ranges() -> I8 {\n",
+        "    let positive_out_of_range: I8 = ~128\n",
+        "    let negative_out_of_range: I8 = ~-129\n",
+        "    let positive_pointer_out_of_range: USize = ~4294967296\n",
+        "    let negative_pointer_out_of_range: ISize = ~-2147483649\n",
+        "    let recovered: I8 = ~127\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let literal_spans = [
+        (
+            source
+                .find("128")
+                .expect("positive out-of-range literal exists"),
+            "128",
+            "I8",
+        ),
+        (
+            source
+                .find("-129")
+                .expect("negative out-of-range literal exists"),
+            "-129",
+            "I8",
+        ),
+        (
+            source
+                .find("4294967296")
+                .expect("positive pointer-width out-of-range literal exists"),
+            "4294967296",
+            "USize",
+        ),
+        (
+            source
+                .find("-2147483649")
+                .expect("negative pointer-width out-of-range literal exists"),
+            "-2147483649",
+            "ISize",
+        ),
+    ];
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        literal_spans.len(),
+        "all annotated integer literals should be checked against their exact target type:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "range errors should recover to I8 and reach the following local and tail:\n{stdout}"
+    );
+    for (start, literal, primitive) in literal_spans {
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "LITERAL_OUT_OF_RANGE",
+            &format!("integer literal is out of range for `{primitive}`"),
+            start,
+            start + literal.len(),
+        );
     }
 }
 
