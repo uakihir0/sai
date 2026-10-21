@@ -5507,7 +5507,6 @@ fn primitive_bitwise_integer_annotation_mismatch_recovers_after_operand_mismatch
 #[test]
 fn unsupported_primitive_bitwise_shapes_remain_gated() {
     for source in [
-        "pub fn left_literal(value: I32) -> I32 { let result = 1 & value; result }\n",
         "pub fn literal_pair() -> I32 { let result = 1 & 2; result }\n",
         "pub fn nested(left: I32, right: I32, extra: I32) -> I32 { let result = left & (right ^ extra); result }\n",
         "pub fn computed(left: I32, right: I32) -> I32 { let result = (left + right) & right; result }\n",
@@ -5931,14 +5930,387 @@ fn primitive_bitwise_right_integer_literal_annotation_mismatch_recovers() {
 }
 
 #[test]
+fn primitive_bitwise_left_integer_literals_accept_all_integer_types_and_operators() {
+    let integer_types = [
+        ("I8", "i8_value"),
+        ("I16", "i16_value"),
+        ("I32", "i32_value"),
+        ("I64", "i64_value"),
+        ("U8", "u8_value"),
+        ("U16", "u16_value"),
+        ("U32", "u32_value"),
+        ("U64", "u64_value"),
+        ("ISize", "isize_value"),
+        ("USize", "usize_value"),
+    ];
+    let mut source = String::from("pub fn bitwise_left_literals(");
+    for (index, (primitive, parameter)) in integer_types.iter().enumerate() {
+        if index > 0 {
+            source.push_str(", ");
+        }
+        source.push_str(&format!("{parameter}: {primitive}"));
+    }
+    source.push_str(") -> I8 {\n");
+
+    for (_, parameter) in integer_types {
+        for (operator, name) in [("&", "and"), ("|", "or"), ("^", "xor")] {
+            source.push_str(&format!(
+                "    let {name}_{parameter} = 1 {operator} {parameter}\n"
+            ));
+        }
+    }
+    source.push_str("    and_i8_value\n}\n");
+
+    assert_success_result(run_check(&source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn primitive_bitwise_left_integer_literals_resolve_preceding_and_shadowed_paths() {
+    for source in [
+        concat!(
+            "pub fn preceding(value: I32) -> I32 {\n",
+            "    let earlier: I32 = value\n",
+            "    let result = 7 ^ earlier\n",
+            "    result\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn shadow(value: U32, right: I32) -> I32 {\n",
+            "    let value: I32 = right\n",
+            "    let result = 11 | value\n",
+            "    result\n",
+            "}\n",
+        ),
+    ] {
+        assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_bitwise_left_integer_literals_check_boundaries_and_signed_spans() {
+    let source = concat!(
+        "pub fn left_literal_boundaries(signed: I8, unsigned: U8) -> I8 {\n",
+        "    let signed_min = -128 & signed\n",
+        "    let signed_max = 127 | signed\n",
+        "    let unsigned_max = 255 ^ unsigned\n",
+        "    let unsigned_negative_zero = -0 & unsigned\n",
+        "    let signed_low = -129 & signed\n",
+        "    let signed_high = 128 | signed\n",
+        "    let unsigned_high = 256 ^ unsigned\n",
+        "    let unsigned_negative = -1 & unsigned\n",
+        "    signed_min\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let literal_spans = [
+        (
+            source
+                .find("-129 & signed")
+                .expect("negative signed boundary exists"),
+            "-129",
+            "integer literal is out of range for `I8`",
+        ),
+        (
+            source
+                .find("128 | signed")
+                .expect("positive signed boundary exists"),
+            "128",
+            "integer literal is out of range for `I8`",
+        ),
+        (
+            source
+                .find("256 ^ unsigned")
+                .expect("positive unsigned boundary exists"),
+            "256",
+            "integer literal is out of range for `U8`",
+        ),
+        (
+            source
+                .find("-1 & unsigned")
+                .expect("negative unsigned boundary exists"),
+            "-1",
+            "integer literal is out of range for `U8`",
+        ),
+    ];
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        literal_spans.len(),
+        "left literals should be range-checked against the right path:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "range errors should recover through the later local and tail:\n{stdout}"
+    );
+    for (start, literal, message) in literal_spans {
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "LITERAL_OUT_OF_RANGE",
+            message,
+            start,
+            start + literal.len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_bitwise_left_integer_literals_use_wasm_pointer_width() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let source = concat!(
+        "pub fn left_pointer_boundaries(signed: ISize, unsigned: USize) -> ISize {\n",
+        "    let signed_min_32 = -2147483648 & signed\n",
+        "    let signed_max_32 = 2147483647 | signed\n",
+        "    let unsigned_max_32 = 4294967295 ^ unsigned\n",
+        "    let signed_min_64 = -9223372036854775808 & signed\n",
+        "    let signed_max_64 = 9223372036854775807 | signed\n",
+        "    let unsigned_max_64 = 18446744073709551615 ^ unsigned\n",
+        "    signed_min_32\n",
+        "}\n",
+    );
+
+    let wasm32 = run_check(&source, manifest, &[], &["--target", "wasm32-core"]);
+    let wasm32_stdout = String::from_utf8(wasm32.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(wasm32.status.code(), Some(1), "{wasm32_stdout}");
+    assert_eq!(
+        wasm32_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        3,
+        "wasm32 must reject the 64-bit ISize and USize bounds:\n{wasm32_stdout}"
+    );
+    assert!(
+        !wasm32_stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !wasm32_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !wasm32_stdout.contains("\"type\":\"result\""),
+        "pointer-width range failures should recover to the right path type:\n{wasm32_stdout}"
+    );
+    for (literal, message) in [
+        (
+            "-9223372036854775808",
+            "integer literal is out of range for `ISize`",
+        ),
+        (
+            "9223372036854775807",
+            "integer literal is out of range for `ISize`",
+        ),
+        (
+            "18446744073709551615",
+            "integer literal is out of range for `USize`",
+        ),
+    ] {
+        let start = source.find(literal).expect("pointer-sized literal exists");
+        assert_json_diagnostic_primary_span(
+            &wasm32_stdout,
+            "LITERAL_OUT_OF_RANGE",
+            message,
+            start,
+            start + literal.len(),
+        );
+    }
+
+    let wasm64 = run_check(&source, manifest, &[], &["--target", "wasm64-core"]);
+    assert_success_result(wasm64, "wasm64-core", "dev");
+}
+
+#[test]
+fn primitive_bitwise_left_integer_literal_mismatches_recover_without_operator_errors() {
+    for (right_type, operator) in [
+        ("Byte", "&"),
+        ("Bool", "|"),
+        ("F32", "^"),
+        ("F64", "&"),
+        ("Char", "|"),
+    ] {
+        let source = format!(
+            concat!(
+                "pub fn mismatch(right: {right_type}) -> I8 {{\n",
+                "    let result: I8 = 7 {operator} right\n",
+                "    let recovered: I8 = result\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            right_type = right_type,
+            operator = operator,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let right_start = source
+            .find(&format!("{operator} right"))
+            .map(|start| start + operator.len() + 1)
+            .expect("mismatched right path exists");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "a non-integer right path should produce one mismatch:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "the integer literal mismatch should preserve recovery through the annotation:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            &format!("expected `I64`, found `{right_type}`"),
+            right_start,
+            right_start + "right".len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_bitwise_left_integer_literal_annotation_constrains_after_rhs_mismatch() {
+    let source = concat!(
+        "pub fn annotation_recovery(right: F32) -> I8 {\n",
+        "    let result: I8 = 128 & right\n",
+        "    let recovered: I8 = result\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let literal_start = source.find("128 & right").expect("left literal exists");
+    let right_start = literal_start + "128 & ".len();
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the incompatible right path should be diagnosed:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        1,
+        "the I8 annotation should constrain and range-check the left literal:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the local should recover to its I8 annotation and continue:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I64`, found `F32`",
+        right_start,
+        right_start + "right".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        literal_start,
+        literal_start + "128".len(),
+    );
+}
+
+#[test]
+fn primitive_bitwise_left_integer_literal_tail_constrains_after_rhs_mismatch() {
+    let source = concat!(
+        "pub fn tail_recovery(right: F32) -> I8 {\n",
+        "    let result = 7 ^ right\n",
+        "    result\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let right_start = source
+        .find("^ right")
+        .map(|start| start + "^ ".len())
+        .expect("mismatched right path exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the right path mismatch should be reported once:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the I8 tail should constrain the retained integer literal:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I64`, found `F32`",
+        right_start,
+        right_start + "right".len(),
+    );
+}
+
+#[test]
+fn primitive_bitwise_left_integer_literal_annotation_mismatch_recovers() {
+    let source = concat!(
+        "pub fn annotation_mismatch(right: F32) -> F32 {\n",
+        "    let result: F32 = 7 & right\n",
+        "    let recovered: F32 = result\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression_start = source
+        .find("7 & right")
+        .expect("annotated bitwise expression exists");
+    let right_start = expression_start + "7 & ".len();
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the annotation and right-path mismatches should both be diagnosed:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the local should recover to F32 and reach the following local and tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `F32`, found an integer literal",
+        expression_start,
+        expression_start + "7 & right".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `I64`, found `F32`",
+        right_start,
+        right_start + "right".len(),
+    );
+    let annotation_position = stdout
+        .find("\"message\":\"expected `F32`, found an integer literal\"")
+        .expect("annotation mismatch exists");
+    let operand_position = stdout
+        .find("\"message\":\"expected `I64`, found `F32`\"")
+        .expect("right-path mismatch exists");
+    assert!(
+        annotation_position < operand_position,
+        "the full initializer mismatch should precede its nested right-path mismatch:\n{stdout}"
+    );
+}
+
+#[test]
 fn unsupported_primitive_bitwise_right_integer_literal_forms_remain_gated() {
     for source in [
-        "pub fn left_literal(value: I32) -> I32 { let result = 1 & value; result }\n",
         "pub fn literal_pair() -> I32 { let result = 1 ^ 2; result }\n",
         "pub fn unresolved(value: I32) -> I32 { let bits = 1; let result = value & bits; result }\n",
         "type Word = I32\npub fn alias(left: Word, right: Word) -> Word { let result = left & right; result }\n",
         "pub fn nested(left: I32, right: I32, extra: I32) -> I32 { let result = left & (right ^ extra); result }\n",
         "pub fn computed(left: I32, right: I32) -> I32 { let result = (left ^ right) & right; result }\n",
+        "pub fn float_left_literal(value: I32) -> I32 { let result = 1.0 & value; result }\n",
         "pub fn float_literal(value: I32) -> I32 { let result = value & 1.0; result }\n",
         "pub fn bool_literal(value: I32) -> I32 { let result = value | true; result }\n",
         "pub fn char_literal(value: I32) -> I32 { let result = value ^ 'a'; result }\n",
