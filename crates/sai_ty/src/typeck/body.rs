@@ -892,21 +892,33 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             .and_then(|local_type| self.concrete_local_type(local_type))
             .filter(|primitive| supports_primitive_literal(*primitive))
             .ok_or(())?;
-        let right_type = self
-            .check_local_path(right)
-            .ok()
-            .and_then(|local_type| self.concrete_local_type(local_type))
-            .filter(|primitive| supports_primitive_literal(*primitive))
-            .ok_or(())?;
+        if let ExprKind::Lit(literal) = right.kind {
+            if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer) {
+                return Err(());
+            }
+            self.check_annotated_literal(
+                PrimTy::U32,
+                literal,
+                PrimitiveLiteralKind::Integer,
+                right.hir_id,
+            );
+        } else {
+            let right_type = self
+                .check_local_path(right)
+                .ok()
+                .and_then(|local_type| self.concrete_local_type(local_type))
+                .filter(|primitive| supports_primitive_literal(*primitive))
+                .ok_or(())?;
 
-        if right_type != PrimTy::U32 {
-            self.errors.push(PrimitiveBodyError {
-                node: right.hir_id,
-                kind: PrimitiveBodyErrorKind::TypeMismatch {
-                    expected: PrimTy::U32,
-                    found: right_type,
-                },
-            });
+            if right_type != PrimTy::U32 {
+                self.errors.push(PrimitiveBodyError {
+                    node: right.hir_id,
+                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                        expected: PrimTy::U32,
+                        found: right_type,
+                    },
+                });
+            }
         }
         if !is_bitwise_primitive(left_type) {
             self.report_operator_not_supported(

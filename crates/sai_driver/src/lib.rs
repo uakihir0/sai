@@ -6390,7 +6390,11 @@ fn check_function_body_primitive_local_block(
                 };
                 let supported_shape = match operator {
                     BinOp::And | BinOp::Or => is_preceding_path(left) && is_preceding_path(right),
-                    BinOp::Shl | BinOp::Shr => is_preceding_path(left) && is_preceding_path(right),
+                    BinOp::Shl | BinOp::Shr => {
+                        is_preceding_path(left)
+                            && (is_preceding_path(right)
+                                || is_direct_function_integer_literal(right))
+                    }
                     BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                         (is_preceding_path(left) && is_preceding_path(right))
                             || (is_preceding_path(left)
@@ -25779,6 +25783,55 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_accepts_flat_local_shift_right_integer_literals() {
+        let integer_types = [
+            "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
+        ];
+        let operators = [("<<", "left"), (">>", "right")];
+        let mut root = String::new();
+        for ty in integer_types {
+            for (operator, name) in operators {
+                root.push_str(&format!(
+                    "pub fn shift_{}_{}(left: {ty}) -> {ty} {{\n    let value = left {operator} 1\n    value\n}}\n",
+                    ty.to_ascii_lowercase(),
+                    name
+                ));
+            }
+        }
+        for (operator, name) in operators {
+            root.push_str(&format!(
+                "pub fn byte_shift_{name}(left: Byte) -> Byte {{\n    let value = left {operator} 1\n    value\n}}\n"
+            ));
+        }
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 22);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("supported primitive shift body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the supported shift literal slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_accepts_flat_local_bitwise_right_integer_literals() {
         let integer_types = [
             "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
@@ -26288,7 +26341,7 @@ mod tests {
             "pub fn unresolved(left: I32) -> I32 {\n    let bits = 1\n    let value = bits & left\n    value\n}\n",
             "pub fn alias(left: Word, right: Word) -> Word {\n    let value = left & right\n    value\n}\n",
             "pub fn nested_bit_not(left: I32) -> I32 {\n    let value = ~(~left)\n    value\n}\n",
-            "pub fn shift(left: I32) -> I32 {\n    let value = left << 1\n    value\n}\n",
+            "pub fn shift(amount: U32) -> I32 {\n    let value = 1 << amount\n    value\n}\n",
             "pub fn self_reference(left: I32) -> I32 {\n    let value = value & left\n    value\n}\n",
             "pub fn forward_reference(left: I32) -> I32 {\n    let value = future & left\n    let future: I32 = 1\n    value\n}\n",
         );

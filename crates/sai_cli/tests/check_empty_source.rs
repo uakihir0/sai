@@ -5347,6 +5347,119 @@ fn primitive_shift_path_pairs_accept_integer_and_byte_left_types() {
 }
 
 #[test]
+fn primitive_shift_right_integer_literals_accept_integer_and_byte_left_types() {
+    for primitive in [
+        "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize", "Byte",
+    ] {
+        for (operator, suffix) in [("<<", "left"), (">>", "right")] {
+            let source = format!(
+                concat!(
+                    "pub fn shift_{suffix}(left: {primitive}) -> {primitive} {{\n",
+                    "    let from_literal = left {operator} 1\n",
+                    "    let recovered: {primitive} = from_literal\n",
+                    "    recovered\n",
+                    "}}\n",
+                ),
+                primitive = primitive,
+                suffix = suffix,
+                operator = operator,
+            );
+            let output = run_check(&source, "", &[], &[]);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "right integer literals should work for {primitive} {operator}:\n{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert_success_result(output, "wasm32-core", "dev");
+        }
+    }
+}
+
+#[test]
+fn primitive_shift_right_integer_literal_range_uses_u32_and_recovers() {
+    for (operator, suffix) in [("<<", "left"), (">>", "right")] {
+        for literal in ["-1", "4294967296"] {
+            let source = format!(
+                concat!(
+                    "pub fn out_of_range_{suffix}(left: I32) -> I32 {{\n",
+                    "    let value = left {operator} {literal}\n",
+                    "    let recovered: I32 = value\n",
+                    "    recovered\n",
+                    "}}\n",
+                ),
+                suffix = suffix,
+                operator = operator,
+                literal = literal,
+            );
+            let output = run_check(&source, "", &[], &[]);
+            let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+            let literal_start = source.find(literal).expect("shift-count literal exists");
+
+            assert_eq!(output.status.code(), Some(1), "{stdout}");
+            assert_eq!(
+                stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+                1,
+                "each invalid U32 literal should produce one range diagnostic:\n{stdout}"
+            );
+            assert!(
+                !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                    && !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                    && !stdout.contains("\"type\":\"result\""),
+                "the invalid count should recover to I32 through the later local and tail:\n{stdout}"
+            );
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "LITERAL_OUT_OF_RANGE",
+                "integer literal is out of range for `U32`",
+                literal_start,
+                literal_start + literal.len(),
+            );
+        }
+    }
+}
+
+#[test]
+fn primitive_shift_right_integer_literal_u32_boundaries_and_left_widths_are_type_valid() {
+    for (operator, suffix, literal) in [
+        ("<<", "zero_left", "0"),
+        (">>", "zero_right", "0"),
+        ("<<", "max_left", "4294967295"),
+        (">>", "max_right", "4294967295"),
+        ("<<", "i32_width", "32"),
+        (">>", "i32_width_right", "32"),
+        ("<<", "byte_width", "8"),
+        (">>", "byte_width_right", "8"),
+    ] {
+        let primitive = if suffix.starts_with("byte_") {
+            "Byte"
+        } else {
+            "I32"
+        };
+        let source = format!(
+            concat!(
+                "pub fn boundary_{suffix}(left: {primitive}) -> {primitive} {{\n",
+                "    let value = left {operator} {literal}\n",
+                "    value\n",
+                "}}\n",
+            ),
+            suffix = suffix,
+            primitive = primitive,
+            operator = operator,
+            literal = literal,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "in-range U32 count {literal} should type-check for {primitive} {operator}:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_success_result(output, "wasm32-core", "dev");
+    }
+}
+
+#[test]
 fn primitive_shift_right_path_mismatches_report_the_operand_and_recover_to_the_left_type() {
     let right_types = [
         "I8", "I16", "I32", "I64", "U8", "U16", "U64", "ISize", "USize", "Byte", "Bool", "Char",
@@ -5456,6 +5569,53 @@ fn primitive_shift_rhs_and_annotation_mismatches_recover_through_following_local
 }
 
 #[test]
+fn primitive_shift_right_literal_range_and_annotation_errors_recover_through_following_local() {
+    let source = concat!(
+        "pub fn annotation_recovery(left: I32) -> U32 {\n",
+        "    let shifted: U32 = left << -1\n",
+        "    let recovered: U32 = shifted\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression = "left << -1";
+    let expression_start = source.find(expression).expect("shift expression exists");
+    let literal_start = expression_start + "left << ".len();
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        1,
+        "the negative U32 shift count should report one range error:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the recovered I32 expression should mismatch its U32 annotation:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the annotation should recover the later local and function tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `U32`",
+        literal_start,
+        literal_start + "-1".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U32`, found `I32`",
+        expression_start,
+        expression_start + expression.len(),
+    );
+}
+
+#[test]
 fn primitive_shift_noninteger_left_paths_report_full_expression_diagnostics_and_recover() {
     for (primitive, operator, suffix) in [
         ("Bool", "<<", "left"),
@@ -5503,6 +5663,113 @@ fn primitive_shift_noninteger_left_paths_report_full_expression_diagnostics_and_
             &stdout,
             "OPERATOR_NOT_SUPPORTED",
             &message,
+            expression_start,
+            expression_start + expression.len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_shift_right_integer_literal_on_noninteger_left_reports_unsupported_operator() {
+    for (primitive, operator, suffix) in [
+        ("Bool", "<<", "bool_left"),
+        ("Bool", ">>", "bool_right"),
+        ("F32", "<<", "f32_left"),
+        ("F32", ">>", "f32_right"),
+        ("F64", "<<", "f64_left"),
+        ("F64", ">>", "f64_right"),
+        ("Char", "<<", "char_left"),
+        ("Char", ">>", "char_right"),
+    ] {
+        let source = format!(
+            concat!(
+                "pub fn unsupported_{suffix}(left: {primitive}) -> {primitive} {{\n",
+                "    let value = left {operator} 1\n",
+                "    let recovered: {primitive} = value\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            primitive = primitive,
+            operator = operator,
+            suffix = suffix,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression = format!("left {operator} 1");
+        let expression_start = source.find(&expression).expect("shift expression exists");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout
+                .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                .count(),
+            1,
+            "{primitive} left operand should keep its unsupported-operator diagnostic:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "a valid U32 literal count should recover to the left type:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` is not defined for `{primitive}`"),
+            expression_start,
+            expression_start + expression.len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_shift_out_of_range_literal_keeps_unsupported_left_diagnostic() {
+    for primitive in ["Bool", "F32", "F64", "Char"] {
+        let source = format!(
+            concat!(
+                "pub fn unsupported(left: {primitive}) -> {primitive} {{\n",
+                "    let value = left << -1\n",
+                "    let recovered: {primitive} = value\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            primitive = primitive,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression = "left << -1";
+        let expression_start = source.find(expression).expect("shift expression exists");
+        let literal_start = expression_start + "left << ".len();
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+            1,
+            "the U32 literal must still be range-checked for `{primitive}`:\n{stdout}"
+        );
+        assert_eq!(
+            stdout
+                .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                .count(),
+            1,
+            "the unsupported left operator diagnostic must remain:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "both independent errors should preserve left-type recovery:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `U32`",
+            literal_start,
+            literal_start + "-1".len(),
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `<<` is not defined for `{primitive}`"),
             expression_start,
             expression_start + expression.len(),
         );
@@ -5781,7 +6048,6 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         "pub fn computed(left: I32, right: I32) -> I32 { let result = (left + right) & right; result }\n",
         "pub fn unresolved(left: I32) -> I32 { let bits = 1; let result = bits & left; result }\n",
         "type Word = I32\npub fn alias(left: Word, right: Word) -> Word { let result = left & right; result }\n",
-        "pub fn shift(left: I32) -> I32 { let result = left << 1; result }\n",
         "pub fn self_reference(left: I32) -> I32 { let result = result & left; result }\n",
         "pub fn forward_reference(left: I32) -> I32 { let result = later & left; let later: I32 = 1; result }\n",
     ] {
@@ -5792,10 +6058,12 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
 #[test]
 fn unsupported_primitive_shift_shapes_and_owners_remain_gated() {
     for source in [
-        "pub fn right_literal(left: I32) -> I32 { let amount: U32 = 1; let result = left << 1; result }\n",
         "pub fn left_literal(amount: U32) -> I32 { let result = 1 << amount; result }\n",
         "pub fn byte_literal_left(amount: U32) -> Byte { let result = b'a' << amount; result }\n",
         "pub fn byte_literal_right(left: Byte) -> Byte { let result = left >> b'a'; result }\n",
+        "pub fn bool_literal_right(left: I32) -> I32 { let result = left << true; result }\n",
+        "pub fn char_literal_right(left: I32) -> I32 { let result = left >> 'a'; result }\n",
+        "pub fn float_literal_right(left: I32) -> I32 { let result = left << 1.0; result }\n",
         "pub fn literal_pair() -> I32 { let result = 1 << 2; result }\n",
         "type Word = I32\ntype ShiftCount = U32\npub fn aliased_left(left: Word, amount: U32) -> Word { let result = left << amount; result }\n",
         "type ShiftCount = U32\npub fn aliased_right(left: I32, amount: ShiftCount) -> I32 { let result = left >> amount; result }\n",
@@ -6797,7 +7065,6 @@ fn unsupported_primitive_bitwise_right_integer_literal_forms_remain_gated() {
         "pub fn float_literal(value: I32) -> I32 { let result = value & 1.0; result }\n",
         "pub fn bool_literal(value: I32) -> I32 { let result = value | true; result }\n",
         "pub fn char_literal(value: I32) -> I32 { let result = value ^ 'a'; result }\n",
-        "pub fn shift(value: I32) -> I32 { let result = value << 1; result }\n",
         "pub fn self_reference(value: I32) -> I32 { let result = result & value; result }\n",
         "pub fn forward_reference(value: I32) -> I32 { let result = later & value; let later: I32 = 1; result }\n",
     ] {
