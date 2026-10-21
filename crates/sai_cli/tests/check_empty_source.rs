@@ -5318,6 +5318,275 @@ fn primitive_bitwise_path_rhs_mismatches_recover_to_the_left_type() {
 }
 
 #[test]
+fn primitive_shift_path_pairs_accept_integer_and_byte_left_types() {
+    for primitive in [
+        "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize", "Byte",
+    ] {
+        let source = format!(
+            concat!(
+                "pub fn shift_{}(left: {primitive}, amount: U32) -> {primitive} {{\n",
+                "    let from_parameters = left << amount\n",
+                "    let local_left: {primitive} = from_parameters\n",
+                "    let local_amount: U32 = amount\n",
+                "    let from_locals = local_left >> local_amount\n",
+                "    from_locals\n",
+                "}}\n",
+            ),
+            primitive.to_ascii_lowercase(),
+            primitive = primitive,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "path shifts should work for {primitive}:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_success_result(output, "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_shift_right_path_mismatches_report_the_operand_and_recover_to_the_left_type() {
+    let right_types = [
+        "I8", "I16", "I32", "I64", "U8", "U16", "U64", "ISize", "USize", "Byte", "Bool", "Char",
+        "F32", "F64",
+    ];
+    for (index, right_type) in right_types.into_iter().enumerate() {
+        for (operator, suffix) in [("<<", "left"), (">>", "right")] {
+            let function = format!(
+                concat!(
+                    "pub fn mismatch_{index}_{suffix}(left: I32, amount: {right_type}) -> I32 {{\n",
+                    "    let value = left {operator} amount\n",
+                    "    let recovered: I32 = value\n",
+                    "    recovered\n",
+                    "}}\n",
+                ),
+                index = index,
+                suffix = suffix,
+                right_type = right_type,
+                operator = operator,
+            );
+            let expression = format!("left {operator} amount");
+            let expression_start = function
+                .find(&expression)
+                .expect("shift expression exists in generated function");
+            let right_start = expression_start + format!("left {operator} ").len();
+            let output = run_check(&function, "", &[], &[]);
+            let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "I32 << or >> {right_type} should produce a supported type error:\n{stdout}"
+            );
+            assert_eq!(
+                stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+                1,
+                "each non-U32 right path should produce one mismatch:\n{stdout}"
+            );
+            assert!(
+                !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                    && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                    && !stdout.contains("\"type\":\"result\""),
+                "integer left operands should recover to I32 after right-path mismatches:\n{stdout}"
+            );
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                &format!("expected `U32`, found `{right_type}`"),
+                right_start,
+                right_start + "amount".len(),
+            );
+        }
+    }
+}
+
+#[test]
+fn primitive_shift_rhs_and_annotation_mismatches_recover_through_following_local() {
+    let source = concat!(
+        "pub fn annotation_recovery(left: I32, amount: I8) -> U32 {\n",
+        "    let shifted: U32 = left << amount\n",
+        "    let recovered: U32 = shifted\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression = "left << amount";
+    let expression_start = source.find(expression).expect("shift expression exists");
+    let right_start = expression_start + "left << ".len();
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the RHS and initializer annotation should both mismatch:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the annotated local should recover to U32 and reach the following local and tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U32`, found `I32`",
+        expression_start,
+        expression_start + expression.len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U32`, found `I8`",
+        right_start,
+        right_start + "amount".len(),
+    );
+    let annotation_position = stdout
+        .find("\"message\":\"expected `U32`, found `I32`\"")
+        .expect("annotation mismatch exists");
+    let right_position = stdout
+        .find("\"message\":\"expected `U32`, found `I8`\"")
+        .expect("shift-count mismatch exists");
+    assert!(
+        annotation_position < right_position,
+        "CLI output should sort the full initializer span before the nested RHS mismatch:\n{stdout}"
+    );
+}
+
+#[test]
+fn primitive_shift_noninteger_left_paths_report_full_expression_diagnostics_and_recover() {
+    for (primitive, operator, suffix) in [
+        ("Bool", "<<", "left"),
+        ("Bool", ">>", "right"),
+        ("F32", "<<", "left"),
+        ("F32", ">>", "right"),
+        ("F64", "<<", "left"),
+        ("F64", ">>", "right"),
+        ("Char", "<<", "left"),
+        ("Char", ">>", "right"),
+    ] {
+        let source = format!(
+            concat!(
+                "pub fn unsupported_{suffix}(left: {primitive}, amount: U32) -> {primitive} {{\n",
+                "    let value = left {operator} amount\n",
+                "    let recovered: {primitive} = value\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            primitive = primitive,
+            operator = operator,
+            suffix = suffix,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression = format!("left {operator} amount");
+        let expression_start = source.find(&expression).expect("shift expression exists");
+        let message = format!("operator `{operator}` is not defined for `{primitive}`");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout
+                .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                .count(),
+            1,
+            "{primitive} should report one unsupported shift diagnostic:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "a U32 RHS should leave only the unsupported-left diagnostic and recover:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &message,
+            expression_start,
+            expression_start + expression.len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_shift_noninteger_left_and_non_u32_right_report_both_diagnostics_in_span_order() {
+    for (primitive, operator, suffix) in [
+        ("Bool", "<<", "left"),
+        ("Bool", ">>", "right"),
+        ("F32", "<<", "left"),
+        ("F32", ">>", "right"),
+        ("F64", "<<", "left"),
+        ("F64", ">>", "right"),
+        ("Char", "<<", "left"),
+        ("Char", ">>", "right"),
+    ] {
+        let source = format!(
+            concat!(
+                "pub fn invalid_{suffix}(left: {primitive}, amount: I32) -> {primitive} {{\n",
+                "    let value = left {operator} amount\n",
+                "    let recovered: {primitive} = value\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            primitive = primitive,
+            operator = operator,
+            suffix = suffix,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression = format!("left {operator} amount");
+        let expression_start = source.find(&expression).expect("shift expression exists");
+        let expression_end = expression_start + expression.len();
+        let right_start = expression_start + format!("left {operator} ").len();
+        let operator_message = format!("operator `{operator}` is not defined for `{primitive}`");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "a non-U32 RHS should report one shift-count mismatch:\n{stdout}"
+        );
+        assert_eq!(
+            stdout
+                .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                .count(),
+            1,
+            "{primitive} should also report one unsupported shift diagnostic:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "both diagnostics should recover through the local and tail:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            "expected `U32`, found `I32`",
+            right_start,
+            right_start + "amount".len(),
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &operator_message,
+            expression_start,
+            expression_end,
+        );
+        let operator_position = stdout
+            .find(&format!("\"message\":\"{operator_message}\""))
+            .expect("unsupported shift diagnostic exists");
+        let mismatch_position = stdout
+            .find("\"message\":\"expected `U32`, found `I32`\"")
+            .expect("shift-count mismatch exists");
+        assert!(
+            operator_position < mismatch_position,
+            "CLI output should sort the full-expression diagnostic before the RHS mismatch:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn primitive_bitwise_bool_float_and_char_diagnostics_have_exact_spans_and_order() {
     let cases = [
         (
@@ -5515,6 +5784,38 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         "pub fn shift(left: I32) -> I32 { let result = left << 1; result }\n",
         "pub fn self_reference(left: I32) -> I32 { let result = result & left; result }\n",
         "pub fn forward_reference(left: I32) -> I32 { let result = later & left; let later: I32 = 1; result }\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn unsupported_primitive_shift_shapes_and_owners_remain_gated() {
+    for source in [
+        "pub fn right_literal(left: I32) -> I32 { let amount: U32 = 1; let result = left << 1; result }\n",
+        "pub fn left_literal(amount: U32) -> I32 { let result = 1 << amount; result }\n",
+        "pub fn byte_literal_left(amount: U32) -> Byte { let result = b'a' << amount; result }\n",
+        "pub fn byte_literal_right(left: Byte) -> Byte { let result = left >> b'a'; result }\n",
+        "pub fn literal_pair() -> I32 { let result = 1 << 2; result }\n",
+        "type Word = I32\ntype ShiftCount = U32\npub fn aliased_left(left: Word, amount: U32) -> Word { let result = left << amount; result }\n",
+        "type ShiftCount = U32\npub fn aliased_right(left: I32, amount: ShiftCount) -> I32 { let result = left >> amount; result }\n",
+        "pub fn unresolved_numeric_right(left: I32) -> I32 { let amount = 1; let result = left << amount; result }\n",
+        "pub fn unresolved(left: I32) -> I32 { let result = left << missing; result }\n",
+        "pub fn self_reference(left: I32, amount: U32) -> I32 { let result = result << amount; result }\n",
+        "pub fn forward_reference(left: I32, amount: U32) -> I32 { let result = later << amount; let later: I32 = left; result }\n",
+        "pub fn computed_left(left: I32, amount: U32) -> I32 { let result = (left + left) << amount; result }\n",
+        "pub fn nested_left(left: I32, amount: U32) -> I32 { let result = (left << amount) >> amount; result }\n",
+        "pub fn nested_right(left: I32, amount: U32, extra: U32) -> I32 { let result = left << (amount >> extra); result }\n",
+        "pub fn generic<T>(left: I32, amount: U32) -> I32 { let result = left << amount; result }\n",
+        concat!(
+            "type ShiftOwner { marker: I32 }\n",
+            "impl ShiftOwner {\n",
+            "    fn method(self: borrow Self, left: I32, amount: U32) -> I32 {\n",
+            "        let result = left << amount\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }

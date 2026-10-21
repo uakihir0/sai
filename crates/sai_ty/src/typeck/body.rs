@@ -278,6 +278,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     } else {
                         result
                     }
+                } else if matches!(operator, BinOp::Shl | BinOp::Shr) {
+                    let result = self.check_shift(operator, left, right, init.hir_id)?;
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(result, expected, init.hir_id)?;
+                        LocalType::Concrete(expected)
+                    } else {
+                        result
+                    }
                 } else {
                     let result = match operator {
                         BinOp::And | BinOp::Or => self.check_logical(operator, left, right)?,
@@ -869,6 +877,48 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         }
 
         Err(())
+    }
+
+    fn check_shift(
+        &mut self,
+        operator: BinOp,
+        left: &'hir Expr<'hir>,
+        right: &'hir Expr<'hir>,
+        expression: HirId,
+    ) -> Result<LocalType, ()> {
+        let left_type = self
+            .check_local_path(left)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .filter(|primitive| supports_primitive_literal(*primitive))
+            .ok_or(())?;
+        let right_type = self
+            .check_local_path(right)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .filter(|primitive| supports_primitive_literal(*primitive))
+            .ok_or(())?;
+
+        if right_type != PrimTy::U32 {
+            self.errors.push(PrimitiveBodyError {
+                node: right.hir_id,
+                kind: PrimitiveBodyErrorKind::TypeMismatch {
+                    expected: PrimTy::U32,
+                    found: right_type,
+                },
+            });
+        }
+        if !is_bitwise_primitive(left_type) {
+            self.report_operator_not_supported(
+                expression,
+                operator,
+                PrimitiveOperatorOperand::Concrete(left_type),
+            );
+        }
+
+        // A failed shift still recovers to the left operand type so later
+        // locals and the function tail can be checked.
+        Ok(LocalType::Concrete(left_type))
     }
 
     fn report_operator_not_supported(

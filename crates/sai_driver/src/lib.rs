@@ -6390,6 +6390,7 @@ fn check_function_body_primitive_local_block(
                 };
                 let supported_shape = match operator {
                     BinOp::And | BinOp::Or => is_preceding_path(left) && is_preceding_path(right),
+                    BinOp::Shl | BinOp::Shr => is_preceding_path(left) && is_preceding_path(right),
                     BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                         (is_preceding_path(left) && is_preceding_path(right))
                             || (is_preceding_path(left)
@@ -6418,7 +6419,6 @@ fn check_function_body_primitive_local_block(
                             || (is_preceding_path(left) && is_direct_function_scalar_literal(right))
                             || (is_direct_function_scalar_literal(left) && is_preceding_path(right))
                     }
-                    _ => false,
                 };
                 if !supported_shape {
                     return Ok(None);
@@ -6476,6 +6476,8 @@ fn is_function_primitive_local_binary_operator(operator: BinOp) -> bool {
             | BinOp::BitAnd
             | BinOp::BitOr
             | BinOp::BitXor
+            | BinOp::Shl
+            | BinOp::Shr
             | BinOp::And
             | BinOp::Or
     ) || is_function_primitive_local_comparison_operator(operator)
@@ -6599,6 +6601,8 @@ fn primitive_body_errors_to_diagnostics(
                     BinOp::BitAnd => "&",
                     BinOp::BitOr => "|",
                     BinOp::BitXor => "^",
+                    BinOp::Shl => "<<",
+                    BinOp::Shr => ">>",
                     _ => return Ok(None),
                 };
                 let message = match operand {
@@ -6620,6 +6624,7 @@ fn primitive_body_errors_to_diagnostics(
                     BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
                         "bitwise operator is not supported for this primitive"
                     }
+                    BinOp::Shl | BinOp::Shr => "shift operator is not supported for this primitive",
                     _ => return Ok(None),
                 };
                 let mut diagnostic = const_literal_diagnostic(
@@ -25719,6 +25724,55 @@ mod tests {
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
                 "function owner {:?} (index {index}) unexpectedly failed the supported body slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_accepts_flat_local_shift_paths() {
+        let integer_types = [
+            "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
+        ];
+        let operators = [("<<", "left"), (">>", "right")];
+        let mut root = String::new();
+        for ty in integer_types {
+            for (operator, name) in operators {
+                root.push_str(&format!(
+                    "pub fn shift_{}_{}(left: {ty}, count: U32) -> {ty} {{\n    let value = left {operator} count\n    value\n}}\n",
+                    ty.to_ascii_lowercase(),
+                    name
+                ));
+            }
+        }
+        for (operator, name) in operators {
+            root.push_str(&format!(
+                "pub fn byte_shift_{name}(left: Byte, count: U32) -> Byte {{\n    let value = left {operator} count\n    value\n}}\n"
+            ));
+        }
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 22);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("supported primitive shift body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the supported shift path slice: {check:?}",
                 owner.owner()
             );
         }
