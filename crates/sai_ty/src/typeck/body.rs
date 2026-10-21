@@ -901,19 +901,20 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                     | PrimitiveLiteralKind::Character
                     | PrimitiveLiteralKind::FloatingPoint),
                 ) => {
-                    if left_type == PrimTy::Char
-                        && matches!(
-                            kind,
-                            PrimitiveLiteralKind::Bool | PrimitiveLiteralKind::Character
-                        )
-                    {
+                    if left_type == PrimTy::Char {
                         let right_type = match kind {
                             PrimitiveLiteralKind::Bool => PrimTy::Bool,
                             PrimitiveLiteralKind::Character => PrimTy::Char,
-                            PrimitiveLiteralKind::Integer
-                            | PrimitiveLiteralKind::Byte
-                            | PrimitiveLiteralKind::FloatingPoint => unreachable!(),
+                            PrimitiveLiteralKind::FloatingPoint => {
+                                primitive_bitwise_char_float_literal_rhs_type(operator).ok_or(())?
+                            }
+                            PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::Byte => {
+                                unreachable!()
+                            }
                         };
+                        if kind == PrimitiveLiteralKind::FloatingPoint {
+                            self.check_annotated_literal(right_type, literal, kind, right.hir_id);
+                        }
                         self.errors.push(PrimitiveBodyError {
                             node: expression,
                             kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
@@ -1564,6 +1565,10 @@ fn primitive_bitwise_byte_literal_pair_result(
     primitive_bitwise_byte_literal_left_result(operator, PrimTy::Byte)
 }
 
+fn primitive_bitwise_char_float_literal_rhs_type(operator: BinOp) -> Option<PrimTy> {
+    matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor).then_some(PrimTy::F64)
+}
+
 const fn is_bitwise_primitive(primitive: PrimTy) -> bool {
     is_integer_primitive(primitive) || matches!(primitive, PrimTy::Byte)
 }
@@ -1675,8 +1680,9 @@ mod tests {
         PrimitiveLiteralKind, primitive_arithmetic_literal_expected_type,
         primitive_arithmetic_literal_left_result, primitive_arithmetic_result,
         primitive_bitwise_byte_literal_left_result, primitive_bitwise_byte_literal_pair_result,
-        primitive_bool_operand_result, primitive_comparison_literal_expected_type,
-        primitive_comparison_result, primitive_shift_left_literal_supported,
+        primitive_bitwise_char_float_literal_rhs_type, primitive_bool_operand_result,
+        primitive_comparison_literal_expected_type, primitive_comparison_result,
+        primitive_shift_left_literal_supported,
     };
     use sai_hir::expressions::BinOp;
     use sai_resolve::prelude::PrimTy;
@@ -2148,6 +2154,21 @@ mod tests {
         assert_eq!(
             primitive_bitwise_byte_literal_pair_result(BinOp::Add, PrimitiveLiteralKind::Byte),
             PrimitiveArithmeticResult::Unsupported
+        );
+    }
+
+    #[test]
+    fn char_bitwise_float_literal_rhs_defaults_to_f64_for_each_operator() {
+        for operator in [BinOp::BitAnd, BinOp::BitOr, BinOp::BitXor] {
+            assert_eq!(
+                primitive_bitwise_char_float_literal_rhs_type(operator),
+                Some(PrimTy::F64),
+                "{operator:?} leaves a Char-right float literal unconstrained"
+            );
+        }
+        assert_eq!(
+            primitive_bitwise_char_float_literal_rhs_type(BinOp::Add),
+            None
         );
     }
 }
