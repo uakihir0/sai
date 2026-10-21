@@ -5894,6 +5894,189 @@ fn primitive_bitwise_float_integer_literal_reports_operand_and_operator_diagnost
 }
 
 #[test]
+fn primitive_bitwise_right_byte_literals_accept_byte_paths_and_tail_expressions() {
+    let source = concat!(
+        "pub fn byte_literals(left: Byte) -> Byte {\n",
+        "    let prior: Byte = left\n",
+        "    let and_value = prior & b'a'\n",
+        "    let or_value = and_value | b'b'\n",
+        "    let xor_value = or_value ^ b'c'\n",
+        "    xor_value\n",
+        "}\n",
+    );
+
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn primitive_bitwise_right_byte_literal_integer_mismatches_recover_to_the_left_type() {
+    for operator in ["&", "|", "^"] {
+        let source = format!(
+            concat!(
+                "pub fn integer_mismatch(left: I32) -> I32 {{\n",
+                "    let value = left {operator} b'a'\n",
+                "    let recovered: I32 = value\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            operator = operator,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression = format!("left {operator} b'a'");
+        let expression_start = source
+            .find(&expression)
+            .expect("right Byte literal expression exists");
+        let literal_start = expression_start + format!("left {operator} ").len();
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "the Byte literal should produce one mismatch for I32:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "the supported operator mismatch should recover through the local and tail:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            "expected `I32`, found a byte literal",
+            literal_start,
+            literal_start + "b'a'".len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_bitwise_right_byte_literals_report_noninteger_diagnostics_in_span_order() {
+    for (primitive, operator) in [
+        ("Bool", "&"),
+        ("Bool", "|"),
+        ("Bool", "^"),
+        ("F32", "&"),
+        ("F32", "|"),
+        ("F32", "^"),
+        ("F64", "&"),
+        ("F64", "|"),
+        ("F64", "^"),
+    ] {
+        let source = format!(
+            concat!(
+                "pub fn noninteger_operand(left: {primitive}) -> {primitive} {{\n",
+                "    let value = left {operator} b'a'\n",
+                "    let recovered: {primitive} = value\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            primitive = primitive,
+            operator = operator,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression = format!("left {operator} b'a'");
+        let expression_start = source
+            .find(&expression)
+            .expect("right Byte literal expression exists");
+        let literal_start = expression_start + format!("left {operator} ").len();
+        let operator_message = format!("operator `{operator}` is not defined for `{primitive}`");
+        let literal_message = format!("expected `{primitive}`, found a byte literal");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+            1,
+            "the Byte literal should produce one mismatch for {primitive}:\n{stdout}"
+        );
+        assert_eq!(
+            stdout
+                .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                .count(),
+            1,
+            "bitwise {operator} should remain unsupported for {primitive}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "the diagnostics should recover through the {primitive} local and tail:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            &literal_message,
+            literal_start,
+            literal_start + "b'a'".len(),
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &operator_message,
+            expression_start,
+            expression_start + expression.len(),
+        );
+        let operator_position = stdout
+            .find(&format!("\"message\":\"{operator_message}\""))
+            .expect("operator diagnostic exists");
+        let literal_position = stdout
+            .find(&format!("\"message\":\"{literal_message}\""))
+            .expect("Byte literal mismatch exists");
+        assert!(
+            operator_position < literal_position,
+            "CLI output should sort the whole-expression error before the RHS literal mismatch:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn primitive_bitwise_right_byte_literals_report_char_trait_failures_without_type_mismatches() {
+    for (operator, trait_name) in [("&", "BitAnd"), ("|", "BitOr"), ("^", "BitXor")] {
+        let source = format!(
+            concat!(
+                "pub fn char_operand(left: Char) -> Char {{\n",
+                "    let value = left {operator} b'a'\n",
+                "    let recovered: Char = value\n",
+                "    recovered\n",
+                "}}\n",
+            ),
+            operator = operator,
+        );
+        let output = run_check(&source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        let expression = format!("left {operator} b'a'");
+        let expression_start = source
+            .find(&expression)
+            .expect("Char and Byte operator expression exists");
+        let operator_message =
+            format!("operator `{operator}` has no `{trait_name}<Byte>` implementation for `Char`");
+
+        assert_eq!(output.status.code(), Some(1), "{stdout}");
+        assert_eq!(
+            stdout
+                .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+                .count(),
+            1,
+            "Char should report one concrete trait failure:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+                && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "the Char trait failure should not synthesize a literal mismatch or block recovery:\n{stdout}"
+        );
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &operator_message,
+            expression_start,
+            expression_start + expression.len(),
+        );
+    }
+}
+
+#[test]
 fn primitive_bitwise_right_integer_literal_annotation_mismatch_recovers() {
     let source = concat!(
         "pub fn annotation_recovery(value: I32) -> U32 {\n",
@@ -6313,10 +6496,21 @@ fn unsupported_primitive_bitwise_right_integer_literal_forms_remain_gated() {
         "pub fn float_literal(value: I32) -> I32 { let result = value & 1.0; result }\n",
         "pub fn bool_literal(value: I32) -> I32 { let result = value | true; result }\n",
         "pub fn char_literal(value: I32) -> I32 { let result = value ^ 'a'; result }\n",
-        "pub fn byte_literal(value: Byte) -> Byte { let result = value & b'a'; result }\n",
         "pub fn shift(value: I32) -> I32 { let result = value << 1; result }\n",
         "pub fn self_reference(value: I32) -> I32 { let result = result & value; result }\n",
         "pub fn forward_reference(value: I32) -> I32 { let result = later & value; let later: I32 = 1; result }\n",
+    ] {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
+}
+
+#[test]
+fn unsupported_primitive_bitwise_right_byte_literal_shapes_remain_gated() {
+    for source in [
+        "pub fn byte_literal_left(value: Byte) -> Byte { let result = b'a' & value; result }\n",
+        "pub fn byte_literal_pair() -> Byte { let result = b'a' ^ b'b'; result }\n",
+        "pub fn byte_string(value: Byte) -> Byte { let result = value & b\"text\"; result }\n",
+        "pub fn computed_left(value: Byte) -> Byte { let result = (value & value) | b'a'; result }\n",
     ] {
         assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
     }
