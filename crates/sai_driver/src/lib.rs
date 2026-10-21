@@ -6406,6 +6406,11 @@ fn check_function_body_primitive_local_block(
                                 && is_direct_function_integer_literal(right))
                             || (is_preceding_path(left)
                                 && matches!(right.kind, ExprKind::Lit(Lit::Byte(_))))
+                            || (is_preceding_path(left)
+                                && matches!(
+                                    right.kind,
+                                    ExprKind::Lit(Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. })
+                                ))
                             || (is_direct_function_integer_literal(left)
                                 && is_preceding_path(right))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
@@ -26183,6 +26188,109 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_reports_byte_path_nonbyte_scalar_literal_mismatches() {
+        let cases = [
+            ("&", "and", "true", "a Bool literal"),
+            ("&", "and", "'x'", "a character literal"),
+            ("&", "and", "1.0", "a floating-point literal"),
+            ("|", "or", "false", "a Bool literal"),
+            ("|", "or", "'y'", "a character literal"),
+            ("|", "or", "2.0", "a floating-point literal"),
+            ("^", "xor", "true", "a Bool literal"),
+            ("^", "xor", "'z'", "a character literal"),
+            ("^", "xor", "3.0", "a floating-point literal"),
+        ];
+        let mut root = String::from("pub fn byte_path_scalar_rhs(left: Byte) -> Byte {\n");
+        root.push_str("    let prior: Byte = left\n");
+        let mut literal_spans = Vec::new();
+        for (operator, name, literal, description) in cases {
+            let suffix = match description {
+                "a Bool literal" => "bool",
+                "a character literal" => "char",
+                "a floating-point literal" => "float",
+                _ => unreachable!("all cases use a scalar literal"),
+            };
+            for (left_kind, left) in [("parameter", "left"), ("local", "prior")] {
+                let local = format!("{name}_{suffix}_{left_kind}");
+                root.push_str(&format!("    let {local} = {left} {operator} {literal}\n"));
+                let start = root.len() - literal.len() - 1;
+                literal_spans.push((literal, description, start, start + literal.len()));
+            }
+        }
+        root.push_str("    xor_float_local\n}\n");
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 1);
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[0]
+            .body_type_check()
+            .expect("Byte path scalar RHSs remain in the supported body slice")
+        else {
+            panic!("Byte path scalar RHSs must remain supported");
+        };
+        assert_eq!(diagnostics.len(), cases.len() * 2);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch),
+            "every scalar RHS should have exactly one type mismatch: {diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "expected `Byte`, found a Bool literal",
+                "expected `Byte`, found a Bool literal",
+                "expected `Byte`, found a character literal",
+                "expected `Byte`, found a character literal",
+                "expected `Byte`, found a floating-point literal",
+                "expected `Byte`, found a floating-point literal",
+                "expected `Byte`, found a Bool literal",
+                "expected `Byte`, found a Bool literal",
+                "expected `Byte`, found a character literal",
+                "expected `Byte`, found a character literal",
+                "expected `Byte`, found a floating-point literal",
+                "expected `Byte`, found a floating-point literal",
+                "expected `Byte`, found a Bool literal",
+                "expected `Byte`, found a Bool literal",
+                "expected `Byte`, found a character literal",
+                "expected `Byte`, found a character literal",
+                "expected `Byte`, found a floating-point literal",
+                "expected `Byte`, found a floating-point literal",
+            ]
+        );
+
+        for (diagnostic, (_, _, start, end)) in diagnostics.iter().zip(literal_spans) {
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("literal mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new(end as u32),
+                )
+                .expect("literal span is ordered"),
+                "each diagnostic should use the complete RHS literal span"
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_accepts_flat_local_bitwise_left_integer_literals() {
         let integer_types = [
             "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
@@ -26607,10 +26715,26 @@ mod tests {
         let root = concat!(
             "type Word = I32\n",
             "type ShiftCount = U32\n",
+            "type ByteAlias = Byte\n",
             "pub fn float_literal_left(left: I32) -> I32 {\n    let value = 1.0 & left\n    value\n}\n",
             "pub fn literal_pair() -> I32 {\n    let value = 1 ^ 2\n    value\n}\n",
             "pub fn non_integer_literal(left: I32) -> I32 {\n    let value = left & 1.0\n    value\n}\n",
             "pub fn char_integer_literal(left: Char) -> Char {\n    let value = left & 1\n    value\n}\n",
+            "pub fn i32_path_bool_rhs(left: I32) -> I32 {\n    let value = left & true\n    value\n}\n",
+            "pub fn bool_path_char_rhs(left: Bool) -> Bool {\n    let value = left | 'x'\n    value\n}\n",
+            "pub fn char_path_float_rhs(left: Char) -> Char {\n    let value = left ^ 1.0\n    value\n}\n",
+            "pub fn f32_path_bool_rhs(left: F32) -> F32 {\n    let value = left & false\n    value\n}\n",
+            "pub fn f64_path_char_rhs(left: F64) -> F64 {\n    let value = left | 'y'\n    value\n}\n",
+            "pub fn byte_alias_path_scalar_rhs(left: ByteAlias) -> ByteAlias {\n    let value = left ^ true\n    value\n}\n",
+            "pub fn generic_path_scalar_rhs<T>(left: Byte) -> Byte {\n    let value = left & 'x'\n    value\n}\n",
+            "type PathScalarBitOwner { marker: Byte }\n",
+            "impl PathScalarBitOwner {\n",
+            "    fn path_scalar_method(self: borrow Self, left: Byte) -> Byte {\n",
+            "        let prior: Byte = left\n",
+            "        let value = prior ^ 1.0\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
             "pub fn nested(left: I32, right: I32, extra: I32) -> I32 {\n    let value = left & (right ^ extra)\n    value\n}\n",
             "pub fn computed(left: I32, right: I32) -> I32 {\n    let value = (left + right) & right\n    value\n}\n",
             "pub fn unresolved(left: I32) -> I32 {\n    let bits = 1\n    let value = bits & left\n    value\n}\n",
@@ -26638,7 +26762,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 16);
+        assert_eq!(resolved.owners().len(), 23);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()

@@ -6564,6 +6564,33 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let result = b'a' & (1 + 0)",
         ),
         fixture(
+            "pub fn i32_path_bool_rhs(left: I32) -> I32",
+            "let result = left & true",
+        ),
+        fixture(
+            "pub fn bool_path_char_rhs(left: Bool) -> Bool",
+            "let result = left | 'x'",
+        ),
+        fixture(
+            "pub fn char_path_float_rhs(left: Char) -> Char",
+            "let result = left ^ 1.0",
+        ),
+        fixture(
+            "pub fn f32_path_bool_rhs(left: F32) -> F32",
+            "let result = left & false",
+        ),
+        fixture(
+            "pub fn f64_path_char_rhs(left: F64) -> F64",
+            "let result = left | 'y'",
+        ),
+        format!(
+            "type ByteAlias = Byte\n{}",
+            fixture(
+                "pub fn byte_alias_path_scalar_rhs(left: ByteAlias) -> ByteAlias",
+                "let result = left ^ true"
+            )
+        ),
+        fixture(
             "pub fn nested(left: I32, right: I32, extra: I32) -> I32",
             "let result = left & (right ^ extra)",
         ),
@@ -6602,6 +6629,10 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn generic_scalar_rhs<T>(unused: I32) -> Byte",
             "let result = b'a' & true",
         ),
+        fixture(
+            "pub fn generic_path_scalar_rhs<T>(left: Byte) -> Byte",
+            "let result = left & 'x'",
+        ),
         concat!(
             "type BitOwner { marker: Byte }\n",
             "impl BitOwner {\n",
@@ -6617,6 +6648,17 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "impl ScalarBitOwner {\n",
             "    fn scalar_method(self: borrow Self) -> Byte {\n",
             "        let result = b'a' & true\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        )
+        .to_owned(),
+        concat!(
+            "type PathScalarBitOwner { marker: Byte }\n",
+            "impl PathScalarBitOwner {\n",
+            "    fn path_scalar_method(self: borrow Self, left: Byte) -> Byte {\n",
+            "        let prior: Byte = left\n",
+            "        let result = prior ^ 1.0\n",
             "        result\n",
             "    }\n",
             "}\n",
@@ -7371,6 +7413,109 @@ fn primitive_bitwise_byte_literal_left_scalar_rhs_mismatches_recover_to_byte() {
             end,
         );
     }
+}
+
+#[test]
+fn primitive_bitwise_byte_path_scalar_rhs_mismatches_recover_to_byte() {
+    let cases = [
+        ("&", "and", "true", "a Bool literal"),
+        ("&", "and", "'x'", "a character literal"),
+        ("&", "and", "1.0", "a floating-point literal"),
+        ("|", "or", "false", "a Bool literal"),
+        ("|", "or", "'y'", "a character literal"),
+        ("|", "or", "2.0", "a floating-point literal"),
+        ("^", "xor", "true", "a Bool literal"),
+        ("^", "xor", "'z'", "a character literal"),
+        ("^", "xor", "3.0", "a floating-point literal"),
+    ];
+    let mut source = String::from("pub fn byte_path_scalar_rhs(left: Byte) -> Byte {\n");
+    source.push_str("    let prior: Byte = left\n");
+    let mut literal_spans = Vec::new();
+    for (operator, name, literal, description) in cases {
+        let suffix = match description {
+            "a Bool literal" => "bool",
+            "a character literal" => "char",
+            "a floating-point literal" => "float",
+            _ => unreachable!("all cases use a scalar literal"),
+        };
+        for (left_kind, left) in [("parameter", "left"), ("local", "prior")] {
+            let local = format!("{name}_{suffix}_{left_kind}");
+            source.push_str(&format!("    let {local} = {left} {operator} {literal}\n"));
+            let start = source.len() - literal.len() - 1;
+            literal_spans.push((description, start, start + literal.len()));
+        }
+    }
+    source.push_str("    xor_float_local\n}\n");
+
+    let output = run_check(&source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        cases.len() * 2,
+        "each direct scalar RHS should mismatch the Byte path exactly once:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "all operands should recover as Byte and reach the function tail:\n{stdout}"
+    );
+    for (description, start, end) in literal_spans {
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            &format!("expected `Byte`, found {description}"),
+            start,
+            end,
+        );
+    }
+}
+
+#[test]
+fn primitive_bitwise_byte_path_scalar_rhs_recovers_to_different_annotation() {
+    let source = concat!(
+        "pub fn annotation_recovery(left: Byte) -> U8 {\n",
+        "    let value: U8 = left ^ 'x'\n",
+        "    let recovered: U8 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression = "left ^ 'x'";
+    let expression_start = source
+        .find(expression)
+        .expect("annotated Byte-path scalar expression exists");
+    let literal_start = expression_start + "left ^ ".len();
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the RHS mismatch and annotation mismatch should both be reported:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the expression should recover to U8 and reach later checks:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Byte`, found a character literal",
+        literal_start,
+        literal_start + "'x'".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Byte`",
+        expression_start,
+        expression_start + expression.len(),
+    );
 }
 
 #[test]
