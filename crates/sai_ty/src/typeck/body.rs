@@ -175,6 +175,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         input,
         known_bindings,
         direct_unannotated_integer_literals: HashSet::new(),
+        direct_unannotated_float_literals: HashSet::new(),
         pending_operator_trait_count: 0,
         literal_variables: Vec::new(),
         errors: Vec::new(),
@@ -194,6 +195,7 @@ struct FnCtxt<'a, 'hir> {
     input: PrimitiveBodyInput<'a, 'hir>,
     known_bindings: HashMap<BindingId, LocalType>,
     direct_unannotated_integer_literals: HashSet<BindingId>,
+    direct_unannotated_float_literals: HashSet<BindingId>,
     pending_operator_trait_count: usize,
     literal_variables: Vec<LiteralVariable<'hir>>,
     errors: Vec<PrimitiveBodyError>,
@@ -434,15 +436,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             _ => return Err(()),
         };
 
-        if annotation.is_none()
-            && matches!(
-                init.kind,
-                ExprKind::Lit(literal)
-                    if primitive_literal_kind(literal)
-                        == Some(PrimitiveLiteralKind::Integer)
-            )
-        {
-            self.direct_unannotated_integer_literals.insert(binding);
+        if annotation.is_none() {
+            if let ExprKind::Lit(literal) = init.kind {
+                match primitive_literal_kind(literal) {
+                    Some(PrimitiveLiteralKind::Integer) => {
+                        self.direct_unannotated_integer_literals.insert(binding);
+                    }
+                    Some(PrimitiveLiteralKind::FloatingPoint) => {
+                        self.direct_unannotated_float_literals.insert(binding);
+                    }
+                    Some(
+                        PrimitiveLiteralKind::Bool
+                        | PrimitiveLiteralKind::Byte
+                        | PrimitiveLiteralKind::Character,
+                    )
+                    | None => {}
+                }
+            }
         }
         self.known_bindings.insert(binding, local_type);
         Ok(())
@@ -837,10 +847,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 if primitive_literal_kind(literal) == Some(PrimitiveLiteralKind::Character) {
                     let ExprKind::Lit(right_literal) = right.kind else {
                         let right_local_type = self.check_local_path(right)?;
-                        let direct_integer_literal_path =
-                            self.is_direct_unannotated_integer_literal_path(right);
+                        let direct_unannotated_literal_path =
+                            self.is_direct_unannotated_literal_path(right);
                         if matches!(right_local_type, LocalType::LiteralVariable(_))
-                            && !direct_integer_literal_path
+                            && !direct_unannotated_literal_path
                         {
                             return Err(());
                         }
@@ -848,7 +858,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             .concrete_local_type(right_local_type)
                             .filter(|primitive| supports_primitive_literal(*primitive));
                         let Some(right_type) = right_type else {
-                            if !direct_integer_literal_path {
+                            if !direct_unannotated_literal_path {
                                 return Err(());
                             }
                             let LocalType::LiteralVariable(id) = right_local_type else {
@@ -863,7 +873,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             if !can_defer_char_literal_path_trait(
                                 variable.kind,
                                 variable.additional_site.is_some(),
-                                direct_integer_literal_path,
+                                direct_unannotated_literal_path,
                             ) {
                                 return Err(());
                             }
@@ -1701,7 +1711,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         Ok(local_type)
     }
 
-    fn is_direct_unannotated_integer_literal_path(&self, expression: &Expr<'hir>) -> bool {
+    fn is_direct_unannotated_literal_path(&self, expression: &Expr<'hir>) -> bool {
         let ExprKind::Path(path) = expression.kind else {
             return false;
         };
@@ -1714,7 +1724,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         self.input
             .local_paths
             .get(&path.hir_id)
-            .is_some_and(|binding| self.direct_unannotated_integer_literals.contains(binding))
+            .is_some_and(|binding| {
+                self.direct_unannotated_integer_literals.contains(binding)
+                    || self.direct_unannotated_float_literals.contains(binding)
+            })
     }
 }
 
@@ -1872,11 +1885,13 @@ fn primitive_bitwise_char_float_literal_rhs_type(operator: BinOp) -> Option<Prim
 fn can_defer_char_literal_path_trait(
     kind: PrimitiveLiteralKind,
     has_additional_site: bool,
-    is_direct_unannotated_integer_literal: bool,
+    is_direct_unannotated_numeric_literal: bool,
 ) -> bool {
-    kind == PrimitiveLiteralKind::Integer
-        && !has_additional_site
-        && is_direct_unannotated_integer_literal
+    matches!(
+        kind,
+        PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+    ) && !has_additional_site
+        && is_direct_unannotated_numeric_literal
 }
 
 const fn is_bitwise_primitive(primitive: PrimTy) -> bool {
@@ -2601,14 +2616,18 @@ mod tests {
     }
 
     #[test]
-    fn char_path_trait_deferral_requires_a_direct_unannotated_integer_literal_local() {
+    fn char_path_trait_deferral_requires_a_direct_unannotated_numeric_literal_local() {
         assert!(can_defer_char_literal_path_trait(
             PrimitiveLiteralKind::Integer,
             false,
             true
         ));
-        for kind in [
+        assert!(can_defer_char_literal_path_trait(
             PrimitiveLiteralKind::FloatingPoint,
+            false,
+            true
+        ));
+        for kind in [
             PrimitiveLiteralKind::Bool,
             PrimitiveLiteralKind::Byte,
             PrimitiveLiteralKind::Character,
@@ -2625,6 +2644,10 @@ mod tests {
         assert!(
             !can_defer_char_literal_path_trait(PrimitiveLiteralKind::Integer, true, true),
             "computed integer literal variables with another source site remain gated"
+        );
+        assert!(
+            !can_defer_char_literal_path_trait(PrimitiveLiteralKind::FloatingPoint, true, true),
+            "float literal variables with another source site remain gated"
         );
     }
 }
