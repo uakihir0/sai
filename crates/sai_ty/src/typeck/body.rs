@@ -887,14 +887,19 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         expression: HirId,
     ) -> Result<LocalType, ()> {
         let left_type = if let ExprKind::Lit(literal) = left.kind {
-            if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer) {
+            let Some(kind) = primitive_literal_kind(literal) else {
+                return Err(());
+            };
+            if !primitive_shift_left_literal_supported(kind) {
                 return Err(());
             }
-            self.local_type_for_unannotated_literal(
-                literal,
-                PrimitiveLiteralKind::Integer,
-                left.hir_id,
-            )
+            match kind {
+                PrimitiveLiteralKind::Byte => LocalType::Concrete(PrimTy::Byte),
+                PrimitiveLiteralKind::Integer => {
+                    self.local_type_for_unannotated_literal(literal, kind, left.hir_id)
+                }
+                _ => return Err(()),
+            }
         } else {
             let local_type = self
                 .check_local_path(left)
@@ -1520,7 +1525,7 @@ mod tests {
         PrimitiveLiteralKind, primitive_arithmetic_literal_expected_type,
         primitive_arithmetic_literal_left_result, primitive_arithmetic_result,
         primitive_bool_operand_result, primitive_comparison_literal_expected_type,
-        primitive_comparison_result,
+        primitive_comparison_result, primitive_shift_left_literal_supported,
     };
     use sai_hir::expressions::BinOp;
     use sai_resolve::prelude::PrimTy;
@@ -1913,6 +1918,26 @@ mod tests {
             PrimitiveBoolOperandResult::Unsupported
         );
     }
+
+    #[test]
+    fn shift_left_accepts_only_integer_and_byte_literal_kinds() {
+        for kind in [PrimitiveLiteralKind::Integer, PrimitiveLiteralKind::Byte] {
+            assert!(
+                primitive_shift_left_literal_supported(kind),
+                "{kind:?} literals are supported on the left of a shift"
+            );
+        }
+        for kind in [
+            PrimitiveLiteralKind::FloatingPoint,
+            PrimitiveLiteralKind::Bool,
+            PrimitiveLiteralKind::Character,
+        ] {
+            assert!(
+                !primitive_shift_left_literal_supported(kind),
+                "{kind:?} literals remain unsupported on the left of a shift"
+            );
+        }
+    }
 }
 
 fn primitive_literal_kind(literal: Lit<'_>) -> Option<PrimitiveLiteralKind> {
@@ -1924,4 +1949,11 @@ fn primitive_literal_kind(literal: Lit<'_>) -> Option<PrimitiveLiteralKind> {
         Lit::Char(_) => Some(PrimitiveLiteralKind::Character),
         Lit::Str(_) | Lit::ByteStr(_) => None,
     }
+}
+
+fn primitive_shift_left_literal_supported(kind: PrimitiveLiteralKind) -> bool {
+    matches!(
+        kind,
+        PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::Byte
+    )
 }
