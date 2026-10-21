@@ -64,6 +64,11 @@ pub enum PrimitiveBodyErrorKind {
         operator: BinOp,
         operand: PrimitiveOperatorOperand,
     },
+    OperatorTraitNotSupported {
+        operator: BinOp,
+        left: PrimTy,
+        right: PrimTy,
+    },
 }
 
 /// An operand description for an unsupported primitive operator diagnostic.
@@ -256,6 +261,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         // The annotation determines the local's recovered
                         // type after the coercion-site mismatch, as it does
                         // for the existing annotated path initializer.
+                        LocalType::Concrete(expected)
+                    } else {
+                        result
+                    }
+                } else if matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) {
+                    let result = self.check_bitwise(operator, left, right, init.hir_id)?;
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(result, expected, init.hir_id)?;
                         LocalType::Concrete(expected)
                     } else {
                         result
@@ -617,6 +630,72 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             );
         }
         Ok(LocalType::Concrete(left_type))
+    }
+
+    fn check_bitwise(
+        &mut self,
+        operator: BinOp,
+        left: &'hir Expr<'hir>,
+        right: &'hir Expr<'hir>,
+        expression: HirId,
+    ) -> Result<LocalType, ()> {
+        let left_type = self
+            .check_local_path(left)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .filter(|primitive| supports_primitive_literal(*primitive))
+            .ok_or(())?;
+        let right_type = self
+            .check_local_path(right)
+            .ok()
+            .and_then(|local_type| self.concrete_local_type(local_type))
+            .filter(|primitive| supports_primitive_literal(*primitive))
+            .ok_or(())?;
+
+        if is_integer_primitive(left_type) || left_type == PrimTy::Byte {
+            if left_type != right_type {
+                self.errors.push(PrimitiveBodyError {
+                    node: right.hir_id,
+                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                        expected: left_type,
+                        found: right_type,
+                    },
+                });
+            }
+            return Ok(LocalType::Concrete(left_type));
+        }
+
+        if matches!(left_type, PrimTy::Bool | PrimTy::F32 | PrimTy::F64) {
+            if left_type != right_type {
+                self.errors.push(PrimitiveBodyError {
+                    node: right.hir_id,
+                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                        expected: left_type,
+                        found: right_type,
+                    },
+                });
+            }
+            self.report_operator_not_supported(
+                expression,
+                operator,
+                PrimitiveOperatorOperand::Concrete(left_type),
+            );
+            return Ok(LocalType::Concrete(left_type));
+        }
+
+        if left_type == PrimTy::Char {
+            self.errors.push(PrimitiveBodyError {
+                node: expression,
+                kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
+                    operator,
+                    left: left_type,
+                    right: right_type,
+                },
+            });
+            return Ok(LocalType::Concrete(left_type));
+        }
+
+        Err(())
     }
 
     fn report_operator_not_supported(
