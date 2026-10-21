@@ -6318,6 +6318,60 @@ fn check_function_body_primitive_local_block(
         return Ok(None);
     };
 
+    // A direct integer addition pair is admitted here only when the resulting
+    // local (or one of its plain-path copies) is actually used as the RHS of
+    // a Char-literal-left bitwise expression. The type checker tracks the
+    // narrower unannotated provenance; this driver prepass keeps unrelated
+    // arithmetic literal pairs outside the supported function-body slice.
+    let mut integer_addition_pair_roots = HashMap::new();
+    let mut char_bitwise_rhs_roots = HashSet::new();
+    for stmt in block.stmts {
+        let StmtKind::Let {
+            pat,
+            init,
+            els: None,
+            ..
+        } = stmt.kind
+        else {
+            continue;
+        };
+        let PatKind::Binding {
+            binding, sub: None, ..
+        } = pat.kind
+        else {
+            continue;
+        };
+
+        match init.kind {
+            ExprKind::Binary(BinOp::Add, left, right)
+                if is_direct_function_integer_literal(left)
+                    && is_direct_function_integer_literal(right) =>
+            {
+                integer_addition_pair_roots.insert(binding, binding);
+            }
+            ExprKind::Path(path) => {
+                if let Some(root) = resolved_plain_local_path_binding(path, locals, inputs)
+                    .and_then(|source| integer_addition_pair_roots.get(&source).copied())
+                {
+                    integer_addition_pair_roots.insert(binding, root);
+                }
+            }
+            ExprKind::Binary(BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor, left, right)
+                if matches!(left.kind, ExprKind::Lit(Lit::Char(_))) =>
+            {
+                let ExprKind::Path(path) = right.kind else {
+                    continue;
+                };
+                if let Some(root) = resolved_plain_local_path_binding(path, locals, inputs)
+                    .and_then(|source| integer_addition_pair_roots.get(&source).copied())
+                {
+                    char_bitwise_rhs_roots.insert(root);
+                }
+            }
+            _ => {}
+        }
+    }
+
     let mut primitive_types = HashMap::new();
     let mut preceding_bindings = initial_bindings.keys().copied().collect::<HashSet<_>>();
     for stmt in block.stmts {
@@ -6470,6 +6524,12 @@ fn check_function_body_primitive_local_block(
                                 && is_direct_function_numeric_literal(right))
                             || (is_direct_function_numeric_literal(left)
                                 && is_preceding_path(right))
+                            || (operator == BinOp::Add
+                                && is_direct_function_integer_literal(left)
+                                && is_direct_function_integer_literal(right)
+                                && integer_addition_pair_roots
+                                    .get(&binding)
+                                    .is_some_and(|root| char_bitwise_rhs_roots.contains(root)))
                     }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         (is_preceding_path(left) && is_preceding_path(right))
@@ -27634,6 +27694,18 @@ mod tests {
             "    let recovered: Char = xor_value\n",
             "    recovered\n",
             "}\n",
+            "pub fn char_integer_addition_pair_alias_chain_late_constraint() -> Char {\n",
+            "    let computed = 1 + 2\n",
+            "    let alias1 = computed\n",
+            "    let alias2 = alias1\n",
+            "    let alias3 = alias2\n",
+            "    let and_value = 'y' & alias3\n",
+            "    let or_value = 'z' | alias3\n",
+            "    let xor_value = 'A' ^ alias3\n",
+            "    let narrowed: I32 = alias3\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -27649,7 +27721,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 14);
+        assert_eq!(owners.len(), 15);
 
         let expected_diagnostics = [
             (
@@ -27872,12 +27944,29 @@ mod tests {
                     ("expected `I32`, found `Char`", "'x' & alias3"),
                 ],
             ),
+            (
+                14,
+                vec![
+                    (
+                        "operator `&` has no `BitAnd<I32>` implementation for `Char`",
+                        "'y' & alias3",
+                    ),
+                    (
+                        "operator `|` has no `BitOr<I32>` implementation for `Char`",
+                        "'z' | alias3",
+                    ),
+                    (
+                        "operator `^` has no `BitXor<I32>` implementation for `Char`",
+                        "'A' ^ alias3",
+                    ),
+                ],
+            ),
         ];
 
         for (index, expected) in expected_diagnostics {
             let FunctionBodyTypeCheck::Supported { diagnostics } = owners[index]
                 .body_type_check()
-                .expect("integer and float local or alias-chain Char bitwise pair is checked")
+                .expect("integer addition and bitwise pair aliases and float aliases are checked")
             else {
                 panic!("owner {index} must remain in the supported body-checking slice");
             };
@@ -27935,6 +28024,279 @@ mod tests {
                     "wrong diagnostic code for {message:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_tracks_direct_integer_addition_pair_aliases() {
+        let root = concat!(
+            "pub fn char_integer_addition_pair_defaults() -> Char {\n",
+            "    let computed = 1 + 2\n",
+            "    let alias1 = computed\n",
+            "    let alias2 = alias1\n",
+            "    let and_value = 'a' & alias2\n",
+            "    let or_value = 'b' | alias2\n",
+            "    let xor_value = 'c' ^ alias2\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_integer_addition_pair_late_constraint() -> Char {\n",
+            "    let computed = 3 + 4\n",
+            "    let alias = computed\n",
+            "    let and_value = 'd' & alias\n",
+            "    let or_value = 'e' | alias\n",
+            "    let xor_value = 'f' ^ alias\n",
+            "    let narrowed: I32 = alias\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_integer_addition_pair_i8_range() -> Char {\n",
+            "    let computed = -129 + 128\n",
+            "    let alias = computed\n",
+            "    let value = 'g' & alias\n",
+            "    let narrowed: I8 = alias\n",
+            "    let recovered: Char = value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_integer_addition_pair_annotated_recovery() -> I32 {\n",
+            "    let computed: I32 = 1 + 2\n",
+            "    let alias = computed\n",
+            "    let value: I32 = 'h' & alias\n",
+            "    let recovered: I32 = value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_integer_addition_pair_preconstrained() -> Char {\n",
+            "    let computed = 5 + 6\n",
+            "    let alias = computed\n",
+            "    let narrowed: I8 = alias\n",
+            "    let value = 'i' ^ alias\n",
+            "    let recovered: Char = value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_integer_addition_pair_annotation_recovery() -> I32 {\n",
+            "    let computed = 1 + 2\n",
+            "    let alias = computed\n",
+            "    let value: I32 = 'j' & alias\n",
+            "    let recovered: I32 = value\n",
+            "    recovered\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 6);
+        let expected_diagnostics = [
+            (
+                0,
+                vec![
+                    (
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+                        "'a' & alias2",
+                    ),
+                    (
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        "operator `|` has no `BitOr<I64>` implementation for `Char`",
+                        "'b' | alias2",
+                    ),
+                    (
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        "operator `^` has no `BitXor<I64>` implementation for `Char`",
+                        "'c' ^ alias2",
+                    ),
+                ],
+            ),
+            (
+                1,
+                vec![
+                    (
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        "operator `&` has no `BitAnd<I32>` implementation for `Char`",
+                        "'d' & alias",
+                    ),
+                    (
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        "operator `|` has no `BitOr<I32>` implementation for `Char`",
+                        "'e' | alias",
+                    ),
+                    (
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        "operator `^` has no `BitXor<I32>` implementation for `Char`",
+                        "'f' ^ alias",
+                    ),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    (
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        "integer literal is out of range for `I8`",
+                        "-129",
+                    ),
+                    (
+                        sai_diagnostics::Code::LiteralOutOfRange,
+                        "integer literal is out of range for `I8`",
+                        "128",
+                    ),
+                    (
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        "operator `&` has no `BitAnd<I8>` implementation for `Char`",
+                        "'g' & alias",
+                    ),
+                ],
+            ),
+            (
+                3,
+                vec![
+                    (
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        "operator `&` has no `BitAnd<I32>` implementation for `Char`",
+                        "'h' & alias",
+                    ),
+                    (
+                        sai_diagnostics::Code::TypeMismatch,
+                        "expected `I32`, found `Char`",
+                        "'h' & alias",
+                    ),
+                ],
+            ),
+            (
+                4,
+                vec![(
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    "operator `^` has no `BitXor<I8>` implementation for `Char`",
+                    "'i' ^ alias",
+                )],
+            ),
+            (
+                5,
+                vec![
+                    (
+                        sai_diagnostics::Code::OperatorNotSupported,
+                        "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+                        "'j' & alias",
+                    ),
+                    (
+                        sai_diagnostics::Code::TypeMismatch,
+                        "expected `I32`, found `Char`",
+                        "'j' & alias",
+                    ),
+                ],
+            ),
+        ];
+
+        for (index, expected) in expected_diagnostics {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
+                .body_type_check()
+                .expect("direct integer addition-pair alias body remains supported")
+            else {
+                panic!("owner {index} must remain in the supported body-checking slice");
+            };
+            assert_eq!(
+                diagnostics.len(),
+                expected.len(),
+                "function owner {index}: {diagnostics:?}"
+            );
+            for (code, message, span_source) in expected {
+                let start = root
+                    .find(span_source)
+                    .expect("expected diagnostic source span exists");
+                let expected_span = sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + span_source.len()) as u32),
+                )
+                .expect("expected diagnostic span is ordered");
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .filter(|diagnostic| {
+                            diagnostic.code == code
+                                && diagnostic.message == message
+                                && diagnostic
+                                    .primary()
+                                    .is_some_and(|primary| primary.span.range == expected_span)
+                        })
+                        .count(),
+                    1,
+                    "owner {index} lacks unique {code:?} diagnostic {message:?} at {span_source:?}: {diagnostics:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_gates_other_integer_addition_pair_origins() {
+        let root = concat!(
+            "pub fn char_subtraction_alias() -> Char {\n",
+            "    let right = 3 - 2\n",
+            "    let value = 'a' & right\n",
+            "    value\n",
+            "}\n",
+            "pub fn char_multiplication_alias() -> Char {\n",
+            "    let right = 3 * 2\n",
+            "    let value = 'b' & right\n",
+            "    value\n",
+            "}\n",
+            "pub fn char_division_alias() -> Char {\n",
+            "    let right = 6 / 2\n",
+            "    let value = 'c' & right\n",
+            "    value\n",
+            "}\n",
+            "pub fn char_nested_addition_alias() -> Char {\n",
+            "    let right = 1 + (2 + 3)\n",
+            "    let value = 'd' & right\n",
+            "    value\n",
+            "}\n",
+            "pub fn char_direct_addition_rhs() -> Char {\n",
+            "    let value = 'e' & (1 + 2)\n",
+            "    value\n",
+            "}\n",
+            "pub fn char_wrapping_addition_alias() -> Char {\n",
+            "    let right = 1 +% 2\n",
+            "    let value = 'f' & right\n",
+            "    value\n",
+            "}\n",
+            "pub fn generic_char_addition_alias<T>() -> Char {\n",
+            "    let right = 1 + 2\n",
+            "    let value = 'g' & right\n",
+            "    value\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 7);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("unsupported integer addition-pair origin is gated");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Unsupported),
+                "owner {index} unexpectedly passed the bounded addition-pair slice: {check:?}"
+            );
         }
     }
 
@@ -30004,7 +30366,7 @@ mod tests {
             "pub fn generic_char_literal_path_rhs<T>(right: T) -> Char {\n    let value = 'a' & right\n    value\n}\n",
             "pub fn char_literal_unresolved_path_rhs() -> Char {\n    let value = 'a' & missing\n    value\n}\n",
             "pub fn char_literal_computed_float_local_rhs() -> Char {\n    let right = 1.0 + 2.0\n    let value = 'a' & right\n    value\n}\n",
-            "pub fn char_literal_computed_integer_path_rhs() -> Char {\n    let right = 1 + 2\n    let value = 'a' & right\n    value\n}\n",
+            "pub fn char_literal_computed_integer_path_rhs() -> Char {\n    let right = 1 - 2\n    let value = 'a' & right\n    value\n}\n",
             "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char {\n    let right = 1\n    let alias1 = right\n    let alias2 = alias1\n    let alias3 = alias2\n    let value = 'a' & alias3\n    value\n}\n",
             "pub fn generic_char_literal_untyped_float_path_rhs<T>() -> Char {\n    let right = 1.0\n    let alias1 = right\n    let alias2 = alias1\n    let alias3 = alias2\n    let value = 'a' & alias3\n    value\n}\n",
             "pub fn char_literal_self_reference_path_rhs() -> Char {\n    let value = 'a' & value\n    value\n}\n",
