@@ -6361,6 +6361,18 @@ fn check_function_body_primitive_local_block(
                     return Ok(None);
                 }
             }
+            ExprKind::Unary(UnOp::BitNot, operand) => {
+                let ExprKind::Path(path) = operand.kind else {
+                    return Ok(None);
+                };
+                let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
+                else {
+                    return Ok(None);
+                };
+                if !preceding_bindings.contains(&source_binding) {
+                    return Ok(None);
+                }
+            }
             ExprKind::Binary(operator, left, right)
                 if is_function_primitive_local_binary_operator(operator) =>
             {
@@ -6648,6 +6660,24 @@ fn primitive_body_errors_to_diagnostics(
                         "operator `{operator_text}` has no `{trait_name}<{}>` implementation for `{}`",
                         const_primitive_name(right),
                         const_primitive_name(left)
+                    ),
+                    "operator trait implementation is not available",
+                )?
+            }
+            PrimitiveBodyErrorKind::UnaryOperatorNotSupported { operator, operand } => {
+                let (operator_text, trait_name) = match operator {
+                    UnOp::BitNot => ("~", "BitNot"),
+                    _ => return Ok(None),
+                };
+                const_literal_diagnostic(
+                    owner.id,
+                    inputs,
+                    snapshot,
+                    span,
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    format!(
+                        "operator `{operator_text}` has no `{trait_name}` implementation for `{}`",
+                        const_primitive_name(operand)
                     ),
                     "operator trait implementation is not available",
                 )?
@@ -25774,6 +25804,100 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_accepts_bit_not_for_integer_and_byte_paths() {
+        let bitwise_types = [
+            "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize", "Byte",
+        ];
+        let mut root = String::new();
+        for ty in bitwise_types {
+            root.push_str(&format!(
+                "pub fn bitnot_{}(value: {ty}) -> {ty} {{\n    let result = ~value\n    result\n}}\n",
+                ty.to_ascii_lowercase()
+            ));
+        }
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 11);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("supported bit-not body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the supported bit-not slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_reports_bit_not_for_unsupported_primitive_paths() {
+        let primitive_types = ["Bool", "Char", "F32", "F64"];
+        let mut root = String::new();
+        for ty in primitive_types {
+            root.push_str(&format!(
+                "pub fn bitnot_{}(value: {ty}) -> {ty} {{\n    let result = ~value\n    result\n}}\n",
+                ty.to_ascii_lowercase()
+            ));
+        }
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 4);
+        for (index, (owner, found)) in resolved.owners().iter().zip(primitive_types).enumerate() {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = owner
+                .body_type_check()
+                .expect("unsupported bit-not operator is diagnosed")
+            else {
+                panic!("unsupported bit-not primitive {found} unexpectedly gated");
+            };
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code)
+                    .collect::<Vec<_>>(),
+                [sai_diagnostics::Code::OperatorNotSupported],
+                "bit-not case {index}"
+            );
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.clone())
+                    .collect::<Vec<_>>(),
+                vec![format!(
+                    "operator `~` has no `BitNot` implementation for `{found}`"
+                )],
+                "bit-not case {index}"
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_retains_left_bitwise_integer_literals_after_family_mismatches() {
         let root = concat!(
             "pub fn byte(right: Byte) -> I32 {\n    let value: I32 = 1 & right\n    value\n}\n",
@@ -26001,7 +26125,7 @@ mod tests {
             "pub fn computed(left: I32, right: I32) -> I32 {\n    let value = (left + right) & right\n    value\n}\n",
             "pub fn unresolved(left: I32) -> I32 {\n    let bits = 1\n    let value = bits & left\n    value\n}\n",
             "pub fn alias(left: Word, right: Word) -> Word {\n    let value = left & right\n    value\n}\n",
-            "pub fn bit_not(left: I32) -> I32 {\n    let value = ~left\n    value\n}\n",
+            "pub fn nested_bit_not(left: I32) -> I32 {\n    let value = ~(~left)\n    value\n}\n",
             "pub fn shift(left: I32) -> I32 {\n    let value = left << 1\n    value\n}\n",
             "pub fn self_reference(left: I32) -> I32 {\n    let value = value & left\n    value\n}\n",
             "pub fn forward_reference(left: I32) -> I32 {\n    let value = future & left\n    let future: I32 = 1\n    value\n}\n",
