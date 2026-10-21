@@ -1,0 +1,31 @@
+use acme:package-lock-auditor/graph
+use acme:package-lock-auditor/lookup
+use acme:package-lock-auditor/model.{AuditReport, Lockfile}
+use acme:package-lock-auditor/versions
+
+pub fn audit(lock: Lockfile) -> AuditReport {
+    let missing = versions.missing_reference_count(lock)
+    let incompatible = versions.incompatible_range_count(lock)
+    let duplicates = lookup.duplicate_id_pair_count(lock)
+    let partial = graph.partial_order(lock)
+    let has_cycle = if duplicates == 0 {
+        Some(partial.length < lookup.package_count(lock))
+    } else {
+        None
+    }
+    let is_valid =
+        (missing == 0 and incompatible == 0 and duplicates == 0 and has_cycle == Some(false))
+    let order = if is_valid {
+        partial
+    } else {
+        graph.empty_order()
+    }
+
+    AuditReport(
+        missing_reference_count: missing,
+        incompatible_range_count: incompatible,
+        duplicate_id_pair_count: duplicates,
+        has_cycle: has_cycle,
+        build_order: order,
+    )
+}

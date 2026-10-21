@@ -1,0 +1,52 @@
+use acme:package-lock-auditor/lookup
+use acme:package-lock-auditor/model.{Lockfile, Requirement}
+
+pub fn range_accepts(lock: Lockfile, requirement: Requirement) -> Bool {
+    match lookup.find_package(lock, requirement.dependency_id) {
+        Some(package) => (
+            package.version.major == requirement.required_major
+            and package.version.minor >= requirement.minimum_minor
+            and package.version.minor < requirement.maximum_minor_exclusive
+        )
+        None => false
+    }
+}
+
+pub fn missing_reference_count(lock: Lockfile) -> USize {
+    var count: USize = 0
+    for requirement in lock.requirements {
+        match lookup.find_package(lock, requirement.requester_id) {
+            Some(_) => {}
+            None => {
+                count += 1
+            }
+        }
+        match lookup.find_package(lock, requirement.dependency_id) {
+            Some(_) => {}
+            None => {
+                count += 1
+            }
+        }
+    }
+    count
+}
+
+pub fn incompatible_range_count(lock: Lockfile) -> USize {
+    var count: USize = 0
+    for requirement in lock.requirements {
+        match lookup.find_package(lock, requirement.requester_id) {
+            Some(_) => {
+                match lookup.find_package(lock, requirement.dependency_id) {
+                    Some(_) => {
+                        if not range_accepts(lock, requirement) {
+                            count += 1
+                        }
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+    }
+    count
+}

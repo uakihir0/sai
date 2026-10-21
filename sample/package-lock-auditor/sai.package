@@ -1,0 +1,5 @@
+package acme:package-lock-auditor @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Audit a fixed dependency graph and produce a stable build order"

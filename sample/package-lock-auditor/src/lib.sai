@@ -1,0 +1,125 @@
+use acme:package-lock-auditor/audit
+use acme:package-lock-auditor/fixtures
+use acme:package-lock-auditor/model.{AuditReport}
+
+pub fn audit_clean_lock() -> AuditReport {
+    audit.audit(fixtures.clean_lock())
+}
+
+pub fn audit_missing_target_fixture() -> AuditReport {
+    audit.audit(fixtures.missing_target_lock())
+}
+
+pub fn audit_missing_both_endpoints_fixture() -> AuditReport {
+    audit.audit(fixtures.missing_both_endpoints_lock())
+}
+
+pub fn audit_incompatible_range_fixture() -> AuditReport {
+    audit.audit(fixtures.incompatible_range_lock())
+}
+
+pub fn audit_inclusive_minimum_fixture() -> AuditReport {
+    audit.audit(fixtures.inclusive_minimum_lock())
+}
+
+pub fn audit_exclusive_maximum_fixture() -> AuditReport {
+    audit.audit(fixtures.exclusive_maximum_lock())
+}
+
+pub fn audit_incompatible_major_fixture() -> AuditReport {
+    audit.audit(fixtures.incompatible_major_lock())
+}
+
+pub fn audit_cycle_fixture() -> AuditReport {
+    audit.audit(fixtures.cyclic_lock())
+}
+
+pub fn audit_missing_and_cycle_fixture() -> AuditReport {
+    audit.audit(fixtures.missing_and_cyclic_lock())
+}
+
+pub fn audit_duplicate_id_fixture() -> AuditReport {
+    audit.audit(fixtures.duplicate_id_lock())
+}
+
+test "a valid shared dependency graph has a stable dependency-first order" {
+    let report = audit_clean_lock()
+    assert report.missing_reference_count == 0
+    assert report.incompatible_range_count == 0
+    assert report.duplicate_id_pair_count == 0
+    assert report.has_cycle == Some(false)
+    assert report.build_order.length == 6
+    assert report.build_order.package_ids[0] == Some(40)
+    assert report.build_order.package_ids[1] == Some(30)
+    assert report.build_order.package_ids[2] == Some(20)
+    assert report.build_order.package_ids[3] == Some(10)
+    assert report.build_order.package_ids[4] == Some(50)
+    assert report.build_order.package_ids[5] == Some(0)
+}
+
+test "a missing target invalidates the whole build order without inventing a cycle" {
+    let report = audit_missing_target_fixture()
+    assert report.missing_reference_count == 1
+    assert report.incompatible_range_count == 0
+    assert report.has_cycle == Some(false)
+    assert report.build_order.length == 0
+}
+
+test "missing requester and dependency endpoints are both counted" {
+    let report = audit_missing_both_endpoints_fixture()
+    assert report.missing_reference_count == 2
+    assert report.incompatible_range_count == 0
+    assert report.has_cycle == Some(false)
+    assert report.build_order.length == 0
+}
+
+test "a range conflict blocks a valid graph plan" {
+    let report = audit_incompatible_range_fixture()
+    assert report.missing_reference_count == 0
+    assert report.incompatible_range_count == 1
+    assert report.has_cycle == Some(false)
+    assert report.build_order.length == 0
+}
+
+test "the minimum minor is inclusive" {
+    let report = audit_inclusive_minimum_fixture()
+    assert report.incompatible_range_count == 0
+    assert report.has_cycle == Some(false)
+    assert report.build_order.length == 6
+}
+
+test "the maximum minor is exclusive" {
+    let report = audit_exclusive_maximum_fixture()
+    assert report.incompatible_range_count == 1
+    assert report.has_cycle == Some(false)
+    assert report.build_order.length == 0
+}
+
+test "major versions must match exactly" {
+    let report = audit_incompatible_major_fixture()
+    assert report.incompatible_range_count == 1
+    assert report.has_cycle == Some(false)
+    assert report.build_order.length == 0
+}
+
+test "a cycle is distinct from missing packages and withholds partial output" {
+    let report = audit_cycle_fixture()
+    assert report.missing_reference_count == 0
+    assert report.incompatible_range_count == 0
+    assert report.has_cycle == Some(true)
+    assert report.build_order.length == 0
+}
+
+test "missing references do not mask a separate known cycle" {
+    let report = audit_missing_and_cycle_fixture()
+    assert report.missing_reference_count == 1
+    assert report.has_cycle == Some(true)
+    assert report.build_order.length == 0
+}
+
+test "duplicate package IDs invalidate ordering and make cycle status unknown" {
+    let report = audit_duplicate_id_fixture()
+    assert report.duplicate_id_pair_count == 1
+    assert report.has_cycle == None
+    assert report.build_order.length == 0
+}
