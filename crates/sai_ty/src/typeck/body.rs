@@ -737,6 +737,20 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         );
                         return Ok(LocalType::Concrete(PrimTy::Byte));
                     }
+                    if matches!(
+                        kind,
+                        PrimitiveLiteralKind::Bool
+                            | PrimitiveLiteralKind::Character
+                            | PrimitiveLiteralKind::FloatingPoint
+                    ) {
+                        self.check_annotated_literal(
+                            PrimTy::Byte,
+                            right_literal,
+                            kind,
+                            right.hir_id,
+                        );
+                        return Ok(LocalType::Concrete(PrimTy::Byte));
+                    }
                     return match primitive_bitwise_byte_literal_pair_result(operator, kind) {
                         PrimitiveArithmeticResult::Type(result) => Ok(LocalType::Concrete(result)),
                         PrimitiveArithmeticResult::TypeMismatch { .. }

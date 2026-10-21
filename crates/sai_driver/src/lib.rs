@@ -6410,8 +6410,7 @@ fn check_function_body_primitive_local_block(
                                 && is_preceding_path(right))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
                                 && (is_preceding_path(right)
-                                    || is_direct_function_integer_literal(right)
-                                    || matches!(right.kind, ExprKind::Lit(Lit::Byte(_)))))
+                                    || is_direct_function_scalar_literal(right)))
                     }
                     BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
                         (is_preceding_path(left) && is_preceding_path(right))
@@ -26094,6 +26093,91 @@ mod tests {
                 )
                 .expect("integer literal span is ordered"),
                 "the complete signed literal span should be diagnosed"
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_reports_byte_left_nonbyte_scalar_literal_mismatches() {
+        let cases = [
+            ("&", "and_bool", "true", "a Bool literal"),
+            ("&", "and_char", "'x'", "a character literal"),
+            ("&", "and_float", "1.0", "a floating-point literal"),
+            ("|", "or_bool", "false", "a Bool literal"),
+            ("|", "or_char", "'y'", "a character literal"),
+            ("|", "or_float", "2.0", "a floating-point literal"),
+            ("^", "xor_bool", "true", "a Bool literal"),
+            ("^", "xor_char", "'z'", "a character literal"),
+            ("^", "xor_float", "3.0", "a floating-point literal"),
+        ];
+        let mut root = String::from("pub fn byte_scalar_rhs() -> Byte {\n");
+        let mut literal_spans = Vec::new();
+        for (operator, local, literal, description) in cases {
+            root.push_str(&format!("    let {local} = b'a' {operator} {literal}\n"));
+            let start = root.len() - literal.len() - 1;
+            literal_spans.push((literal, description, start, start + literal.len()));
+        }
+        root.push_str("    xor_float\n}\n");
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 1);
+        let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[0]
+            .body_type_check()
+            .expect("direct Byte-left scalar RHS stays in the supported body slice")
+        else {
+            panic!("the direct Byte-left scalar RHS shape must remain supported");
+        };
+        assert_eq!(diagnostics.len(), cases.len());
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [sai_diagnostics::Code::TypeMismatch; 9]
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "expected `Byte`, found a Bool literal",
+                "expected `Byte`, found a character literal",
+                "expected `Byte`, found a floating-point literal",
+                "expected `Byte`, found a Bool literal",
+                "expected `Byte`, found a character literal",
+                "expected `Byte`, found a floating-point literal",
+                "expected `Byte`, found a Bool literal",
+                "expected `Byte`, found a character literal",
+                "expected `Byte`, found a floating-point literal",
+            ]
+        );
+
+        for (diagnostic, (_, _, start, end)) in diagnostics.iter().zip(literal_spans) {
+            assert_eq!(
+                diagnostic
+                    .primary()
+                    .expect("literal mismatch has a primary span")
+                    .span
+                    .range,
+                sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new(end as u32),
+                )
+                .expect("literal span is ordered"),
+                "each diagnostic should use the full RHS literal span"
             );
         }
     }
