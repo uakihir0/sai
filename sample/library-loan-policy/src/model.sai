@@ -1,0 +1,57 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum MemberStatus {
+    Active
+    Suspended
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CopyStatus {
+    Available
+    OnLoan
+    Repair
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Member {
+    pub id: U32
+    pub status: MemberStatus
+    pub open_loans: U32
+    pub overdue_loans: U32
+    pub loan_limit: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BookCopy {
+    pub id: U32
+    pub status: CopyStatus
+    pub held_for_member: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Loan {
+    pub member_id: U32
+    pub copy_id: U32
+    pub checked_out_day: U32
+    pub due_day: U32
+    pub renewals: U32
+    pub returned_day: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum LoanError {
+    MemberSuspended
+    MemberHasOverdueLoan
+    LoanLimitReached
+    CopyUnavailable
+    ReservedForAnotherMember(U32)
+    DateOutOfRange
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RenewalError {
+    AlreadyReturned
+    LoanOverdue
+    RenewalLimitReached
+    WaitingMember
+    DateOutOfRange
+}

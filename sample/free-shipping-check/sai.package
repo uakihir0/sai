@@ -1,0 +1,5 @@
+package acme:free-shipping-check @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "A typed free-shipping threshold check"
