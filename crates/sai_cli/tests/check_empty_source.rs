@@ -6517,20 +6517,12 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let result = 1.0 & b'a'",
         ),
         fixture(
-            "pub fn byte_float_literal_rhs() -> Byte",
-            "let result = b'a' | 1.0",
-        ),
-        fixture(
-            "pub fn byte_bool_literal_rhs() -> Byte",
-            "let result = b'a' & true",
-        ),
-        fixture(
-            "pub fn byte_char_literal_rhs() -> Byte",
-            "let result = b'a' ^ 'b'",
-        ),
-        fixture(
             "pub fn byte_string_left(right: Byte) -> Byte",
             "let result = b\"text\" & right",
+        ),
+        fixture(
+            "pub fn byte_string_rhs() -> Byte",
+            "let result = b'a' & b\"text\"",
         ),
         format!(
             "type ByteAlias = Byte\n{}",
@@ -6606,11 +6598,25 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn generic_integer_rhs<T>(unused: I32) -> Byte",
             "let result = b'a' & 1",
         ),
+        fixture(
+            "pub fn generic_scalar_rhs<T>(unused: I32) -> Byte",
+            "let result = b'a' & true",
+        ),
         concat!(
             "type BitOwner { marker: Byte }\n",
             "impl BitOwner {\n",
             "    fn method(self: borrow Self) -> Byte {\n",
             "        let result = b'a' & b'b'\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        )
+        .to_owned(),
+        concat!(
+            "type ScalarBitOwner { marker: Byte }\n",
+            "impl ScalarBitOwner {\n",
+            "    fn scalar_method(self: borrow Self) -> Byte {\n",
+            "        let result = b'a' & true\n",
             "        result\n",
             "    }\n",
             "}\n",
@@ -7310,6 +7316,105 @@ fn primitive_bitwise_byte_literal_left_integer_rhs_recovers_to_different_annotat
         "expected `Byte`, found an integer literal",
         literal_start,
         literal_start + "1".len(),
+    );
+}
+
+#[test]
+fn primitive_bitwise_byte_literal_left_scalar_rhs_mismatches_recover_to_byte() {
+    let cases = [
+        ("&", "and", "true", "a Bool literal"),
+        ("&", "and", "'x'", "a character literal"),
+        ("&", "and", "1.0", "a floating-point literal"),
+        ("|", "or", "false", "a Bool literal"),
+        ("|", "or", "'y'", "a character literal"),
+        ("|", "or", "2.0", "a floating-point literal"),
+        ("^", "xor", "true", "a Bool literal"),
+        ("^", "xor", "'z'", "a character literal"),
+        ("^", "xor", "3.0", "a floating-point literal"),
+    ];
+    let mut source = String::from("pub fn byte_scalar_rhs() -> Byte {\n");
+    let mut literal_spans = Vec::new();
+    for (operator, name, literal, description) in cases {
+        let local = match description {
+            "a Bool literal" => format!("{name}_bool"),
+            "a character literal" => format!("{name}_char"),
+            "a floating-point literal" => format!("{name}_float"),
+            _ => unreachable!("all cases use a scalar literal"),
+        };
+        source.push_str(&format!("    let {local} = b'a' {operator} {literal}\n"));
+        let start = source.len() - literal.len() - 1;
+        literal_spans.push((description, start, start + literal.len()));
+    }
+    source.push_str("    xor_float\n}\n");
+
+    let output = run_check(&source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        cases.len(),
+        "each non-Byte scalar literal should mismatch Byte:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            && !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "all operands should recover as Byte and reach the function tail:\n{stdout}"
+    );
+    for (description, start, end) in literal_spans {
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            &format!("expected `Byte`, found {description}"),
+            start,
+            end,
+        );
+    }
+}
+
+#[test]
+fn primitive_bitwise_byte_literal_left_scalar_rhs_recovers_to_different_annotation() {
+    let source = concat!(
+        "pub fn annotation_recovery() -> U8 {\n",
+        "    let value: U8 = b'a' ^ 'x'\n",
+        "    let recovered: U8 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression = "b'a' ^ 'x'";
+    let expression_start = source
+        .find(expression)
+        .expect("annotated Byte-left scalar expression exists");
+    let literal_start = expression_start + "b'a' ^ ".len();
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the RHS mismatch and annotation mismatch should both be reported:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the expression should recover to U8 and reach later checks:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Byte`, found a character literal",
+        literal_start,
+        literal_start + "'x'".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Byte`",
+        expression_start,
+        expression_start + expression.len(),
     );
 }
 
