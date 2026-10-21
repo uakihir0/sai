@@ -27598,6 +27598,42 @@ mod tests {
             "    let recovered: Char = xor_value\n",
             "    recovered\n",
             "}\n",
+            "pub fn char_computed_bitwise_alias_chain_defaults() -> Char {\n",
+            "    let computed = 1 & 2\n",
+            "    let alias1 = computed\n",
+            "    let alias2 = alias1\n",
+            "    let alias3 = alias2\n",
+            "    let and_value = 'o' & alias3\n",
+            "    let or_value = 'p' | alias3\n",
+            "    let xor_value = 'q' ^ alias3\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_computed_bitwise_alias_chain_late_constraint() -> Char {\n",
+            "    let computed = 3 | 4\n",
+            "    let alias1 = computed\n",
+            "    let alias2 = alias1\n",
+            "    let alias3 = alias2\n",
+            "    let and_value = 'r' & alias3\n",
+            "    let or_value = 's' | alias3\n",
+            "    let xor_value = 't' ^ alias3\n",
+            "    let narrowed: I32 = alias3\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_computed_bitwise_alias_chain_i8_range() -> Char {\n",
+            "    let computed = 128 ^ 256\n",
+            "    let alias1 = computed\n",
+            "    let alias2 = alias1\n",
+            "    let alias3 = alias2\n",
+            "    let narrowed: I8 = alias3\n",
+            "    let and_value = 'u' & alias3\n",
+            "    let or_value = 'v' | alias3\n",
+            "    let xor_value = 'w' ^ alias3\n",
+            "    let mismatch: I32 = 'x' & alias3\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -27613,7 +27649,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         let owners = resolved.owners();
-        assert_eq!(owners.len(), 11);
+        assert_eq!(owners.len(), 14);
 
         let expected_diagnostics = [
             (
@@ -27776,6 +27812,64 @@ mod tests {
                         "operator `^` has no `BitXor<F32>` implementation for `Char`",
                         "'n' ^ alias3",
                     ),
+                ],
+            ),
+            (
+                11,
+                vec![
+                    (
+                        "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+                        "'o' & alias3",
+                    ),
+                    (
+                        "operator `|` has no `BitOr<I64>` implementation for `Char`",
+                        "'p' | alias3",
+                    ),
+                    (
+                        "operator `^` has no `BitXor<I64>` implementation for `Char`",
+                        "'q' ^ alias3",
+                    ),
+                ],
+            ),
+            (
+                12,
+                vec![
+                    (
+                        "operator `&` has no `BitAnd<I32>` implementation for `Char`",
+                        "'r' & alias3",
+                    ),
+                    (
+                        "operator `|` has no `BitOr<I32>` implementation for `Char`",
+                        "'s' | alias3",
+                    ),
+                    (
+                        "operator `^` has no `BitXor<I32>` implementation for `Char`",
+                        "'t' ^ alias3",
+                    ),
+                ],
+            ),
+            (
+                13,
+                vec![
+                    ("integer literal is out of range for `I8`", "128"),
+                    ("integer literal is out of range for `I8`", "256"),
+                    (
+                        "operator `&` has no `BitAnd<I8>` implementation for `Char`",
+                        "'u' & alias3",
+                    ),
+                    (
+                        "operator `|` has no `BitOr<I8>` implementation for `Char`",
+                        "'v' | alias3",
+                    ),
+                    (
+                        "operator `^` has no `BitXor<I8>` implementation for `Char`",
+                        "'w' ^ alias3",
+                    ),
+                    (
+                        "operator `&` has no `BitAnd<I8>` implementation for `Char`",
+                        "'x' & alias3",
+                    ),
+                    ("expected `I32`, found `Char`", "'x' & alias3"),
                 ],
             ),
         ];
@@ -29911,7 +30005,6 @@ mod tests {
             "pub fn char_literal_unresolved_path_rhs() -> Char {\n    let value = 'a' & missing\n    value\n}\n",
             "pub fn char_literal_computed_float_local_rhs() -> Char {\n    let right = 1.0 + 2.0\n    let value = 'a' & right\n    value\n}\n",
             "pub fn char_literal_computed_integer_path_rhs() -> Char {\n    let right = 1 + 2\n    let value = 'a' & right\n    value\n}\n",
-            "pub fn char_literal_integer_variable_additional_site_alias_chain_rhs() -> Char {\n    let computed = 1 & 2\n    let alias1 = computed\n    let alias2 = alias1\n    let alias3 = alias2\n    let narrowed: I32 = alias3\n    let value = 'a' & alias3\n    value\n}\n",
             "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char {\n    let right = 1\n    let alias1 = right\n    let alias2 = alias1\n    let alias3 = alias2\n    let value = 'a' & alias3\n    value\n}\n",
             "pub fn generic_char_literal_untyped_float_path_rhs<T>() -> Char {\n    let right = 1.0\n    let alias1 = right\n    let alias2 = alias1\n    let alias3 = alias2\n    let value = 'a' & alias3\n    value\n}\n",
             "pub fn char_literal_self_reference_path_rhs() -> Char {\n    let value = 'a' & value\n    value\n}\n",
@@ -30088,7 +30181,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 85);
+        assert_eq!(resolved.owners().len(), 84);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()

@@ -1,0 +1,111 @@
+use acme:rail-shuttle-dispatch/model.{Corridor, ServiceRequest, Vehicle}
+
+pub fn disruption_name() -> Str {
+    "Riverfront line suspension"
+}
+
+pub fn snapshot_time() -> Str {
+    "18:00"
+}
+
+pub fn vehicles() -> Array<Vehicle, 5> {
+    [
+        Vehicle(
+            id: 101,
+            name: "East 101",
+            corridor: Corridor.EastLink,
+            seat_capacity: 20,
+            wheelchair_bays: 2,
+        ),
+        Vehicle(
+            id: 102,
+            name: "East 102",
+            corridor: Corridor.EastLink,
+            seat_capacity: 16,
+            wheelchair_bays: 0,
+        ),
+        Vehicle(
+            id: 201,
+            name: "North 201",
+            corridor: Corridor.NorthLoop,
+            seat_capacity: 14,
+            wheelchair_bays: 1,
+        ),
+        Vehicle(
+            id: 202,
+            name: "North 202",
+            corridor: Corridor.NorthLoop,
+            seat_capacity: 22,
+            wheelchair_bays: 0,
+        ),
+        Vehicle(
+            id: 301,
+            name: "West 301",
+            corridor: Corridor.WestBranch,
+            seat_capacity: 24,
+            wheelchair_bays: 0,
+        ),
+    ]
+}
+
+// Priorities are ordered numerically: 0 is most urgent. Request IDs break ties.
+pub fn requests() -> Array<ServiceRequest, 7> {
+    [
+        ServiceRequest(
+            id: 10,
+            stop: "Civic Hall",
+            corridor: Corridor.EastLink,
+            priority: 0,
+            passengers: 8,
+            wheelchair_bays_needed: 3,
+        ),
+        ServiceRequest(
+            id: 20,
+            stop: "Harbor Hospital",
+            corridor: Corridor.EastLink,
+            priority: 1,
+            passengers: 18,
+            wheelchair_bays_needed: 2,
+        ),
+        ServiceRequest(
+            id: 21,
+            stop: "Ferry Terminal",
+            corridor: Corridor.EastLink,
+            priority: 1,
+            passengers: 14,
+            wheelchair_bays_needed: 0,
+        ),
+        ServiceRequest(
+            id: 30,
+            stop: "Senior Center",
+            corridor: Corridor.NorthLoop,
+            priority: 2,
+            passengers: 12,
+            wheelchair_bays_needed: 1,
+        ),
+        ServiceRequest(
+            id: 31,
+            stop: "Airport",
+            corridor: Corridor.WestBranch,
+            priority: 2,
+            passengers: 24,
+            wheelchair_bays_needed: 0,
+        ),
+        ServiceRequest(
+            id: 40,
+            stop: "University",
+            corridor: Corridor.NorthLoop,
+            priority: 3,
+            passengers: 22,
+            wheelchair_bays_needed: 0,
+        ),
+        ServiceRequest(
+            id: 50,
+            stop: "Lakeside Homes",
+            corridor: Corridor.EastLink,
+            priority: 4,
+            passengers: 12,
+            wheelchair_bays_needed: 0,
+        ),
+    ]
+}

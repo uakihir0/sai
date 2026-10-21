@@ -1,0 +1,82 @@
+use acme:rail-shuttle-dispatch/data
+use acme:rail-shuttle-dispatch/model.{Assignment, Corridor, ServiceRequest, Vehicle}
+use acme:rail-shuttle-dispatch/planner
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn corridor_name(corridor: Corridor) -> Str {
+    match corridor {
+        Corridor.EastLink => "EastLink"
+        Corridor.NorthLoop => "NorthLoop"
+        Corridor.WestBranch => "WestBranch"
+    }
+}
+
+fn print_assignment(out: borrow mut Stdout, assignment: Assignment)
+    effects { stdio.write, alloc }
+{
+    let request = assignment.request
+    match assignment.vehicle {
+        Some(vehicle) => {
+            out.write_str(
+                f"REQ-{request.id} {request.stop} ({corridor_name(request.corridor)}, priority {request.priority}): {vehicle.name} — {request.passengers}/{vehicle.seat_capacity} seats, {request.wheelchair_bays_needed}/{vehicle.wheelchair_bays} wheelchair bays\n".as_str(),
+            )
+        }
+        None => {
+            out.write_str(
+                f"REQ-{request.id} {request.stop} ({corridor_name(request.corridor)}, priority {request.priority}): unserved — {planner.unserved_reason(request)}\n".as_str(),
+            )
+        }
+    }
+}
+
+pub fn print_plan(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str(
+        f"Transit disruption plan: {data.disruption_name()} — {data.snapshot_time()} snapshot\n".as_str(),
+    )
+    out.write_str("Allocation order: priority 0–4, then request ID; best-fitting vehicle first\n\n")
+    out.write_str("Service assignments\n")
+    for request in data.requests() {
+        print_assignment(borrow mut out, planner.assignment(request))
+    }
+    out.write_str(
+        f"\nAssigned {planner.assigned_count()} of {data.requests().len()} requests; {planner.unserved_count()} shortfalls\n".as_str(),
+    )
+    out.write_str(
+        f"Passengers served: {planner.passengers_assigned()}; unserved demand: {planner.passengers_unserved()}\n".as_str(),
+    )
+}
+
+pub fn print_shortfalls(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    var count: U32 = 0
+    out.write_str("Unserved requests and constraint conflicts\n")
+    for request in data.requests() {
+        match planner.assignment(request).vehicle {
+            Some(_) => {}
+            None => {
+                count += 1
+                out.write_str(
+                    f"REQ-{request.id} {request.stop}: {planner.unserved_reason(request)}\n".as_str(),
+                )
+            }
+        }
+    }
+    if count == 0 {
+        out.write_str("No unserved requests.\n")
+    }
+}
+
+pub fn print_fleet(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Replacement fleet\n")
+    for vehicle in data.vehicles() {
+        out.write_str(
+            f"Bus {vehicle.id} {vehicle.name}: {corridor_name(vehicle.corridor)}, {vehicle.seat_capacity} seats, {vehicle.wheelchair_bays} wheelchair bays\n".as_str(),
+        )
+    }
+}
