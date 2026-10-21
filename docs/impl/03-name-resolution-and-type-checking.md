@@ -2311,6 +2311,8 @@ The **IR-765 flat-local addition slice** is narrower than general operator check
 
 **IR-781 direct `Byte` literal for flat-local bitwise NOT.** Extend the local-initializer `~` form to one direct byte literal. Without an annotation the result is `Byte`; an explicit `Byte` annotation is accepted. A differing supported primitive annotation reports `TYPE_MISMATCH` on the full unary initializer, with the expression result recovering to the annotation for following locals and tail checking. Keep float, `Bool`, and `Char` literals, byte strings, aliases, unresolved numeric locals used as paths, self/forward references, nested/computed operands, and unsupported owners gated. No bitwise lowering or runtime execution is added (spec/06 §§6.3.3, 6.8.5–6.8.6; spec/16 §16.6.1).
 
+**IR-782 direct `Byte` right literal for flat-local bitwise operators.** Extend one eligible path-left `&`, `|`, or `^` initializer to a direct byte literal on the right. Matching `Byte` paths and literals succeed. An integer, `Bool`, `F32`, or `F64` left path reports a right-literal `TYPE_MISMATCH` and recovers to the left type; `Bool` and float left paths also report `OPERATOR_NOT_SUPPORTED` on the full expression. A `Char` left path reports only the full-expression `OPERATOR_NOT_SUPPORTED` naming the missing `BitAnd<Byte>`, `BitOr<Byte>`, or `BitXor<Byte>` implementation. Keep direct Byte literals on the left, literal/literal, other literal kinds, byte strings, unresolved numeric paths, aliases, self/forward references, nested/computed operands, shifts, and unsupported owners gated. No bitwise lowering or runtime execution is added (spec/06 §§6.3.3, 6.8.2, 6.8.5; spec/16 §16.6.1).
+
 ### 3.10.2 Coercions and adjustments
 
 ```rust
