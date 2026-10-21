@@ -544,6 +544,8 @@ Locked dependency-source regressions verify dependency syntax and Phase 1 diagno
 
 **IR-781 direct `Byte` literal for flat-local bitwise NOT.** A local initializer may apply `~` to one direct byte literal. Without an annotation the result is `Byte`; an explicit `Byte` annotation is accepted. A differing supported primitive annotation reports `TYPE_MISMATCH` on the full unary initializer and recovers the local to that annotation for later locals and tail checking. Keep float, `Bool`, and `Char` literals, byte strings, unresolved numeric locals, aliases, self/forward references, nested/computed operands, shifts, and unsupported owners gated. No bitwise lowering or runtime execution is implemented.
 
+**IR-782 direct `Byte` right literal for flat-local bitwise operators.** A local initializer may apply one of `&`, `|`, or `^` to an eligible path on the left and a direct byte literal on the right. A `Byte` left path accepts the literal. Integer, `Bool`, `F32`, and `F64` left paths report a mismatch on the byte literal and recover to the left type; `Bool` and floats also report `OPERATOR_NOT_SUPPORTED` on the full expression. A `Char` left path reports only the full-expression trait diagnostic naming the missing operator implementation for `Byte`. Keep Byte literals on the left, literal/literal, other literal kinds, byte strings, unresolved numeric paths, aliases, self/forward references, nested/computed operands, shifts, and unsupported owners gated. No bitwise lowering or runtime execution is implemented.
+
 ### 13.6.3 `sai build`
 
 ```text
