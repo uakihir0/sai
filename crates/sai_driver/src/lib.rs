@@ -6374,7 +6374,9 @@ fn check_function_body_primitive_local_block(
                 let supported_shape = match operator {
                     BinOp::And | BinOp::Or => is_preceding_path(left) && is_preceding_path(right),
                     BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
-                        is_preceding_path(left) && is_preceding_path(right)
+                        (is_preceding_path(left) && is_preceding_path(right))
+                            || (is_preceding_path(left)
+                                && is_direct_function_integer_literal(right))
                     }
                     BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
                         (is_preceding_path(left) && is_preceding_path(right))
@@ -25684,6 +25686,49 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_accepts_flat_local_bitwise_right_integer_literals() {
+        let integer_types = [
+            "I8", "I16", "I32", "I64", "U8", "U16", "U32", "U64", "ISize", "USize",
+        ];
+        let operators = [("&", "and"), ("|", "or"), ("^", "xor")];
+        let mut root = String::new();
+        for ty in integer_types {
+            for (operator, name) in operators {
+                root.push_str(&format!(
+                    "pub fn {name}_{}(left: {ty}) -> {ty} {{\n    let value = left {operator} 1\n    value\n}}\n",
+                    ty.to_ascii_lowercase()
+                ));
+            }
+        }
+
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 30);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("supported primitive body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the supported body slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_reports_flat_local_bitwise_operand_errors() {
         let root = concat!(
             "pub fn integer_mismatch(left: I32, right: U8) -> I32 {\n    let value = left & right\n    value\n}\n",
@@ -25848,7 +25893,10 @@ mod tests {
     fn function_body_type_check_keeps_unsupported_bitwise_forms_gated() {
         let root = concat!(
             "type Word = I32\n",
-            "pub fn literal(left: I32) -> I32 {\n    let value = left & 1\n    value\n}\n",
+            "pub fn left_literal(left: I32) -> I32 {\n    let value = 1 & left\n    value\n}\n",
+            "pub fn literal_pair() -> I32 {\n    let value = 1 ^ 2\n    value\n}\n",
+            "pub fn non_integer_literal(left: I32) -> I32 {\n    let value = left & 1.0\n    value\n}\n",
+            "pub fn char_integer_literal(left: Char) -> Char {\n    let value = left & 1\n    value\n}\n",
             "pub fn nested(left: I32, right: I32, extra: I32) -> I32 {\n    let value = left & (right ^ extra)\n    value\n}\n",
             "pub fn computed(left: I32, right: I32) -> I32 {\n    let value = (left + right) & right\n    value\n}\n",
             "pub fn unresolved(left: I32) -> I32 {\n    let bits = 1\n    let value = bits & left\n    value\n}\n",
@@ -25872,7 +25920,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 9);
+        assert_eq!(resolved.owners().len(), 12);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()
