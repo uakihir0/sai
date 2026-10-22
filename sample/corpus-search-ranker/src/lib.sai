@@ -1,0 +1,6 @@
+use acme:corpus-search-ranker/model.{SearchError, SearchResults}
+use acme:corpus-search-ranker/search
+
+pub fn sample_query() -> Result<SearchResults, SearchError> {
+    search.search("river water")
+}

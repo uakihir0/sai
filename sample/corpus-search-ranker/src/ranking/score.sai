@@ -1,0 +1,40 @@
+use acme:corpus-search-ranker/model.{Document, SearchHit}
+
+fn count_matches(text: Str, query_term: Str) -> U32 {
+    var count: U32 = 0
+    for token in text.split_whitespace() {
+        if token.eq_ignore_ascii_case(query_term) {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn score_document(document: Document, query: Str) -> SearchHit {
+    var hit = SearchHit(document_id: document.id, score: 0, title_matches: 0, body_matches: 0)
+
+    for query_term in query.split_whitespace() {
+        let title_matches = count_matches(document.title, query_term)
+        let body_matches = count_matches(document.body, query_term)
+        hit.title_matches += title_matches
+        hit.body_matches += body_matches
+        hit.score += title_matches * 3 + body_matches
+    }
+
+    hit
+}
+
+test "title matches are weighted above body matches" {
+    let title_match = Document(id: 1, title: "river guide", body: "")
+    let body_match = Document(id: 2, title: "guide", body: "river")
+    assert score_document(title_match, "RIVER").score == 3
+    assert score_document(body_match, "RIVER").score == 1
+}
+
+test "repeated query terms contribute repeatedly" {
+    let document = Document(id: 1, title: "river", body: "river")
+    let hit = score_document(document, "river river")
+    assert hit.score == 8
+    assert hit.title_matches == 2
+    assert hit.body_matches == 2
+}

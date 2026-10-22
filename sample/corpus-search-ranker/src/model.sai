@@ -1,0 +1,27 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Document {
+    pub id: U32
+    pub title: Str
+    pub body: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SearchHit {
+    pub document_id: U32
+    pub score: U32
+    pub title_matches: U32
+    pub body_matches: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SearchResults {
+    pub entries: Array<Option<SearchHit>, 5>
+    pub len: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum SearchError {
+    EmptyQuery
+    QueryTooLong
+    TooManyTerms
+}

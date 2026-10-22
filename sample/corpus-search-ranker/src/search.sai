@@ -1,0 +1,133 @@
+use acme:corpus-search-ranker/data
+use acme:corpus-search-ranker/model.{SearchError, SearchHit, SearchResults}
+use acme:corpus-search-ranker/ranking/order
+use acme:corpus-search-ranker/ranking/score
+
+fn query_term_count(query: Str) -> USize {
+    var count: USize = 0
+    for _ in query.split_whitespace() {
+        count += 1
+        if count > data.MAX_QUERY_TERMS {
+            return count
+        }
+    }
+    count
+}
+
+fn insert_ranked(
+    entries: borrow mut Array<Option<SearchHit>, 5>,
+    len: borrow mut USize,
+    hit: SearchHit,
+) {
+    var position = *len
+    while position > 0 {
+        match entries[position - 1] {
+            Some(current) => {
+                if order.precedes(hit, current) {
+                    position -= 1
+                } else {
+                    break
+                }
+            }
+            None => break
+        }
+    }
+
+    var cursor = *len
+    while cursor > position {
+        entries[cursor] = entries[cursor - 1]
+        cursor -= 1
+    }
+    entries[position] = Some(hit)
+    *len += 1
+}
+
+pub fn search(query: Str) -> Result<SearchResults, SearchError> {
+    if query.len() > data.MAX_QUERY_BYTES {
+        return Err(SearchError.QueryTooLong)
+    }
+
+    let term_count = query_term_count(query)
+    if term_count == 0 {
+        return Err(SearchError.EmptyQuery)
+    }
+    if term_count > data.MAX_QUERY_TERMS {
+        return Err(SearchError.TooManyTerms)
+    }
+
+    var entries = Array<Option<SearchHit>, 5>.filled(None)
+    var len: USize = 0
+    for document in data.documents() {
+        let hit = score.score_document(document, query)
+        if hit.score > 0 {
+            insert_ranked(borrow mut entries, borrow mut len, hit)
+        }
+    }
+
+    Ok(SearchResults(entries: entries, len: len))
+}
+
+test "river and water results are scored and sorted deterministically" {
+    let results = search("river water").unwrap()
+    assert results.len == 4
+    assert results.entries[0].unwrap().document_id == 101
+    assert results.entries[0].unwrap().score == 5
+    assert results.entries[0].unwrap().title_matches == 1
+    assert results.entries[0].unwrap().body_matches == 2
+    assert results.entries[1].unwrap().document_id == 202
+    assert results.entries[1].unwrap().score == 5
+    assert results.entries[2].unwrap().document_id == 303
+    assert results.entries[2].unwrap().score == 1
+    assert results.entries[3].unwrap().document_id == 505
+    assert results.entries[3].unwrap().score == 1
+}
+
+test "query terms match without ASCII case sensitivity" {
+    let results = search("RIVER").unwrap()
+    assert results.len == 3
+    assert results.entries[0].unwrap().document_id == 101
+    assert results.entries[0].unwrap().score == 4
+    assert results.entries[1].unwrap().document_id == 202
+    assert results.entries[2].unwrap().document_id == 303
+}
+
+test "documents with no matching terms are omitted" {
+    let results = search("volcano").unwrap()
+    assert results.len == 0
+}
+
+test "eight query terms are accepted and punctuation remains part of a token" {
+    let bounded = search("river river river river river river river river").unwrap()
+    assert bounded.entries[0].unwrap().score == 32
+    assert search("river,").unwrap().len == 0
+}
+
+test "empty and overlong queries are rejected before ranking" {
+    assert search(" \t\n").unwrap_err() == SearchError.EmptyQuery
+    assert (
+        search("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890xxxxx").unwrap_err()
+        == SearchError.QueryTooLong
+    )
+    assert (
+        search("one two three four five six seven eight nine").unwrap_err()
+        == SearchError.TooManyTerms
+    )
+}
+
+test "insertion order does not change equal-score ranking" {
+    var entries = Array<Option<SearchHit>, 5>.filled(None)
+    var len: USize = 0
+    insert_ranked(
+        borrow mut entries,
+        borrow mut len,
+        SearchHit(document_id: 202, score: 5, title_matches: 1, body_matches: 2),
+    )
+    insert_ranked(
+        borrow mut entries,
+        borrow mut len,
+        SearchHit(document_id: 101, score: 5, title_matches: 1, body_matches: 2),
+    )
+    assert len == 2
+    assert entries[0].unwrap().document_id == 101
+    assert entries[1].unwrap().document_id == 202
+}
