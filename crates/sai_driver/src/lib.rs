@@ -6386,48 +6386,61 @@ fn check_inherent_method_body_type(
         let StmtKind::Let { init, .. } = stmt.kind else {
             continue;
         };
-        if matches!(init.kind, ExprKind::Field { .. }) {
-            let Some(field_lookup) = primitive_self_field_type(init, &field_types.fields, symbols)
-            else {
-                return Ok(FunctionBodyTypeCheck::Unsupported);
-            };
-            match field_lookup {
-                Ok(field_type) => {
-                    self_field_projections.insert(init.hir_id, field_type);
-                }
-                Err(name) => {
-                    unknown_self_fields.insert(init.hir_id);
-                    diagnostics.push(unknown_self_field_diagnostic(
-                        method_owner.id,
-                        &field_types,
-                        name,
-                        inputs,
-                        snapshot,
-                    )?);
+        match init.kind {
+            ExprKind::Field { .. } => {
+                if !collect_inherent_method_self_field(
+                    method_owner.id,
+                    init,
+                    true,
+                    &field_types,
+                    &mut self_field_projections,
+                    &mut unknown_self_fields,
+                    &mut diagnostics,
+                    symbols,
+                    inputs,
+                    snapshot,
+                )? {
+                    return Ok(FunctionBodyTypeCheck::Unsupported);
                 }
             }
+            ExprKind::Binary(_, left, right) => {
+                for operand in [left, right] {
+                    if matches!(operand.kind, ExprKind::Field { .. })
+                        && !collect_inherent_method_self_field(
+                            method_owner.id,
+                            operand,
+                            false,
+                            &field_types,
+                            &mut self_field_projections,
+                            &mut unknown_self_fields,
+                            &mut diagnostics,
+                            symbols,
+                            inputs,
+                            snapshot,
+                        )?
+                    {
+                        return Ok(FunctionBodyTypeCheck::Unsupported);
+                    }
+                }
+            }
+            _ => {}
         }
     }
     if let Some(tail) = method_block.tail {
         if matches!(tail.kind, ExprKind::Field { .. }) {
-            let Some(field_lookup) = primitive_self_field_type(tail, &field_types.fields, symbols)
-            else {
+            if !collect_inherent_method_self_field(
+                method_owner.id,
+                tail,
+                true,
+                &field_types,
+                &mut self_field_projections,
+                &mut unknown_self_fields,
+                &mut diagnostics,
+                symbols,
+                inputs,
+                snapshot,
+            )? {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
-            };
-            match field_lookup {
-                Ok(field_type) => {
-                    self_field_projections.insert(tail.hir_id, field_type);
-                }
-                Err(name) => {
-                    unknown_self_fields.insert(tail.hir_id);
-                    diagnostics.push(unknown_self_field_diagnostic(
-                        method_owner.id,
-                        &field_types,
-                        name,
-                        inputs,
-                        snapshot,
-                    )?);
-                }
             }
         }
     }
@@ -6465,6 +6478,36 @@ struct InherentMethodPrimitiveFields {
     type_name_span: sai_diagnostics::Span,
     fields: HashMap<String, sai_resolve::prelude::PrimTy>,
     candidate_names: Vec<String>,
+}
+
+fn collect_inherent_method_self_field(
+    owner: OwnerId,
+    expression: &HirExpr<'_>,
+    collect_known_type: bool,
+    fields: &InherentMethodPrimitiveFields,
+    self_field_projections: &mut HashMap<HirId, sai_resolve::prelude::PrimTy>,
+    unknown_self_fields: &mut HashSet<HirId>,
+    diagnostics: &mut Vec<Diagnostic>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<bool, OwnerControlFlowResolutionError> {
+    let Some(field_lookup) = primitive_self_field_type(expression, &fields.fields, symbols) else {
+        return Ok(false);
+    };
+    match field_lookup {
+        Ok(field_type) if collect_known_type => {
+            self_field_projections.insert(expression.hir_id, field_type);
+        }
+        Ok(_) => {}
+        Err(name) => {
+            unknown_self_fields.insert(expression.hir_id);
+            diagnostics.push(unknown_self_field_diagnostic(
+                owner, fields, name, inputs, snapshot,
+            )?);
+        }
+    }
+    Ok(true)
 }
 
 fn inherent_method_primitive_field_types(
@@ -7001,31 +7044,43 @@ fn check_function_body_primitive_local_block(
                     resolved_plain_local_path_binding(path, locals, inputs)
                         .is_some_and(|binding| preceding_bindings.contains(&binding))
                 };
+                let is_unknown_self_field = |operand: &HirExpr<'_>| {
+                    matches!(operand.kind, ExprKind::Field { .. })
+                        && unknown_self_fields
+                            .is_some_and(|fields| fields.contains(&operand.hir_id))
+                };
+                let is_preceding_path_or_unknown_field = |operand: &HirExpr<'_>| {
+                    is_preceding_path(operand) || is_unknown_self_field(operand)
+                };
                 let supported_shape = match operator {
-                    BinOp::And | BinOp::Or => is_preceding_path(left) && is_preceding_path(right),
+                    BinOp::And | BinOp::Or => {
+                        is_preceding_path_or_unknown_field(left)
+                            && is_preceding_path_or_unknown_field(right)
+                    }
                     BinOp::Shl | BinOp::Shr => {
-                        (is_preceding_path(left)
-                            && (is_preceding_path(right)
+                        (is_preceding_path_or_unknown_field(left)
+                            && (is_preceding_path_or_unknown_field(right)
                                 || is_direct_function_integer_literal(right)))
                             || (is_direct_function_integer_literal(left)
-                                && is_preceding_path(right))
+                                && is_preceding_path_or_unknown_field(right))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
-                                && (is_preceding_path(right)
+                                && (is_preceding_path_or_unknown_field(right)
                                     || is_direct_function_integer_literal(right)))
                     }
                     BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
-                        (is_preceding_path(left) && is_preceding_path(right))
-                            || (is_preceding_path(left)
+                        (is_preceding_path_or_unknown_field(left)
+                            && is_preceding_path_or_unknown_field(right))
+                            || (is_preceding_path_or_unknown_field(left)
                                 && is_direct_function_integer_literal(right))
-                            || (is_preceding_path(left)
+                            || (is_preceding_path_or_unknown_field(left)
                                 && matches!(right.kind, ExprKind::Lit(Lit::Byte(_))))
-                            || (is_preceding_path(left)
+                            || (is_preceding_path_or_unknown_field(left)
                                 && matches!(
                                     right.kind,
                                     ExprKind::Lit(Lit::Bool(_) | Lit::Char(_) | Lit::Float { .. })
                                 ))
                             || (is_direct_function_integer_literal(left)
-                                && is_preceding_path(right))
+                                && is_preceding_path_or_unknown_field(right))
                             || (is_direct_function_integer_literal(left)
                                 && is_direct_function_integer_literal(right))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Bool(_)))
@@ -7043,26 +7098,28 @@ fn check_function_body_primitive_local_block(
                             || (matches!(left.kind, ExprKind::Lit(Lit::Char(_)))
                                 && is_direct_function_integer_literal(right))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Char(_)))
-                                && is_preceding_path(right))
+                                && is_preceding_path_or_unknown_field(right))
                             || (matches!(left.kind, ExprKind::Lit(Lit::Byte(_)))
-                                && (is_preceding_path(right)
+                                && (is_preceding_path_or_unknown_field(right)
                                     || is_direct_function_scalar_literal(right)))
                     }
                     BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
-                        (is_preceding_path(left) && is_preceding_path(right))
-                            || (is_preceding_path(left)
+                        (is_preceding_path_or_unknown_field(left)
+                            && is_preceding_path_or_unknown_field(right))
+                            || (is_preceding_path_or_unknown_field(left)
                                 && is_direct_function_integer_literal(right))
                             || (is_direct_function_integer_literal(left)
-                                && is_preceding_path(right))
+                                && is_preceding_path_or_unknown_field(right))
                             || (is_direct_function_integer_literal(left)
                                 && is_direct_function_integer_literal(right))
                     }
                     BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
-                        (is_preceding_path(left) && is_preceding_path(right))
-                            || (is_preceding_path(left)
+                        (is_preceding_path_or_unknown_field(left)
+                            && is_preceding_path_or_unknown_field(right))
+                            || (is_preceding_path_or_unknown_field(left)
                                 && is_direct_function_numeric_literal(right))
                             || (is_direct_function_numeric_literal(left)
-                                && is_preceding_path(right))
+                                && is_preceding_path_or_unknown_field(right))
                             || (matches!(
                                 operator,
                                 BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
@@ -7070,9 +7127,12 @@ fn check_function_body_primitive_local_block(
                                 && is_direct_function_integer_literal(right))
                     }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                        (is_preceding_path(left) && is_preceding_path(right))
-                            || (is_preceding_path(left) && is_direct_function_scalar_literal(right))
-                            || (is_direct_function_scalar_literal(left) && is_preceding_path(right))
+                        (is_preceding_path_or_unknown_field(left)
+                            && is_preceding_path_or_unknown_field(right))
+                            || (is_preceding_path_or_unknown_field(left)
+                                && is_direct_function_scalar_literal(right))
+                            || (is_direct_function_scalar_literal(left)
+                                && is_preceding_path_or_unknown_field(right))
                     }
                 };
                 if !supported_shape {
