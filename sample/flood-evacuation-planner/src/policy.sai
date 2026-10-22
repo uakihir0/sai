@@ -1,0 +1,9 @@
+use acme:flood-evacuation-planner/model.{Route}
+
+pub fn hazard_limit_points() -> U32 {
+    10
+}
+
+pub fn route_is_usable(route: Route) -> Bool {
+    route.open and route.hazard_points <= hazard_limit_points()
+}

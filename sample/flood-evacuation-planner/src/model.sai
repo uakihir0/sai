@@ -1,0 +1,77 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Priority {
+    Critical
+    High
+    Standard
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PlacementStatus {
+    Assigned
+    AllRoutesClosed
+    HazardLimit
+    ArrivalDeadline
+    GroupCapacity
+    AccessibleCapacity
+    MedicalSupportCapacity
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Household {
+    pub id: U32
+    pub name: Str
+    pub origin_zone: U32
+    pub priority: Priority
+    pub people: U32
+    pub accessible_places: U32
+    pub medical_places: U32
+    pub departure_minute: U32
+    pub arrival_deadline: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Shelter {
+    pub id: U32
+    pub name: Str
+    pub people_capacity: U32
+    pub accessible_capacity: U32
+    pub medical_capacity: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Route {
+    pub origin_zone: U32
+    pub shelter_id: U32
+    pub travel_minutes: U32
+    pub hazard_points: U32
+    pub open: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Placement {
+    pub household_id: U32
+    pub status: PlacementStatus
+    pub shelter_id: Option<U32>
+    pub travel_minutes: Option<U32>
+    pub arrival_minute: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Plan {
+    pub placements: Array<Option<Placement>, 8>
+    pub placement_count: USize
+    pub assigned_households: U32
+    pub assigned_people: U32
+    pub held_households: U32
+    pub held_people: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PlanEvaluation {
+    pub assigned_households: U32
+    pub held_households: U32
+    pub household_coverage_holds: Bool
+    pub assignment_totals_match: Bool
+    pub shelter_capacities_hold: Bool
+    pub route_rules_hold: Bool
+}

@@ -1,0 +1,163 @@
+use acme:flood-evacuation-planner/data
+use acme:flood-evacuation-planner/evaluation
+use acme:flood-evacuation-planner/model.{Placement, PlacementStatus, Plan, Priority}
+use acme:flood-evacuation-planner/planner
+use acme:flood-evacuation-planner/policy
+use sai:alloc/string.{String}
+use sai:core/fmt.{Writer}
+
+fn priority_text(priority: Priority) -> Str {
+    match priority {
+        Priority.Critical => "critical"
+        Priority.High => "high"
+        Priority.Standard => "standard"
+    }
+}
+
+fn clock_text(minutes_after_midnight: U32) -> String
+    effects { alloc }
+{
+    let hour = minutes_after_midnight / 60
+    let minute = minutes_after_midnight % 60
+    f"{hour:zpad(2)}:{minute:zpad(2)}"
+}
+
+fn hold_reason_text(status: PlacementStatus) -> Str {
+    match status {
+        PlacementStatus.AllRoutesClosed => "all routes are closed"
+        PlacementStatus.HazardLimit => "no open route is under the hazard limit"
+        PlacementStatus.ArrivalDeadline => "every safe route misses the arrival deadline"
+        PlacementStatus.GroupCapacity => "no shelter can fit the whole household"
+        PlacementStatus.AccessibleCapacity => "accessible places are unavailable"
+        PlacementStatus.MedicalSupportCapacity => "medical-support places are unavailable"
+        PlacementStatus.Assigned => "assigned"
+    }
+}
+
+fn write_placement(out: borrow mut String, placement: Placement)
+    effects { alloc }
+{
+    match planner.find_household(placement.household_id) {
+        Some(household) => {
+            out.write_str(
+                f"{household.name} ({household.people} people, {priority_text(household.priority)}): ".as_str(),
+            )
+            match placement.status {
+                PlacementStatus.Assigned => {
+                    match placement.shelter_id {
+                        Some(shelter_id) => {
+                            match planner.find_shelter(shelter_id) {
+                                Some(shelter) => {
+                                    let departure = clock_text(household.departure_minute)
+                                    match placement.arrival_minute {
+                                        Some(arrival_minute) => {
+                                            let arrival = clock_text(arrival_minute)
+                                            match placement.travel_minutes {
+                                                Some(travel_minutes) => {
+                                                    out.write_str(
+                                                        f"assigned to {shelter.name}; departs {departure}, arrives {arrival} ({travel_minutes} min)\n".as_str(),
+                                                    )
+                                                }
+                                                None => out.write_str(
+                                                    f"assigned to {shelter.name}; departs {departure}, arrives {arrival}\n".as_str(),
+                                                )
+                                            }
+                                        }
+                                        None => out.write_str(
+                                            f"assigned to {shelter.name}; departs {departure}\n".as_str(),
+                                        )
+                                    }
+                                }
+                                None => out.write_str("assigned to an unknown shelter\n")
+                            }
+                        }
+                        None => out.write_str("assigned, but the shelter is missing\n")
+                    }
+                }
+                _ => out.write_str(f"on hold — {hold_reason_text(placement.status)}\n".as_str())
+            }
+        }
+        None => out.write_str("unknown household\n")
+    }
+}
+
+pub fn evacuation_report() -> String
+    effects { alloc }
+{
+    let plan = planner.build_plan()
+    var out = String.new()
+
+    out.write_str("River County evacuation plan\n")
+    out.write_str(
+        "Fixture order: critical, high, standard; household IDs ascend within each group\n",
+    )
+    out.write_str(f"Hazard limit: {policy.hazard_limit_points()} points\n\n".as_str())
+    for index in 0..plan.placement_count {
+        match plan.placements[index] {
+            Some(placement) => write_placement(borrow mut out, placement)
+            None => {}
+        }
+    }
+    out.write_str("\n")
+    out.write_str(
+        f"Assigned: {plan.assigned_households} households / {plan.assigned_people} people\n".as_str(),
+    )
+    out.write_str(
+        f"On hold: {plan.held_households} households / {plan.held_people} people\n".as_str(),
+    )
+    out
+}
+
+fn remaining(capacity: U32, used: U32) -> U32 {
+    if used < capacity {
+        capacity - used
+    } else {
+        0
+    }
+}
+
+pub fn shelter_capacity_report() -> String
+    effects { alloc }
+{
+    let plan: Plan = planner.build_plan()
+    var out = String.new()
+    out.write_str("River County shelter capacity\n")
+
+    for shelter in data.shelters() {
+        let people_used = planner.shelter_people_used(plan, shelter.id)
+        let accessible_used = planner.shelter_accessible_used(plan, shelter.id)
+        let medical_used = planner.shelter_medical_used(plan, shelter.id)
+        out.write_str(
+            f"{shelter.name}: people {people_used}/{shelter.people_capacity} ({remaining(shelter.people_capacity, people_used)} remaining), accessible {accessible_used}/{shelter.accessible_capacity} ({remaining(shelter.accessible_capacity, accessible_used)} remaining), medical {medical_used}/{shelter.medical_capacity} ({remaining(shelter.medical_capacity, medical_used)} remaining)\n".as_str(),
+        )
+    }
+    out
+}
+
+fn check_text(passed: Bool) -> Str {
+    if passed {
+        "PASS"
+    } else {
+        "REVIEW"
+    }
+}
+
+pub fn plan_validation_report() -> String
+    effects { alloc }
+{
+    let plan = planner.build_plan()
+    let result = evaluation.evaluate(plan)
+    var out = String.new()
+    out.write_str("River County plan evaluation\n")
+    out.write_str(f"Household coverage: {check_text(result.household_coverage_holds)}\n".as_str())
+    out.write_str(
+        f"Assignment counts: {result.assigned_households} placed, {result.held_households} held ({check_text(result.assignment_totals_match)})\n".as_str(),
+    )
+    out.write_str(
+        f"Shelter capacity checks: {check_text(result.shelter_capacities_hold)}\n".as_str(),
+    )
+    out.write_str(
+        f"Open-route, hazard, and deadline checks: {check_text(result.route_rules_hold)}\n".as_str(),
+    )
+    out
+}

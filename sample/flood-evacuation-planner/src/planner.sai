@@ -1,0 +1,308 @@
+use acme:flood-evacuation-planner/data
+use acme:flood-evacuation-planner/model.{
+    Household
+    Placement
+    PlacementStatus
+    Plan
+    Route
+    Shelter
+}
+use acme:flood-evacuation-planner/policy
+use sai:core/num.{U32_MAX}
+
+pub fn find_household(household_id: U32) -> Option<Household> {
+    for household in data.households() {
+        if household.id == household_id {
+            return Some(household)
+        }
+    }
+    None
+}
+
+pub fn find_shelter(shelter_id: U32) -> Option<Shelter> {
+    for shelter in data.shelters() {
+        if shelter.id == shelter_id {
+            return Some(shelter)
+        }
+    }
+    None
+}
+
+fn used_people(
+    placements: Array<Option<Placement>, 8>,
+    placement_count: USize,
+    shelter_id: U32,
+) -> U32 {
+    var used: U32 = 0
+    for index in 0..placement_count {
+        match placements[index] {
+            Some(placement) => {
+                if placement.shelter_id == Some(shelter_id) {
+                    match find_household(placement.household_id) {
+                        Some(household) => {
+                            used += household.people
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    used
+}
+
+fn used_accessible_places(
+    placements: Array<Option<Placement>, 8>,
+    placement_count: USize,
+    shelter_id: U32,
+) -> U32 {
+    var used: U32 = 0
+    for index in 0..placement_count {
+        match placements[index] {
+            Some(placement) => {
+                if placement.shelter_id == Some(shelter_id) {
+                    match find_household(placement.household_id) {
+                        Some(household) => {
+                            used += household.accessible_places
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    used
+}
+
+fn used_medical_places(
+    placements: Array<Option<Placement>, 8>,
+    placement_count: USize,
+    shelter_id: U32,
+) -> U32 {
+    var used: U32 = 0
+    for index in 0..placement_count {
+        match placements[index] {
+            Some(placement) => {
+                if placement.shelter_id == Some(shelter_id) {
+                    match find_household(placement.household_id) {
+                        Some(household) => {
+                            used += household.medical_places
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    used
+}
+
+fn remaining(capacity: U32, used: U32) -> U32 {
+    if used < capacity {
+        capacity - used
+    } else {
+        0
+    }
+}
+
+fn route_fits(
+    household: Household,
+    route: Route,
+    shelter: Shelter,
+    placements: Array<Option<Placement>, 8>,
+    placement_count: USize,
+    best_travel_minutes: U32,
+    has_best: Bool,
+) -> Bool {
+    let arrival = household.departure_minute + route.travel_minutes
+    let available_people =
+        remaining(shelter.people_capacity, used_people(placements, placement_count, shelter.id))
+    let available_accessible = remaining(
+        shelter.accessible_capacity,
+        used_accessible_places(placements, placement_count, shelter.id),
+    )
+    let available_medical = remaining(
+        shelter.medical_capacity,
+        used_medical_places(placements, placement_count, shelter.id),
+    )
+
+    (
+        policy.route_is_usable(route)
+        and arrival <= household.arrival_deadline
+        and household.people <= available_people
+        and household.accessible_places <= available_accessible
+        and household.medical_places <= available_medical
+        and (not has_best or route.travel_minutes < best_travel_minutes)
+    )
+}
+
+fn hold_status(
+    household: Household,
+    placements: Array<Option<Placement>, 8>,
+    placement_count: USize,
+) -> PlacementStatus {
+    var saw_open_route = false
+    var saw_usable_route = false
+    var saw_on_time_route = false
+    var saw_people_capacity = false
+    var saw_accessible_capacity = false
+    var saw_medical_capacity = false
+
+    for route in data.routes() {
+        if route.origin_zone == household.origin_zone and route.open {
+            saw_open_route = true
+            if policy.route_is_usable(route) {
+                saw_usable_route = true
+                match find_shelter(route.shelter_id) {
+                    Some(shelter) => {
+                        let arrival = household.departure_minute + route.travel_minutes
+                        if arrival <= household.arrival_deadline {
+                            saw_on_time_route = true
+                            let available_people = remaining(
+                                shelter.people_capacity,
+                                used_people(placements, placement_count, shelter.id),
+                            )
+                            if household.people <= available_people {
+                                saw_people_capacity = true
+                                let available_accessible = remaining(
+                                    shelter.accessible_capacity,
+                                    used_accessible_places(placements, placement_count, shelter.id),
+                                )
+                                if household.accessible_places <= available_accessible {
+                                    saw_accessible_capacity = true
+                                    let available_medical = remaining(
+                                        shelter.medical_capacity,
+                                        used_medical_places(
+                                            placements,
+                                            placement_count,
+                                            shelter.id,
+                                        ),
+                                    )
+                                    if household.medical_places <= available_medical {
+                                        saw_medical_capacity = true
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    if not saw_open_route {
+        PlacementStatus.AllRoutesClosed
+    } else if not saw_usable_route {
+        PlacementStatus.HazardLimit
+    } else if not saw_on_time_route {
+        PlacementStatus.ArrivalDeadline
+    } else if not saw_people_capacity {
+        PlacementStatus.GroupCapacity
+    } else if not saw_accessible_capacity {
+        PlacementStatus.AccessibleCapacity
+    } else if not saw_medical_capacity {
+        PlacementStatus.MedicalSupportCapacity
+    } else {
+        PlacementStatus.MedicalSupportCapacity
+    }
+}
+
+fn choose_placement(
+    household: Household,
+    placements: Array<Option<Placement>, 8>,
+    placement_count: USize,
+) -> Placement {
+    var best: Option<Placement> = None
+    var best_travel_minutes = U32_MAX
+    var has_best = false
+
+    for route in data.routes() {
+        if route.origin_zone == household.origin_zone {
+            match find_shelter(route.shelter_id) {
+                Some(shelter) => {
+                    if route_fits(
+                        household,
+                        route,
+                        shelter,
+                        placements,
+                        placement_count,
+                        best_travel_minutes,
+                        has_best,
+                    ) {
+                        let arrival = household.departure_minute + route.travel_minutes
+                        best = Some(
+                            Placement(
+                                household_id: household.id,
+                                status: PlacementStatus.Assigned,
+                                shelter_id: Some(shelter.id),
+                                travel_minutes: Some(route.travel_minutes),
+                                arrival_minute: Some(arrival),
+                            ),
+                        )
+                        best_travel_minutes = route.travel_minutes
+                        has_best = true
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    match best {
+        Some(placement) => placement
+        None => Placement(
+            household_id: household.id,
+            status: hold_status(household, placements, placement_count),
+            shelter_id: None,
+            travel_minutes: None,
+            arrival_minute: None,
+        )
+    }
+}
+
+pub fn build_plan() -> Plan {
+    var placements = Array<Option<Placement>, 8>.filled(None)
+    var placement_count: USize = 0
+    var assigned_households: U32 = 0
+    var assigned_people: U32 = 0
+    var held_households: U32 = 0
+    var held_people: U32 = 0
+
+    for household in data.households() {
+        let placement = choose_placement(household, placements, placement_count)
+        placements[placement_count] = Some(placement)
+        placement_count += 1
+        if placement.status == PlacementStatus.Assigned {
+            assigned_households += 1
+            assigned_people += household.people
+        } else {
+            held_households += 1
+            held_people += household.people
+        }
+    }
+
+    Plan(
+        placements: placements,
+        placement_count: placement_count,
+        assigned_households: assigned_households,
+        assigned_people: assigned_people,
+        held_households: held_households,
+        held_people: held_people,
+    )
+}
+
+pub fn shelter_people_used(plan: Plan, shelter_id: U32) -> U32 {
+    used_people(plan.placements, plan.placement_count, shelter_id)
+}
+
+pub fn shelter_accessible_used(plan: Plan, shelter_id: U32) -> U32 {
+    used_accessible_places(plan.placements, plan.placement_count, shelter_id)
+}
+
+pub fn shelter_medical_used(plan: Plan, shelter_id: U32) -> U32 {
+    used_medical_places(plan.placements, plan.placement_count, shelter_id)
+}

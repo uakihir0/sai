@@ -35,6 +35,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`rail-shuttle-dispatch`](rail-shuttle-dispatch/README.md) | Assign a fixed replacement-bus fleet to disrupted transit services under corridor, passenger-capacity, and wheelchair-space constraints; report unresolved requests deterministically. |
 | Advanced | [`weighted-route-finder`](weighted-route-finder/README.md) | Find a minimum-time multi-edge route with Dijkstra's algorithm, stable tie-breaking, and predecessor-based path reconstruction. |
 | Advanced | [`access-policy-review`](access-policy-review/README.md) | Evaluate role, action, and resource rules with deny-overrides, default-deny, and stable decision explanations. |
+| Advanced | [`flood-evacuation-planner`](flood-evacuation-planner/README.md) | Assign whole households to safe shelters under deadlines, closed roads, hazard limits, accessible-space, and medical-support capacity constraints. |
 | Advanced | [`package-lock-auditor`](package-lock-auditor/README.md) | Check a fixed dependency lock for missing packages, version-range conflicts, and cycles; produce a stable build order only when the graph is valid. |
 | Advanced | [`ranked-choice-audit`](ranked-choice-audit/README.md) | Tally fixed ranked ballots by round, track exhausted preferences, and apply a documented tie rule. |
 | Advanced | [`telemetry-frame-decoder`](telemetry-frame-decoder/README.md) | Validate and decode fixed sensor frames with byte masks, a checksum, and ordered structured errors. |
