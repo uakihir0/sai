@@ -1,0 +1,193 @@
+use acme:university-enrollment-planner/data
+use acme:university-enrollment-planner/model.{
+    RegistrationDecision
+    RegistrationStatus
+    RejectionReason
+    TermPlan
+}
+use acme:university-enrollment-planner/planner
+use acme:university-enrollment-planner/policy
+
+// Build the hand-auditable Spring term plan from the fixed in-memory fixture.
+pub fn spring_term_plan() -> TermPlan {
+    planner.build()
+}
+
+fn decision_for_sequence(plan: TermPlan, sequence: U32) -> Option<RegistrationDecision> {
+    for index in 0..plan.decision_count {
+        match plan.decisions[index] {
+            Some(decision) => {
+                if decision.sequence == sequence {
+                    return Some(decision)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+fn sequence_ids(plan: TermPlan) -> Array<Option<U32>, 14> {
+    var sequences = Array<Option<U32>, 14>.filled(None)
+    for index in 0..plan.decision_count {
+        match plan.decisions[index] {
+            Some(decision) => {
+                sequences[index] = Some(decision.sequence)
+            }
+            None => {}
+        }
+    }
+    sequences
+}
+
+fn matches_decision(
+    plan: TermPlan,
+    sequence: U32,
+    status: RegistrationStatus,
+    reason: Option<RejectionReason>,
+    section_id: Option<U32>,
+    waitlist_position: Option<U32>,
+) -> Bool {
+    match decision_for_sequence(plan, sequence) {
+        Some(decision) => {
+            (
+                decision.status == status
+                and decision.reason == reason
+                and decision.section_id == section_id
+                and decision.waitlist_position == waitlist_position
+            )
+        }
+        None => false
+    }
+}
+
+fn enrolled_in_section_count(plan: TermPlan, section_id: U32) -> U32 {
+    var count: U32 = 0
+    for index in 0..plan.decision_count {
+        match plan.decisions[index] {
+            Some(decision) => {
+                if (
+                    decision.status == RegistrationStatus.Enrolled
+                    and decision.section_id == Some(section_id)
+                ) {
+                    count += 1
+                }
+            }
+            None => {}
+        }
+    }
+    count
+}
+
+test "year standing wins before earlier sequence and waitlists use that order" {
+    let plan = spring_term_plan()
+    assert plan.decision_count == 14
+    assert plan.enrolled_count == 4
+    assert plan.waitlisted_count == 4
+    assert plan.rejected_count == 6
+    assert (
+        sequence_ids(plan)
+        == [
+            Some(101),
+            Some(102),
+            Some(103),
+            Some(104),
+            Some(1),
+            Some(2),
+            Some(3),
+            Some(4),
+            Some(5),
+            Some(6),
+            Some(7),
+            Some(8),
+            Some(9),
+            Some(10),
+        ]
+    )
+    assert matches_decision(plan, 101, RegistrationStatus.Enrolled, None, Some(1401), None)
+    assert matches_decision(plan, 102, RegistrationStatus.Enrolled, None, Some(1301), None)
+    assert matches_decision(plan, 1, RegistrationStatus.Waitlisted, None, Some(1301), Some(1))
+    assert matches_decision(plan, 4, RegistrationStatus.Waitlisted, None, Some(1301), Some(2))
+    assert matches_decision(plan, 8, RegistrationStatus.Waitlisted, None, Some(1201), Some(1))
+    assert matches_decision(plan, 9, RegistrationStatus.Waitlisted, None, Some(1220), Some(1))
+}
+
+test "waitlisted credits do not reduce the student's later credit budget" {
+    let plan = spring_term_plan()
+    assert matches_decision(plan, 1, RegistrationStatus.Waitlisted, None, Some(1301), Some(1))
+    assert matches_decision(plan, 2, RegistrationStatus.Enrolled, None, Some(1220), None)
+    assert matches_decision(
+        plan,
+        3,
+        RegistrationStatus.Rejected,
+        Some(RejectionReason.ScheduleConflict),
+        Some(1201),
+        None,
+    )
+}
+
+test "program year prerequisite and credit gates report distinct reasons" {
+    let plan = spring_term_plan()
+    assert matches_decision(
+        plan,
+        103,
+        RegistrationStatus.Rejected,
+        Some(RejectionReason.CreditLimit),
+        Some(1220),
+        None,
+    )
+    assert matches_decision(
+        plan,
+        104,
+        RegistrationStatus.Rejected,
+        Some(RejectionReason.ProgramMismatch),
+        Some(1301),
+        None,
+    )
+    assert matches_decision(
+        plan,
+        7,
+        RegistrationStatus.Rejected,
+        Some(RejectionReason.MissingPrerequisite),
+        Some(1201),
+        None,
+    )
+    assert matches_decision(
+        plan,
+        10,
+        RegistrationStatus.Rejected,
+        Some(RejectionReason.YearRequirement),
+        Some(1201),
+        None,
+    )
+}
+
+test "timetable conflicts reject requests before a full section can waitlist them" {
+    let plan = spring_term_plan()
+    assert matches_decision(plan, 2, RegistrationStatus.Enrolled, None, Some(1220), None)
+    assert matches_decision(
+        plan,
+        3,
+        RegistrationStatus.Rejected,
+        Some(RejectionReason.ScheduleConflict),
+        Some(1201),
+        None,
+    )
+    assert matches_decision(plan, 5, RegistrationStatus.Enrolled, None, Some(1201), None)
+    assert matches_decision(
+        plan,
+        6,
+        RegistrationStatus.Rejected,
+        Some(RejectionReason.ScheduleConflict),
+        Some(1220),
+        None,
+    )
+
+    let sections = data.sections()
+    assert not policy.sections_overlap(sections[0], sections[1])
+    assert policy.sections_overlap(sections[1], sections[2])
+
+    for section in sections {
+        assert enrolled_in_section_count(plan, section.id) <= section.capacity
+    }
+}

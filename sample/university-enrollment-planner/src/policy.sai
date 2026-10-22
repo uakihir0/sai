@@ -1,0 +1,37 @@
+use acme:university-enrollment-planner/data
+use acme:university-enrollment-planner/model.{Course, Section, Student}
+
+pub fn find_student(student_id: U32) -> Option<Student> {
+    for student in data.students() {
+        if student.id == student_id {
+            return Some(student)
+        }
+    }
+    None
+}
+
+pub fn find_course(course_id: U32) -> Option<Course> {
+    for course in data.courses() {
+        if course.id == course_id {
+            return Some(course)
+        }
+    }
+    None
+}
+
+pub fn find_section(section_id: U32) -> Option<Section> {
+    for section in data.sections() {
+        if section.id == section_id {
+            return Some(section)
+        }
+    }
+    None
+}
+
+pub fn sections_overlap(first: Section, second: Section) -> Bool {
+    (
+        first.weekday == second.weekday
+        and first.start_minute < second.end_minute
+        and second.start_minute < first.end_minute
+    )
+}

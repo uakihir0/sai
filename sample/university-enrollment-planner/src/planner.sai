@@ -1,0 +1,331 @@
+use acme:university-enrollment-planner/data
+use acme:university-enrollment-planner/model.{
+    Course
+    RegistrationDecision
+    RegistrationRequest
+    RegistrationStatus
+    RejectionReason
+    Section
+    Student
+    TermPlan
+}
+use acme:university-enrollment-planner/policy
+
+fn request_precedes(candidate: RegistrationRequest, current: RegistrationRequest) -> Bool {
+    let candidate_year = match policy.find_student(candidate.student_id) {
+        Some(student) => student.year
+        None => 0
+    }
+    let current_year = match policy.find_student(current.student_id) {
+        Some(student) => student.year
+        None => 0
+    }
+
+    (
+        candidate_year > current_year
+        or (candidate_year == current_year and candidate.sequence < current.sequence)
+    )
+}
+
+fn prioritize_requests() -> Array<RegistrationRequest, 14> {
+    var ordered = data.requests()
+    let request_count = ordered.len()
+
+    for first_index in 0..request_count {
+        var best_index = first_index
+        for candidate_index in first_index + 1..request_count {
+            if request_precedes(ordered[candidate_index], ordered[best_index]) {
+                best_index = candidate_index
+            }
+        }
+
+        if best_index != first_index {
+            let displaced = ordered[first_index]
+            ordered[first_index] = ordered[best_index]
+            ordered[best_index] = displaced
+        }
+    }
+
+    ordered
+}
+
+fn decision(
+    request: RegistrationRequest,
+    status: RegistrationStatus,
+    reason: Option<RejectionReason>,
+    section_id: Option<U32>,
+    waitlist_position: Option<U32>,
+) -> RegistrationDecision {
+    RegistrationDecision(
+        sequence: request.sequence,
+        student_id: request.student_id,
+        course_id: request.course_id,
+        status: status,
+        reason: reason,
+        section_id: section_id,
+        waitlist_position: waitlist_position,
+    )
+}
+
+fn section_enrollment_count(plan: TermPlan, preceding_count: USize, section_id: U32) -> U32 {
+    var count: U32 = 0
+    for index in 0..preceding_count {
+        match plan.decisions[index] {
+            Some(decision) => {
+                if (
+                    decision.status == RegistrationStatus.Enrolled
+                    and decision.section_id == Some(section_id)
+                ) {
+                    count += 1
+                }
+            }
+            None => {}
+        }
+    }
+    count
+}
+
+fn waitlist_position(plan: TermPlan, preceding_count: USize, section_id: U32) -> U32 {
+    var earlier_waitlisted: U32 = 0
+    for index in 0..preceding_count {
+        match plan.decisions[index] {
+            Some(decision) => {
+                if (
+                    decision.status == RegistrationStatus.Waitlisted
+                    and decision.section_id == Some(section_id)
+                ) {
+                    earlier_waitlisted += 1
+                }
+            }
+            None => {}
+        }
+    }
+    earlier_waitlisted + 1
+}
+
+fn has_completed_prerequisite(student: Student, course: Course) -> Bool {
+    match course.prerequisite_course_id {
+        Some(prerequisite_id) => {
+            var completed = false
+            for completed_id in student.completed_course_ids {
+                if completed_id == Some(prerequisite_id) {
+                    completed = true
+                }
+            }
+            completed
+        }
+        None => true
+    }
+}
+
+fn enrolled_credits(plan: TermPlan, preceding_count: USize, student_id: U32) -> U32 {
+    var credits: U32 = 0
+    for index in 0..preceding_count {
+        match plan.decisions[index] {
+            Some(decision) => {
+                if (
+                    decision.student_id == student_id
+                    and decision.status == RegistrationStatus.Enrolled
+                ) {
+                    match policy.find_course(decision.course_id) {
+                        Some(course) => {
+                            credits += course.credits
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    credits
+}
+
+fn has_schedule_conflict(
+    plan: TermPlan,
+    preceding_count: USize,
+    student_id: U32,
+    proposed_section: Section,
+) -> Bool {
+    var conflict = false
+    for index in 0..preceding_count {
+        match plan.decisions[index] {
+            Some(decision) => {
+                if (
+                    decision.student_id == student_id
+                    and decision.status == RegistrationStatus.Enrolled
+                ) {
+                    match decision.section_id {
+                        Some(section_id) => {
+                            match policy.find_section(section_id) {
+                                Some(section) => {
+                                    if policy.sections_overlap(proposed_section, section) {
+                                        conflict = true
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    conflict
+}
+
+fn rejection_reason(
+    student: Student,
+    course: Course,
+    section: Section,
+    plan: TermPlan,
+    preceding_count: USize,
+) -> Option<RejectionReason> {
+    match course.required_program {
+        Some(required_program) => {
+            if student.program != required_program {
+                return Some(RejectionReason.ProgramMismatch)
+            }
+        }
+        None => {}
+    }
+
+    if student.year < course.minimum_year {
+        return Some(RejectionReason.YearRequirement)
+    }
+
+    if not has_completed_prerequisite(student, course) {
+        return Some(RejectionReason.MissingPrerequisite)
+    }
+
+    let credits_already_enrolled = enrolled_credits(plan, preceding_count, student.id)
+    if credits_already_enrolled > student.term_credit_limit {
+        return Some(RejectionReason.CreditLimit)
+    }
+    let credits_remaining = student.term_credit_limit - credits_already_enrolled
+    if course.credits > credits_remaining {
+        return Some(RejectionReason.CreditLimit)
+    }
+
+    if has_schedule_conflict(plan, preceding_count, student.id, section) {
+        return Some(RejectionReason.ScheduleConflict)
+    }
+
+    None
+}
+
+fn evaluate_known_request(
+    request: RegistrationRequest,
+    student: Student,
+    course: Course,
+    section: Section,
+    plan: TermPlan,
+    preceding_count: USize,
+) -> RegistrationDecision {
+    match rejection_reason(student, course, section, plan, preceding_count) {
+        Some(reason) => {
+            decision(request, RegistrationStatus.Rejected, Some(reason), Some(section.id), None)
+        }
+        None => {
+            if section_enrollment_count(plan, preceding_count, section.id) >= section.capacity {
+                decision(
+                    request,
+                    RegistrationStatus.Waitlisted,
+                    None,
+                    Some(section.id),
+                    Some(waitlist_position(plan, preceding_count, section.id)),
+                )
+            } else {
+                decision(request, RegistrationStatus.Enrolled, None, Some(section.id), None)
+            }
+        }
+    }
+}
+
+fn evaluate_request(
+    request: RegistrationRequest,
+    plan: TermPlan,
+    preceding_count: USize,
+) -> RegistrationDecision {
+    match policy.find_student(request.student_id) {
+        Some(student) => {
+            match policy.find_course(request.course_id) {
+                Some(course) => {
+                    match policy.find_section(course.section_id) {
+                        Some(section) => {
+                            evaluate_known_request(
+                                request,
+                                student,
+                                course,
+                                section,
+                                plan,
+                                preceding_count,
+                            )
+                        }
+                        None => {
+                            decision(
+                                request,
+                                RegistrationStatus.Rejected,
+                                Some(RejectionReason.UnknownSection),
+                                None,
+                                None,
+                            )
+                        }
+                    }
+                }
+                None => {
+                    decision(
+                        request,
+                        RegistrationStatus.Rejected,
+                        Some(RejectionReason.UnknownCourse),
+                        None,
+                        None,
+                    )
+                }
+            }
+        }
+        None => {
+            decision(
+                request,
+                RegistrationStatus.Rejected,
+                Some(RejectionReason.UnknownStudent),
+                None,
+                None,
+            )
+        }
+    }
+}
+
+pub fn build() -> TermPlan {
+    var plan = TermPlan(
+        decisions: Array<Option<RegistrationDecision>, 14>.filled(None),
+        decision_count: 0,
+        enrolled_count: 0,
+        waitlisted_count: 0,
+        rejected_count: 0,
+    )
+    let ordered = prioritize_requests()
+
+    for index in 0..ordered.len() {
+        let request = ordered[index]
+        let result = evaluate_request(request, plan, index)
+        plan.decisions[index] = Some(result)
+        plan.decision_count += 1
+
+        match result.status {
+            RegistrationStatus.Enrolled => {
+                plan.enrolled_count += 1
+            }
+            RegistrationStatus.Waitlisted => {
+                plan.waitlisted_count += 1
+            }
+            RegistrationStatus.Rejected => {
+                plan.rejected_count += 1
+            }
+        }
+    }
+
+    plan
+}
