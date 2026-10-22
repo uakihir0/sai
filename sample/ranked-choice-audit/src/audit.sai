@@ -1,0 +1,240 @@
+use acme:ranked-choice-audit/model.{
+    Ballot
+    Candidate
+    Election
+    ElectionAudit
+    InputError
+    RoundResult
+    RoundStatus
+    Tally
+}
+use acme:ranked-choice-audit/validate
+
+fn candidate_id_at(election: Election, slot: USize) -> U32 {
+    match election.candidates[slot] { Some(candidate) => candidate.id, None => 0 }
+}
+
+fn candidate_ids(election: Election) -> Array<Option<U32>, 3> {
+    var ids = Array<Option<U32>, 3>.filled(None)
+    for slot in 0..3 {
+        if slot < election.candidate_count {
+            ids[slot] = Some(candidate_id_at(election, slot))
+        }
+    }
+    ids
+}
+
+fn first_continuing_preference(
+    ballot: Ballot,
+    election: Election,
+    continuing: Array<Bool, 3>,
+) -> Option<USize> {
+    for rank in 0..3 {
+        if rank < ballot.preference_count {
+            match ballot.preferences[rank] {
+                Some(candidate_id) => {
+                    match validate.candidate_slot(election, candidate_id) {
+                        Some(slot) => {
+                            if continuing[slot] {
+                                return Some(slot)
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    None
+}
+
+fn tally(election: Election, continuing: Array<Bool, 3>) -> Tally {
+    var votes = Array<USize, 3>.filled(0)
+    var active_ballot_count: USize = 0
+    var exhausted_ballot_count: USize = 0
+
+    for ballot_slot in 0..8 {
+        if ballot_slot < election.ballot_count {
+            match election.ballots[ballot_slot] {
+                Some(ballot) => {
+                    match first_continuing_preference(ballot, election, continuing) {
+                        Some(candidate_slot) => {
+                            votes[candidate_slot] += 1
+                            active_ballot_count += 1
+                        }
+                        None => {
+                            exhausted_ballot_count += 1
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    Tally(
+        votes: votes,
+        active_ballot_count: active_ballot_count,
+        exhausted_ballot_count: exhausted_ballot_count,
+    )
+}
+
+fn majority_winner(election: Election, continuing: Array<Bool, 3>, current_tally: Tally) -> Option<
+    U32,
+> {
+    if current_tally.active_ballot_count == 0 {
+        return None
+    }
+
+    let majority_required = current_tally.active_ballot_count / 2 + 1
+    for slot in 0..3 {
+        if (
+            slot < election.candidate_count
+            and continuing[slot]
+            and current_tally.votes[slot] >= majority_required
+        ) {
+            return Some(candidate_id_at(election, slot))
+        }
+    }
+    None
+}
+
+fn lowest_candidate_to_eliminate(
+    election: Election,
+    continuing: Array<Bool, 3>,
+    current_tally: Tally,
+) -> USize {
+    var selected_slot: USize = 0
+    var has_selection = false
+
+    for slot in 0..3 {
+        if slot < election.candidate_count and continuing[slot] {
+            if not has_selection {
+                selected_slot = slot
+                has_selection = true
+            } else {
+                let selected_votes = current_tally.votes[selected_slot]
+                let candidate_votes = current_tally.votes[slot]
+                if (
+                    candidate_votes < selected_votes
+                    or (
+                        candidate_votes == selected_votes
+                        and candidate_id_at(election, slot)
+                            > candidate_id_at(election, selected_slot)
+                    )
+                ) {
+                    selected_slot = slot
+                }
+            }
+        }
+    }
+
+    selected_slot
+}
+
+fn round_result(
+    election: Election,
+    continuing: Array<Bool, 3>,
+    current_tally: Tally,
+    round_number: USize,
+    majority_required: USize,
+    status: RoundStatus,
+    outcome_candidate_id: Option<U32>,
+) -> RoundResult {
+    RoundResult(
+        round_number: round_number,
+        candidate_ids: candidate_ids(election),
+        continuing: continuing,
+        votes: current_tally.votes,
+        active_ballot_count: current_tally.active_ballot_count,
+        exhausted_ballot_count: current_tally.exhausted_ballot_count,
+        majority_required: majority_required,
+        status: status,
+        outcome_candidate_id: outcome_candidate_id,
+    )
+}
+
+fn run_validated(election: Election) -> ElectionAudit {
+    var continuing = Array<Bool, 3>.filled(false)
+    for slot in 0..3 {
+        if slot < election.candidate_count {
+            continuing[slot] = true
+        }
+    }
+
+    var rounds = Array<Option<RoundResult>, 3>.filled(None)
+    var round_count: USize = 0
+    var winner_id: Option<U32> = None
+    var finished = false
+
+    while round_count < election.candidate_count and not finished {
+        let current_tally = tally(election, continuing)
+        let majority_required = if current_tally.active_ballot_count == 0 {
+            0
+        } else {
+            current_tally.active_ballot_count / 2 + 1
+        }
+
+        if current_tally.active_ballot_count == 0 {
+            rounds[round_count] = Some(
+                round_result(
+                    election,
+                    continuing,
+                    current_tally,
+                    round_count + 1,
+                    majority_required,
+                    RoundStatus.NoActiveBallots,
+                    None,
+                ),
+            )
+            finished = true
+        } else {
+            match majority_winner(election, continuing, current_tally) {
+                Some(candidate_id) => {
+                    rounds[round_count] = Some(
+                        round_result(
+                            election,
+                            continuing,
+                            current_tally,
+                            round_count + 1,
+                            majority_required,
+                            RoundStatus.WinnerSelected,
+                            Some(candidate_id),
+                        ),
+                    )
+                    winner_id = Some(candidate_id)
+                    finished = true
+                }
+                None => {
+                    let eliminated_slot =
+                        lowest_candidate_to_eliminate(election, continuing, current_tally)
+                    let eliminated_id = candidate_id_at(election, eliminated_slot)
+                    rounds[round_count] = Some(
+                        round_result(
+                            election,
+                            continuing,
+                            current_tally,
+                            round_count + 1,
+                            majority_required,
+                            RoundStatus.CandidateEliminated,
+                            Some(eliminated_id),
+                        ),
+                    )
+                    continuing[eliminated_slot] = false
+                }
+            }
+        }
+
+        round_count += 1
+    }
+
+    ElectionAudit(rounds: rounds, round_count: round_count, winner_id: winner_id)
+}
+
+pub fn audit(election: Election) -> Result<ElectionAudit, InputError> {
+    match validate.validate(election) {
+        Ok(_) => Ok(run_validated(election))
+        Err(error) => Err(error)
+    }
+}

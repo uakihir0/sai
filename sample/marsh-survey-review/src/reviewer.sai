@@ -1,0 +1,68 @@
+use acme:marsh-survey-review/model.{
+    Assessment
+    ReviewStatus
+    ReviewedObservation
+    Summary
+    Survey
+    SurveyError
+    Transect
+}
+use acme:marsh-survey-review/rules
+use sai:core/num.{U32_MAX}
+
+fn transect_index(transect: Transect) -> USize {
+    match transect { Transect.NorthChannel => 0, Transect.SouthDunes => 1 }
+}
+
+pub fn review(survey: Survey) -> Result<Assessment, SurveyError> {
+    if survey.observation_count > survey.observations.len() {
+        return Err(SurveyError.TooManyObservations)
+    }
+
+    var reviews = Array<Option<ReviewedObservation>, 8>.filled(None)
+    var summary = Summary(
+        record_count: survey.observation_count,
+        accepted_count: 0,
+        verify_count: 0,
+        conservation_review_count: 0,
+        correction_count: 0,
+        accepted_total: 0,
+        accepted_by_transect: Array<U32, 2>.filled(0),
+    )
+
+    for index in 0..survey.observation_count {
+        let observation = match survey.observations[index] {
+            Some(value) => value
+            None => return Err(SurveyError.MissingObservation(index))
+        }
+        let status = rules.status_for(observation)
+        reviews[index] = Some(ReviewedObservation(observation: observation, status: status))
+
+        match status {
+            ReviewStatus.Accepted => {
+                let transect = transect_index(observation.transect)
+                let transect_total = summary.accepted_by_transect[transect]
+                if (
+                    observation.count > U32_MAX - summary.accepted_total
+                    or observation.count > U32_MAX - transect_total
+                ) {
+                    return Err(SurveyError.AcceptedCountOverflow)
+                }
+                summary.accepted_count += 1
+                summary.accepted_total += observation.count
+                summary.accepted_by_transect[transect] += observation.count
+            }
+            ReviewStatus.Verify => {
+                summary.verify_count += 1
+            }
+            ReviewStatus.ConservationReview => {
+                summary.conservation_review_count += 1
+            }
+            ReviewStatus.CorrectionRequired => {
+                summary.correction_count += 1
+            }
+        }
+    }
+
+    Ok(Assessment(review_count: survey.observation_count, reviews: reviews, summary: summary))
+}

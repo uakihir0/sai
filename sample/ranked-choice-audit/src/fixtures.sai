@@ -1,0 +1,201 @@
+use acme:ranked-choice-audit/model.{Ballot, Candidate, Election}
+
+fn candidate_set() -> Array<Option<Candidate>, 3> {
+    [
+        Some(Candidate(id: 10, name: "Maya")),
+        Some(Candidate(id: 20, name: "Niko")),
+        Some(Candidate(id: 30, name: "Oren")),
+    ]
+}
+
+fn election(ballots: Array<Option<Ballot>, 8>, ballot_count: USize) -> Election {
+    Election(
+        candidate_count: 3,
+        candidates: candidate_set(),
+        ballot_count: ballot_count,
+        ballots: ballots,
+    )
+}
+
+pub fn tied_first_round_with_exhaustion() -> Election {
+    election(
+        [
+            Some(
+                Ballot(
+                    ballot_id: 1,
+                    preference_count: 3,
+                    preferences: [Some(10), Some(20), Some(30)],
+                ),
+            ),
+            Some(
+                Ballot(
+                    ballot_id: 2,
+                    preference_count: 3,
+                    preferences: [Some(10), Some(30), Some(20)],
+                ),
+            ),
+            Some(
+                Ballot(
+                    ballot_id: 3,
+                    preference_count: 3,
+                    preferences: [Some(20), Some(10), Some(30)],
+                ),
+            ),
+            Some(
+                Ballot(
+                    ballot_id: 4,
+                    preference_count: 3,
+                    preferences: [Some(20), Some(30), Some(10)],
+                ),
+            ),
+            Some(
+                Ballot(ballot_id: 5, preference_count: 2, preferences: [Some(30), Some(10), None]),
+            ),
+            Some(Ballot(ballot_id: 6, preference_count: 1, preferences: [Some(30), None, None])),
+            None,
+            None,
+        ],
+        6,
+    )
+}
+
+pub fn first_round_majority() -> Election {
+    election(
+        [
+            Some(Ballot(ballot_id: 1, preference_count: 1, preferences: [Some(10), None, None])),
+            Some(Ballot(ballot_id: 2, preference_count: 1, preferences: [Some(10), None, None])),
+            Some(Ballot(ballot_id: 3, preference_count: 1, preferences: [Some(10), None, None])),
+            Some(Ballot(ballot_id: 4, preference_count: 1, preferences: [Some(20), None, None])),
+            Some(Ballot(ballot_id: 5, preference_count: 1, preferences: [Some(30), None, None])),
+            None,
+            None,
+            None,
+        ],
+        5,
+    )
+}
+
+pub fn exactly_half_is_not_a_majority() -> Election {
+    election(
+        [
+            Some(
+                Ballot(ballot_id: 1, preference_count: 2, preferences: [Some(10), Some(20), None]),
+            ),
+            Some(
+                Ballot(ballot_id: 2, preference_count: 2, preferences: [Some(10), Some(20), None]),
+            ),
+            Some(
+                Ballot(ballot_id: 3, preference_count: 2, preferences: [Some(20), Some(10), None]),
+            ),
+            Some(
+                Ballot(ballot_id: 4, preference_count: 2, preferences: [Some(30), Some(10), None]),
+            ),
+            None,
+            None,
+            None,
+            None,
+        ],
+        4,
+    )
+}
+
+pub fn no_ballots() -> Election {
+    election([None, None, None, None, None, None, None, None], 0)
+}
+
+pub fn duplicate_preference() -> Election {
+    election(
+        [
+            Some(
+                Ballot(ballot_id: 1, preference_count: 2, preferences: [Some(10), Some(10), None]),
+            ),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ],
+        1,
+    )
+}
+
+pub fn duplicate_candidate_id() -> Election {
+    Election(
+        candidate_count: 3,
+        candidates: [
+            Some(Candidate(id: 10, name: "Maya")),
+            Some(Candidate(id: 10, name: "Niko")),
+            Some(Candidate(id: 30, name: "Oren")),
+        ],
+        ballot_count: 0,
+        ballots: Array<Option<Ballot>, 8>.filled(None),
+    )
+}
+
+pub fn duplicate_ballot_id() -> Election {
+    election(
+        [
+            Some(Ballot(ballot_id: 1, preference_count: 1, preferences: [Some(10), None, None])),
+            Some(Ballot(ballot_id: 1, preference_count: 1, preferences: [Some(20), None, None])),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ],
+        2,
+    )
+}
+
+pub fn unknown_candidate_preference() -> Election {
+    election(
+        [
+            Some(Ballot(ballot_id: 1, preference_count: 1, preferences: [Some(99), None, None])),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ],
+        1,
+    )
+}
+
+pub fn unpacked_preferences() -> Election {
+    election(
+        [
+            Some(Ballot(ballot_id: 1, preference_count: 1, preferences: [None, Some(20), None])),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ],
+        1,
+    )
+}
+
+pub fn candidate_count_over_capacity() -> Election {
+    Election(
+        candidate_count: 4,
+        candidates: candidate_set(),
+        ballot_count: 0,
+        ballots: Array<Option<Ballot>, 8>.filled(None),
+    )
+}
+
+pub fn count_over_capacity() -> Election {
+    Election(
+        candidate_count: 3,
+        candidates: candidate_set(),
+        ballot_count: 9,
+        ballots: Array<Option<Ballot>, 8>.filled(None),
+    )
+}

@@ -1,0 +1,124 @@
+use acme:ranked-choice-audit/model.{Election, InputError}
+
+pub fn candidate_slot(election: Election, candidate_id: U32) -> Option<USize> {
+    for slot in 0..3 {
+        if slot < election.candidate_count {
+            match election.candidates[slot] {
+                Some(candidate) => {
+                    if candidate.id == candidate_id {
+                        return Some(slot)
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    None
+}
+
+pub fn validate(election: Election) -> Result<(), InputError> {
+    if election.candidate_count < 2 or election.candidate_count > 3 {
+        return Err(InputError.CandidateCountOutOfRange)
+    }
+
+    for slot in 0..3 {
+        if slot < election.candidate_count {
+            match election.candidates[slot] {
+                Some(candidate) => {
+                    for earlier in 0..slot {
+                        match election.candidates[earlier] {
+                            Some(previous) => {
+                                if previous.id == candidate.id {
+                                    return Err(InputError.DuplicateCandidateId)
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                }
+                None => {
+                    return Err(InputError.CandidateSlotsNotPacked)
+                }
+            }
+        } else {
+            match election.candidates[slot] {
+                Some(_) => {
+                    return Err(InputError.CandidateSlotsNotPacked)
+                }
+                None => {}
+            }
+        }
+    }
+
+    if election.ballot_count > 8 {
+        return Err(InputError.TooManyBallots)
+    }
+
+    for slot in 0..8 {
+        if slot < election.ballot_count {
+            match election.ballots[slot] {
+                Some(ballot) => {
+                    for earlier in 0..slot {
+                        match election.ballots[earlier] {
+                            Some(previous) => {
+                                if previous.ballot_id == ballot.ballot_id {
+                                    return Err(InputError.DuplicateBallotId)
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+
+                    if ballot.preference_count > election.candidate_count {
+                        return Err(InputError.PreferenceCountOutOfRange)
+                    }
+
+                    for rank in 0..3 {
+                        if rank < ballot.preference_count {
+                            match ballot.preferences[rank] {
+                                Some(candidate_id) => {
+                                    if candidate_slot(election, candidate_id) == None {
+                                        return Err(InputError.UnknownCandidateId)
+                                    }
+
+                                    for earlier_rank in 0..rank {
+                                        match ballot.preferences[earlier_rank] {
+                                            Some(earlier_candidate_id) => {
+                                                if earlier_candidate_id == candidate_id {
+                                                    return Err(InputError.DuplicatePreferenceId)
+                                                }
+                                            }
+                                            None => {}
+                                        }
+                                    }
+                                }
+                                None => {
+                                    return Err(InputError.PreferenceSlotsNotPacked)
+                                }
+                            }
+                        } else {
+                            match ballot.preferences[rank] {
+                                Some(_) => {
+                                    return Err(InputError.PreferenceSlotsNotPacked)
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                }
+                None => {
+                    return Err(InputError.BallotSlotsNotPacked)
+                }
+            }
+        } else {
+            match election.ballots[slot] {
+                Some(_) => {
+                    return Err(InputError.BallotSlotsNotPacked)
+                }
+                None => {}
+            }
+        }
+    }
+
+    Ok(())
+}
