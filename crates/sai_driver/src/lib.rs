@@ -4788,13 +4788,14 @@ pub enum TraitImplMemberKind {
     ImplMethod,
 }
 
-/// Partial type-head and test-only path results for one associated
-/// declaration owner.
+/// Partial type-head, bounded body, and test-only path results for one
+/// associated declaration owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraitImplMemberTestOnlyResolution {
     parent_owner: OwnerId,
     owner: OwnerId,
     kind: TraitImplMemberKind,
+    body_type_check: Result<FunctionBodyTypeCheck, OwnerControlFlowResolutionError>,
     type_path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
@@ -4815,6 +4816,19 @@ impl TraitImplMemberTestOnlyResolution {
 
     pub const fn kind(&self) -> TraitImplMemberKind {
         self.kind
+    }
+
+    /// Returns the bounded associated-method body check, independently of
+    /// test-only path diagnostics.
+    ///
+    /// Only public inherent methods in a non-generic safe impl with an unused
+    /// first shared `Self` receiver, named immutable primitive parameters, an
+    /// explicit primitive return type, and the supported primitive-local body
+    /// shape are checked; every other associated member is unsupported.
+    pub fn body_type_check(
+        &self,
+    ) -> Result<&FunctionBodyTypeCheck, &OwnerControlFlowResolutionError> {
+        self.body_type_check.as_ref()
     }
 
     pub fn type_path_resolution(
@@ -6248,6 +6262,142 @@ fn check_function_body_type(
         }
     };
     Ok(FunctionBodyTypeCheck::Supported { diagnostics })
+}
+
+fn check_inherent_method_body_type(
+    impl_owner: &HirOwner<'_>,
+    method_owner: &HirOwner<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<FunctionBodyTypeCheck, OwnerControlFlowResolutionError> {
+    if !impl_owner.raw_attrs.is_empty()
+        || !method_owner.raw_attrs.is_empty()
+        || !body.contracts.is_empty()
+        || !body.invariant_preds.is_empty()
+    {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+
+    let OwnerNode::Item(impl_item) = impl_owner.node else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    let ItemKind::Impl {
+        safety: sai_hir::Safety::Safe,
+        generics: impl_generics,
+        kind: ImplKind::Inherent { self_ty },
+        ..
+    } = impl_item.kind
+    else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    if !impl_generics.params.is_empty()
+        || !impl_generics.where_preds.is_empty()
+        || !matches!(
+            self_ty.kind,
+            TyKind::Path(path)
+                if path.root == PathRoot::Plain
+                    && path.segments.len() == 1
+                    && path.segments[0].args.is_none()
+        )
+    {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+
+    let OwnerNode::ImplItem(method) = method_owner.node else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    if method.owner_id != method_owner.id
+        || method.impl_def != impl_item.owner_id.def_id
+        || method.vis != Visibility::Pub
+        || !function_name_is_supported(method.name, symbols, inputs)
+    {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+    let ImplItemKind::Fn {
+        sig,
+        generics,
+        has_body: true,
+    } = method.kind
+    else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    if sig.safety != sai_hir::Safety::Safe
+        || sig.is_async
+        || sig.borrows.is_some()
+        || sig.effects.is_some()
+        || !sig.requires.is_empty()
+        || !sig.ensures.is_empty()
+        || !generics.params.is_empty()
+        || !generics.where_preds.is_empty()
+    {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+
+    let Some((receiver, explicit_params)) = sig.params.split_first() else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    let Some((body_receiver, explicit_body_params)) = body.params.split_first() else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    if !receiver.is_self
+        || receiver.mutable
+        || !matches!(
+            receiver.ty.kind,
+            TyKind::Borrow(
+                sai_hir::Mutability::Not,
+                inner
+            ) if matches!(
+                inner.kind,
+                TyKind::Path(path)
+                    if path.root == PathRoot::SelfType && path.segments.is_empty()
+            )
+        )
+        || body_receiver.mutable
+        || !matches!(
+            locals.bindings.get(&body_receiver.binding),
+            Some(sai_resolve::owner::LocalBinding {
+                kind: sai_resolve::owner::BindingKind::Param,
+                ..
+            })
+        )
+        || locals
+            .paths
+            .values()
+            .any(|path| path.base == Res::Local(body_receiver.binding))
+        || explicit_params.iter().any(|parameter| parameter.is_self)
+        || explicit_params.len() != explicit_body_params.len()
+    {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+
+    let explicit_sig = sai_hir::body::FnSig {
+        params: explicit_params,
+        ..sig
+    };
+    let explicit_body = sai_hir::body::Body {
+        params: explicit_body_params,
+        ..*body
+    };
+    if let Some(diagnostics) = check_function_body_primitive_local_block(
+        method_owner,
+        explicit_sig,
+        &explicit_body,
+        locals,
+        type_paths,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )? {
+        Ok(FunctionBodyTypeCheck::Supported { diagnostics })
+    } else {
+        Ok(FunctionBodyTypeCheck::Unsupported)
+    }
 }
 
 fn check_function_body_primitive_local_block(
@@ -22459,6 +22609,8 @@ impl RootDatabase {
     /// include method-body and contract type positions. For methods with
     /// bodies or contracts, it resolves locals before module fallback and
     /// diagnoses test-only expression paths after local and generic lookup.
+    /// Inherent impl methods also carry a separate narrow primitive-local body
+    /// type-check result; this does not broaden test-only path diagnostics.
     pub fn resolve_trait_impl_member_test_only_paths(
         &mut self,
         collection: &Phase1PackageScopesCollection,
@@ -22717,6 +22869,7 @@ impl RootDatabase {
                     };
                     let mut lowering_diagnostics = Vec::new();
                     let mut type_path_resolution = None;
+                    let mut body_type_check = Ok(FunctionBodyTypeCheck::Unsupported);
                     let member_analysis: Result<
                         (
                             OwnerTestOnlyPathResolution,
@@ -22833,6 +22986,25 @@ impl RootDatabase {
                                 &module_aliases,
                             ) {
                                 Ok(locals) => {
+                                    let resolved_type_paths = type_path_resolution
+                                        .as_ref()
+                                        .and_then(|result| result.as_ref().ok());
+                                    body_type_check = if descriptor.kind == TopLevelOwnerKind::Impl
+                                    {
+                                        check_inherent_method_body_type(
+                                            &parent_hir,
+                                            &member_hir,
+                                            body,
+                                            &locals,
+                                            resolved_type_paths,
+                                            &self.symbols,
+                                            &inputs,
+                                            snapshot,
+                                            &collection.target_cfg,
+                                        )
+                                    } else {
+                                        Ok(FunctionBodyTypeCheck::Unsupported)
+                                    };
                                     let mut module = resolve_owner_module_paths(
                                         &locals,
                                         module_scope,
@@ -22922,6 +23094,7 @@ impl RootDatabase {
                         parent_owner: descriptor.owner,
                         owner: member_owner,
                         kind,
+                        body_type_check,
                         type_path_resolution,
                         module_path_diagnostics: Ok(None),
                         test_only_path_resolution,
@@ -42112,6 +42285,133 @@ mod tests {
                 .flat_map(TraitImplMemberOwnerResolution::members)
                 .all(|member| diagnostics_for(member).is_empty()),
             "ordinary module imports do not receive test-only diagnostics"
+        );
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_omits_an_unused_shared_self_receiver() {
+        let root = concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "  pub fn add_one(self: borrow Self, value: I32) -> I32 {\n",
+            "    let result = value + 1\n",
+            "    result\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let parsed = database
+            .parse_file(&snapshot, module_tree.modules[0].file)
+            .expect("test source parses");
+        assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("single inherent method collects");
+
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        assert_eq!(results.owners().len(), 1);
+        let impl_owner = &results.owners()[0];
+        assert_eq!(impl_owner.kind(), TopLevelOwnerKind::Impl);
+        assert!(impl_owner.error().is_none());
+        assert_eq!(impl_owner.members().len(), 1);
+        let method = &impl_owner.members()[0];
+        assert_eq!(method.kind(), TraitImplMemberKind::ImplMethod);
+        let check = method
+            .body_type_check()
+            .expect("method body check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("the unused shared receiver does not block primitive body checking");
+        };
+        assert!(
+            diagnostics.is_empty(),
+            "the valid primitive-local method has no type diagnostics: {diagnostics:?}"
+        );
+        assert!(
+            method
+                .local_resolution()
+                .expect("method locals resolve")
+                .is_some_and(|locals| locals.diagnostics.is_empty())
+        );
+        assert!(
+            method
+                .test_only_diagnostics()
+                .expect("test-only diagnostics have a separate result")
+                .is_empty(),
+            "method body checking does not mix with test-only diagnostics"
+        );
+    }
+
+    #[test]
+    fn inherent_method_body_type_mismatches_keep_source_spans() {
+        let root = concat!(
+            "type Counter { marker: I32 }\n",
+            "impl Counter {\n",
+            "  pub fn mismatch(self: borrow Self, value: I32) -> I32 {\n",
+            "    let result: I32 = value < 1\n",
+            "    result\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("single inherent method collects");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let check = results.owners()[0].members()[0]
+            .body_type_check()
+            .expect("method body check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a supported body mismatch remains in the body-check slice");
+        };
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+        assert!(diagnostics.iter().all(|diagnostic| diagnostic.code
+            == sai_diagnostics::Code::TypeMismatch
+            && diagnostic.message == "expected `I32`, found `Bool`"));
+        let initializer_start = root
+            .find("value < 1")
+            .expect("mismatched initializer exists") as u32;
+        assert_eq!(
+            diagnostics[0]
+                .primary()
+                .expect("initializer mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(initializer_start),
+                sai_diagnostics::TextSize::new(initializer_start + "value < 1".len() as u32),
+            )
+            .expect("initializer span is ordered")
+        );
+        let tail_start = root
+            .rfind("result")
+            .expect("mismatched return expression exists") as u32;
+        assert_eq!(
+            diagnostics[1]
+                .primary()
+                .expect("return mismatch has a primary span")
+                .span
+                .range,
+            sai_diagnostics::TextRange::new(
+                sai_diagnostics::TextSize::new(tail_start),
+                sai_diagnostics::TextSize::new(tail_start + "result".len() as u32),
+            )
+            .expect("return mismatch span is ordered")
         );
     }
 

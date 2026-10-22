@@ -1,0 +1,98 @@
+use acme:webhook-delivery-audit/model.{
+    DeliveryAttempt
+    DeliveryAudit
+    DeliveryOutcome
+    DeliveryRequest
+    DeliveryState
+    empty_audit
+    empty_outcome
+}
+use acme:webhook-delivery-audit/policy
+
+fn has_seen_key(audit: DeliveryAudit, request: DeliveryRequest) -> Bool {
+    for index in 0..audit.length {
+        match audit.outcomes[index] {
+            Some(previous) => {
+                if (
+                    previous.request.endpoint == request.endpoint
+                    and previous.request.idempotency_key == request.idempotency_key
+                ) {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+fn attempt_minute(request: DeliveryRequest, prior_attempt_count: USize) -> U32 {
+    var minute = request.created_minute
+    for prior_attempt in 0..prior_attempt_count {
+        minute += policy.retry_delay_after(prior_attempt + 1)
+    }
+    minute
+}
+
+fn schedule_one(audit: DeliveryAudit, request: DeliveryRequest) -> DeliveryOutcome {
+    if has_seen_key(audit, request) {
+        return empty_outcome(request, DeliveryState.DuplicateSuppressed)
+    }
+
+    if request.response_count == 0 or request.response_count > request.response_codes.len() {
+        return empty_outcome(request, DeliveryState.IncompleteScript)
+    }
+
+    var attempts = Array<Option<DeliveryAttempt>, 4>.filled(None)
+    var attempt_count: USize = 0
+    var state = DeliveryState.IncompleteScript
+    var finished = false
+
+    for response_index in 0..request.response_count {
+        if not finished {
+            let response_code = request.response_codes[response_index]
+            attempts[attempt_count] = Some(
+                DeliveryAttempt(
+                    number: attempt_count + 1,
+                    minute: attempt_minute(request, attempt_count),
+                    response_code: response_code,
+                ),
+            )
+            attempt_count += 1
+
+            match policy.classify_response(response_code) {
+                ResponseClass.Accepted => {
+                    state = DeliveryState.Delivered
+                    finished = true
+                }
+                ResponseClass.Permanent => {
+                    state = DeliveryState.PermanentFailure
+                    finished = true
+                }
+                ResponseClass.Retryable => {
+                    if attempt_count >= policy.maximum_attempts() {
+                        state = DeliveryState.RetryExhausted
+                        finished = true
+                    }
+                }
+            }
+        }
+    }
+
+    DeliveryOutcome(
+        request: request,
+        state: state,
+        attempts: attempts,
+        attempt_count: attempt_count,
+    )
+}
+
+pub fn schedule(requests: Array<DeliveryRequest, 9>) -> DeliveryAudit {
+    var audit = empty_audit()
+    for request in requests {
+        let outcome = schedule_one(audit, request)
+        audit.outcomes[audit.length] = Some(outcome)
+        audit.length += 1
+    }
+    audit
+}

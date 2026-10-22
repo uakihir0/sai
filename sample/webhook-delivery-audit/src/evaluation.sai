@@ -1,0 +1,202 @@
+use acme:webhook-delivery-audit/data
+use acme:webhook-delivery-audit/model.{
+    DeliveryAudit
+    DeliveryOutcome
+    DeliveryState
+    DeliverySummary
+    ResponseClass
+}
+use acme:webhook-delivery-audit/policy
+
+fn has_earlier_key(audit: DeliveryAudit, before_index: USize, outcome: DeliveryOutcome) -> Bool {
+    for index in 0..before_index {
+        match audit.outcomes[index] {
+            Some(previous) => {
+                if (
+                    previous.request.endpoint == outcome.request.endpoint
+                    and previous.request.idempotency_key == outcome.request.idempotency_key
+                ) {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+fn expected_attempt_minute(outcome: DeliveryOutcome, zero_based_attempt: USize) -> U32 {
+    var minute = outcome.request.created_minute
+    for prior_attempt in 0..zero_based_attempt {
+        minute += policy.retry_delay_after(prior_attempt + 1)
+    }
+    minute
+}
+
+fn all_attempt_slots_after_are_empty(outcome: DeliveryOutcome) -> Bool {
+    for index in outcome.attempt_count..outcome.attempts.len() {
+        match outcome.attempts[index] {
+            Some(_) => {
+                return false
+            }
+            None => {}
+        }
+    }
+    true
+}
+
+fn outcome_is_valid(audit: DeliveryAudit, index: USize, outcome: DeliveryOutcome) -> Bool {
+    let is_duplicate = has_earlier_key(audit, index, outcome)
+    if is_duplicate {
+        return (
+            outcome.state == DeliveryState.DuplicateSuppressed
+            and outcome.attempt_count == 0
+            and all_attempt_slots_after_are_empty(outcome)
+        )
+    }
+
+    if (
+        outcome.state == DeliveryState.DuplicateSuppressed
+        or outcome.state == DeliveryState.IncompleteScript
+        or outcome.attempt_count == 0
+        or outcome.attempt_count > policy.maximum_attempts()
+    ) {
+        return false
+    }
+
+    for attempt_index in 0..outcome.attempt_count {
+        match outcome.attempts[attempt_index] {
+            Some(attempt) => {
+                if (
+                    attempt.number != attempt_index + 1
+                    or attempt.minute != expected_attempt_minute(outcome, attempt_index)
+                    or attempt.response_code != outcome.request.response_codes[attempt_index]
+                ) {
+                    return false
+                }
+
+                let response_class = policy.classify_response(attempt.response_code)
+                if (
+                    attempt_index + 1 < outcome.attempt_count
+                    and response_class != ResponseClass.Retryable
+                ) {
+                    return false
+                }
+
+                if attempt_index + 1 == outcome.attempt_count {
+                    match outcome.state {
+                        DeliveryState.Delivered => {
+                            if response_class != ResponseClass.Accepted {
+                                return false
+                            }
+                        }
+                        DeliveryState.PermanentFailure => {
+                            if response_class != ResponseClass.Permanent {
+                                return false
+                            }
+                        }
+                        DeliveryState.RetryExhausted => {
+                            if (
+                                response_class != ResponseClass.Retryable
+                                or outcome.attempt_count != policy.maximum_attempts()
+                            ) {
+                                return false
+                            }
+                        }
+                        _ => {
+                            return false
+                        }
+                    }
+                }
+            }
+            None => {
+                return false
+            }
+        }
+    }
+
+    all_attempt_slots_after_are_empty(outcome)
+}
+
+pub fn is_valid(audit: DeliveryAudit) -> Bool {
+    let requests = data.requests()
+    if audit.length != requests.len() {
+        return false
+    }
+
+    for index in 0..audit.length {
+        match audit.outcomes[index] {
+            Some(outcome) => {
+                if (
+                    outcome.request != requests[index]
+                    or not outcome_is_valid(audit, index, outcome)
+                ) {
+                    return false
+                }
+            }
+            None => {
+                return false
+            }
+        }
+    }
+    true
+}
+
+pub fn summarize(audit: DeliveryAudit) -> DeliverySummary {
+    if not is_valid(audit) {
+        return DeliverySummary(
+            request_count: audit.length,
+            delivered_count: 0,
+            permanent_failure_count: 0,
+            retry_exhausted_count: 0,
+            duplicate_suppressed_count: 0,
+            incomplete_script_count: 0,
+            attempt_count: 0,
+            valid: false,
+        )
+    }
+
+    var delivered: USize = 0
+    var permanent_failure: USize = 0
+    var retry_exhausted: USize = 0
+    var duplicate_suppressed: USize = 0
+    var incomplete_script: USize = 0
+    var attempts: USize = 0
+
+    for index in 0..audit.length {
+        match audit.outcomes[index] {
+            Some(outcome) => {
+                attempts += outcome.attempt_count
+                match outcome.state {
+                    DeliveryState.Delivered => {
+                        delivered += 1
+                    }
+                    DeliveryState.PermanentFailure => {
+                        permanent_failure += 1
+                    }
+                    DeliveryState.RetryExhausted => {
+                        retry_exhausted += 1
+                    }
+                    DeliveryState.DuplicateSuppressed => {
+                        duplicate_suppressed += 1
+                    }
+                    DeliveryState.IncompleteScript => {
+                        incomplete_script += 1
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    DeliverySummary(
+        request_count: audit.length,
+        delivered_count: delivered,
+        permanent_failure_count: permanent_failure,
+        retry_exhausted_count: retry_exhausted,
+        duplicate_suppressed_count: duplicate_suppressed,
+        incomplete_script_count: incomplete_script,
+        attempt_count: attempts,
+        valid: true,
+    )
+}

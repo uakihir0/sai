@@ -1,0 +1,72 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ResponseClass {
+    Accepted
+    Retryable
+    Permanent
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum DeliveryState {
+    Delivered
+    PermanentFailure
+    RetryExhausted
+    DuplicateSuppressed
+    IncompleteScript
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DeliveryRequest {
+    pub id: U32
+    pub endpoint: Str
+    pub idempotency_key: Str
+    pub event_name: Str
+    pub created_minute: U32
+    pub response_codes: Array<U16, 4>
+    pub response_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DeliveryAttempt {
+    pub number: USize
+    pub minute: U32
+    pub response_code: U16
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DeliveryOutcome {
+    pub request: DeliveryRequest
+    pub state: DeliveryState
+    pub attempts: Array<Option<DeliveryAttempt>, 4>
+    pub attempt_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DeliveryAudit {
+    pub outcomes: Array<Option<DeliveryOutcome>, 9>
+    pub length: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DeliverySummary {
+    pub request_count: USize
+    pub delivered_count: USize
+    pub permanent_failure_count: USize
+    pub retry_exhausted_count: USize
+    pub duplicate_suppressed_count: USize
+    pub incomplete_script_count: USize
+    pub attempt_count: USize
+    pub valid: Bool
+}
+
+pub fn empty_audit() -> DeliveryAudit {
+    DeliveryAudit(outcomes: Array<Option<DeliveryOutcome>, 9>.filled(None), length: 0)
+}
+
+pub fn empty_outcome(request: DeliveryRequest, state: DeliveryState) -> DeliveryOutcome {
+    DeliveryOutcome(
+        request: request,
+        state: state,
+        attempts: Array<Option<DeliveryAttempt>, 4>.filled(None),
+        attempt_count: 0,
+    )
+}
