@@ -832,7 +832,7 @@ world image_service {
 
 ### D-TOOL-02 Symbol identity
 
-- A symbol ID has the form `symbol://<ns>:<pkg>/<module path>/<item>[/<member>]#<6 hex digits>`. The hex part is computed deterministically from the symbol's canonical path when the symbol is first seen (a hash of the path, with probing on collision), and persisted in `.sai/index`; it survives renames and moves. The exact computation is in [impl/12](../impl/12-semantic-tooling.md) §12.2.3.
+- A symbol ID has the valid URI form `symbol://<ns>%3A<pkg>/<module path>/<item>[/<member>]#<6 hex digits>`. The package separator is percent-encoded because a raw colon in an authority is a port delimiter. The hex part is computed deterministically from the symbol's canonical path when the symbol is first seen (a hash of the path, with probing on collision), and persisted in `.sai/index`; it survives renames and moves. The exact computation is in [impl/12](../impl/12-semantic-tooling.md) §12.2.3.
 - A node ID has the form `<kind>:<hex>` and is valid within one document snapshot (version).
 
 ### D-TOOL-03 Additional CLI commands

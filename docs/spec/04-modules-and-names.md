@@ -733,14 +733,14 @@ acme:user.User.create                         item of the root module of acme:us
 
 ### 4.9.2 Mapping to symbol IDs
 
-A symbol ID has the form `symbol://<ns>:<pkg>/<module path>/<item>[/<member>]#<6 hex digits>` (D-TOOL-02). It is built from the canonical path by:
+A symbol ID has the form `symbol://<ns>%3A<pkg>/<module path>/<item>[/<member>]#<6 hex digits>` (D-TOOL-02). The `%3A` encodes the package separator as a byte in the URI authority; a literal colon there would be interpreted as a port delimiter. It is built from the canonical path by:
 
-1. writing `symbol://` and the `PackageId`;
+1. writing `symbol://` and the `PackageId`, with its namespace/package separator encoded as `%3A`;
 2. for a non-root module, appending `/` and the module path. For the root module, nothing is appended (C-08);
 3. appending `/` and each `Component` without its leading `.`, percent-encoded as in [impl/12](../impl/12-semantic-tooling.md) §12.2.2;
 4. appending `#` and the persistent hex identifier ([impl/12](../impl/12-semantic-tooling.md) §12.2.3).
 
-So `acme:user.User.create` becomes `symbol://acme:user/User/create#8F21A7` (C-08). The identity of a symbol is the pair of its package node (a package identity and a compatibility line, [package/02](../package/02-resolver.md) §2.1) and its hex part; within one package node no two symbols have the same hex part. The hex part is computed from the canonical path when the symbol is first seen and persists across renames and moves ([impl/12](../impl/12-semantic-tooling.md) §12.2.3, §12.2.4, N-H-65). The path part is descriptive and changes on rename or move ([impl/12](../impl/12-semantic-tooling.md) §12.2.2).
+So `acme:user.User.create` becomes `symbol://acme%3Auser/User/create#8F21A7` (C-08). The identity of a symbol is the pair of its package node (a package identity and a compatibility line, [package/02](../package/02-resolver.md) §2.1) and its hex part; within one package node no two symbols have the same hex part. The hex part is computed from the canonical path when the symbol is first seen and persists across renames and moves ([impl/12](../impl/12-semantic-tooling.md) §12.2.3, §12.2.4, N-H-65). The path part is descriptive and changes on rename or move ([impl/12](../impl/12-semantic-tooling.md) §12.2.2).
 
 ## 4.10 Stages
 

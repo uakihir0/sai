@@ -11,6 +11,7 @@ members = [
     "crates/sai_package",
     "crates/sai_query",
     "crates/sai_resolve",
+    "crates/sai_semantic",
     "crates/sai_stable_hash",
     "crates/sai_syntax",
     "crates/sai_ty",

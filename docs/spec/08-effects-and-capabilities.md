@@ -49,7 +49,7 @@ There are exactly three kinds of effect atom:
 
 1. A **built-in effect**: one of the fifteen names of §8.3 (D-EFF-03). Built-in effects are global; their identity is their name.
 2. An **interface effect**: the effect of calling a function of an imported WIT interface (D-EFF-03, §8.5). Its identity is the versionless interface name `ns:pkg/iface` (for example `wasi:http/outgoing-handler`). The version of the interface is fixed by the resolved dependency graph and recorded in `sai.lock` ([package/03](../package/03-lock-file.md)); it is not part of the atom (N-D-1).
-3. A **user effect**: an effect declared with `effect` (§8.4). Its identity is its declaring symbol (`symbol://ns:pkg/module/name`, D-TOOL-02), not the path used to name it.
+3. A **user effect**: an effect declared with `effect` (§8.4). Its identity is its declaring symbol (`symbol://ns%3Apkg/module/name`, D-TOOL-02), not the path used to name it.
 
 Two atoms are equal exactly when they are of the same kind and have the same identity. Paths, aliases and re-exports never create new atoms.
 

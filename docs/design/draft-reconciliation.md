@@ -282,7 +282,7 @@ The draft's examples (`memory.linear`, `virtual memory`, `gpu buffers`, ...) des
 
 ### C-08 Symbol ID format (draft §64)
 
-The draft's example `symbol://acme:user/User/create#8F21A7` matches the final format `symbol://<ns>:<pkg>/<module path>/<item>[/<member>]#<6 hex digits>`, with an empty module path for the root module (D-TOOL-02).
+The draft's example `symbol://acme%3Auser/User/create#8F21A7` matches the final format `symbol://<ns>%3A<pkg>/<module path>/<item>[/<member>]#<6 hex digits>`, with an empty module path for the root module (D-TOOL-02). The package separator is percent-encoded to make the URI authority valid.
 
 ### C-09 The tiny profile does not strip exports (draft §46)
 
