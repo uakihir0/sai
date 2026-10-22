@@ -1,0 +1,68 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Candidate {
+    pub id: U32
+    pub name: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Ballot {
+    pub ballot_id: U32
+    pub preference_count: USize
+    pub preferences: Array<Option<U32>, 3>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Election {
+    pub candidate_count: USize
+    pub candidates: Array<Option<Candidate>, 3>
+    pub ballot_count: USize
+    pub ballots: Array<Option<Ballot>, 8>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum InputError {
+    CandidateCountOutOfRange
+    CandidateSlotsNotPacked
+    DuplicateCandidateId
+    TooManyBallots
+    BallotSlotsNotPacked
+    DuplicateBallotId
+    PreferenceCountOutOfRange
+    PreferenceSlotsNotPacked
+    UnknownCandidateId
+    DuplicatePreferenceId
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RoundStatus {
+    WinnerSelected
+    CandidateEliminated
+    NoActiveBallots
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RoundResult {
+    pub round_number: USize
+    pub candidate_ids: Array<Option<U32>, 3>
+    pub continuing: Array<Bool, 3>
+    pub votes: Array<USize, 3>
+    pub active_ballot_count: USize
+    pub exhausted_ballot_count: USize
+    pub majority_required: USize
+    pub status: RoundStatus
+    pub outcome_candidate_id: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ElectionAudit {
+    pub rounds: Array<Option<RoundResult>, 3>
+    pub round_count: USize
+    pub winner_id: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Tally {
+    pub votes: Array<USize, 3>
+    pub active_ballot_count: USize
+    pub exhausted_ballot_count: USize
+}

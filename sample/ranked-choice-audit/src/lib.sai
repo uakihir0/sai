@@ -1,0 +1,170 @@
+use acme:ranked-choice-audit/audit
+use acme:ranked-choice-audit/fixtures
+use acme:ranked-choice-audit/model.{ElectionAudit, InputError, RoundStatus}
+
+pub fn primary_audit() -> Result<ElectionAudit, InputError> {
+    audit.audit(fixtures.tied_first_round_with_exhaustion())
+}
+
+pub fn half_boundary_audit() -> Result<ElectionAudit, InputError> {
+    audit.audit(fixtures.exactly_half_is_not_a_majority())
+}
+
+pub fn first_round_majority_audit() -> Result<ElectionAudit, InputError> {
+    audit.audit(fixtures.first_round_majority())
+}
+
+test "the tied minimum removes the highest candidate ID and later counts exhaustion" {
+    match primary_audit() {
+        Ok(result) => {
+            assert result.winner_id == Some(10)
+            assert result.round_count == 2
+            match result.rounds[0] {
+                Some(round) => {
+                    assert round.status == RoundStatus.CandidateEliminated
+                    assert round.outcome_candidate_id == Some(30)
+                    assert round.votes[0] == 2
+                    assert round.votes[1] == 2
+                    assert round.votes[2] == 2
+                    assert round.active_ballot_count == 6
+                    assert round.exhausted_ballot_count == 0
+                    assert round.majority_required == 4
+                }
+                None => {
+                    assert false
+                }
+            }
+            match result.rounds[1] {
+                Some(round) => {
+                    assert round.status == RoundStatus.WinnerSelected
+                    assert round.outcome_candidate_id == Some(10)
+                    assert round.votes[0] == 3
+                    assert round.votes[1] == 2
+                    assert round.votes[2] == 0
+                    assert round.continuing[0]
+                    assert round.continuing[1]
+                    assert not round.continuing[2]
+                    assert round.active_ballot_count == 5
+                    assert round.exhausted_ballot_count == 1
+                    assert round.majority_required == 3
+                    assert (round.active_ballot_count + round.exhausted_ballot_count == 6)
+                }
+                None => {
+                    assert false
+                }
+            }
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "three of five votes is a strict majority in the first round" {
+    match first_round_majority_audit() {
+        Ok(result) => {
+            assert result.winner_id == Some(10)
+            assert result.round_count == 1
+            match result.rounds[0] {
+                Some(round) => {
+                    assert round.status == RoundStatus.WinnerSelected
+                    assert round.votes[0] == 3
+                    assert round.votes[1] == 1
+                    assert round.votes[2] == 1
+                    assert round.active_ballot_count == 5
+                    assert round.exhausted_ballot_count == 0
+                    assert round.majority_required == 3
+                }
+                None => {
+                    assert false
+                }
+            }
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "exactly half fails the threshold before transfer creates a majority" {
+    match half_boundary_audit() {
+        Ok(result) => {
+            assert result.winner_id == Some(10)
+            assert result.round_count == 2
+            match result.rounds[0] {
+                Some(round) => {
+                    assert round.status == RoundStatus.CandidateEliminated
+                    assert round.outcome_candidate_id == Some(30)
+                    assert round.votes[0] == 2
+                    assert round.active_ballot_count == 4
+                    assert round.majority_required == 3
+                }
+                None => {
+                    assert false
+                }
+            }
+            match result.rounds[1] {
+                Some(round) => {
+                    assert round.status == RoundStatus.WinnerSelected
+                    assert round.outcome_candidate_id == Some(10)
+                    assert round.votes[0] == 3
+                    assert round.votes[1] == 1
+                    assert round.votes[2] == 0
+                    assert round.majority_required == 3
+                }
+                None => {
+                    assert false
+                }
+            }
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "an election with no ballots has no winner and reports no active ballots" {
+    match audit.audit(fixtures.no_ballots()) {
+        Ok(result) => {
+            assert result.winner_id == None
+            assert result.round_count == 1
+            match result.rounds[0] {
+                Some(round) => {
+                    assert round.status == RoundStatus.NoActiveBallots
+                    assert round.active_ballot_count == 0
+                    assert round.exhausted_ballot_count == 0
+                    assert round.majority_required == 0
+                }
+                None => {
+                    assert false
+                }
+            }
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "invalid preference references and duplicates are rejected" {
+    assert (audit.audit(fixtures.duplicate_preference()) == Err(InputError.DuplicatePreferenceId))
+    assert (audit.audit(fixtures.duplicate_candidate_id()) == Err(InputError.DuplicateCandidateId))
+    assert (audit.audit(fixtures.duplicate_ballot_id()) == Err(InputError.DuplicateBallotId))
+    assert (
+        audit.audit(fixtures.unknown_candidate_preference()) == Err(InputError.UnknownCandidateId)
+    )
+}
+
+test "unpacked preferences and candidate counts beyond capacity are rejected" {
+    assert (
+        audit.audit(fixtures.unpacked_preferences()) == Err(InputError.PreferenceSlotsNotPacked)
+    )
+    assert (
+        audit.audit(fixtures.candidate_count_over_capacity())
+        == Err(InputError.CandidateCountOutOfRange)
+    )
+}
+
+test "a count beyond fixed ballot capacity is rejected before indexing" {
+    assert (audit.audit(fixtures.count_over_capacity()) == Err(InputError.TooManyBallots))
+}
