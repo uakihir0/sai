@@ -21,9 +21,12 @@ fn print_reason(out: borrow mut Stdout, reason: HoldReason)
         HoldReason.NoRoute => out.write_str("no route serves the destination")
         HoldReason.TransitTooSlow => out.write_str("no route meets the transit limit")
         HoldReason.DeliveryTooLate => out.write_str("no route can deliver by the requested day")
-        HoldReason.ColdChainUnavailable => out.write_str("no timely warehouse can handle the cold-chain items")
-        HoldReason.InventoryShortfall => out.write_str("eligible stock is insufficient at one warehouse")
-        HoldReason.LaneCapacity => out.write_str("order exceeds the lane's remaining daily weight capacity")
+        HoldReason.ColdChainUnavailable =>
+            out.write_str("no timely warehouse can handle the cold-chain items")
+        HoldReason.InventoryShortfall =>
+            out.write_str("eligible stock is insufficient at one warehouse")
+        HoldReason.LaneCapacity =>
+            out.write_str("order exceeds the lane's remaining daily weight capacity")
         HoldReason.NoFeasibleRoute => out.write_str("no complete route passed every constraint")
     }
 }

@@ -1,4 +1,11 @@
-use acme:warehouse-fulfillment/model.{FulfillmentOrder, OrderLine, ShippingRoute, Sku, StockLot, Warehouse}
+use acme:warehouse-fulfillment/model.{
+    FulfillmentOrder
+    OrderLine
+    ShippingRoute
+    Sku
+    StockLot
+    Warehouse
+}
 
 pub fn fulfillment_day() -> U32 {
     40
@@ -43,7 +50,6 @@ pub fn warehouses() -> Array<Warehouse, 3> {
 
 pub fn stock_lots() -> Array<StockLot, 9> {
     [
-        // Day 44 is too soon for the chilled meal's five-day shelf-life rule.
         StockLot(lot_id: 101, warehouse_id: 1, sku: "COLD-MEAL", units: 1, best_before_day: 44),
         StockLot(lot_id: 102, warehouse_id: 1, sku: "COLD-MEAL", units: 4, best_before_day: 48),
         StockLot(lot_id: 103, warehouse_id: 1, sku: "LANTERN", units: 3, best_before_day: 0),

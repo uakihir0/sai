@@ -1,6 +1,13 @@
 use acme:warehouse-fulfillment/data
 use acme:warehouse-fulfillment/inventory
-use acme:warehouse-fulfillment/model.{FulfillmentOrder, HoldReason, ShippingRoute, Shipment, Sku, Warehouse}
+use acme:warehouse-fulfillment/model.{
+    FulfillmentOrder
+    HoldReason
+    Shipment
+    ShippingRoute
+    Sku
+    Warehouse
+}
 use acme:warehouse-fulfillment/policy
 
 fn demanded_units(order: FulfillmentOrder, code: Str) -> U32 {
