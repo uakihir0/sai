@@ -161,8 +161,8 @@ struct LiteralVariable<'hir> {
 /// Char-left bitwise diagnostics accept resolved numeric literal computations
 /// through unannotated plain-path copies when no additional literal site exists.
 /// They also defer through unannotated copies of direct integer-literal
-/// addition, subtraction, bitwise, and wrapping-arithmetic pairs, preserving
-/// both literal sites on the shared inference variable.
+/// addition, subtraction, multiplication, bitwise, and wrapping-arithmetic
+/// pairs, preserving both literal sites on the shared inference variable.
 /// Unary `~` accepts direct integer/Byte literals and concrete integer/Byte paths.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
@@ -184,6 +184,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         resolved_computed_literal_paths: HashSet::new(),
         unannotated_integer_addition_pair_paths: HashSet::new(),
         unannotated_integer_subtraction_pair_paths: HashSet::new(),
+        unannotated_integer_multiplication_pair_paths: HashSet::new(),
         unannotated_integer_wrapping_pair_paths: HashSet::new(),
         unannotated_integer_bitwise_pair_paths: HashSet::new(),
         direct_unannotated_float_literals: HashSet::new(),
@@ -211,6 +212,7 @@ struct FnCtxt<'a, 'hir> {
     resolved_computed_literal_paths: HashSet<BindingId>,
     unannotated_integer_addition_pair_paths: HashSet<BindingId>,
     unannotated_integer_subtraction_pair_paths: HashSet<BindingId>,
+    unannotated_integer_multiplication_pair_paths: HashSet<BindingId>,
     unannotated_integer_wrapping_pair_paths: HashSet<BindingId>,
     unannotated_integer_bitwise_pair_paths: HashSet<BindingId>,
     direct_unannotated_float_literals: HashSet<BindingId>,
@@ -557,6 +559,33 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         }
 
+        let has_direct_integer_multiplication_literal_pair = matches!(
+            init.kind,
+            ExprKind::Binary(
+                BinOp::Mul,
+                left,
+                right
+            ) if matches!(
+                left.kind,
+                ExprKind::Lit(Lit::Int { .. })
+            ) && matches!(
+                right.kind,
+                ExprKind::Lit(Lit::Int { .. })
+            )
+        );
+        if annotation.is_none() && has_direct_integer_multiplication_literal_pair {
+            if let LocalType::LiteralVariable(id) = local_type {
+                if self.literal_variables.get(id).is_some_and(|variable| {
+                    variable.kind == PrimitiveLiteralKind::Integer
+                        && variable.resolved.is_none()
+                        && variable.additional_site.is_some()
+                }) {
+                    self.unannotated_integer_multiplication_pair_paths
+                        .insert(binding);
+                }
+            }
+        }
+
         let has_direct_integer_wrapping_literal_pair = matches!(
             init.kind,
             ExprKind::Binary(
@@ -644,6 +673,18 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 annotation.is_some(),
             ) {
                 self.unannotated_integer_subtraction_pair_paths
+                    .insert(binding);
+            }
+
+            let source_has_integer_multiplication_pair_provenance = self
+                .unannotated_integer_multiplication_pair_paths
+                .contains(&source_binding);
+            if can_track_unannotated_integer_multiplication_pair_alias(
+                source_has_integer_multiplication_pair_provenance,
+                matches!(init.kind, ExprKind::Path(_)),
+                annotation.is_some(),
+            ) {
+                self.unannotated_integer_multiplication_pair_paths
                     .insert(binding);
             }
 
@@ -1137,6 +1178,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             self.is_eligible_unannotated_integer_addition_pair_path(right);
                         let eligible_unannotated_integer_subtraction_pair_path =
                             self.is_eligible_unannotated_integer_subtraction_pair_path(right);
+                        let eligible_unannotated_integer_multiplication_pair_path =
+                            self.is_eligible_unannotated_integer_multiplication_pair_path(right);
                         let eligible_unannotated_integer_wrapping_pair_path =
                             self.is_eligible_unannotated_integer_wrapping_pair_path(right);
                         let right_type = self
@@ -1149,6 +1192,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                                 && !eligible_unannotated_integer_bitwise_pair_path
                                 && !eligible_unannotated_integer_addition_pair_path
                                 && !eligible_unannotated_integer_subtraction_pair_path
+                                && !eligible_unannotated_integer_multiplication_pair_path
                                 && !eligible_unannotated_integer_wrapping_pair_path
                             {
                                 return Err(());
@@ -1168,6 +1212,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             && !eligible_unannotated_integer_bitwise_pair_path
                             && !eligible_unannotated_integer_addition_pair_path
                             && !eligible_unannotated_integer_subtraction_pair_path
+                            && !eligible_unannotated_integer_multiplication_pair_path
                             && !eligible_unannotated_integer_wrapping_pair_path
                         {
                             return Err(());
@@ -1188,6 +1233,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             eligible_unannotated_integer_bitwise_pair_path
                                 || eligible_unannotated_integer_addition_pair_path
                                 || eligible_unannotated_integer_subtraction_pair_path
+                                || eligible_unannotated_integer_multiplication_pair_path
                                 || eligible_unannotated_integer_wrapping_pair_path,
                         ) {
                             return Err(());
@@ -2058,6 +2104,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             })
     }
 
+    fn is_eligible_unannotated_integer_multiplication_pair_path(
+        &self,
+        expression: &Expr<'hir>,
+    ) -> bool {
+        self.plain_local_path_binding(expression)
+            .is_some_and(|binding| {
+                self.unannotated_integer_multiplication_pair_paths
+                    .contains(&binding)
+            })
+    }
+
     fn is_eligible_unannotated_integer_wrapping_pair_path(&self, expression: &Expr<'hir>) -> bool {
         self.plain_local_path_binding(expression)
             .is_some_and(|binding| {
@@ -2140,6 +2197,16 @@ fn can_track_unannotated_integer_subtraction_pair_alias(
     alias_has_annotation: bool,
 ) -> bool {
     source_has_integer_subtraction_pair_provenance
+        && initializer_is_plain_path
+        && !alias_has_annotation
+}
+
+fn can_track_unannotated_integer_multiplication_pair_alias(
+    source_has_integer_multiplication_pair_provenance: bool,
+    initializer_is_plain_path: bool,
+    alias_has_annotation: bool,
+) -> bool {
+    source_has_integer_multiplication_pair_provenance
         && initializer_is_plain_path
         && !alias_has_annotation
 }
@@ -2423,6 +2490,7 @@ mod tests {
         can_track_unannotated_integer_addition_pair_alias,
         can_track_unannotated_integer_bitwise_pair_alias,
         can_track_unannotated_integer_literal_alias,
+        can_track_unannotated_integer_multiplication_pair_alias,
         can_track_unannotated_integer_subtraction_pair_alias,
         can_track_unannotated_integer_wrapping_pair_alias,
         primitive_arithmetic_literal_expected_type, primitive_arithmetic_literal_left_result,
@@ -3221,6 +3289,26 @@ mod tests {
         assert!(
             !can_track_unannotated_integer_subtraction_pair_alias(true, false, false),
             "computed initializers do not propagate subtraction-pair provenance"
+        );
+    }
+
+    #[test]
+    fn integer_multiplication_pair_alias_tracking_requires_provenance_and_plain_paths() {
+        assert!(
+            can_track_unannotated_integer_multiplication_pair_alias(true, true, false),
+            "a direct integer-literal multiplication pair can source unannotated copies"
+        );
+        assert!(
+            !can_track_unannotated_integer_multiplication_pair_alias(true, true, true),
+            "annotated copies use the existing concrete-path behavior"
+        );
+        assert!(
+            !can_track_unannotated_integer_multiplication_pair_alias(false, true, false),
+            "other computed expressions do not gain multiplication-pair provenance"
+        );
+        assert!(
+            !can_track_unannotated_integer_multiplication_pair_alias(true, false, false),
+            "computed initializers do not propagate multiplication-pair provenance"
         );
     }
 }
