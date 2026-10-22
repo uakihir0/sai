@@ -47,7 +47,7 @@ The commands of draft §77 and D-TOOL-03 are all present. `sai lock` is required
 
 ### 13.1.3 Bounded inherent-method body slice
 
-The current `sai check` implementation accepts a narrow inherent-method body only when the complete root source contains one supported struct and its matching inherent impl. The receiver must be `self: borrow Self`; explicit parameters, return type, and directly accessed fields must use supported primitive types. In addition to the flat primitive-local forms, an immutable local may copy one direct `self.field` read as its complete initializer. The initializer's field type is checked against any local annotation. Unknown fields and all other uses of `self` remain behind `FEATURE_NOT_IMPLEMENTED`; this slice does not provide general field or method lookup.
+The current `sai check` implementation accepts a narrow inherent-method body only when the complete root source contains one supported struct and its matching inherent impl. The receiver must be `self: borrow Self`; explicit parameters, return type, and directly accessed fields must use supported primitive types. In addition to the flat primitive-local forms, an immutable local may copy one direct `self.field` read as its complete initializer, and the block may return a direct `self.field` as its tail, including in a getter with no preceding statements. The field type is checked against any local annotation or the method return type. Unknown fields and all other uses of `self` remain behind `FEATURE_NOT_IMPLEMENTED`; this slice does not provide general field or method lookup.
 
 ---
 

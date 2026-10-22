@@ -4823,9 +4823,10 @@ impl TraitImplMemberTestOnlyResolution {
     ///
     /// Only public inherent methods in a non-generic safe impl with a first
     /// shared `Self` receiver used only as the base of a supported direct
-    /// primitive field initializer, named immutable primitive parameters, an
-    /// explicit primitive return type, and the supported primitive-local body
-    /// shape are checked; every other associated member is unsupported.
+    /// primitive field initializer or direct block-tail projection, named
+    /// immutable primitive parameters, an explicit primitive return type, and
+    /// the supported primitive-local body shape are checked; every other
+    /// associated member is unsupported.
     pub fn body_type_check(
         &self,
     ) -> Result<&FunctionBodyTypeCheck, &OwnerControlFlowResolutionError> {
@@ -6378,31 +6379,25 @@ fn check_inherent_method_body_type(
     let Some(field_types) = inherent_method_primitive_field_types(*self_ty, symbols, inputs) else {
         return Ok(FunctionBodyTypeCheck::Unsupported);
     };
-    let mut self_field_initializers = HashMap::new();
+    let mut self_field_projections = HashMap::new();
     for stmt in method_block.stmts {
         let StmtKind::Let { init, .. } = stmt.kind else {
             continue;
         };
-        let ExprKind::Field {
-            base,
-            name,
-            args: None,
-        } = init.kind
-        else {
-            continue;
-        };
-        if !is_direct_self_value_expression(base) {
-            continue;
+        if matches!(init.kind, ExprKind::Field { .. }) {
+            let Some(field_type) = primitive_self_field_type(init, &field_types, symbols) else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            self_field_projections.insert(init.hir_id, field_type);
         }
-        let Some(field_name) = symbols.resolve(name.sym).ok() else {
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        };
-        let Some(field_type) = field_types.get(field_name.as_ref()).copied() else {
-            // General field lookup and UNKNOWN_FIELD diagnostics are outside
-            // this bounded method-body slice.
-            return Ok(FunctionBodyTypeCheck::Unsupported);
-        };
-        self_field_initializers.insert(init.hir_id, field_type);
+    }
+    if let Some(tail) = method_block.tail {
+        if matches!(tail.kind, ExprKind::Field { .. }) {
+            let Some(field_type) = primitive_self_field_type(tail, &field_types, symbols) else {
+                return Ok(FunctionBodyTypeCheck::Unsupported);
+            };
+            self_field_projections.insert(tail.hir_id, field_type);
+        }
     }
 
     let explicit_sig = sai_hir::body::FnSig {
@@ -6420,7 +6415,7 @@ fn check_inherent_method_body_type(
         locals,
         type_paths,
         symbols,
-        Some(&self_field_initializers),
+        Some(&self_field_projections),
         inputs,
         snapshot,
         target_cfg,
@@ -6571,6 +6566,26 @@ fn is_direct_self_value_expression(expression: &HirExpr<'_>) -> bool {
     )
 }
 
+fn primitive_self_field_type(
+    expression: &HirExpr<'_>,
+    field_types: &HashMap<String, sai_resolve::prelude::PrimTy>,
+    symbols: &Interner,
+) -> Option<sai_resolve::prelude::PrimTy> {
+    let ExprKind::Field {
+        base,
+        name,
+        args: None,
+    } = expression.kind
+    else {
+        return None;
+    };
+    if !is_direct_self_value_expression(base) {
+        return None;
+    }
+    let field_name = symbols.resolve(name.sym).ok()?;
+    field_types.get(field_name.as_ref()).copied()
+}
+
 fn check_function_body_primitive_local_block(
     owner: &HirOwner<'_>,
     sig: sai_hir::body::FnSig<'_>,
@@ -6578,7 +6593,7 @@ fn check_function_body_primitive_local_block(
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
-    self_field_initializers: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
@@ -6627,18 +6642,28 @@ fn check_function_body_primitive_local_block(
     let ExprKind::Block(block) = body.value.kind else {
         return Ok(None);
     };
-    if block.safety != sai_hir::Safety::Safe || block.stmts.is_empty() {
+    if block.safety != sai_hir::Safety::Safe {
         return Ok(None);
     }
     let Some(tail) = block.tail else {
         return Ok(None);
     };
-    let ExprKind::Path(tail_path) = tail.kind else {
-        return Ok(None);
+    let is_supported_field_tail = matches!(tail.kind, ExprKind::Field { .. })
+        && self_field_projections.is_some_and(|fields| fields.contains_key(&tail.hir_id));
+    let tail_binding = match tail.kind {
+        ExprKind::Path(tail_path) => {
+            let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
+            else {
+                return Ok(None);
+            };
+            Some(tail_binding)
+        }
+        ExprKind::Field { .. } if is_supported_field_tail => None,
+        _ => return Ok(None),
     };
-    let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs) else {
+    if block.stmts.is_empty() && !is_supported_field_tail {
         return Ok(None);
-    };
+    }
 
     // Track direct integer addition-pair provenance separately so Char
     // bitwise diagnostics can still be deferred through unannotated copies.
@@ -6737,7 +6762,7 @@ fn check_function_body_primitive_local_block(
         match init.kind {
             ExprKind::Lit(_) if is_direct_function_scalar_literal(init) => {}
             ExprKind::Field { .. }
-                if self_field_initializers
+                if self_field_projections
                     .is_some_and(|fields| fields.contains_key(&init.hir_id)) => {}
             ExprKind::Path(path) => {
                 let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
@@ -6869,7 +6894,7 @@ fn check_function_body_primitive_local_block(
         }
         preceding_bindings.insert(binding);
     }
-    if !preceding_bindings.contains(&tail_binding) {
+    if tail_binding.is_some_and(|binding| !preceding_bindings.contains(&binding)) {
         return Ok(None);
     }
 
@@ -6891,7 +6916,7 @@ fn check_function_body_primitive_local_block(
             return_type,
             initial_bindings: &initial_bindings,
             primitive_types: &primitive_types,
-            self_field_initializers,
+            self_field_projections,
             local_paths: &local_paths,
             symbols,
             pointer_width: target_cfg.pointer_width(),
