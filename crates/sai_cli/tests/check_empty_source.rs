@@ -2266,6 +2266,50 @@ fn primitive_wrapping_literal_pair_aliases_keep_inference_and_recovery() {
         start + expression.len(),
     );
 
+    let resolved_source = concat!(
+        "pub fn char_wrapping_pair_resolved_before_bitwise() -> Char {\n",
+        "    let pair = 5 *% 6\n",
+        "    let alias = pair\n",
+        "    let constrained: I32 = alias\n",
+        "    let value = 'h' ^ alias\n",
+        "    let recovered: Char = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let resolved_output = run_check(resolved_source, "", &[], &[]);
+    let resolved_stdout = String::from_utf8(resolved_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(resolved_output.status.code(), Some(1), "{resolved_stdout}");
+    assert_eq!(
+        resolved_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the earlier I32 constraint resolves the Char trait diagnostic immediately:\n{resolved_stdout}"
+    );
+    assert_eq!(
+        resolved_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        0,
+        "the Char result annotation and function tail recover without a type mismatch:\n{resolved_stdout}"
+    );
+    assert!(
+        !resolved_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !resolved_stdout.contains("\"type\":\"result\""),
+        "resolved wrapping-pair aliases should stay in the supported Char recovery path:\n{resolved_stdout}"
+    );
+    let expression = "'h' ^ alias";
+    let start = resolved_source
+        .find(expression)
+        .expect("resolved Char bitwise expression exists");
+    assert_json_diagnostic_primary_span(
+        &resolved_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `^` has no `BitXor<I32>` implementation for `Char`",
+        start,
+        start + expression.len(),
+    );
+
     let mismatch_source = concat!(
         "pub fn char_wrapping_pair_annotation_recovery() -> I32 {\n",
         "    let pair = 1 *% 2\n",
