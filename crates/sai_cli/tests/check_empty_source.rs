@@ -2315,6 +2315,133 @@ fn primitive_arithmetic_local_initializers_accept_left_numeric_literals() {
 }
 
 #[test]
+fn primitive_arithmetic_integer_literal_pairs_share_inference() {
+    let source = concat!(
+        "pub fn integer_pair_inference() -> U8 {\n",
+        "    let default_i64 = -9223372036854775808 + 0\n",
+        "    let annotated_i32: I32 = 2147483647 + 0\n",
+        "    let later_i8 = 100 + 27\n",
+        "    let selected_i8: I8 = later_i8\n",
+        "    let tail_u8 = 255 + 0\n",
+        "    tail_u8\n",
+        "}\n",
+    );
+
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn primitive_arithmetic_integer_literal_pairs_report_ranges_and_recover_mismatches() {
+    let source = concat!(
+        "pub fn recover_pairs() -> I64 {\n",
+        "    let default_i64 = 9223372036854775808 + 0\n",
+        "    let out_of_range: I8 = 128 + -129\n",
+        "    let recovered_range: I8 = out_of_range\n",
+        "    let incompatible: Bool = 1 + 2\n",
+        "    let recovered_bool: Bool = incompatible\n",
+        "    let output: I64 = 0\n",
+        "    output\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let default_i64_start = source
+        .find("9223372036854775808")
+        .expect("out-of-range default integer literal exists");
+    let signed_pair_start = source
+        .find("128 + -129")
+        .expect("out-of-range signed integer pair exists");
+    let mismatch_start = source
+        .find("1 + 2")
+        .expect("incompatible annotated integer pair exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        3,
+        "defaulting should check the first pair against I64 and both signed operands against I8:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the non-integer annotation should produce one initializer mismatch:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "diagnostics should recover through later local uses and both tails:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I64`",
+        default_i64_start,
+        default_i64_start + "9223372036854775808".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        signed_pair_start,
+        signed_pair_start + "128".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        signed_pair_start + "128 + ".len(),
+        signed_pair_start + "128 + -129".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found an integer literal",
+        mismatch_start,
+        mismatch_start + "1 + 2".len(),
+    );
+}
+
+#[test]
+fn primitive_integer_addition_pairs_preserve_char_bitwise_recovery() {
+    let source = concat!(
+        "pub fn char_pair_recovery() -> Char {\n",
+        "    let unrelated = 5 + 6\n",
+        "    let pair = 1 + 2\n",
+        "    let result = 'a' & pair\n",
+        "    let recovered: Char = result\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the Char operation should retain its missing-trait diagnostic:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "both arithmetic pairs should be checked and the Char result should recover:\n{stdout}"
+    );
+    let expression_start = source
+        .find("'a' & pair")
+        .expect("Char bitwise expression exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+        expression_start,
+        expression_start + "'a' & pair".len(),
+    );
+}
+
+#[test]
 fn primitive_arithmetic_left_literal_mismatches_keep_context_and_recover() {
     let source = concat!(
         "pub fn mismatches(f32_value: F32, f64_value: F64, integer: I32, narrow: I8) -> F32 {\n",
@@ -3028,8 +3155,6 @@ fn primitive_add_diagnostics_follow_source_order_after_shadowed_binding_resoluti
 #[test]
 fn unsupported_primitive_add_local_initializer_shapes_remain_gated() {
     for source in [
-        "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = 1 + 2\n    sum\n}\n",
-        "pub fn char_pair_with_unrelated_addition() -> Char {\n    let unrelated = 5 + 6\n    let pair = 1 + 2\n    let result = 'a' & pair\n    result\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let one = 1\n    let sum = one + right\n    sum\n}\n",
         "pub fn add(left: I32, right: I32) -> I32 {\n    let sum = (left + right) + left\n    sum\n}\n",
         "pub fn add(left: Byte, right: Byte) -> Byte {\n    let sum = left + right\n    sum\n}\n",
@@ -4630,10 +4755,8 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local(value: I32) -> I32 { let next = value; next }\n",
         "pub fn local() -> I32 {\nvar value: I32 = 42\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet var value: I32 = 42\nvalue\n}\n",
-        "pub fn local() -> I32 {\nlet value: I32 = 40 + 2\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\n{ value }\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nvar second: I32 = 2\nfirst\n}\n",
-        "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = 40 + 2\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nlet second: I32 = first % (1 + 0)\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet first: I32 = 1\nfirst\nfirst\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nlet copy: I32 = r#value\ncopy\n}\n",
@@ -4643,7 +4766,6 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
         "pub fn local() -> I32 {\nlet valueName: I32 = 42\nvalueName\n}\n",
         "pub fn local() -> I32 {\nlet r#value: I32 = 42\nr#value\n}\n",
         "pub fn local() -> I32 {\nlet value: I32 = 42\nr#value\n}\n",
-        "pub fn local() -> I32 {\nlet value = 40 + 2\nvalue\n}\n",
         "pub fn local() -> I32 {\nlet valueName = 42\nvalueName\n}\n",
         "pub fn local() -> I32 {\nlet r#value = 42\nr#value\n}\n",
         "pub fn local() -> I32 {\nlet value = 42\nr#value\n}\n",

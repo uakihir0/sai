@@ -6318,11 +6318,9 @@ fn check_function_body_primitive_local_block(
         return Ok(None);
     };
 
-    // A direct integer addition pair is admitted here only when the resulting
-    // local (or one of its plain-path copies) is actually used as the RHS of
-    // a Char-literal-left bitwise expression. The type checker tracks the
-    // narrower unannotated provenance; this driver prepass keeps unrelated
-    // arithmetic literal pairs outside the supported function-body slice.
+    // Track direct integer addition-pair provenance separately so Char
+    // bitwise diagnostics can still be deferred through unannotated copies.
+    // The arithmetic initializer itself is admitted independently below.
     let mut integer_addition_pair_roots = HashMap::new();
     let mut char_bitwise_rhs_roots = HashSet::new();
     for stmt in block.stmts {
@@ -6526,10 +6524,7 @@ fn check_function_body_primitive_local_block(
                                 && is_preceding_path(right))
                             || (operator == BinOp::Add
                                 && is_direct_function_integer_literal(left)
-                                && is_direct_function_integer_literal(right)
-                                && integer_addition_pair_roots
-                                    .get(&binding)
-                                    .is_some_and(|root| char_bitwise_rhs_roots.contains(root)))
+                                && is_direct_function_integer_literal(right))
                     }
                     BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                         (is_preceding_path(left) && is_preceding_path(right))
@@ -28237,6 +28232,106 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_accepts_flat_local_integer_addition_literal_pairs() {
+        let root = concat!(
+            "pub fn defaults_to_i64() -> I32 {\n",
+            "    let value = 1 + 2\n",
+            "    let output: I32 = 0\n",
+            "    output\n",
+            "}\n",
+            "pub fn annotation_selects_i32() -> I32 {\n",
+            "    let value: I32 = 2147483647 + 0\n",
+            "    value\n",
+            "}\n",
+            "pub fn later_annotation_selects_i8() -> I8 {\n",
+            "    let value = 100 + 27\n",
+            "    let selected: I8 = value\n",
+            "    selected\n",
+            "}\n",
+            "pub fn tail_selects_u8() -> U8 {\n",
+            "    let value = 255 + 0\n",
+            "    value\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 4);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("ordinary integer addition-pair body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the integer addition-pair slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_gates_other_flat_local_arithmetic_literal_pairs() {
+        let root = concat!(
+            "pub fn integer_subtraction() -> I64 {\n",
+            "    let value = 3 - 2\n",
+            "    value\n",
+            "}\n",
+            "pub fn integer_multiplication() -> I64 {\n",
+            "    let value = 3 * 2\n",
+            "    value\n",
+            "}\n",
+            "pub fn integer_division() -> I64 {\n",
+            "    let value = 6 / 2\n",
+            "    value\n",
+            "}\n",
+            "pub fn float_addition() -> F64 {\n",
+            "    let value = 1.0 + 2.0\n",
+            "    value\n",
+            "}\n",
+            "pub fn mixed_addition() -> I64 {\n",
+            "    let value = 1 + 2.0\n",
+            "    value\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 5);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            assert!(
+                matches!(
+                    owner.body_type_check(),
+                    Ok(FunctionBodyTypeCheck::Unsupported)
+                ),
+                "function owner {:?} (index {index}) must keep this literal pair gated",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_gates_other_integer_addition_pair_origins() {
         let root = concat!(
             "pub fn char_subtraction_alias() -> Char {\n",
@@ -30562,9 +30657,7 @@ mod tests {
             "type Number = I32\n",
             "pub fn mutable() -> I32 {\n    var value: I32 = 42\n    value\n}\n",
             "pub fn mutable_let() -> I32 {\n    let var value: I32 = 42\n    value\n}\n",
-            "pub fn computed() -> I32 {\n    let value: I32 = 40 + 2\n    value\n}\n",
             "pub fn multiple_mutable() -> I32 {\n    let first: I32 = 1\n    var second: I32 = 2\n    first\n}\n",
-            "pub fn multiple_computed() -> I32 {\n    let first: I32 = 1\n    let second: I32 = 40 + 2\n    first\n}\n",
             "pub fn multiple_expr_stmt() -> I32 {\n    let first: I32 = 1\n    first\n    first\n}\n",
             "pub fn raw_copy() -> I32 {\n    let value: I32 = 42\n    let copy: I32 = r#value\n    copy\n}\n",
             "pub fn forward_copy() -> I32 {\n    let first: I32 = second\n    let second: I32 = 2\n    first\n}\n",
@@ -30573,7 +30666,6 @@ mod tests {
             "pub fn nested() -> I32 {\n    let value: I32 = 42\n    { value }\n}\n",
             "pub fn camel_local() -> I32 {\n    let valueName: I32 = 42\n    valueName\n}\n",
             "pub fn raw_local() -> I32 {\n    let r#value: I32 = 42\n    r#value\n}\n",
-            "pub fn unannotated_computed() -> I32 {\n    let value = 40 + 2\n    value\n}\n",
             "pub fn unannotated_copy_from_constant() -> I32 {\n    let copy = ONE\n    copy\n}\n",
             "pub fn unannotated_copy_computed() -> I32 {\n    let source: I32 = 42\n    let copy = source % (1 + 0)\n    copy\n}\n",
             "pub fn unannotated_raw_copy() -> I32 {\n    let source: I32 = 42\n    let copy = r#source\n    copy\n}\n",
@@ -30597,7 +30689,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 22);
+        assert_eq!(resolved.owners().len(), 19);
         for owner in resolved.owners() {
             assert!(matches!(
                 owner
