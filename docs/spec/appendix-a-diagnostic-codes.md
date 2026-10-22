@@ -522,6 +522,7 @@ Codes owned by implementation documents (`impl/`). 44 codes.
 | `SOURCE_READ_FAILED` | error | [impl/01](../impl/01-architecture.md) | A file of a package unit is listed but cannot be read; data: `path`, `reason` (§1.7.2 rule 3) |
 | `STALE_SNAPSHOT` | error | [impl/12](../impl/12-semantic-tooling.md) | A request names a document version that is not the current one; JSON-RPC code `-32801` (§12.3.3, §12.5.2). |
 | `SYMBOL_INDEX_DISCARDED` | info | [impl/12](../impl/12-semantic-tooling.md) | The symbol index in `.sai/index/` is unreadable, has another format or version, or has an invalid file, and is discarded; `primary` is `null` (§12.9.3 rule 4). |
+| `SYMBOL_INDEX_RECOVERY_REQUIRED` | error | [impl/12](../impl/12-semantic-tooling.md) | An unresolved or invalid symbol-index journal blocks allocation and indexed edits (§12.9.3). |
 | `TARGET_NOT_RUNNABLE` | error | [impl/13](../impl/13-cli.md) | `sai run` was used with a target that is not a WASI target: a core target or a native target (§13.6.5). |
 | `TRAIT_ALREADY_IMPLEMENTED` | error | [impl/12](../impl/12-semantic-tooling.md) | `implement_trait`: the type already has an impl of the trait with the same arguments, written or derived (§12.6.13). |
 | `TYPE_TOO_LARGE` | error | [impl/06](../impl/06-wasm-lowering-and-layout.md) | The size of a reachable Mono type exceeds `MAX_OBJECT` (§6.4.1). Reported at the use that instantiated the type. |
@@ -538,4 +539,4 @@ Codes owned by implementation documents (`impl/`). 44 codes.
 
 ## A.6 Counts
 
-v0.1 defines 493 codes: 344 in spec, 101 in package, 4 in targets, 44 in impl. 28 of them are lints.
+v0.1 defines 494 codes: 344 in spec, 101 in package, 4 in targets, 45 in impl. 28 of them are lints.
