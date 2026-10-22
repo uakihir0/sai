@@ -2,6 +2,14 @@
 
 //! Stable symbol identifiers used by semantic tooling.
 
+mod canonical_path;
+mod symbol_index;
+
+pub use symbol_index::{
+    EncodedSymbolIndex, PackageIndexFileName, PackageIndexFileRecord, SymbolIndex,
+    SymbolIndexCodecError, SymbolIndexEntry, SymbolKind, UnvalidatedSymbolIndex,
+};
+
 use sai_stable_hash::StableHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
