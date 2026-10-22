@@ -1,0 +1,75 @@
+use acme:nonogram-solver/fixtures
+use acme:nonogram-solver/model.{Board, LineClue, Puzzle, PuzzleError, SolutionSummary}
+use acme:nonogram-solver/patterns
+use acme:nonogram-solver/solver
+
+const LINE_WIDTH: USize = 5
+
+fn column_pattern(board: Board, column: USize) -> U32 {
+    var pattern: U32 = 0
+    for row in 0..LINE_WIDTH {
+        if patterns.is_filled(board.rows[row], column) {
+            pattern |= 1 << row
+        }
+    }
+    pattern
+}
+
+pub fn summarize(puzzle: Puzzle, board: Board) -> SolutionSummary {
+    var all_clues_match = true
+    var filled_cells: USize = 0
+    for row in 0..LINE_WIDTH {
+        if not patterns.matches_clue(board.rows[row], puzzle.rows[row]) {
+            all_clues_match = false
+        }
+        for column in 0..LINE_WIDTH {
+            if patterns.is_filled(board.rows[row], column) {
+                filled_cells += 1
+            }
+        }
+    }
+
+    for column in 0..LINE_WIDTH {
+        let pattern = column_pattern(board, column)
+        if not patterns.matches_clue(pattern, puzzle.columns[column]) {
+            all_clues_match = false
+        }
+    }
+
+    SolutionSummary(all_clues_match: all_clues_match, filled_cells: filled_cells, checked_lines: 10)
+}
+
+test "the solved fixture satisfies every clue" {
+    let puzzle = fixtures.x_shape()
+    match solver.solve(puzzle) {
+        Ok(board) => {
+            let summary = summarize(puzzle, board)
+            assert summary.all_clues_match
+            assert summary.filled_cells == 9
+            assert summary.checked_lines == 10
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "the report rejects a changed completed row" {
+    let puzzle = fixtures.x_shape()
+    let board = Board(rows: [0, 0, 0, 0, 0])
+    let summary = summarize(puzzle, board)
+    assert not summary.all_clues_match
+    assert summary.filled_cells == 0
+}
+
+test "an impossible clue has no candidate patterns" {
+    let impossible = LineClue(runs: [Some(3), Some(3), None], run_count: 2)
+    match patterns.candidates(impossible) {
+        Err(PuzzleError.NoLinePattern) => {
+            assert true
+        }
+        _ => {
+            assert false
+        }
+    }
+}

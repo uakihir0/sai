@@ -24,9 +24,9 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     pub return_type: PrimTy,
     pub initial_bindings: &'a HashMap<BindingId, PrimTy>,
     pub primitive_types: &'a HashMap<HirId, PrimTy>,
-    /// Direct `self.field` initializer types resolved by the owner-aware
+    /// Direct `self.field` projection types resolved by the owner-aware
     /// driver. Other field expressions remain outside this body slice.
-    pub self_field_initializers: Option<&'a HashMap<HirId, PrimTy>>,
+    pub self_field_projections: Option<&'a HashMap<HirId, PrimTy>>,
     pub local_paths: &'a HashMap<HirId, BindingId>,
     pub symbols: &'a Interner,
     pub pointer_width: u8,
@@ -232,17 +232,25 @@ struct FnCtxt<'a, 'hir> {
 
 impl<'a, 'hir> FnCtxt<'a, 'hir> {
     fn check_block(&mut self, block: &Block<'hir>) -> Result<(), ()> {
-        if block.safety != Safety::Safe || block.stmts.is_empty() {
+        if block.safety != Safety::Safe {
             return Err(());
-        }
-
-        for stmt in block.stmts {
-            self.check_stmt(stmt)?;
         }
 
         let Some(tail) = block.tail else {
             return Err(());
         };
+        let is_supported_field_tail = matches!(tail.kind, ExprKind::Field { .. })
+            && self
+                .input
+                .self_field_projections
+                .is_some_and(|fields| fields.contains_key(&tail.hir_id));
+        if block.stmts.is_empty() && !is_supported_field_tail {
+            return Err(());
+        }
+        for stmt in block.stmts {
+            self.check_stmt(stmt)?;
+        }
+
         self.check_expr(tail)?;
         self.default_unresolved_literals();
         Ok(())
@@ -306,7 +314,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             ExprKind::Field { .. } => {
                 let Some(field_type) = self
                     .input
-                    .self_field_initializers
+                    .self_field_projections
                     .and_then(|fields| fields.get(&init.hir_id))
                     .copied()
                 else {
@@ -1983,7 +1991,16 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_expr(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
-        let local_type = self.check_local_path(expression)?;
+        let local_type = match expression.kind {
+            ExprKind::Field { .. } => LocalType::Concrete(
+                self.input
+                    .self_field_projections
+                    .and_then(|fields| fields.get(&expression.hir_id))
+                    .copied()
+                    .ok_or(())?,
+            ),
+            _ => self.check_local_path(expression)?,
+        };
         match local_type {
             LocalType::Concrete(found) => {
                 self.check_concrete_tail_type(found, expression.hir_id);

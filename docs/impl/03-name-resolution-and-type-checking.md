@@ -2410,6 +2410,8 @@ The direct integer-literal pair extension for wrapping operators is recorded in 
 
 **IR-829 direct primitive `self`-field initializer.** Within the same bounded public inherent-method slice, an immutable single-name local may be initialized from a directly declared primitive field using `let value = self.field`; the field expression is the complete initializer, its field type is taken from the method's single validated nominal struct, and an incompatible local annotation reports `TYPE_MISMATCH` on the complete field expression. The resulting local can be used by the existing flat-local rules. Unknown fields, field expressions in tails or operators, nested projections, generic member arguments, nonprimitive field types, and every other receiver use remain gated. This does not implement general field lookup, auto-deref, tuple fields, visibility diagnostics, method calls, or general method-body typing.
 
+**IR-830 direct primitive `self`-field return tail.** Within the same bounded public inherent-method slice, the block tail may directly return `self.field` when that field has a supported primitive type on the single validated nominal struct targeted by the inherent impl. This includes a getter body with no preceding statements. A return-type mismatch reports `TYPE_MISMATCH` on the full field projection. Unknown fields, generic member arguments, nested projections, operator operands, nonprimitive field types, and other receiver uses remain gated; this does not implement general field lookup, auto-deref, tuple fields, visibility diagnostics, method calls, or general method-body typing.
+
 ### 3.10.2 Coercions and adjustments
 
 ```rust
