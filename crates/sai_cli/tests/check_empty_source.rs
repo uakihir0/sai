@@ -1875,6 +1875,262 @@ fn primitive_integer_wrapping_operators_accept_left_integer_literals() {
 }
 
 #[test]
+fn primitive_integer_wrapping_operators_accept_integer_literal_pairs() {
+    for source in [
+        concat!(
+            "pub fn defaults_to_i64() -> I32 {\n",
+            "    let value = -9223372036854775808 +% 1\n",
+            "    let output: I32 = 0\n",
+            "    output\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn annotation_selects_i32() -> I32 {\n",
+            "    let value: I32 = 2147483647 -% 1\n",
+            "    value\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn later_annotation_selects_i8() -> I8 {\n",
+            "    let value = 100 *% 2\n",
+            "    let selected: I8 = value\n",
+            "    selected\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn tail_selects_u8() -> U8 {\n",
+            "    let value = 255 +% 0\n",
+            "    value\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn wrapped_result_is_not_evaluated() -> I8 {\n",
+            "    let value: I8 = 127 +% 1\n",
+            "    value\n",
+            "}\n",
+        ),
+    ] {
+        let output = run_check(source, "", &[], &[]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "integer wrapping literal pairs should share inference for this function:\n{source}\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_success_result(output, "wasm32-core", "dev");
+    }
+}
+
+#[test]
+fn primitive_integer_wrapping_literal_pairs_check_ranges_and_recover_annotations() {
+    let manifest = "targets { wasm32-core, wasm64-core }\n";
+    let default_source = concat!(
+        "pub fn default_range() -> I32 {\n",
+        "    let too_large = 9223372036854775808 +% 0\n",
+        "    let output: I32 = 0\n",
+        "    output\n",
+        "}\n",
+    );
+    let default_output = run_check(default_source, "", &[], &[]);
+    let default_stdout = String::from_utf8(default_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(default_output.status.code(), Some(1), "{default_stdout}");
+    assert_eq!(
+        default_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        1,
+        "{default_stdout}"
+    );
+    let too_large = default_source
+        .find("9223372036854775808")
+        .expect("out-of-range default literal exists");
+    assert_json_diagnostic_primary_span(
+        &default_stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I64`",
+        too_large,
+        too_large + "9223372036854775808".len(),
+    );
+
+    let narrow_source = concat!(
+        "pub fn narrow_ranges() -> I8 {\n",
+        "    let bad_operands: I8 = 128 -% -129\n",
+        "    let output: I8 = 0\n",
+        "    output\n",
+        "}\n",
+    );
+    let narrow_output = run_check(narrow_source, "", &[], &[]);
+    let narrow_stdout = String::from_utf8(narrow_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(narrow_output.status.code(), Some(1), "{narrow_stdout}");
+    assert_eq!(
+        narrow_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        2,
+        "each signed operand should be range-checked without evaluating subtraction:\n{narrow_stdout}"
+    );
+    for literal in ["128", "-129"] {
+        let start = narrow_source
+            .find(literal)
+            .expect("out-of-range I8 operand exists");
+        assert_json_diagnostic_primary_span(
+            &narrow_stdout,
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `I8`",
+            start,
+            start + literal.len(),
+        );
+    }
+
+    let pointer_source = concat!(
+        "pub fn pointer_ranges() -> USize {\n",
+        "    let unsigned_32: USize = 4294967295 +% 0\n",
+        "    let signed_minimum_32: ISize = -2147483648 -% 0\n",
+        "    let unsigned_64: USize = 18446744073709551615 *% 0\n",
+        "    let signed_minimum_64: ISize = -9223372036854775808 *% 0\n",
+        "    unsigned_32\n",
+        "}\n",
+    );
+    let wasm32 = run_check(pointer_source, manifest, &[], &["--target", "wasm32-core"]);
+    let wasm32_stdout = String::from_utf8(wasm32.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(wasm32.status.code(), Some(1), "{wasm32_stdout}");
+    assert_eq!(
+        wasm32_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        2,
+        "pointer-width wrapping literals must use wasm32 bounds:\n{wasm32_stdout}"
+    );
+    for (literal, message) in [
+        (
+            "18446744073709551615",
+            "integer literal is out of range for `USize`",
+        ),
+        (
+            "-9223372036854775808",
+            "integer literal is out of range for `ISize`",
+        ),
+    ] {
+        let start = pointer_source
+            .find(literal)
+            .expect("pointer-sized literal exists");
+        assert_json_diagnostic_primary_span(
+            &wasm32_stdout,
+            "LITERAL_OUT_OF_RANGE",
+            message,
+            start,
+            start + literal.len(),
+        );
+    }
+    let wasm64 = run_check(pointer_source, manifest, &[], &["--target", "wasm64-core"]);
+    assert_success_result(wasm64, "wasm64-core", "dev");
+
+    let mismatch_source = concat!(
+        "pub fn bool_recovery() -> Bool {\n",
+        "    let invalid: Bool = 1 *% 2\n",
+        "    let recovered: Bool = invalid\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let mismatch_output = run_check(mismatch_source, "", &[], &[]);
+    let mismatch_stdout = String::from_utf8(mismatch_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(mismatch_output.status.code(), Some(1), "{mismatch_stdout}");
+    assert_eq!(
+        mismatch_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "{mismatch_stdout}"
+    );
+    assert!(
+        !mismatch_stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && !mismatch_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !mismatch_stdout.contains("\"type\":\"result\""),
+        "a non-integer annotation should recover to Bool and keep later uses supported:\n{mismatch_stdout}"
+    );
+    let expression = mismatch_source
+        .find("1 *% 2")
+        .expect("annotated wrapping pair exists");
+    assert_json_diagnostic_primary_span(
+        &mismatch_stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found an integer literal",
+        expression,
+        expression + "1 *% 2".len(),
+    );
+}
+
+#[test]
+fn primitive_wrapping_literal_pair_provenance_does_not_extend_to_char_bitwise() {
+    for (name, operator) in [("add", "+%"), ("sub", "-%"), ("mul", "*%")] {
+        let source = format!(
+            concat!(
+                "pub fn char_{name}_pair_alias() -> Char {{\n",
+                "    let pair = 1 {operator} 2\n",
+                "    let value = 'a' & pair\n",
+                "    value\n",
+                "}}\n",
+            ),
+            name = name,
+            operator = operator,
+        );
+        assert_check_stays_gated(&run_check(&source, "", &[], &[]), &source);
+    }
+
+    let annotated_source = concat!(
+        "pub fn char_annotated_wrapping_pairs() -> Char {\n",
+        "    let added: I32 = 1 +% 2\n",
+        "    let subtracted: I32 = 3 -% 2\n",
+        "    let multiplied: I32 = 3 *% 2\n",
+        "    let a = 'a' & added\n",
+        "    let b = 'b' | subtracted\n",
+        "    let c = 'c' ^ multiplied\n",
+        "    c\n",
+        "}\n",
+    );
+    let annotated_output = run_check(annotated_source, "", &[], &[]);
+    let annotated_stdout = String::from_utf8(annotated_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        annotated_output.status.code(),
+        Some(1),
+        "{annotated_stdout}"
+    );
+    assert_eq!(
+        annotated_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        3,
+        "{annotated_stdout}"
+    );
+    assert!(
+        !annotated_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !annotated_stdout.contains("\"type\":\"result\""),
+        "explicit concrete types should keep the existing Char bitwise diagnostics:\n{annotated_stdout}"
+    );
+    for (expression, primitive) in [
+        ("'a' & added", "BitAnd<I32>"),
+        ("'b' | subtracted", "BitOr<I32>"),
+        ("'c' ^ multiplied", "BitXor<I32>"),
+    ] {
+        let start = annotated_source
+            .find(expression)
+            .expect("annotated wrapping pair Char use exists");
+        let end = start + expression.len();
+        let message = format!(
+            "operator `{}` has no `{primitive}` implementation for `Char`",
+            expression.split_whitespace().nth(1).unwrap()
+        );
+        assert_json_diagnostic_primary_span(
+            &annotated_stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &message,
+            start,
+            end,
+        );
+    }
+}
+
+#[test]
 fn primitive_wrapping_left_integer_literals_check_right_operand_first() {
     let mut source = String::from(
         "pub fn wrapping_non_integer_rhs(f32_value: F32, f64_value: F64, byte_value: Byte, bool_value: Bool, char_value: Char) -> I64 {\n",
@@ -3611,7 +3867,25 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn remainder_char_rhs(left: I32, right: Char) -> I32 {\n    let result = left % right\n    result\n}\n",
         "pub fn float_remainder() -> F64 {\n    let result = 1.0 % 2.0\n    result\n}\n",
         "pub fn mixed_remainder() -> I64 {\n    let result = 1 % 2.0\n    result\n}\n",
-        "pub fn wrapping_literal_literal() -> I32 {\n    let result = 1 +% 2\n    result\n}\n",
+        "pub fn wrapping_float_addition() -> F64 {\n    let result = 1.0 +% 2.0\n    result\n}\n",
+        "pub fn wrapping_mixed_addition() -> F64 {\n    let result = 1 +% 2.0\n    result\n}\n",
+        "pub fn wrapping_float_subtraction() -> F64 {\n    let result = 1.0 -% 2.0\n    result\n}\n",
+        "pub fn wrapping_mixed_subtraction() -> F64 {\n    let result = 1 -% 2.0\n    result\n}\n",
+        "pub fn wrapping_float_multiplication() -> F64 {\n    let result = 1.0 *% 2.0\n    result\n}\n",
+        "pub fn wrapping_mixed_multiplication() -> F64 {\n    let result = 1 *% 2.0\n    result\n}\n",
+        "pub fn wrapping_byte_literal_pair() -> Byte {\n    let result = b'a' +% b'b'\n    result\n}\n",
+        "pub fn wrapping_bool_literal_pair() -> Bool {\n    let result = true -% false\n    result\n}\n",
+        "pub fn wrapping_char_literal_pair() -> Char {\n    let result = 'a' *% 'b'\n    result\n}\n",
+        "pub fn wrapping_generic_literal_pair<T>() -> I64 {\n    let result = 1 +% 2\n    result\n}\n",
+        concat!(
+            "type WrappingPairOwner { marker: I32 }\n",
+            "impl WrappingPairOwner {\n",
+            "    fn wrapping_literal_pair(self: borrow Self) -> I32 {\n",
+            "        let result = 1 -% 2\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ),
         "pub fn wrapping_float_left_literal(right: I32) -> I32 {\n    let result = 1.0 +% right\n    result\n}\n",
         "pub fn wrapping_float_literal_right(left: I32) -> I32 {\n    let result = left +% 1.0\n    result\n}\n",
         "pub fn wrapping_integer_literal_non_integer_path(left: F32) -> F32 {\n    let result = left +% 1\n    result\n}\n",
@@ -9801,6 +10075,14 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         fixture(
             "pub fn char_literal_wrapping_addition_pair_path_rhs() -> Char",
             "let right = 1 +% 2\n    let result = 'a' & right",
+        ),
+        fixture(
+            "pub fn char_literal_wrapping_subtraction_pair_path_rhs() -> Char",
+            "let right = 3 -% 2\n    let result = 'a' & right",
+        ),
+        fixture(
+            "pub fn char_literal_wrapping_multiplication_pair_path_rhs() -> Char",
+            "let right = 3 *% 2\n    let result = 'a' & right",
         ),
         fixture(
             "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char",
