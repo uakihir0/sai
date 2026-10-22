@@ -103,6 +103,119 @@ fn waitlist_position(plan: TermPlan, preceding_count: USize, section_id: U32) ->
     earlier_waitlisted + 1
 }
 
+fn has_completed_prerequisite(student: Student, course: Course) -> Bool {
+    match course.prerequisite_course_id {
+        Some(prerequisite_id) => {
+            var completed = false
+            for completed_id in student.completed_course_ids {
+                if completed_id == Some(prerequisite_id) {
+                    completed = true
+                }
+            }
+            completed
+        }
+        None => true
+    }
+}
+
+fn enrolled_credits(plan: TermPlan, preceding_count: USize, student_id: U32) -> U32 {
+    var credits: U32 = 0
+    for index in 0..preceding_count {
+        match plan.decisions[index] {
+            Some(decision) => {
+                if (
+                    decision.student_id == student_id
+                    and decision.status == RegistrationStatus.Enrolled
+                ) {
+                    match policy.find_course(decision.course_id) {
+                        Some(course) => {
+                            credits += course.credits
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    credits
+}
+
+fn has_schedule_conflict(
+    plan: TermPlan,
+    preceding_count: USize,
+    student_id: U32,
+    proposed_section: Section,
+) -> Bool {
+    var conflict = false
+    for index in 0..preceding_count {
+        match plan.decisions[index] {
+            Some(decision) => {
+                if (
+                    decision.student_id == student_id
+                    and decision.status == RegistrationStatus.Enrolled
+                ) {
+                    match decision.section_id {
+                        Some(section_id) => {
+                            match policy.find_section(section_id) {
+                                Some(section) => {
+                                    if policy.sections_overlap(proposed_section, section) {
+                                        conflict = true
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    conflict
+}
+
+fn rejection_reason(
+    student: Student,
+    course: Course,
+    section: Section,
+    plan: TermPlan,
+    preceding_count: USize,
+) -> Option<RejectionReason> {
+    match course.required_program {
+        Some(required_program) => {
+            if student.program != required_program {
+                return Some(RejectionReason.ProgramMismatch)
+            }
+        }
+        None => {}
+    }
+
+    if student.year < course.minimum_year {
+        return Some(RejectionReason.YearRequirement)
+    }
+
+    if not has_completed_prerequisite(student, course) {
+        return Some(RejectionReason.MissingPrerequisite)
+    }
+
+    let credits_already_enrolled = enrolled_credits(plan, preceding_count, student.id)
+    if credits_already_enrolled > student.term_credit_limit {
+        return Some(RejectionReason.CreditLimit)
+    }
+    let credits_remaining = student.term_credit_limit - credits_already_enrolled
+    if course.credits > credits_remaining {
+        return Some(RejectionReason.CreditLimit)
+    }
+
+    if has_schedule_conflict(plan, preceding_count, student.id, section) {
+        return Some(RejectionReason.ScheduleConflict)
+    }
+
+    None
+}
+
 fn evaluate_known_request(
     request: RegistrationRequest,
     student: Student,
@@ -111,7 +224,7 @@ fn evaluate_known_request(
     plan: TermPlan,
     preceding_count: USize,
 ) -> RegistrationDecision {
-    match policy.rejection_reason(student, course, section, plan, preceding_count) {
+    match rejection_reason(student, course, section, plan, preceding_count) {
         Some(reason) => {
             decision(request, RegistrationStatus.Rejected, Some(reason), Some(section.id), None)
         }

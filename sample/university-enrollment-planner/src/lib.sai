@@ -112,6 +112,20 @@ test "year standing wins before earlier sequence and waitlists use that order" {
     assert matches_decision(plan, 9, RegistrationStatus.Waitlisted, None, Some(1220), Some(1))
 }
 
+test "waitlisted credits do not reduce the student's later credit budget" {
+    let plan = spring_term_plan()
+    assert matches_decision(plan, 1, RegistrationStatus.Waitlisted, None, Some(1301), Some(1))
+    assert matches_decision(plan, 2, RegistrationStatus.Enrolled, None, Some(1220), None)
+    assert matches_decision(
+        plan,
+        3,
+        RegistrationStatus.Rejected,
+        Some(RejectionReason.ScheduleConflict),
+        Some(1201),
+        None,
+    )
+}
+
 test "program year prerequisite and credit gates report distinct reasons" {
     let plan = spring_term_plan()
     assert matches_decision(

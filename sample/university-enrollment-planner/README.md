@@ -19,14 +19,14 @@ Aki Tanaka (year 4, 7-credit cap)
 Noa Sato (year 4, Arts)
   CS-301 AI Lab: rejected — Computer Science program required
 
-Mio Kato (year 3)
+Mio Kato (year 3, 5-credit cap)
   CS-301 AI Lab: waitlist #1
   CS-220 Databases: enrolled (3 credits)
   CS-201 Data Structures: rejected — timetable conflict with CS-220
 
 Aya Mori (year 3)
   CS-301 AI Lab: waitlist #2
-  CS-201 Data Structures: enrolled (4 credits)
+  CS-201 Data Structures: enrolled (2 credits)
   CS-220 Databases: rejected — timetable conflict with CS-201
 
 Sam Ito (year 2)
@@ -42,7 +42,7 @@ Yui Nakamura (year 1)
 Summary: 4 enrolled, 4 waitlisted, 6 rejected
 Section use: CS-101 0/2, CS-201 1/1, CS-220 1/1,
              CS-301 1/1, CS-401 1/1
-Accepted term credits: Aki 7/7, Mio 3/9, Aya 4/7
+Accepted term credits: Aki 7/7, Mio 3/5, Aya 2/7
 ```
 
 ## Rules and fixed assumptions
@@ -75,10 +75,9 @@ Accepted term credits: Aki 7/7, Mio 3/9, Aya 4/7
   decisions.
 - `data.sai` contains seven students, five courses and sections, and fourteen
   deliberately unsorted requests.
-- `policy.sai` checks degree program, year, prior-term prerequisites, accepted
-  credit totals, and interval overlap.
-- `planner.sai` orders requests, applies the checks, reserves seats, and assigns
-  stable waitlist positions.
+- `policy.sai` provides fixed-data lookups and half-open interval overlap.
+- `planner.sai` orders requests, applies academic eligibility, credit, and
+  timetable checks, reserves seats, and assigns stable waitlist positions.
 - `lib.sai` exposes `spring_term_plan()` as the pure library entry point.
 
 ## Package and compiler status
@@ -86,7 +85,8 @@ Accepted term credits: Aki 7/7, Mio 3/9, Aya 4/7
 The package targets `wasm32-core`, has no external dependencies, and declares no
 runtime capabilities. The sample includes focused Stage 3 `test` declarations
 for request ordering, counts, waitlist positions, academic rejection reasons,
-timetable conflicts, interval boundaries, and section capacity. The current
+waitlisted-credit handling, timetable conflicts, interval boundaries, and
+section capacity. The current
 compiler's Stage 0 `sai check` and `@derive` feature gates prevent semantic
 compilation, and Stage 3 `sai test` is not implemented. `sai fmt --check sample`
 parses and formats the declarations, but the source tests have not been

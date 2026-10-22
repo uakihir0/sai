@@ -29,7 +29,7 @@ pub fn students() -> Array<Student, 7> {
             name: "Mio Kato",
             program: Program.ComputerScience,
             year: 3,
-            term_credit_limit: 9,
+            term_credit_limit: 5,
             completed_course_ids: [Some(101), Some(201), None],
         ),
         Student(
@@ -83,7 +83,7 @@ pub fn courses() -> Array<Course, 5> {
             id: 201,
             code: "CS-201",
             title: "Data Structures",
-            credits: 4,
+            credits: 2,
             required_program: Some(Program.ComputerScience),
             minimum_year: 2,
             prerequisite_course_id: Some(101),
