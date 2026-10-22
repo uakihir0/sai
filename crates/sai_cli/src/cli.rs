@@ -1690,7 +1690,8 @@ fn run_check(
     let profile = check_profile_override(command).unwrap_or_else(|| "dev".to_owned());
     let root_analysis_is_covered = root_coverage.empty_root_module_only_covered
         || root_coverage.public_primitive_const_set_covered
-        || root_coverage.single_public_function_body_covered;
+        || root_coverage.single_public_function_body_covered
+        || root_coverage.single_public_inherent_method_body_covered;
     let check_slice_is_supported = root_analysis_is_covered
         && empty_root_manifest_supported
         && root_manifest_semantically_valid
@@ -1934,6 +1935,130 @@ fn check_source_is_single_unattributed_public_function(source: &[u8]) -> bool {
             .is_some_and(|visibility| visibility.pub_token().is_some())
 }
 
+fn check_source_is_single_unattributed_public_inherent_method(source: &[u8]) -> bool {
+    use sai_syntax::ast::AstNode as _;
+
+    let Some(parsed) = sai_fmt::parse_source(source).ok() else {
+        return false;
+    };
+    let Some(source_file) = sai_syntax::ast::SourceFile::cast(parsed.root().clone()) else {
+        return false;
+    };
+    if source_file.module_header().is_some()
+        || source_file.test_decls().next().is_some()
+        || source_file.property_decls().next().is_some()
+        || source_file
+            .syntax()
+            .children()
+            .any(|child| sai_syntax::ast::UseDecl::can_cast(child.kind()))
+    {
+        return false;
+    }
+    let mut items = source_file.items();
+    let Some(sai_syntax::ast::Item::Type(type_decl)) = items.next() else {
+        return false;
+    };
+    let Some(sai_syntax::ast::Item::Impl(impl_decl)) = items.next() else {
+        return false;
+    };
+    let Some(type_name) = type_decl
+        .name()
+        .and_then(|name| name.token())
+        .map(|token| token.text().to_owned())
+    else {
+        return false;
+    };
+    let Some(struct_def) = type_decl.struct_def() else {
+        return false;
+    };
+    let Some(fields) = struct_def.fields() else {
+        return false;
+    };
+    if items.next().is_some()
+        || type_decl.attrs().next().is_some()
+        || type_decl
+            .syntax()
+            .children()
+            .any(|child| sai_syntax::ast::GenericParamList::can_cast(child.kind()))
+        || type_decl
+            .syntax()
+            .descendants()
+            .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
+        || struct_def.where_clause().is_some()
+        || fields.fields().next().is_none()
+        || impl_decl.attrs().next().is_some()
+        || impl_decl
+            .syntax()
+            .descendants()
+            .any(|node| sai_syntax::ast::Attribute::can_cast(node.kind()))
+        || impl_decl.unsafe_token().is_some()
+    {
+        return false;
+    }
+    let mut field_names = HashSet::new();
+    if !fields.fields().all(|field| {
+        let Some(field_name) = field
+            .name()
+            .and_then(|name| name.token())
+            .map(|token| token.text().to_owned())
+        else {
+            return false;
+        };
+        let normalized_field_name =
+            sai_syntax::normalize_identifier(field_name.strip_prefix("r#").unwrap_or(&field_name));
+        field_names.insert(normalized_field_name)
+            && field.attrs().next().is_none()
+            && field.ty().is_some_and(|ty| {
+                let range = ty.syntax().text_range();
+                let Some(type_text) = source.get(range.start().to_usize()..range.end().to_usize())
+                else {
+                    return false;
+                };
+                matches!(
+                    type_text,
+                    b"Bool"
+                        | b"Byte"
+                        | b"Char"
+                        | b"I8"
+                        | b"I16"
+                        | b"I32"
+                        | b"I64"
+                        | b"ISize"
+                        | b"U8"
+                        | b"U16"
+                        | b"U32"
+                        | b"U64"
+                        | b"USize"
+                        | b"F32"
+                        | b"F64"
+                )
+            })
+    }) {
+        return false;
+    }
+    let Some(inherent_type) = impl_decl.inherent_type() else {
+        return false;
+    };
+    let range = inherent_type.syntax().text_range();
+    if source.get(range.start().to_usize()..range.end().to_usize()) != Some(type_name.as_bytes()) {
+        return false;
+    }
+    let Some(associated_items) = impl_decl.items() else {
+        return false;
+    };
+    let mut functions = associated_items.functions();
+    let Some(method) = functions.next() else {
+        return false;
+    };
+    functions.next().is_none()
+        && associated_items.assoc_type_decls().next().is_none()
+        && method.attrs().next().is_none()
+        && method.body().is_some()
+        && method
+            .visibility()
+            .is_some_and(|visibility| visibility.pub_token().is_some())
+}
+
 fn check_public_primitive_const_set_coverage(
     source_count: usize,
     scopes: &sai_driver::Phase1PackageScopes,
@@ -1997,6 +2122,63 @@ fn check_public_function_body_coverage(
             .resolution()
             .is_ok_and(|resolution| resolution.diagnostics.is_empty())
         && owner.lowering_diagnostics().is_empty()
+}
+
+fn check_public_inherent_method_body_coverage(
+    source_is_candidate: bool,
+    scopes: &sai_driver::Phase1PackageScopes,
+    method_resolutions: &sai_driver::TraitImplMemberTestOnlyResolutions,
+) -> bool {
+    if !source_is_candidate
+        || scopes.modules.len() != 1
+        || !scopes.modules[0].imports.is_empty()
+        || scopes.top_level_owners.len() != 2
+        || method_resolutions.owners().len() != 1
+        || scopes
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Struct)
+            .count()
+            != 1
+        || scopes
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Impl)
+            .count()
+            != 1
+        || scopes.top_level_owners.iter().any(|owner| {
+            !matches!(
+                owner.kind,
+                sai_driver::TopLevelOwnerKind::Struct | sai_driver::TopLevelOwnerKind::Impl
+            )
+        })
+    {
+        return false;
+    }
+
+    let impl_owner = &method_resolutions.owners()[0];
+    if impl_owner.kind() != sai_driver::TopLevelOwnerKind::Impl
+        || impl_owner.error().is_some()
+        || !impl_owner.lowering_diagnostics().is_empty()
+        || impl_owner.members().len() != 1
+    {
+        return false;
+    }
+
+    let method = &impl_owner.members()[0];
+    method.parent_owner() == impl_owner.owner()
+        && method.kind() == sai_driver::TraitImplMemberKind::ImplMethod
+        && method
+            .body_type_check()
+            .is_ok_and(sai_driver::FunctionBodyTypeCheck::is_supported)
+        && method
+            .local_resolution()
+            .is_ok_and(|locals| locals.is_some_and(|locals| locals.diagnostics.is_empty()))
+        && method.type_path_resolution().is_ok()
+        && method
+            .test_only_diagnostics()
+            .is_ok_and(|diagnostics| diagnostics.is_empty())
+        && method.lowering_diagnostics().is_empty()
 }
 
 fn active_public_name_diagnostics(
@@ -5312,6 +5494,7 @@ struct CheckRootCoverage {
     empty_root_module_only_covered: bool,
     public_primitive_const_set_covered: bool,
     single_public_function_body_covered: bool,
+    single_public_inherent_method_body_covered: bool,
 }
 
 struct CheckSuccessRecord {
@@ -5677,8 +5860,22 @@ fn module_tree_workspace_check_diagnostics(
                 path == &root_source_path
                     && check_source_is_single_unattributed_public_function(source.as_ref())
             });
+    let root_single_inherent_method_source_candidate = root_const_input_shape
+        && inputs[0]
+            .source_inputs
+            .first()
+            .is_some_and(|(path, _, source)| {
+                let root_source_path = if inputs[0].source_directory == "." {
+                    "lib.sai".to_owned()
+                } else {
+                    format!("{}/lib.sai", inputs[0].source_directory)
+                };
+                path == &root_source_path
+                    && check_source_is_single_unattributed_public_inherent_method(source.as_ref())
+            });
     let mut public_primitive_const_set_covered = false;
     let mut single_public_function_body_covered = false;
+    let mut single_public_inherent_method_body_covered = false;
     let mut database = RootDatabase::new()
         .map_err(|error| format!("could not initialize query database: {error:?}"))?;
     let package_graph_for_scopes = package_graph.clone();
@@ -6303,6 +6500,87 @@ fn module_tree_workspace_check_diagnostics(
                         single_public_function_body_covered = true;
                     }
                 }
+
+                if root_single_inherent_method_source_candidate {
+                    let method_resolutions = database
+                        .resolve_trait_impl_member_test_only_paths(
+                            &collection,
+                            module_tree,
+                            &workspace_snapshot,
+                        )
+                        .map_err(|error| {
+                            format!("inherent method owner analysis failed: {error:?}")
+                        })?;
+                    let mut body_diagnostics = Vec::new();
+                    for owner in method_resolutions.owners() {
+                        if let Some(error) = owner.error() {
+                            diagnostics.push(check_diagnostic_with_package(
+                                check_internal_diagnostic(
+                                    &format!("inherent impl analysis failed: {error:?}"),
+                                    None,
+                                ),
+                                Some(&input.package_identity),
+                            ));
+                            errors = errors.saturating_add(1);
+                            continue;
+                        }
+                        for method in owner.members() {
+                            match method.body_type_check() {
+                                Ok(body_check) => body_diagnostics
+                                    .extend(body_check.diagnostics().iter().cloned()),
+                                Err(error) => {
+                                    diagnostics.push(check_diagnostic_with_package(
+                                        check_internal_diagnostic(
+                                            &format!(
+                                                "inherent method body type check failed: {error:?}"
+                                            ),
+                                            None,
+                                        ),
+                                        Some(&input.package_identity),
+                                    ));
+                                    errors = errors.saturating_add(1);
+                                }
+                            }
+                            match method.local_resolution() {
+                                Ok(Some(locals)) => {
+                                    body_diagnostics.extend(locals.diagnostics.iter().cloned())
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    diagnostics.push(check_diagnostic_with_package(
+                                        check_internal_diagnostic(
+                                            &format!(
+                                                "inherent method local resolution failed: {error:?}"
+                                            ),
+                                            None,
+                                        ),
+                                        Some(&input.package_identity),
+                                    ));
+                                    errors = errors.saturating_add(1);
+                                }
+                            }
+                        }
+                    }
+                    let (body_diagnostics, body_errors, body_warnings, body_infos) =
+                        phase1_check_diagnostics(
+                            &body_diagnostics,
+                            &workspace_source_by_key,
+                            &input.package_identity,
+                            include_source_lines,
+                        );
+                    diagnostics.extend(body_diagnostics);
+                    errors = errors.saturating_add(body_errors);
+                    warnings = warnings.saturating_add(body_warnings);
+                    infos = infos.saturating_add(body_infos);
+
+                    if check_public_inherent_method_body_coverage(
+                        true,
+                        collection.scopes(),
+                        &method_resolutions,
+                    ) {
+                        single_public_inherent_method_body_covered = true;
+                    }
+                }
             }
 
             if let Some(graph) = package_graph_for_scopes.as_ref()
@@ -6886,6 +7164,7 @@ fn module_tree_workspace_check_diagnostics(
             empty_root_module_only_covered,
             public_primitive_const_set_covered,
             single_public_function_body_covered,
+            single_public_inherent_method_body_covered,
         },
     })
 }
