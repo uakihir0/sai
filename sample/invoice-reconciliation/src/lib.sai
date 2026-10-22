@@ -1,0 +1,128 @@
+use acme:invoice-reconciliation/audit
+use acme:invoice-reconciliation/fixtures
+use acme:invoice-reconciliation/model.{BatchAudit}
+
+pub fn sample_batch() -> BatchAudit {
+    audit.reconcile(fixtures.documents())
+}
+
+test "a partial invoice is ready when its billed lines are received and priced correctly" {
+    let batch = sample_batch()
+    match batch.audits[0] {
+        Some(invoice) => {
+            assert invoice.invoice_number == 701
+            assert invoice.ready_to_pay
+            assert invoice.billed_total_cents == 5000
+            assert batch.summary.ready_count == 1
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "an invoice cannot bill more units than the receipt records" {
+    let batch = sample_batch()
+    match batch.audits[1] {
+        Some(invoice) => {
+            assert invoice.invoice_number == 702
+            assert not invoice.ready_to_pay
+            match invoice.lines[0] {
+                Some(line) => {
+                    assert line.within_received_quantity == Some(false)
+                }
+                None => {
+                    assert false
+                }
+            }
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "vendor and unit-price discrepancies are both counted" {
+    let batch = sample_batch()
+    match batch.audits[2] {
+        Some(invoice) => {
+            assert invoice.invoice_number == 703
+            assert not invoice.vendor_matches_order
+            assert batch.summary.price_variance_count == 1
+            match invoice.lines[0] {
+                Some(line) => {
+                    assert line.unit_price_matches == Some(false)
+                }
+                None => {
+                    assert false
+                }
+            }
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "an invoice SKU outside its purchase order is held" {
+    let batch = sample_batch()
+    match batch.audits[3] {
+        Some(invoice) => {
+            assert invoice.invoice_number == 704
+            assert not invoice.ready_to_pay
+            assert batch.summary.unknown_order_item_count == 1
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "a receipt for another order cannot clear an invoice" {
+    let batch = sample_batch()
+    match batch.audits[4] {
+        Some(invoice) => {
+            assert invoice.invoice_number == 705
+            assert invoice.purchase_order_found
+            assert not invoice.receipt_matches_order
+            assert not invoice.ready_to_pay
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "ready-to-pay invoices reserve received quantities for later invoices in the batch" {
+    let batch = sample_batch()
+    match batch.audits[5] {
+        Some(invoice) => {
+            assert invoice.invoice_number == 706
+            assert not invoice.ready_to_pay
+            match invoice.lines[0] {
+                Some(line) => {
+                    assert line.previously_accepted_order_quantity == 10
+                    assert line.previously_accepted_receipt_quantity == 10
+                    assert line.within_order_quantity == Some(false)
+                    assert line.within_received_quantity == Some(false)
+                }
+                None => {
+                    assert false
+                }
+            }
+        }
+        None => {
+            assert false
+        }
+    }
+    assert batch.summary.quantity_variance_count == 3
+}
+
+test "batch totals include held invoices without marking them ready" {
+    let batch = sample_batch()
+    assert batch.summary.invoice_count == 6
+    assert batch.summary.ready_count == 1
+    assert batch.summary.held_count == 5
+    assert batch.summary.billed_total_cents == 23950
+    assert batch.summary.header_issue_count == 2
+}

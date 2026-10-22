@@ -51,6 +51,8 @@ struct CheckDiagnostic {
     package: Option<String>,
     related: Vec<CheckRelated>,
     children: Vec<CheckChild>,
+    node: Option<String>,
+    symbol: Option<String>,
 }
 
 struct CheckRelated {
@@ -2605,6 +2607,8 @@ fn push_public_name_diagnostic(
         package: Some(package_identity.to_owned()),
         related: Vec::new(),
         children: Vec::new(),
+        node: None,
+        symbol: None,
     });
 }
 
@@ -4393,6 +4397,8 @@ fn check_lock_source_diagnostic(
         package: package_identity.map(str::to_owned),
         related: Vec::new(),
         children: Vec::new(),
+        node: None,
+        symbol: None,
     }
 }
 
@@ -4422,6 +4428,8 @@ fn check_cache_corrupt_warning(
         package: root_package_identity.map(str::to_owned),
         related: Vec::new(),
         children: Vec::new(),
+        node: None,
+        symbol: None,
     }
 }
 
@@ -6248,6 +6256,8 @@ fn module_tree_workspace_check_diagnostics(
                     source_by_key,
                     include_source_lines,
                 ),
+                node: diagnostic.node.clone(),
+                symbol: diagnostic.symbol.clone(),
             });
         }
     }
@@ -7350,6 +7360,8 @@ fn phase1_check_diagnostics(
             package: Some(package_identity.to_owned()),
             related,
             children,
+            node: diagnostic.node.clone(),
+            symbol: diagnostic.symbol.clone(),
         });
     }
     (diagnostics, errors, warnings, infos)
@@ -7488,6 +7500,8 @@ fn package_manifest_check_diagnostics(
             package: package_identity.clone(),
             related: Vec::new(),
             children: Vec::new(),
+            node: None,
+            symbol: None,
         });
     }
     for error in parsed.errors() {
@@ -7509,6 +7523,8 @@ fn package_manifest_check_diagnostics(
             package: package_identity.clone(),
             related: Vec::new(),
             children: Vec::new(),
+            node: None,
+            symbol: None,
         });
     }
     for warning in parsed.warnings() {
@@ -7534,6 +7550,8 @@ fn package_manifest_check_diagnostics(
             package: package_identity.clone(),
             related: Vec::new(),
             children: Vec::new(),
+            node: None,
+            symbol: None,
         });
     }
     (
@@ -7575,6 +7593,8 @@ fn package_validation_check_diagnostics(
             package: package_identity.map(str::to_owned),
             related: Vec::new(),
             children: Vec::new(),
+            node: None,
+            symbol: None,
         });
         errors = errors.saturating_add(1);
     }
@@ -7608,6 +7628,8 @@ fn package_validation_check_diagnostics(
             package: package_identity.map(str::to_owned),
             related: Vec::new(),
             children: Vec::new(),
+            node: None,
+            symbol: None,
         });
         warnings = warnings.saturating_add(1);
     }
@@ -7710,6 +7732,8 @@ fn check_source_diagnostics(
             package: package_identity.map(str::to_owned),
             related: Vec::new(),
             children,
+            node: diagnostic.node.clone(),
+            symbol: diagnostic.symbol.clone(),
         });
     }
     (diagnostics, errors, warnings, infos)
@@ -7722,6 +7746,8 @@ fn check_cli_diagnostic(diagnostic: CliDiagnostic) -> CheckDiagnostic {
         package: None,
         related: Vec::new(),
         children: Vec::new(),
+        node: None,
+        symbol: None,
     }
 }
 
@@ -8043,13 +8069,21 @@ fn write_json_check_diagnostic_records(
         );
         writeln!(
             writer,
-            "{{\"type\":\"diagnostic\",\"code\":\"{}\",\"severity\":\"{severity}\",\"level\":null,\"message\":\"{}\",\"primary\":{},\"primary_label\":\"{}\",\"labels\":[],\"children\":{},\"fixes\":[],\"related\":{related},\"data\":{},\"node\":null,\"symbol\":null,\"package\":{package}}}",
+            "{{\"type\":\"diagnostic\",\"code\":\"{}\",\"severity\":\"{severity}\",\"level\":null,\"message\":\"{}\",\"primary\":{},\"primary_label\":\"{}\",\"labels\":[],\"children\":{},\"fixes\":[],\"related\":{related},\"data\":{},\"node\":{},\"symbol\":{},\"package\":{package}}}",
             diagnostic.code,
             escape_json(&diagnostic.message),
             primary,
             escape_json(&diagnostic.primary_label),
             children,
-            data
+            data,
+            check_diagnostic.node.as_deref().map_or_else(
+                || "null".to_owned(),
+                |node| format!("\"{}\"", escape_json(node)),
+            ),
+            check_diagnostic.symbol.as_deref().map_or_else(
+                || "null".to_owned(),
+                |symbol| format!("\"{}\"", escape_json(symbol)),
+            ),
         )?;
     }
     Ok(())
@@ -13854,12 +13888,12 @@ mod tests {
         WorkspaceSnapshot, check_locked_active_wit_directory_inputs,
         check_locked_dependency_source_inputs, check_locked_wit_directory_inputs,
         check_module_tree_workspace_exceeds_limits, check_package_manifest_snapshot_files,
-        cli_position, compare_check_diagnostics, fmt_path_selection_signature,
-        has_incomplete_wit_input_capture, human_file_path, internal_fmt_diagnostic, parse_args,
-        phase1_package_collection_order, read_file_limited_with_progress, relative_path,
-        report_fmt_diagnostics, run, run_new_with_creator, run_with_cancellation,
-        run_with_cancellation_and_input, write_file_atomically_in_directory,
-        write_human_diagnostics, write_json_explain_diagnostic,
+        check_source_is_single_unattributed_public_inherent_method, cli_position,
+        compare_check_diagnostics, fmt_path_selection_signature, has_incomplete_wit_input_capture,
+        human_file_path, internal_fmt_diagnostic, parse_args, phase1_package_collection_order,
+        read_file_limited_with_progress, relative_path, report_fmt_diagnostics, run,
+        run_new_with_creator, run_with_cancellation, run_with_cancellation_and_input,
+        write_file_atomically_in_directory, write_human_diagnostics, write_json_explain_diagnostic,
     };
     use sai_diagnostics::{Value, ValueObject};
     use sai_driver::CancellationToken;
@@ -13872,6 +13906,23 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn unknown_self_field_source_is_an_inherent_method_check_candidate() {
+        let source = concat!(
+            "type User { name: I32, display_name: I32 }\n",
+            "impl User {\n",
+            "    pub fn from_initializer(self: borrow Self) -> I32 {\n",
+            "        let value = self.naem\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
+        );
+        assert!(
+            check_source_is_single_unattributed_public_inherent_method(source.as_bytes()),
+            "an unknown field spelling must not prevent candidate body analysis"
+        );
+    }
 
     #[test]
     fn check_manifest_inputs_enter_the_workspace_snapshot_with_role_bound_paths() {
@@ -14750,6 +14801,8 @@ mod tests {
             package,
             related: Vec::new(),
             children: Vec::new(),
+            node: None,
+            symbol: None,
         }
     }
 

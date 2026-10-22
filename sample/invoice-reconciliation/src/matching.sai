@@ -1,0 +1,79 @@
+use acme:invoice-reconciliation/lookup
+use acme:invoice-reconciliation/model.{GoodsReceipt, InvoiceLine, LineAudit, PurchaseOrder}
+
+pub fn audit_line(
+    invoice_line: InvoiceLine,
+    order: Option<PurchaseOrder>,
+    receipt: Option<GoodsReceipt>,
+    receipt_matches_order: Bool,
+    previously_accepted_order_quantity: U32,
+    previously_accepted_receipt_quantity: U32,
+) -> LineAudit {
+    let order_line = match order {
+        Some(value) => lookup.purchase_order_line(value, invoice_line.sku)
+        None => None
+    }
+    let receipt_line = if receipt_matches_order {
+        match receipt { Some(value) => lookup.receipt_line(value, invoice_line.sku), None => None }
+    } else {
+        None
+    }
+
+    let order_line_found = match order_line { Some(_) => true, None => false }
+    let receipt_line_found = match receipt_line { Some(_) => true, None => false }
+    let ordered_quantity = match order_line { Some(value) => Some(value.quantity), None => None }
+    let received_quantity = match receipt_line { Some(value) => Some(value.quantity), None => None }
+    let expected_unit_price_cents = match order_line {
+        Some(value) => Some(value.unit_price_cents)
+        None => None
+    }
+    let within_order_quantity = match order_line {
+        Some(value) => {
+            if previously_accepted_order_quantity <= value.quantity {
+                Some(invoice_line.quantity <= value.quantity - previously_accepted_order_quantity)
+            } else {
+                Some(false)
+            }
+        }
+        None => None
+    }
+    let within_received_quantity = if order_line_found and receipt_matches_order {
+        match receipt_line {
+            Some(value) => {
+                if previously_accepted_receipt_quantity <= value.quantity {
+                    Some(
+                        invoice_line.quantity
+                            <= value.quantity - previously_accepted_receipt_quantity,
+                    )
+                } else {
+                    Some(false)
+                }
+            }
+            None => Some(false)
+        }
+    } else {
+        None
+    }
+    let unit_price_matches = match order_line {
+        Some(value) => Some(invoice_line.unit_price_cents == value.unit_price_cents)
+        None => None
+    }
+
+    LineAudit(
+        sku: invoice_line.sku,
+        billed_quantity: invoice_line.quantity,
+        billed_unit_price_cents: invoice_line.unit_price_cents,
+        billed_amount_cents: invoice_line.quantity * invoice_line.unit_price_cents,
+        ordered_quantity: ordered_quantity,
+        received_quantity: received_quantity,
+        expected_unit_price_cents: expected_unit_price_cents,
+        order_line_found: order_line_found,
+        receipt_line_found: receipt_line_found,
+        previously_accepted_order_quantity: previously_accepted_order_quantity,
+        previously_accepted_receipt_quantity: previously_accepted_receipt_quantity,
+        positive_quantity: invoice_line.quantity > 0,
+        within_order_quantity: within_order_quantity,
+        within_received_quantity: within_received_quantity,
+        unit_price_matches: unit_price_matches,
+    )
+}

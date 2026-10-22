@@ -358,6 +358,620 @@ fn public_inherent_method_body_mismatch_reports_its_source_span() {
 }
 
 #[test]
+fn unknown_direct_self_fields_report_name_spans_candidates_and_declaration() {
+    let source = concat!(
+        "type User { display_name: I32, name: I32 }\n",
+        "impl User {\n",
+        "    pub fn from_initializer(self: borrow Self) -> I32 {\n",
+        "        let value = self.naem\n",
+        "        value\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "unknown fields must be hard errors without a feature gate or successful result:\n{stdout}"
+    );
+
+    let initializer_start = source.find("naem").expect("initializer typo exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "UNKNOWN_FIELD",
+        "`User` has no field `naem`",
+        initializer_start,
+        initializer_start + "naem".len(),
+    );
+    let initializer = stdout
+        .lines()
+        .find(|record| record.contains("\"field\":\"naem\""))
+        .expect("initializer diagnostic exists");
+    assert!(
+        initializer.contains("\"type_name\":\"User\"")
+            && initializer.contains("\"candidates\":[\"name\",\"display_name\"]"),
+        "unknown-field data and distance-ranked suggestions are present:\n{initializer}"
+    );
+    assert!(
+        initializer.contains("\"node\":\"name:0045\""),
+        "unknown-field diagnostic identifies the exact pre-order name syntax node:\n{initializer}"
+    );
+    let declaration_start = source.find("User").expect("type declaration exists");
+    assert!(
+        initializer.contains(&format!("\"byte\":{declaration_start}")),
+        "unknown-field diagnostic points back to the type declaration:\n{initializer}"
+    );
+
+    let tail_source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn from_empty_tail(self: borrow Self) -> I32 {\n",
+        "        self.missing\n",
+        "    }\n",
+        "}\n",
+    );
+    let tail_output = run_check(tail_source, "", &[], &[]);
+    let tail_stdout = String::from_utf8(tail_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(tail_output.status.code(), Some(1), "{tail_stdout}");
+    assert_eq!(
+        tail_stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{tail_stdout}"
+    );
+    assert!(
+        !tail_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !tail_stdout.contains("\"type\":\"result\""),
+        "an empty method body with an unknown direct tail reports only its semantic error:\n{tail_stdout}"
+    );
+    let tail_start = tail_source.rfind("missing").expect("unknown tail exists");
+    assert_json_diagnostic_primary_span(
+        &tail_stdout,
+        "UNKNOWN_FIELD",
+        "`User` has no field `missing`",
+        tail_start,
+        tail_start + "missing".len(),
+    );
+}
+
+#[test]
+fn unknown_direct_self_field_propagates_without_cascading_type_errors() {
+    let source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn propagate(self: borrow Self) -> I32 {\n",
+        "        let original = self.missing\n",
+        "        let copy = original\n",
+        "        let combined = copy + 1\n",
+        "        combined\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{stdout}"
+    );
+    for cascading_code in ["TYPE_MISMATCH", "OPERATOR_NOT_SUPPORTED"] {
+        assert!(
+            !stdout.contains(&format!("\"code\":\"{cascading_code}\"")),
+            "an unknown field should not trigger a cascading {cascading_code} diagnostic:\n{stdout}"
+        );
+    }
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the supported body reports the unknown field and suppresses the check result:\n{stdout}"
+    );
+}
+
+#[test]
+fn unknown_direct_self_field_keeps_independent_sibling_operand_errors() {
+    let source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn preserve_sibling_error(self: borrow Self) -> Bool {\n",
+        "        let missing = self.missing\n",
+        "        let count: I32 = 1\n",
+        "        let combined = missing and count\n",
+        "        combined\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a known sibling operand remains checkable without inferring an Error expression:\n{stdout}"
+    );
+
+    let count_start = source.rfind("count").expect("logical RHS exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        count_start,
+        count_start + "count".len(),
+    );
+}
+
+#[test]
+fn unknown_direct_self_field_does_not_enable_nested_operator_shapes() {
+    let source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+        "        let missing = self.missing\n",
+        "        let count: I32 = 1\n",
+        "        let combined = missing + count + 1\n",
+        "        combined\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "an unknown local must not make a nested unsupported body shape appear checked:\n{stdout}"
+    );
+}
+
+#[test]
+fn unknown_direct_self_fields_in_both_operands_do_not_add_a_feature_gate() {
+    let source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn combine_errors(self: borrow Self) -> I32 {\n",
+        "        let missing = self.missing\n",
+        "        let absent = self.absent\n",
+        "        let combined = missing + absent\n",
+        "        combined\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        2,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "two already-diagnosed operands retain Error without inventing an operator error:\n{stdout}"
+    );
+}
+
+#[test]
+fn unknown_direct_self_field_does_not_enable_compound_unary_shapes() {
+    let source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn unsupported(self: borrow Self) -> Bool {\n",
+        "        let missing = self.missing\n",
+        "        let enabled: Bool = true\n",
+        "        let combined = not (missing and enabled)\n",
+        "        combined\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "an error inside a compound unary operand must preserve the unsupported-shape gate:\n{stdout}"
+    );
+}
+
+#[test]
+fn unknown_direct_self_field_recovers_through_supported_unary_aliases() {
+    let cases = [
+        (
+            "logical not",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover_not(self: borrow Self) -> Bool {\n",
+                "        let missing = self.missing\n",
+                "        let negated = not missing\n",
+                "        negated\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "bitwise not",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn recover_bit_not(self: borrow Self) -> I32 {\n",
+                "        let absent = self.absent\n",
+                "        let inverted = ~absent\n",
+                "        inverted\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+    ];
+    for (label, source) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{label}:\n{stdout}");
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            1,
+            "{label}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{label} should preserve an earlier Error without adding a feature gate:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn unknown_direct_self_field_keeps_annotated_error_types_for_later_checks() {
+    let source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn recover(self: borrow Self) -> Bool {\n",
+        "        let missing: Bool = self.missing\n",
+        "        let copied = missing\n",
+        "        let inverted = ~copied\n",
+        "        inverted\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            && stdout.contains("operator `~` has no `BitNot` implementation for `Bool`"),
+        "a known Bool annotation must keep the later bitwise-not diagnostic:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "typed error aliases should stay within the supported recovery path:\n{stdout}"
+    );
+}
+
+#[test]
+fn unknown_direct_self_field_checks_known_types_on_both_boolean_operands() {
+    let source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn recover(self: borrow Self) -> Bool {\n",
+        "        let missing_left: I32 = self.left\n",
+        "        let missing_right: I32 = self.right\n",
+        "        let flag: Bool = true\n",
+        "        let left_result = missing_left and flag\n",
+        "        let right_result = flag and missing_right\n",
+        "        left_result\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        2,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "both typed Error operands must keep their independent Bool mismatches:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a known mismatch must not turn boolean recovery into inference:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("expected `Bool`, found `I32`"),
+        "typed error operands must be checked against Bool:\n{stdout}"
+    );
+}
+
+#[test]
+fn unknown_direct_self_field_does_not_hide_unsupported_typed_arithmetic() {
+    let cases = [
+        (
+            "local sibling",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        let missing: Bool = self.missing\n",
+                "        let count: I32 = 1\n",
+                "        let sum = missing + count\n",
+                "        sum\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "literal sibling after an alias",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        let missing: Bool = self.missing\n",
+                "        let copy = missing\n",
+                "        let sum = copy + 1\n",
+                "        sum\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+    ];
+    for (label, source) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{label}: a known Bool Error operand must not let numeric addition appear checked:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn unknown_direct_self_field_keeps_left_literal_type_and_range_checks() {
+    let source = concat!(
+        "type User { name: I8 }\n",
+        "impl User {\n",
+        "    pub fn recover(self: borrow Self) -> Bool {\n",
+        "        let missing: I8 = self.missing\n",
+        "        let sum = 128 + missing\n",
+        "        sum\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    for code in ["UNKNOWN_FIELD", "LITERAL_OUT_OF_RANGE", "TYPE_MISMATCH"] {
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\"")),
+            "known right operand should preserve {code}:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("expected `Bool`, found `I8`"),
+        "the known arithmetic result must be checked against the method return type:\n{stdout}"
+    );
+    let literal_start = source.find("128").expect("integer literal exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        literal_start,
+        literal_start + "128".len(),
+    );
+}
+
+#[test]
+fn unknown_direct_self_field_preserves_context_for_mismatched_left_literals() {
+    let source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn recover(self: borrow Self) -> I8 {\n",
+        "        let missing: F32 = self.missing\n",
+        "        let quotient = 128 / missing\n",
+        "        let copy = quotient\n",
+        "        copy\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    for code in ["UNKNOWN_FIELD", "LITERAL_OUT_OF_RANGE", "TYPE_MISMATCH"] {
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\"")),
+            "tail context must preserve {code} after an arithmetic family mismatch:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("expected `I64`, found `F32`"),
+        "the arithmetic family mismatch remains independently visible:\n{stdout}"
+    );
+    let literal_start = source.find("128").expect("integer literal exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        literal_start,
+        literal_start + "128".len(),
+    );
+    assert!(
+        !stdout.contains("\"type\":\"result\"")
+            && !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\""),
+        "error-tainted literal recovery must remain a semantic failure, not a gate:\n{stdout}"
+    );
+}
+
+#[test]
+fn unknown_direct_self_field_gates_compound_unresolved_literal_errors() {
+    let source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn recover(self: borrow Self) -> I8 {\n",
+        "        let missing: F32 = self.missing\n",
+        "        let quotient = 128 / missing\n",
+        "        let adjusted = quotient + 1\n",
+        "        adjusted\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated(
+        &output,
+        "compound use of an unresolved error-tainted literal",
+    );
+}
+
+#[test]
+fn unknown_direct_self_field_keeps_independent_boolean_result_mismatches() {
+    let source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn recover(self: borrow Self) -> I32 {\n",
+        "        let missing = self.missing\n",
+        "        let flag: Bool = true\n",
+        "        let negated: I32 = not missing\n",
+        "        let combined: I32 = missing and flag\n",
+        "        combined\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "known Bool results keep independent annotation mismatches:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "known result types must not force inference through an Error operand:\n{stdout}"
+    );
+    for expression in ["not missing", "missing and flag"] {
+        let start = source
+            .find(expression)
+            .expect("tainted Bool expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "TYPE_MISMATCH",
+            "expected `I32`, found `Bool`",
+            start,
+            start + expression.len(),
+        );
+    }
+}
+
+#[test]
+fn unknown_direct_self_field_keeps_known_shift_initializer_mismatches() {
+    let source = concat!(
+        "type User { name: I32 }\n",
+        "impl User {\n",
+        "    pub fn recover(self: borrow Self) -> Bool {\n",
+        "        let count: I32 = 1\n",
+        "        let missing = self.missing\n",
+        "        let shifted: Bool = count << missing\n",
+        "        shifted\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "known shift result type should keep its independent annotation mismatch:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the annotated shift initializer should remain in the supported recovery slice:\n{stdout}"
+    );
+}
+
+#[test]
+fn unknown_direct_self_field_does_not_hide_unsupported_arithmetic_siblings() {
+    let cases = [
+        (
+            "Bool local",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        let missing = self.missing\n",
+                "        let flag: Bool = true\n",
+                "        let sum = missing + flag\n",
+                "        sum\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "Bool literal",
+            concat!(
+                "type User { name: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        let missing = self.missing\n",
+                "        let sum = missing + true\n",
+                "        sum\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+    ];
+    for (label, source) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{label}:\n{stdout}");
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "an Error operand must not make unsupported arithmetic appear checked:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn unsupported_inherent_method_shapes_remain_gated() {
     let cases = [
         (
@@ -410,37 +1024,48 @@ fn unsupported_inherent_method_shapes_remain_gated() {
             ),
         ),
         (
-            "unknown receiver field",
-            concat!(
-                "type Counter { marker: I32 }\n",
-                "impl Counter {\n",
-                "    pub fn add_one(self: borrow Self) -> I32 {\n",
-                "        let result = self.missing\n",
-                "        result\n",
-                "    }\n",
-                "}\n",
-            ),
-        ),
-        (
             "receiver field in an operator",
             concat!(
                 "type Counter { marker: I32 }\n",
                 "impl Counter {\n",
                 "    pub fn add_one(self: borrow Self) -> I32 {\n",
-                "        let result = self.marker + 1\n",
+                "        let result = self.missing + 1\n",
                 "        result\n",
                 "    }\n",
                 "}\n",
             ),
         ),
         (
-            "unknown receiver field as the tail",
+            "operator as the method tail",
             concat!(
                 "type Counter { marker: I32 }\n",
                 "impl Counter {\n",
                 "    pub fn current_count(self: borrow Self) -> I32 {\n",
-                "        let result = 1\n",
-                "        self.missing\n",
+                "        self.missing + 1\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "nested receiver field",
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn current_count(self: borrow Self) -> I32 {\n",
+                "        let nested = self.missing.value\n",
+                "        nested\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "receiver field with generic arguments",
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn current_count(self: borrow Self) -> I32 {\n",
+                "        let field = self.missing<I32>\n",
+                "        field\n",
                 "    }\n",
                 "}\n",
             ),
@@ -569,6 +1194,25 @@ fn unsupported_inherent_method_shapes_remain_gated() {
     for (shape, source) in cases {
         assert_check_stays_gated_without_syntax_errors(&run_check(source, "", &[], &[]), shape);
     }
+}
+
+#[test]
+fn unknown_direct_self_field_operator_method_tail_stays_gated() {
+    let source = concat!(
+        "type Counter { marker: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn current_count(self: borrow Self) -> I32 {\n",
+        "        self.missing + 1\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert!(
+        stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a binary method tail must remain outside the direct field-tail checker:\n{stdout}"
+    );
 }
 
 #[test]

@@ -1,0 +1,109 @@
+use acme:air-quality-monitor/model.{
+    AlertPhase
+    Decision
+    MonitorSummary
+    MonitoringRun
+    Policy
+    ReadingQuality
+    Series
+}
+
+pub fn evaluate(series: Series, policy: Policy) -> MonitoringRun {
+    var phase = AlertPhase.Normal
+    var high_streak: USize = 0
+    var clear_streak: USize = 0
+    var valid_reading_count: USize = 0
+    var sensor_fault_count: USize = 0
+    var alerts_opened: USize = 0
+    var alerts_closed: USize = 0
+    var peak_pm25: U32 = 0
+    var decisions = Array<Option<Decision>, 12>.filled(None)
+    var index: USize = 0
+
+    for reading in series.readings {
+        if reading.quality == ReadingQuality.SensorFault {
+            sensor_fault_count += 1
+            high_streak = 0
+            clear_streak = 0
+            if phase == AlertPhase.HighPending {
+                phase = AlertPhase.Normal
+            }
+            if phase == AlertPhase.ClearPending {
+                phase = AlertPhase.Active
+            }
+        } else {
+            valid_reading_count += 1
+            if reading.pm25 > peak_pm25 {
+                peak_pm25 = reading.pm25
+            }
+
+            if reading.pm25 >= policy.trigger_pm25 {
+                clear_streak = 0
+                if phase == AlertPhase.Active or phase == AlertPhase.ClearPending {
+                    phase = AlertPhase.Active
+                } else {
+                    if phase == AlertPhase.HighPending {
+                        high_streak += 1
+                    } else {
+                        high_streak = 1
+                    }
+                    if high_streak >= policy.consecutive_high_required {
+                        phase = AlertPhase.Active
+                        high_streak = 0
+                        alerts_opened += 1
+                    } else {
+                        phase = AlertPhase.HighPending
+                    }
+                }
+            } else if reading.pm25 <= policy.clear_pm25 {
+                high_streak = 0
+                if phase == AlertPhase.Active or phase == AlertPhase.ClearPending {
+                    clear_streak += 1
+                    if clear_streak >= policy.consecutive_clear_required {
+                        phase = AlertPhase.Normal
+                        clear_streak = 0
+                        alerts_closed += 1
+                    } else {
+                        phase = AlertPhase.ClearPending
+                    }
+                } else {
+                    phase = AlertPhase.Normal
+                    clear_streak = 0
+                }
+            } else {
+                high_streak = 0
+                clear_streak = 0
+                if phase == AlertPhase.HighPending {
+                    phase = AlertPhase.Normal
+                }
+                if phase == AlertPhase.ClearPending {
+                    phase = AlertPhase.Active
+                }
+            }
+        }
+
+        decisions[index] = Some(
+            Decision(
+                minute: reading.minute,
+                pm25: reading.pm25,
+                quality: reading.quality,
+                phase_after: phase,
+            ),
+        )
+        index += 1
+    }
+
+    MonitoringRun(
+        station: series.station,
+        decisions: decisions,
+        summary: MonitorSummary(
+            reading_count: index,
+            valid_reading_count: valid_reading_count,
+            sensor_fault_count: sensor_fault_count,
+            alerts_opened: alerts_opened,
+            alerts_closed: alerts_closed,
+            peak_pm25: peak_pm25,
+            current_phase: phase,
+        ),
+    )
+}

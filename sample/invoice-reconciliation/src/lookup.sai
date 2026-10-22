@@ -1,0 +1,53 @@
+use acme:invoice-reconciliation/model.{
+    Documents
+    GoodsReceipt
+    PurchaseOrder
+    PurchaseOrderLine
+    ReceiptLine
+}
+
+pub fn purchase_order(documents: Documents, number: U32) -> Option<PurchaseOrder> {
+    for order in documents.purchase_orders {
+        if order.number == number {
+            return Some(order)
+        }
+    }
+    None
+}
+
+pub fn receipt(documents: Documents, number: U32) -> Option<GoodsReceipt> {
+    for receipt in documents.receipts {
+        if receipt.number == number {
+            return Some(receipt)
+        }
+    }
+    None
+}
+
+pub fn purchase_order_line(order: PurchaseOrder, sku: Str) -> Option<PurchaseOrderLine> {
+    for slot in order.lines {
+        match slot {
+            Some(line) => {
+                if line.sku == sku {
+                    return Some(line)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+pub fn receipt_line(receipt: GoodsReceipt, sku: Str) -> Option<ReceiptLine> {
+    for slot in receipt.lines {
+        match slot {
+            Some(line) => {
+                if line.sku == sku {
+                    return Some(line)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}

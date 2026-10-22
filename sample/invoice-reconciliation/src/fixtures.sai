@@ -1,0 +1,126 @@
+use acme:invoice-reconciliation/model.{
+    Documents
+    GoodsReceipt
+    Invoice
+    InvoiceLine
+    PurchaseOrder
+    PurchaseOrderLine
+    ReceiptLine
+}
+
+pub fn documents() -> Documents {
+    Documents(
+        purchase_orders: [
+            PurchaseOrder(
+                number: 4501,
+                vendor: "Cedar Office",
+                lines: [
+                    Some(PurchaseOrderLine(sku: "PAPER-A4", quantity: 10, unit_price_cents: 250)),
+                    Some(PurchaseOrderLine(sku: "PEN-BLUE", quantity: 20, unit_price_cents: 125)),
+                    Some(PurchaseOrderLine(sku: "MARKER-BLK", quantity: 8, unit_price_cents: 300)),
+                    None,
+                ],
+            ),
+            PurchaseOrder(
+                number: 4502,
+                vendor: "Northstar Print",
+                lines: [
+                    Some(PurchaseOrderLine(sku: "INK-4K", quantity: 4, unit_price_cents: 3250)),
+                    Some(PurchaseOrderLine(sku: "TONER-2K", quantity: 2, unit_price_cents: 1300)),
+                    None,
+                    None,
+                ],
+            ),
+        ],
+        receipts: [
+            GoodsReceipt(
+                number: 9001,
+                purchase_order_number: 4501,
+                lines: [
+                    Some(ReceiptLine(sku: "PAPER-A4", quantity: 10)),
+                    Some(ReceiptLine(sku: "PEN-BLUE", quantity: 20)),
+                    Some(ReceiptLine(sku: "MARKER-BLK", quantity: 6)),
+                    None,
+                ],
+            ),
+            GoodsReceipt(
+                number: 9002,
+                purchase_order_number: 4502,
+                lines: [
+                    Some(ReceiptLine(sku: "INK-4K", quantity: 4)),
+                    Some(ReceiptLine(sku: "TONER-2K", quantity: 2)),
+                    None,
+                    None,
+                ],
+            ),
+        ],
+        invoices: [
+            Invoice(
+                number: 701,
+                vendor: "Cedar Office",
+                purchase_order_number: 4501,
+                receipt_number: 9001,
+                lines: [
+                    Some(InvoiceLine(sku: "PAPER-A4", quantity: 10, unit_price_cents: 250)),
+                    Some(InvoiceLine(sku: "PEN-BLUE", quantity: 20, unit_price_cents: 125)),
+                    None,
+                ],
+            ),
+            Invoice(
+                number: 702,
+                vendor: "Cedar Office",
+                purchase_order_number: 4501,
+                receipt_number: 9001,
+                lines: [
+                    Some(InvoiceLine(sku: "MARKER-BLK", quantity: 8, unit_price_cents: 300)),
+                    None,
+                    None,
+                ],
+            ),
+            Invoice(
+                number: 703,
+                vendor: "Bright Ink",
+                purchase_order_number: 4501,
+                receipt_number: 9001,
+                lines: [
+                    Some(InvoiceLine(sku: "MARKER-BLK", quantity: 2, unit_price_cents: 350)),
+                    None,
+                    None,
+                ],
+            ),
+            Invoice(
+                number: 704,
+                vendor: "Northstar Print",
+                purchase_order_number: 4502,
+                receipt_number: 9002,
+                lines: [
+                    Some(InvoiceLine(sku: "TONER-COLOR", quantity: 2, unit_price_cents: 1300)),
+                    None,
+                    None,
+                ],
+            ),
+            Invoice(
+                number: 705,
+                vendor: "Northstar Print",
+                purchase_order_number: 4502,
+                receipt_number: 9001,
+                lines: [
+                    Some(InvoiceLine(sku: "INK-4K", quantity: 4, unit_price_cents: 3250)),
+                    None,
+                    None,
+                ],
+            ),
+            Invoice(
+                number: 706,
+                vendor: "Cedar Office",
+                purchase_order_number: 4501,
+                receipt_number: 9001,
+                lines: [
+                    Some(InvoiceLine(sku: "PAPER-A4", quantity: 1, unit_price_cents: 250)),
+                    None,
+                    None,
+                ],
+            ),
+        ],
+    )
+}

@@ -34,8 +34,8 @@ use crate::package_graph::{PackageForm, PackageGraph, PackageGraphRole};
 use package_wit_name_queries::PackageWitNamesQueries;
 pub use package_wit_name_queries::PackageWitNamesQueryError;
 use sai_diagnostics::{
-    CauseKey, Child, ChildKind, Diagnostic, Label, LevelInfo, OverrideLintLevel, Related,
-    SourceRef, source_text_status_diagnostic,
+    CauseKey, Child, ChildKind, Diagnostic, Label, LevelInfo, NodeGroup, NodeId, OverrideLintLevel,
+    Related, SourceRef, source_text_status_diagnostic,
 };
 use sai_hir::arena::HirArena;
 use sai_hir::attrs::ValidatedAttrs;
@@ -121,7 +121,7 @@ use sai_resolve::{
 use sai_resolve::{ModuleId, ModuleTree, ModuleTreeQueries, ModuleTreeQueryError};
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher, fingerprint};
 use sai_syntax::ast::{self, AstNode, AstToken};
-use sai_syntax::{Parse, ParseQueryError, SyntaxNode, SyntaxQueries};
+use sai_syntax::{Parse, ParseQueryError, SyntaxElement, SyntaxNode, SyntaxQueries};
 use sai_vfs::{
     FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex, PackageFileKind,
     PackageFilesSnapshot, PackageKey, PackageKeyError, PackageRelativePath, PackageSourceDirectory,
@@ -5904,7 +5904,7 @@ fn check_function_body_type(
     }
     if sig.params.len() == body.params.len() {
         if let Some(diagnostics) = check_function_body_primitive_local_block(
-            owner, sig, body, locals, type_paths, symbols, None, inputs, snapshot, target_cfg,
+            owner, sig, body, locals, type_paths, symbols, None, None, inputs, snapshot, target_cfg,
         )? {
             return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
         }
@@ -6380,23 +6380,55 @@ fn check_inherent_method_body_type(
         return Ok(FunctionBodyTypeCheck::Unsupported);
     };
     let mut self_field_projections = HashMap::new();
+    let mut unknown_self_fields = HashSet::new();
+    let mut diagnostics = Vec::new();
     for stmt in method_block.stmts {
         let StmtKind::Let { init, .. } = stmt.kind else {
             continue;
         };
         if matches!(init.kind, ExprKind::Field { .. }) {
-            let Some(field_type) = primitive_self_field_type(init, &field_types, symbols) else {
+            let Some(field_lookup) = primitive_self_field_type(init, &field_types.fields, symbols)
+            else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
             };
-            self_field_projections.insert(init.hir_id, field_type);
+            match field_lookup {
+                Ok(field_type) => {
+                    self_field_projections.insert(init.hir_id, field_type);
+                }
+                Err(name) => {
+                    unknown_self_fields.insert(init.hir_id);
+                    diagnostics.push(unknown_self_field_diagnostic(
+                        method_owner.id,
+                        &field_types,
+                        name,
+                        inputs,
+                        snapshot,
+                    )?);
+                }
+            }
         }
     }
     if let Some(tail) = method_block.tail {
         if matches!(tail.kind, ExprKind::Field { .. }) {
-            let Some(field_type) = primitive_self_field_type(tail, &field_types, symbols) else {
+            let Some(field_lookup) = primitive_self_field_type(tail, &field_types.fields, symbols)
+            else {
                 return Ok(FunctionBodyTypeCheck::Unsupported);
             };
-            self_field_projections.insert(tail.hir_id, field_type);
+            match field_lookup {
+                Ok(field_type) => {
+                    self_field_projections.insert(tail.hir_id, field_type);
+                }
+                Err(name) => {
+                    unknown_self_fields.insert(tail.hir_id);
+                    diagnostics.push(unknown_self_field_diagnostic(
+                        method_owner.id,
+                        &field_types,
+                        name,
+                        inputs,
+                        snapshot,
+                    )?);
+                }
+            }
         }
     }
 
@@ -6408,7 +6440,7 @@ fn check_inherent_method_body_type(
         params: explicit_body_params,
         ..*body
     };
-    if let Some(diagnostics) = check_function_body_primitive_local_block(
+    if let Some(type_diagnostics) = check_function_body_primitive_local_block(
         method_owner,
         explicit_sig,
         &explicit_body,
@@ -6416,21 +6448,30 @@ fn check_inherent_method_body_type(
         type_paths,
         symbols,
         Some(&self_field_projections),
+        Some(&unknown_self_fields),
         inputs,
         snapshot,
         target_cfg,
     )? {
+        diagnostics.extend(type_diagnostics);
         Ok(FunctionBodyTypeCheck::Supported { diagnostics })
     } else {
         Ok(FunctionBodyTypeCheck::Unsupported)
     }
 }
 
+struct InherentMethodPrimitiveFields {
+    type_name: String,
+    type_name_span: sai_diagnostics::Span,
+    fields: HashMap<String, sai_resolve::prelude::PrimTy>,
+    candidate_names: Vec<String>,
+}
+
 fn inherent_method_primitive_field_types(
     self_ty: Ty<'_>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
-) -> Option<HashMap<String, sai_resolve::prelude::PrimTy>> {
+) -> Option<InherentMethodPrimitiveFields> {
     use sai_syntax::ast::AstNode as _;
 
     let TyKind::Path(path) = self_ty.kind else {
@@ -6461,10 +6502,10 @@ fn inherent_method_primitive_field_types(
     let Some(ast::Item::Impl(impl_decl)) = items.next() else {
         return None;
     };
-    let type_name = type_decl
-        .name()
-        .and_then(|name| name.token())
-        .map(|token| token.text().to_owned())?;
+    let type_name_node = type_decl.name()?;
+    let type_name = type_name_node.token()?.text().to_owned();
+    let type_name_span =
+        sai_diagnostics::Span::new(inputs.source.id(), type_name_node.syntax().text_range());
     let struct_def = type_decl.struct_def()?;
     let fields = struct_def.fields()?;
     if items.next().is_some()
@@ -6508,16 +6549,15 @@ fn inherent_method_primitive_field_types(
         return None;
     }
     let mut field_types = HashMap::new();
+    let mut candidate_names = Vec::new();
     for field in fields.fields() {
         if field.attrs().next().is_some() {
             return None;
         }
-        let field_name = field
-            .name()
-            .and_then(|name| name.token())
-            .map(|token| token.text().to_owned())?;
-        let field_name =
-            sai_syntax::normalize_identifier(field_name.strip_prefix("r#").unwrap_or(&field_name));
+        let field_name_node = field.name()?;
+        let field_name = field_name_node.token()?.text().to_owned();
+        let field_spelling = field_name.strip_prefix("r#").unwrap_or(&field_name);
+        let normalized_field_name = sai_syntax::normalize_identifier(field_spelling);
         let ty = field.ty()?;
         let range = ty.syntax().text_range();
         let ty_text = inputs
@@ -6525,11 +6565,23 @@ fn inherent_method_primitive_field_types(
             .text()
             .get(range.start().to_usize()..range.end().to_usize())?;
         let field_type = primitive_method_field_type(ty_text)?;
-        if field_types.insert(field_name, field_type).is_some() {
+        if field_types
+            .insert(normalized_field_name, field_type)
+            .is_some()
+        {
             return None;
         }
+        candidate_names.push(field_spelling.to_owned());
     }
-    Some(field_types)
+    Some(InherentMethodPrimitiveFields {
+        type_name: type_name
+            .strip_prefix("r#")
+            .unwrap_or(&type_name)
+            .to_owned(),
+        type_name_span,
+        fields: field_types,
+        candidate_names,
+    })
 }
 
 fn primitive_method_field_type(ty: &str) -> Option<sai_resolve::prelude::PrimTy> {
@@ -6570,7 +6622,7 @@ fn primitive_self_field_type(
     expression: &HirExpr<'_>,
     field_types: &HashMap<String, sai_resolve::prelude::PrimTy>,
     symbols: &Interner,
-) -> Option<sai_resolve::prelude::PrimTy> {
+) -> Option<Result<sai_resolve::prelude::PrimTy, Name>> {
     let ExprKind::Field {
         base,
         name,
@@ -6583,7 +6635,141 @@ fn primitive_self_field_type(
         return None;
     }
     let field_name = symbols.resolve(name.sym).ok()?;
-    field_types.get(field_name.as_ref()).copied()
+    Some(field_types.get(field_name.as_ref()).copied().ok_or(name))
+}
+
+fn name_node_id_for_span(root: &SyntaxNode, span: sai_hir::Span) -> Option<String> {
+    fn visit(
+        node: &SyntaxNode,
+        target: sai_vfs::TextRange,
+        next_index: &mut u64,
+        found: &mut Option<NodeId>,
+    ) -> Option<()> {
+        let index = *next_index;
+        *next_index = next_index.checked_add(1)?;
+        if node.text_range() == target
+            && matches!(
+                node.kind(),
+                sai_syntax::SyntaxKind::NAME | sai_syntax::SyntaxKind::NAME_REF
+            )
+        {
+            *found = Some(NodeId::new(NodeGroup::Name, index));
+        }
+        for element in node.children_with_tokens() {
+            match element {
+                SyntaxElement::Node(child) => visit(&child, target, next_index, found)?,
+                SyntaxElement::Token(_) => *next_index = next_index.checked_add(1)?,
+            }
+        }
+        Some(())
+    }
+
+    let mut next_index = 0;
+    let mut found = None;
+    visit(root, span.range, &mut next_index, &mut found)?;
+    found.map(|node| node.to_string())
+}
+
+fn unknown_self_field_diagnostic(
+    owner: OwnerId,
+    fields: &InherentMethodPrimitiveFields,
+    name: Name,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    let written_field = inputs
+        .source
+        .text()
+        .get(name.span.range.start().to_usize()..name.span.range.end().to_usize())
+        .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+            owner,
+        ))?;
+    let field = written_field.strip_prefix("r#").unwrap_or(written_field);
+    let include_all = fields.candidate_names.len() <= 5;
+    let threshold = (field.chars().count() / 3).max(1);
+    let mut candidates = fields
+        .candidate_names
+        .iter()
+        .enumerate()
+        .filter_map(|(declaration_order, candidate)| {
+            let distance = unicode_damerau_levenshtein(field, candidate);
+            (include_all || distance <= threshold).then_some((
+                distance,
+                declaration_order,
+                candidate,
+            ))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(distance, declaration_order, _)| (*distance, *declaration_order));
+    candidates.truncate(10);
+    let candidate_names = candidates
+        .into_iter()
+        .map(|(_, _, candidate)| candidate.clone())
+        .collect::<Vec<_>>();
+    let primary = sai_diagnostics::Location::from_decoded_source(
+        inputs.source_ref.clone(),
+        sai_diagnostics::Span::new(name.span.file, name.span.range),
+        &inputs.source,
+    )
+    .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        owner,
+    ))?;
+    let declaration = sai_diagnostics::Location::from_decoded_source(
+        inputs.source_ref.clone(),
+        fields.type_name_span,
+        &inputs.source,
+    )
+    .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        owner,
+    ))?;
+    let node = name_node_id_for_span(&inputs.root, name.span).ok_or(
+        OwnerControlFlowResolutionError::InvalidSourceLocation(owner),
+    )?;
+    let mut diagnostic = Diagnostic::new(
+        sai_diagnostics::Code::UnknownField,
+        sai_diagnostics::Severity::Error,
+        format!("`{}` has no field `{field}`", fields.type_name),
+        Some(primary),
+    );
+    diagnostic.primary_label = "unknown field".to_owned();
+    diagnostic.node = Some(node);
+    diagnostic.package = inputs.source_ref.package.clone();
+    diagnostic.data.insert(
+        "type_name".to_owned(),
+        sai_diagnostics::Value::String(fields.type_name.clone()),
+    );
+    diagnostic.data.insert(
+        "field".to_owned(),
+        sai_diagnostics::Value::String(written_field.to_owned()),
+    );
+    diagnostic.data.insert(
+        "candidates".to_owned(),
+        sai_diagnostics::Value::Array(
+            candidate_names
+                .iter()
+                .cloned()
+                .map(sai_diagnostics::Value::String)
+                .collect(),
+        ),
+    );
+    diagnostic
+        .push_related(Related::DeclaredHere {
+            location: declaration,
+            what: format!("`{}`", fields.type_name),
+        })
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    if !candidate_names.is_empty() {
+        diagnostic
+            .push_child(Child {
+                kind: ChildKind::Help,
+                message: format!("available fields:\n{}", candidate_names.join("\n")),
+                location: None,
+            })
+            .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    }
+    diagnostic
+        .with_workspace_snapshot(snapshot)
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))
 }
 
 fn check_function_body_primitive_local_block(
@@ -6594,6 +6780,7 @@ fn check_function_body_primitive_local_block(
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     self_field_projections: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
+    unknown_self_fields: Option<&HashSet<HirId>>,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
@@ -6649,7 +6836,8 @@ fn check_function_body_primitive_local_block(
         return Ok(None);
     };
     let is_supported_field_tail = matches!(tail.kind, ExprKind::Field { .. })
-        && self_field_projections.is_some_and(|fields| fields.contains_key(&tail.hir_id));
+        && (self_field_projections.is_some_and(|fields| fields.contains_key(&tail.hir_id))
+            || unknown_self_fields.is_some_and(|fields| fields.contains(&tail.hir_id)));
     let tail_binding = match tail.kind {
         ExprKind::Path(tail_path) => {
             let Some(tail_binding) = resolved_plain_local_path_binding(tail_path, locals, inputs)
@@ -6763,7 +6951,8 @@ fn check_function_body_primitive_local_block(
             ExprKind::Lit(_) if is_direct_function_scalar_literal(init) => {}
             ExprKind::Field { .. }
                 if self_field_projections
-                    .is_some_and(|fields| fields.contains_key(&init.hir_id)) => {}
+                    .is_some_and(|fields| fields.contains_key(&init.hir_id))
+                    || unknown_self_fields.is_some_and(|fields| fields.contains(&init.hir_id)) => {}
             ExprKind::Path(path) => {
                 let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
                 else {
@@ -6917,6 +7106,7 @@ fn check_function_body_primitive_local_block(
             initial_bindings: &initial_bindings,
             primitive_types: &primitive_types,
             self_field_projections,
+            unknown_self_fields,
             local_paths: &local_paths,
             symbols,
             pointer_width: target_cfg.pointer_width(),
@@ -42581,6 +42771,64 @@ mod tests {
             matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
             "a direct primitive self-field initializer should be checked: {check:#?}"
         );
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_reports_unknown_primitive_self_fields() {
+        let root = concat!(
+            "type User { name: I32 }\n",
+            "impl User {\n",
+            "  pub fn read_name(self: borrow Self) -> I32 {\n",
+            "    let name = self.naem\n",
+            "    name\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("single inherent method collects");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let method = &results.owners()[0].members()[0];
+        assert!(
+            method
+                .local_resolution()
+                .expect("method locals resolve")
+                .is_some_and(|locals| locals.diagnostics.is_empty()),
+            "the unsupported result must come from body checking rather than local resolution"
+        );
+        assert!(
+            method.lowering_diagnostics().is_empty(),
+            "unknown fields in a supported local initializer must not produce lowering diagnostics: {:#?}",
+            method.lowering_diagnostics()
+        );
+        assert!(
+            method.type_path_resolution().is_ok(),
+            "the field diagnostic must not make type-path resolution fail"
+        );
+        assert!(
+            method
+                .test_only_diagnostics()
+                .expect("test-only diagnostics resolve")
+                .is_empty(),
+            "the field diagnostic must not alter test-only path analysis"
+        );
+        let check = method
+            .body_type_check()
+            .expect("method body check has an independent result");
+        let FunctionBodyTypeCheck::Supported { diagnostics } = check else {
+            panic!("a direct unknown self-field initializer should be checked: {check:#?}");
+        };
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(diagnostics[0].code, sai_diagnostics::Code::UnknownField);
     }
 
     #[test]

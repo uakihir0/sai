@@ -1,0 +1,46 @@
+use acme:air-quality-monitor/fixtures
+use acme:air-quality-monitor/model.{AlertPhase, MonitoringRun, ReadingQuality}
+use acme:air-quality-monitor/monitor
+use acme:air-quality-monitor/policy
+
+pub fn harborview_run() -> MonitoringRun {
+    monitor.evaluate(fixtures.harborview_series(), policy.harborview_policy())
+}
+
+test "consecutive thresholds open and close alert episodes" {
+    let run = harborview_run()
+    assert run.summary.reading_count == 12
+    assert run.summary.valid_reading_count == 11
+    assert run.summary.sensor_fault_count == 1
+    assert run.summary.alerts_opened == 2
+    assert run.summary.alerts_closed == 1
+    assert run.summary.current_phase == AlertPhase.Active
+    assert run.summary.peak_pm25 == 66
+}
+
+test "a middle-band sample keeps an open alert active" {
+    let run = harborview_run()
+    match run.decisions[4] {
+        Some(decision) => {
+            assert decision.pm25 == 42
+            assert decision.phase_after == AlertPhase.Active
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "a sensor fault breaks an unconfirmed high streak and is excluded from peak" {
+    let run = harborview_run()
+    match run.decisions[8] {
+        Some(decision) => {
+            assert decision.quality == ReadingQuality.SensorFault
+            assert decision.phase_after == AlertPhase.Normal
+        }
+        None => {
+            assert false
+        }
+    }
+    assert run.summary.peak_pm25 == 66
+}
