@@ -39,6 +39,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`package-lock-auditor`](package-lock-auditor/README.md) | Check a fixed dependency lock for missing packages, version-range conflicts, and cycles; produce a stable build order only when the graph is valid. |
 | Advanced | [`ranked-choice-audit`](ranked-choice-audit/README.md) | Tally fixed ranked ballots by round, track exhausted preferences, and apply a documented tie rule. |
 | Advanced | [`telemetry-frame-decoder`](telemetry-frame-decoder/README.md) | Validate and decode fixed sensor frames with byte masks, a checksum, and ordered structured errors. |
+| Advanced | [`webhook-delivery-audit`](webhook-delivery-audit/README.md) | Replay scripted delivery responses with capped backoff, terminal HTTP classification, attempt histories, and endpoint-scoped idempotency. |
 | Advanced | [`quota-ledger`](quota-ledger/README.md) | Model capacity-bounded reserve/release operations with contracts and property tests. |
 
 Most of the more involved examples use fixed fixtures and in-memory

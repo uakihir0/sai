@@ -1,0 +1,25 @@
+use acme:webhook-delivery-audit/model.{ResponseClass}
+
+pub fn classify_response(code: U16) -> ResponseClass {
+    if code >= 200 and code <= 299 {
+        ResponseClass.Accepted
+    } else if code == 408 or code == 429 or (code >= 500 and code <= 599) {
+        ResponseClass.Retryable
+    } else {
+        ResponseClass.Permanent
+    }
+}
+
+pub fn maximum_attempts() -> USize {
+    4
+}
+
+pub fn retry_delay_after(failed_attempt_number: USize) -> U32 {
+    if failed_attempt_number <= 1 {
+        1
+    } else if failed_attempt_number == 2 {
+        2
+    } else {
+        4
+    }
+}

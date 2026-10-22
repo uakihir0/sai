@@ -1,0 +1,155 @@
+use acme:webhook-delivery-audit/data
+use acme:webhook-delivery-audit/evaluation
+use acme:webhook-delivery-audit/model.{DeliveryAudit, DeliveryState, DeliverySummary, ResponseClass}
+use acme:webhook-delivery-audit/policy
+use acme:webhook-delivery-audit/scheduler
+
+pub fn audit_fixture() -> DeliveryAudit {
+    scheduler.schedule(data.requests())
+}
+
+pub fn summary() -> DeliverySummary {
+    evaluation.summarize(audit_fixture())
+}
+
+test "the complete fixture has deterministic outcome totals" {
+    let report = summary()
+    assert report.valid
+    assert report.request_count == 9
+    assert report.delivered_count == 4
+    assert report.permanent_failure_count == 2
+    assert report.retry_exhausted_count == 1
+    assert report.duplicate_suppressed_count == 2
+    assert report.incomplete_script_count == 0
+    assert report.attempt_count == 14
+}
+
+test "transient server failures use the capped exponential retry schedule" {
+    let audit = audit_fixture()
+    match audit.outcomes[0] {
+        Some(outcome) => {
+            assert outcome.state == DeliveryState.Delivered
+            assert outcome.attempt_count == 3
+            match outcome.attempts[0] {
+                Some(attempt) => {
+                    assert attempt.minute == 10
+                }
+                None => {
+                    assert false
+                }
+            }
+            match outcome.attempts[1] {
+                Some(attempt) => {
+                    assert attempt.minute == 11
+                }
+                None => {
+                    assert false
+                }
+            }
+            match outcome.attempts[2] {
+                Some(attempt) => {
+                    assert attempt.minute == 13
+                }
+                None => {
+                    assert false
+                }
+            }
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "a retryable response may be followed by a permanent client error" {
+    let audit = audit_fixture()
+    match audit.outcomes[1] {
+        Some(outcome) => {
+            assert outcome.state == DeliveryState.PermanentFailure
+            assert outcome.attempt_count == 2
+            match outcome.attempts[1] {
+                Some(attempt) => {
+                    assert attempt.response_code == 422
+                }
+                None => {
+                    assert false
+                }
+            }
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "a fourth retryable response exhausts the attempt budget" {
+    let audit = audit_fixture()
+    match audit.outcomes[4] {
+        Some(outcome) => {
+            assert outcome.state == DeliveryState.RetryExhausted
+            assert outcome.attempt_count == 4
+            match outcome.attempts[3] {
+                Some(attempt) => {
+                    assert attempt.minute == 37
+                }
+                None => {
+                    assert false
+                }
+            }
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "idempotency keys are scoped to an endpoint" {
+    let audit = audit_fixture()
+    match audit.outcomes[3] {
+        Some(duplicate) => {
+            assert duplicate.state == DeliveryState.DuplicateSuppressed
+            assert duplicate.attempt_count == 0
+        }
+        None => {
+            assert false
+        }
+    }
+    match audit.outcomes[7] {
+        Some(independent_endpoint) => {
+            assert independent_endpoint.state == DeliveryState.Delivered
+            assert independent_endpoint.attempt_count == 1
+        }
+        None => {
+            assert false
+        }
+    }
+    match audit.outcomes[8] {
+        Some(duplicate_after_failure) => {
+            assert duplicate_after_failure.state == DeliveryState.DuplicateSuppressed
+            assert duplicate_after_failure.attempt_count == 0
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "response classification keeps only the documented retry classes" {
+    assert policy.classify_response(204) == ResponseClass.Accepted
+    assert policy.classify_response(408) == ResponseClass.Retryable
+    assert policy.classify_response(429) == ResponseClass.Retryable
+    assert policy.classify_response(503) == ResponseClass.Retryable
+    assert policy.classify_response(422) == ResponseClass.Permanent
+    assert policy.classify_response(600) == ResponseClass.Permanent
+}
+
+test "an audit length beyond fixed capacity is rejected before aggregation" {
+    var audit = audit_fixture()
+    audit.length = audit.outcomes.len() + 1
+
+    let report = evaluation.summarize(audit)
+    assert not report.valid
+    assert report.attempt_count == 0
+    assert report.delivered_count == 0
+    assert report.permanent_failure_count == 0
+}
