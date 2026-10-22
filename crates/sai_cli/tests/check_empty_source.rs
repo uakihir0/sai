@@ -3283,15 +3283,207 @@ fn primitive_integer_addition_pairs_preserve_char_bitwise_recovery() {
 }
 
 #[test]
-fn primitive_integer_subtraction_pairs_do_not_extend_char_bitwise_aliases() {
+fn primitive_integer_subtraction_pair_aliases_defer_char_bitwise_traits() {
     let source = concat!(
-        "pub fn char_subtraction_pair() -> Char {\n",
+        "pub fn char_subtraction_pair_aliases() -> Char {\n",
         "    let pair = 1 - 2\n",
-        "    let result = 'a' & pair\n",
-        "    result\n",
+        "    let alias1 = pair\n",
+        "    let alias2 = alias1\n",
+        "    let and_value = 'a' & alias2\n",
+        "    let or_value = 'b' | alias2\n",
+        "    let xor_value = 'c' ^ alias2\n",
+        "    let recovered: Char = xor_value\n",
+        "    recovered\n",
         "}\n",
     );
-    assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        3,
+        "each Char operator should report its missing integer trait:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the unannotated subtraction-pair aliases should be checked and recover as Char:\n{stdout}"
+    );
+    for (expression, trait_name) in [
+        ("'a' & alias2", "BitAnd"),
+        ("'b' | alias2", "BitOr"),
+        ("'c' ^ alias2", "BitXor"),
+    ] {
+        let start = source
+            .find(expression)
+            .expect("Char bitwise expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!(
+                "operator `{}` has no `{trait_name}<I64>` implementation for `Char`",
+                expression
+                    .split_whitespace()
+                    .nth(1)
+                    .expect("operator is present")
+            ),
+            start,
+            start + expression.len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_integer_subtraction_pair_aliases_keep_inference_and_recovery() {
+    let range_source = concat!(
+        "pub fn char_subtraction_pair_i8_range() -> Char {\n",
+        "    let pair = -129 - 128\n",
+        "    let alias1 = pair\n",
+        "    let alias2 = alias1\n",
+        "    let value = 'g' & alias2\n",
+        "    let narrowed: I8 = alias2\n",
+        "    let recovered: Char = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let range_output = run_check(range_source, "", &[], &[]);
+    let range_stdout = String::from_utf8(range_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(range_output.status.code(), Some(1), "{range_stdout}");
+    assert_eq!(
+        range_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the later I8 constraint resolves the Char trait diagnostic:\n{range_stdout}"
+    );
+    assert_eq!(
+        range_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        2,
+        "both original signed literals are checked under I8:\n{range_stdout}"
+    );
+    let expression = "'g' & alias2";
+    let start = range_source
+        .find(expression)
+        .expect("I8-constrained Char expression exists");
+    assert_json_diagnostic_primary_span(
+        &range_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `&` has no `BitAnd<I8>` implementation for `Char`",
+        start,
+        start + expression.len(),
+    );
+    for literal in ["-129", "128"] {
+        let start = range_source
+            .find(literal)
+            .expect("out-of-range subtraction literal exists");
+        assert_json_diagnostic_primary_span(
+            &range_stdout,
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `I8`",
+            start,
+            start + literal.len(),
+        );
+    }
+
+    let resolved_source = concat!(
+        "pub fn char_subtraction_pair_resolved_before_bitwise() -> Char {\n",
+        "    let pair = 5 - 6\n",
+        "    let alias = pair\n",
+        "    let constrained: I32 = alias\n",
+        "    let value = 'h' ^ alias\n",
+        "    let recovered: Char = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let resolved_output = run_check(resolved_source, "", &[], &[]);
+    let resolved_stdout = String::from_utf8(resolved_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(resolved_output.status.code(), Some(1), "{resolved_stdout}");
+    assert_eq!(
+        resolved_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the earlier I32 constraint resolves the Char trait diagnostic immediately:\n{resolved_stdout}"
+    );
+    assert_eq!(
+        resolved_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        0,
+        "the Char result annotation and function tail recover without a mismatch:\n{resolved_stdout}"
+    );
+    assert!(
+        !resolved_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !resolved_stdout.contains("\"type\":\"result\""),
+        "the resolved subtraction alias should stay in the supported Char recovery path:\n{resolved_stdout}"
+    );
+    let expression = "'h' ^ alias";
+    let start = resolved_source
+        .find(expression)
+        .expect("preconstrained Char bitwise expression exists");
+    assert_json_diagnostic_primary_span(
+        &resolved_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `^` has no `BitXor<I32>` implementation for `Char`",
+        start,
+        start + expression.len(),
+    );
+
+    let mismatch_source = concat!(
+        "pub fn char_subtraction_pair_annotation_recovery() -> I32 {\n",
+        "    let pair = 1 - 2\n",
+        "    let alias = pair\n",
+        "    let value: I32 = 'j' & alias\n",
+        "    let recovered: I32 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let mismatch_output = run_check(mismatch_source, "", &[], &[]);
+    let mismatch_stdout = String::from_utf8(mismatch_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(mismatch_output.status.code(), Some(1), "{mismatch_stdout}");
+    assert_eq!(
+        mismatch_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "{mismatch_stdout}"
+    );
+    assert_eq!(
+        mismatch_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "the Char result annotation reports one mismatch and later uses recover:\n{mismatch_stdout}"
+    );
+    assert!(
+        !mismatch_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !mismatch_stdout.contains("\"type\":\"result\""),
+        "the annotation mismatch should recover through the following local and tail:\n{mismatch_stdout}"
+    );
+    let expression = "'j' & alias";
+    let start = mismatch_source
+        .find(expression)
+        .expect("Char annotation recovery expression exists");
+    assert_json_diagnostic_primary_span(
+        &mismatch_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+        start,
+        start + expression.len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &mismatch_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Char`",
+        start,
+        start + expression.len(),
+    );
 }
 
 #[test]
@@ -10269,12 +10461,12 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "let right = 1.0 + 2.0\n    let result = 'a' & right",
         ),
         fixture(
-            "pub fn char_literal_computed_integer_path_rhs() -> Char",
-            "let right = 1 - 2\n    let result = 'a' & right",
+            "pub fn char_literal_direct_subtraction_rhs() -> Char",
+            "let result = 'a' & (1 - 2)",
         ),
         fixture(
-            "pub fn char_literal_computed_subtraction_path_rhs() -> Char",
-            "let right = 3 - 2\n    let result = 'a' & right",
+            "pub fn char_literal_nested_subtraction_path_rhs() -> Char",
+            "let right = 3 - (2 - 1)\n    let result = 'a' & right",
         ),
         fixture(
             "pub fn char_literal_computed_integer_multiplication_path_rhs() -> Char",
@@ -10292,11 +10484,26 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn generic_char_literal_addition_pair_path_rhs<T>() -> Char",
             "let right = 1 + 2\n    let result = 'a' & right",
         ),
+        fixture(
+            "pub fn generic_char_literal_subtraction_pair_path_rhs<T>() -> Char",
+            "let right = 1 - 2\n    let result = 'a' & right",
+        ),
         concat!(
             "type CharAdditionPairOwner { marker: Char }\n",
             "impl CharAdditionPairOwner {\n",
             "    fn char_addition_pair_method(self: borrow Self) -> Char {\n",
             "        let right = 1 + 2\n",
+            "        let result = 'a' & right\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        )
+        .to_owned(),
+        concat!(
+            "type CharSubtractionPairOwner { marker: Char }\n",
+            "impl CharSubtractionPairOwner {\n",
+            "    fn char_subtraction_pair_method(self: borrow Self) -> Char {\n",
+            "        let right = 1 - 2\n",
             "        let result = 'a' & right\n",
             "        result\n",
             "    }\n",
