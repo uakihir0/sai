@@ -1,0 +1,193 @@
+use acme:university-enrollment-planner/model.{
+    Course
+    Program
+    RegistrationRequest
+    Section
+    Student
+}
+
+pub fn students() -> Array<Student, 7> {
+    [
+        Student(
+            id: 1,
+            name: "Aki Tanaka",
+            program: Program.ComputerScience,
+            year: 4,
+            term_credit_limit: 7,
+            completed_course_ids: [Some(101), Some(201), Some(301)],
+        ),
+        Student(
+            id: 2,
+            name: "Noa Sato",
+            program: Program.Arts,
+            year: 4,
+            term_credit_limit: 12,
+            completed_course_ids: [Some(101), Some(201), None],
+        ),
+        Student(
+            id: 3,
+            name: "Mio Kato",
+            program: Program.ComputerScience,
+            year: 3,
+            term_credit_limit: 9,
+            completed_course_ids: [Some(101), Some(201), None],
+        ),
+        Student(
+            id: 4,
+            name: "Aya Mori",
+            program: Program.ComputerScience,
+            year: 3,
+            term_credit_limit: 7,
+            completed_course_ids: [Some(101), Some(201), None],
+        ),
+        Student(
+            id: 5,
+            name: "Sam Ito",
+            program: Program.ComputerScience,
+            year: 2,
+            term_credit_limit: 8,
+            completed_course_ids: [None, None, None],
+        ),
+        Student(
+            id: 6,
+            name: "Ren Watanabe",
+            program: Program.ComputerScience,
+            year: 2,
+            term_credit_limit: 8,
+            completed_course_ids: [Some(101), None, None],
+        ),
+        Student(
+            id: 7,
+            name: "Yui Nakamura",
+            program: Program.ComputerScience,
+            year: 1,
+            term_credit_limit: 8,
+            completed_course_ids: [None, None, None],
+        ),
+    ]
+}
+
+pub fn courses() -> Array<Course, 5> {
+    [
+        Course(
+            id: 101,
+            code: "CS-101",
+            title: "Programming Foundations",
+            credits: 3,
+            required_program: None,
+            minimum_year: 1,
+            prerequisite_course_id: None,
+            section_id: 1101,
+        ),
+        Course(
+            id: 201,
+            code: "CS-201",
+            title: "Data Structures",
+            credits: 4,
+            required_program: Some(Program.ComputerScience),
+            minimum_year: 2,
+            prerequisite_course_id: Some(101),
+            section_id: 1201,
+        ),
+        Course(
+            id: 220,
+            code: "CS-220",
+            title: "Databases",
+            credits: 3,
+            required_program: Some(Program.ComputerScience),
+            minimum_year: 2,
+            prerequisite_course_id: None,
+            section_id: 1220,
+        ),
+        Course(
+            id: 301,
+            code: "CS-301",
+            title: "AI Lab",
+            credits: 3,
+            required_program: Some(Program.ComputerScience),
+            minimum_year: 3,
+            prerequisite_course_id: Some(201),
+            section_id: 1301,
+        ),
+        Course(
+            id: 401,
+            code: "CS-401",
+            title: "Capstone Studio",
+            credits: 4,
+            required_program: Some(Program.ComputerScience),
+            minimum_year: 4,
+            prerequisite_course_id: Some(301),
+            section_id: 1401,
+        ),
+    ]
+}
+
+pub fn sections() -> Array<Section, 5> {
+    [
+        Section(
+            id: 1101,
+            course_id: 101,
+            room: "North 101",
+            weekday: 1,
+            start_minute: 540,
+            end_minute: 600,
+            capacity: 2,
+        ),
+        Section(
+            id: 1201,
+            course_id: 201,
+            room: "Science 204",
+            weekday: 1,
+            start_minute: 600,
+            end_minute: 720,
+            capacity: 1,
+        ),
+        Section(
+            id: 1220,
+            course_id: 220,
+            room: "Library 12",
+            weekday: 1,
+            start_minute: 660,
+            end_minute: 780,
+            capacity: 1,
+        ),
+        Section(
+            id: 1301,
+            course_id: 301,
+            room: "Computing Lab",
+            weekday: 3,
+            start_minute: 780,
+            end_minute: 960,
+            capacity: 1,
+        ),
+        Section(
+            id: 1401,
+            course_id: 401,
+            room: "Innovation Hall",
+            weekday: 4,
+            start_minute: 540,
+            end_minute: 720,
+            capacity: 1,
+        ),
+    ]
+}
+
+// Deliberately unsorted: the planner orders by student year, then request sequence.
+pub fn requests() -> Array<RegistrationRequest, 14> {
+    [
+        RegistrationRequest(sequence: 103, student_id: 1, course_id: 220),
+        RegistrationRequest(sequence: 2, student_id: 3, course_id: 220),
+        RegistrationRequest(sequence: 10, student_id: 7, course_id: 201),
+        RegistrationRequest(sequence: 101, student_id: 1, course_id: 401),
+        RegistrationRequest(sequence: 9, student_id: 6, course_id: 220),
+        RegistrationRequest(sequence: 104, student_id: 2, course_id: 301),
+        RegistrationRequest(sequence: 6, student_id: 4, course_id: 220),
+        RegistrationRequest(sequence: 7, student_id: 5, course_id: 201),
+        RegistrationRequest(sequence: 102, student_id: 1, course_id: 301),
+        RegistrationRequest(sequence: 5, student_id: 4, course_id: 201),
+        RegistrationRequest(sequence: 1, student_id: 3, course_id: 301),
+        RegistrationRequest(sequence: 8, student_id: 6, course_id: 201),
+        RegistrationRequest(sequence: 4, student_id: 4, course_id: 301),
+        RegistrationRequest(sequence: 3, student_id: 3, course_id: 201),
+    ]
+}

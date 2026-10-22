@@ -1,0 +1,84 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Program {
+    ComputerScience
+    Arts
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RegistrationStatus {
+    Enrolled
+    Waitlisted
+    Rejected
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RejectionReason {
+    UnknownStudent
+    UnknownCourse
+    UnknownSection
+    ProgramMismatch
+    YearRequirement
+    MissingPrerequisite
+    CreditLimit
+    ScheduleConflict
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Student {
+    pub id: U32
+    pub name: Str
+    pub program: Program
+    pub year: U32
+    pub term_credit_limit: U32
+    pub completed_course_ids: Array<Option<U32>, 3>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Course {
+    pub id: U32
+    pub code: Str
+    pub title: Str
+    pub credits: U32
+    pub required_program: Option<Program>
+    pub minimum_year: U32
+    pub prerequisite_course_id: Option<U32>
+    pub section_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Section {
+    pub id: U32
+    pub course_id: U32
+    pub room: Str
+    pub weekday: U32
+    pub start_minute: U32
+    pub end_minute: U32
+    pub capacity: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RegistrationRequest {
+    pub sequence: U32
+    pub student_id: U32
+    pub course_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RegistrationDecision {
+    pub sequence: U32
+    pub student_id: U32
+    pub course_id: U32
+    pub status: RegistrationStatus
+    pub reason: Option<RejectionReason>
+    pub section_id: Option<U32>
+    pub waitlist_position: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TermPlan {
+    pub decisions: Array<Option<RegistrationDecision>, 14>
+    pub decision_count: USize
+    pub enrolled_count: U32
+    pub waitlisted_count: U32
+    pub rejected_count: U32
+}
