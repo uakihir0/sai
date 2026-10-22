@@ -2347,6 +2347,23 @@ fn primitive_arithmetic_integer_subtraction_literal_pairs_share_inference() {
 }
 
 #[test]
+fn primitive_arithmetic_integer_multiplication_literal_pairs_share_inference() {
+    let source = concat!(
+        "pub fn integer_multiplication_pair_inference() -> U8 {\n",
+        "    let default_i64 = -9223372036854775808 * 1\n",
+        "    let annotated_i32: I32 = 2147483647 * 1\n",
+        "    let product_overflows_i8: I8 = 100 * 2\n",
+        "    let later_i8 = 25 * 4\n",
+        "    let selected_i8: I8 = later_i8\n",
+        "    let tail_u8 = 255 * 1\n",
+        "    tail_u8\n",
+        "}\n",
+    );
+
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
 fn primitive_arithmetic_integer_literal_pairs_report_ranges_and_recover_mismatches() {
     let source = concat!(
         "pub fn recover_pairs() -> I64 {\n",
@@ -2489,6 +2506,78 @@ fn primitive_arithmetic_integer_subtraction_literal_pairs_report_ranges_and_reco
 }
 
 #[test]
+fn primitive_arithmetic_integer_multiplication_literal_pairs_report_ranges_and_recover_mismatches()
+{
+    let source = concat!(
+        "pub fn recover_multiplication_pairs() -> I64 {\n",
+        "    let default_i64 = 9223372036854775808 * 1\n",
+        "    let out_of_range: I8 = 128 * -129\n",
+        "    let recovered_range: I8 = out_of_range\n",
+        "    let incompatible: Bool = 1 * 2\n",
+        "    let recovered_bool: Bool = incompatible\n",
+        "    let output: I64 = 0\n",
+        "    output\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let default_i64_start = source
+        .find("9223372036854775808")
+        .expect("out-of-range default integer literal exists");
+    let signed_pair_start = source
+        .find("128 * -129")
+        .expect("out-of-range signed multiplication pair exists");
+    let mismatch_start = source
+        .find("1 * 2")
+        .expect("incompatible annotated multiplication pair exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        3,
+        "defaulting should check the first pair against I64 and both signed operands against I8:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the non-integer annotation should produce one initializer mismatch:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "diagnostics should recover through later local uses and the function tail:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I64`",
+        default_i64_start,
+        default_i64_start + "9223372036854775808".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        signed_pair_start,
+        signed_pair_start + "128".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `I8`",
+        signed_pair_start + "128 * ".len(),
+        signed_pair_start + "128 * -129".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found an integer literal",
+        mismatch_start,
+        mismatch_start + "1 * 2".len(),
+    );
+}
+
+#[test]
 fn primitive_integer_addition_pairs_preserve_char_bitwise_recovery() {
     let source = concat!(
         "pub fn char_pair_recovery() -> Char {\n",
@@ -2568,6 +2657,56 @@ fn primitive_integer_subtraction_annotated_pairs_keep_concrete_char_behavior() {
             && !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
             && !stdout.contains("\"type\":\"result\""),
         "an annotated subtraction pair should follow concrete Char-bitwise recovery:\n{stdout}"
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `&` has no `BitAnd<I32>` implementation for `Char`",
+        expression_start,
+        expression_start + "'a' & pair".len(),
+    );
+}
+
+#[test]
+fn primitive_integer_multiplication_pairs_do_not_extend_char_bitwise_aliases() {
+    let source = concat!(
+        "pub fn char_multiplication_pair() -> Char {\n",
+        "    let pair = 1 * 2\n",
+        "    let result = 'a' & pair\n",
+        "    result\n",
+        "}\n",
+    );
+    assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+}
+
+#[test]
+fn primitive_integer_multiplication_annotated_pairs_keep_concrete_char_behavior() {
+    let source = concat!(
+        "pub fn char_annotated_multiplication_pair() -> Char {\n",
+        "    let pair: I32 = 1 * 2\n",
+        "    let result = 'a' & pair\n",
+        "    result\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    let expression_start = source
+        .find("'a' & pair")
+        .expect("Char bitwise expression exists");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the concrete I32 pair should retain its Char trait diagnostic:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "an annotated multiplication pair should follow concrete Char-bitwise recovery:\n{stdout}"
     );
     assert_json_diagnostic_primary_span(
         &stdout,
@@ -3177,8 +3316,9 @@ fn unsupported_primitive_arithmetic_local_initializer_shapes_remain_gated() {
         "pub fn div_nested_right(left: I32, right: I32) -> I32 {\n    let result = left / (right / 1)\n    result\n}\n",
         "pub fn div_nested_left(left: I32, right: I32) -> I32 {\n    let result = (left / right) / left\n    result\n}\n",
         "type IntegerAlias = I32\npub fn div_alias(left: IntegerAlias, right: IntegerAlias) -> IntegerAlias {\n    let result = left / right\n    result\n}\n",
-        "pub fn mul(left: I32, right: I32) -> I32 {\n    let result = 1 * 2\n    result\n}\n",
         "pub fn mul(left: I32, right: I32) -> I32 {\n    let one = 1\n    let result = one * left\n    result\n}\n",
+        "pub fn float_mul() -> F64 {\n    let result = 1.0 * 2.0\n    result\n}\n",
+        "pub fn mixed_mul() -> I64 {\n    let result = 1 * 2.0\n    result\n}\n",
         "pub fn nested(left: I32, right: I32) -> I32 {\n    let result = (left - right) * left\n    result\n}\n",
         "pub fn remainder_literal_literal() -> I32 {\n    let result = 1 % 2\n    result\n}\n",
         "pub fn remainder_unresolved_local(left: I32) -> I32 {\n    let one = 1\n    let result = one % left\n    result\n}\n",

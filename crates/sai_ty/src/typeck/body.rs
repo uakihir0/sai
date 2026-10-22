@@ -627,7 +627,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             let Some(kind) = primitive_literal_kind(literal) else {
                 return Err(());
             };
-            if matches!(operator, BinOp::Add | BinOp::Sub)
+            if matches!(operator, BinOp::Add | BinOp::Sub | BinOp::Mul)
                 && kind == PrimitiveLiteralKind::Integer
                 && matches!(right.kind, ExprKind::Lit(Lit::Int { .. }))
             {
