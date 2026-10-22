@@ -1,0 +1,21 @@
+use acme:nonogram-solver/fixtures
+use acme:nonogram-solver/model.{Board, LineClue, Puzzle, PuzzleError, SolutionSummary}
+use acme:nonogram-solver/patterns
+use acme:nonogram-solver/report
+use acme:nonogram-solver/solver
+
+pub fn example_puzzle() -> Puzzle {
+    fixtures.x_shape()
+}
+
+pub fn solve_example() -> Result<Board, PuzzleError> {
+    solver.solve(example_puzzle())
+}
+
+pub fn summarize_example(board: Board) -> SolutionSummary {
+    report.summarize(example_puzzle(), board)
+}
+
+pub fn line_pattern_matches(pattern: U32, clue: LineClue) -> Bool {
+    patterns.matches_clue(pattern, clue)
+}

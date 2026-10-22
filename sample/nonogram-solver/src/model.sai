@@ -1,0 +1,36 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type LineClue {
+    pub runs: Array<Option<USize>, 3>
+    pub run_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Puzzle {
+    pub rows: Array<LineClue, 5>
+    pub columns: Array<LineClue, 5>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CandidateSet {
+    pub patterns: Array<U32, 32>
+    pub count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Board {
+    pub rows: Array<U32, 5>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PuzzleError {
+    InvalidClue
+    NoLinePattern
+    NoSolution
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SolutionSummary {
+    pub all_clues_match: Bool
+    pub filled_cells: USize
+    pub checked_lines: USize
+}

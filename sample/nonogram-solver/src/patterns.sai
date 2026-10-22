@@ -1,0 +1,128 @@
+use acme:nonogram-solver/model.{CandidateSet, LineClue, PuzzleError}
+
+const LINE_WIDTH: USize = 5
+const PATTERN_COUNT: U32 = 32
+const MAX_RUNS: USize = 3
+
+pub fn empty_candidates() -> CandidateSet {
+    CandidateSet(patterns: Array<U32, 32>.filled(0), count: 0)
+}
+
+pub fn is_filled(pattern: U32, index: USize) -> Bool {
+    pattern & (1 << index) != 0
+}
+
+fn clue_is_well_formed(clue: LineClue) -> Bool {
+    if clue.run_count > MAX_RUNS {
+        return false
+    }
+
+    for index in 0..MAX_RUNS {
+        match clue.runs[index] {
+            Some(length) => {
+                if index >= clue.run_count or length == 0 {
+                    return false
+                }
+            }
+            None => {
+                if index < clue.run_count {
+                    return false
+                }
+            }
+        }
+    }
+    true
+}
+
+pub fn matches_clue(pattern: U32, clue: LineClue) -> Bool {
+    if pattern >= PATTERN_COUNT {
+        return false
+    }
+    if not clue_is_well_formed(clue) {
+        return false
+    }
+
+    var found_runs: USize = 0
+    var current_run: USize = 0
+    for index in 0..LINE_WIDTH {
+        if is_filled(pattern, index) {
+            current_run += 1
+        } else if current_run > 0 {
+            if found_runs >= clue.run_count {
+                return false
+            }
+            match clue.runs[found_runs] {
+                Some(expected) => {
+                    if current_run != expected {
+                        return false
+                    }
+                }
+                None => return false
+            }
+            found_runs += 1
+            current_run = 0
+        }
+    }
+
+    if current_run > 0 {
+        if found_runs >= clue.run_count {
+            return false
+        }
+        match clue.runs[found_runs] {
+            Some(expected) => {
+                if current_run != expected {
+                    return false
+                }
+            }
+            None => return false
+        }
+        found_runs += 1
+    }
+    found_runs == clue.run_count
+}
+
+pub fn candidates(clue: LineClue) -> Result<CandidateSet, PuzzleError> {
+    if not clue_is_well_formed(clue) {
+        return Err(PuzzleError.InvalidClue)
+    }
+
+    var result = empty_candidates()
+    var pattern: U32 = 0
+    while pattern < PATTERN_COUNT {
+        if matches_clue(pattern, clue) {
+            result.patterns[result.count] = pattern
+            result.count += 1
+        }
+        pattern += 1
+    }
+
+    if result.count == 0 {
+        return Err(PuzzleError.NoLinePattern)
+    }
+    Ok(result)
+}
+
+pub fn puzzle_candidates(puzzle: Puzzle) -> Result<
+    (Array<CandidateSet, 5>, Array<CandidateSet, 5>),
+    PuzzleError,
+> {
+    var rows = Array<CandidateSet, 5>.filled(empty_candidates())
+    var columns = Array<CandidateSet, 5>.filled(empty_candidates())
+
+    for index in 0..LINE_WIDTH {
+        match candidates(puzzle.rows[index]) {
+            Ok(found) => {
+                rows[index] = found
+            }
+            Err(error) => return Err(error)
+        }
+        match candidates(puzzle.columns[index]) {
+            Ok(found) => {
+                columns[index] = found
+            }
+            Err(error) => return Err(error)
+        }
+    }
+
+    Ok((rows, columns))
+}

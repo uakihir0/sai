@@ -1,0 +1,20 @@
+use acme:nonogram-solver/model.{LineClue, Puzzle}
+
+pub fn x_shape() -> Puzzle {
+    Puzzle(
+        rows: [
+            LineClue(runs: [Some(1), Some(1), None], run_count: 2),
+            LineClue(runs: [Some(1), Some(1), None], run_count: 2),
+            LineClue(runs: [Some(1), None, None], run_count: 1),
+            LineClue(runs: [Some(1), Some(1), None], run_count: 2),
+            LineClue(runs: [Some(1), Some(1), None], run_count: 2),
+        ],
+        columns: [
+            LineClue(runs: [Some(1), Some(1), None], run_count: 2),
+            LineClue(runs: [Some(1), Some(1), None], run_count: 2),
+            LineClue(runs: [Some(1), None, None], run_count: 1),
+            LineClue(runs: [Some(1), Some(1), None], run_count: 2),
+            LineClue(runs: [Some(1), Some(1), None], run_count: 2),
+        ],
+    )
+}

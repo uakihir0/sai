@@ -1,0 +1,80 @@
+use acme:nonogram-solver/model.{Board, CandidateSet, Puzzle, PuzzleError}
+use acme:nonogram-solver/patterns
+
+const LINE_COUNT: USize = 5
+
+fn column_prefix_has_candidate(
+    candidates: CandidateSet,
+    selected_rows: Array<U32, 5>,
+    rows_filled: USize,
+    column: USize,
+) -> Bool {
+    var candidate_index: USize = 0
+    while candidate_index < candidates.count {
+        let pattern = candidates.patterns[candidate_index]
+        var matches = true
+        for row in 0..rows_filled {
+            let candidate_cell = patterns.is_filled(pattern, row)
+            let selected_cell = patterns.is_filled(selected_rows[row], column)
+            if candidate_cell != selected_cell {
+                matches = false
+            }
+        }
+        if matches {
+            return true
+        }
+        candidate_index += 1
+    }
+    false
+}
+
+fn search_rows(
+    row_candidates: Array<CandidateSet, 5>,
+    column_candidates: Array<CandidateSet, 5>,
+    selected_rows: Array<U32, 5>,
+    next_row: USize,
+) -> Option<Array<U32, 5>> {
+    if next_row == LINE_COUNT {
+        return Some(selected_rows)
+    }
+
+    let candidates = row_candidates[next_row]
+    var candidate_index: USize = 0
+    while candidate_index < candidates.count {
+        var next_rows = selected_rows
+        next_rows[next_row] = candidates.patterns[candidate_index]
+        let rows_filled = next_row + 1
+        var columns_possible = true
+        for column in 0..LINE_COUNT {
+            if not column_prefix_has_candidate(
+                column_candidates[column],
+                next_rows,
+                rows_filled,
+                column,
+            ) {
+                columns_possible = false
+            }
+        }
+
+        if columns_possible {
+            match search_rows(row_candidates, column_candidates, next_rows, rows_filled) {
+                Some(solution) => return Some(solution)
+                None => {}
+            }
+        }
+        candidate_index += 1
+    }
+    None
+}
+
+pub fn solve(puzzle: Puzzle) -> Result<Board, PuzzleError> {
+    let (row_candidates, column_candidates) = match patterns.puzzle_candidates(puzzle) {
+        Ok(found) => found
+        Err(error) => return Err(error)
+    }
+    let selected_rows = Array<U32, 5>.filled(0)
+    match search_rows(row_candidates, column_candidates, selected_rows, 0) {
+        Some(rows) => Ok(Board(rows: rows))
+        None => Err(PuzzleError.NoSolution)
+    }
+}
