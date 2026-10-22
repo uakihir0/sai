@@ -4015,15 +4015,224 @@ fn primitive_integer_division_annotated_pairs_keep_concrete_char_behavior() {
 }
 
 #[test]
-fn primitive_integer_remainder_pairs_do_not_extend_char_bitwise_aliases() {
+fn primitive_integer_remainder_pair_aliases_defer_char_bitwise_traits() {
     let source = concat!(
-        "pub fn char_remainder_pair() -> Char {\n",
+        "pub fn char_remainder_pair_defaults() -> Char {\n",
         "    let pair = 1 % 2\n",
-        "    let result = 'a' & pair\n",
-        "    result\n",
+        "    let alias1 = pair\n",
+        "    let alias2 = alias1\n",
+        "    let and_value = 'a' & alias2\n",
+        "    let or_value = 'b' | alias2\n",
+        "    let xor_value = 'c' ^ alias2\n",
+        "    let recovered: Char = xor_value\n",
+        "    recovered\n",
         "}\n",
     );
-    assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        3,
+        "each Char operator should report its missing integer trait:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        0,
+        "both original signed literals should be checked under I8:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        0,
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the unannotated remainder-pair aliases should be checked and recover as Char:\n{stdout}"
+    );
+    for (expression, trait_name, operator, primitive) in [
+        ("'a' & alias2", "BitAnd", "&", "I64"),
+        ("'b' | alias2", "BitOr", "|", "I64"),
+        ("'c' ^ alias2", "BitXor", "^", "I64"),
+    ] {
+        let start = source
+            .find(expression)
+            .expect("Char bitwise expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!(
+                "operator `{operator}` has no `{trait_name}<{primitive}>` implementation for `Char`"
+            ),
+            start,
+            start + expression.len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_integer_remainder_pair_aliases_apply_late_constraints() {
+    let source = concat!(
+        "pub fn char_remainder_pair_late_constraint() -> Char {\n",
+        "    let pair = -129 % 128\n",
+        "    let alias = pair\n",
+        "    let and_value = 'd' & alias\n",
+        "    let or_value = 'e' | alias\n",
+        "    let xor_value = 'f' ^ alias\n",
+        "    let narrowed: I8 = alias\n",
+        "    let recovered: Char = xor_value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        3,
+        "each Char operator should use the final I8 constraint:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        2,
+        "both original signed literals should be checked under I8:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"code\":\"TYPE_MISMATCH\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the late integer constraint should preserve Char recovery:\n{stdout}"
+    );
+    for (expression, trait_name, operator) in [
+        ("'d' & alias", "BitAnd", "&"),
+        ("'e' | alias", "BitOr", "|"),
+        ("'f' ^ alias", "BitXor", "^"),
+    ] {
+        let start = source
+            .find(expression)
+            .expect("I8-constrained Char expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<I8>` implementation for `Char`"),
+            start,
+            start + expression.len(),
+        );
+    }
+    for literal in ["-129", "128"] {
+        let start = source
+            .find(literal)
+            .expect("out-of-range remainder literal exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `I8`",
+            start,
+            start + literal.len(),
+        );
+    }
+}
+
+#[test]
+fn primitive_integer_remainder_pair_aliases_keep_prior_constraints_and_recovery() {
+    let constrained_source = concat!(
+        "pub fn char_remainder_pair_preconstrained() -> Char {\n",
+        "    let pair = 5 % 2\n",
+        "    let alias = pair\n",
+        "    let narrowed: I32 = alias\n",
+        "    let value = 'h' ^ alias\n",
+        "    let recovered: Char = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let constrained_output = run_check(constrained_source, "", &[], &[]);
+    let constrained_stdout =
+        String::from_utf8(constrained_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        constrained_output.status.code(),
+        Some(1),
+        "{constrained_stdout}"
+    );
+    assert_eq!(
+        constrained_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the earlier I32 constraint resolves the Char trait diagnostic:\n{constrained_stdout}"
+    );
+    assert_eq!(
+        constrained_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        0,
+        "the Char result annotation recovers:\n{constrained_stdout}"
+    );
+    assert!(
+        !constrained_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !constrained_stdout.contains("\"type\":\"result\""),
+        "the preconstrained remainder alias remains in the supported Char recovery path:\n{constrained_stdout}"
+    );
+    let expression = "'h' ^ alias";
+    let start = constrained_source
+        .find(expression)
+        .expect("preconstrained Char bitwise expression exists");
+    assert_json_diagnostic_primary_span(
+        &constrained_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `^` has no `BitXor<I32>` implementation for `Char`",
+        start,
+        start + expression.len(),
+    );
+
+    let mismatch_source = concat!(
+        "pub fn char_remainder_pair_annotation_recovery() -> I32 {\n",
+        "    let pair = 1 % 2\n",
+        "    let alias = pair\n",
+        "    let value: I32 = 'j' & alias\n",
+        "    let recovered: I32 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let mismatch_output = run_check(mismatch_source, "", &[], &[]);
+    let mismatch_stdout = String::from_utf8(mismatch_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(mismatch_output.status.code(), Some(1), "{mismatch_stdout}");
+    assert_eq!(
+        mismatch_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "{mismatch_stdout}"
+    );
+    assert_eq!(
+        mismatch_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "a mismatched Char result annotation reports once and later uses recover:\n{mismatch_stdout}"
+    );
+    assert!(
+        !mismatch_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !mismatch_stdout.contains("\"type\":\"result\""),
+        "the annotation mismatch should recover through the following local and tail:\n{mismatch_stdout}"
+    );
+    let expression = "'j' & alias";
+    let start = mismatch_source
+        .find(expression)
+        .expect("annotation recovery expression exists");
+    assert_json_diagnostic_primary_span(
+        &mismatch_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Char`",
+        start,
+        start + expression.len(),
+    );
 }
 
 #[test]
@@ -4062,6 +4271,45 @@ fn primitive_integer_remainder_annotated_pairs_keep_concrete_char_behavior() {
         expression_start,
         expression_start + "'a' & pair".len(),
     );
+}
+
+#[test]
+fn primitive_integer_other_remainder_origins_stay_gated_for_char_bitwise_aliases() {
+    let cases = [
+        concat!(
+            "pub fn char_direct_remainder_rhs() -> Char {\n",
+            "    let value = 'a' & (1 % 2)\n",
+            "    value\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn char_nested_remainder_alias() -> Char {\n",
+            "    let pair = 1 % (2 % 3)\n",
+            "    let value = 'a' & pair\n",
+            "    value\n",
+            "}\n",
+        ),
+        concat!(
+            "pub fn generic_char_remainder_alias<T>() -> Char {\n",
+            "    let pair = 1 % 2\n",
+            "    let value = 'a' & pair\n",
+            "    value\n",
+            "}\n",
+        ),
+        concat!(
+            "type CharRemainderPairOwner { marker: Char }\n",
+            "impl CharRemainderPairOwner {\n",
+            "    fn char_remainder_pair_method(self: borrow Self) -> Char {\n",
+            "        let pair = 1 % 2\n",
+            "        let value = 'a' & pair\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
+        ),
+    ];
+    for source in cases {
+        assert_check_stays_gated(&run_check(source, "", &[], &[]), source);
+    }
 }
 
 #[test]
