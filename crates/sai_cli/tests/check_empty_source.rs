@@ -2061,20 +2061,65 @@ fn primitive_integer_wrapping_literal_pairs_check_ranges_and_recover_annotations
 }
 
 #[test]
-fn primitive_wrapping_literal_pair_provenance_does_not_extend_to_char_bitwise() {
-    for (name, operator) in [("add", "+%"), ("sub", "-%"), ("mul", "*%")] {
-        let source = format!(
+fn primitive_wrapping_literal_pair_aliases_defer_char_bitwise_traits() {
+    let mut source = String::from("pub fn char_wrapping_pair_aliases() -> Char {\n");
+    for (name, operator) in [("added", "+%"), ("subtracted", "-%"), ("multiplied", "*%")] {
+        source.push_str(&format!(
             concat!(
-                "pub fn char_{name}_pair_alias() -> Char {{\n",
-                "    let pair = 1 {operator} 2\n",
-                "    let value = 'a' & pair\n",
-                "    value\n",
-                "}}\n",
+                "    let pair_{name} = 1 {operator} 2\n",
+                "    let alias1_{name} = pair_{name}\n",
+                "    let alias2_{name} = alias1_{name}\n",
+                "    let alias3_{name} = alias2_{name}\n",
             ),
             name = name,
             operator = operator,
+        ));
+    }
+    let mut expressions = Vec::new();
+    for (pair, alias) in [
+        ("added", "alias3_added"),
+        ("subtracted", "alias3_subtracted"),
+        ("multiplied", "alias3_multiplied"),
+    ] {
+        for (name, operator, character, trait_name) in [
+            ("and", "&", "'a'", "BitAnd"),
+            ("or", "|", "'b'", "BitOr"),
+            ("xor", "^", "'c'", "BitXor"),
+        ] {
+            let binding = format!("result_{pair}_{name}");
+            let expression = format!("{character} {operator} {alias}");
+            source.push_str(&format!("    let {binding} = {expression}\n"));
+            expressions.push((expression, operator, trait_name));
+        }
+    }
+    source.push_str("    let recovered: Char = result_multiplied_xor\n    recovered\n}\n");
+
+    let output = run_check(&source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        9,
+        "each Char operator over each wrapping pair reports its missing trait:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "unannotated wrapping-pair aliases should be checked and recover as Char:\n{stdout}"
+    );
+    for (expression, operator, trait_name) in &expressions {
+        let start = source
+            .find(expression)
+            .expect("Char bitwise expression exists");
+        assert_json_diagnostic_primary_span(
+            &stdout,
+            "OPERATOR_NOT_SUPPORTED",
+            &format!("operator `{operator}` has no `{trait_name}<I64>` implementation for `Char`"),
+            start,
+            start + expression.len(),
         );
-        assert_check_stays_gated(&run_check(&source, "", &[], &[]), &source);
     }
 
     let annotated_source = concat!(
@@ -2128,6 +2173,148 @@ fn primitive_wrapping_literal_pair_provenance_does_not_extend_to_char_bitwise() 
             end,
         );
     }
+}
+
+#[test]
+fn primitive_wrapping_literal_pair_aliases_keep_inference_and_recovery() {
+    let range_source = concat!(
+        "pub fn char_wrapping_pair_i8_range() -> Char {\n",
+        "    let pair = -129 +% 128\n",
+        "    let alias1 = pair\n",
+        "    let alias2 = alias1\n",
+        "    let value = 'g' & alias2\n",
+        "    let narrowed: I8 = alias2\n",
+        "    let recovered: Char = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let range_output = run_check(range_source, "", &[], &[]);
+    let range_stdout = String::from_utf8(range_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(range_output.status.code(), Some(1), "{range_stdout}");
+    assert_eq!(
+        range_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "the later I8 constraint resolves the Char trait diagnostic:\n{range_stdout}"
+    );
+    assert_eq!(
+        range_stdout
+            .matches("\"code\":\"LITERAL_OUT_OF_RANGE\"")
+            .count(),
+        2,
+        "both original signed literal sites are checked under I8:\n{range_stdout}"
+    );
+    let expression = "'g' & alias2";
+    let start = range_source
+        .find(expression)
+        .expect("I8-constrained Char expression exists");
+    assert_json_diagnostic_primary_span(
+        &range_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `&` has no `BitAnd<I8>` implementation for `Char`",
+        start,
+        start + expression.len(),
+    );
+    for literal in ["-129", "128"] {
+        let start = range_source
+            .find(literal)
+            .expect("out-of-range wrapping literal exists");
+        assert_json_diagnostic_primary_span(
+            &range_stdout,
+            "LITERAL_OUT_OF_RANGE",
+            "integer literal is out of range for `I8`",
+            start,
+            start + literal.len(),
+        );
+    }
+
+    let constrained_source = concat!(
+        "pub fn char_wrapping_pair_late_constraint() -> Char {\n",
+        "    let pair = 3 -% 4\n",
+        "    let alias = pair\n",
+        "    let value = 'd' | alias\n",
+        "    let narrowed: I32 = alias\n",
+        "    let recovered: Char = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let constrained_output = run_check(constrained_source, "", &[], &[]);
+    let constrained_stdout =
+        String::from_utf8(constrained_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        constrained_output.status.code(),
+        Some(1),
+        "{constrained_stdout}"
+    );
+    assert_eq!(
+        constrained_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "{constrained_stdout}"
+    );
+    let expression = "'d' | alias";
+    let start = constrained_source
+        .find(expression)
+        .expect("I32-constrained Char expression exists");
+    assert_json_diagnostic_primary_span(
+        &constrained_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `|` has no `BitOr<I32>` implementation for `Char`",
+        start,
+        start + expression.len(),
+    );
+
+    let mismatch_source = concat!(
+        "pub fn char_wrapping_pair_annotation_recovery() -> I32 {\n",
+        "    let pair = 1 *% 2\n",
+        "    let alias = pair\n",
+        "    let value: I32 = 'j' & alias\n",
+        "    let recovered: I32 = value\n",
+        "    recovered\n",
+        "}\n",
+    );
+    let mismatch_output = run_check(mismatch_source, "", &[], &[]);
+    let mismatch_stdout = String::from_utf8(mismatch_output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(mismatch_output.status.code(), Some(1), "{mismatch_stdout}");
+    assert_eq!(
+        mismatch_stdout
+            .matches("\"code\":\"OPERATOR_NOT_SUPPORTED\"")
+            .count(),
+        1,
+        "{mismatch_stdout}"
+    );
+    assert_eq!(
+        mismatch_stdout
+            .matches("\"code\":\"TYPE_MISMATCH\"")
+            .count(),
+        1,
+        "the Char result annotation reports one mismatch and later uses recover:\n{mismatch_stdout}"
+    );
+    assert!(
+        !mismatch_stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !mismatch_stdout.contains("\"type\":\"result\""),
+        "Char-result annotation recovery should preserve later local and tail checks:\n{mismatch_stdout}"
+    );
+    let expression = "'j' & alias";
+    let start = mismatch_source
+        .find(expression)
+        .expect("Char annotation recovery expression exists");
+    assert_json_diagnostic_primary_span(
+        &mismatch_stdout,
+        "OPERATOR_NOT_SUPPORTED",
+        "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+        start,
+        start + expression.len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &mismatch_stdout,
+        "TYPE_MISMATCH",
+        "expected `I32`, found `Char`",
+        start,
+        start + expression.len(),
+    );
 }
 
 #[test]
@@ -10073,16 +10260,12 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
         )
         .to_owned(),
         fixture(
-            "pub fn char_literal_wrapping_addition_pair_path_rhs() -> Char",
-            "let right = 1 +% 2\n    let result = 'a' & right",
+            "pub fn char_literal_direct_wrapping_pair_rhs() -> Char",
+            "let result = 'a' & (1 +% 2)",
         ),
         fixture(
-            "pub fn char_literal_wrapping_subtraction_pair_path_rhs() -> Char",
-            "let right = 3 -% 2\n    let result = 'a' & right",
-        ),
-        fixture(
-            "pub fn char_literal_wrapping_multiplication_pair_path_rhs() -> Char",
-            "let right = 3 *% 2\n    let result = 'a' & right",
+            "pub fn char_literal_nested_wrapping_pair_path_rhs() -> Char",
+            "let right = 1 +% (2 *% 3)\n    let result = 'a' & right",
         ),
         fixture(
             "pub fn generic_char_literal_untyped_integer_path_rhs<T>() -> Char",
@@ -10092,6 +10275,21 @@ fn unsupported_primitive_bitwise_shapes_remain_gated() {
             "pub fn generic_char_literal_untyped_float_path_rhs<T>() -> Char",
             "let right = 1.0\n    let alias1 = right\n    let alias2 = alias1\n    let alias3 = alias2\n    let result = 'a' & alias3",
         ),
+        fixture(
+            "pub fn generic_char_literal_wrapping_pair_path_rhs<T>() -> Char",
+            "let right = 1 +% 2\n    let result = 'a' & right",
+        ),
+        concat!(
+            "type CharWrappingPairOwner { marker: Char }\n",
+            "impl CharWrappingPairOwner {\n",
+            "    fn char_wrapping_pair_method(self: borrow Self) -> Char {\n",
+            "        let right = 1 +% 2\n",
+            "        let result = 'a' & right\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        )
+        .to_owned(),
         concat!(
             "type CharUntypedIntegerPathOwner { marker: Char }\n",
             "impl CharUntypedIntegerPathOwner {\n",

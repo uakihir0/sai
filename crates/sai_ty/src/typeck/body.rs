@@ -161,8 +161,8 @@ struct LiteralVariable<'hir> {
 /// Char-left bitwise diagnostics accept resolved numeric literal computations
 /// through unannotated plain-path copies when no additional literal site exists.
 /// They also defer through unannotated copies of direct integer-literal
-/// addition and bitwise pairs, preserving both literal sites on the shared
-/// inference variable.
+/// addition, bitwise, and wrapping-arithmetic pairs, preserving both literal
+/// sites on the shared inference variable.
 /// Unary `~` accepts direct integer/Byte literals and concrete integer/Byte paths.
 /// Unannotated numeric literals retain one inference variable across copies
 /// until a coercion site or the tail constrains it. Other body forms remain
@@ -183,6 +183,7 @@ pub fn check_primitive_local_block_body(input: PrimitiveBodyInput<'_, '_>) -> Pr
         unannotated_integer_literal_aliases: HashSet::new(),
         resolved_computed_literal_paths: HashSet::new(),
         unannotated_integer_addition_pair_paths: HashSet::new(),
+        unannotated_integer_wrapping_pair_paths: HashSet::new(),
         unannotated_integer_bitwise_pair_paths: HashSet::new(),
         direct_unannotated_float_literals: HashSet::new(),
         unannotated_float_literal_aliases: HashSet::new(),
@@ -208,6 +209,7 @@ struct FnCtxt<'a, 'hir> {
     unannotated_integer_literal_aliases: HashSet<BindingId>,
     resolved_computed_literal_paths: HashSet<BindingId>,
     unannotated_integer_addition_pair_paths: HashSet<BindingId>,
+    unannotated_integer_wrapping_pair_paths: HashSet<BindingId>,
     unannotated_integer_bitwise_pair_paths: HashSet<BindingId>,
     direct_unannotated_float_literals: HashSet<BindingId>,
     unannotated_float_literal_aliases: HashSet<BindingId>,
@@ -526,6 +528,32 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         }
 
+        let has_direct_integer_wrapping_literal_pair = matches!(
+            init.kind,
+            ExprKind::Binary(
+                BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul,
+                left,
+                right
+            ) if matches!(
+                left.kind,
+                ExprKind::Lit(Lit::Int { .. })
+            ) && matches!(
+                right.kind,
+                ExprKind::Lit(Lit::Int { .. })
+            )
+        );
+        if annotation.is_none() && has_direct_integer_wrapping_literal_pair {
+            if let LocalType::LiteralVariable(id) = local_type {
+                if self.literal_variables.get(id).is_some_and(|variable| {
+                    variable.kind == PrimitiveLiteralKind::Integer
+                        && variable.resolved.is_none()
+                        && variable.additional_site.is_some()
+                }) {
+                    self.unannotated_integer_wrapping_pair_paths.insert(binding);
+                }
+            }
+        }
+
         if annotation.is_none() {
             if let ExprKind::Lit(literal) = init.kind {
                 match primitive_literal_kind(literal) {
@@ -576,6 +604,17 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 annotation.is_some(),
             ) {
                 self.unannotated_integer_addition_pair_paths.insert(binding);
+            }
+
+            let source_has_integer_wrapping_pair_provenance = self
+                .unannotated_integer_wrapping_pair_paths
+                .contains(&source_binding);
+            if can_track_unannotated_integer_wrapping_pair_alias(
+                source_has_integer_wrapping_pair_provenance,
+                matches!(init.kind, ExprKind::Path(_)),
+                annotation.is_some(),
+            ) {
+                self.unannotated_integer_wrapping_pair_paths.insert(binding);
             }
 
             let source_has_integer_literal_provenance = self
@@ -1055,6 +1094,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             self.is_eligible_unannotated_integer_bitwise_pair_path(right);
                         let eligible_unannotated_integer_addition_pair_path =
                             self.is_eligible_unannotated_integer_addition_pair_path(right);
+                        let eligible_unannotated_integer_wrapping_pair_path =
+                            self.is_eligible_unannotated_integer_wrapping_pair_path(right);
                         let right_type = self
                             .concrete_local_type(right_local_type)
                             .filter(|primitive| supports_primitive_literal(*primitive));
@@ -1064,6 +1105,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                                 && !eligible_resolved_computed_literal_path
                                 && !eligible_unannotated_integer_bitwise_pair_path
                                 && !eligible_unannotated_integer_addition_pair_path
+                                && !eligible_unannotated_integer_wrapping_pair_path
                             {
                                 return Err(());
                             }
@@ -1081,6 +1123,7 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         if !eligible_unannotated_literal_path
                             && !eligible_unannotated_integer_bitwise_pair_path
                             && !eligible_unannotated_integer_addition_pair_path
+                            && !eligible_unannotated_integer_wrapping_pair_path
                         {
                             return Err(());
                         }
@@ -1098,7 +1141,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             variable.additional_site.is_some(),
                             eligible_unannotated_literal_path,
                             eligible_unannotated_integer_bitwise_pair_path
-                                || eligible_unannotated_integer_addition_pair_path,
+                                || eligible_unannotated_integer_addition_pair_path
+                                || eligible_unannotated_integer_wrapping_pair_path,
                         ) {
                             return Err(());
                         }
@@ -1957,6 +2001,14 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             })
     }
 
+    fn is_eligible_unannotated_integer_wrapping_pair_path(&self, expression: &Expr<'hir>) -> bool {
+        self.plain_local_path_binding(expression)
+            .is_some_and(|binding| {
+                self.unannotated_integer_wrapping_pair_paths
+                    .contains(&binding)
+            })
+    }
+
     fn plain_local_path_binding(&self, expression: &Expr<'hir>) -> Option<BindingId> {
         let ExprKind::Path(path) = expression.kind else {
             return None;
@@ -2011,6 +2063,16 @@ fn can_track_unannotated_integer_addition_pair_alias(
     alias_has_annotation: bool,
 ) -> bool {
     source_has_integer_addition_pair_provenance
+        && initializer_is_plain_path
+        && !alias_has_annotation
+}
+
+fn can_track_unannotated_integer_wrapping_pair_alias(
+    source_has_integer_wrapping_pair_provenance: bool,
+    initializer_is_plain_path: bool,
+    alias_has_annotation: bool,
+) -> bool {
+    source_has_integer_wrapping_pair_provenance
         && initializer_is_plain_path
         && !alias_has_annotation
 }
@@ -2293,10 +2355,12 @@ mod tests {
         can_track_resolved_computed_literal_alias, can_track_unannotated_float_literal_alias,
         can_track_unannotated_integer_addition_pair_alias,
         can_track_unannotated_integer_bitwise_pair_alias,
-        can_track_unannotated_integer_literal_alias, primitive_arithmetic_literal_expected_type,
-        primitive_arithmetic_literal_left_result, primitive_arithmetic_result,
-        primitive_bitwise_bool_literal_pair_supported, primitive_bitwise_byte_literal_left_result,
-        primitive_bitwise_byte_literal_pair_result, primitive_bitwise_char_float_literal_rhs_type,
+        can_track_unannotated_integer_literal_alias,
+        can_track_unannotated_integer_wrapping_pair_alias,
+        primitive_arithmetic_literal_expected_type, primitive_arithmetic_literal_left_result,
+        primitive_arithmetic_result, primitive_bitwise_bool_literal_pair_supported,
+        primitive_bitwise_byte_literal_left_result, primitive_bitwise_byte_literal_pair_result,
+        primitive_bitwise_char_float_literal_rhs_type,
         primitive_bitwise_char_literal_pair_supported,
         primitive_bitwise_integer_literal_pair_supported, primitive_bool_operand_result,
         primitive_comparison_literal_expected_type, primitive_comparison_result,
@@ -3049,6 +3113,26 @@ mod tests {
         assert!(
             !can_track_unannotated_integer_addition_pair_alias(true, false, false),
             "computed initializers do not propagate addition-pair provenance"
+        );
+    }
+
+    #[test]
+    fn integer_wrapping_pair_alias_tracking_requires_provenance_and_plain_paths() {
+        assert!(
+            can_track_unannotated_integer_wrapping_pair_alias(true, true, false),
+            "a direct integer-literal wrapping pair can source unannotated copies"
+        );
+        assert!(
+            !can_track_unannotated_integer_wrapping_pair_alias(true, true, true),
+            "annotated copies use the existing concrete-path behavior"
+        );
+        assert!(
+            !can_track_unannotated_integer_wrapping_pair_alias(false, true, false),
+            "other computed expressions do not gain wrapping-pair provenance"
+        );
+        assert!(
+            !can_track_unannotated_integer_wrapping_pair_alias(true, false, false),
+            "computed initializers do not propagate wrapping-pair provenance"
         );
     }
 }
