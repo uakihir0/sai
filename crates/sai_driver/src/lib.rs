@@ -28767,6 +28767,131 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_tracks_direct_integer_remainder_pair_aliases() {
+        let root = concat!(
+            "pub fn char_integer_remainder_pair_defaults() -> Char {\n",
+            "    let computed = 1 % 2\n",
+            "    let alias1 = computed\n",
+            "    let alias2 = alias1\n",
+            "    let and_value = 'a' & alias2\n",
+            "    let or_value = 'b' | alias2\n",
+            "    let xor_value = 'c' ^ alias2\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
+            "pub fn char_integer_remainder_pair_late_constraint() -> Char {\n",
+            "    let computed = -129 % 128\n",
+            "    let alias = computed\n",
+            "    let and_value = 'd' & alias\n",
+            "    let or_value = 'e' | alias\n",
+            "    let xor_value = 'f' ^ alias\n",
+            "    let narrowed: I8 = alias\n",
+            "    let recovered: Char = xor_value\n",
+            "    recovered\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 2);
+        let expected_diagnostics = [
+            vec![
+                (
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    "operator `&` has no `BitAnd<I64>` implementation for `Char`",
+                    "'a' & alias2",
+                ),
+                (
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    "operator `|` has no `BitOr<I64>` implementation for `Char`",
+                    "'b' | alias2",
+                ),
+                (
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    "operator `^` has no `BitXor<I64>` implementation for `Char`",
+                    "'c' ^ alias2",
+                ),
+            ],
+            vec![
+                (
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    "integer literal is out of range for `I8`",
+                    "-129",
+                ),
+                (
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    "integer literal is out of range for `I8`",
+                    "128",
+                ),
+                (
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    "operator `&` has no `BitAnd<I8>` implementation for `Char`",
+                    "'d' & alias",
+                ),
+                (
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    "operator `|` has no `BitOr<I8>` implementation for `Char`",
+                    "'e' | alias",
+                ),
+                (
+                    sai_diagnostics::Code::OperatorNotSupported,
+                    "operator `^` has no `BitXor<I8>` implementation for `Char`",
+                    "'f' ^ alias",
+                ),
+            ],
+        ];
+
+        for (index, expected) in expected_diagnostics.into_iter().enumerate() {
+            let FunctionBodyTypeCheck::Supported { diagnostics } = resolved.owners()[index]
+                .body_type_check()
+                .expect("direct integer remainder-pair alias body remains supported")
+            else {
+                panic!("owner {index} must remain in the supported body-checking slice");
+            };
+            assert_eq!(
+                diagnostics.len(),
+                expected.len(),
+                "function owner {index}: {diagnostics:?}"
+            );
+            for (code, message, span_source) in expected {
+                let start = root
+                    .find(span_source)
+                    .expect("expected diagnostic source span exists");
+                let expected_span = sai_diagnostics::TextRange::new(
+                    sai_diagnostics::TextSize::new(start as u32),
+                    sai_diagnostics::TextSize::new((start + span_source.len()) as u32),
+                )
+                .expect("expected diagnostic span is ordered");
+                assert_eq!(
+                    diagnostics
+                        .iter()
+                        .filter(|diagnostic| {
+                            diagnostic.code == code
+                                && diagnostic.message == message
+                                && diagnostic
+                                    .primary()
+                                    .is_some_and(|primary| primary.span.range == expected_span)
+                        })
+                        .count(),
+                    1,
+                    "owner {index} lacks unique {code:?} diagnostic {message:?} at {span_source:?}: {diagnostics:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn function_body_type_check_accepts_flat_local_integer_addition_literal_pairs() {
         let root = concat!(
             "pub fn defaults_to_i64() -> I32 {\n",
@@ -29253,8 +29378,17 @@ mod tests {
             "    let value = 'c' & right\n",
             "    value\n",
             "}\n",
-            "pub fn char_remainder_alias() -> Char {\n",
-            "    let right = 3 % 2\n",
+            "pub fn char_nested_remainder_alias() -> Char {\n",
+            "    let right = 3 % (2 % 1)\n",
+            "    let value = 'd' & right\n",
+            "    value\n",
+            "}\n",
+            "pub fn char_direct_remainder_rhs() -> Char {\n",
+            "    let value = 'd' & (1 % 2)\n",
+            "    value\n",
+            "}\n",
+            "pub fn generic_char_remainder_alias<T>() -> Char {\n",
+            "    let right = 1 % 2\n",
             "    let value = 'd' & right\n",
             "    value\n",
             "}\n",
@@ -29307,6 +29441,14 @@ mod tests {
             "        value\n",
             "    }\n",
             "}\n",
+            "type CharRemainderPairOwner { marker: Char }\n",
+            "impl CharRemainderPairOwner {\n",
+            "    fn char_remainder_pair_method(self: borrow Self) -> Char {\n",
+            "        let right = 1 % 2\n",
+            "        let value = 'm' & right\n",
+            "        value\n",
+            "    }\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -29322,7 +29464,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 11);
+        assert_eq!(resolved.owners().len(), 13);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()
