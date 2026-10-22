@@ -1,0 +1,13 @@
+use acme:marsh-survey-review/model.{Confidence, Observation, ReviewStatus, Species}
+
+pub fn status_for(observation: Observation) -> ReviewStatus {
+    if observation.count == 0 {
+        ReviewStatus.CorrectionRequired
+    } else if observation.species == Species.TurtleNest {
+        ReviewStatus.ConservationReview
+    } else if observation.confidence == Confidence.Low {
+        ReviewStatus.Verify
+    } else {
+        ReviewStatus.Accepted
+    }
+}

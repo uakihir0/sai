@@ -1,0 +1,130 @@
+use acme:marsh-survey-review/fixtures
+use acme:marsh-survey-review/model.{Assessment, ReviewStatus, SurveyError}
+use acme:marsh-survey-review/reviewer
+use acme:marsh-survey-review/rules
+use sai:core/num.{U32_MAX}
+
+pub fn coastal_assessment() -> Result<Assessment, SurveyError> {
+    reviewer.review(fixtures.coastal_survey())
+}
+
+test "the fixed survey has hand-checkable status and transect totals" {
+    match coastal_assessment() {
+        Ok(assessment) => {
+            assert assessment.summary.record_count == 5
+            assert assessment.summary.accepted_count == 2
+            assert assessment.summary.verify_count == 1
+            assert assessment.summary.conservation_review_count == 1
+            assert assessment.summary.correction_count == 1
+            assert assessment.summary.accepted_total == 28
+            assert assessment.summary.accepted_by_transect[0] == 8
+            assert assessment.summary.accepted_by_transect[1] == 20
+            match assessment.reviews[0] {
+                Some(review) => {
+                    assert review.observation.id == 101
+                    assert review.status == ReviewStatus.Accepted
+                }
+                None => {
+                    assert false
+                }
+            }
+            match assessment.reviews[1] {
+                Some(review) => {
+                    assert review.observation.id == 102
+                    assert review.status == ReviewStatus.ConservationReview
+                }
+                None => {
+                    assert false
+                }
+            }
+            match assessment.reviews[2] {
+                Some(review) => {
+                    assert review.observation.id == 103
+                    assert review.status == ReviewStatus.Accepted
+                }
+                None => {
+                    assert false
+                }
+            }
+            match assessment.reviews[3] {
+                Some(review) => {
+                    assert review.observation.id == 104
+                    assert review.status == ReviewStatus.CorrectionRequired
+                }
+                None => {
+                    assert false
+                }
+            }
+            match assessment.reviews[4] {
+                Some(review) => {
+                    assert review.observation.id == 105
+                    assert review.status == ReviewStatus.Verify
+                }
+                None => {
+                    assert false
+                }
+            }
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "an empty protected observation needs correction before conservation review" {
+    assert (
+        rules.status_for(fixtures.empty_protected_observation()) == ReviewStatus.CorrectionRequired
+    )
+}
+
+test "a protected observation is reviewed even when confidence is low" {
+    assert (
+        rules.status_for(fixtures.protected_low_confidence_observation())
+        == ReviewStatus.ConservationReview
+    )
+}
+
+test "an empty survey returns an empty zero summary" {
+    match reviewer.review(fixtures.empty_survey()) {
+        Ok(assessment) => {
+            assert assessment.review_count == 0
+            assert assessment.summary.accepted_count == 0
+            assert assessment.summary.accepted_total == 0
+            assert assessment.summary.accepted_by_transect[0] == 0
+            assert assessment.summary.accepted_by_transect[1] == 0
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "the input count is checked before indexing the fixed array" {
+    assert (reviewer.review(fixtures.oversized_survey()) == Err(SurveyError.TooManyObservations))
+}
+
+test "a missing counted observation reports its index" {
+    assert (
+        reviewer.review(fixtures.missing_slot_survey()) == Err(SurveyError.MissingObservation(1))
+    )
+}
+
+test "the largest accepted total fits exactly" {
+    match reviewer.review(fixtures.maximum_single_accepted_survey()) {
+        Ok(assessment) => {
+            assert assessment.summary.accepted_total == U32_MAX
+            assert assessment.summary.accepted_by_transect[0] == U32_MAX
+            assert assessment.summary.accepted_by_transect[1] == 0
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "accepted totals report U32 overflow without returning partial results" {
+    assert (
+        reviewer.review(fixtures.overflowing_accepted_survey())
+        == Err(SurveyError.AcceptedCountOverflow)
+    )
+}

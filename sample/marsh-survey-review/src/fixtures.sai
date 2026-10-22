@@ -1,0 +1,166 @@
+use acme:marsh-survey-review/model.{Confidence, Observation, Species, Survey, Transect}
+use sai:core/num.{U32_MAX}
+
+pub fn coastal_survey() -> Survey {
+    Survey(
+        observation_count: 5,
+        observations: [
+            Some(
+                Observation(
+                    id: 101,
+                    transect: Transect.NorthChannel,
+                    species: Species.MarshSparrow,
+                    count: 8,
+                    confidence: Confidence.High,
+                ),
+            ),
+            Some(
+                Observation(
+                    id: 102,
+                    transect: Transect.NorthChannel,
+                    species: Species.TurtleNest,
+                    count: 2,
+                    confidence: Confidence.High,
+                ),
+            ),
+            Some(
+                Observation(
+                    id: 103,
+                    transect: Transect.SouthDunes,
+                    species: Species.Cordgrass,
+                    count: 20,
+                    confidence: Confidence.High,
+                ),
+            ),
+            Some(
+                Observation(
+                    id: 104,
+                    transect: Transect.SouthDunes,
+                    species: Species.FiddlerCrab,
+                    count: 0,
+                    confidence: Confidence.High,
+                ),
+            ),
+            Some(
+                Observation(
+                    id: 105,
+                    transect: Transect.SouthDunes,
+                    species: Species.Rail,
+                    count: 5,
+                    confidence: Confidence.Low,
+                ),
+            ),
+            None,
+            None,
+            None,
+        ],
+    )
+}
+
+pub fn empty_survey() -> Survey {
+    Survey(observation_count: 0, observations: Array<Option<Observation>, 8>.filled(None))
+}
+
+pub fn oversized_survey() -> Survey {
+    Survey(observation_count: 9, observations: Array<Option<Observation>, 8>.filled(None))
+}
+
+pub fn missing_slot_survey() -> Survey {
+    Survey(
+        observation_count: 2,
+        observations: [
+            Some(
+                Observation(
+                    id: 201,
+                    transect: Transect.NorthChannel,
+                    species: Species.MarshSparrow,
+                    count: 1,
+                    confidence: Confidence.High,
+                ),
+            ),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ],
+    )
+}
+
+pub fn maximum_single_accepted_survey() -> Survey {
+    Survey(
+        observation_count: 1,
+        observations: [
+            Some(
+                Observation(
+                    id: 250,
+                    transect: Transect.NorthChannel,
+                    species: Species.MarshSparrow,
+                    count: U32_MAX,
+                    confidence: Confidence.High,
+                ),
+            ),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ],
+    )
+}
+
+pub fn overflowing_accepted_survey() -> Survey {
+    Survey(
+        observation_count: 2,
+        observations: [
+            Some(
+                Observation(
+                    id: 301,
+                    transect: Transect.NorthChannel,
+                    species: Species.MarshSparrow,
+                    count: U32_MAX,
+                    confidence: Confidence.High,
+                ),
+            ),
+            Some(
+                Observation(
+                    id: 302,
+                    transect: Transect.SouthDunes,
+                    species: Species.Cordgrass,
+                    count: 1,
+                    confidence: Confidence.High,
+                ),
+            ),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ],
+    )
+}
+
+pub fn protected_low_confidence_observation() -> Observation {
+    Observation(
+        id: 401,
+        transect: Transect.NorthChannel,
+        species: Species.TurtleNest,
+        count: 1,
+        confidence: Confidence.Low,
+    )
+}
+
+pub fn empty_protected_observation() -> Observation {
+    Observation(
+        id: 402,
+        transect: Transect.NorthChannel,
+        species: Species.TurtleNest,
+        count: 0,
+        confidence: Confidence.Low,
+    )
+}

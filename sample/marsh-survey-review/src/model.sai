@@ -1,0 +1,74 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Transect {
+    NorthChannel
+    SouthDunes
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Species {
+    MarshSparrow
+    TurtleNest
+    Cordgrass
+    FiddlerCrab
+    Rail
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Confidence {
+    High
+    Low
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReviewStatus {
+    Accepted
+    Verify
+    ConservationReview
+    CorrectionRequired
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Observation {
+    pub id: U32
+    pub transect: Transect
+    pub species: Species
+    pub count: U32
+    pub confidence: Confidence
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ReviewedObservation {
+    pub observation: Observation
+    pub status: ReviewStatus
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Survey {
+    pub observation_count: USize
+    pub observations: Array<Option<Observation>, 8>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Summary {
+    pub record_count: USize
+    pub accepted_count: USize
+    pub verify_count: USize
+    pub conservation_review_count: USize
+    pub correction_count: USize
+    pub accepted_total: U32
+    pub accepted_by_transect: Array<U32, 2>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Assessment {
+    pub review_count: USize
+    pub reviews: Array<Option<ReviewedObservation>, 8>
+    pub summary: Summary
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum SurveyError {
+    TooManyObservations
+    MissingObservation(USize)
+    AcceptedCountOverflow
+}

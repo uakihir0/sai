@@ -1,0 +1,27 @@
+use acme:marsh-survey-review/model.{ReviewStatus, Species, Transect}
+
+pub fn transect_name(transect: Transect) -> Str {
+    match transect {
+        Transect.NorthChannel => "North Channel"
+        Transect.SouthDunes => "South Dunes"
+    }
+}
+
+pub fn species_name(species: Species) -> Str {
+    match species {
+        Species.MarshSparrow => "Marsh Sparrow"
+        Species.TurtleNest => "Turtle Nest"
+        Species.Cordgrass => "Cordgrass"
+        Species.FiddlerCrab => "Fiddler Crab"
+        Species.Rail => "Rail"
+    }
+}
+
+pub fn status_name(status: ReviewStatus) -> Str {
+    match status {
+        ReviewStatus.Accepted => "accepted"
+        ReviewStatus.Verify => "verify"
+        ReviewStatus.ConservationReview => "conservation review"
+        ReviewStatus.CorrectionRequired => "correction required"
+    }
+}

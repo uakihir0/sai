@@ -1,0 +1,5 @@
+package acme:marsh-survey-review @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Review fixed marsh survey observations and summarize accepted counts"
