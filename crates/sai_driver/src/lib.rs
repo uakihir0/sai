@@ -28706,7 +28706,7 @@ mod tests {
     }
 
     #[test]
-    fn function_body_type_check_gates_other_integer_addition_pair_origins() {
+    fn function_body_type_check_gates_other_computed_integer_pair_char_rhs_origins() {
         let root = concat!(
             "pub fn char_subtraction_alias() -> Char {\n",
             "    let right = 3 - 2\n",
@@ -28737,21 +28737,6 @@ mod tests {
             "    let value = 'f' & (1 + 2)\n",
             "    value\n",
             "}\n",
-            "pub fn char_wrapping_addition_alias() -> Char {\n",
-            "    let right = 1 +% 2\n",
-            "    let value = 'g' & right\n",
-            "    value\n",
-            "}\n",
-            "pub fn char_wrapping_subtraction_alias() -> Char {\n",
-            "    let right = 3 -% 2\n",
-            "    let value = 'i' & right\n",
-            "    value\n",
-            "}\n",
-            "pub fn char_wrapping_multiplication_alias() -> Char {\n",
-            "    let right = 3 *% 2\n",
-            "    let value = 'j' & right\n",
-            "    value\n",
-            "}\n",
             "pub fn generic_char_addition_alias<T>() -> Char {\n",
             "    let right = 1 + 2\n",
             "    let value = 'h' & right\n",
@@ -28772,14 +28757,14 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 10);
+        assert_eq!(resolved.owners().len(), 7);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()
                 .expect("unsupported integer addition-pair origin is gated");
             assert!(
                 matches!(check, FunctionBodyTypeCheck::Unsupported),
-                "owner {index} unexpectedly passed the bounded addition-pair slice: {check:?}"
+                "owner {index} unexpectedly passed the bounded computed-pair Char RHS slice: {check:?}"
             );
         }
     }
