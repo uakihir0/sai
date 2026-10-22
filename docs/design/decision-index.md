@@ -657,7 +657,7 @@ Defined in impl/11, impl/13, impl/14, impl/12.
 | N-H-73 | [impl/12](../impl/12-semantic-tooling.md) §12.12 | The semantic diff does not compare function bodies, comments, formatting, or declaration order. |
 | N-H-74 | [impl/12](../impl/12-semantic-tooling.md) §12.12 | Diff entities are matched by same canonical path and kind, then by same kind and hexadecimal part of the symbol ID, then by unique kind-and-fingerprint partner, with members following their parent after each match by path change (§12.8.1 rule 3). |
 | N-H-75 | [impl/12](../impl/12-semantic-tooling.md) §12.12 | Impact analysis counts distinct call sites in workspace files, tests and properties, exported interfaces, and component worlds, from the before version on the graphs of §12.4.2, and the size change only on request. |
-| N-H-76 | [impl/12](../impl/12-semantic-tooling.md) §12.12 | The symbol index is `.sai/index/index.json` with one JSON Lines file `<ns>.<pkg>.<line>.jsonl` per workspace package node. |
+| N-H-76 | [impl/12](../impl/12-semantic-tooling.md) §12.12 | The symbol index uses one JSON Lines file per workspace package node; its header lists unique UTF-8-byte-sorted basenames with exact-byte BLAKE3 digests. |
 | N-H-77 | [impl/12](../impl/12-semantic-tooling.md) §12.12 | Every index-changing LSP edit uses a durable journal until the planned source and index states are committed. |
 | N-H-78 | [impl/12](../impl/12-semantic-tooling.md) §12.12 | The language server uses the `utf-8` position encoding if the client offers it, and `utf-16` otherwise. |
 | N-H-79 | [impl/12](../impl/12-semantic-tooling.md) §12.12 | Semantic tooling analyzes a workspace snapshot as `sai check --tests` does, so tests and test-only code are in every graph and are updated by every operation. |
@@ -669,6 +669,7 @@ Defined in impl/11, impl/13, impl/14, impl/12.
 | N-H-85 | [impl/13](../impl/13-cli.md) §13.9 | Every test runs in a fresh store with the same engine configuration on every host: the target's features, NaN canonicalization, no fuel, no epoch interruption, no memory limit below the target's, and an 8 MiB engine stack (§13.6.6.3). |
 | N-H-86 | [impl/13](../impl/13-cli.md) §13.9 | The selection options of `sai test` are the input `test_options`, and the selection is the query `test_selection`, which reads only item trees. |
 | N-H-87 | [impl/12](../impl/12-semantic-tooling.md) §12.12 | The semantic diff compares the unsafe inventories (`sai inspect unsafe`) of every dependency node whose lock entry changed version, source or checksum, or that is new, paired by identity and compatibility line, then by unique identity. |
+| N-H-88 | [impl/12](../impl/12-semantic-tooling.md) §12.12 | An empty symbol package file is zero bytes; nonempty JSONL files have one canonical object and LF per entry, with no blank records. |
 
 ## N-I
 
