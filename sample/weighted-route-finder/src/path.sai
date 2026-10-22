@@ -1,0 +1,142 @@
+use acme:weighted-route-finder/data
+use acme:weighted-route-finder/lookup
+use acme:weighted-route-finder/model.{Network, Route, RouteError}
+use sai:core/num.{U32_MAX}
+
+fn closest_unvisited(network: Network, distances: Array<U32, 6>, settled: Array<Bool, 6>) -> Option<
+    USize,
+> {
+    var selected: Option<USize> = None
+    var best_distance = U32_MAX
+
+    for index in 0..network.nodes.len() {
+        if not settled[index] and distances[index] < best_distance {
+            selected = Some(index)
+            best_distance = distances[index]
+        }
+    }
+    selected
+}
+
+fn has_smaller_predecessor(
+    previous: Array<Option<USize>, 6>,
+    destination: USize,
+    candidate: USize,
+) -> Bool {
+    match previous[destination] { Some(existing) => candidate < existing, None => true }
+}
+
+fn reconstruct(
+    network: Network,
+    origin: USize,
+    destination: USize,
+    duration: U32,
+    previous: Array<Option<USize>, 6>,
+) -> Result<Route, RouteError> {
+    var reversed = Array<Option<U32>, 6>.filled(None)
+    var length: USize = 0
+    var cursor: Option<USize> = Some(destination)
+    var found_origin = false
+
+    while length < network.nodes.len() {
+        match cursor {
+            Some(index) => {
+                reversed[length] = Some(network.nodes[index].id)
+                length += 1
+                if index == origin {
+                    found_origin = true
+                    break
+                }
+                cursor = previous[index]
+            }
+            None => break
+        }
+    }
+
+    if not found_origin {
+        return Err(RouteError.Unreachable)
+    }
+
+    var left: USize = 0
+    while left < length / 2 {
+        let right = length - 1 - left
+        let left_node = reversed[left]
+        reversed[left] = reversed[right]
+        reversed[right] = left_node
+        left += 1
+    }
+
+    Ok(Route(node_ids: reversed, length: length, minutes: duration))
+}
+
+pub fn shortest_route(network: Network, origin_id: U32, destination_id: U32) -> Result<
+    Route,
+    RouteError,
+> {
+    let origin = match lookup.node_index(network, origin_id) {
+        Some(index) => index
+        None => return Err(RouteError.UnknownOrigin)
+    }
+    let destination = match lookup.node_index(network, destination_id) {
+        Some(index) => index
+        None => return Err(RouteError.UnknownDestination)
+    }
+
+    var distances = Array<U32, 6>.filled(U32_MAX)
+    var settled = Array<Bool, 6>.filled(false)
+    var previous = Array<Option<USize>, 6>.filled(None)
+    distances[origin] = 0
+
+    var searching = true
+    while searching {
+        match closest_unvisited(network, distances, settled) {
+            Some(current) => {
+                settled[current] = true
+                if current == destination {
+                    searching = false
+                } else {
+                    for edge_slot in 0..network.edges.len() {
+                        match network.edges[edge_slot] {
+                            Some(edge) => {
+                                if edge.from_index == current and not settled[edge.to_index] {
+                                    let base = distances[current]
+                                    if edge.minutes < U32_MAX - base {
+                                        let candidate = base + edge.minutes
+                                        let improves = candidate < distances[edge.to_index]
+                                        let ties_with_better_parent = (
+                                            candidate == distances[edge.to_index]
+                                            and has_smaller_predecessor(
+                                                previous,
+                                                edge.to_index,
+                                                current,
+                                            )
+                                        )
+                                        if improves or ties_with_better_parent {
+                                            distances[edge.to_index] = candidate
+                                            previous[edge.to_index] = Some(current)
+                                        }
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                }
+            }
+            None => {
+                searching = false
+            }
+        }
+    }
+
+    if distances[destination] == U32_MAX {
+        return Err(RouteError.Unreachable)
+    }
+    reconstruct(network, origin, destination, distances[destination], previous)
+}
+
+test "the lowest index is selected when unsettled distances tie" {
+    let distances: Array<U32, 6> = [0, 5, 5, U32_MAX, U32_MAX, U32_MAX]
+    let settled: Array<Bool, 6> = [true, false, false, false, false, false]
+    assert closest_unvisited(data.downtown(), distances, settled) == Some(1)
+}

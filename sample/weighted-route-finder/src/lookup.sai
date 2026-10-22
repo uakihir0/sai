@@ -1,0 +1,10 @@
+use acme:weighted-route-finder/model.{Network}
+
+pub fn node_index(network: Network, node_id: U32) -> Option<USize> {
+    for index in 0..network.nodes.len() {
+        if network.nodes[index].id == node_id {
+            return Some(index)
+        }
+    }
+    None
+}
