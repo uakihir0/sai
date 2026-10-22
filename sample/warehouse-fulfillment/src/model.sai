@@ -1,0 +1,77 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Sku {
+    pub code: Str
+    pub name: Str
+    pub unit_weight_grams: U32
+    pub minimum_shelf_life_days: U32
+    pub best_before_tracked: Bool
+    pub cold_chain_required: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Warehouse {
+    pub id: U32
+    pub name: Str
+    pub region: Str
+    pub cold_chain: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type StockLot {
+    pub lot_id: U32
+    pub warehouse_id: U32
+    pub sku: Str
+    pub units: U32
+    pub best_before_day: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type OrderLine {
+    pub sku: Str
+    pub quantity: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type FulfillmentOrder {
+    pub id: U32
+    pub customer: Str
+    pub destination_region: Str
+    // Lower numbers are more urgent.
+    pub priority: U32
+    pub requested_delivery_by_day: U32
+    pub max_transit_days: U32
+    // Zero-quantity lines are unused slots in this fixed-size fixture shape.
+    pub lines: Array<OrderLine, 3>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ShippingRoute {
+    pub warehouse_id: U32
+    pub destination_region: Str
+    pub transit_days: U32
+    pub daily_weight_limit_grams: U32
+    pub freight_cents_per_kg: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Shipment {
+    pub order_id: U32
+    pub warehouse_id: U32
+    pub destination_region: Str
+    pub transit_days: U32
+    pub weight_grams: U32
+    pub freight_cents: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum HoldReason {
+    EmptyOrder
+    UnknownSku
+    NoRoute
+    TransitTooSlow
+    DeliveryTooLate
+    ColdChainUnavailable
+    InventoryShortfall
+    LaneCapacity
+    NoFeasibleRoute
+}

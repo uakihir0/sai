@@ -1,0 +1,110 @@
+use acme:warehouse-fulfillment/data
+use acme:warehouse-fulfillment/inventory
+use acme:warehouse-fulfillment/model.{HoldReason, ShippingRoute}
+use acme:warehouse-fulfillment/planner
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn warehouse_name(id: U32) -> Str {
+    match inventory.find_warehouse(id) {
+        Some(warehouse) => warehouse.name
+        None => "(unknown warehouse)"
+    }
+}
+
+fn print_reason(out: borrow mut Stdout, reason: HoldReason)
+    effects { stdio.write }
+{
+    match reason {
+        HoldReason.EmptyOrder => out.write_str("order has no requested items")
+        HoldReason.UnknownSku => out.write_str("unknown SKU")
+        HoldReason.NoRoute => out.write_str("no route serves the destination")
+        HoldReason.TransitTooSlow => out.write_str("no route meets the transit limit")
+        HoldReason.DeliveryTooLate => out.write_str("no route can deliver by the requested day")
+        HoldReason.ColdChainUnavailable => out.write_str("no timely warehouse can handle the cold-chain items")
+        HoldReason.InventoryShortfall => out.write_str("eligible stock is insufficient at one warehouse")
+        HoldReason.LaneCapacity => out.write_str("order exceeds the lane's remaining daily weight capacity")
+        HoldReason.NoFeasibleRoute => out.write_str("no complete route passed every constraint")
+    }
+}
+
+pub fn print_plan(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str(f"Warehouse fulfillment plan — day {data.fulfillment_day()}\n".as_str())
+    out.write_str("Order order: priority, delivery day, then order ID\n\n")
+    for order in data.orders() {
+        out.write_str(f"Order #{order.id} for {order.customer}: ".as_str())
+        match planner.fulfillment_for(order) {
+            Some(shipment) => {
+                out.write_str(
+                    f"{warehouse_name(shipment.warehouse_id)} to {shipment.destination_region} — {shipment.weight_grams} g, {shipment.transit_days} day(s), ".as_str(),
+                )
+                let dollars = shipment.freight_cents / 100
+                let remainder = shipment.freight_cents % 100
+                out.write_str(f"freight ${dollars}.{remainder:zpad(2)}\n".as_str())
+            }
+            None => {
+                out.write_str("held — ")
+                print_reason(borrow mut out, planner.rejection_reason(order))
+                out.write_str("\n")
+            }
+        }
+    }
+}
+
+pub fn print_inventory(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Eligible inventory by warehouse\n")
+    for warehouse in data.warehouses() {
+        out.write_str(f"{warehouse.name} ({warehouse.region})\n".as_str())
+        for sku in data.skus() {
+            out.write_str(
+                f"  {sku.code}: {inventory.eligible_units(warehouse.id, sku.code)} eligible".as_str(),
+            )
+            let excluded = inventory.excluded_units(warehouse.id, sku.code)
+            if excluded > 0 {
+                out.write_str(f", {excluded} excluded by shelf-life rule".as_str())
+            }
+            out.write_str("\n")
+        }
+    }
+}
+
+fn print_lane(out: borrow mut Stdout, route: ShippingRoute)
+    effects { stdio.write, alloc }
+{
+    out.write_str(
+        f"{warehouse_name(route.warehouse_id)} to {route.destination_region}: {planner.used_lane_weight(route)} / {route.daily_weight_limit_grams} g reserved\n".as_str(),
+    )
+}
+
+pub fn print_lanes(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Daily lane capacity\n")
+    for route in data.routes() {
+        print_lane(borrow mut out, route)
+    }
+}
+
+pub fn print_summary(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let orders = data.orders()
+    let planned = planner.planned_order_count()
+    let requested = planner.requested_units()
+    let supplied = planner.planned_units()
+    let held_orders = orders.len() - planned
+    let held_units = requested - supplied
+    let dollars = planner.total_freight_cents() / 100
+    let remainder = planner.total_freight_cents() % 100
+
+    out.write_str("Fulfillment summary\n")
+    out.write_str(f"Orders planned: {planned} / {orders.len()}\n".as_str())
+    out.write_str(f"Orders held: {held_orders}\n".as_str())
+    out.write_str(f"Units planned: {supplied} / {requested}\n".as_str())
+    out.write_str(f"Units held: {held_units}\n".as_str())
+    out.write_str(f"Planned freight: ${dollars}.{remainder:zpad(2)}\n".as_str())
+}
