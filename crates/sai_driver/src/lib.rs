@@ -6522,7 +6522,7 @@ fn check_function_body_primitive_local_block(
                                 && is_direct_function_numeric_literal(right))
                             || (is_direct_function_numeric_literal(left)
                                 && is_preceding_path(right))
-                            || (operator == BinOp::Add
+                            || (matches!(operator, BinOp::Add | BinOp::Sub)
                                 && is_direct_function_integer_literal(left)
                                 && is_direct_function_integer_literal(right))
                     }
@@ -28281,12 +28281,57 @@ mod tests {
     }
 
     #[test]
-    fn function_body_type_check_gates_other_flat_local_arithmetic_literal_pairs() {
+    fn function_body_type_check_accepts_flat_local_integer_subtraction_literal_pairs() {
         let root = concat!(
-            "pub fn integer_subtraction() -> I64 {\n",
+            "pub fn defaults_to_i64() -> I32 {\n",
             "    let value = 3 - 2\n",
+            "    let output: I32 = 0\n",
+            "    output\n",
+            "}\n",
+            "pub fn annotation_selects_i32() -> I32 {\n",
+            "    let value: I32 = 2147483647 - 0\n",
             "    value\n",
             "}\n",
+            "pub fn later_annotation_selects_i8() -> I8 {\n",
+            "    let value = 100 - 27\n",
+            "    let selected: I8 = value\n",
+            "    selected\n",
+            "}\n",
+            "pub fn tail_selects_u8() -> U8 {\n",
+            "    let value = 255 - 0\n",
+            "    value\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 4);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("ordinary integer subtraction-pair body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the integer subtraction-pair slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
+    fn function_body_type_check_gates_other_flat_local_arithmetic_literal_pairs() {
+        let root = concat!(
             "pub fn integer_multiplication() -> I64 {\n",
             "    let value = 3 * 2\n",
             "    value\n",
@@ -28318,7 +28363,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 5);
+        assert_eq!(resolved.owners().len(), 4);
         for (index, owner) in resolved.owners().iter().enumerate() {
             assert!(
                 matches!(
