@@ -2537,52 +2537,66 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 }
             }
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
-                if let (Some(left_type), Some(right_type)) = (
-                    self.known_recovery_operand_type(left),
-                    self.known_recovery_operand_type(right),
-                ) {
-                    if !supports_primitive_literal(left_type)
-                        || !supports_primitive_literal(right_type)
-                    {
-                        return Err(());
-                    }
-                    if is_integer_primitive(left_type) || left_type == PrimTy::Byte {
-                        if left_type != right_type {
-                            self.errors.push(PrimitiveBodyError {
-                                node: right.hir_id,
-                                kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                    expected: left_type,
-                                    found: right_type,
-                                },
-                            });
+                let left_type = self.known_recovery_operand_type(left);
+                let right_type = self.known_recovery_operand_type(right);
+                match (left_type, right_type) {
+                    (Some(left_type), Some(right_type)) => {
+                        if !supports_primitive_literal(left_type)
+                            || !supports_primitive_literal(right_type)
+                        {
+                            return Err(());
                         }
-                    } else if matches!(left_type, PrimTy::Bool | PrimTy::F32 | PrimTy::F64) {
-                        if left_type != right_type {
-                            self.errors.push(PrimitiveBodyError {
-                                node: right.hir_id,
-                                kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                    expected: left_type,
-                                    found: right_type,
-                                },
-                            });
-                        }
-                        self.report_operator_not_supported(
-                            expression.hir_id,
-                            operator,
-                            PrimitiveOperatorOperand::Concrete(left_type),
-                        );
-                    } else if left_type == PrimTy::Char {
-                        self.errors.push(PrimitiveBodyError {
-                            node: expression.hir_id,
-                            kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
+                        if is_integer_primitive(left_type) || left_type == PrimTy::Byte {
+                            if left_type != right_type {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: right.hir_id,
+                                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                        expected: left_type,
+                                        found: right_type,
+                                    },
+                                });
+                            }
+                        } else if matches!(left_type, PrimTy::Bool | PrimTy::F32 | PrimTy::F64) {
+                            if left_type != right_type {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: right.hir_id,
+                                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                        expected: left_type,
+                                        found: right_type,
+                                    },
+                                });
+                            }
+                            self.report_operator_not_supported(
+                                expression.hir_id,
                                 operator,
-                                left: left_type,
-                                right: right_type,
-                            },
-                        });
-                    } else {
-                        return Err(());
+                                PrimitiveOperatorOperand::Concrete(left_type),
+                            );
+                        } else if left_type == PrimTy::Char {
+                            self.errors.push(PrimitiveBodyError {
+                                node: expression.hir_id,
+                                kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
+                                    operator,
+                                    left: left_type,
+                                    right: right_type,
+                                },
+                            });
+                        } else {
+                            return Err(());
+                        }
                     }
+                    (Some(left_type), None) if right_has_error => {
+                        if !supports_primitive_literal(left_type) {
+                            return Err(());
+                        }
+                        if matches!(left_type, PrimTy::Bool | PrimTy::F32 | PrimTy::F64) {
+                            self.report_operator_not_supported(
+                                expression.hir_id,
+                                operator,
+                                PrimitiveOperatorOperand::Concrete(left_type),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -2616,6 +2630,15 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             matches!(expression.kind, ExprKind::Path(_))
                 && self.check_local_path(expression).is_ok()
         };
+        let is_unknown_self_field = |expression: &Expr<'hir>| {
+            matches!(expression.kind, ExprKind::Field { .. })
+                && self
+                    .input
+                    .unknown_self_fields
+                    .is_some_and(|fields| fields.contains(&expression.hir_id))
+        };
+        let is_path_or_unknown_field =
+            |expression: &Expr<'hir>| is_path(expression) || is_unknown_self_field(expression);
         let is_literal = |expression: &Expr<'hir>| {
             matches!(
                 expression.kind,
@@ -2624,6 +2647,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         };
         let is_path_or_literal =
             |expression: &Expr<'hir>| is_path(expression) || is_literal(expression);
+        let is_path_literal_or_unknown_field = |expression: &Expr<'hir>| {
+            is_path_or_literal(expression) || is_unknown_self_field(expression)
+        };
         let primitive_path = |expression: &Expr<'hir>| self.known_recovery_operand_type(expression);
         let literal_kind = |expression: &Expr<'hir>| match expression.kind {
             ExprKind::Lit(literal) => primitive_literal_kind(literal),
@@ -2659,7 +2685,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         };
 
         let shape_is_supported = match operator {
-            BinOp::And | BinOp::Or => is_path(left) && is_path(right),
+            BinOp::And | BinOp::Or => {
+                is_path_or_unknown_field(left) && is_path_or_unknown_field(right)
+            }
             BinOp::Shl | BinOp::Shr => {
                 let supported_left_literal = matches!(
                     left.kind,
@@ -2675,13 +2703,13 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                         if primitive_literal_kind(literal)
                             == Some(PrimitiveLiteralKind::Integer)
                 );
-                (is_path(left) || supported_left_literal)
-                    && (is_path(right) || supported_right_literal)
+                (is_path_or_unknown_field(left) || supported_left_literal)
+                    && (is_path_or_unknown_field(right) || supported_right_literal)
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                (is_path(left) && is_path(right))
-                    || (is_path(left) && is_literal(right))
-                    || (is_literal(left) && is_path(right))
+                (is_path_or_unknown_field(left) && is_path_or_unknown_field(right))
+                    || (is_path_or_unknown_field(left) && is_literal(right))
+                    || (is_literal(left) && is_path_or_unknown_field(right))
             }
             BinOp::Add
             | BinOp::Sub
@@ -2693,7 +2721,9 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             | BinOp::WrapMul
             | BinOp::BitAnd
             | BinOp::BitOr
-            | BinOp::BitXor => is_path_or_literal(left) && is_path_or_literal(right),
+            | BinOp::BitXor => {
+                is_path_literal_or_unknown_field(left) && is_path_literal_or_unknown_field(right)
+            }
         };
         if !shape_is_supported {
             return false;

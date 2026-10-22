@@ -518,6 +518,192 @@ fn unknown_direct_self_field_keeps_independent_sibling_operand_errors() {
 }
 
 #[test]
+fn unknown_direct_self_fields_in_binary_initializer_operands_are_diagnosed() {
+    let cases = [
+        (
+            "unknown left operand",
+            concat!(
+                "type User { count: I32 }\n",
+                "impl User {\n",
+                "    pub fn add_one(self: borrow Self) -> I32 {\n",
+                "        let result = self.missing + 1\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            "missing",
+        ),
+        (
+            "unknown right operand",
+            concat!(
+                "type User { count: I32 }\n",
+                "impl User {\n",
+                "    pub fn add_one(self: borrow Self) -> I32 {\n",
+                "        let count: I32 = 1\n",
+                "        let result = count + self.missing\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            "missing",
+        ),
+        (
+            "two unknown operands",
+            concat!(
+                "type User { count: I32 }\n",
+                "impl User {\n",
+                "    pub fn add_missing(self: borrow Self) -> I32 {\n",
+                "        let result = self.missing + self.absent\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+            "missing",
+        ),
+    ];
+
+    for (label, source, expected_field) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert_eq!(output.status.code(), Some(1), "{label}:\n{stdout}");
+        let expected_count = if label == "two unknown operands" {
+            2
+        } else {
+            1
+        };
+        assert_eq!(
+            stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+            expected_count,
+            "{label}:\n{stdout}"
+        );
+        assert!(
+            !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{label} should be checked without inventing a primitive type for the missing field:\n{stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("has no field `{expected_field}`")),
+            "{label} should retain the direct field lookup diagnostic:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn unknown_direct_self_field_binary_initializer_keeps_known_sibling_errors() {
+    let source = concat!(
+        "type User { count: I32 }\n",
+        "impl User {\n",
+        "    pub fn preserve_sibling_error(self: borrow Self) -> Bool {\n",
+        "        let count: I32 = 1\n",
+        "        let result = self.missing and count\n",
+        "        result\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        stdout.matches("\"code\":\"UNKNOWN_FIELD\"").count(),
+        1,
+        "{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        1,
+        "the known logical sibling remains independently checked:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "a direct unknown field must not hide an independently known operand error:\n{stdout}"
+    );
+
+    let count_start = source.rfind("count").expect("logical RHS exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found `I32`",
+        count_start,
+        count_start + "count".len(),
+    );
+}
+
+#[test]
+fn unknown_direct_self_field_keeps_known_bitwise_operator_errors() {
+    let source = concat!(
+        "type User { count: I32 }\n",
+        "impl User {\n",
+        "    pub fn preserve_operator_error(self: borrow Self) -> I32 {\n",
+        "        let flag: Bool = true\n",
+        "        let result: I32 = flag & self.missing\n",
+        "        result\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    for code in ["UNKNOWN_FIELD", "OPERATOR_NOT_SUPPORTED", "TYPE_MISMATCH"] {
+        assert!(
+            stdout.contains(&format!("\"code\":\"{code}\"")),
+            "the known Bool left operand must preserve {code}:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("operator `&` is not defined for `Bool`"),
+        "the known Bool left operand independently determines the unsupported-operator error:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "the known Bool error must be retained without inferring the missing field's type:\n{stdout}"
+    );
+}
+
+#[test]
+fn unknown_direct_self_fields_in_unsupported_binary_shapes_stay_gated() {
+    let cases = [
+        (
+            "nested binary operand",
+            concat!(
+                "type User { count: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        let count: I32 = 1\n",
+                "        let result = (self.missing + count) + 1\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "unsupported arithmetic sibling",
+            concat!(
+                "type User { count: I32 }\n",
+                "impl User {\n",
+                "    pub fn unsupported(self: borrow Self) -> I32 {\n",
+                "        let result = self.missing + true\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+    ];
+
+    for (shape, source) in cases {
+        let output = run_check(source, "", &[], &[]);
+        let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+        assert!(
+            stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+                && !stdout.contains("\"code\":\"UNKNOWN_FIELD\"")
+                && !stdout.contains("\"type\":\"result\""),
+            "{shape} must keep the whole method shape gated without leaking a partial field diagnostic:\n{stdout}"
+        );
+    }
+}
+
+#[test]
 fn unknown_direct_self_field_does_not_enable_nested_operator_shapes() {
     let source = concat!(
         "type User { name: I32 }\n",
@@ -1024,12 +1210,12 @@ fn unsupported_inherent_method_shapes_remain_gated() {
             ),
         ),
         (
-            "receiver field in an operator",
+            "known receiver field in an operator",
             concat!(
                 "type Counter { marker: I32 }\n",
                 "impl Counter {\n",
                 "    pub fn add_one(self: borrow Self) -> I32 {\n",
-                "        let result = self.missing + 1\n",
+                "        let result = self.marker + 1\n",
                 "        result\n",
                 "    }\n",
                 "}\n",
@@ -1210,6 +1396,7 @@ fn unknown_direct_self_field_operator_method_tail_stays_gated() {
     let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
     assert!(
         stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"code\":\"UNKNOWN_FIELD\"")
             && !stdout.contains("\"type\":\"result\""),
         "a binary method tail must remain outside the direct field-tail checker:\n{stdout}"
     );
