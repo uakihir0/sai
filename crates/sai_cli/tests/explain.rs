@@ -261,5 +261,5 @@ fn explain_keeps_other_individual_codes_gated_and_preserves_list() {
     assert!(list.stderr.is_empty());
     assert!(list_stdout.contains("\"kind\":\"explain.list\""));
     assert!(list_stdout.contains("\"code\":\"TYPE_MISMATCH\",\"class\":\"hard\""));
-    assert_eq!(list_stdout.matches("\"code\":").count(), 493);
+    assert_eq!(list_stdout.matches("\"code\":").count(), 494);
 }

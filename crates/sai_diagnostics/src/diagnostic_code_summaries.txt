@@ -370,19 +370,20 @@ STATEMENT_HAS_NO_EFFECT|lint|260|A discarded expression without side effects (§
 SUBMODULE_IGNORED|hard|418|A submodule in fetched content is not part of the package (§3.4.2)
 SUPERTRAIT_CYCLE|hard|261|A trait that is its own supertrait, directly or transitively
 SYMBOL_INDEX_DISCARDED|hard|479|The symbol index in `.sai/index/` is unreadable, has another format or version, or has an invalid file, and is discarded; `primary` is `null` (§12.9.3 rule 4).
+SYMBOL_INDEX_RECOVERY_REQUIRED|hard|480|An unresolved or invalid symbol-index journal blocks allocation and indexed edits (§12.9.3).
 SYMLINK_IGNORED|hard|419|A symbolic link in fetched content is not part of the package (§3.4.2)
 SYMLINK_IN_SOURCE|hard|262|A symbolic link inside `<source>`
 TAG_MISSING|hard|420|The release tag of a locked version no longer exists; the locked commit was used (§4.3.3)
 TAG_MOVED|hard|421|A release tag of a locked version peels to another commit than the lock records, or its content replacement was not approved (§4.3.3, §4.7.2)
 TARGET_CAPABILITY_UNAVAILABLE|hard|263|A required capability is not provided by the target (§8.12.6, §8.12.7)
 TARGET_NOT_DECLARED|hard|422|Building the root for a target not in its `targets`
-TARGET_NOT_RUNNABLE|hard|480|`sai run` was used with a target that is not a WASI target: a core target or a native target (§13.6.5).
+TARGET_NOT_RUNNABLE|hard|481|`sai run` was used with a target that is not a WASI target: a core target or a native target (§13.6.5).
 TARGET_NOT_SUPPORTED_BY_DEPENDENCY|hard|423|An active dependency does not list the build target
 TEMPORARY_DROPPED_WHILE_BORROWED|hard|264|A temporary is dropped at the end of its scope while a loan of it is live (§7.5.6, §7.9.6)
 TEST_DEPENDENCY_OUTSIDE_TEST|hard|265|A reference to a binding of a test-only use outside a test or property body and property parameter types, or a `pub use` of a test dependency; checked in every build (§14.2.5)
 TEST_DEPENDENCY_UNAVAILABLE|hard|266|A test-only use in a selected workspace member that is not the root, whose test dependencies are not resolved (§14.2.5 item 5)
 TEST_EFFECT_NOT_PERMITTED|hard|267|A test or property whose entry set maps to a capability other than `alloc`, reported once per test and capability at the name, with the capability chain (§14.3.1)
-TRAIT_ALREADY_IMPLEMENTED|hard|481|`implement_trait`: the type already has an impl of the trait with the same arguments, written or derived (§12.6.13).
+TRAIT_ALREADY_IMPLEMENTED|hard|482|`implement_trait`: the type already has an impl of the trait with the same arguments, written or derived (§12.6.13).
 TRAIT_IMPL_EFFECTS_EXCEED_BOUND|hard|268|An impl method's effects are not permitted by the trait method's clause (§8.6.3)
 TRAIT_ITEM_SIGNATURE_MISMATCH|hard|269|A trait impl item whose signature does not match the trait exactly (N-A-32)
 TRAIT_NOT_IN_SCOPE|hard|270|The method exists only in a trait that is not in scope; the fix adds a `use`
@@ -395,39 +396,39 @@ TRY_OPTION_RESULT_MIX|hard|276|`?` applied to an `Option` in a body returning a 
 TUPLE_INDEX_OUT_OF_RANGE|hard|277|`e.N` with `N` not less than the tuple's arity
 TYPE_ANNOTATIONS_NEEDED|hard|278|A type that must be known (§5.16.4), or remains unknown at the end of the body (§5.16.5), or an obligation that stays ambiguous
 TYPE_MISMATCH|hard|279|Two types that must be equal, or a coercion that does not apply; names the expected and found types and the origin of the expectation
-TYPE_TOO_LARGE|hard|482|The size of a reachable Mono type exceeds `MAX_OBJECT` (§6.4.1). Reported at the use that instantiated the type.
+TYPE_TOO_LARGE|hard|483|The size of a reachable Mono type exceeds `MAX_OBJECT` (§6.4.1). Reported at the use that instantiated the type.
 UNCONSTRAINED_IMPL_PARAM|hard|280|An impl parameter that does not occur in the impl header
 UNDECLARED_LABEL|hard|281|A `break` or `continue` label that names no enclosing loop
-UNEXPECTED_ARGUMENT|hard|483|A positional argument that the command does not take (usage error).
+UNEXPECTED_ARGUMENT|hard|484|A positional argument that the command does not take (usage error).
 UNEXPECTED_CHARACTER|hard|282|Character that cannot start any token
 UNEXPECTED_FN_BODY|hard|283|A body on a function of an extern block (§3.5, §3.10)
 UNEXPECTED_NEWLINE|hard|284|NEWLINE in a position the grammar does not allow
-UNFORMATTED_FILE|hard|484|`sai fmt --check`: the file is not in canonical format; the primary location is the first differing line (§14.11.4).
+UNFORMATTED_FILE|hard|485|`sai fmt --check`: the file is not in canonical format; the primary location is the first differing line (§14.11.4).
 UNKNOWN_ABI|hard|285|Unknown extern ABI (§3.10)
 UNKNOWN_ARTIFACT_KIND|hard|424|`artifact` followed by a word other than `component`
 UNKNOWN_ASSOC_TYPE|hard|286|An associated-type binding or projection naming no associated type of the trait
 UNKNOWN_ATTRIBUTE|hard|287|An attribute name outside the closed set of 15 §15.2.3 (§3.3)
 UNKNOWN_BUDGET_METRIC|hard|425|A budget metric other than `wasm`
 UNKNOWN_CAPABILITY|hard|288|A capability name denotes no known WIT package, interface or target capability (§8.12.1)
-UNKNOWN_COMMAND|hard|485|The command or subcommand does not exist (usage error, §13.3.5).
+UNKNOWN_COMMAND|hard|486|The command or subcommand does not exist (usage error, §13.3.5).
 UNKNOWN_DECLARATION|hard|426|A line starts with a word that is not a declaration keyword
 UNKNOWN_DERIVE|hard|289|A name in `@derive` that is not a derivable trait
-UNKNOWN_DIAGNOSTIC_CODE|hard|486|`sai explain` was given a name that is not a registered code (§11.13.1)
+UNKNOWN_DIAGNOSTIC_CODE|hard|487|`sai explain` was given a name that is not a registered code (§11.13.1)
 UNKNOWN_EFFECT|hard|290|An `EffectRef` names no built-in effect, user effect, interface binding or world (§8.2.2)
 UNKNOWN_EXPORT_WORLD|hard|291|`export world` names no world (§13.5.1)
 UNKNOWN_FIELD|hard|292|A field name that the record, variant or tuple type does not have
 UNKNOWN_FORMAT_SPEC|hard|293|A format specifier name that is not one of `debug`, `hex`, `upper_hex`, `bin`, `oct`, `exp`, `prec`, `pad`, `left` and `zpad`; data: `name` (§16.14.3)
 UNKNOWN_LINT|hard|294|A level attribute, a `lints` entry or a CLI lint flag names something that is not a diagnostic code (§15.15.4); the registry lookup is in [impl/11](../impl/11-diagnostics.md) §11.12.3
 UNKNOWN_MODULE|hard|295|No module or interface has the given path
-UNKNOWN_NODE_ID|hard|487|A node ID is malformed, names a file outside the workspace snapshot, or names no element of the given group (§12.3.3).
-UNKNOWN_OPERATION|hard|488|The operation name is not one of §12.6 (§12.6.1).
-UNKNOWN_OPTION|hard|489|The option does not exist for this command (usage error).
+UNKNOWN_NODE_ID|hard|488|A node ID is malformed, names a file outside the workspace snapshot, or names no element of the given group (§12.3.3).
+UNKNOWN_OPERATION|hard|489|The operation name is not one of §12.6 (§12.6.1).
+UNKNOWN_OPTION|hard|490|The option does not exist for this command (usage error).
 UNKNOWN_PACKAGE|hard|296|The package of a `PKG_PATH` is neither the current package, `sai:core`, `sai:alloc`, a WASI package of the toolchain, nor a declared dependency
 UNKNOWN_POLICY_ITEM|hard|427|An unknown `policy` item
 UNKNOWN_PROFILE|hard|428|A profile name other than `dev`, `release`, `tiny`
-UNKNOWN_REVISION|hard|490|A revision given to `sai diff` does not resolve to a commit (§13.6.17).
-UNKNOWN_SYMBOL_ID|hard|491|A string that starts with `symbol://` is not a valid symbol ID, or no symbol of the chosen package node has its hexadecimal part (§12.2.5).
-UNKNOWN_SYMBOL_PATH|hard|492|A canonical path does not parse or names no symbol or module, or a node key names no graph node (§12.2.5, §12.4.3).
+UNKNOWN_REVISION|hard|491|A revision given to `sai diff` does not resolve to a commit (§13.6.17).
+UNKNOWN_SYMBOL_ID|hard|492|A string that starts with `symbol://` is not a valid symbol ID, or no symbol of the chosen package node has its hexadecimal part (§12.2.5).
+UNKNOWN_SYMBOL_PATH|hard|493|A canonical path does not parse or names no symbol or module, or a node key names no graph node (§12.2.5, §12.4.3).
 UNKNOWN_TARGET|hard|429|A name that is not a target name
 UNKNOWN_TRAIT_ITEM|hard|297|A trait impl item that the trait does not declare
 UNKNOWN_VARIANT|hard|298|`E.V` naming no variant of `E`, or a UIDENT member of a non-enum type

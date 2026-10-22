@@ -3159,6 +3159,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sai_semantic"
+version = "0.1.0"
+dependencies = [
+ "sai_stable_hash",
+]
+
+[[package]]
 name = "sai_stable_hash"
 version = "0.1.0"
 dependencies = [

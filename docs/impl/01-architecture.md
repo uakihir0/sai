@@ -109,7 +109,7 @@ The reference implementation is a Rust workspace (D-TOOL-05). Each crate has one
 | `sai_package` | `sai.package`, MVS, `sai.lock`, Git fetching (`gix`), local package sources, the global cache | [package/01](../package/01-package-contract.md) to [package/04](../package/04-distribution-and-security.md) | `sai_syntax`, `sai_diagnostics`, `gix`, `getrandom`, `libc`, `rustix`, `cap-std`, `same-file`, `sai_windows_fs`, `windows-sys`, `sha2`, `unicode-general-category`, `unicode-normalization` |
 | `sai_fmt` | the formatter | [14](14-formatter.md) | `sai_syntax` |
 | `sai_library` | the embedded source and metadata of `sai:core` and `sai:alloc` (§1.12) | §1.12 | `sai_query`, `sai_vfs` |
-| `sai_semantic` | symbol identity, semantic graphs, semantic operations, semantic diff | [12](12-semantic-tooling.md) | `sai_ty`, `sai_mir`, `sai_effects` |
+| `sai_semantic` | symbol identity, semantic graphs, semantic operations, semantic diff | [12](12-semantic-tooling.md) | `sai_stable_hash`, `sai_ty`, `sai_mir`, `sai_effects` |
 | `sai_driver` | sessions, the root database, the pipeline, output writing, execution for `sai run` and `sai test` (`wasmtime`) | this chapter | every crate above |
 | `sai_cli` | the `sai` binary and its commands | [13](13-cli.md) | `sai_diagnostics`, `sai_driver`, `sai_fmt`, `sai_package`, `sai_windows_fs`, `cap-std`, `same-file`, `unicode-width` |
 | `sai_lsp` | the language server | [12](12-semantic-tooling.md) §12.10 | `sai_driver` |

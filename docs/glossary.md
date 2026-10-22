@@ -178,7 +178,7 @@ This glossary defines the technical terms that are used across the documents, in
 - **structured diagnostics.** Diagnostics with stable codes, severities, spans in UTF-8 byte offsets and structured fixes, emitted as JSON in a fixed schema; required for v0.1. [spec/01](spec/01-introduction.md) §1.4.4 item 1, [impl/11](impl/11-diagnostics.md) §11.9.
 - **structured fix.** A machine-applicable repair attached to a diagnostic, stated as edits that refer to semantic node IDs. [impl/11](impl/11-diagnostics.md) §11.7, D-TOOL-01.
 - **symbol.** An entity with a canonical path that is not a package or a module, such as an item, a member or a test. [impl/12](impl/12-semantic-tooling.md) §12.2.1.
-- **symbol ID.** An identifier of a symbol of the form `symbol://<ns>:<pkg>/<module path>/<item>[/<member>]#<6 hex digits>`. The path part only describes the symbol; its identity is the package node and the hexadecimal part, which the symbol index keeps across renames and moves. [impl/12](impl/12-semantic-tooling.md) §12.2, D-TOOL-02.
+- **symbol ID.** A valid URI of the form `symbol://<ns>%3A<pkg>/<module path>/<item>[/<member>]#<6 hex digits>`. The path part only describes the symbol; its identity is the package node and the hexadecimal part, which the symbol index keeps across renames and moves. [impl/12](impl/12-semantic-tooling.md) §12.2, D-TOOL-02.
 
 ## T
 
