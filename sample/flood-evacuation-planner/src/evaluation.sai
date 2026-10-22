@@ -1,0 +1,156 @@
+use acme:flood-evacuation-planner/data
+use acme:flood-evacuation-planner/model.{
+    Household
+    Placement
+    PlacementStatus
+    Plan
+    PlanEvaluation
+}
+use acme:flood-evacuation-planner/planner
+use acme:flood-evacuation-planner/policy
+
+fn assigned_route_is_valid(household: Household, placement: Placement) -> Bool {
+    var valid = false
+    for route in data.routes() {
+        if (
+            route.origin_zone == household.origin_zone
+            and placement.shelter_id == Some(route.shelter_id)
+        ) {
+            let arrival = household.departure_minute + route.travel_minutes
+            if (
+                policy.route_is_usable(route)
+                and arrival <= household.arrival_deadline
+                and placement.travel_minutes == Some(route.travel_minutes)
+                and placement.arrival_minute == Some(arrival)
+            ) {
+                valid = true
+            }
+        }
+    }
+    valid
+}
+
+fn assigned_routes_hold(plan: Plan) -> Bool {
+    var valid = true
+    for index in 0..plan.placement_count {
+        match plan.placements[index] {
+            Some(placement) => {
+                if placement.status == PlacementStatus.Assigned {
+                    match planner.find_household(placement.household_id) {
+                        Some(household) => {
+                            if not assigned_route_is_valid(household, placement) {
+                                valid = false
+                            }
+                        }
+                        None => {
+                            valid = false
+                        }
+                    }
+                }
+            }
+            None => {
+                valid = false
+            }
+        }
+    }
+    valid
+}
+
+fn shelter_capacities_hold(plan: Plan) -> Bool {
+    var valid = true
+    for shelter in data.shelters() {
+        if (
+            planner.shelter_people_used(plan, shelter.id) > shelter.people_capacity
+            or planner.shelter_accessible_used(plan, shelter.id) > shelter.accessible_capacity
+            or planner.shelter_medical_used(plan, shelter.id) > shelter.medical_capacity
+        ) {
+            valid = false
+        }
+    }
+    valid
+}
+
+fn household_appears_once(plan: Plan, household_id: U32) -> Bool {
+    var occurrences: U32 = 0
+    for index in 0..plan.placement_count {
+        match plan.placements[index] {
+            Some(placement) => {
+                if placement.household_id == household_id {
+                    occurrences += 1
+                }
+            }
+            None => {}
+        }
+    }
+    occurrences == 1
+}
+
+fn household_coverage_holds(plan: Plan) -> Bool {
+    var valid = true
+    for household in data.households() {
+        if not household_appears_once(plan, household.id) {
+            valid = false
+        }
+    }
+    for index in 0..plan.placement_count {
+        match plan.placements[index] {
+            Some(placement) => {
+                match planner.find_household(placement.household_id) {
+                    Some(_) => {}
+                    None => {
+                        valid = false
+                    }
+                }
+            }
+            None => {
+                valid = false
+            }
+        }
+    }
+    valid
+}
+
+pub fn evaluate(plan: Plan) -> PlanEvaluation {
+    var assigned_households: U32 = 0
+    var held_households: U32 = 0
+    var assigned_people: U32 = 0
+    var held_people: U32 = 0
+
+    for index in 0..plan.placement_count {
+        match plan.placements[index] {
+            Some(placement) => {
+                match planner.find_household(placement.household_id) {
+                    Some(household) => {
+                        if placement.status == PlacementStatus.Assigned {
+                            assigned_households += 1
+                            assigned_people += household.people
+                        } else {
+                            held_households += 1
+                            held_people += household.people
+                        }
+                    }
+                    None => {
+                        held_households += 1
+                    }
+                }
+            }
+            None => {
+                held_households += 1
+            }
+        }
+    }
+
+    PlanEvaluation(
+        assigned_households: assigned_households,
+        held_households: held_households,
+        household_coverage_holds: household_coverage_holds(plan),
+        assignment_totals_match: (
+            assigned_households == plan.assigned_households
+            and held_households == plan.held_households
+            and assigned_people == plan.assigned_people
+            and held_people == plan.held_people
+        ),
+        shelter_capacities_hold: shelter_capacities_hold(plan),
+        route_rules_hold: assigned_routes_hold(plan),
+    )
+}

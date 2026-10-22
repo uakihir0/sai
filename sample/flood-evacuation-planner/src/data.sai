@@ -1,0 +1,145 @@
+use acme:flood-evacuation-planner/model.{Household, Priority, Route, Shelter}
+
+pub fn households() -> Array<Household, 8> {
+    [
+        Household(
+            id: 1,
+            name: "Linh Nguyen",
+            origin_zone: 1,
+            priority: Priority.Critical,
+            people: 4,
+            accessible_places: 2,
+            medical_places: 1,
+            departure_minute: 360,
+            arrival_deadline: 430,
+        ),
+        Household(
+            id: 2,
+            name: "Omar Patel",
+            origin_zone: 2,
+            priority: Priority.High,
+            people: 3,
+            accessible_places: 0,
+            medical_places: 0,
+            departure_minute: 370,
+            arrival_deadline: 440,
+        ),
+        Household(
+            id: 3,
+            name: "Rosa Alvarez",
+            origin_zone: 3,
+            priority: Priority.High,
+            people: 4,
+            accessible_places: 1,
+            medical_places: 0,
+            departure_minute: 390,
+            arrival_deadline: 470,
+        ),
+        Household(
+            id: 4,
+            name: "Kenji Mori",
+            origin_zone: 2,
+            priority: Priority.High,
+            people: 2,
+            accessible_places: 1,
+            medical_places: 1,
+            departure_minute: 405,
+            arrival_deadline: 480,
+        ),
+        Household(
+            id: 5,
+            name: "Mae Carter",
+            origin_zone: 1,
+            priority: Priority.Standard,
+            people: 3,
+            accessible_places: 0,
+            medical_places: 0,
+            departure_minute: 420,
+            arrival_deadline: 475,
+        ),
+        Household(
+            id: 6,
+            name: "June Okafor",
+            origin_zone: 3,
+            priority: Priority.Standard,
+            people: 8,
+            accessible_places: 0,
+            medical_places: 0,
+            departure_minute: 420,
+            arrival_deadline: 600,
+        ),
+        Household(
+            id: 7,
+            name: "Sam Rivera",
+            origin_zone: 3,
+            priority: Priority.Standard,
+            people: 2,
+            accessible_places: 2,
+            medical_places: 0,
+            departure_minute: 360,
+            arrival_deadline: 420,
+        ),
+        Household(
+            id: 8,
+            name: "Tara Brooks",
+            origin_zone: 3,
+            priority: Priority.Standard,
+            people: 2,
+            accessible_places: 0,
+            medical_places: 0,
+            departure_minute: 400,
+            arrival_deadline: 430,
+        ),
+    ]
+}
+
+pub fn shelters() -> Array<Shelter, 4> {
+    [
+        Shelter(
+            id: 1,
+            name: "Ridge Hall",
+            people_capacity: 7,
+            accessible_capacity: 2,
+            medical_capacity: 1,
+        ),
+        Shelter(
+            id: 2,
+            name: "Central School",
+            people_capacity: 6,
+            accessible_capacity: 1,
+            medical_capacity: 0,
+        ),
+        Shelter(
+            id: 3,
+            name: "West Stadium",
+            people_capacity: 9,
+            accessible_capacity: 3,
+            medical_capacity: 2,
+        ),
+        Shelter(
+            id: 4,
+            name: "Clinic Annex",
+            people_capacity: 5,
+            accessible_capacity: 2,
+            medical_capacity: 3,
+        ),
+    ]
+}
+
+// Route order is the stable tie-break after travel time.
+pub fn routes() -> Array<Route, 12> {
+    [
+        Route(origin_zone: 1, shelter_id: 1, travel_minutes: 55, hazard_points: 4, open: true),
+        Route(origin_zone: 1, shelter_id: 2, travel_minutes: 35, hazard_points: 6, open: true),
+        Route(origin_zone: 1, shelter_id: 3, travel_minutes: 50, hazard_points: 4, open: true),
+        Route(origin_zone: 1, shelter_id: 4, travel_minutes: 25, hazard_points: 8, open: true),
+        Route(origin_zone: 2, shelter_id: 1, travel_minutes: 70, hazard_points: 5, open: true),
+        Route(origin_zone: 2, shelter_id: 2, travel_minutes: 30, hazard_points: 6, open: true),
+        Route(origin_zone: 2, shelter_id: 3, travel_minutes: 42, hazard_points: 9, open: true),
+        Route(origin_zone: 2, shelter_id: 4, travel_minutes: 20, hazard_points: 31, open: true),
+        Route(origin_zone: 3, shelter_id: 1, travel_minutes: 90, hazard_points: 8, open: true),
+        Route(origin_zone: 3, shelter_id: 2, travel_minutes: 60, hazard_points: 15, open: true),
+        Route(origin_zone: 3, shelter_id: 3, travel_minutes: 45, hazard_points: 9, open: true),
+        Route(origin_zone: 3, shelter_id: 4, travel_minutes: 30, hazard_points: 12, open: false),
+    ]
+}

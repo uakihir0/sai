@@ -1,0 +1,20 @@
+use acme:flood-evacuation-planner/report
+use sai:alloc/string.{String}
+
+pub fn evacuation_report() -> String
+    effects { alloc }
+{
+    report.evacuation_report()
+}
+
+pub fn shelter_capacity_report() -> String
+    effects { alloc }
+{
+    report.shelter_capacity_report()
+}
+
+pub fn plan_validation_report() -> String
+    effects { alloc }
+{
+    report.plan_validation_report()
+}
