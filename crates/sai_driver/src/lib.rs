@@ -4821,8 +4821,9 @@ impl TraitImplMemberTestOnlyResolution {
     /// Returns the bounded associated-method body check, independently of
     /// test-only path diagnostics.
     ///
-    /// Only public inherent methods in a non-generic safe impl with an unused
-    /// first shared `Self` receiver, named immutable primitive parameters, an
+    /// Only public inherent methods in a non-generic safe impl with a first
+    /// shared `Self` receiver used only as the base of a supported direct
+    /// primitive field initializer, named immutable primitive parameters, an
     /// explicit primitive return type, and the supported primitive-local body
     /// shape are checked; every other associated member is unsupported.
     pub fn body_type_check(
@@ -5902,7 +5903,7 @@ fn check_function_body_type(
     }
     if sig.params.len() == body.params.len() {
         if let Some(diagnostics) = check_function_body_primitive_local_block(
-            owner, sig, body, locals, type_paths, symbols, inputs, snapshot, target_cfg,
+            owner, sig, body, locals, type_paths, symbols, None, inputs, snapshot, target_cfg,
         )? {
             return Ok(FunctionBodyTypeCheck::Supported { diagnostics });
         }
@@ -6365,14 +6366,43 @@ fn check_inherent_method_body_type(
                 ..
             })
         )
-        || locals
-            .paths
-            .values()
-            .any(|path| path.base == Res::Local(body_receiver.binding))
         || explicit_params.iter().any(|parameter| parameter.is_self)
         || explicit_params.len() != explicit_body_params.len()
     {
         return Ok(FunctionBodyTypeCheck::Unsupported);
+    }
+
+    let ExprKind::Block(method_block) = body.value.kind else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    let Some(field_types) = inherent_method_primitive_field_types(*self_ty, symbols, inputs) else {
+        return Ok(FunctionBodyTypeCheck::Unsupported);
+    };
+    let mut self_field_initializers = HashMap::new();
+    for stmt in method_block.stmts {
+        let StmtKind::Let { init, .. } = stmt.kind else {
+            continue;
+        };
+        let ExprKind::Field {
+            base,
+            name,
+            args: None,
+        } = init.kind
+        else {
+            continue;
+        };
+        if !is_direct_self_value_expression(base) {
+            continue;
+        }
+        let Some(field_name) = symbols.resolve(name.sym).ok() else {
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        let Some(field_type) = field_types.get(field_name.as_ref()).copied() else {
+            // General field lookup and UNKNOWN_FIELD diagnostics are outside
+            // this bounded method-body slice.
+            return Ok(FunctionBodyTypeCheck::Unsupported);
+        };
+        self_field_initializers.insert(init.hir_id, field_type);
     }
 
     let explicit_sig = sai_hir::body::FnSig {
@@ -6390,6 +6420,7 @@ fn check_inherent_method_body_type(
         locals,
         type_paths,
         symbols,
+        Some(&self_field_initializers),
         inputs,
         snapshot,
         target_cfg,
@@ -6400,6 +6431,146 @@ fn check_inherent_method_body_type(
     }
 }
 
+fn inherent_method_primitive_field_types(
+    self_ty: Ty<'_>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<HashMap<String, sai_resolve::prelude::PrimTy>> {
+    use sai_syntax::ast::AstNode as _;
+
+    let TyKind::Path(path) = self_ty.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return None;
+    }
+    let target_name = symbols.resolve(path.segments[0].name.sym).ok()?;
+    if primitive_method_field_type(target_name.as_ref()).is_some() {
+        return None;
+    }
+    let source_file = ast::SourceFile::cast(inputs.root.clone())?;
+    if source_file.module_header().is_some()
+        || source_file.test_decls().next().is_some()
+        || source_file.property_decls().next().is_some()
+        || source_file
+            .syntax()
+            .children()
+            .any(|child| ast::UseDecl::can_cast(child.kind()))
+    {
+        return None;
+    }
+    let mut items = source_file.items();
+    let Some(ast::Item::Type(type_decl)) = items.next() else {
+        return None;
+    };
+    let Some(ast::Item::Impl(impl_decl)) = items.next() else {
+        return None;
+    };
+    let type_name = type_decl
+        .name()
+        .and_then(|name| name.token())
+        .map(|token| token.text().to_owned())?;
+    let struct_def = type_decl.struct_def()?;
+    let fields = struct_def.fields()?;
+    if items.next().is_some()
+        || type_decl.attrs().next().is_some()
+        || type_decl
+            .syntax()
+            .children()
+            .any(|child| ast::GenericParamList::can_cast(child.kind()))
+        || type_decl
+            .syntax()
+            .descendants()
+            .any(|node| ast::Attribute::can_cast(node.kind()))
+        || struct_def.where_clause().is_some()
+        || fields.fields().next().is_none()
+        || impl_decl.attrs().next().is_some()
+        || impl_decl
+            .syntax()
+            .children()
+            .any(|child| ast::GenericParamList::can_cast(child.kind()))
+        || impl_decl
+            .syntax()
+            .descendants()
+            .any(|node| ast::Attribute::can_cast(node.kind()))
+        || impl_decl.unsafe_token().is_some()
+    {
+        return None;
+    }
+    let normalized_type_name =
+        sai_syntax::normalize_identifier(type_name.strip_prefix("r#").unwrap_or(&type_name));
+    if normalized_type_name != target_name.as_ref() {
+        return None;
+    }
+    let inherent_type = impl_decl.inherent_type()?;
+    let range = inherent_type.syntax().text_range();
+    if inputs
+        .source
+        .text()
+        .get(range.start().to_usize()..range.end().to_usize())
+        != Some(type_name.as_str())
+    {
+        return None;
+    }
+    let mut field_types = HashMap::new();
+    for field in fields.fields() {
+        if field.attrs().next().is_some() {
+            return None;
+        }
+        let field_name = field
+            .name()
+            .and_then(|name| name.token())
+            .map(|token| token.text().to_owned())?;
+        let field_name =
+            sai_syntax::normalize_identifier(field_name.strip_prefix("r#").unwrap_or(&field_name));
+        let ty = field.ty()?;
+        let range = ty.syntax().text_range();
+        let ty_text = inputs
+            .source
+            .text()
+            .get(range.start().to_usize()..range.end().to_usize())?;
+        let field_type = primitive_method_field_type(ty_text)?;
+        if field_types.insert(field_name, field_type).is_some() {
+            return None;
+        }
+    }
+    Some(field_types)
+}
+
+fn primitive_method_field_type(ty: &str) -> Option<sai_resolve::prelude::PrimTy> {
+    use sai_resolve::prelude::PrimTy;
+
+    Some(match ty {
+        "Bool" => PrimTy::Bool,
+        "Byte" => PrimTy::Byte,
+        "Char" => PrimTy::Char,
+        "I8" => PrimTy::I8,
+        "I16" => PrimTy::I16,
+        "I32" => PrimTy::I32,
+        "I64" => PrimTy::I64,
+        "ISize" => PrimTy::ISize,
+        "U8" => PrimTy::U8,
+        "U16" => PrimTy::U16,
+        "U32" => PrimTy::U32,
+        "U64" => PrimTy::U64,
+        "USize" => PrimTy::USize,
+        "F32" => PrimTy::F32,
+        "F64" => PrimTy::F64,
+        _ => return None,
+    })
+}
+
+fn is_direct_self_value_expression(expression: &HirExpr<'_>) -> bool {
+    matches!(
+        expression.kind,
+        ExprKind::Path(HirPath {
+            root: PathRoot::SelfValue,
+            segments,
+            ..
+        }) if segments.is_empty()
+    )
+}
+
 fn check_function_body_primitive_local_block(
     owner: &HirOwner<'_>,
     sig: sai_hir::body::FnSig<'_>,
@@ -6407,6 +6578,7 @@ fn check_function_body_primitive_local_block(
     locals: &LocalResolution,
     type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
+    self_field_initializers: Option<&HashMap<HirId, sai_resolve::prelude::PrimTy>>,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
     target_cfg: &TargetCfg,
@@ -6564,6 +6736,9 @@ fn check_function_body_primitive_local_block(
 
         match init.kind {
             ExprKind::Lit(_) if is_direct_function_scalar_literal(init) => {}
+            ExprKind::Field { .. }
+                if self_field_initializers
+                    .is_some_and(|fields| fields.contains_key(&init.hir_id)) => {}
             ExprKind::Path(path) => {
                 let Some(source_binding) = resolved_plain_local_path_binding(path, locals, inputs)
                 else {
@@ -6716,6 +6891,7 @@ fn check_function_body_primitive_local_block(
             return_type,
             initial_bindings: &initial_bindings,
             primitive_types: &primitive_types,
+            self_field_initializers,
             local_paths: &local_paths,
             symbols,
             pointer_width: target_cfg.pointer_width(),
@@ -42346,6 +42522,73 @@ mod tests {
                 .expect("test-only diagnostics have a separate result")
                 .is_empty(),
             "method body checking does not mix with test-only diagnostics"
+        );
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_reads_primitive_self_fields() {
+        let root = concat!(
+            "type Counter { count: I32 }\n",
+            "impl Counter {\n",
+            "  pub fn current_count(self: borrow Self) -> I32 {\n",
+            "    let count = self.count\n",
+            "    count\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("single inherent method collects");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let check = results.owners()[0].members()[0]
+            .body_type_check()
+            .expect("method body check has an independent result");
+        assert!(
+            matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+            "a direct primitive self-field initializer should be checked: {check:#?}"
+        );
+    }
+
+    #[test]
+    fn inherent_method_body_type_check_rejects_generic_primitive_named_field_types() {
+        let root = concat!(
+            "type Counter<I32> { count: I32 }\n",
+            "impl Counter {\n",
+            "  pub fn current_count(self: borrow Self) -> I32 {\n",
+            "    let count = self.count\n",
+            "    count\n",
+            "  }\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("single generic inherent method collects");
+        let results = database
+            .resolve_trait_impl_member_test_only_paths(&collection, &module_tree, &snapshot)
+            .expect("associated owner analysis succeeds");
+        let check = results.owners()[0].members()[0]
+            .body_type_check()
+            .expect("method body check has an independent result");
+        assert_eq!(
+            check,
+            &FunctionBodyTypeCheck::Unsupported,
+            "a generic field type that shadows the primitive spelling must not enter the primitive slice"
         );
     }
 

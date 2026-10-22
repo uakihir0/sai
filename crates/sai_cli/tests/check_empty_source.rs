@@ -236,6 +236,52 @@ fn public_inherent_method_body_emits_check_result() {
 }
 
 #[test]
+fn public_inherent_method_body_reads_primitive_field() {
+    let source = concat!(
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn current_count(self: borrow Self) -> I32 {\n",
+        "        let count = self.count\n",
+        "        count\n",
+        "    }\n",
+        "}\n",
+    );
+    assert_success_result(run_check(source, "", &[], &[]), "wasm32-core", "dev");
+}
+
+#[test]
+fn public_inherent_method_field_mismatch_reports_the_field_span() {
+    let source = concat!(
+        "type Counter { count: I32 }\n",
+        "impl Counter {\n",
+        "    pub fn current_count(self: borrow Self) -> U32 {\n",
+        "        let count: U32 = self.count\n",
+        "        count\n",
+        "    }\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert!(
+        !stdout.contains("\"code\":\"FEATURE_NOT_IMPLEMENTED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "supported field type errors are reported without a feature gate:\n{stdout}"
+    );
+    let start = source
+        .find("self.count")
+        .expect("mismatched field initializer exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U32`, found `I32`",
+        start,
+        start + "self.count".len(),
+    );
+}
+
+#[test]
 fn public_inherent_method_body_mismatch_reports_its_source_span() {
     let source = concat!(
         "type Counter { marker: I32 }\n",
@@ -320,6 +366,42 @@ fn unsupported_inherent_method_shapes_remain_gated() {
             ),
         ),
         (
+            "unknown receiver field",
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn add_one(self: borrow Self) -> I32 {\n",
+                "        let result = self.missing\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "receiver field in an operator",
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn add_one(self: borrow Self) -> I32 {\n",
+                "        let result = self.marker + 1\n",
+                "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "receiver field as the tail",
+            concat!(
+                "type Counter { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn current_count(self: borrow Self) -> I32 {\n",
+                "        let result = 1\n",
+                "        self.marker\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
             "generic method",
             concat!(
                 "type Counter { marker: I32 }\n",
@@ -327,6 +409,18 @@ fn unsupported_inherent_method_shapes_remain_gated() {
                 "    pub fn add_one<T>(self: borrow Self, value: I32) -> I32 {\n",
                 "        let result = value + 1\n",
                 "        result\n",
+                "    }\n",
+                "}\n",
+            ),
+        ),
+        (
+            "generic struct parameter shadows primitive field spelling",
+            concat!(
+                "type Counter<I32> { marker: I32 }\n",
+                "impl Counter {\n",
+                "    pub fn current_count(self: borrow Self) -> I32 {\n",
+                "        let count = self.marker\n",
+                "        count\n",
                 "    }\n",
                 "}\n",
             ),

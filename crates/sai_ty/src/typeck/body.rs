@@ -24,6 +24,9 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     pub return_type: PrimTy,
     pub initial_bindings: &'a HashMap<BindingId, PrimTy>,
     pub primitive_types: &'a HashMap<HirId, PrimTy>,
+    /// Direct `self.field` initializer types resolved by the owner-aware
+    /// driver. Other field expressions remain outside this body slice.
+    pub self_field_initializers: Option<&'a HashMap<HirId, PrimTy>>,
     pub local_paths: &'a HashMap<HirId, BindingId>,
     pub symbols: &'a Interner,
     pub pointer_width: u8,
@@ -293,6 +296,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
             ExprKind::Path(_) => {
                 let source_type = self.check_local_path(init)?;
+                if let Some(expected) = annotation {
+                    self.check_annotated_path(source_type, expected, init.hir_id)?;
+                    LocalType::Concrete(expected)
+                } else {
+                    source_type
+                }
+            }
+            ExprKind::Field { .. } => {
+                let Some(field_type) = self
+                    .input
+                    .self_field_initializers
+                    .and_then(|fields| fields.get(&init.hir_id))
+                    .copied()
+                else {
+                    return Err(());
+                };
+                let source_type = LocalType::Concrete(field_type);
                 if let Some(expected) = annotation {
                     self.check_annotated_path(source_type, expected, init.hir_id)?;
                     LocalType::Concrete(expected)
