@@ -684,13 +684,19 @@ PackageId     ::= PkgSeg ':' PkgSeg                    (* 02 §2.9 *)
 ModulePart    ::= ( '/' Segment )+                     (* module path; absent for the root module *)
 Component     ::= '.' Name                             (* item or member *)
                 | '.' 'impl[' ImplHeader ']'           (* trait or interface impl *)
-                | '.' 'field[' ( Name | INT ) ']'      (* field; INT for a tuple-variant payload *)
+                | '.' 'field[' ( Name | CanonicalIndex ) ']' (* field; index for a tuple-variant payload *)
                 | '.' 'generic[' Name ']'              (* generic parameter *)
-                | '.' 'test[' STRING ']'               (* test declaration *)
-                | '.' 'property[' STRING ']'           (* property declaration *)
+                | '.' 'test[' CanonicalString ']'      (* test declaration *)
+                | '.' 'property[' CanonicalString ']'   (* property declaration *)
 ImplHeader    ::= CanonType ' for ' CanonType          (* trait impl: trait, then self type *)
                 | CanonicalPath                        (* interface impl: the interface *)
+CanonicalIndex ::= '0' | [1-9] [0-9]*
+CanonicalString ::= '"' CanonicalStringChar* '"'
+CanonicalStringChar ::= UnescapedStringCodePoint | '\\' | '\"'
+UnescapedStringCodePoint ::= any Unicode scalar value except U+0022, U+005C, or a code point in Unicode General_Category=Cc
 ```
+
+`CanonicalIndex` is the tuple field's numeric value written in unpadded decimal, regardless of the spelling of the source `INT`. In `CanonicalStringChar`, the two escaped forms are a backslash followed by a backslash, or a backslash followed by `"`. `CanonicalString` is the decoded test or property name written as one simple double-quoted string: `\` and `"` are escaped as `\\` and `\"`, and every other code point is kept as written. String values are not NFC-normalized. Source raw and multiline strings therefore have the same canonical path as a simple string with the same value. Test and property names must still be non-empty and contain no `Cc` character as required by [14](14-testing.md) §14.2.3.
 
 | Entity | Canonical path |
 |---|---|
@@ -707,7 +713,7 @@ ImplHeader    ::= CanonType ' for ' CanonType          (* trait impl: trait, the
 | interface impl in module `m` | `m.impl[I]`, where `I` is the interface's canonical path |
 | interface member `x` of interface `i` | `i.x`; a resource method `i.R.f` |
 | generic parameter `T` of item `p` | `p.generic[T]` |
-| `test "name"` / `property "name"` in module `m` | `m.test["name"]` / `m.property["name"]` (STRING with the escapes of 02 §2.6.4, whose `Escape` forms are listed in §2.6.3) |
+| `test "name"` / `property "name"` in module `m` | `m.test["name"]` / `m.property["name"]` (the decoded name in `CanonicalString` form) |
 | extern function `f` declared in module `m` | `m.f` |
 | item of a WIT package (Stage 4) | `ns:pkg/iface.x`, where `iface` is the WIT interface name and `x` the SAI name of the member ([13](13-components-and-wit.md)) |
 

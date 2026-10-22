@@ -670,6 +670,7 @@ Defined in impl/11, impl/13, impl/14, impl/12.
 | N-H-86 | [impl/13](../impl/13-cli.md) §13.9 | The selection options of `sai test` are the input `test_options`, and the selection is the query `test_selection`, which reads only item trees. |
 | N-H-87 | [impl/12](../impl/12-semantic-tooling.md) §12.12 | The semantic diff compares the unsafe inventories (`sai inspect unsafe`) of every dependency node whose lock entry changed version, source or checksum, or that is new, paired by identity and compatibility line, then by unique identity. |
 | N-H-88 | [impl/12](../impl/12-semantic-tooling.md) §12.12 | An empty symbol package file is zero bytes; nonempty JSONL files have one canonical object and LF per entry, with no blank records. |
+| N-H-89 | [impl/12](../impl/12-semantic-tooling.md) §12.12 | Tuple-field indexes use unpadded decimal, and test/property names use simple quoted canonical strings with only quote and backslash escapes, preserving other code points without NFC normalization. |
 
 ## N-I
 
