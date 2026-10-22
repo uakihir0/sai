@@ -721,6 +721,23 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
         right: &'hir Expr<'hir>,
         expression: HirId,
     ) -> Result<LocalType, ()> {
+        if let (
+            ExprKind::Lit(left_literal @ Lit::Int { .. }),
+            ExprKind::Lit(right_literal @ Lit::Int { .. }),
+        ) = (left.kind, right.kind)
+        {
+            let local_type = self.local_type_for_unannotated_literal(
+                left_literal,
+                PrimitiveLiteralKind::Integer,
+                left.hir_id,
+            );
+            let LocalType::LiteralVariable(id) = local_type else {
+                return Err(());
+            };
+            self.add_integer_literal_constraint(id, right_literal, right.hir_id)?;
+            return Ok(local_type);
+        }
+
         if let ExprKind::Lit(literal) = left.kind {
             let Some(kind @ (PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint)) =
                 primitive_literal_kind(literal)

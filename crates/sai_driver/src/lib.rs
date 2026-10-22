@@ -6524,7 +6524,7 @@ fn check_function_body_primitive_local_block(
                                 && is_preceding_path(right))
                             || (matches!(
                                 operator,
-                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div
+                                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
                             ) && is_direct_function_integer_literal(left)
                                 && is_direct_function_integer_literal(right))
                     }
@@ -28430,6 +28430,63 @@ mod tests {
     }
 
     #[test]
+    fn function_body_type_check_accepts_flat_local_integer_remainder_literal_pairs() {
+        let root = concat!(
+            "pub fn defaults_to_i64() -> I32 {\n",
+            "    let value = -9223372036854775808 % 1\n",
+            "    let output: I32 = 0\n",
+            "    output\n",
+            "}\n",
+            "pub fn annotation_selects_i32() -> I32 {\n",
+            "    let value: I32 = 2147483647 % 1\n",
+            "    value\n",
+            "}\n",
+            "pub fn later_annotation_selects_i8() -> I8 {\n",
+            "    let value = 100 % 2\n",
+            "    let selected: I8 = value\n",
+            "    selected\n",
+            "}\n",
+            "pub fn tail_selects_u8() -> U8 {\n",
+            "    let value = 255 % 1\n",
+            "    value\n",
+            "}\n",
+            "pub fn zero_divisor_is_not_evaluated() -> I8 {\n",
+            "    let value: I8 = 1 % 0\n",
+            "    value\n",
+            "}\n",
+            "pub fn signed_minimum_is_not_evaluated() -> I8 {\n",
+            "    let value: I8 = -128 % -1\n",
+            "    value\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+
+        assert_eq!(resolved.owners().len(), 6);
+        for (index, owner) in resolved.owners().iter().enumerate() {
+            let check = owner
+                .body_type_check()
+                .expect("ordinary integer remainder-pair body check succeeds");
+            assert!(
+                matches!(check, FunctionBodyTypeCheck::Supported { diagnostics } if diagnostics.is_empty()),
+                "function owner {:?} (index {index}) unexpectedly failed the integer remainder-pair slice: {check:?}",
+                owner.owner()
+            );
+        }
+    }
+
+    #[test]
     fn function_body_type_check_gates_other_flat_local_arithmetic_literal_pairs() {
         let root = concat!(
             "pub fn float_addition() -> F64 {\n",
@@ -28456,6 +28513,14 @@ mod tests {
             "    let value = 1 / 2.0\n",
             "    value\n",
             "}\n",
+            "pub fn float_remainder() -> F64 {\n",
+            "    let value = 1.0 % 2.0\n",
+            "    value\n",
+            "}\n",
+            "pub fn mixed_remainder() -> I64 {\n",
+            "    let value = 1 % 2.0\n",
+            "    value\n",
+            "}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -28471,7 +28536,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 6);
+        assert_eq!(resolved.owners().len(), 8);
         for (index, owner) in resolved.owners().iter().enumerate() {
             assert!(
                 matches!(
@@ -28502,23 +28567,28 @@ mod tests {
             "    let value = 'c' & right\n",
             "    value\n",
             "}\n",
-            "pub fn char_nested_addition_alias() -> Char {\n",
-            "    let right = 1 + (2 + 3)\n",
+            "pub fn char_remainder_alias() -> Char {\n",
+            "    let right = 3 % 2\n",
             "    let value = 'd' & right\n",
             "    value\n",
             "}\n",
+            "pub fn char_nested_addition_alias() -> Char {\n",
+            "    let right = 1 + (2 + 3)\n",
+            "    let value = 'e' & right\n",
+            "    value\n",
+            "}\n",
             "pub fn char_direct_addition_rhs() -> Char {\n",
-            "    let value = 'e' & (1 + 2)\n",
+            "    let value = 'f' & (1 + 2)\n",
             "    value\n",
             "}\n",
             "pub fn char_wrapping_addition_alias() -> Char {\n",
             "    let right = 1 +% 2\n",
-            "    let value = 'f' & right\n",
+            "    let value = 'g' & right\n",
             "    value\n",
             "}\n",
             "pub fn generic_char_addition_alias<T>() -> Char {\n",
             "    let right = 1 + 2\n",
-            "    let value = 'g' & right\n",
+            "    let value = 'h' & right\n",
             "    value\n",
             "}\n",
         );
@@ -28536,7 +28606,7 @@ mod tests {
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
 
-        assert_eq!(resolved.owners().len(), 7);
+        assert_eq!(resolved.owners().len(), 8);
         for (index, owner) in resolved.owners().iter().enumerate() {
             let check = owner
                 .body_type_check()
