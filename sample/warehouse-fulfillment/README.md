@@ -23,6 +23,8 @@ The fixture is intentionally small enough to trace by hand:
 - Shelf-life checks apply only to SKUs whose best-before dates are tracked.
   Shelf-stable SKUs set `best_before_tracked` to false; their fixture lot dates
   are ignored.
+- The North Cold Hub's day-44 chilled-meal lot is excluded for fulfillment on
+  day 40 because it misses the five-day minimum shelf-life rule.
 
 ## Intended commands
 

@@ -1,0 +1,74 @@
+use acme:weighted-route-finder/data
+use acme:weighted-route-finder/model.{Route, RouteError}
+use acme:weighted-route-finder/path
+use sai:core/num.{U32_MAX}
+
+pub fn depot_to_terminal() -> Result<Route, RouteError> {
+    path.shortest_route(data.downtown(), 101, 606)
+}
+
+pub fn equal_time_choice() -> Result<Route, RouteError> {
+    path.shortest_route(data.equal_time_routes(), 101, 505)
+}
+
+pub fn terminal_to_depot() -> Result<Route, RouteError> {
+    path.shortest_route(data.downtown(), 606, 101)
+}
+
+test "the minimum route uses the cumulative cost of every leg" {
+    match depot_to_terminal() {
+        Ok(route) => {
+            assert route.minutes == 17
+            assert route.length == 6
+            assert route.node_ids[0] == Some(101)
+            assert route.node_ids[1] == Some(303)
+            assert route.node_ids[2] == Some(202)
+            assert route.node_ids[3] == Some(404)
+            assert route.node_ids[4] == Some(505)
+            assert route.node_ids[5] == Some(606)
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "equal cost routes use the lower-index predecessor" {
+    match equal_time_choice() {
+        Ok(route) => {
+            assert route.minutes == 10
+            assert route.length == 3
+            assert route.node_ids[0] == Some(101)
+            assert route.node_ids[1] == Some(202)
+            assert route.node_ids[2] == Some(505)
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "a path below U32_MAX remains representable" {
+    match path.shortest_route(data.below_maximum_duration(), 101, 202) {
+        Ok(route) => {
+            assert route.minutes == U32_MAX - 1
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "U32_MAX and overflowing path sums are not treated as reachable" {
+    assert (path.shortest_route(data.maximum_duration(), 101, 202) == Err(RouteError.Unreachable))
+    assert (path.shortest_route(data.overflowing_sum(), 101, 303) == Err(RouteError.Unreachable))
+}
+
+test "a directed graph can have no route in the reverse direction" {
+    assert terminal_to_depot() == Err(RouteError.Unreachable)
+}
+
+test "unknown endpoint IDs have distinct errors" {
+    assert path.shortest_route(data.downtown(), 999, 606) == Err(RouteError.UnknownOrigin)
+    assert path.shortest_route(data.downtown(), 101, 999) == Err(RouteError.UnknownDestination)
+}

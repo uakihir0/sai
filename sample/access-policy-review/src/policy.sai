@@ -1,0 +1,109 @@
+use acme:access-policy-review/model.{
+    Action
+    Decision
+    DecisionReason
+    Effect
+    Policy
+    PolicyInputError
+    Principal
+    Request
+    Role
+    Rule
+}
+
+fn has_role(principal: Principal, expected: Role) -> Bool {
+    for index in 0..principal.role_count {
+        match principal.roles[index] {
+            Some(role) => {
+                if role == expected {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+fn matches(rule: Rule, principal: Principal, request: Request) -> Bool {
+    (
+        has_role(principal, rule.role)
+        and rule.action == request.action
+        and rule.resource == request.resource
+    )
+}
+
+fn lowest_rule_id(current: Option<U32>, candidate: U32) -> Option<U32> {
+    match current {
+        Some(existing) => {
+            if candidate < existing {
+                Some(candidate)
+            } else {
+                Some(existing)
+            }
+        }
+        None => Some(candidate)
+    }
+}
+
+pub fn decide(policy: Policy, principal: Principal, request: Request) -> Result<
+    Decision,
+    PolicyInputError,
+> {
+    if principal.role_count > principal.roles.len() {
+        return Err(PolicyInputError.TooManyPrincipalRoles)
+    }
+    if policy.rule_count > policy.rules.len() {
+        return Err(PolicyInputError.TooManyPolicyRules)
+    }
+
+    var matching_allow: Option<U32> = None
+    var matching_deny: Option<U32> = None
+
+    for index in 0..policy.rule_count {
+        match policy.rules[index] {
+            Some(rule) => {
+                if matches(rule, principal, request) {
+                    match rule.effect {
+                        Effect.Allow => {
+                            matching_allow = lowest_rule_id(matching_allow, rule.id)
+                        }
+                        Effect.Deny => {
+                            matching_deny = lowest_rule_id(matching_deny, rule.id)
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    let decision = match matching_deny {
+        Some(rule_id) => Decision(
+            principal_id: principal.id,
+            request: request,
+            allowed: false,
+            reason: DecisionReason.ExplicitDeny,
+            rule_id: Some(rule_id),
+        )
+        None => {
+            match matching_allow {
+                Some(rule_id) => Decision(
+                    principal_id: principal.id,
+                    request: request,
+                    allowed: true,
+                    reason: DecisionReason.ExplicitAllow,
+                    rule_id: Some(rule_id),
+                )
+                None => Decision(
+                    principal_id: principal.id,
+                    request: request,
+                    allowed: false,
+                    reason: DecisionReason.DefaultDeny,
+                    rule_id: None,
+                )
+            }
+        }
+    }
+    Ok(decision)
+}

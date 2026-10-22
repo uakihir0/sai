@@ -2,8 +2,10 @@ use acme:rail-shuttle-dispatch/data
 use acme:rail-shuttle-dispatch/model.{Assignment, ServiceRequest, Vehicle}
 
 fn precedes(candidate: ServiceRequest, request: ServiceRequest) -> Bool {
-    candidate.priority < request.priority
+    (
+        candidate.priority < request.priority
         or (candidate.priority == request.priority and candidate.id < request.id)
+    )
 }
 
 fn is_compatible(vehicle: Vehicle, request: ServiceRequest) -> Bool {
@@ -25,10 +27,7 @@ fn improves_fit(candidate: Vehicle, current: Vehicle, request: ServiceRequest) -
             candidate_seat_slack == current_seat_slack
             and (
                 candidate_bay_slack < current_bay_slack
-                or (
-                    candidate_bay_slack == current_bay_slack
-                    and candidate.id < current.id
-                )
+                or (candidate_bay_slack == current_bay_slack and candidate.id < current.id)
             )
         )
     )
@@ -74,10 +73,7 @@ fn select_vehicle(request: ServiceRequest) -> Option<Vehicle> {
 }
 
 pub fn assignment(request: ServiceRequest) -> Assignment {
-    Assignment(
-        request: request,
-        vehicle: select_vehicle(request),
-    )
+    Assignment(request: request, vehicle: select_vehicle(request))
 }
 
 fn corridor_vehicle_count(request: ServiceRequest) -> U32 {
@@ -93,10 +89,7 @@ fn corridor_vehicle_count(request: ServiceRequest) -> U32 {
 fn corridor_capacity_candidate_count(request: ServiceRequest) -> U32 {
     var count: U32 = 0
     for vehicle in data.vehicles() {
-        if (
-            vehicle.corridor == request.corridor
-            and vehicle.seat_capacity >= request.passengers
-        ) {
+        if (vehicle.corridor == request.corridor and vehicle.seat_capacity >= request.passengers) {
             count += 1
         }
     }

@@ -22,17 +22,13 @@ pub fn find_warehouse(id: U32) -> Option<Warehouse> {
 pub fn eligible_units(warehouse_id: U32, code: Str) -> U32 {
     match find_sku(code) {
         Some(sku) => {
-            let earliest_best_before =
-                data.fulfillment_day() + sku.minimum_shelf_life_days
+            let earliest_best_before = data.fulfillment_day() + sku.minimum_shelf_life_days
             var units: U32 = 0
             for lot in data.stock_lots() {
                 if (
                     lot.warehouse_id == warehouse_id
                     and lot.sku == code
-                    and (
-                        not sku.best_before_tracked
-                        or lot.best_before_day >= earliest_best_before
-                    )
+                    and (not sku.best_before_tracked or lot.best_before_day >= earliest_best_before)
                 ) {
                     units += lot.units
                 }
@@ -62,4 +58,3 @@ pub fn excluded_units(warehouse_id: U32, code: Str) -> U32 {
         None => 0
     }
 }
-
