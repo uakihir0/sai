@@ -1,0 +1,21 @@
+use acme:air-quality-monitor/model.{Reading, ReadingQuality, Series}
+
+pub fn harborview_series() -> Series {
+    Series(
+        station: "Harborview north pier",
+        readings: [
+            Reading(minute: 0, pm25: 20, quality: ReadingQuality.Good),
+            Reading(minute: 10, pm25: 38, quality: ReadingQuality.Good),
+            Reading(minute: 20, pm25: 52, quality: ReadingQuality.Good),
+            Reading(minute: 30, pm25: 61, quality: ReadingQuality.Good),
+            Reading(minute: 40, pm25: 42, quality: ReadingQuality.Good),
+            Reading(minute: 50, pm25: 29, quality: ReadingQuality.Good),
+            Reading(minute: 60, pm25: 32, quality: ReadingQuality.Good),
+            Reading(minute: 70, pm25: 55, quality: ReadingQuality.Good),
+            Reading(minute: 80, pm25: 999, quality: ReadingQuality.SensorFault),
+            Reading(minute: 90, pm25: 18, quality: ReadingQuality.Good),
+            Reading(minute: 100, pm25: 60, quality: ReadingQuality.Good),
+            Reading(minute: 110, pm25: 66, quality: ReadingQuality.Good),
+        ],
+    )
+}

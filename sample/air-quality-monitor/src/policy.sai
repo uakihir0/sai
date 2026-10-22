@@ -1,0 +1,10 @@
+use acme:air-quality-monitor/model.{Policy}
+
+pub fn harborview_policy() -> Policy {
+    Policy(
+        trigger_pm25: 50,
+        clear_pm25: 35,
+        consecutive_high_required: 2,
+        consecutive_clear_required: 2,
+    )
+}

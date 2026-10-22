@@ -1,0 +1,108 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PurchaseOrderLine {
+    pub sku: Str
+    pub quantity: U32
+    pub unit_price_cents: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PurchaseOrder {
+    pub number: U32
+    pub vendor: Str
+    pub lines: Array<Option<PurchaseOrderLine>, 4>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ReceiptLine {
+    pub sku: Str
+    pub quantity: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type GoodsReceipt {
+    pub number: U32
+    pub purchase_order_number: U32
+    pub lines: Array<Option<ReceiptLine>, 4>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type InvoiceLine {
+    pub sku: Str
+    pub quantity: U32
+    pub unit_price_cents: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Invoice {
+    pub number: U32
+    pub vendor: Str
+    pub purchase_order_number: U32
+    pub receipt_number: U32
+    pub lines: Array<Option<InvoiceLine>, 3>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Documents {
+    pub purchase_orders: Array<PurchaseOrder, 2>
+    pub receipts: Array<GoodsReceipt, 2>
+    pub invoices: Array<Invoice, 6>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AcceptedQuantity {
+    pub purchase_order_number: U32
+    pub receipt_number: U32
+    pub sku: Str
+    pub quantity: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type LineAudit {
+    pub sku: Str
+    pub billed_quantity: U32
+    pub billed_unit_price_cents: U32
+    pub billed_amount_cents: U32
+    pub ordered_quantity: Option<U32>
+    pub received_quantity: Option<U32>
+    pub expected_unit_price_cents: Option<U32>
+    pub order_line_found: Bool
+    pub receipt_line_found: Bool
+    pub previously_accepted_order_quantity: U32
+    pub previously_accepted_receipt_quantity: U32
+    pub positive_quantity: Bool
+    pub within_order_quantity: Option<Bool>
+    pub within_received_quantity: Option<Bool>
+    pub unit_price_matches: Option<Bool>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type InvoiceAudit {
+    pub invoice_number: U32
+    pub vendor: Str
+    pub billed_total_cents: U32
+    pub line_count: USize
+    pub lines: Array<Option<LineAudit>, 3>
+    pub purchase_order_found: Bool
+    pub receipt_found: Bool
+    pub vendor_matches_order: Bool
+    pub receipt_matches_order: Bool
+    pub ready_to_pay: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BatchSummary {
+    pub invoice_count: USize
+    pub ready_count: USize
+    pub held_count: USize
+    pub billed_total_cents: U32
+    pub quantity_variance_count: USize
+    pub price_variance_count: USize
+    pub unknown_order_item_count: USize
+    pub header_issue_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BatchAudit {
+    pub audits: Array<Option<InvoiceAudit>, 6>
+    pub summary: BatchSummary
+}

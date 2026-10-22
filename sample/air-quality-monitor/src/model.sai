@@ -1,0 +1,60 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReadingQuality {
+    Good
+    SensorFault
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum AlertPhase {
+    Normal
+    HighPending
+    Active
+    ClearPending
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Reading {
+    pub minute: U32
+    pub pm25: U32
+    pub quality: ReadingQuality
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Series {
+    pub station: Str
+    pub readings: Array<Reading, 12>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Policy {
+    pub trigger_pm25: U32
+    pub clear_pm25: U32
+    pub consecutive_high_required: USize
+    pub consecutive_clear_required: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Decision {
+    pub minute: U32
+    pub pm25: U32
+    pub quality: ReadingQuality
+    pub phase_after: AlertPhase
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type MonitorSummary {
+    pub reading_count: USize
+    pub valid_reading_count: USize
+    pub sensor_fault_count: USize
+    pub alerts_opened: USize
+    pub alerts_closed: USize
+    pub peak_pm25: U32
+    pub current_phase: AlertPhase
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type MonitoringRun {
+    pub station: Str
+    pub decisions: Array<Option<Decision>, 12>
+    pub summary: MonitorSummary
+}

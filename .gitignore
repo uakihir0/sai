@@ -1,3 +1,4 @@
 /target/
 /.sai/
+/sample/*/.sai/
 /out/

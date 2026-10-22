@@ -1,0 +1,288 @@
+use acme:invoice-reconciliation/lookup
+use acme:invoice-reconciliation/matching
+use acme:invoice-reconciliation/model.{
+    AcceptedQuantity
+    BatchAudit
+    BatchSummary
+    Documents
+    Invoice
+    InvoiceAudit
+    LineAudit
+}
+
+fn accepted_order_quantity(
+    reservations: Array<Option<AcceptedQuantity>, 18>,
+    purchase_order_number: U32,
+    sku: Str,
+) -> U32 {
+    var quantity: U32 = 0
+    for slot in reservations {
+        match slot {
+            Some(value) => {
+                if (value.purchase_order_number == purchase_order_number and value.sku == sku) {
+                    quantity += value.quantity
+                }
+            }
+            None => {}
+        }
+    }
+    quantity
+}
+
+fn accepted_receipt_quantity(
+    reservations: Array<Option<AcceptedQuantity>, 18>,
+    purchase_order_number: U32,
+    receipt_number: U32,
+    sku: Str,
+) -> U32 {
+    for slot in reservations {
+        match slot {
+            Some(value) => {
+                if (
+                    value.purchase_order_number == purchase_order_number
+                    and value.receipt_number == receipt_number
+                    and value.sku == sku
+                ) {
+                    return value.quantity
+                }
+            }
+            None => {}
+        }
+    }
+    0
+}
+
+fn audit_invoice(
+    documents: Documents,
+    invoice: Invoice,
+    reservations: Array<Option<AcceptedQuantity>, 18>,
+) -> InvoiceAudit {
+    let order = lookup.purchase_order(documents, invoice.purchase_order_number)
+    let receipt = lookup.receipt(documents, invoice.receipt_number)
+
+    let purchase_order_found = match order { Some(_) => true, None => false }
+    let receipt_found = match receipt { Some(_) => true, None => false }
+    let vendor_matches_order = match order {
+        Some(value) => invoice.vendor == value.vendor
+        None => false
+    }
+    let receipt_matches_order = match receipt {
+        Some(value) => value.purchase_order_number == invoice.purchase_order_number
+        None => false
+    }
+
+    var lines = Array<Option<LineAudit>, 3>.filled(None)
+    var line_count: USize = 0
+    var billed_total_cents: U32 = 0
+    var ready_to_pay =
+        purchase_order_found and receipt_found and vendor_matches_order and receipt_matches_order
+
+    for slot in invoice.lines {
+        match slot {
+            Some(invoice_line) => {
+                let line = matching.audit_line(
+                    invoice_line,
+                    order,
+                    receipt,
+                    receipt_matches_order,
+                    accepted_order_quantity(
+                        reservations,
+                        invoice.purchase_order_number,
+                        invoice_line.sku,
+                    ),
+                    accepted_receipt_quantity(
+                        reservations,
+                        invoice.purchase_order_number,
+                        invoice.receipt_number,
+                        invoice_line.sku,
+                    ),
+                )
+                lines[line_count] = Some(line)
+                line_count += 1
+                billed_total_cents += line.billed_amount_cents
+
+                if (
+                    not line.order_line_found
+                    or not line.positive_quantity
+                    or line.within_order_quantity != Some(true)
+                    or line.within_received_quantity != Some(true)
+                    or line.unit_price_matches != Some(true)
+                ) {
+                    ready_to_pay = false
+                }
+            }
+            None => {}
+        }
+    }
+
+    if line_count == 0 {
+        ready_to_pay = false
+    }
+
+    InvoiceAudit(
+        invoice_number: invoice.number,
+        vendor: invoice.vendor,
+        billed_total_cents: billed_total_cents,
+        line_count: line_count,
+        lines: lines,
+        purchase_order_found: purchase_order_found,
+        receipt_found: receipt_found,
+        vendor_matches_order: vendor_matches_order,
+        receipt_matches_order: receipt_matches_order,
+        ready_to_pay: ready_to_pay,
+    )
+}
+
+fn count_false(value: Option<Bool>) -> USize {
+    if value == Some(false) {
+        1
+    } else {
+        0
+    }
+}
+
+fn summarize_line(
+    summary: BatchSummary,
+    line: LineAudit,
+    purchase_order_found: Bool,
+) -> BatchSummary {
+    let is_unknown_item = purchase_order_found and not line.order_line_found
+    let unknown_item_count = if is_unknown_item {
+        1
+    } else {
+        0
+    }
+
+    BatchSummary(
+        invoice_count: summary.invoice_count,
+        ready_count: summary.ready_count,
+        held_count: summary.held_count,
+        billed_total_cents: summary.billed_total_cents,
+        quantity_variance_count: summary.quantity_variance_count
+            + count_false(line.within_order_quantity)
+            + count_false(line.within_received_quantity),
+        price_variance_count: summary.price_variance_count + count_false(line.unit_price_matches),
+        unknown_order_item_count: summary.unknown_order_item_count + unknown_item_count,
+        header_issue_count: summary.header_issue_count,
+    )
+}
+
+fn add_accepted_line(
+    reservations: Array<Option<AcceptedQuantity>, 18>,
+    purchase_order_number: U32,
+    receipt_number: U32,
+    sku: Str,
+    quantity: U32,
+) -> Array<Option<AcceptedQuantity>, 18> {
+    var updated = reservations
+    var handled = false
+
+    for index in 0..updated.len() {
+        if not handled {
+            match updated[index] {
+                Some(existing) => {
+                    if (
+                        existing.purchase_order_number == purchase_order_number
+                        and existing.receipt_number == receipt_number
+                        and existing.sku == sku
+                    ) {
+                        var combined = existing
+                        combined.quantity += quantity
+                        updated[index] = Some(combined)
+                        handled = true
+                    }
+                }
+                None => {
+                    updated[index] = Some(
+                        AcceptedQuantity(
+                            purchase_order_number: purchase_order_number,
+                            receipt_number: receipt_number,
+                            sku: sku,
+                            quantity: quantity,
+                        ),
+                    )
+                    handled = true
+                }
+            }
+        }
+    }
+    updated
+}
+
+fn reserve_ready_invoice(
+    reservations: Array<Option<AcceptedQuantity>, 18>,
+    invoice: Invoice,
+    audit: InvoiceAudit,
+) -> Array<Option<AcceptedQuantity>, 18> {
+    var updated = reservations
+
+    if audit.ready_to_pay {
+        for slot in invoice.lines {
+            match slot {
+                Some(line) => {
+                    updated = add_accepted_line(
+                        updated,
+                        invoice.purchase_order_number,
+                        invoice.receipt_number,
+                        line.sku,
+                        line.quantity,
+                    )
+                }
+                None => {}
+            }
+        }
+    }
+    updated
+}
+
+pub fn reconcile(documents: Documents) -> BatchAudit {
+    var audits = Array<Option<InvoiceAudit>, 6>.filled(None)
+    var reservations = Array<Option<AcceptedQuantity>, 18>.filled(None)
+    var summary = BatchSummary(
+        invoice_count: 0,
+        ready_count: 0,
+        held_count: 0,
+        billed_total_cents: 0,
+        quantity_variance_count: 0,
+        price_variance_count: 0,
+        unknown_order_item_count: 0,
+        header_issue_count: 0,
+    )
+    var index: USize = 0
+
+    for invoice in documents.invoices {
+        let audit = audit_invoice(documents, invoice, reservations)
+        audits[index] = Some(audit)
+        reservations = reserve_ready_invoice(reservations, invoice, audit)
+        summary.invoice_count += 1
+        summary.billed_total_cents += audit.billed_total_cents
+
+        if audit.ready_to_pay {
+            summary.ready_count += 1
+        } else {
+            summary.held_count += 1
+        }
+
+        if (
+            not audit.purchase_order_found
+            or not audit.receipt_found
+            or not audit.vendor_matches_order
+            or not audit.receipt_matches_order
+        ) {
+            summary.header_issue_count += 1
+        }
+
+        for line_slot in audit.lines {
+            match line_slot {
+                Some(line) => {
+                    summary = summarize_line(summary, line, audit.purchase_order_found)
+                }
+                None => {}
+            }
+        }
+
+        index += 1
+    }
+
+    BatchAudit(audits: audits, summary: summary)
+}

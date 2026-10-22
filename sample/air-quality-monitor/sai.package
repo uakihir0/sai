@@ -1,0 +1,5 @@
+package acme:air-quality-monitor @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Apply a small hysteresis alert policy to fixed PM2.5 readings"
