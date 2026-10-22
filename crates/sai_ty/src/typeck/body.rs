@@ -27,6 +27,10 @@ pub struct PrimitiveBodyInput<'a, 'hir> {
     /// Direct `self.field` projection types resolved by the owner-aware
     /// driver. Other field expressions remain outside this body slice.
     pub self_field_projections: Option<&'a HashMap<HirId, PrimTy>>,
+    /// Direct `self.field` projections whose names were diagnosed as
+    /// unknown by the owner-aware driver. These act as error types so later
+    /// local uses do not produce cascading primitive-type errors.
+    pub unknown_self_fields: Option<&'a HashSet<HirId>>,
     pub local_paths: &'a HashMap<HirId, BindingId>,
     pub symbols: &'a Interner,
     pub pointer_width: u8,
@@ -127,6 +131,8 @@ pub enum PrimitiveLiteralKind {
 enum LocalType {
     Concrete(PrimTy),
     LiteralVariable(usize),
+    ErrorLiteralVariable(usize),
+    Error(Option<PrimTy>),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -243,7 +249,12 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             && self
                 .input
                 .self_field_projections
-                .is_some_and(|fields| fields.contains_key(&tail.hir_id));
+                .is_some_and(|fields| fields.contains_key(&tail.hir_id))
+            || matches!(tail.kind, ExprKind::Field { .. })
+                && self
+                    .input
+                    .unknown_self_fields
+                    .is_some_and(|fields| fields.contains(&tail.hir_id));
         if block.stmts.is_empty() && !is_supported_field_tail {
             return Err(());
         }
@@ -290,87 +301,146 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             None => None,
         };
 
-        let local_type = match init.kind {
-            ExprKind::Lit(literal) => {
-                let Some(found) = primitive_literal_kind(literal) else {
-                    return Err(());
-                };
+        let local_type = if self.expression_has_unknown_field_error(init) {
+            self.check_error_tainted_expression(init)?;
+            if let Some(id) = self.error_tainted_literal_variable(init) {
                 if let Some(expected) = annotation {
-                    self.check_annotated_literal(expected, literal, found, init.hir_id);
-                    LocalType::Concrete(expected)
+                    self.check_annotated_path(
+                        LocalType::LiteralVariable(id),
+                        expected,
+                        init.hir_id,
+                    )?;
+                    LocalType::Error(Some(expected))
                 } else {
-                    self.local_type_for_unannotated_literal(literal, found, init.hir_id)
+                    LocalType::ErrorLiteralVariable(id)
                 }
-            }
-            ExprKind::Path(_) => {
-                let source_type = self.check_local_path(init)?;
-                if let Some(expected) = annotation {
-                    self.check_annotated_path(source_type, expected, init.hir_id)?;
-                    LocalType::Concrete(expected)
-                } else {
-                    source_type
+            } else {
+                let found = self.known_error_tainted_result_type(init);
+                if let (Some(expected), Some(found)) = (annotation, found) {
+                    if expected != found {
+                        self.errors.push(PrimitiveBodyError {
+                            node: init.hir_id,
+                            kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                        });
+                    }
                 }
+                LocalType::Error(annotation.or(found))
             }
-            ExprKind::Field { .. } => {
-                let Some(field_type) = self
-                    .input
-                    .self_field_projections
-                    .and_then(|fields| fields.get(&init.hir_id))
-                    .copied()
-                else {
-                    return Err(());
-                };
-                let source_type = LocalType::Concrete(field_type);
-                if let Some(expected) = annotation {
-                    self.check_annotated_path(source_type, expected, init.hir_id)?;
-                    LocalType::Concrete(expected)
-                } else {
-                    source_type
-                }
-            }
-            ExprKind::Binary(operator, left, right) => {
-                if matches!(
-                    operator,
-                    BinOp::Add
-                        | BinOp::Sub
-                        | BinOp::Mul
-                        | BinOp::Div
-                        | BinOp::Rem
-                        | BinOp::WrapAdd
-                        | BinOp::WrapSub
-                        | BinOp::WrapMul
-                ) {
-                    let result = self.check_arithmetic(operator, left, right, init.hir_id)?;
-                    if let Some(expected) = annotation {
-                        self.check_annotated_path(result, expected, init.hir_id)?;
-                        // The annotation determines the local's recovered
-                        // type after the coercion-site mismatch, as it does
-                        // for the existing annotated path initializer.
-                        LocalType::Concrete(expected)
-                    } else {
-                        result
-                    }
-                } else if matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) {
-                    let result = self.check_bitwise(operator, left, right, init.hir_id)?;
-                    if let Some(expected) = annotation {
-                        self.check_annotated_path(result, expected, init.hir_id)?;
-                        LocalType::Concrete(expected)
-                    } else {
-                        result
-                    }
-                } else if matches!(operator, BinOp::Shl | BinOp::Shr) {
-                    let result = self.check_shift(operator, left, right, init.hir_id)?;
-                    if let Some(expected) = annotation {
-                        self.check_annotated_path(result, expected, init.hir_id)?;
-                        LocalType::Concrete(expected)
-                    } else {
-                        result
-                    }
-                } else {
-                    let result = match operator {
-                        BinOp::And | BinOp::Or => self.check_logical(operator, left, right)?,
-                        _ => self.check_comparison(operator, left, right)?,
+        } else {
+            match init.kind {
+                ExprKind::Lit(literal) => {
+                    let Some(found) = primitive_literal_kind(literal) else {
+                        return Err(());
                     };
+                    if let Some(expected) = annotation {
+                        self.check_annotated_literal(expected, literal, found, init.hir_id);
+                        LocalType::Concrete(expected)
+                    } else {
+                        self.local_type_for_unannotated_literal(literal, found, init.hir_id)
+                    }
+                }
+                ExprKind::Path(_) => {
+                    let source_type = self.check_local_path(init)?;
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(source_type, expected, init.hir_id)?;
+                        LocalType::Concrete(expected)
+                    } else {
+                        source_type
+                    }
+                }
+                ExprKind::Field { .. } => {
+                    let Some(field_type) = self
+                        .input
+                        .self_field_projections
+                        .and_then(|fields| fields.get(&init.hir_id))
+                        .copied()
+                    else {
+                        return Err(());
+                    };
+                    let source_type = LocalType::Concrete(field_type);
+                    if let Some(expected) = annotation {
+                        self.check_annotated_path(source_type, expected, init.hir_id)?;
+                        LocalType::Concrete(expected)
+                    } else {
+                        source_type
+                    }
+                }
+                ExprKind::Binary(operator, left, right) => {
+                    if matches!(
+                        operator,
+                        BinOp::Add
+                            | BinOp::Sub
+                            | BinOp::Mul
+                            | BinOp::Div
+                            | BinOp::Rem
+                            | BinOp::WrapAdd
+                            | BinOp::WrapSub
+                            | BinOp::WrapMul
+                    ) {
+                        let result = self.check_arithmetic(operator, left, right, init.hir_id)?;
+                        if let Some(expected) = annotation {
+                            self.check_annotated_path(result, expected, init.hir_id)?;
+                            // The annotation determines the local's recovered
+                            // type after the coercion-site mismatch, as it does
+                            // for the existing annotated path initializer.
+                            LocalType::Concrete(expected)
+                        } else {
+                            result
+                        }
+                    } else if matches!(operator, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) {
+                        let result = self.check_bitwise(operator, left, right, init.hir_id)?;
+                        if let Some(expected) = annotation {
+                            self.check_annotated_path(result, expected, init.hir_id)?;
+                            LocalType::Concrete(expected)
+                        } else {
+                            result
+                        }
+                    } else if matches!(operator, BinOp::Shl | BinOp::Shr) {
+                        let result = self.check_shift(operator, left, right, init.hir_id)?;
+                        if let Some(expected) = annotation {
+                            self.check_annotated_path(result, expected, init.hir_id)?;
+                            LocalType::Concrete(expected)
+                        } else {
+                            result
+                        }
+                    } else {
+                        let result = match operator {
+                            BinOp::And | BinOp::Or => self.check_logical(operator, left, right)?,
+                            _ => self.check_comparison(operator, left, right)?,
+                        };
+                        if let Some(expected) = annotation {
+                            if expected != PrimTy::Bool {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: init.hir_id,
+                                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                        expected,
+                                        found: PrimTy::Bool,
+                                    },
+                                });
+                            }
+                        }
+                        result
+                    }
+                }
+                ExprKind::Unary(UnOp::Not, operand) => {
+                    let operand_type = self
+                        .check_local_path(operand)
+                        .ok()
+                        .and_then(|local_type| self.concrete_local_type(local_type))
+                        .ok_or(())?;
+                    match primitive_bool_operand_result(operand_type) {
+                        PrimitiveBoolOperandResult::Bool => {}
+                        PrimitiveBoolOperandResult::TypeMismatch { found } => {
+                            self.errors.push(PrimitiveBodyError {
+                                node: operand.hir_id,
+                                kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                    expected: PrimTy::Bool,
+                                    found,
+                                },
+                            });
+                        }
+                        PrimitiveBoolOperandResult::Unsupported => return Err(()),
+                    }
                     if let Some(expected) = annotation {
                         if expected != PrimTy::Bool {
                             self.errors.push(PrimitiveBodyError {
@@ -382,112 +452,80 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                             });
                         }
                     }
-                    result
+                    LocalType::Concrete(PrimTy::Bool)
                 }
-            }
-            ExprKind::Unary(UnOp::Not, operand) => {
-                let operand_type = self
-                    .check_local_path(operand)
-                    .ok()
-                    .and_then(|local_type| self.concrete_local_type(local_type))
-                    .ok_or(())?;
-                match primitive_bool_operand_result(operand_type) {
-                    PrimitiveBoolOperandResult::Bool => {}
-                    PrimitiveBoolOperandResult::TypeMismatch { found } => {
-                        self.errors.push(PrimitiveBodyError {
-                            node: operand.hir_id,
-                            kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                expected: PrimTy::Bool,
-                                found,
-                            },
-                        });
-                    }
-                    PrimitiveBoolOperandResult::Unsupported => return Err(()),
-                }
-                if let Some(expected) = annotation {
-                    if expected != PrimTy::Bool {
-                        self.errors.push(PrimitiveBodyError {
-                            node: init.hir_id,
-                            kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                expected,
-                                found: PrimTy::Bool,
-                            },
-                        });
-                    }
-                }
-                LocalType::Concrete(PrimTy::Bool)
-            }
-            ExprKind::Unary(UnOp::BitNot, operand) => {
-                if let ExprKind::Lit(literal) = operand.kind {
-                    match primitive_literal_kind(literal) {
-                        Some(PrimitiveLiteralKind::Integer) => {
-                            if let Some(expected) = annotation {
-                                self.check_annotated_literal(
-                                    expected,
-                                    literal,
-                                    PrimitiveLiteralKind::Integer,
-                                    operand.hir_id,
-                                );
-                                LocalType::Concrete(expected)
-                            } else {
-                                self.local_type_for_unannotated_literal(
-                                    literal,
-                                    PrimitiveLiteralKind::Integer,
-                                    operand.hir_id,
-                                )
-                            }
-                        }
-                        Some(PrimitiveLiteralKind::Byte) => {
-                            if let Some(expected) = annotation {
-                                if expected != PrimTy::Byte {
-                                    self.errors.push(PrimitiveBodyError {
-                                        node: init.hir_id,
-                                        kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                            expected,
-                                            found: PrimTy::Byte,
-                                        },
-                                    });
+                ExprKind::Unary(UnOp::BitNot, operand) => {
+                    if let ExprKind::Lit(literal) = operand.kind {
+                        match primitive_literal_kind(literal) {
+                            Some(PrimitiveLiteralKind::Integer) => {
+                                if let Some(expected) = annotation {
+                                    self.check_annotated_literal(
+                                        expected,
+                                        literal,
+                                        PrimitiveLiteralKind::Integer,
+                                        operand.hir_id,
+                                    );
+                                    LocalType::Concrete(expected)
+                                } else {
+                                    self.local_type_for_unannotated_literal(
+                                        literal,
+                                        PrimitiveLiteralKind::Integer,
+                                        operand.hir_id,
+                                    )
                                 }
-                                LocalType::Concrete(expected)
-                            } else {
-                                LocalType::Concrete(PrimTy::Byte)
                             }
+                            Some(PrimitiveLiteralKind::Byte) => {
+                                if let Some(expected) = annotation {
+                                    if expected != PrimTy::Byte {
+                                        self.errors.push(PrimitiveBodyError {
+                                            node: init.hir_id,
+                                            kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                                expected,
+                                                found: PrimTy::Byte,
+                                            },
+                                        });
+                                    }
+                                    LocalType::Concrete(expected)
+                                } else {
+                                    LocalType::Concrete(PrimTy::Byte)
+                                }
+                            }
+                            _ => return Err(()),
                         }
-                        _ => return Err(()),
-                    }
-                } else {
-                    let operand_type = self
-                        .check_local_path(operand)
-                        .ok()
-                        .and_then(|local_type| self.concrete_local_type(local_type))
-                        .filter(|primitive| supports_primitive_literal(*primitive))
-                        .ok_or(())?;
-                    if !is_bitwise_primitive(operand_type) {
-                        self.errors.push(PrimitiveBodyError {
-                            node: init.hir_id,
-                            kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
-                                operator: UnOp::BitNot,
-                                operand: operand_type,
-                            },
-                        });
-                    }
-                    if let Some(expected) = annotation {
-                        if expected != operand_type {
+                    } else {
+                        let operand_type = self
+                            .check_local_path(operand)
+                            .ok()
+                            .and_then(|local_type| self.concrete_local_type(local_type))
+                            .filter(|primitive| supports_primitive_literal(*primitive))
+                            .ok_or(())?;
+                        if !is_bitwise_primitive(operand_type) {
                             self.errors.push(PrimitiveBodyError {
                                 node: init.hir_id,
-                                kind: PrimitiveBodyErrorKind::TypeMismatch {
-                                    expected,
-                                    found: operand_type,
+                                kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                                    operator: UnOp::BitNot,
+                                    operand: operand_type,
                                 },
                             });
                         }
-                        LocalType::Concrete(expected)
-                    } else {
-                        LocalType::Concrete(operand_type)
+                        if let Some(expected) = annotation {
+                            if expected != operand_type {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: init.hir_id,
+                                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                        expected,
+                                        found: operand_type,
+                                    },
+                                });
+                            }
+                            LocalType::Concrete(expected)
+                        } else {
+                            LocalType::Concrete(operand_type)
+                        }
                     }
                 }
+                _ => return Err(()),
             }
-            _ => return Err(()),
         };
 
         if annotation.is_none()
@@ -1883,7 +1921,10 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     fn concrete_local_type(&self, local_type: LocalType) -> Option<PrimTy> {
         let primitive = match local_type {
             LocalType::Concrete(primitive) => primitive,
-            LocalType::LiteralVariable(id) => self.literal_variables.get(id)?.resolved?,
+            LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
+                self.literal_variables.get(id)?.resolved?
+            }
+            LocalType::Error(_) => return None,
         };
         supports_primitive_literal(primitive).then_some(primitive)
     }
@@ -1956,7 +1997,8 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
                 });
             }
             LocalType::Concrete(_) => {}
-            LocalType::LiteralVariable(id) => {
+            LocalType::Error(_) => {}
+            LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
                 let Some((resolved, kind)) = self
                     .literal_variables
                     .get(id)
@@ -1991,21 +2033,38 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
     }
 
     fn check_expr(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
-        let local_type = match expression.kind {
-            ExprKind::Field { .. } => LocalType::Concrete(
-                self.input
-                    .self_field_projections
-                    .and_then(|fields| fields.get(&expression.hir_id))
-                    .copied()
-                    .ok_or(())?,
-            ),
-            _ => self.check_local_path(expression)?,
+        let local_type = if self.expression_has_unknown_field_error(expression) {
+            if !matches!(expression.kind, ExprKind::Path(_) | ExprKind::Field { .. }) {
+                return Err(());
+            }
+            self.check_error_tainted_expression(expression)?;
+            if let Some(id) = self.error_tainted_literal_variable(expression) {
+                LocalType::ErrorLiteralVariable(id)
+            } else {
+                LocalType::Error(self.known_error_tainted_result_type(expression))
+            }
+        } else {
+            match expression.kind {
+                ExprKind::Field { .. } => LocalType::Concrete(
+                    self.input
+                        .self_field_projections
+                        .and_then(|fields| fields.get(&expression.hir_id))
+                        .copied()
+                        .ok_or(())?,
+                ),
+                _ => self.check_local_path(expression)?,
+            }
         };
         match local_type {
+            LocalType::Error(found) => {
+                if let Some(found) = found {
+                    self.check_concrete_tail_type(found, expression.hir_id);
+                }
+            }
             LocalType::Concrete(found) => {
                 self.check_concrete_tail_type(found, expression.hir_id);
             }
-            LocalType::LiteralVariable(id) => {
+            LocalType::LiteralVariable(id) | LocalType::ErrorLiteralVariable(id) => {
                 let Some((resolved, kind)) = self
                     .literal_variables
                     .get(id)
@@ -2031,6 +2090,692 @@ impl<'a, 'hir> FnCtxt<'a, 'hir> {
             }
         }
         Ok(())
+    }
+
+    fn expression_has_unknown_field_error(&self, expression: &Expr<'hir>) -> bool {
+        if self
+            .input
+            .unknown_self_fields
+            .is_some_and(|fields| fields.contains(&expression.hir_id))
+        {
+            return true;
+        }
+        match expression.kind {
+            ExprKind::Path(_) => self.check_local_path(expression).is_ok_and(|local_type| {
+                matches!(
+                    local_type,
+                    LocalType::Error(_) | LocalType::ErrorLiteralVariable(_)
+                )
+            }),
+            ExprKind::Unary(_, operand) => self.expression_has_unknown_field_error(operand),
+            ExprKind::Binary(_, left, right) => {
+                self.expression_has_unknown_field_error(left)
+                    || self.expression_has_unknown_field_error(right)
+            }
+            _ => false,
+        }
+    }
+
+    fn error_tainted_literal_variable(&mut self, expression: &Expr<'hir>) -> Option<usize> {
+        if let ExprKind::Path(_) = expression.kind {
+            let binding = self.plain_local_path_binding(expression)?;
+            return match self.known_bindings.get(&binding).copied()? {
+                LocalType::ErrorLiteralVariable(id) => Some(id),
+                _ => None,
+            };
+        }
+
+        let ExprKind::Binary(
+            operator @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div),
+            left,
+            right,
+        ) = expression.kind
+        else {
+            return None;
+        };
+        if !self.expression_has_unknown_field_error(right) {
+            return None;
+        }
+        let ExprKind::Lit(literal) = left.kind else {
+            return None;
+        };
+        let kind = primitive_literal_kind(literal)?;
+        if !matches!(
+            kind,
+            PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint
+        ) {
+            return None;
+        }
+        let right_is_unresolved_error_literal = self
+            .plain_local_path_binding(right)
+            .and_then(|binding| self.known_bindings.get(&binding).copied())
+            .is_some_and(|local_type| match local_type {
+                LocalType::ErrorLiteralVariable(id) => self
+                    .literal_variables
+                    .get(id)
+                    .is_some_and(|variable| variable.resolved.is_none()),
+                _ => false,
+            });
+        if right_is_unresolved_error_literal {
+            return None;
+        }
+        if let Some(right_type) = self.known_recovery_operand_type(right) {
+            if !matches!(
+                primitive_arithmetic_literal_left_result(operator, kind, right_type),
+                PrimitiveArithmeticResult::TypeMismatch { .. }
+            ) {
+                return None;
+            }
+        }
+        match self.local_type_for_unannotated_literal(literal, kind, left.hir_id) {
+            LocalType::LiteralVariable(id) => Some(id),
+            LocalType::Concrete(_) | LocalType::Error(_) | LocalType::ErrorLiteralVariable(_) => {
+                None
+            }
+        }
+    }
+
+    fn known_error_tainted_result_type(&self, expression: &Expr<'hir>) -> Option<PrimTy> {
+        match expression.kind {
+            ExprKind::Path(_) => self.known_recovery_operand_type(expression),
+            ExprKind::Unary(UnOp::Not, _) => Some(PrimTy::Bool),
+            ExprKind::Unary(UnOp::BitNot, operand) => self.known_recovery_operand_type(operand),
+            ExprKind::Binary(
+                BinOp::And
+                | BinOp::Or
+                | BinOp::Eq
+                | BinOp::Ne
+                | BinOp::Lt
+                | BinOp::Le
+                | BinOp::Gt
+                | BinOp::Ge,
+                _,
+                _,
+            ) => Some(PrimTy::Bool),
+            ExprKind::Binary(
+                operator @ (BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div),
+                left,
+                right,
+            ) => {
+                if self.expression_has_unknown_field_error(left) {
+                    self.known_recovery_operand_type(left)
+                } else if let Some(left_type) = self.known_recovery_operand_type(left) {
+                    Some(left_type)
+                } else if let (ExprKind::Lit(literal), Some(right_type)) =
+                    (left.kind, self.known_recovery_operand_type(right))
+                {
+                    let literal_kind = primitive_literal_kind(literal)?;
+                    match primitive_arithmetic_literal_left_result(
+                        operator,
+                        literal_kind,
+                        right_type,
+                    ) {
+                        PrimitiveArithmeticResult::Type(result) => Some(result),
+                        PrimitiveArithmeticResult::TypeMismatch { .. }
+                        | PrimitiveArithmeticResult::Unsupported => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            ExprKind::Binary(
+                BinOp::Rem
+                | BinOp::WrapAdd
+                | BinOp::WrapSub
+                | BinOp::WrapMul
+                | BinOp::BitAnd
+                | BinOp::BitOr
+                | BinOp::BitXor
+                | BinOp::Shl
+                | BinOp::Shr,
+                left,
+                _,
+            ) if !self.expression_has_unknown_field_error(left) => {
+                self.known_recovery_operand_type(left)
+            }
+            _ => None,
+        }
+    }
+
+    fn check_error_tainted_expression(&mut self, expression: &Expr<'hir>) -> Result<(), ()> {
+        let ExprKind::Binary(operator, left, right) = expression.kind else {
+            return match expression.kind {
+                ExprKind::Field { .. }
+                    if self
+                        .input
+                        .unknown_self_fields
+                        .is_some_and(|fields| fields.contains(&expression.hir_id)) =>
+                {
+                    Ok(())
+                }
+                ExprKind::Path(_)
+                    if self.check_local_path(expression).is_ok_and(|local_type| {
+                        matches!(
+                            local_type,
+                            LocalType::Error(_) | LocalType::ErrorLiteralVariable(_)
+                        )
+                    }) =>
+                {
+                    Ok(())
+                }
+                ExprKind::Unary(UnOp::Not, operand)
+                    if matches!(operand.kind, ExprKind::Path(_))
+                        && self.check_local_path(operand).is_ok_and(|local_type| {
+                            matches!(
+                                local_type,
+                                LocalType::Error(_) | LocalType::ErrorLiteralVariable(_)
+                            )
+                        }) =>
+                {
+                    if self.has_unresolved_error_literal_path(operand) {
+                        return Err(());
+                    }
+                    if let Some(operand_type) = self.known_recovery_operand_type(operand) {
+                        match primitive_bool_operand_result(operand_type) {
+                            PrimitiveBoolOperandResult::Bool => {}
+                            PrimitiveBoolOperandResult::TypeMismatch { found } => {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: operand.hir_id,
+                                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                        expected: PrimTy::Bool,
+                                        found,
+                                    },
+                                });
+                            }
+                            PrimitiveBoolOperandResult::Unsupported => return Err(()),
+                        }
+                    }
+                    Ok(())
+                }
+                ExprKind::Unary(UnOp::BitNot, operand)
+                    if matches!(operand.kind, ExprKind::Path(_))
+                        && self.check_local_path(operand).is_ok_and(|local_type| {
+                            matches!(
+                                local_type,
+                                LocalType::Error(_) | LocalType::ErrorLiteralVariable(_)
+                            )
+                        }) =>
+                {
+                    if self.has_unresolved_error_literal_path(operand) {
+                        return Err(());
+                    }
+                    if let Some(operand_type) = self.known_recovery_operand_type(operand) {
+                        if !is_bitwise_primitive(operand_type) {
+                            self.errors.push(PrimitiveBodyError {
+                                node: expression.hir_id,
+                                kind: PrimitiveBodyErrorKind::UnaryOperatorNotSupported {
+                                    operator: UnOp::BitNot,
+                                    operand: operand_type,
+                                },
+                            });
+                        }
+                    }
+                    Ok(())
+                }
+                _ => Err(()),
+            };
+        };
+        let left_has_error = self.expression_has_unknown_field_error(left);
+        let right_has_error = self.expression_has_unknown_field_error(right);
+        if self.has_unresolved_error_literal_path(left)
+            || self.has_unresolved_error_literal_path(right)
+        {
+            return Err(());
+        }
+        if !self.is_supported_error_tainted_binary_shape(
+            operator,
+            left,
+            right,
+            left_has_error,
+            right_has_error,
+        ) {
+            return Err(());
+        }
+        if !left_has_error && !right_has_error {
+            return Err(());
+        }
+
+        match operator {
+            BinOp::And | BinOp::Or => {
+                for operand in [left, right] {
+                    if let Some(operand_type) = self.known_recovery_operand_type(operand) {
+                        match primitive_bool_operand_result(operand_type) {
+                            PrimitiveBoolOperandResult::Bool => {}
+                            PrimitiveBoolOperandResult::TypeMismatch { found } => {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: operand.hir_id,
+                                    kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                        expected: PrimTy::Bool,
+                                        found,
+                                    },
+                                });
+                            }
+                            PrimitiveBoolOperandResult::Unsupported => return Err(()),
+                        }
+                    }
+                }
+            }
+            BinOp::Shl | BinOp::Shr => {
+                if let Some(left_type) = self.known_recovery_operand_type(left) {
+                    if !is_bitwise_primitive(left_type) {
+                        self.report_operator_not_supported(
+                            expression.hir_id,
+                            operator,
+                            PrimitiveOperatorOperand::Concrete(left_type),
+                        );
+                    }
+                }
+                if !right_has_error {
+                    if let ExprKind::Lit(literal) = right.kind {
+                        if primitive_literal_kind(literal) != Some(PrimitiveLiteralKind::Integer) {
+                            return Err(());
+                        }
+                        self.check_annotated_literal(
+                            PrimTy::U32,
+                            literal,
+                            PrimitiveLiteralKind::Integer,
+                            right.hir_id,
+                        );
+                    }
+                }
+                if let Some(right_type) = self.known_recovery_operand_type(right) {
+                    if right_type != PrimTy::U32 {
+                        self.errors.push(PrimitiveBodyError {
+                            node: right.hir_id,
+                            kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                expected: PrimTy::U32,
+                                found: right_type,
+                            },
+                        });
+                    }
+                }
+            }
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div => {
+                match (
+                    self.known_recovery_operand_type(left),
+                    self.known_recovery_operand_type(right),
+                ) {
+                    (Some(left_type), Some(right_type)) => {
+                        match primitive_arithmetic_result(operator, left_type, right_type) {
+                            PrimitiveArithmeticResult::Type(_) => {}
+                            PrimitiveArithmeticResult::TypeMismatch { expected, found } => {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: right.hir_id,
+                                    kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                                });
+                            }
+                            PrimitiveArithmeticResult::Unsupported => return Err(()),
+                        }
+                    }
+                    (Some(left_type), None) if left_has_error => {
+                        if !is_arithmetic_primitive(left_type) {
+                            return Err(());
+                        }
+                        let ExprKind::Lit(literal) = right.kind else {
+                            return Ok(());
+                        };
+                        let Some(
+                            literal_kind @ (PrimitiveLiteralKind::Integer
+                            | PrimitiveLiteralKind::FloatingPoint),
+                        ) = primitive_literal_kind(literal)
+                        else {
+                            return Err(());
+                        };
+                        if primitive_arithmetic_literal_expected_type(
+                            operator,
+                            left_type,
+                            literal_kind,
+                        )
+                        .is_none()
+                        {
+                            return Err(());
+                        }
+                        self.check_annotated_literal(
+                            left_type,
+                            literal,
+                            literal_kind,
+                            right.hir_id,
+                        );
+                    }
+                    (None, Some(right_type)) if right_has_error => {
+                        let ExprKind::Lit(literal) = left.kind else {
+                            return Ok(());
+                        };
+                        let Some(literal_kind) = primitive_literal_kind(literal) else {
+                            return Err(());
+                        };
+                        match primitive_arithmetic_literal_left_result(
+                            operator,
+                            literal_kind,
+                            right_type,
+                        ) {
+                            PrimitiveArithmeticResult::Type(expected) => {
+                                self.check_annotated_literal(
+                                    expected,
+                                    literal,
+                                    literal_kind,
+                                    left.hir_id,
+                                );
+                            }
+                            PrimitiveArithmeticResult::TypeMismatch { expected, found } => {
+                                self.errors.push(PrimitiveBodyError {
+                                    node: right.hir_id,
+                                    kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                                });
+                            }
+                            PrimitiveArithmeticResult::Unsupported => return Err(()),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            BinOp::Rem => {
+                if let (Some(left_type), Some(right_type)) = (
+                    self.known_recovery_operand_type(left),
+                    self.known_recovery_operand_type(right),
+                ) {
+                    if !is_arithmetic_primitive(left_type) || !is_arithmetic_primitive(right_type) {
+                        return Err(());
+                    }
+                    if left_type != right_type {
+                        self.errors.push(PrimitiveBodyError {
+                            node: right.hir_id,
+                            kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                expected: left_type,
+                                found: right_type,
+                            },
+                        });
+                    }
+                    if !is_integer_primitive(left_type) {
+                        self.report_unsupported_float_remainder(expression.hir_id, left_type);
+                    }
+                }
+            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                if let (Some(left_type), Some(right_type)) = (
+                    self.known_recovery_operand_type(left),
+                    self.known_recovery_operand_type(right),
+                ) {
+                    match primitive_comparison_result(operator, left_type, right_type) {
+                        PrimitiveComparisonResult::Bool => {}
+                        PrimitiveComparisonResult::TypeMismatch { expected, found } => {
+                            self.errors.push(PrimitiveBodyError {
+                                node: right.hir_id,
+                                kind: PrimitiveBodyErrorKind::TypeMismatch { expected, found },
+                            });
+                        }
+                        PrimitiveComparisonResult::Unsupported => return Err(()),
+                    }
+                }
+            }
+            BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
+                if let (Some(left_type), Some(right_type)) = (
+                    self.known_recovery_operand_type(left),
+                    self.known_recovery_operand_type(right),
+                ) {
+                    if !supports_primitive_literal(left_type)
+                        || !supports_primitive_literal(right_type)
+                    {
+                        return Err(());
+                    }
+                    if left_type != right_type && left_type != PrimTy::Char {
+                        self.errors.push(PrimitiveBodyError {
+                            node: right.hir_id,
+                            kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                expected: left_type,
+                                found: right_type,
+                            },
+                        });
+                    }
+                    if !is_integer_primitive(left_type) {
+                        self.report_operator_not_supported(
+                            expression.hir_id,
+                            operator,
+                            PrimitiveOperatorOperand::Concrete(left_type),
+                        );
+                    }
+                }
+            }
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                if let (Some(left_type), Some(right_type)) = (
+                    self.known_recovery_operand_type(left),
+                    self.known_recovery_operand_type(right),
+                ) {
+                    if !supports_primitive_literal(left_type)
+                        || !supports_primitive_literal(right_type)
+                    {
+                        return Err(());
+                    }
+                    if is_integer_primitive(left_type) || left_type == PrimTy::Byte {
+                        if left_type != right_type {
+                            self.errors.push(PrimitiveBodyError {
+                                node: right.hir_id,
+                                kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                    expected: left_type,
+                                    found: right_type,
+                                },
+                            });
+                        }
+                    } else if matches!(left_type, PrimTy::Bool | PrimTy::F32 | PrimTy::F64) {
+                        if left_type != right_type {
+                            self.errors.push(PrimitiveBodyError {
+                                node: right.hir_id,
+                                kind: PrimitiveBodyErrorKind::TypeMismatch {
+                                    expected: left_type,
+                                    found: right_type,
+                                },
+                            });
+                        }
+                        self.report_operator_not_supported(
+                            expression.hir_id,
+                            operator,
+                            PrimitiveOperatorOperand::Concrete(left_type),
+                        );
+                    } else if left_type == PrimTy::Char {
+                        self.errors.push(PrimitiveBodyError {
+                            node: expression.hir_id,
+                            kind: PrimitiveBodyErrorKind::OperatorTraitNotSupported {
+                                operator,
+                                left: left_type,
+                                right: right_type,
+                            },
+                        });
+                    } else {
+                        return Err(());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn has_unresolved_error_literal_path(&self, expression: &Expr<'hir>) -> bool {
+        let ExprKind::Path(_) = expression.kind else {
+            return false;
+        };
+        self.plain_local_path_binding(expression)
+            .and_then(|binding| self.known_bindings.get(&binding).copied())
+            .is_some_and(|local_type| match local_type {
+                LocalType::ErrorLiteralVariable(id) => self
+                    .literal_variables
+                    .get(id)
+                    .is_some_and(|variable| variable.resolved.is_none()),
+                _ => false,
+            })
+    }
+
+    fn is_supported_error_tainted_binary_shape(
+        &self,
+        operator: BinOp,
+        left: &Expr<'hir>,
+        right: &Expr<'hir>,
+        left_has_error: bool,
+        right_has_error: bool,
+    ) -> bool {
+        let is_path = |expression: &Expr<'hir>| {
+            matches!(expression.kind, ExprKind::Path(_))
+                && self.check_local_path(expression).is_ok()
+        };
+        let is_literal = |expression: &Expr<'hir>| {
+            matches!(
+                expression.kind,
+                ExprKind::Lit(literal) if primitive_literal_kind(literal).is_some()
+            )
+        };
+        let is_path_or_literal =
+            |expression: &Expr<'hir>| is_path(expression) || is_literal(expression);
+        let primitive_path = |expression: &Expr<'hir>| self.known_recovery_operand_type(expression);
+        let literal_kind = |expression: &Expr<'hir>| match expression.kind {
+            ExprKind::Lit(literal) => primitive_literal_kind(literal),
+            _ => None,
+        };
+        let clean_operand_is_arithmetic = |expression: &Expr<'hir>| {
+            primitive_path(expression).is_some_and(is_arithmetic_primitive)
+                || matches!(
+                    literal_kind(expression),
+                    Some(PrimitiveLiteralKind::Integer | PrimitiveLiteralKind::FloatingPoint)
+                )
+        };
+        let clean_operand_is_integer_arithmetic = |expression: &Expr<'hir>| {
+            primitive_path(expression).is_some_and(is_integer_primitive)
+                || literal_kind(expression) == Some(PrimitiveLiteralKind::Integer)
+        };
+        let clean_operand_is_shift_value = |expression: &Expr<'hir>| {
+            primitive_path(expression).is_some()
+                || matches!(
+                    literal_kind(expression),
+                    Some(PrimitiveLiteralKind::Byte | PrimitiveLiteralKind::Integer)
+                )
+        };
+        let clean_operand_is_shift_count = |expression: &Expr<'hir>| {
+            primitive_path(expression).is_some()
+                || literal_kind(expression) == Some(PrimitiveLiteralKind::Integer)
+        };
+        let clean_operand_is_bitwise = |expression: &Expr<'hir>| {
+            primitive_path(expression).is_some() || literal_kind(expression).is_some()
+        };
+        let clean_operand_is_comparable = |expression: &Expr<'hir>| {
+            primitive_path(expression).is_some() || literal_kind(expression).is_some()
+        };
+
+        let shape_is_supported = match operator {
+            BinOp::And | BinOp::Or => is_path(left) && is_path(right),
+            BinOp::Shl | BinOp::Shr => {
+                let supported_left_literal = matches!(
+                    left.kind,
+                    ExprKind::Lit(literal)
+                        if matches!(
+                            primitive_literal_kind(literal),
+                            Some(PrimitiveLiteralKind::Byte | PrimitiveLiteralKind::Integer)
+                        )
+                );
+                let supported_right_literal = matches!(
+                    right.kind,
+                    ExprKind::Lit(literal)
+                        if primitive_literal_kind(literal)
+                            == Some(PrimitiveLiteralKind::Integer)
+                );
+                (is_path(left) || supported_left_literal)
+                    && (is_path(right) || supported_right_literal)
+            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                (is_path(left) && is_path(right))
+                    || (is_path(left) && is_literal(right))
+                    || (is_literal(left) && is_path(right))
+            }
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::Rem
+            | BinOp::WrapAdd
+            | BinOp::WrapSub
+            | BinOp::WrapMul
+            | BinOp::BitAnd
+            | BinOp::BitOr
+            | BinOp::BitXor => is_path_or_literal(left) && is_path_or_literal(right),
+        };
+        if !shape_is_supported {
+            return false;
+        }
+        if !left_has_error && !right_has_error {
+            return false;
+        }
+        let error_operand_matches =
+            |expression: &Expr<'hir>, has_error: bool, predicate: fn(PrimTy) -> bool| {
+                !has_error || primitive_path(expression).map_or(true, predicate)
+            };
+        match operator {
+            BinOp::And | BinOp::Or => [left, right]
+                .into_iter()
+                .zip([left_has_error, right_has_error])
+                .all(|(operand, has_error)| {
+                    if has_error {
+                        error_operand_matches(operand, true, |ty| {
+                            !matches!(
+                                primitive_bool_operand_result(ty),
+                                PrimitiveBoolOperandResult::Unsupported
+                            )
+                        })
+                    } else {
+                        self.known_recovery_operand_type(operand).is_some_and(|ty| {
+                            !matches!(
+                                primitive_bool_operand_result(ty),
+                                PrimitiveBoolOperandResult::Unsupported
+                            )
+                        })
+                    }
+                }),
+            BinOp::Shl | BinOp::Shr => {
+                error_operand_matches(left, left_has_error, |_| true)
+                    && error_operand_matches(right, right_has_error, |_| true)
+                    && (left_has_error || clean_operand_is_shift_value(left))
+                    && (right_has_error || clean_operand_is_shift_count(right))
+            }
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                error_operand_matches(left, left_has_error, supports_primitive_literal)
+                    && error_operand_matches(right, right_has_error, supports_primitive_literal)
+                    && (left_has_error || clean_operand_is_arithmetic(left))
+                    && (right_has_error || clean_operand_is_arithmetic(right))
+            }
+            BinOp::WrapAdd | BinOp::WrapSub | BinOp::WrapMul => {
+                error_operand_matches(left, left_has_error, supports_primitive_literal)
+                    && error_operand_matches(right, right_has_error, supports_primitive_literal)
+                    && (left_has_error || clean_operand_is_integer_arithmetic(left))
+                    && (right_has_error || clean_operand_is_integer_arithmetic(right))
+            }
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                error_operand_matches(left, left_has_error, supports_primitive_literal)
+                    && error_operand_matches(right, right_has_error, supports_primitive_literal)
+                    && (left_has_error || clean_operand_is_bitwise(left))
+                    && (right_has_error || clean_operand_is_bitwise(right))
+            }
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                error_operand_matches(left, left_has_error, supports_primitive_literal)
+                    && error_operand_matches(right, right_has_error, supports_primitive_literal)
+                    && (left_has_error || clean_operand_is_comparable(left))
+                    && (right_has_error || clean_operand_is_comparable(right))
+            }
+        }
+    }
+
+    fn known_recovery_operand_type(&self, expression: &Expr<'hir>) -> Option<PrimTy> {
+        match expression.kind {
+            ExprKind::Path(_) => self
+                .check_local_path(expression)
+                .ok()
+                .and_then(|local_type| match local_type {
+                    LocalType::Error(found) => found,
+                    LocalType::ErrorLiteralVariable(id) => self.literal_variables.get(id)?.resolved,
+                    _ => self.concrete_local_type(local_type),
+                }),
+            ExprKind::Field { .. } => self
+                .input
+                .self_field_projections
+                .and_then(|fields| fields.get(&expression.hir_id))
+                .copied(),
+            _ => None,
+        }
     }
 
     fn check_concrete_tail_type(&mut self, found: PrimTy, node: HirId) {
