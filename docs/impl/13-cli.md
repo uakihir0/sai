@@ -611,6 +611,8 @@ Locked dependency-source regressions verify dependency syntax and Phase 1 diagno
 
 **IR-826 direct integer-division-pair aliases as Char bitwise RHSs.** A plain Char-left `&`, `|`, or `^` RHS path may trace through unannotated local copies to an unannotated local initialized by `/` over two direct integer literals. The dedicated division provenance preserves shared inference, both source literal spans, I64 defaulting, late and prior integer constraints, full-expression missing-trait diagnostics, and Char recovery. Annotated paths retain the existing concrete-path behavior. Direct computed RHS expressions, nested division, remainder pairs, generic functions, and methods remain gated. Type checking does not evaluate the quotient or add division-by-zero diagnostics, Char bitwise semantics, lowering, or runtime behavior.
 
+**IR-827 direct integer-remainder-pair aliases as Char bitwise RHSs.** `sai check` follows unannotated plain-path aliases from a direct `%` pair of two integer literals when a Char-literal-left `&`, `|`, or `^` uses that path. A dedicated provenance set preserves shared inference, both literal spans, I64 defaulting, later and prior integer constraints, full-expression trait diagnostics, and Char recovery. Annotated pairs keep concrete-path behavior. Direct computed RHS expressions, nested remainder, generic functions, and methods remain gated; type checking does not evaluate the remainder or add Char bitwise runtime behavior.
+
 ### 13.6.3 `sai build`
 
 ```text
