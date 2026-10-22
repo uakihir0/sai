@@ -1,0 +1,111 @@
+use acme:access-policy-review/model.{Action, Effect, Policy, Principal, Resource, Role, Rule}
+
+pub fn policy() -> Policy {
+    Policy(
+        rule_count: 8,
+        rules: [
+            Some(
+                Rule(
+                    id: 301,
+                    role: Role.Support,
+                    action: Action.Read,
+                    resource: Resource.Incident,
+                    effect: Effect.Allow,
+                ),
+            ),
+            Some(
+                Rule(
+                    id: 102,
+                    role: Role.Support,
+                    action: Action.Update,
+                    resource: Resource.Incident,
+                    effect: Effect.Allow,
+                ),
+            ),
+            Some(
+                Rule(
+                    id: 201,
+                    role: Role.Supervisor,
+                    action: Action.Delete,
+                    resource: Resource.Incident,
+                    effect: Effect.Allow,
+                ),
+            ),
+            Some(
+                Rule(
+                    id: 103,
+                    role: Role.Support,
+                    action: Action.Delete,
+                    resource: Resource.Incident,
+                    effect: Effect.Deny,
+                ),
+            ),
+            Some(
+                Rule(
+                    id: 202,
+                    role: Role.Supervisor,
+                    action: Action.Update,
+                    resource: Resource.Incident,
+                    effect: Effect.Allow,
+                ),
+            ),
+            Some(
+                Rule(
+                    id: 101,
+                    role: Role.Auditor,
+                    action: Action.Read,
+                    resource: Resource.Incident,
+                    effect: Effect.Allow,
+                ),
+            ),
+            Some(
+                Rule(
+                    id: 401,
+                    role: Role.Support,
+                    action: Action.Read,
+                    resource: Resource.AuditLog,
+                    effect: Effect.Allow,
+                ),
+            ),
+            Some(
+                Rule(
+                    id: 402,
+                    role: Role.Auditor,
+                    action: Action.Delete,
+                    resource: Resource.AuditLog,
+                    effect: Effect.Deny,
+                ),
+            ),
+        ],
+    )
+}
+
+pub fn support_user() -> Principal {
+    Principal(id: 1, role_count: 1, roles: [Some(Role.Support), None])
+}
+
+pub fn supervisor_support_user() -> Principal {
+    Principal(id: 2, role_count: 2, roles: [Some(Role.Support), Some(Role.Supervisor)])
+}
+
+pub fn support_auditor_user() -> Principal {
+    Principal(id: 3, role_count: 2, roles: [Some(Role.Support), Some(Role.Auditor)])
+}
+
+pub fn auditor_user() -> Principal {
+    Principal(id: 4, role_count: 1, roles: [Some(Role.Auditor), None])
+}
+
+pub fn unassigned_user() -> Principal {
+    Principal(id: 5, role_count: 0, roles: [None, None])
+}
+
+pub fn too_many_roles_user() -> Principal {
+    Principal(id: 6, role_count: 3, roles: [Some(Role.Support), Some(Role.Supervisor)])
+}
+
+pub fn too_many_rules_policy() -> Policy {
+    var invalid = policy()
+    invalid.rule_count = invalid.rules.len() + 1
+    invalid
+}

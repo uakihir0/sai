@@ -1,0 +1,76 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Role {
+    Support
+    Supervisor
+    Auditor
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Action {
+    Read
+    Update
+    Delete
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Resource {
+    Incident
+    AuditLog
+    Account
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Effect {
+    Allow
+    Deny
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum DecisionReason {
+    ExplicitAllow
+    ExplicitDeny
+    DefaultDeny
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PolicyInputError {
+    TooManyPrincipalRoles
+    TooManyPolicyRules
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Principal {
+    pub id: U32
+    pub role_count: USize
+    pub roles: Array<Option<Role>, 2>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Request {
+    pub action: Action
+    pub resource: Resource
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Rule {
+    pub id: U32
+    pub role: Role
+    pub action: Action
+    pub resource: Resource
+    pub effect: Effect
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Policy {
+    pub rule_count: USize
+    pub rules: Array<Option<Rule>, 8>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Decision {
+    pub principal_id: U32
+    pub request: Request
+    pub allowed: Bool
+    pub reason: DecisionReason
+    pub rule_id: Option<U32>
+}

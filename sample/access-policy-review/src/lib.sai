@@ -1,0 +1,149 @@
+use acme:access-policy-review/fixtures
+use acme:access-policy-review/model.{
+    Action
+    Decision
+    DecisionReason
+    PolicyInputError
+    Request
+    Resource
+}
+use acme:access-policy-review/policy
+
+pub fn support_reads_incidents() -> Result<Decision, PolicyInputError> {
+    policy.decide(
+        fixtures.policy(),
+        fixtures.support_user(),
+        Request(action: Action.Read, resource: Resource.Incident),
+    )
+}
+
+pub fn support_reads_account() -> Result<Decision, PolicyInputError> {
+    policy.decide(
+        fixtures.policy(),
+        fixtures.support_user(),
+        Request(action: Action.Read, resource: Resource.Account),
+    )
+}
+
+pub fn dual_role_delete_incident() -> Result<Decision, PolicyInputError> {
+    policy.decide(
+        fixtures.policy(),
+        fixtures.supervisor_support_user(),
+        Request(action: Action.Delete, resource: Resource.Incident),
+    )
+}
+
+pub fn auditor_updates_incident() -> Result<Decision, PolicyInputError> {
+    policy.decide(
+        fixtures.policy(),
+        fixtures.auditor_user(),
+        Request(action: Action.Update, resource: Resource.Incident),
+    )
+}
+
+pub fn dual_role_reads_incident() -> Result<Decision, PolicyInputError> {
+    policy.decide(
+        fixtures.policy(),
+        fixtures.support_auditor_user(),
+        Request(action: Action.Read, resource: Resource.Incident),
+    )
+}
+
+pub fn unassigned_reads_account() -> Result<Decision, PolicyInputError> {
+    policy.decide(
+        fixtures.policy(),
+        fixtures.unassigned_user(),
+        Request(action: Action.Read, resource: Resource.Account),
+    )
+}
+
+test "a matching allow returns its rule ID" {
+    match support_reads_incidents() {
+        Ok(decision) => {
+            assert decision.principal_id == 1
+            assert decision.request.action == Action.Read
+            assert decision.request.resource == Resource.Incident
+            assert decision.allowed
+            assert decision.reason == DecisionReason.ExplicitAllow
+            assert decision.rule_id == Some(301)
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "a matching deny overrides an allow from another role" {
+    match dual_role_delete_incident() {
+        Ok(decision) => {
+            assert not decision.allowed
+            assert decision.reason == DecisionReason.ExplicitDeny
+            assert decision.rule_id == Some(103)
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "an unmatched action defaults to deny" {
+    match auditor_updates_incident() {
+        Ok(decision) => {
+            assert not decision.allowed
+            assert decision.reason == DecisionReason.DefaultDeny
+            assert decision.rule_id == None
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "the lowest matching allow rule ID explains a multi-role decision" {
+    match dual_role_reads_incident() {
+        Ok(decision) => {
+            assert decision.allowed
+            assert decision.rule_id == Some(101)
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "an unassigned principal receives the default deny" {
+    match unassigned_reads_account() {
+        Ok(decision) => {
+            assert not decision.allowed
+            assert decision.reason == DecisionReason.DefaultDeny
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "a matching role and action on another resource does not authorize it" {
+    match support_reads_account() {
+        Ok(decision) => {
+            assert not decision.allowed
+            assert decision.reason == DecisionReason.DefaultDeny
+            assert decision.rule_id == None
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "oversized principal and policy counts return errors before indexing" {
+    let read_incident = Request(action: Action.Read, resource: Resource.Incident)
+    assert (
+        policy.decide(fixtures.policy(), fixtures.too_many_roles_user(), read_incident)
+        == Err(PolicyInputError.TooManyPrincipalRoles)
+    )
+    assert (
+        policy.decide(fixtures.too_many_rules_policy(), fixtures.support_user(), read_incident)
+        == Err(PolicyInputError.TooManyPolicyRules)
+    )
+}
