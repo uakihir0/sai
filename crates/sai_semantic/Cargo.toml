@@ -5,4 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+unicode-ident.workspace = true
+unicode-normalization.workspace = true
 sai_stable_hash = { path = "../sai_stable_hash" }

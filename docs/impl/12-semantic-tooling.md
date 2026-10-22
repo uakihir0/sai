@@ -1066,16 +1066,16 @@ The symbol index is stored in `.sai/index/` below the package directory of the r
 
 | File | Content |
 |---|---|
-| `index.json` | the header: `{ "format": "sai-index", "version": 1, "packages": [{ "file": <file name>, "blake3": <digest> }] }`, with unique records in byte order of `file` |
+| `index.json` | the header: `{ "format": "sai-index", "version": 1, "packages": [{ "file": <file name>, "blake3": <digest> }] }`, with unique records in UTF-8 byte order of `file` |
 | `<ns>.<pkg>.<line>.jsonl` | the entries of one workspace package node, one JSON object per line |
 
-`<line>` is the package's compatibility line ([package/02-resolver.md](../package/02-resolver.md) §2.1), such as `acme.user.0.4.jsonl` for the node `acme:user#0.4` or `acme.user.1.jsonl` for `acme:user#1`. Namespaces and package names contain no `.`, so the first two dots of the file name separate the namespace, the name, and the line, and the file name determines the package node. Every file ends with a line feed. JSON is serialized as in [11-diagnostics.md](11-diagnostics.md) §11.9.2.
+`<line>` is the package's compatibility line ([package/02-resolver.md](../package/02-resolver.md) §2.1), such as `acme.user.0.4.jsonl` for the node `acme:user#0.4` or `acme.user.1.jsonl` for `acme:user#1`. Namespaces and package names contain no `.`, so the first two dots of the file name separate the namespace, the name, and the line, and the file name determines the package node. A package with no symbols has a zero-byte package file; otherwise each entry ends with one line feed, including the final entry. JSON is serialized as in [11-diagnostics.md](11-diagnostics.md) §11.9.2.
 
 Each `blake3` is the lowercase 64-digit BLAKE3 digest of the exact bytes of its package file. Package filenames are untrusted input: parse and validate their namespace, package name, and compatibility line with the package grammar, reconstruct the canonical filename, and compare it with the recorded name before joining it to `.sai/index/`. Reject path separators, traversal, and absolute paths. Reject symlinks and reparse points in `.sai/index/`, at the fixed `index.json` path, and at every package-file or temporary-file path; use no-follow checks when opening and replacing files. The header has exactly the documented members, rejects duplicate JSON keys and duplicate filenames, and is serialized canonically with one trailing LF. For example, a header is serialized as `{"format":"sai-index","version":1,"packages":[{"file":"acme.user.1.jsonl","blake3":"<64 lowercase hex digits>}]}` followed by LF. The header therefore changes whenever any listed package file changes, even when the package set is unchanged.
 
 ### 12.9.2 Entries
 
-Each line of a package file is one entry with exactly the following members:
+Each nonempty line of a package file is one entry with exactly the following members:
 
 ```json
 {"hex":"5B0C3E","def_path_hash":"9f3c0a7e51d2b84466a01c3e7f90b2d1","path":"acme:user/service.create_user","kind":"fn","fingerprint":"c41b07e2a9d35f6680e1b4c27d9a03f5"}
@@ -1086,6 +1086,8 @@ Each line of a package file is one entry with exactly the following members:
 3. `path` is the canonical path, `kind` the symbol kind of §12.2.1, and `fingerprint` the fingerprint of §12.2.4, as 32 lowercase hexadecimal digits.
 4. Entries are sorted by `path` in byte order. No two entries of one file have the same `hex`, the same `path`, or the same `def_path_hash`.
 5. Each line is the canonical JSON serialization of the entry followed by one LF. Duplicate or unknown object members, alternate JSON encodings, and a final line without LF are invalid.
+
+A zero-byte package file contains no entries. A lone LF is an invalid blank record.
 
 ### 12.9.3 Reading, writing, and recovery
 
@@ -1430,7 +1432,17 @@ The JSON documents of this chapter MUST validate against the following schema (J
       "properties": {
         "format": { "const": "sai-index" },
         "version": { "const": 1 },
-        "packages": { "type": "array", "items": { "type": "string", "pattern": "^[a-z][a-z0-9-]*\\.[a-z][a-z0-9-]*\\.[0-9][0-9.]*\\.jsonl$" } }
+        "packages": { "type": "array", "items": { "$ref": "#/$defs/index_package" } }
+      }
+    },
+    "index_package": {
+      "type": "object", "required": ["file", "blake3"], "additionalProperties": false,
+      "properties": {
+        "file": {
+          "type": "string",
+          "pattern": "^(?!wasi\\.)(?!sai\\.(?:core|alloc)\\.)[a-z](?:[a-z0-9]|-(?=[a-z0-9])){0,63}\\.[a-z](?:[a-z0-9]|-(?=[a-z0-9])){0,63}\\.(?:(?:[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0][0-9]|1844674407370955161[0-4]|18446744073709551615)|0\\.(?:[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0][0-9]|1844674407370955161[0-4]|18446744073709551615)|0\\.0\\.(?:0|[1-9][0-9]{0,18}|1[0-7][0-9]{18}|18[0-3][0-9]{17}|184[0-3][0-9]{16}|1844[0-5][0-9]{15}|18446[0-6][0-9]{14}|184467[0-3][0-9]{13}|1844674[0-3][0-9]{12}|184467440[0-6][0-9]{10}|1844674407[0-2][0-9]{9}|18446744073[0-6][0-9]{8}|1844674407370[0-8][0-9]{6}|18446744073709[0-4][0-9]{5}|184467440737095[0-4][0-9]{4}|1844674407370955[0][0-9]{3}|18446744073709551[0-5][0-9]{2}|184467440737095516[0][0-9]|1844674407370955161[0-4]|18446744073709551615))\\.jsonl(?![\\s\\S])"
+        },
+        "blake3": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
       }
     },
     "index_entry": {
@@ -1438,7 +1450,7 @@ The JSON documents of this chapter MUST validate against the following schema (J
       "properties": {
         "hex": { "type": "string", "pattern": "^[0-9A-F]{6}$" },
         "def_path_hash": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
-        "path": { "type": "string" },
+        "path": { "type": "string", "minLength": 1 },
         "kind": { "$ref": "#/$defs/symbol_kind" },
         "fingerprint": { "type": "string", "pattern": "^[0-9a-f]{32}$" }
       }
@@ -1470,12 +1482,14 @@ These decisions refine D-TOOL-01, D-TOOL-02, and D-TOOL-03. They do not change t
 | N-H-73 | The semantic diff does not compare function bodies, comments, formatting, or declaration order. A body change appears only through the properties derived from it: inferred effects, size, and the package footprint (§12.8.1 rule 2). | The diff describes the interface of the code, which is what reviewers and dependents rely on. Text diffs already show bodies; repeating them would hide the semantic changes. |
 | N-H-74 | Diff entities are matched by same canonical path and kind, then by same kind and hexadecimal part of the symbol ID, then by unique kind-and-fingerprint partner, with members following their parent after each match by path change (§12.8.1 rule 3). | Exact paths are the common case. Symbol IDs recognize renames made by operations even when the body changed too, and fingerprints recognize editor renames, in the same order as reconciliation (N-H-67). |
 | N-H-75 | Impact analysis counts distinct call sites in workspace files, tests and properties, exported interfaces, and component worlds, from the before version on the graphs of §12.4.2, and the size change only on request. Dependencies' interfaces, worlds, and tests are never counted. The impact is incomplete when the before version has errors (§12.7.2). | The counts must be exact and cheap enough to compute before every operation. Building artifacts is expensive, so it is optional; dependencies cannot be affected by an edit of the workspace. |
-| N-H-76 | The symbol index is `.sai/index/index.json` with one JSON Lines file `<ns>.<pkg>.<line>.jsonl` per workspace package node. The unique, sorted header records each committed file's exact-byte BLAKE3 digest. LSP and read-only consumers read under the shared lock from the same byte snapshots that are hashed; CLI index writers hold the exclusive lock for the full command. Writers atomically replace changed files, publish the matching header last, and remove obsolete files only after that header is durable. Invalid or mismatched committed files discard the whole index with `SYMBOL_INDEX_DISCARDED` only after journal recovery; unlisted files are ignored. Builds never read it (§12.9). | The index affects only symbol IDs in JSON output, so a corrupt index is replaced, not repaired, once no journaled transaction can recover it. Exact content digests detect interruption among files in the previously committed set; an unlisted file is not part of that set. |
+| N-H-76 | The symbol index is `.sai/index/index.json` with one JSON Lines file `<ns>.<pkg>.<line>.jsonl` per workspace package node. Its unique, UTF-8-byte-sorted header records each basename and the lowercase BLAKE3 digest of that package file's exact bytes. LSP and read-only consumers read under the shared lock from the same byte snapshots that are hashed; CLI index writers hold the exclusive lock for the full command. Writers atomically replace changed files, publish the matching header last, and remove obsolete files only after that header is durable. Invalid or mismatched committed files discard the whole index with `SYMBOL_INDEX_DISCARDED` only after journal recovery; unlisted files are ignored. Builds never read it (§12.9). | The index affects only symbol IDs in JSON output, so a corrupt index is replaced, not repaired, once no journaled transaction can recover it. Exact content digests detect interruption among files in the previously committed set; an unlisted file is not part of that set. |
 | N-H-77 | At most one unresolved index-changing LSP edit may exist per workspace, including edits returned directly when the client lacks `workspace/applyEdit`. Journal it durably before sending or returning it; settle it after the exact planned source state and corresponding index update are committed. An unchanged snapshot does not cancel a returned edit, so its journal remains pending and blocks other index-writing operations. A timeout never cancels it. An in-memory pending edit may accelerate exact same-session matches but is never sufficient for recovery (§12.5.3, §12.9.3, §12.10.5–§12.10.6). | The server never writes files (§12.10.6), so a client-applied edit may outlive a server crash. Durable before/after states preserve source and symbol identity; the server cannot infer rejection from an unchanged snapshot, and must not overwrite another edit when observed content is unexpected. Automatic expiry could let a delayed client apply an edit after its ID mapping had been discarded. |
 | N-H-78 | The language server uses the `utf-8` position encoding if the client offers it, and `utf-16` otherwise. It never chooses `utf-32` (§12.10.2). | UTF-8 offsets are the compiler's native representation (11 §11.5.3), so they avoid conversions and their errors. `utf-16` is the LSP default that every client supports. |
 | N-H-79 | Semantic tooling analyzes a workspace snapshot as `sai check --tests` does, so tests and test-only code are in every graph and are updated by every operation. Capability facts (`Req`, `requires` edges, `FootprintChanged`) are those of the build without tests (§12.1.2 rule 2). | An operation that ignored tests would leave them broken, and impact analysis must count them. Capabilities describe the artifact, which never contains tests (spec/14). |
 | N-H-80 | LSP names a file of a dependency by the `file` URI of its copy in the package cache. The server never edits such a file and ignores `didChange` for it in analysis (§12.10.3 rule 5). | Go-to-definition into dependencies must open a real file. The package cache is content-addressed and must stay unchanged (package/04). |
 | N-H-87 | The semantic diff compares the unsafe inventories (`sai inspect unsafe`) of every dependency node whose lock entry changed version, source or checksum, or that is new, paired by identity and compatibility line, then by unique identity. Entries are matched by `(kind, item, ordinal)`; changes are `added`, `removed`, and `safety_changed` for `unsafe_fn` and `unsafe_trait` entries whose `# Safety` texts differ after trailing blanks of each line are removed. Artifact-form nodes get a record without entries. The records are the `dependency_unsafe` member of the diff, ordered by package and version (§12.8.7). | spec/12 §12.11.2 asks that new unsafe code of a dependency be visible in review (P1, P3). Keys from canonical paths survive edits and fresh symbol ID allocation, and depend only on the two lock entries and inventories, so the output is deterministic (P8). The diff reuses the inventory of `sai inspect unsafe` instead of a new analysis or command (P9), and checksums skip unchanged packages. |
+| N-H-88 | An index package file with no symbol entries is zero bytes; a nonempty file has one canonical JSON object and one LF per entry, with no blank records. | A final LF is required to detect truncated records, but a package can have no symbols. A blank JSON line would not represent an entry and must not be accepted as an empty package. |
+| N-H-89 | A tuple-field component writes its index as unpadded decimal, and a test/property component writes its decoded name as a simple double-quoted string with only `\\` and `\"` escapes; all other string code points are preserved without NFC normalization (spec/04 §4.9.1). | Multiple source integer bases/separators or string literal forms can denote one entity. Fixed path spellings keep canonical paths and symbol-index byte order unique while preserving the test name's code points. |
 
 ---
 
