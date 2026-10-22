@@ -613,6 +613,8 @@ Locked dependency-source regressions verify dependency syntax and Phase 1 diagno
 
 **IR-827 direct integer-remainder-pair aliases as Char bitwise RHSs.** `sai check` follows unannotated plain-path aliases from a direct `%` pair of two integer literals when a Char-literal-left `&`, `|`, or `^` uses that path. A dedicated provenance set preserves shared inference, both literal spans, I64 defaulting, later and prior integer constraints, full-expression trait diagnostics, and Char recovery. Annotated pairs keep concrete-path behavior. Direct computed RHS expressions, nested remainder, generic functions, and methods remain gated; type checking does not evaluate the remainder or add Char bitwise runtime behavior.
 
+**IR-828 bounded inherent method bodies.** A complete single root source may replace the one public top-level function body with one public method in a safe, non-generic inherent impl. The method must start with one immutable `self: borrow Self` receiver that its body never uses; explicit parameters must be named immutable supported primitives, and the return type must be an explicit supported primitive. Its body must fit the existing flat primitive-local form. A type mismatch in that body is reported at the associated method's source span, without the feature gate. Trait/interface and generic impls or methods, other receiver forms, any receiver use, nonprimitive signatures, attributes/contracts, and other body shapes remain gated.
+
 ### 13.6.3 `sai build`
 
 ```text
