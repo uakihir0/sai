@@ -2744,3 +2744,421 @@ mod windows_tests {
         );
     }
 }
+
+/// Visit the names of the direct entries in an already-open directory.
+///
+/// The visitor receives each filename as an [`OsStr`], so Unix filenames that
+/// are not valid UTF-8 are preserved. The `.` and `..` entries are omitted.
+/// Enumeration is anchored to `directory`; this function never resolves or
+/// globs a path. On Windows, the handle must be synchronous and grant
+/// directory-list access.
+pub fn visit_directory_entry_names(
+    directory: &File,
+    mut visitor: impl FnMut(&OsStr) -> io::Result<()>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+
+        if !directory.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory entry visitor requires a directory handle",
+            ));
+        }
+
+        let mut entries = rustix::fs::Dir::read_from(directory).map_err(io::Error::from)?;
+        while let Some(entry) = entries.next() {
+            let entry = entry.map_err(io::Error::from)?;
+            let name = OsStr::from_bytes(entry.file_name().to_bytes());
+            if name == OsStr::new(".") || name == OsStr::new("..") {
+                continue;
+            }
+            visitor(name)?;
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        if !directory.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory entry visitor requires a directory handle",
+            ));
+        }
+        if is_reparse_point(directory)? {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "directory entry visitor does not enumerate a reparse point",
+            ));
+        }
+        windows_directory_entries::visit(directory, &mut visitor)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (directory, &mut visitor);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "handle-relative directory enumeration is unavailable on this platform",
+        ))
+    }
+}
+
+#[cfg(windows)]
+mod windows_directory_entries {
+    use std::ffi::{OsStr, OsString};
+    use std::fs::File;
+    use std::io;
+    use std::mem::{offset_of, size_of};
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr;
+
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_NAMES_INFORMATION, FileNamesInformation, NtQueryDirectoryFile,
+    };
+    use windows_sys::Win32::Foundation::{RtlNtStatusToDosError, STATUS_NO_MORE_FILES};
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    const BUFFER_BYTES: usize = 64 * 1024;
+
+    pub(super) fn visit(
+        directory: &File,
+        visitor: &mut impl FnMut(&OsStr) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut restart_scan = true;
+        loop {
+            let mut buffer = vec![0usize; BUFFER_BYTES / size_of::<usize>()];
+            let buffer_bytes = buffer.len() * size_of::<usize>();
+            // SAFETY: `buffer` is pointer-aligned and owns `buffer_bytes`
+            // writable bytes, which remain alive until the native query has
+            // completed and its records have been consumed.
+            let buffer = unsafe {
+                std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u8>(), buffer_bytes)
+            };
+            let mut io_status = IO_STATUS_BLOCK::default();
+            // SAFETY: `directory` is required to be an open synchronous
+            // directory handle. With synchronous I/O, Event and ApcRoutine
+            // must be null; the call completes before returning, so the
+            // output buffer and I/O status block remain alive for the query.
+            // No callback or filename filter is supplied, so the query
+            // returns names from this handle only.
+            let status = unsafe {
+                NtQueryDirectoryFile(
+                    directory.as_raw_handle(),
+                    ptr::null_mut(),
+                    None,
+                    ptr::null(),
+                    &mut io_status,
+                    buffer.as_mut_ptr().cast(),
+                    u32::try_from(buffer_bytes).expect("directory query buffer fits u32"),
+                    FileNamesInformation,
+                    false,
+                    ptr::null(),
+                    restart_scan,
+                )
+            };
+
+            if status == STATUS_NO_MORE_FILES {
+                return Ok(());
+            }
+            if status != 0 {
+                // SAFETY: RtlNtStatusToDosError accepts every NTSTATUS value.
+                let error = unsafe { RtlNtStatusToDosError(status) };
+                return Err(io::Error::from_raw_os_error(error as i32));
+            }
+
+            let bytes_returned = io_status.Information;
+            if bytes_returned > buffer_bytes {
+                return Err(invalid_directory_record(
+                    "Windows returned more directory data than the supplied buffer",
+                ));
+            }
+            if bytes_returned == 0 {
+                return Ok(());
+            }
+            visit_names_information(&buffer[..bytes_returned], visitor)?;
+            restart_scan = false;
+        }
+    }
+
+    fn visit_names_information(
+        buffer: &[u8],
+        visitor: &mut impl FnMut(&OsStr) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let header_bytes = offset_of!(FILE_NAMES_INFORMATION, FileName);
+        let mut offset = 0usize;
+
+        loop {
+            let remaining = buffer.len().checked_sub(offset).ok_or_else(|| {
+                invalid_directory_record("Windows directory record offset overflowed")
+            })?;
+            if remaining < header_bytes {
+                return Err(invalid_directory_record(
+                    "Windows directory record is shorter than its header",
+                ));
+            }
+
+            let next_entry_offset = read_u32(buffer, offset)? as usize;
+            let name_bytes = read_u32(buffer, offset + 8)? as usize;
+            if name_bytes % size_of::<u16>() != 0 {
+                return Err(invalid_directory_record(
+                    "Windows directory filename has an odd UTF-16 byte length",
+                ));
+            }
+            if name_bytes == 0 {
+                return Err(invalid_directory_record(
+                    "Windows directory record has an empty filename",
+                ));
+            }
+            let record_bytes = header_bytes.checked_add(name_bytes).ok_or_else(|| {
+                invalid_directory_record("Windows directory record length overflowed")
+            })?;
+            if record_bytes > remaining {
+                return Err(invalid_directory_record(
+                    "Windows directory filename exceeds its record buffer",
+                ));
+            }
+            if next_entry_offset != 0
+                && (next_entry_offset < record_bytes
+                    || next_entry_offset > remaining
+                    || next_entry_offset % size_of::<u32>() != 0)
+            {
+                return Err(invalid_directory_record(
+                    "Windows directory next-entry offset is outside its record buffer",
+                ));
+            }
+
+            let name_start = offset + header_bytes;
+            let name_end = name_start + name_bytes;
+            let units = buffer[name_start..name_end]
+                .chunks_exact(size_of::<u16>())
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect::<Vec<_>>();
+            if units.contains(&0) {
+                return Err(invalid_directory_record(
+                    "Windows directory filename contains a NUL code unit",
+                ));
+            }
+            let name = OsString::from_wide(&units);
+            if name != OsStr::new(".") && name != OsStr::new("..") {
+                if name.to_string_lossy().contains(['\\', '/']) {
+                    return Err(invalid_directory_record(
+                        "Windows directory filename contains a path separator",
+                    ));
+                }
+                visitor(&name)?;
+            }
+
+            if next_entry_offset == 0 {
+                return Ok(());
+            }
+            offset = offset.checked_add(next_entry_offset).ok_or_else(|| {
+                invalid_directory_record("Windows directory record offset overflowed")
+            })?;
+        }
+    }
+
+    fn read_u32(buffer: &[u8], offset: usize) -> io::Result<u32> {
+        let end = offset
+            .checked_add(size_of::<u32>())
+            .ok_or_else(|| invalid_directory_record("Windows directory field offset overflowed"))?;
+        let bytes = buffer
+            .get(offset..end)
+            .ok_or_else(|| invalid_directory_record("Windows directory header is truncated"))?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn invalid_directory_record(message: &'static str) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, message)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{FILE_NAMES_INFORMATION, visit_names_information};
+        use std::io;
+        use std::mem::offset_of;
+
+        #[test]
+        fn rejects_odd_utf16_lengths_and_out_of_bounds_records() {
+            let header_bytes = offset_of!(FILE_NAMES_INFORMATION, FileName);
+            let mut odd_length = vec![0u8; header_bytes + 2];
+            odd_length[8..12].copy_from_slice(&1u32.to_le_bytes());
+            assert_eq!(
+                visit_names_information(&odd_length, &mut |_| Ok(()))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData,
+            );
+
+            let mut truncated = vec![0u8; header_bytes + 1];
+            truncated[8..12].copy_from_slice(&2u32.to_le_bytes());
+            assert_eq!(
+                visit_names_information(&truncated, &mut |_| Ok(()))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData,
+            );
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod directory_entry_visitor_unix_tests {
+    use std::collections::BTreeSet;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{open_directory_without_following, visit_directory_entry_names};
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("sai-directory-visitor-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path).expect("create temporary test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn collect_names(directory: &fs::File) -> io::Result<BTreeSet<OsString>> {
+        let mut names = BTreeSet::new();
+        visit_directory_entry_names(directory, |name| {
+            names.insert(name.to_os_string());
+            Ok(())
+        })?;
+        Ok(names)
+    }
+
+    #[test]
+    fn visits_only_direct_entries_and_restarts_on_repeated_scans() {
+        let temporary = TestDirectory::new();
+        let root = temporary.0.join("index");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("header.json"), b"header").unwrap();
+        fs::write(root.join("café-東京.json"), b"unicode").unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        fs::write(root.join("nested/hidden.json"), b"nested").unwrap();
+
+        let handle = open_directory_without_following(&root).unwrap();
+        let expected = BTreeSet::from([
+            OsString::from("header.json"),
+            OsString::from("café-東京.json"),
+            OsString::from("nested"),
+        ]);
+        assert_eq!(collect_names(&handle).unwrap(), expected);
+        assert_eq!(collect_names(&handle).unwrap(), expected);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preserves_non_utf8_names() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let temporary = TestDirectory::new();
+        let name = OsStr::from_bytes(b"entry-\xff.json");
+        fs::write(temporary.0.join(name), b"opaque name").unwrap();
+        let handle = open_directory_without_following(&temporary.0).unwrap();
+
+        let names = collect_names(&handle).unwrap();
+
+        assert_eq!(names.len(), 1);
+        assert_eq!(
+            names.first().unwrap().as_os_str().as_bytes(),
+            b"entry-\xff.json"
+        );
+    }
+
+    #[test]
+    fn enumeration_stays_anchored_after_directory_path_is_replaced() {
+        let temporary = TestDirectory::new();
+        let original_path = temporary.0.join("index");
+        let moved_path = temporary.0.join("index-moved");
+        fs::create_dir(&original_path).unwrap();
+        fs::write(original_path.join("before.json"), b"original").unwrap();
+        let handle = open_directory_without_following(&original_path).unwrap();
+
+        fs::rename(&original_path, &moved_path).unwrap();
+        fs::create_dir(&original_path).unwrap();
+        fs::write(original_path.join("replacement.json"), b"replacement").unwrap();
+
+        let names = collect_names(&handle).unwrap();
+
+        assert_eq!(names, BTreeSet::from([OsString::from("before.json")]));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod directory_entry_visitor_windows_tests {
+    use std::collections::BTreeSet;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{open_directory_without_following, visit_directory_entry_names};
+
+    static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let id = NEXT_TEST_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("sai-directory-visitor-{}-{id}", std::process::id()));
+            fs::create_dir_all(&path).expect("create temporary test directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn collect_names(directory: &fs::File) -> io::Result<BTreeSet<OsString>> {
+        let mut names = BTreeSet::new();
+        visit_directory_entry_names(directory, |name| {
+            names.insert(name.to_os_string());
+            Ok(())
+        })?;
+        Ok(names)
+    }
+
+    #[test]
+    fn native_query_reads_direct_unicode_entries_and_restarts() {
+        let temporary = TestDirectory::new();
+        let root = temporary.0.join("index");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("header.json"), b"header").unwrap();
+        fs::write(root.join("café-東京.json"), b"unicode").unwrap();
+        fs::create_dir(root.join("nested")).unwrap();
+        fs::write(root.join("nested/hidden.json"), b"nested").unwrap();
+        let handle = open_directory_without_following(&root).unwrap();
+        let expected = BTreeSet::from([
+            OsString::from("header.json"),
+            OsString::from("café-東京.json"),
+            OsString::from("nested"),
+        ]);
+
+        assert_eq!(collect_names(&handle).unwrap(), expected);
+        assert_eq!(collect_names(&handle).unwrap(), expected);
+    }
+}
