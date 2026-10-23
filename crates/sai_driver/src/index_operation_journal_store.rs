@@ -20,14 +20,14 @@ use sai_semantic::{
 };
 use sai_stable_hash::{ContentHash, ContentHasher};
 use sai_windows_fs::{
-    FileIdentity, create_child_directory_without_following,
+    ConditionalFileUpdate, FileIdentity, create_child_directory_without_following,
     create_new_file_in_directory_without_following, file_identity,
     move_file_in_directory_without_replacing,
     open_child_directory_for_file_updates_without_following,
     open_child_directory_without_following, open_file_for_stable_read_without_following,
     open_file_without_following, remove_file_in_directory_if_identity,
     remove_file_in_directory_if_unchanged, replace_file_in_directory_if_unchanged, sync_directory,
-    visit_directory_entry_names,
+    update_file_in_directory_if_matches, visit_directory_entry_names,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -67,6 +67,9 @@ pub enum IndexOperationJournalStoreError {
     JournalChanged,
     InvalidPreparedState,
     OperationIdChanged,
+    IndexFileNotRecorded,
+    IndexStateNotRecorded,
+    IndexFileChanged,
 }
 
 impl fmt::Display for IndexOperationJournalStoreError {
@@ -108,6 +111,13 @@ impl fmt::Display for IndexOperationJournalStoreError {
             }
             Self::OperationIdChanged => formatter
                 .write_str("an operation journal replacement cannot change its operation ID"),
+            Self::IndexFileNotRecorded => formatter
+                .write_str("the index file is not one of the operation journal's affected files"),
+            Self::IndexStateNotRecorded => formatter.write_str(
+                "the requested index file states are not recorded by the operation journal",
+            ),
+            Self::IndexFileChanged => formatter
+                .write_str("the index file no longer matches either recorded operation state"),
         }
     }
 }
@@ -123,9 +133,24 @@ impl Error for IndexOperationJournalStoreError {
             | Self::JournalAlreadyExists
             | Self::JournalChanged
             | Self::InvalidPreparedState
-            | Self::OperationIdChanged => None,
+            | Self::OperationIdChanged
+            | Self::IndexFileNotRecorded
+            | Self::IndexStateNotRecorded
+            | Self::IndexFileChanged => None,
         }
     }
+}
+
+/// The closed set of index files an operation journal can authorize for
+/// conditional recovery updates.
+///
+/// The operation journal itself is intentionally not an index target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndexOperationJournalIndexTarget {
+    /// The fixed committed-generation header at `index.json`.
+    Header,
+    /// One canonical package index file named by the journal.
+    Package(PackageIndexFileName),
 }
 
 /// A journal store whose lifetime is tied to the lock protecting its workspace.
@@ -172,6 +197,90 @@ impl<'lock> IndexOperationJournalStore<'lock> {
         journal: &IndexOperationJournal,
     ) -> Result<IndexGenerationObservation, IndexOperationJournalStoreError> {
         self.observe_index_generation_with_hook(journal, || {})
+    }
+
+    /// Conditionally updates one journal-recorded index file.
+    ///
+    /// `target` can name only `index.json` or a typed package-index basename.
+    /// The requested `expected` and `desired` states must be the exact
+    /// before/after states recorded for that target, in either direction.
+    /// This method requires the exclusive workspace lock and confirms that
+    /// the durable journal still exactly matches `journal` immediately before
+    /// delegating to the one-file conditional filesystem primitive. The
+    /// primitive treats the desired state as an idempotent success and
+    /// refuses any third state. It does not settle the whole journaled
+    /// operation; callers must observe every source and index file before
+    /// reporting recovery complete.
+    ///
+    /// Directory durability is preflighted before any mutation. If a
+    /// directory flush fails after publication, the returned error does not
+    /// establish whether the namespace update persisted; callers must retain
+    /// the journal and read the file back before retrying.
+    pub fn update_index_file_if_matches(
+        &self,
+        journal: &IndexOperationJournal,
+        target: IndexOperationJournalIndexTarget,
+        expected: &FileState,
+        desired: &FileState,
+    ) -> Result<ConditionalFileUpdate, IndexOperationJournalStoreError> {
+        self.require_exclusive()?;
+
+        let (file_name, before, after) = match &target {
+            IndexOperationJournalIndexTarget::Header => (
+                OsString::from("index.json"),
+                &journal.index_before.header,
+                &journal.index_after.header,
+            ),
+            IndexOperationJournalIndexTarget::Package(file) => {
+                let Some((before, after)) = affected_file_state(journal, file) else {
+                    return Err(IndexOperationJournalStoreError::IndexFileNotRecorded);
+                };
+                (OsString::from(file.as_str()), before, after)
+            }
+        };
+        let requested_pair_is_recorded =
+            (expected == before && desired == after) || (expected == after && desired == before);
+        if !requested_pair_is_recorded {
+            return Err(IndexOperationJournalStoreError::IndexStateNotRecorded);
+        }
+
+        let encoded_journal =
+            journal
+                .encode()
+                .map_err(|source| IndexOperationJournalStoreError::Codec {
+                    path: self.journal_path(),
+                    source,
+                })?;
+        // Opening the existing mutation-capable handle does not itself mutate
+        // the namespace. Defer the directory-flush preflight until the
+        // conditional filesystem primitive has confirmed that a change is
+        // needed, so already-desired states remain observable on platforms
+        // that cannot durably flush directory metadata.
+        let Some(index_directory) =
+            self.open_existing_index_directory_for_mutation(self.lock.state_directory_handle())?
+        else {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        };
+        let Some(current) = self.read_current(&index_directory)? else {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        };
+        if current.journal != *journal || current.bytes != encoded_journal {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        }
+
+        update_file_in_directory_if_matches(
+            &index_directory,
+            &file_name,
+            state_bytes(expected),
+            state_bytes(desired),
+        )
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::WouldBlock {
+                IndexOperationJournalStoreError::IndexFileChanged
+            } else {
+                self.io_error(self.index_directory_path().join(file_name), source)
+            }
+        })
     }
 
     /// Observes the journal's source files and committed index generation for
@@ -1642,7 +1751,10 @@ fn read_bounded_file(
 #[cfg(test)]
 mod tests {
     use super::is_staged_file_name;
-    use super::{IndexOperationJournalStore, IndexOperationJournalStoreError, read_bounded_file};
+    use super::{
+        IndexOperationJournalIndexTarget, IndexOperationJournalStore,
+        IndexOperationJournalStoreError, read_bounded_file,
+    };
     use crate::index_operation_journal_recovery::IndexGenerationObservation;
     use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
     use sai_semantic::{
@@ -1860,6 +1972,223 @@ mod tests {
         assert!(store.clear_if_current(&sources_applied).unwrap());
         assert!(store.read().unwrap().is_none());
         assert!(!store.clear_if_current(&sources_applied).unwrap());
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn conditionally_updates_one_recorded_package_file_and_is_idempotent() {
+        let directory = TestDirectory::new();
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let store = IndexOperationJournalStore::new(&lock);
+        let journal = journal();
+        let index_directory = lock.package_directory().join(".sai/index");
+        write_snapshot(&index_directory, &journal.index_before);
+        write_current_journal(&index_directory, &journal);
+
+        let target = IndexOperationJournalIndexTarget::Package(
+            journal.index_before.package_files[0].file.clone(),
+        );
+        let before = &journal.index_before.package_files[0].state;
+        let after = &journal.index_after.package_files[0].state;
+        assert_eq!(
+            store
+                .update_index_file_if_matches(&journal, target.clone(), before, after)
+                .unwrap(),
+            sai_windows_fs::ConditionalFileUpdate::Updated
+        );
+        assert_eq!(
+            fs::read(index_directory.join(journal.index_before.package_files[0].file.as_str()))
+                .unwrap(),
+            match after {
+                FileState::RegularFile(bytes) => bytes.clone(),
+                FileState::Absent => panic!("fixture after state is present"),
+            }
+        );
+        assert_eq!(
+            store
+                .update_index_file_if_matches(&journal, target, before, after)
+                .unwrap(),
+            sai_windows_fs::ConditionalFileUpdate::AlreadyDesired,
+            "a retry that already observes the requested state is idempotent"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn rejects_unrecorded_targets_states_and_third_party_bytes() {
+        let directory = TestDirectory::new();
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let store = IndexOperationJournalStore::new(&lock);
+        let (journal, unaffected_file) = journal_with_unaffected_file();
+        let index_directory = lock.package_directory().join(".sai/index");
+        write_snapshot(&index_directory, &journal.index_before);
+        write_current_journal(&index_directory, &journal);
+
+        assert!(matches!(
+            store.update_index_file_if_matches(
+                &journal,
+                IndexOperationJournalIndexTarget::Package(unaffected_file),
+                &journal.index_before.package_files[0].state,
+                &journal.index_after.package_files[0].state,
+            ),
+            Err(IndexOperationJournalStoreError::IndexFileNotRecorded)
+        ));
+
+        let wrong_expected = FileState::RegularFile(b"not recorded".to_vec());
+        assert!(matches!(
+            store.update_index_file_if_matches(
+                &journal,
+                IndexOperationJournalIndexTarget::Package(
+                    journal.index_before.package_files[0].file.clone(),
+                ),
+                &wrong_expected,
+                &journal.index_after.package_files[0].state,
+            ),
+            Err(IndexOperationJournalStoreError::IndexStateNotRecorded)
+        ));
+
+        let target_path = index_directory.join(journal.index_before.package_files[0].file.as_str());
+        fs::write(&target_path, b"external edit").unwrap();
+        assert!(matches!(
+            store.update_index_file_if_matches(
+                &journal,
+                IndexOperationJournalIndexTarget::Package(
+                    journal.index_before.package_files[0].file.clone(),
+                ),
+                &journal.index_before.package_files[0].state,
+                &journal.index_after.package_files[0].state,
+            ),
+            Err(IndexOperationJournalStoreError::IndexFileChanged)
+        ));
+        assert_eq!(fs::read(target_path).unwrap(), b"external edit");
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn guards_header_updates_with_the_current_durable_journal() {
+        let directory = TestDirectory::new();
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let store = IndexOperationJournalStore::new(&lock);
+        let journal = journal();
+        let index_directory = lock.package_directory().join(".sai/index");
+        write_snapshot(&index_directory, &journal.index_before);
+        write_current_journal(&index_directory, &journal);
+
+        assert_eq!(
+            store
+                .update_index_file_if_matches(
+                    &journal,
+                    IndexOperationJournalIndexTarget::Header,
+                    &journal.index_before.header,
+                    &journal.index_after.header,
+                )
+                .unwrap(),
+            sai_windows_fs::ConditionalFileUpdate::Updated
+        );
+        assert_eq!(
+            fs::read(index_directory.join("index.json")).unwrap(),
+            match &journal.index_after.header {
+                FileState::RegularFile(bytes) => bytes.clone(),
+                FileState::Absent => panic!("fixture after header is present"),
+            }
+        );
+
+        let mut replacement = journal.clone();
+        replacement.operation_id = "27d632c8-f4b3-41f9-9cc2-3cf1f95e95fc".into();
+        write_current_journal(&index_directory, &replacement);
+        assert!(matches!(
+            store.update_index_file_if_matches(
+                &journal,
+                IndexOperationJournalIndexTarget::Header,
+                &journal.index_after.header,
+                &journal.index_before.header,
+            ),
+            Err(IndexOperationJournalStoreError::JournalChanged)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn already_desired_index_file_is_a_noop_without_directory_durability() {
+        let directory = TestDirectory::new();
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let store = IndexOperationJournalStore::new(&lock);
+        let journal = journal();
+        let index_directory = lock.package_directory().join(".sai/index");
+        write_snapshot(&index_directory, &journal.index_before);
+        write_current_journal(&index_directory, &journal);
+
+        assert_eq!(
+            store
+                .update_index_file_if_matches(
+                    &journal,
+                    IndexOperationJournalIndexTarget::Header,
+                    &journal.index_after.header,
+                    &journal.index_before.header,
+                )
+                .unwrap(),
+            sai_windows_fs::ConditionalFileUpdate::AlreadyDesired
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unsupported_directory_durability_fails_before_index_mutation() {
+        let directory = TestDirectory::new();
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let store = IndexOperationJournalStore::new(&lock);
+        let journal = journal();
+        let index_directory = lock.package_directory().join(".sai/index");
+        write_snapshot(&index_directory, &journal.index_before);
+        write_current_journal(&index_directory, &journal);
+        let target_path = index_directory.join(journal.index_before.package_files[0].file.as_str());
+
+        assert!(matches!(
+            store.update_index_file_if_matches(
+                &journal,
+                IndexOperationJournalIndexTarget::Package(
+                    journal.index_before.package_files[0].file.clone(),
+                ),
+                &journal.index_before.package_files[0].state,
+                &journal.index_after.package_files[0].state,
+            ),
+            Err(IndexOperationJournalStoreError::Io { source, .. })
+                if source.kind() == io::ErrorKind::Unsupported
+        ));
+        assert_eq!(
+            fs::read(target_path).unwrap(),
+            match &journal.index_before.package_files[0].state {
+                FileState::RegularFile(bytes) => bytes.clone(),
+                FileState::Absent => panic!("fixture before package file is present"),
+            }
+        );
     }
 
     #[test]
