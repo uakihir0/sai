@@ -32,7 +32,9 @@ use crate::manifest::{
     PackageRole, RequirementSource, Spanned, parse_for_role,
 };
 use crate::mvs::{MvsNode, MvsPackageVersion, MvsRequirer};
-use crate::package_path::{ContentPackagePath, DependencyPackagePath, PackagePathError};
+use crate::package_path::{
+    ContentPackagePath, DependencyPackagePath, PackagePathError, RepositoryPackageDirectory,
+};
 use crate::resolver_contract::{
     ResolverContract, ResolverContractBuildError, ResolverContractContext, ResolverPathKey,
     build_resolver_contract as adapt_resolver_contract,
@@ -855,6 +857,71 @@ impl LocalPackageDirectory {
     /// this directory was opened.
     pub fn manifest_bytes(&self) -> Arc<[u8]> {
         Arc::clone(&self.manifest_source)
+    }
+
+    /// Reopens this captured package beneath a retained workspace-root handle.
+    ///
+    /// Every component of `package_root` is inspected and opened relative to
+    /// the preceding directory handle without following symlinks. The opened
+    /// directory must have the same identity and exact manifest bytes as this
+    /// captured package. The workspace root's own identity and manifest are
+    /// checked as well. `.` refers to the workspace root itself.
+    ///
+    /// This operation is supported only on platforms with handle-relative
+    /// no-follow traversal. It never uses path canonicalization to authorize
+    /// access.
+    pub fn reopen_from_workspace_root(
+        &self,
+        workspace_root: &LocalPackageDirectory,
+        package_root: &RepositoryPackageDirectory,
+    ) -> Result<LocalPackageDirectory, LocalPackageError> {
+        #[cfg(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        ))]
+        {
+            let workspace_identity = directory_identity(&workspace_root.directory)?;
+            if workspace_identity != workspace_root.identity
+                || read_manifest_from_directory_without_following(&workspace_root.directory)?
+                    .as_ref()
+                    != workspace_root.manifest_source.as_ref()
+            {
+                return Err(LocalPackageError::DirectoryChanged);
+            }
+
+            let directory = open_workspace_relative_directory(
+                &workspace_root.directory,
+                package_root.as_str(),
+            )?;
+            let identity = directory_identity(&directory)?;
+            if identity != self.identity
+                || read_manifest_from_directory_without_following(&directory)?.as_ref()
+                    != self.manifest_source.as_ref()
+            {
+                return Err(LocalPackageError::DirectoryChanged);
+            }
+
+            let canonical_path = if package_root.as_str() == "." {
+                workspace_root.canonical_path.clone()
+            } else {
+                workspace_root.canonical_path.join(package_root.as_str())
+            };
+            Ok(LocalPackageDirectory {
+                canonical_path,
+                manifest_source: Arc::clone(&self.manifest_source),
+                directory: Arc::new(directory),
+                identity,
+            })
+        }
+
+        #[cfg(not(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        )))]
+        {
+            let _ = (self, workspace_root, package_root);
+            Err(LocalPackageError::PlatformNotSupported)
+        }
     }
 
     /// Reads a source tree relative to this package's retained directory
@@ -3688,6 +3755,52 @@ fn open_directory_relative(
     unix,
     not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
 ))]
+fn open_workspace_relative_directory(
+    workspace_directory: &File,
+    package_root: &str,
+) -> Result<File, LocalPackageError> {
+    let mut current = workspace_directory
+        .try_clone()
+        .map_err(|error| LocalPackageError::Io {
+            operation: LocalPackageIoOperation::ResolveDependency,
+            kind: error.kind(),
+        })?;
+
+    if package_root == "." {
+        return Ok(current);
+    }
+
+    for component in package_root.split('/') {
+        let metadata = statat(&current, component, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+            local_source_io_error(LocalPackageIoOperation::ResolveDependency, error)
+        })?;
+        if !FileType::from_raw_mode(metadata.st_mode).is_dir() {
+            return Err(LocalPackageError::NotDirectory);
+        }
+
+        let opened = openat(
+            &current,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|error| {
+            local_source_io_error(LocalPackageIoOperation::ResolveDependency, error)
+        })?;
+        if directory_identity(&opened)? != local_source_stat_identity(&metadata) {
+            return Err(LocalPackageError::DirectoryChanged);
+        }
+        current = opened;
+    }
+
+    Ok(current)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
 fn map_directory_open_error(
     error: io::Error,
     operation: LocalPackageIoOperation,
@@ -3734,6 +3847,82 @@ fn read_manifest_from_directory(directory: &File) -> Result<Arc<[u8]>, LocalPack
     .map(File::from)
     .map_err(|error| map_manifest_open_error(error.into()))?;
     read_manifest_file(file)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn read_manifest_from_directory_without_following(
+    directory: &File,
+) -> Result<Arc<[u8]>, LocalPackageError> {
+    let entry = statat(directory, "sai.package", AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| map_manifest_open_error(error.into()))?;
+    if !FileType::from_raw_mode(entry.st_mode).is_file() {
+        return Err(LocalPackageError::ManifestNotFile);
+    }
+
+    let mut file = openat(
+        directory,
+        "sai.package",
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| map_manifest_open_error(error.into()))?;
+    let before = file.metadata().map_err(|error| LocalPackageError::Io {
+        operation: LocalPackageIoOperation::OpenManifest,
+        kind: error.kind(),
+    })?;
+    if !before.is_file() {
+        return Err(LocalPackageError::ManifestNotFile);
+    }
+    if local_source_file_identity(&before) != local_source_stat_identity(&entry) {
+        return Err(LocalPackageError::DirectoryChanged);
+    }
+    if before.len() > MAX_PACKAGE_MANIFEST_BYTES as u64 {
+        return Err(LocalPackageError::ManifestTooLarge);
+    }
+
+    let capacity =
+        usize::try_from(before.len()).map_err(|_| LocalPackageError::ManifestTooLarge)?;
+    let mut source = Vec::new();
+    source
+        .try_reserve_exact(capacity)
+        .map_err(|_| LocalPackageError::Io {
+            operation: LocalPackageIoOperation::ReadManifest,
+            kind: io::ErrorKind::OutOfMemory,
+        })?;
+    file.by_ref()
+        .take(MAX_PACKAGE_MANIFEST_BYTES as u64 + 1)
+        .read_to_end(&mut source)
+        .map_err(|error| LocalPackageError::Io {
+            operation: LocalPackageIoOperation::ReadManifest,
+            kind: error.kind(),
+        })?;
+    if source.len() > MAX_PACKAGE_MANIFEST_BYTES {
+        return Err(LocalPackageError::ManifestTooLarge);
+    }
+
+    let after = file.metadata().map_err(|error| LocalPackageError::Io {
+        operation: LocalPackageIoOperation::ReadManifest,
+        kind: error.kind(),
+    })?;
+    if !local_source_file_metadata_unchanged(&before, &after)
+        || u64::try_from(source.len()).unwrap_or(u64::MAX) != before.len()
+    {
+        return Err(LocalPackageError::DirectoryChanged);
+    }
+
+    let current_entry = statat(directory, "sai.package", AtFlags::SYMLINK_NOFOLLOW)
+        .map_err(|error| local_source_io_error(LocalPackageIoOperation::InspectDirectory, error))?;
+    if !FileType::from_raw_mode(current_entry.st_mode).is_file()
+        || local_source_stat_identity(&current_entry) != local_source_file_identity(&after)
+    {
+        return Err(LocalPackageError::DirectoryChanged);
+    }
+
+    Ok(Arc::from(source))
 }
 
 #[cfg(any(
@@ -3817,7 +4006,9 @@ mod tests {
 
     use crate::manifest::{PackageDeclaration, PackageRole, parse};
     use crate::mvs::{MvsPackageVersion, MvsRequirer};
-    use crate::package_path::{ContentPackagePath, DependencyPackagePath, PackagePathError};
+    use crate::package_path::{
+        ContentPackagePath, DependencyPackagePath, PackagePathError, RepositoryPackageDirectory,
+    };
     use crate::resolver_contract::{
         ResolverContractBuildError, ResolverContractContext, ResolverPathKey,
         build_resolver_contract,
@@ -3926,6 +4117,152 @@ mod tests {
             .parse_manifest(PackageRole::Dependency);
         assert_eq!(dependency.role(), PackageRole::Dependency);
         assert!(dependency.errors().is_empty());
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn workspace_relative_reopen_returns_the_same_captured_package() {
+        let tree = TempTree::new();
+        let workspace_path = tree.package("workspace", ROOT_MANIFEST);
+        let package_path = tree.package("workspace/members/dependency", DEPENDENCY_MANIFEST);
+        let workspace = LocalPackageDirectory::open(&workspace_path).expect("open workspace");
+        let captured = LocalPackageDirectory::open(&package_path).expect("open captured package");
+        let package_root =
+            RepositoryPackageDirectory::parse("members/dependency").expect("valid member root");
+
+        let reopened = captured
+            .reopen_from_workspace_root(&workspace, &package_root)
+            .expect("reopen exact package through workspace handle");
+
+        assert_eq!(reopened, captured);
+        assert_eq!(reopened.manifest_bytes().as_ref(), DEPENDENCY_MANIFEST);
+        assert!(reopened.path().ends_with("workspace/members/dependency"));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn workspace_relative_reopen_rejects_replaced_directories_and_changed_manifests() {
+        let tree = TempTree::new();
+        let workspace_path = tree.package("workspace", ROOT_MANIFEST);
+        let package_path = tree.package("workspace/member", DEPENDENCY_MANIFEST);
+        let workspace = LocalPackageDirectory::open(&workspace_path).expect("open workspace");
+        let package_root = RepositoryPackageDirectory::parse("member").expect("valid member root");
+
+        let captured = LocalPackageDirectory::open(&package_path).expect("open captured package");
+        let displaced_path = workspace_path.join("member-displaced");
+        fs::rename(&package_path, &displaced_path).expect("move captured package away");
+        tree.package("workspace/member", DEPENDENCY_MANIFEST);
+        assert_eq!(
+            captured.reopen_from_workspace_root(&workspace, &package_root),
+            Err(LocalPackageError::DirectoryChanged)
+        );
+
+        let changed_path = tree.package("workspace/changed", DEPENDENCY_MANIFEST);
+        let changed = LocalPackageDirectory::open(&changed_path).expect("open another package");
+        let changed_root =
+            RepositoryPackageDirectory::parse("changed").expect("valid changed root");
+        fs::write(changed_path.join("sai.package"), ROOT_MANIFEST)
+            .expect("change captured package manifest");
+        assert_eq!(
+            changed.reopen_from_workspace_root(&workspace, &changed_root),
+            Err(LocalPackageError::DirectoryChanged)
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn workspace_relative_reopen_rejects_a_changed_workspace_manifest() {
+        let tree = TempTree::new();
+        let workspace_path = tree.package("workspace", ROOT_MANIFEST);
+        let package_path = tree.package("workspace/member", DEPENDENCY_MANIFEST);
+        let workspace = LocalPackageDirectory::open(&workspace_path).expect("open workspace");
+        let captured = LocalPackageDirectory::open(package_path).expect("open captured package");
+        let package_root = RepositoryPackageDirectory::parse("member").expect("valid member root");
+
+        fs::write(workspace_path.join("sai.package"), DEPENDENCY_MANIFEST)
+            .expect("change workspace manifest");
+
+        assert_eq!(
+            captured.reopen_from_workspace_root(&workspace, &package_root),
+            Err(LocalPackageError::DirectoryChanged)
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn workspace_relative_reopen_rejects_symlinked_path_components() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TempTree::new();
+        let workspace_path = tree.package("workspace", ROOT_MANIFEST);
+        let package_path = tree.package("workspace/members/real/dependency", DEPENDENCY_MANIFEST);
+        symlink("real", workspace_path.join("members/linked"))
+            .expect("create package-root symlink");
+        let workspace = LocalPackageDirectory::open(&workspace_path).expect("open workspace");
+        let captured = LocalPackageDirectory::open(&package_path).expect("open captured package");
+        let symlink_root = RepositoryPackageDirectory::parse("members/linked/dependency")
+            .expect("valid member root");
+
+        assert_eq!(
+            captured.reopen_from_workspace_root(&workspace, &symlink_root),
+            Err(LocalPackageError::NotDirectory)
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn workspace_relative_reopen_treats_dot_as_the_workspace_root() {
+        let tree = TempTree::new();
+        let workspace_path = tree.package("workspace", ROOT_MANIFEST);
+        let workspace = LocalPackageDirectory::open(&workspace_path).expect("open workspace");
+        let root = RepositoryPackageDirectory::parse(".").expect("valid workspace-root sentinel");
+
+        let reopened = workspace
+            .reopen_from_workspace_root(&workspace, &root)
+            .expect("reopen workspace root through its retained handle");
+        assert_eq!(reopened, workspace);
+        assert_eq!(reopened.manifest_bytes().as_ref(), ROOT_MANIFEST);
+
+        let member_path = tree.package("workspace/member", DEPENDENCY_MANIFEST);
+        let member = LocalPackageDirectory::open(member_path).expect("open member package");
+        assert_eq!(
+            member.reopen_from_workspace_root(&workspace, &root),
+            Err(LocalPackageError::DirectoryChanged)
+        );
+    }
+
+    #[cfg(not(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    )))]
+    #[test]
+    fn workspace_relative_reopen_fails_closed_without_handle_relative_traversal() {
+        let tree = TempTree::new();
+        let workspace_path = tree.package("workspace", ROOT_MANIFEST);
+        let package_path = tree.package("workspace/member", DEPENDENCY_MANIFEST);
+        let workspace = LocalPackageDirectory::open(&workspace_path).expect("open workspace");
+        let captured = LocalPackageDirectory::open(&package_path).expect("open member");
+        let package_root = RepositoryPackageDirectory::parse("member").expect("valid member root");
+
+        assert_eq!(
+            captured.reopen_from_workspace_root(&workspace, &package_root),
+            Err(LocalPackageError::PlatformNotSupported)
+        );
     }
 
     #[cfg(all(
