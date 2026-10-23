@@ -26420,7 +26420,7 @@ property "shared"() {}
             &b"type Malformed<T:> { value: U32 }\n"[..],
             &b"type MissingFieldName { : U32 }\n"[..],
             &b"type DuplicateFields { value: U32\n    value: U64 }\n"[..],
-            &b"enum Unsupported { Empty }\n"[..],
+            &b"enum Unsupported { Empty(I32) }\n"[..],
             &b"resource Unsupported { handle: U32 }\n"[..],
             &b"type WithImpl {}\nimpl WithImpl { fn method() {} }\n"[..],
             &b"@derive(Clone)\ntype Derived {}\n"[..],
@@ -26608,24 +26608,478 @@ property "shared"() {}
     }
 
     #[test]
-    fn module_function_inventory_fails_closed_for_other_symbol_forms() {
-        for (source, expected_reason) in [(
-            &b"enum Marker { Empty }\n"[..],
-            "outside the function-generic-parameter-record-generic-parameter-field-type-alias-generic-parameter-refined-type-constant-effect-test-property inventory",
-        )] {
+    fn module_enum_inventory_collects_root_and_nested_generic_variants_and_fields() {
+        let (database, module_tree, _, collection) = collect_package_inventory_for_target(
+            b"enum Maybe<T, const N: U32> { Nothing, Some(value: T) }\n",
+            b"enum Nested<const M: U32> { Empty, Sized(value: U32) }\n",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<Vec<_>>(),
+            [
+                ("acme:phase1.Maybe", sai_semantic::SymbolKind::Enum),
+                (
+                    "acme:phase1.Maybe.generic[T]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.Maybe.generic[N]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.Maybe.Nothing",
+                    sai_semantic::SymbolKind::Variant
+                ),
+                ("acme:phase1.Maybe.Some", sai_semantic::SymbolKind::Variant),
+                (
+                    "acme:phase1.Maybe.Some.field[value]",
+                    sai_semantic::SymbolKind::Field
+                ),
+                ("acme:phase1/child.Nested", sai_semantic::SymbolKind::Enum),
+                (
+                    "acme:phase1/child.Nested.generic[M]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1/child.Nested.Empty",
+                    sai_semantic::SymbolKind::Variant
+                ),
+                (
+                    "acme:phase1/child.Nested.Sized",
+                    sai_semantic::SymbolKind::Variant
+                ),
+                (
+                    "acme:phase1/child.Nested.Sized.field[value]",
+                    sai_semantic::SymbolKind::Field
+                ),
+            ]
+        );
+
+        let def_paths = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("the package has a DefPath interner");
+        let root_file = module_tree.modules[0].file;
+        let enum_owner = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| {
+                owner.file == root_file
+                    && owner.kind == TopLevelOwnerKind::Enum
+                    && database
+                        .resolve_def_path(owner.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            matches!(
+                                path.data().last().map(|component| &component.data),
+                                Some(DefPathData::TypeNs(name))
+                                    if database.symbols.resolve(*name).is_ok_and(|name| name.as_ref() == "Maybe")
+                            )
+                        })
+            })
+            .expect("the exact enum owner descriptor exists");
+        let enum_path = database
+            .resolve_def_path(enum_owner.owner.def_id.to_def_id())
+            .expect("enum DefId is valid")
+            .expect("enum DefPath exists");
+        assert_eq!(enum_path.package(), module_tree.package);
+        assert!(matches!(
+            enum_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::TypeNs(database.symbols.intern("Maybe").unwrap())
+                    && component.disambiguator == 0
+        ));
+        let maybe = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.path() == "acme:phase1.Maybe")
+            .expect("the enum symbol exists");
+        let enum_hash =
+            sai_hir::DefPathHash::compute(&enum_path, &database.packages, &database.symbols)
+                .expect("the enum owner path hashes");
+        assert_eq!(
+            maybe.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(enum_hash.raw())
+        );
+
+        let type_t = database.symbols.intern("T").expect("T interns");
+        let const_n = database.symbols.intern("N").expect("N interns");
+        let generics = def_paths
+            .intern_generic_params(
+                enum_owner.owner.def_id,
+                &[(type_t, false, 0), (const_n, true, 0)],
+            )
+            .expect("generic enum parameters were lowered");
+        for (id, component, name) in [
+            (generics[0], DefPathData::TypeParam(type_t), "T"),
+            (generics[1], DefPathData::ConstParam(const_n), "N"),
+        ] {
+            let path = database
+                .resolve_def_path(id.to_def_id())
+                .expect("generic parameter DefId is valid")
+                .expect("generic parameter DefPath exists");
+            assert_eq!(path.package(), module_tree.package);
+            assert_eq!(&path.data()[..enum_path.data().len()], enum_path.data());
+            assert!(matches!(
+                path.data().last(),
+                Some(last) if last.data == component && last.disambiguator == 0
+            ));
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&path, &database.packages, &database.symbols)
+                    .expect("generic parameter path hashes");
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == format!("acme:phase1.Maybe.generic[{name}]"))
+                .expect("generic parameter symbol exists");
+            assert_eq!(
+                symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+        }
+
+        let nothing = database.symbols.intern("Nothing").expect("Nothing interns");
+        let some = database.symbols.intern("Some").expect("Some interns");
+        let variants = def_paths
+            .intern_variants(enum_owner.owner.def_id, &[(nothing, 0), (some, 0)])
+            .expect("enum variants were lowered");
+        for (id, component, expected_path) in [
+            (
+                variants[0],
+                DefPathData::Variant(nothing),
+                "acme:phase1.Maybe.Nothing",
+            ),
+            (
+                variants[1],
+                DefPathData::Variant(some),
+                "acme:phase1.Maybe.Some",
+            ),
+        ] {
+            let path = database
+                .resolve_def_path(id.to_def_id())
+                .expect("variant DefId is valid")
+                .expect("variant DefPath exists");
+            assert_eq!(path.package(), module_tree.package);
+            assert_eq!(&path.data()[..enum_path.data().len()], enum_path.data());
+            assert!(matches!(
+                path.data().last(),
+                Some(last) if last.data == component && last.disambiguator == 0
+            ));
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&path, &database.packages, &database.symbols)
+                    .expect("variant path hashes");
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == expected_path)
+                .expect("variant symbol exists");
+            assert_eq!(
+                symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+        }
+        let value = database.symbols.intern("value").expect("value interns");
+        let field_id = def_paths
+            .intern_fields_for_parents(&[(variants[1], value, 0)])
+            .expect("record variant field was lowered")[0];
+        let field_path = database
+            .resolve_def_path(field_id.to_def_id())
+            .expect("field DefId is valid")
+            .expect("field DefPath exists");
+        assert_eq!(field_path.package(), module_tree.package);
+        let variant_path = database
+            .resolve_def_path(variants[1].to_def_id())
+            .expect("variant DefId is valid")
+            .expect("variant DefPath exists");
+        assert_eq!(
+            &field_path.data()[..variant_path.data().len()],
+            variant_path.data()
+        );
+        assert!(matches!(
+            field_path.data().last(),
+            Some(last)
+                if last.data == DefPathData::Field(value) && last.disambiguator == 0
+        ));
+        let field_hash =
+            sai_hir::DefPathHash::compute(&field_path, &database.packages, &database.symbols)
+                .expect("field path hashes");
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == "acme:phase1.Maybe.Some.field[value]")
+                .expect("record variant field symbol exists")
+                .def_path_hash(),
+            sai_stable_hash::Fingerprint::new(field_hash.raw())
+        );
+    }
+
+    #[test]
+    fn module_enum_inventory_fingerprints_ignore_renames_and_track_discriminants_and_payloads() {
+        let fingerprint = |source: &[u8], kind: sai_semantic::SymbolKind| {
             let (_, _, _, collection) =
                 collect_package_inventory_for_target(source, b"", "wasm32-core");
             let inventory = inventory_symbols(&collection);
+            assert_eq!(
+                inventory.coverage(),
+                &sai_semantic::InventoryCoverage::Complete
+            );
+            inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind() == kind)
+                .expect("the requested symbol kind is inventoried")
+                .fingerprint()
+        };
+
+        let enum_original =
+            fingerprint(b"enum First { A = 1, B }\n", sai_semantic::SymbolKind::Enum);
+        let enum_renamed = fingerprint(
+            b"enum Renamed { A = 1, B }\n",
+            sai_semantic::SymbolKind::Enum,
+        );
+        let enum_discriminant =
+            fingerprint(b"enum First { A = 2, B }\n", sai_semantic::SymbolKind::Enum);
+        assert_eq!(enum_original, enum_renamed);
+        assert_ne!(enum_original, enum_discriminant);
+
+        let variant_original =
+            fingerprint(b"enum E { A = 1 }\n", sai_semantic::SymbolKind::Variant);
+        let variant_renamed = fingerprint(b"enum E { B = 1 }\n", sai_semantic::SymbolKind::Variant);
+        let variant_discriminant =
+            fingerprint(b"enum E { A = 2 }\n", sai_semantic::SymbolKind::Variant);
+        assert_eq!(variant_original, variant_renamed);
+        assert_ne!(variant_original, variant_discriminant);
+
+        let variant_payload = fingerprint(
+            b"enum E { Data(value: I32) }\n",
+            sai_semantic::SymbolKind::Variant,
+        );
+        let variant_payload_changed = fingerprint(
+            b"enum E { Data(value: U32) }\n",
+            sai_semantic::SymbolKind::Variant,
+        );
+        let field_original = fingerprint(
+            b"enum E { Data(value: I32) }\n",
+            sai_semantic::SymbolKind::Field,
+        );
+        let field_renamed = fingerprint(
+            b"enum E { Data(item: I32) }\n",
+            sai_semantic::SymbolKind::Field,
+        );
+        let field_payload_changed = fingerprint(
+            b"enum E { Data(value: U32) }\n",
+            sai_semantic::SymbolKind::Field,
+        );
+        assert_ne!(variant_payload, variant_payload_changed);
+        assert_eq!(field_original, field_renamed);
+        assert_ne!(field_original, field_payload_changed);
+    }
+
+    #[test]
+    fn module_enum_inventory_rejects_duplicate_variant_and_field_paths() {
+        for source in [
+            &b"enum Duplicate { Same, Same(value: I32) }\n"[..],
+            &b"enum Duplicate { Data(value: I32, value: U32) }\n"[..],
+        ] {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert!(matches!(
+                inventory.coverage(),
+                sai_semantic::InventoryCoverage::Incomplete { reason }
+                    if reason.contains("duplicate canonical symbol path")
+            ));
+            let duplicate_paths = inventory.symbols().iter().fold(
+                HashMap::<&str, usize>::new(),
+                |mut counts, symbol| {
+                    *counts.entry(symbol.path()).or_default() += 1;
+                    counts
+                },
+            );
+            assert!(
+                duplicate_paths.values().any(|count| *count > 1),
+                "the incomplete inventory retains both candidate declarations"
+            );
+        }
+    }
+
+    #[test]
+    fn module_enum_inventory_fails_closed_for_malformed_and_invalid_member_attributes() {
+        for (source, expected_reason, expect_parser_diagnostic) in [
+            (
+                &b"enum Malformed<T:> { Ready }\n"[..],
+                "syntax tree contains recovery or parse errors",
+                false,
+            ),
+            (
+                &b"enum InvalidGenericAttribute<@target(\"wasm64-core\") T> { Ready }\n"[..],
+                "enum syntax node has a parser diagnostic",
+                true,
+            ),
+            (
+                &b"enum InvalidVariantAttribute { @cold Ready }\n"[..],
+                "target-filtered module has an attribute or target-selection error",
+                false,
+            ),
+            (
+                &b"enum InvalidFieldAttribute { Item(@field value: I32) }\n"[..],
+                "enum syntax node has a parser diagnostic",
+                true,
+            ),
+            (
+                &b"enum InvalidMemberTarget { @target(\"wasm32-core\") Ready }\n"[..],
+                "target-filtered module has an attribute or target-selection error",
+                false,
+            ),
+        ] {
+            let (_, module_tree, snapshot, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            if expect_parser_diagnostic {
+                let parsed = sai_syntax::parse(&snapshot, module_tree.modules[0].file)
+                    .expect("the invalid attribute fixture parses with a diagnostic");
+                let enum_syntax = parsed
+                    .root
+                    .descendants()
+                    .find_map(sai_syntax::ast::EnumDecl::cast)
+                    .expect("the diagnostic fixture has an enum declaration");
+                let enum_range = enum_syntax.syntax().text_range();
+                assert!(
+                    parsed.parser_diagnostics().iter().any(|diagnostic| {
+                        diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget
+                            && diagnostic.primary().is_some_and(|primary| {
+                                primary.span.range.start() <= enum_range.end()
+                                    && enum_range.start() <= primary.span.range.end()
+                            })
+                    }),
+                    "the parser diagnostic must overlap the enclosing enum owner syntax"
+                );
+            }
             assert!(
                 matches!(
-                    inventory.coverage(),
+                    inventory_symbols(&collection).coverage(),
                     sai_semantic::InventoryCoverage::Incomplete { reason }
                         if reason.contains(expected_reason)
                 ),
-                "expected incomplete reason containing {expected_reason:?}, got {:?}",
-                inventory.coverage()
+                "{source:?}: {:#?}",
+                inventory_symbols(&collection).coverage()
             );
         }
+
+        let (_, _, _, invalid_target) = collect_package_inventory_for_target(
+            b"@target(\"wasm32-linux\")\nenum Uncertain { Ready }\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(matches!(
+            inventory_symbols(&invalid_target).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("target-selection error")
+        ));
+    }
+
+    #[test]
+    fn module_enum_inventory_filters_by_selected_target_and_fails_closed_for_tuple_and_derive() {
+        let source = b"@target(\"wasm64-core\")\nenum Only64<T> { Empty }\n";
+        let (_, _, _, wasm32) = collect_package_inventory_for_target(source, b"", "wasm32-core");
+        assert_eq!(
+            inventory_symbols(&wasm32).coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert!(inventory_symbols(&wasm32).symbols().is_empty());
+
+        let (_, _, _, wasm64) = collect_package_inventory_for_target(source, b"", "wasm64-core");
+        assert_eq!(
+            inventory_symbols(&wasm64).coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory_symbols(&wasm64)
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.path())
+                .collect::<Vec<_>>(),
+            [
+                "acme:phase1.Only64",
+                "acme:phase1.Only64.generic[T]",
+                "acme:phase1.Only64.Empty"
+            ]
+        );
+
+        for (source, reason) in [
+            (
+                &b"enum Tuple { With(I32) }\n"[..],
+                "tuple variant payload symbols are outside the supported enum inventory",
+            ),
+            (
+                &b"@derive(Clone)\nenum Derived { Empty }\n"[..],
+                "derived impl symbols outside the supported inventory",
+            ),
+        ] {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            assert!(matches!(
+                inventory_symbols(&collection).coverage(),
+                sai_semantic::InventoryCoverage::Incomplete { reason: actual }
+                    if actual.contains(reason)
+            ));
+        }
+    }
+
+    #[test]
+    fn module_enum_inventory_preserves_existing_record_function_alias_test_and_property_symbols() {
+        let (_, _, _, collection) = collect_package_inventory_for_target(
+            b"fn keep_fn() {}\ntype KeepRecord { value: I32 }\ntype KeepAlias<T> = T\ntest \"keep test\" {}\nproperty \"keep property\" () {}\nenum KeepEnum { Unit }\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        for path in [
+            "acme:phase1.keep_fn",
+            "acme:phase1.KeepRecord",
+            "acme:phase1.KeepRecord.field[value]",
+            "acme:phase1.KeepAlias",
+            "acme:phase1.KeepAlias.generic[T]",
+            "acme:phase1.test[\"keep test\"]",
+            "acme:phase1.property[\"keep property\"]",
+            "acme:phase1.KeepEnum",
+            "acme:phase1.KeepEnum.Unit",
+        ] {
+            assert!(
+                inventory
+                    .symbols()
+                    .iter()
+                    .any(|symbol| symbol.path() == path),
+                "expected preserved symbol at {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_function_inventory_fails_closed_for_other_symbol_forms() {
+        let (_, _, _, collection) =
+            collect_package_inventory_for_target(b"distinct Marker = U32\n", b"", "wasm32-core");
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("outside the")
+        ));
     }
 
     #[test]
