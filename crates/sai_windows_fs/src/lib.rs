@@ -265,7 +265,7 @@ mod tests {
         is_reparse_point, lock_file_range, lock_file_range_windows,
         move_directory_without_replacing, move_file_without_replacing,
         open_directory_for_rename_without_following, open_directory_without_following,
-        replace_file, unlock_file_range,
+        open_file_for_stable_read_without_following, replace_file, unlock_file_range,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -370,6 +370,65 @@ mod tests {
         assert!(!is_reparse_point(&handle).unwrap());
         assert!(handle.metadata().unwrap().is_dir());
         assert!(fs::rename(&directory.0, directory.0.with_extension("moved")).is_err());
+    }
+
+    #[test]
+    fn stable_read_open_excludes_writers_and_replacements_until_drop() {
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_DELETE;
+
+        let directory = TestDirectory::new();
+        let path = directory.0.join("record.json");
+        fs::write(&path, b"original").unwrap();
+
+        let existing_writer = OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .unwrap();
+        assert!(
+            open_file_for_stable_read_without_following(
+                &open_directory_without_following(&directory.0).unwrap(),
+                &directory.0,
+                path.file_name().unwrap(),
+            )
+            .is_err(),
+            "a preexisting write-capable handle prevents a stable observation"
+        );
+        drop(existing_writer);
+
+        let parent = open_directory_without_following(&directory.0).unwrap();
+        let stable = open_file_for_stable_read_without_following(
+            &parent,
+            &directory.0,
+            path.file_name().unwrap(),
+        )
+        .unwrap();
+        let writer_result = OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path);
+        assert!(
+            writer_result.is_err(),
+            "a stable observation handle denies new writers"
+        );
+
+        let replacement = directory.0.join("replacement.tmp");
+        fs::write(&replacement, b"replacement").unwrap();
+        assert!(
+            fs::rename(&replacement, &path).is_err(),
+            "a stable observation handle denies replacement"
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+
+        drop(stable);
+        let writer = OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .unwrap();
+        drop(writer);
+        fs::rename(&replacement, &path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
     }
 
     #[test]
@@ -1202,6 +1261,32 @@ pub fn open_file_without_following(
     }
 }
 
+/// Open a direct child regular file without following a symbolic link, while
+/// preventing Windows writers and replacements until the returned handle is
+/// dropped.
+///
+/// On Windows the open fails if a write-capable handle already exists. The
+/// returned handle allows readers but denies write and delete sharing, so
+/// later target checks can retain it to keep the observed bytes stable. Unix
+/// and unsupported platforms preserve the behavior of
+/// [`open_file_without_following`].
+pub fn open_file_for_stable_read_without_following(
+    parent: &File,
+    parent_path: &Path,
+    file_name: &OsStr,
+) -> io::Result<File> {
+    validate_child_name(file_name)?;
+    #[cfg(windows)]
+    {
+        let _ = parent_path;
+        windows_handle::open_child_for_stable_read(parent, file_name)
+    }
+    #[cfg(not(windows))]
+    {
+        open_file_without_following(parent, parent_path, file_name)
+    }
+}
+
 /// Open a direct child regular file without following a reparse point, with
 /// rights to update its file attributes.
 ///
@@ -1774,6 +1859,19 @@ mod windows_handle {
             !directory,
         )?;
         validate_opened_child(file, directory)
+    }
+
+    pub(super) fn open_child_for_stable_read(parent: &File, name: &OsStr) -> io::Result<File> {
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let file = open_child_with_access_and_share(
+            parent,
+            name,
+            false,
+            GENERIC_READ | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ,
+        )?;
+        validate_opened_child(file, false)
     }
 
     pub(super) fn open_child_for_child_updates(parent: &File, name: &OsStr) -> io::Result<File> {
