@@ -3,6 +3,7 @@
 //! The lock file is persistent state: this module creates it when needed but
 //! never removes, replaces, or writes to it.
 
+use std::cell::Cell;
 use std::error::Error;
 #[cfg(any(
     windows,
@@ -15,6 +16,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
 use std::io;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
 /// Whether a workspace lock permits other readers or excludes all users.
@@ -85,7 +87,17 @@ impl Error for WorkspaceLockError {
 /// remains in place so concurrent processes always lock the same file.
 /// Participating processes must not remove or replace that directory entry
 /// while a guard may be held; arbitrary external filesystem mutation is
-/// outside this advisory lock's coordination contract.
+/// outside this advisory lock's coordination contract. A guard is intentionally
+/// not `Sync`: filesystem mutations perform a read-check-update sequence that
+/// must not be interleaved by another thread sharing this guard. Concurrent
+/// readers can acquire independent shared guards.
+///
+/// ```compile_fail
+/// use sai_package::workspace_lock::WorkspaceLockGuard;
+///
+/// fn require_sync<T: Sync>() {}
+/// require_sync::<WorkspaceLockGuard>();
+/// ```
 #[must_use = "dropping the guard releases the workspace lock"]
 pub struct WorkspaceLockGuard {
     file: File,
@@ -94,6 +106,7 @@ pub struct WorkspaceLockGuard {
     package_directory_path: PathBuf,
     path: PathBuf,
     mode: WorkspaceLockMode,
+    _not_sync: PhantomData<Cell<()>>,
 }
 
 impl fmt::Debug for WorkspaceLockGuard {
@@ -146,6 +159,7 @@ impl WorkspaceLockGuard {
             package_directory_path,
             path,
             mode,
+            _not_sync: PhantomData,
         };
 
         if !lock_platform(&guard.file, mode, false).map_err(|source| WorkspaceLockError::Io {
@@ -212,6 +226,7 @@ impl WorkspaceLockGuard {
             package_directory_path,
             path,
             mode,
+            _not_sync: PhantomData,
         };
         guard.validate_empty()?;
         Ok(Some(guard))
