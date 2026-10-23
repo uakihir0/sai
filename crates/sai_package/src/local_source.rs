@@ -853,6 +853,31 @@ impl LocalPackageDirectory {
         &self.canonical_path
     }
 
+    /// Returns whether `directory` is the same opened directory capability
+    /// captured by this package directory.
+    ///
+    /// The comparison uses device and inode identity on supported Unix
+    /// targets. Other platforms return `false` because this type does not
+    /// retain a comparable directory identity there.
+    pub fn is_same_open_directory(&self, directory: &File) -> bool {
+        #[cfg(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        ))]
+        {
+            matches!(directory_identity(directory), Ok(identity) if identity == self.identity)
+        }
+
+        #[cfg(not(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        )))]
+        {
+            let _ = directory;
+            false
+        }
+    }
+
     /// Returns a shared copy of the exact `sai.package` bytes captured when
     /// this directory was opened.
     pub fn manifest_bytes(&self) -> Arc<[u8]> {
@@ -955,18 +980,35 @@ impl LocalPackageDirectory {
         &self,
         source_path: &ContentPackagePath,
     ) -> Result<LocalPackageSourceFileState, LocalPackageSourceFileSnapshotError> {
+        self.read_source_file_snapshot_with_limit(source_path, MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES)
+    }
+
+    /// Reads one package-relative `.sai` file through the retained package
+    /// directory handle, without following symlinks, with a caller-supplied
+    /// byte ceiling no larger than the normal per-file source limit.
+    ///
+    /// A missing final file component is still reported as `Absent`, even
+    /// when `maximum_bytes` is zero. A regular file larger than the effective
+    /// limit is rejected before allocating for its contents.
+    pub fn read_source_file_snapshot_with_limit(
+        &self,
+        source_path: &ContentPackagePath,
+        maximum_bytes: u64,
+    ) -> Result<LocalPackageSourceFileState, LocalPackageSourceFileSnapshotError> {
         let path = source_path.as_str();
         let file_name = path.rsplit('/').next().unwrap_or_default();
         if path == "." || !file_name.ends_with(".sai") {
             return Err(LocalPackageSourceFileSnapshotError::InvalidSourcePath);
         }
 
+        let maximum_bytes = maximum_bytes.min(MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES);
+
         #[cfg(all(
             unix,
             not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
         ))]
         {
-            read_source_file_from_directory(&self.directory, path)
+            read_source_file_from_directory(&self.directory, path, maximum_bytes)
         }
 
         #[cfg(not(all(
@@ -974,7 +1016,7 @@ impl LocalPackageDirectory {
             not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
         )))]
         {
-            let _ = (self, source_path);
+            let _ = (self, source_path, maximum_bytes);
             Err(LocalPackageSourceFileSnapshotError::PlatformNotSupported)
         }
     }
@@ -1680,6 +1722,7 @@ fn record_local_wit_entry_path(
 fn read_source_file_from_directory(
     package_directory: &File,
     source_path: &str,
+    maximum_bytes: u64,
 ) -> Result<LocalPackageSourceFileState, LocalPackageSourceFileSnapshotError> {
     const READ_BUFFER_BYTES: usize = 64 * 1024;
 
@@ -1769,7 +1812,7 @@ fn read_source_file_from_directory(
     {
         return Err(LocalPackageError::DirectoryChanged.into());
     }
-    if before.len() > MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES {
+    if before.len() > maximum_bytes {
         return Err(LocalPackageSourceFileSnapshotError::FileTooLarge);
     }
 
@@ -1782,7 +1825,7 @@ fn read_source_file_from_directory(
     let mut buffer = [0u8; READ_BUFFER_BYTES];
     loop {
         let read_so_far = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-        let remaining = MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES.saturating_sub(read_so_far);
+        let remaining = maximum_bytes.saturating_sub(read_so_far);
         let request = usize::try_from(remaining.saturating_add(1).min(buffer.len() as u64))
             .unwrap_or(buffer.len());
         let read = file
@@ -3540,7 +3583,7 @@ impl fmt::Display for LocalPackageSourceFileSnapshotError {
             }
             Self::FileTooLarge => write!(
                 formatter,
-                "local package source file exceeds the {MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES} byte limit"
+                "local package source file exceeds its configured byte limit"
             ),
             Self::OutOfMemory => {
                 formatter.write_str("not enough memory to observe the local package source file")
