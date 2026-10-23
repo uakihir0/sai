@@ -32,10 +32,6 @@ pub enum IndexJournalClearExecution {
     Cleared {
         decision: IndexJournalRecoveryDecision,
     },
-    /// The exact journal was already absent when the clear was attempted.
-    AlreadyAbsent {
-        decision: IndexJournalRecoveryDecision,
-    },
 }
 
 /// Re-observes and executes one clear-only recovery decision.
@@ -51,7 +47,10 @@ pub enum IndexJournalClearExecution {
 /// The store's [`IndexOperationJournalStore::clear_if_current`] also verifies
 /// that the durable record still equals `journal` while removing it and
 /// flushes the containing directory. A failure or a journal race is returned
-/// as a store error, preserving the record where possible.
+/// as a store error, preserving the record where possible. On any error, the
+/// caller must read back the journal under the same exclusive lock and keep
+/// recovery gated until a later observation resolves the state; an absent
+/// journal after an error does not prove that recovery completed.
 pub fn execute_index_operation_journal_clear(
     store: &IndexOperationJournalStore<'_>,
     journal: &IndexOperationJournal,
@@ -100,9 +99,10 @@ fn execute_index_operation_journal_clear_with_hook(
             decision: observed_decision,
         })
     } else {
-        Ok(IndexJournalClearExecution::AlreadyAbsent {
-            decision: observed_decision,
-        })
+        // The journal disappeared after the fresh observation. Do not treat
+        // that race as settled: the caller must read back current state and
+        // keep recovery gated until it can classify the missing record.
+        Err(IndexOperationJournalStoreError::JournalChanged)
     }
 }
 
@@ -475,25 +475,52 @@ mod tests {
         not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
     ))]
     #[test]
-    fn already_absent_journal_is_reported_after_fresh_observation() {
+    fn journal_removed_after_observation_is_unconfirmed_and_never_successful() {
         let journal = journal(IndexJournalOrigin::Cli, IndexJournalState::Prepared);
         let (workspace, lock, inventory) = setup(&journal, &journal.sources[0].before, false);
         let store = IndexOperationJournalStore::new(&lock);
         let decision = expected_decision(&store, &journal, &inventory);
         assert_eq!(decision, IndexJournalRecoveryDecision::ClearBefore);
 
-        let result =
+        let error =
             execute_clear_only_with_hook_for_test(&store, &journal, &inventory, decision, || {
                 fs::remove_file(workspace.0.join(".sai/index/operation.json"))
                     .expect("remove journal after observation");
             })
-            .expect("report journal absence");
+            .expect_err("a concurrent journal removal is not a successful recovery");
 
-        assert_eq!(
-            result,
-            IndexJournalClearExecution::AlreadyAbsent { decision }
-        );
+        assert!(matches!(
+            error,
+            IndexOperationJournalStoreError::JournalChanged
+        ));
         assert!(!journal_still_exists(&workspace));
+        assert_eq!(
+            fs::read(workspace.0.join("src/lib.sai")).expect("source remains readable"),
+            b"before"
+        );
+        let FileState::RegularFile(expected_header) = &journal.index_before.header else {
+            panic!("before header is regular");
+        };
+        assert_eq!(
+            fs::read(workspace.0.join(".sai/index/index.json"))
+                .expect("index header remains readable"),
+            *expected_header
+        );
+        let package_file = &journal.index_before.package_files[0];
+        let FileState::RegularFile(expected_package) = &package_file.state else {
+            panic!("before package file is regular");
+        };
+        assert_eq!(
+            fs::read(
+                workspace
+                    .0
+                    .join(".sai/index")
+                    .join(package_file.file.as_str())
+            )
+            .expect("package file remains readable"),
+            *expected_package
+        );
+        assert_eq!(store.read().expect("read back missing journal"), None);
     }
 
     fn execute_clear_only_with_hook_for_test(
