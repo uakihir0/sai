@@ -71,6 +71,7 @@ pub type LoanDecision {
 pub type LoanReport {
     pub decisions: Array<Option<LoanDecision>, 10>
     pub decision_count: USize
+    pub input_valid: Bool
     pub accepted_count: USize
     pub held_count: USize
     pub deferred_count: USize

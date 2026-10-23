@@ -74,7 +74,35 @@ fn rejected(reason: ReviewReason) -> Bool {
     reason == ReviewReason.DuplicateAccession
 }
 
+fn input_is_valid(batch: LoanBatch) -> Bool {
+    if batch.request_count > 10 {
+        return false
+    }
+    for index in 0..batch.request_count {
+        if batch.requests[index] == None {
+            return false
+        }
+    }
+    true
+}
+
+fn invalid_report() -> LoanReport {
+    LoanReport(
+        decisions: [None, None, None, None, None, None, None, None, None, None],
+        decision_count: 0,
+        input_valid: false,
+        accepted_count: 0,
+        held_count: 0,
+        deferred_count: 0,
+        rejected_count: 0,
+    )
+}
+
 pub fn review(batch: LoanBatch) -> LoanReport {
+    if not input_is_valid(batch) {
+        return invalid_report()
+    }
+
     var ordered = batch.requests
     for index in 1..batch.request_count {
         let candidate = ordered[index].unwrap()
@@ -165,6 +193,7 @@ pub fn review(batch: LoanBatch) -> LoanReport {
     LoanReport(
         decisions: decisions,
         decision_count: batch.request_count,
+        input_valid: true,
         accepted_count: accepted_count,
         held_count: held_count,
         deferred_count: deferred_count,

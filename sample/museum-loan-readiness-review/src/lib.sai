@@ -9,6 +9,7 @@ pub fn sample_report() -> LoanReport {
 test "the intake order is priority then request ID" {
     let result = sample_report()
     assert result.decision_count == 10
+    assert result.input_valid
     assert result.decisions[0].unwrap().request_id == 4107
     assert result.decisions[1].unwrap().request_id == 4102
     assert result.decisions[2].unwrap().request_id == 4103
@@ -46,4 +47,18 @@ test "only ready loans consume the two display slots and one climate case" {
     assert not result.decisions[6].unwrap().climate_case_used
     assert result.decisions[7].unwrap().reason == Some(ReviewReason.GalleryFull)
     assert result.accepted_count == 2
+}
+
+test "invalid request counts and unpopulated slots fail closed before indexing" {
+    var too_many = data.batch()
+    too_many.request_count = 11
+    let oversized = review.review(too_many)
+    assert not oversized.input_valid
+    assert oversized.decision_count == 0
+
+    var missing_request = data.batch()
+    missing_request.requests[5] = None
+    let incomplete = review.review(missing_request)
+    assert not incomplete.input_valid
+    assert incomplete.decision_count == 0
 }

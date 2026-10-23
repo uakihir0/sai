@@ -60,12 +60,14 @@ Summary: 2 accepted, 3 held, 3 deferred, 2 rejected
   readiness checks, sorts requests deterministically, and reserves capacity.
 - `lib.sai` exposes `sample_report()` and includes example regression tests.
 
-This is an in-memory example using fixed arrays. It assumes every fixture slot
-before `request_count` is populated and that request IDs are unique. The
-accession check deliberately rejects all members of a duplicate group instead
-of guessing which record is authoritative. Dollar values, condition categories,
-crate ratings, and environmental ranges are illustrative; museum lenders,
-conservators, insurers, and transport professionals determine real requirements.
+This is an in-memory example using fixed arrays. The reviewer fails closed with
+an empty report marked invalid if `request_count` exceeds ten or any slot in the
+counted prefix is empty. Request IDs must be unique for deterministic ordering.
+The accession check deliberately rejects all members of a duplicate group
+instead of guessing which record is authoritative. Dollar values, condition
+categories, crate ratings, and environmental ranges are illustrative; museum
+lenders, conservators, insurers, and transport professionals determine real
+requirements.
 
 ## Compiler status
 
