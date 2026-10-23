@@ -1,0 +1,53 @@
+use acme:trial-cohort-auditor/data
+use acme:trial-cohort-auditor/model.{TrialAudit, TrialDataset, VisitFindingKind, VisitKind}
+use acme:trial-cohort-auditor/screening
+use acme:trial-cohort-auditor/visit_audit
+
+pub fn audit(dataset: TrialDataset) -> TrialAudit {
+    let screening_report = screening.review(dataset)
+    let visits = visit_audit.review(dataset, screening_report)
+    TrialAudit(screening: screening_report, visits: visits)
+}
+
+pub fn sample_audit() -> TrialAudit {
+    audit(data.trial())
+}
+
+test "screening review applies eligibility and duplicate rules" {
+    let report = sample_audit().screening
+    assert report.row_count == 7
+    assert report.enrolled_count == 2
+    assert report.duplicate_id_count == 2
+    assert report.consent_not_signed_count == 1
+    assert report.age_out_of_range_count == 1
+    assert report.exclusion_criterion_count == 1
+    assert report.rows[0].unwrap().participant_id == 101
+    assert report.rows[0].unwrap().enrolled
+    assert report.rows[3].unwrap().participant_id == 104
+    assert not report.rows[3].unwrap().enrolled
+    assert report.rows[4].unwrap().participant_id == 104
+    assert not report.rows[4].unwrap().enrolled
+}
+
+test "visit review reports missing, late, out-of-window, and ineligible records" {
+    let report = sample_audit().visits
+    assert report.expected_visit_count == 6
+    assert report.observed_enrolled_visit_count == 5
+    assert report.ineligible_visit_count == 1
+    assert report.missing_visit_count == 1
+    assert report.out_of_window_count == 1
+    assert report.serious_event_count == 1
+    assert report.late_safety_report_count == 1
+    assert report.finding_count == 4
+}
+
+test "findings are stable across unsorted input records" {
+    let report = sample_audit().visits
+    assert report.findings[0].unwrap().participant_id == 104
+    assert report.findings[0].unwrap().kind == VisitFindingKind.VisitForIneligibleParticipant
+    assert report.findings[1].unwrap().participant_id == 106
+    assert report.findings[1].unwrap().kind == VisitFindingKind.VisitOutsideWindow
+    assert report.findings[2].unwrap().kind == VisitFindingKind.LateSafetyReport
+    assert report.findings[3].unwrap().visit == VisitKind.Week12
+    assert report.findings[3].unwrap().kind == VisitFindingKind.MissingRequiredVisit
+}

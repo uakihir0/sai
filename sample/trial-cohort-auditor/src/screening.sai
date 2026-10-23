@@ -1,0 +1,113 @@
+use acme:trial-cohort-auditor/model.{
+    ConsentStatus
+    ScreenFailure
+    ScreeningDecision
+    ScreeningRecord
+    ScreeningReport
+    TrialDataset
+}
+
+fn failure(dataset: TrialDataset, record: ScreeningRecord) -> Option<ScreenFailure> {
+    var participant_records: U32 = 0
+    for index in 0..dataset.screening_count {
+        let candidate = dataset.screenings[index].unwrap()
+        if candidate.participant_id == record.participant_id {
+            participant_records += 1
+        }
+    }
+
+    if participant_records > 1 {
+        return Some(ScreenFailure.DuplicateParticipantId)
+    }
+    if record.consent != ConsentStatus.Signed {
+        return Some(ScreenFailure.ConsentNotSigned)
+    }
+    if record.age_years < 18 or record.age_years > 70 {
+        return Some(ScreenFailure.AgeOutOfRange)
+    }
+    if record.has_exclusion_criterion {
+        return Some(ScreenFailure.ExclusionCriterion)
+    }
+    None
+}
+
+fn precedes(left: ScreeningDecision, right: ScreeningDecision) -> Bool {
+    if left.participant_id != right.participant_id {
+        return left.participant_id < right.participant_id
+    }
+    left.record_id < right.record_id
+}
+
+pub fn review(dataset: TrialDataset) -> ScreeningReport {
+    var rows: Array<Option<ScreeningDecision>, 7> = [None, None, None, None, None, None, None]
+    var enrolled_count: U32 = 0
+    var duplicate_id_count: U32 = 0
+    var consent_not_signed_count: U32 = 0
+    var age_out_of_range_count: U32 = 0
+    var exclusion_criterion_count: U32 = 0
+
+    for index in 0..dataset.screening_count {
+        let record = dataset.screenings[index].unwrap()
+        let reason = failure(dataset, record)
+        let enrolled = match reason { Some(_) => false, None => true }
+        rows[index] = Some(
+            ScreeningDecision(
+                record_id: record.record_id,
+                participant_id: record.participant_id,
+                enrolled: enrolled,
+                failure: reason,
+            ),
+        )
+        match reason {
+            Some(ScreenFailure.DuplicateParticipantId) => {
+                duplicate_id_count += 1
+            }
+            Some(ScreenFailure.ConsentNotSigned) => {
+                consent_not_signed_count += 1
+            }
+            Some(ScreenFailure.AgeOutOfRange) => {
+                age_out_of_range_count += 1
+            }
+            Some(ScreenFailure.ExclusionCriterion) => {
+                exclusion_criterion_count += 1
+            }
+            None => {
+                enrolled_count += 1
+            }
+        }
+    }
+
+    for index in 1..dataset.screening_count {
+        let candidate = rows[index].unwrap()
+        var cursor = index
+        while cursor > 0 {
+            if precedes(candidate, rows[cursor - 1].unwrap()) {
+                rows[cursor] = rows[cursor - 1]
+                cursor -= 1
+            } else {
+                break
+            }
+        }
+        rows[cursor] = Some(candidate)
+    }
+
+    ScreeningReport(
+        rows: rows,
+        row_count: dataset.screening_count,
+        enrolled_count: enrolled_count,
+        duplicate_id_count: duplicate_id_count,
+        consent_not_signed_count: consent_not_signed_count,
+        age_out_of_range_count: age_out_of_range_count,
+        exclusion_criterion_count: exclusion_criterion_count,
+    )
+}
+
+pub fn is_enrolled(report: ScreeningReport, participant_id: U32) -> Bool {
+    for index in 0..report.row_count {
+        let decision = report.rows[index].unwrap()
+        if decision.participant_id == participant_id and decision.enrolled {
+            return true
+        }
+    }
+    false
+}

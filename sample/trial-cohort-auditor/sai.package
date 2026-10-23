@@ -1,0 +1,5 @@
+package acme:trial-cohort-auditor @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Audit a fixed study cohort for screening and visit-protocol data quality"

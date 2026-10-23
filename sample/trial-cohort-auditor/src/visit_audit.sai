@@ -1,0 +1,268 @@
+use acme:trial-cohort-auditor/model.{
+    ScreeningReport
+    TrialDataset
+    VisitFinding
+    VisitFindingKind
+    VisitKind
+    VisitRecord
+    VisitReport
+}
+use acme:trial-cohort-auditor/screening
+
+fn first_day(visit: VisitKind) -> U32 {
+    match visit { VisitKind.Baseline => 0, VisitKind.Week4 => 26, VisitKind.Week12 => 82 }
+}
+
+fn last_day(visit: VisitKind) -> U32 {
+    match visit { VisitKind.Baseline => 0, VisitKind.Week4 => 30, VisitKind.Week12 => 86 }
+}
+
+fn matching_visits(dataset: TrialDataset, participant_id: U32, visit: VisitKind) -> U32 {
+    var count: U32 = 0
+    for index in 0..dataset.visit_count {
+        let record = dataset.visits[index].unwrap()
+        if record.participant_id == participant_id and record.visit == visit {
+            count += 1
+        }
+    }
+    count
+}
+
+fn visit_rank(visit: VisitKind) -> U32 {
+    match visit { VisitKind.Baseline => 0, VisitKind.Week4 => 1, VisitKind.Week12 => 2 }
+}
+
+fn finding_rank(kind: VisitFindingKind) -> U32 {
+    match kind {
+        VisitFindingKind.VisitForIneligibleParticipant => 0
+        VisitFindingKind.DuplicateVisitRecords => 1
+        VisitFindingKind.VisitOutsideWindow => 2
+        VisitFindingKind.LateSafetyReport => 3
+        VisitFindingKind.MissingRequiredVisit => 4
+    }
+}
+
+fn optional_day_precedes(left: Option<U32>, right: Option<U32>) -> Bool {
+    match left {
+        None => match right { None => false, Some(_) => true }
+        Some(left_day) => match right { None => false, Some(right_day) => left_day < right_day }
+    }
+}
+
+fn precedes(left: VisitFinding, right: VisitFinding) -> Bool {
+    if left.participant_id != right.participant_id {
+        return left.participant_id < right.participant_id
+    }
+    let left_visit_rank = visit_rank(left.visit)
+    let right_visit_rank = visit_rank(right.visit)
+    if left_visit_rank != right_visit_rank {
+        return left_visit_rank < right_visit_rank
+    }
+    let left_kind_rank = finding_rank(left.kind)
+    let right_kind_rank = finding_rank(right.kind)
+    if left_kind_rank != right_kind_rank {
+        return left_kind_rank < right_kind_rank
+    }
+    if left.observed_day != right.observed_day {
+        return optional_day_precedes(left.observed_day, right.observed_day)
+    }
+    if left.due_day != right.due_day {
+        return optional_day_precedes(left.due_day, right.due_day)
+    }
+    false
+}
+
+pub fn review(dataset: TrialDataset, screening_report: ScreeningReport) -> VisitReport {
+    var findings: Array<Option<VisitFinding>, 40> = [
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]
+    var finding_count: USize = 0
+    var expected_visit_count: U32 = 0
+    var observed_enrolled_visit_count: U32 = 0
+    var ineligible_visit_count: U32 = 0
+    var missing_visit_count: U32 = 0
+    var out_of_window_count: U32 = 0
+    var serious_event_count: U32 = 0
+    var late_safety_report_count: U32 = 0
+
+    for index in 0..dataset.visit_count {
+        let record = dataset.visits[index].unwrap()
+        if not screening.is_enrolled(screening_report, record.participant_id) {
+            findings[finding_count] = Some(
+                VisitFinding(
+                    participant_id: record.participant_id,
+                    visit: record.visit,
+                    kind: VisitFindingKind.VisitForIneligibleParticipant,
+                    observed_day: Some(record.study_day),
+                    due_day: None,
+                ),
+            )
+            finding_count += 1
+            ineligible_visit_count += 1
+        } else {
+            observed_enrolled_visit_count += 1
+            let earliest = first_day(record.visit)
+            let latest = last_day(record.visit)
+            if record.study_day < earliest or record.study_day > latest {
+                let boundary = if record.study_day < earliest {
+                    earliest
+                } else {
+                    latest
+                }
+                findings[finding_count] = Some(
+                    VisitFinding(
+                        participant_id: record.participant_id,
+                        visit: record.visit,
+                        kind: VisitFindingKind.VisitOutsideWindow,
+                        observed_day: Some(record.study_day),
+                        due_day: Some(boundary),
+                    ),
+                )
+                finding_count += 1
+                out_of_window_count += 1
+            }
+
+            match record.serious_event_onset_day {
+                Some(onset_day) => {
+                    serious_event_count += 1
+                    let deadline = onset_day + 1
+                    match record.serious_event_report_day {
+                        Some(report_day) => {
+                            if report_day > deadline {
+                                findings[finding_count] = Some(
+                                    VisitFinding(
+                                        participant_id: record.participant_id,
+                                        visit: record.visit,
+                                        kind: VisitFindingKind.LateSafetyReport,
+                                        observed_day: Some(report_day),
+                                        due_day: Some(deadline),
+                                    ),
+                                )
+                                finding_count += 1
+                                late_safety_report_count += 1
+                            }
+                        }
+                        None => {
+                            findings[finding_count] = Some(
+                                VisitFinding(
+                                    participant_id: record.participant_id,
+                                    visit: record.visit,
+                                    kind: VisitFindingKind.LateSafetyReport,
+                                    observed_day: None,
+                                    due_day: Some(deadline),
+                                ),
+                            )
+                            finding_count += 1
+                            late_safety_report_count += 1
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+
+    for index in 0..screening_report.row_count {
+        let decision = screening_report.rows[index].unwrap()
+        if decision.enrolled {
+            expected_visit_count += 3
+            for visit_index in 0..3 {
+                let visit = match visit_index {
+                    0 => VisitKind.Baseline
+                    1 => VisitKind.Week4
+                    _ => VisitKind.Week12
+                }
+                let count = matching_visits(dataset, decision.participant_id, visit)
+                if count == 0 {
+                    findings[finding_count] = Some(
+                        VisitFinding(
+                            participant_id: decision.participant_id,
+                            visit: visit,
+                            kind: VisitFindingKind.MissingRequiredVisit,
+                            observed_day: None,
+                            due_day: Some(last_day(visit)),
+                        ),
+                    )
+                    finding_count += 1
+                    missing_visit_count += 1
+                } else if count > 1 {
+                    findings[finding_count] = Some(
+                        VisitFinding(
+                            participant_id: decision.participant_id,
+                            visit: visit,
+                            kind: VisitFindingKind.DuplicateVisitRecords,
+                            observed_day: None,
+                            due_day: None,
+                        ),
+                    )
+                    finding_count += 1
+                }
+            }
+        }
+    }
+
+    for index in 1..finding_count {
+        let candidate = findings[index].unwrap()
+        var cursor = index
+        while cursor > 0 {
+            if precedes(candidate, findings[cursor - 1].unwrap()) {
+                findings[cursor] = findings[cursor - 1]
+                cursor -= 1
+            } else {
+                break
+            }
+        }
+        findings[cursor] = Some(candidate)
+    }
+
+    VisitReport(
+        findings: findings,
+        finding_count: finding_count,
+        expected_visit_count: expected_visit_count,
+        observed_enrolled_visit_count: observed_enrolled_visit_count,
+        ineligible_visit_count: ineligible_visit_count,
+        missing_visit_count: missing_visit_count,
+        out_of_window_count: out_of_window_count,
+        serious_event_count: serious_event_count,
+        late_safety_report_count: late_safety_report_count,
+    )
+}

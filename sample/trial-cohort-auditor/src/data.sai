@@ -1,0 +1,135 @@
+use acme:trial-cohort-auditor/model.{
+    ConsentStatus
+    ScreeningRecord
+    TrialDataset
+    VisitKind
+    VisitRecord
+}
+
+pub fn trial() -> TrialDataset {
+    TrialDataset(
+        screenings: [
+            Some(
+                ScreeningRecord(
+                    record_id: 7006,
+                    participant_id: 106,
+                    age_years: 44,
+                    consent: ConsentStatus.Signed,
+                    has_exclusion_criterion: false,
+                ),
+            ),
+            Some(
+                ScreeningRecord(
+                    record_id: 7001,
+                    participant_id: 101,
+                    age_years: 32,
+                    consent: ConsentStatus.Signed,
+                    has_exclusion_criterion: false,
+                ),
+            ),
+            Some(
+                ScreeningRecord(
+                    record_id: 7004,
+                    participant_id: 104,
+                    age_years: 48,
+                    consent: ConsentStatus.Signed,
+                    has_exclusion_criterion: false,
+                ),
+            ),
+            Some(
+                ScreeningRecord(
+                    record_id: 7002,
+                    participant_id: 102,
+                    age_years: 38,
+                    consent: ConsentStatus.Declined,
+                    has_exclusion_criterion: false,
+                ),
+            ),
+            Some(
+                ScreeningRecord(
+                    record_id: 7005,
+                    participant_id: 104,
+                    age_years: 48,
+                    consent: ConsentStatus.Signed,
+                    has_exclusion_criterion: false,
+                ),
+            ),
+            Some(
+                ScreeningRecord(
+                    record_id: 7007,
+                    participant_id: 105,
+                    age_years: 53,
+                    consent: ConsentStatus.Signed,
+                    has_exclusion_criterion: true,
+                ),
+            ),
+            Some(
+                ScreeningRecord(
+                    record_id: 7003,
+                    participant_id: 103,
+                    age_years: 17,
+                    consent: ConsentStatus.Signed,
+                    has_exclusion_criterion: false,
+                ),
+            ),
+        ],
+        screening_count: 7,
+        visits: [
+            Some(
+                VisitRecord(
+                    participant_id: 106,
+                    visit: VisitKind.Week4,
+                    study_day: 35,
+                    serious_event_onset_day: Some(34),
+                    serious_event_report_day: Some(37),
+                ),
+            ),
+            Some(
+                VisitRecord(
+                    participant_id: 101,
+                    visit: VisitKind.Week12,
+                    study_day: 84,
+                    serious_event_onset_day: None,
+                    serious_event_report_day: None,
+                ),
+            ),
+            Some(
+                VisitRecord(
+                    participant_id: 104,
+                    visit: VisitKind.Baseline,
+                    study_day: 0,
+                    serious_event_onset_day: None,
+                    serious_event_report_day: None,
+                ),
+            ),
+            Some(
+                VisitRecord(
+                    participant_id: 106,
+                    visit: VisitKind.Baseline,
+                    study_day: 0,
+                    serious_event_onset_day: None,
+                    serious_event_report_day: None,
+                ),
+            ),
+            Some(
+                VisitRecord(
+                    participant_id: 101,
+                    visit: VisitKind.Week4,
+                    study_day: 28,
+                    serious_event_onset_day: None,
+                    serious_event_report_day: None,
+                ),
+            ),
+            Some(
+                VisitRecord(
+                    participant_id: 101,
+                    visit: VisitKind.Baseline,
+                    study_day: 0,
+                    serious_event_onset_day: None,
+                    serious_event_report_day: None,
+                ),
+            ),
+        ],
+        visit_count: 6,
+    )
+}
