@@ -35,6 +35,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`clinic-shift-roster`](clinic-shift-roster/README.md) | Validate clinician credentials, availability, shift caps, rest periods, and required coverage. |
 | Advanced | [`court-calendar-planner`](court-calendar-planner/README.md) | Schedule fixed hearings around deadlines, judges, courtrooms, parties, witnesses, and session capacity; report unscheduled cases. |
 | Advanced | [`community-food-bank`](community-food-bank/README.md) | Allocate expiring pantry stock across household requests with dietary eligibility and priority rules. |
+| Advanced | [`community-irrigation-rotation`](community-irrigation-rotation/README.md) | Plan drought-restricted garden watering across zone windows, field and canal losses, priority order, flow caps, and a weekly allotment. |
 | Advanced | [`warehouse-fulfillment`](warehouse-fulfillment/README.md) | Reserve date-eligible inventory for prioritized orders, then choose a warehouse and route under cold-chain, delivery-deadline, and lane-capacity constraints. |
 | Advanced | [`rail-shuttle-dispatch`](rail-shuttle-dispatch/README.md) | Assign a fixed replacement-bus fleet to disrupted transit services under corridor, passenger-capacity, and wheelchair-space constraints; report unresolved requests deterministically. |
 | Advanced | [`weighted-route-finder`](weighted-route-finder/README.md) | Find a minimum-time multi-edge route with Dijkstra's algorithm, stable tie-breaking, and predecessor-based path reconstruction. |

@@ -1,0 +1,60 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Zone {
+    North
+    South
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ChannelWindow {
+    pub name: Str
+    pub zone: Zone
+    pub max_withdrawal_liters: U32
+    pub conveyance_efficiency_bps: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type IrrigationRequest {
+    pub id: U32
+    pub field: Str
+    pub zone: Zone
+    // Lower numbers are served first.
+    pub priority: U32
+    pub earliest_window: USize
+    pub latest_window: USize
+    pub target_delivery_liters: U32
+    pub application_efficiency_bps: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum HoldReason {
+    OutsideAvailableWindow
+    RequestExceedsChannel
+    FlowCapacityReserved
+    CommunityAllotmentInsufficient
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Allocation {
+    pub request_id: U32
+    pub window_index: USize
+    pub target_delivery_liters: U32
+    pub source_withdrawal_liters: U64
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Decision {
+    Scheduled(Allocation)
+    Deferred(HoldReason)
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type WaterPlan {
+    pub decisions: Array<Decision, 7>
+    // Each entry uses the same index as data.requests().
+    pub service_order: Array<USize, 7>
+    pub window_withdrawals: Array<U64, 4>
+    pub requested_delivery_liters: U64
+    pub delivered_liters: U64
+    pub total_withdrawal_liters: U64
+    pub scheduled_count: USize
+}

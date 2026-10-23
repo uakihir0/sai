@@ -1,0 +1,110 @@
+use acme:community-irrigation-rotation/model.{ChannelWindow, IrrigationRequest, Zone}
+
+pub fn weekly_allotment_liters() -> U32 {
+    5200
+}
+
+pub fn windows() -> Array<ChannelWindow, 4> {
+    [
+        ChannelWindow(
+            name: "North dawn",
+            zone: Zone.North,
+            max_withdrawal_liters: 2200,
+            conveyance_efficiency_bps: 9000,
+        ),
+        ChannelWindow(
+            name: "South dawn",
+            zone: Zone.South,
+            max_withdrawal_liters: 1500,
+            conveyance_efficiency_bps: 8500,
+        ),
+        ChannelWindow(
+            name: "North evening",
+            zone: Zone.North,
+            max_withdrawal_liters: 2000,
+            conveyance_efficiency_bps: 9500,
+        ),
+        ChannelWindow(
+            name: "South evening",
+            zone: Zone.South,
+            max_withdrawal_liters: 1800,
+            conveyance_efficiency_bps: 9000,
+        ),
+    ]
+}
+
+// The fixture order is intentionally different from service priority.
+pub fn requests() -> Array<IrrigationRequest, 7> {
+    [
+        IrrigationRequest(
+            id: 504,
+            field: "South field",
+            zone: Zone.South,
+            priority: 2,
+            earliest_window: 1,
+            latest_window: 3,
+            target_delivery_liters: 900,
+            application_efficiency_bps: 7500,
+        ),
+        IrrigationRequest(
+            id: 506,
+            field: "Kitchen beds",
+            zone: Zone.South,
+            priority: 3,
+            earliest_window: 1,
+            latest_window: 3,
+            target_delivery_liters: 100,
+            application_efficiency_bps: 9500,
+        ),
+        IrrigationRequest(
+            id: 502,
+            field: "Orchard",
+            zone: Zone.North,
+            priority: 1,
+            earliest_window: 0,
+            latest_window: 2,
+            target_delivery_liters: 1100,
+            application_efficiency_bps: 8000,
+        ),
+        IrrigationRequest(
+            id: 501,
+            field: "Seedling nursery",
+            zone: Zone.North,
+            priority: 0,
+            earliest_window: 0,
+            latest_window: 2,
+            target_delivery_liters: 900,
+            application_efficiency_bps: 9000,
+        ),
+        IrrigationRequest(
+            id: 505,
+            field: "Seedling expansion",
+            zone: Zone.North,
+            priority: 3,
+            earliest_window: 0,
+            latest_window: 2,
+            target_delivery_liters: 1000,
+            application_efficiency_bps: 8500,
+        ),
+        IrrigationRequest(
+            id: 507,
+            field: "Herb planter",
+            zone: Zone.South,
+            priority: 4,
+            earliest_window: 1,
+            latest_window: 3,
+            target_delivery_liters: 100,
+            application_efficiency_bps: 9500,
+        ),
+        IrrigationRequest(
+            id: 503,
+            field: "Greenhouse beds",
+            zone: Zone.South,
+            priority: 1,
+            earliest_window: 1,
+            latest_window: 3,
+            target_delivery_liters: 850,
+            application_efficiency_bps: 9000,
+        ),
+    ]
+}

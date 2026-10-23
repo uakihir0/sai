@@ -1,0 +1,196 @@
+use acme:community-irrigation-rotation/data
+use acme:community-irrigation-rotation/model.{
+    Allocation
+    ChannelWindow
+    Decision
+    HoldReason
+    IrrigationRequest
+    WaterPlan
+}
+use acme:community-irrigation-rotation/policy
+
+fn source_liters_for(request: IrrigationRequest, window: ChannelWindow) -> U64 {
+    let field_liters = policy.gross_field_liters(request)
+    policy.round_up_div(field_liters * 10000, U64.from(window.conveyance_efficiency_bps))
+}
+
+fn next_request_index(requests: Array<IrrigationRequest, 7>, processed: Array<Bool, 7>) -> Option<
+    USize,
+> {
+    var selected: Option<USize> = None
+    var index: USize = 0
+
+    for request in requests {
+        if not processed[index] {
+            match selected {
+                Some(current_index) => {
+                    if policy.precedes(request, requests[current_index]) {
+                        selected = Some(index)
+                    }
+                }
+                None => {
+                    selected = Some(index)
+                }
+            }
+        }
+        index += 1
+    }
+    selected
+}
+
+fn remaining_window_liters(window: ChannelWindow, already_withdrawn: U64) -> U64 {
+    let max_withdrawal = U64.from(window.max_withdrawal_liters)
+    if already_withdrawn < max_withdrawal {
+        max_withdrawal - already_withdrawn
+    } else {
+        0
+    }
+}
+
+fn choose_window(
+    request: IrrigationRequest,
+    windows: Array<ChannelWindow, 4>,
+    window_withdrawals: Array<U64, 4>,
+    total_withdrawal_liters: U64,
+) -> Option<Allocation> {
+    let weekly_allotment = U64.from(data.weekly_allotment_liters())
+    let weekly_remaining = if total_withdrawal_liters < weekly_allotment {
+        weekly_allotment - total_withdrawal_liters
+    } else {
+        0
+    }
+    var best: Option<Allocation> = None
+    var index: USize = 0
+
+    for window in windows {
+        if (
+            window.zone == request.zone
+            and index >= request.earliest_window
+            and index <= request.latest_window
+        ) {
+            let source_liters = source_liters_for(request, window)
+            let available_window_liters = remaining_window_liters(window, window_withdrawals[index])
+            if source_liters <= available_window_liters and source_liters <= weekly_remaining {
+                let candidate = Allocation(
+                    request_id: request.id,
+                    window_index: index,
+                    target_delivery_liters: request.target_delivery_liters,
+                    source_withdrawal_liters: source_liters,
+                )
+                match best {
+                    Some(current) => {
+                        if (
+                            source_liters < current.source_withdrawal_liters
+                            or (
+                                source_liters == current.source_withdrawal_liters
+                                and index < current.window_index
+                            )
+                        ) {
+                            best = Some(candidate)
+                        }
+                    }
+                    None => {
+                        best = Some(candidate)
+                    }
+                }
+            }
+        }
+        index += 1
+    }
+    best
+}
+
+fn deferred_reason(
+    request: IrrigationRequest,
+    windows: Array<ChannelWindow, 4>,
+    window_withdrawals: Array<U64, 4>,
+) -> HoldReason {
+    var has_window = false
+    var fits_any_channel = false
+    var fits_remaining_channel = false
+    var index: USize = 0
+
+    for window in windows {
+        if (
+            window.zone == request.zone
+            and index >= request.earliest_window
+            and index <= request.latest_window
+        ) {
+            has_window = true
+            let source_liters = source_liters_for(request, window)
+            if source_liters <= U64.from(window.max_withdrawal_liters) {
+                fits_any_channel = true
+                if source_liters <= remaining_window_liters(window, window_withdrawals[index]) {
+                    fits_remaining_channel = true
+                }
+            }
+        }
+        index += 1
+    }
+
+    if not has_window {
+        HoldReason.OutsideAvailableWindow
+    } else if not fits_any_channel {
+        HoldReason.RequestExceedsChannel
+    } else if not fits_remaining_channel {
+        HoldReason.FlowCapacityReserved
+    } else {
+        HoldReason.CommunityAllotmentInsufficient
+    }
+}
+
+pub fn build_plan() -> WaterPlan {
+    let requests = data.requests()
+    let windows = data.windows()
+    var processed = Array<Bool, 7>.filled(false)
+    var decisions = Array<Decision, 7>.filled(Decision.Deferred(HoldReason.OutsideAvailableWindow))
+    var service_order = Array<USize, 7>.filled(0)
+    var window_withdrawals = Array<U64, 4>.filled(0)
+    var requested_delivery_liters: U64 = 0
+    var delivered_liters: U64 = 0
+    var total_withdrawal_liters: U64 = 0
+    var scheduled_count: USize = 0
+    var processed_count: USize = 0
+
+    for request in requests {
+        requested_delivery_liters += U64.from(request.target_delivery_liters)
+    }
+
+    while processed_count < requests.len() {
+        match next_request_index(requests, processed) {
+            Some(index) => {
+                let request = requests[index]
+                processed[index] = true
+                service_order[processed_count] = index
+                match choose_window(request, windows, window_withdrawals, total_withdrawal_liters) {
+                    Some(allocation) => {
+                        decisions[index] = Decision.Scheduled(allocation)
+                        window_withdrawals[allocation.window_index] +=
+                            allocation.source_withdrawal_liters
+                        total_withdrawal_liters += allocation.source_withdrawal_liters
+                        delivered_liters += U64.from(allocation.target_delivery_liters)
+                        scheduled_count += 1
+                    }
+                    None => {
+                        decisions[index] =
+                            Decision.Deferred(deferred_reason(request, windows, window_withdrawals))
+                    }
+                }
+                processed_count += 1
+            }
+            None => {
+                processed_count = requests.len()
+            }
+        }
+    }
+
+    WaterPlan(
+        decisions: decisions,
+        service_order: service_order,
+        window_withdrawals: window_withdrawals,
+        requested_delivery_liters: requested_delivery_liters,
+        delivered_liters: delivered_liters,
+        total_withdrawal_liters: total_withdrawal_liters,
+        scheduled_count: scheduled_count,
+    )
+}

@@ -1,0 +1,78 @@
+use acme:community-irrigation-rotation/model.{Decision, HoldReason, WaterPlan}
+use acme:community-irrigation-rotation/planner
+use acme:community-irrigation-rotation/report
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        report.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    let command = args[1].as_str()
+    if command == "plan" {
+        report.print_plan(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "channels" {
+        report.print_channels(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "summary" {
+        report.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    out.write_str("usage: community-irrigation-rotation [plan|channels|summary]\n")
+    process.ExitCode.failure()
+}
+
+pub fn fixture_plan() -> WaterPlan {
+    planner.build_plan()
+}
+
+test "the higher-efficiency window is chosen while the whole request fits" {
+    let plan = fixture_plan()
+    assert plan.scheduled_count == 5
+    assert plan.window_withdrawals[2] == 1053
+    assert plan.window_withdrawals[0] == 1528
+    match plan.decisions[3] {
+        Decision.Scheduled(allocation) => {
+            assert allocation.request_id == 501
+            assert allocation.window_index == 2
+            assert allocation.source_withdrawal_liters == 1053
+        }
+        _ => {
+            assert false
+        }
+    }
+}
+
+test "a full channel window defers the lower-priority whole request" {
+    let plan = fixture_plan()
+    match plan.decisions[4] {
+        Decision.Deferred(HoldReason.FlowCapacityReserved) => {}
+        _ => {
+            assert false
+        }
+    }
+}
+
+test "the weekly allotment bounds final reservations" {
+    let plan = fixture_plan()
+    assert plan.total_withdrawal_liters == 5161
+    assert plan.delivered_liters == 3850
+    assert plan.requested_delivery_liters == 4950
+    assert plan.window_withdrawals[3] == 1168
+    match plan.decisions[5] {
+        Decision.Deferred(HoldReason.CommunityAllotmentInsufficient) => {}
+        _ => {
+            assert false
+        }
+    }
+}

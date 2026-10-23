@@ -1,0 +1,101 @@
+use acme:community-irrigation-rotation/data
+use acme:community-irrigation-rotation/model.{Decision, HoldReason, WaterPlan}
+use acme:community-irrigation-rotation/planner
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn window_name(index: USize) -> Str {
+    data.windows()[index].name
+}
+
+fn print_hold_reason(out: borrow mut Stdout, reason: HoldReason)
+    effects { stdio.write }
+{
+    match reason {
+        HoldReason.OutsideAvailableWindow =>
+            out.write_str("no matching zone window in the request's time range")
+        HoldReason.RequestExceedsChannel =>
+            out.write_str("request is larger than every eligible channel window")
+        HoldReason.FlowCapacityReserved =>
+            out.write_str("higher-priority requests use the remaining channel flow")
+        HoldReason.CommunityAllotmentInsufficient =>
+            out.write_str("the remaining weekly allotment cannot cover the full request")
+    }
+}
+
+fn print_decision(out: borrow mut Stdout, request_index: USize, plan: WaterPlan)
+    effects { stdio.write, alloc }
+{
+    let request = data.requests()[request_index]
+    out.write_str(f"#{request.id} {request.field}: ".as_str())
+    match plan.decisions[request_index] {
+        Decision.Scheduled(allocation) => {
+            let loss_liters = allocation.source_withdrawal_liters
+            -U64.from(allocation.target_delivery_liters)
+            out.write_str(
+                f"{window_name(allocation.window_index)} — {allocation.target_delivery_liters} L to field, {allocation.source_withdrawal_liters} L withdrawn ({loss_liters} L losses)\n".as_str(),
+            )
+        }
+        Decision.Deferred(reason) => {
+            out.write_str("deferred — ")
+            print_hold_reason(borrow mut out, reason)
+            out.write_str("\n")
+        }
+    }
+}
+
+pub fn print_plan(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let plan = planner.build_plan()
+    out.write_str("Community irrigation rotation\n")
+    out.write_str("Service order: priority, last allowed window, then request ID\n")
+    for rank in 0..plan.service_order.len() {
+        print_decision(borrow mut out, plan.service_order[rank], plan)
+    }
+}
+
+pub fn print_channels(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let plan = planner.build_plan()
+    let windows = data.windows()
+    out.write_str("Canal window withdrawals\n")
+    for index in 0..windows.len() {
+        let window = windows[index]
+        let used = plan.window_withdrawals[index]
+        let maximum = U64.from(window.max_withdrawal_liters)
+        let remaining = if used < maximum {
+            maximum - used
+        } else {
+            0
+        }
+        out.write_str(
+            f"{window.name}: {used} / {window.max_withdrawal_liters} L withdrawn; {remaining} L remaining\n".as_str(),
+        )
+    }
+}
+
+pub fn print_summary(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let plan = planner.build_plan()
+    let held_count = data.requests().len() - plan.scheduled_count
+    let held_liters = plan.requested_delivery_liters - plan.delivered_liters
+    let community_remaining =
+        U64.from(data.weekly_allotment_liters()) - plan.total_withdrawal_liters
+
+    out.write_str("Community irrigation summary\n")
+    out.write_str(
+        f"Requests scheduled: {plan.scheduled_count} / {data.requests().len()}\n".as_str(),
+    )
+    out.write_str(f"Requests deferred: {held_count}\n".as_str())
+    out.write_str(
+        f"Water delivered: {plan.delivered_liters} / {plan.requested_delivery_liters} L\n".as_str(),
+    )
+    out.write_str(
+        f"Water withdrawn: {plan.total_withdrawal_liters} / {data.weekly_allotment_liters()} L\n".as_str(),
+    )
+    out.write_str(f"Community allotment remaining: {community_remaining} L\n")
+    out.write_str(f"Undelivered request volume: {held_liters} L\n")
+}
