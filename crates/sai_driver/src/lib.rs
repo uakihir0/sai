@@ -1148,6 +1148,7 @@ impl Drop for StagedPhase1InputGuard {
 struct OwnedPhase1ModuleInput {
     filtered: TargetFilterResult,
     ast_ids: sai_syntax::ast::AstIdMap,
+    parser_diagnostics: Vec<sai_diagnostics::Diagnostic>,
     root: sai_syntax::SyntaxNode,
     source: Arc<SourceFile>,
     source_ref: SourceRef,
@@ -13808,9 +13809,11 @@ impl RootDatabase {
                 snapshot,
                 target_cfg,
             )?;
+            let parser_diagnostics = parsed.parser_diagnostics().to_vec();
             owned_inputs.push(OwnedPhase1ModuleInput {
                 filtered,
                 ast_ids,
+                parser_diagnostics,
                 root: parsed.root,
                 source,
                 source_ref: SourceRef {
@@ -24861,6 +24864,378 @@ mod tests {
     }
 
     #[test]
+    fn module_function_inventory_collects_generic_parameters_with_lowered_metadata() {
+        let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"fn generic<T: Bound, const N: I32, U>() {}\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<Vec<_>>(),
+            [
+                ("acme:phase1.generic", sai_semantic::SymbolKind::Fn),
+                (
+                    "acme:phase1.generic.generic[T]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.generic.generic[N]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.generic.generic[U]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+            ]
+        );
+
+        let function_owner = collection
+            .scopes()
+            .function_owners
+            .iter()
+            .find(|owner| {
+                owner.file == module_tree.modules[0].file
+                    && database
+                        .resolve_def_path(owner.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            matches!(
+                                path.data().last().map(|component| &component.data),
+                                Some(DefPathData::ValueNs(name))
+                                    if database.symbols.resolve(*name).is_ok_and(|name| name.as_ref() == "generic")
+                            )
+                        })
+            })
+            .expect("the function owner is present");
+        let function_owner_path = database
+            .resolve_def_path(function_owner.owner.def_id.to_def_id())
+            .expect("function owner DefId is valid")
+            .expect("function owner DefPath exists");
+        let def_paths = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("the selected package has a DefPath interner");
+        let type_t = database
+            .symbols
+            .intern("T")
+            .expect("type parameter interns");
+        let const_n = database
+            .symbols
+            .intern("N")
+            .expect("const parameter interns");
+        let type_u = database
+            .symbols
+            .intern("U")
+            .expect("type parameter interns");
+        let parameter_def_ids = def_paths
+            .intern_generic_params(
+                function_owner.owner.def_id,
+                &[(type_t, false, 0), (const_n, true, 0), (type_u, false, 0)],
+            )
+            .expect("HIR lowering interns function generic parameters in source order");
+        let parsed = sai_syntax::parse(&snapshot, module_tree.modules[0].file)
+            .expect("generic function module parses");
+        let function = parsed
+            .root
+            .descendants()
+            .find_map(ast::FnDecl::cast)
+            .expect("the generic function AST exists");
+        let ast_parameters = function
+            .generic_params()
+            .expect("generic parameter list exists")
+            .params()
+            .collect::<Vec<_>>();
+        for (((parameter, expected_name), def_id), expected_component) in ast_parameters
+            .iter()
+            .zip(["T", "N", "U"])
+            .zip(parameter_def_ids)
+            .zip([
+                DefPathData::TypeParam(type_t),
+                DefPathData::ConstParam(const_n),
+                DefPathData::TypeParam(type_u),
+            ])
+        {
+            let (name_token, syntax) = match parameter {
+                ast::GenericParam::Type(parameter) => (
+                    parameter.name().and_then(|name| name.token()),
+                    parameter.syntax().clone(),
+                ),
+                ast::GenericParam::Const(parameter) => (
+                    parameter.name().and_then(|name| name.token()),
+                    parameter.syntax().clone(),
+                ),
+            };
+            let name_token = name_token.expect("generic parameter name token exists");
+            assert_eq!(name_token.text(), expected_name);
+
+            let from_interner = def_paths
+                .resolve(def_id)
+                .expect("lowered generic parameter DefId resolves")
+                .expect("lowered generic parameter path exists");
+            let from_database = database
+                .resolve_def_path(def_id.to_def_id())
+                .expect("lowered generic parameter DefId is valid")
+                .expect("lowered generic parameter DefId resolves through HIR");
+            assert_eq!(from_interner, from_database);
+            assert_eq!(from_database.package(), module_tree.package);
+            assert_eq!(
+                &from_database.data()[..function_owner_path.data().len()],
+                function_owner_path.data()
+            );
+            assert_eq!(
+                from_database.data().len(),
+                function_owner_path.data().len() + 1
+            );
+            assert!(matches!(
+                from_database.data().last(),
+                Some(component)
+                    if component.data == expected_component && component.disambiguator == 0
+            ));
+
+            let canonical_path = format!("acme:phase1.generic.generic[{expected_name}]");
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == canonical_path)
+                .expect("the generic parameter has a canonical path");
+            let expected_hash = sai_hir::DefPathHash::compute(
+                &from_database,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("the HIR generic parameter path hashes");
+            assert_eq!(
+                symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+            assert_eq!(symbol.kind(), sai_semantic::SymbolKind::GenericParam);
+            assert_eq!(
+                symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint(
+                    sai_semantic::SymbolKind::GenericParam,
+                    &syntax,
+                    Some(&name_token),
+                )
+                .expect("generic parameter fingerprint is defined")
+            );
+        }
+    }
+
+    #[test]
+    fn module_function_generic_parameter_fingerprints_ignore_name_and_track_bounds_and_const_type()
+    {
+        let fingerprint_for = |source: &[u8]| {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert_eq!(
+                inventory.coverage(),
+                &sai_semantic::InventoryCoverage::Complete
+            );
+            inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind() == sai_semantic::SymbolKind::GenericParam)
+                .expect("the generic parameter is inventoried")
+                .fingerprint()
+        };
+
+        let type_original = fingerprint_for(b"fn f<T: Bound>() {}\n");
+        let type_renamed = fingerprint_for(b"fn f<U: Bound>() {}\n");
+        let changed_bound = fingerprint_for(b"fn f<T: Other>() {}\n");
+        let const_original = fingerprint_for(b"fn f<const N: I32>() {}\n");
+        let changed_const_type = fingerprint_for(b"fn f<const N: U32>() {}\n");
+
+        assert_eq!(
+            type_original, type_renamed,
+            "renaming a generic parameter preserves its fingerprint"
+        );
+        assert_ne!(
+            type_original, changed_bound,
+            "a type parameter bound contributes to its fingerprint"
+        );
+        assert_ne!(
+            const_original, changed_const_type,
+            "a const parameter type contributes to its fingerprint"
+        );
+    }
+
+    #[test]
+    fn module_function_generic_parameter_disambiguators_preserve_duplicate_paths_as_incomplete() {
+        let (database, module_tree, _, collection) =
+            collect_package_inventory_for_target(b"fn duplicate<T, T>() {}\n", b"", "wasm32-core");
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("duplicate canonical symbol path")
+        ));
+        let parameters = inventory
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.kind() == sai_semantic::SymbolKind::GenericParam)
+            .collect::<Vec<_>>();
+        assert_eq!(parameters.len(), 2);
+        assert_eq!(parameters[0].path(), "acme:phase1.duplicate.generic[T]");
+        assert_eq!(parameters[1].path(), parameters[0].path());
+        assert_ne!(
+            parameters[0].def_path_hash(),
+            parameters[1].def_path_hash(),
+            "the duplicate type parameter name receives distinct HIR disambiguators"
+        );
+
+        let owner = collection
+            .scopes()
+            .function_owners
+            .iter()
+            .find(|owner| owner.file == module_tree.modules[0].file)
+            .expect("the duplicate-parameter function owner exists");
+        let def_paths = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("the selected package has a DefPath interner");
+        let type_t = database
+            .symbols
+            .intern("T")
+            .expect("type parameter interns");
+        let ids = def_paths
+            .intern_generic_params(
+                owner.owner.def_id,
+                &[(type_t, false, 0), (type_t, false, 1)],
+            )
+            .expect("HIR lowering disambiguates equal type parameters in source order");
+        for (parameter, (id, expected_disambiguator)) in
+            parameters.iter().zip(ids.into_iter().zip([0, 1]))
+        {
+            let path = database
+                .resolve_def_path(id.to_def_id())
+                .expect("generic parameter DefId is valid")
+                .expect("generic parameter DefPath exists");
+            assert!(matches!(
+                path.data().last(),
+                Some(component)
+                    if component.data == DefPathData::TypeParam(type_t)
+                        && component.disambiguator == expected_disambiguator
+            ));
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&path, &database.packages, &database.symbols)
+                    .expect("generic parameter DefPath hashes");
+            assert_eq!(
+                parameter.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+        }
+    }
+
+    #[test]
+    fn module_function_inventory_filters_generic_parameters_by_target_and_rejects_target_errors() {
+        let source = b"@target(\"wasm64-core\")\nfn only64<T>() {}\n";
+        let (_, _, _, wasm32) = collect_package_inventory_for_target(source, b"", "wasm32-core");
+        assert_eq!(
+            inventory_symbols(&wasm32).coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert!(inventory_symbols(&wasm32).symbols().is_empty());
+
+        let (_, _, _, wasm64) = collect_package_inventory_for_target(source, b"", "wasm64-core");
+        let wasm64 = inventory_symbols(&wasm64);
+        assert_eq!(
+            wasm64.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            wasm64
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.path())
+                .collect::<Vec<_>>(),
+            ["acme:phase1.only64", "acme:phase1.only64.generic[T]"]
+        );
+
+        let (_, _, _, invalid_target) = collect_package_inventory_for_target(
+            b"@target(\"wasm32-linux\")\nfn uncertain<T>() {}\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(matches!(
+            inventory_symbols(&invalid_target).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("target-selection error")
+        ));
+    }
+
+    #[test]
+    fn module_function_inventory_fails_closed_for_malformed_generic_parameter_syntax() {
+        let (_, _, _, collection) =
+            collect_package_inventory_for_target(b"fn malformed<T:>() {}\n", b"", "wasm32-core");
+        assert!(matches!(
+            inventory_symbols(&collection).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("syntax tree contains recovery or parse errors")
+        ));
+    }
+
+    #[test]
+    fn module_function_inventory_fails_closed_for_generic_parameter_parser_diagnostics() {
+        let (mut database, module_tree, snapshot, collection) =
+            collect_package_inventory_for_target(
+                b"fn invalid<@target(\"wasm64-core\") T>() {}\n",
+                b"",
+                "wasm32-core",
+            );
+        let file_id = module_tree.modules[0].file;
+        let parsed = sai_syntax::parse(&snapshot, file_id)
+            .expect("the generic-parameter fixture parses with a diagnostic");
+        assert!(parsed.parser_diagnostics().iter().any(|diagnostic| {
+            diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget
+        }));
+        assert!(matches!(
+            inventory_symbols(&collection).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("generic-parameter list has a parser diagnostic")
+        ));
+
+        let ast_ids = database
+            .ast_id_map(&snapshot, file_id)
+            .expect("module AST ID map is available");
+        let item_tree = database
+            .def_collector(&snapshot, file_id)
+            .expect("the module ItemTree is available");
+        let source = snapshot
+            .file(file_id)
+            .expect("module snapshot file exists")
+            .source()
+            .text();
+        let filtered = item_tree
+            .filter_for_target(
+                source,
+                &parsed.root,
+                &ast_ids,
+                &database.symbols,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").expect("target config is valid"),
+            )
+            .expect("target filtering keeps the invalid generic parameter");
+        assert!(
+            filtered
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::InvalidAttributeTarget),
+            "the regression fixture must stay outside filtered-item diagnostics"
+        );
+    }
+
+    #[test]
     fn module_symbol_inventory_collects_functions_constants_and_effects_with_stable_metadata() {
         let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
             b"fn root_fn() {}\nconst ROOT_VALUE: I32 = 7\neffect audit\n",
@@ -25112,14 +25487,11 @@ mod tests {
     }
 
     #[test]
-    fn module_function_inventory_fails_closed_for_generic_functions_and_other_symbols() {
-        for (source, expected_reason) in [
-            (&b"fn generic<T>() {}\n"[..], "generic function"),
-            (
-                &b"type Marker {}\n"[..],
-                "outside the function-constant-effect inventory",
-            ),
-        ] {
+    fn module_function_inventory_fails_closed_for_other_symbol_forms() {
+        for (source, expected_reason) in [(
+            &b"type Marker {}\n"[..],
+            "outside the function-generic-parameter-constant-effect inventory",
+        )] {
             let (_, _, _, collection) =
                 collect_package_inventory_for_target(source, b"", "wasm32-core");
             let inventory = inventory_symbols(&collection);

@@ -41,9 +41,10 @@ impl Phase1PackageSymbolInventory {
     }
 }
 
-/// Collects target-visible, non-generic module-level functions, constants,
-/// and user effects. Every other symbol-bearing declaration makes the result
-/// incomplete until its symbol kind and path are collected as well.
+/// Collects target-visible module-level functions and their generic
+/// parameters, constants, and user effects. Every other symbol-bearing
+/// declaration makes the result incomplete until its symbol kind and path are
+/// collected as well.
 pub(super) fn collect_module_function_inventory(
     package_key: &PackageKey,
     package_version: Option<&MvsPackageVersion>,
@@ -276,7 +277,7 @@ pub(super) fn collect_module_function_inventory(
                 // functions are children of ExternBlock and are symbols.
                 _ => {
                     reasons.insert(format!(
-                        "target-filtered declaration {:?} is outside the function-constant-effect inventory",
+                        "target-filtered declaration {:?} is outside the function-generic-parameter-constant-effect inventory",
                         entry.kind
                     ));
                 }
@@ -673,14 +674,6 @@ fn collect_function(
         reasons
             .insert("the target-filtered ItemTree contains a duplicate function AST ID".to_owned());
     }
-    if !entry.children.is_empty() {
-        reasons.insert(format!(
-            "generic function {:?} is not supported by the first inventory slice",
-            symbols
-                .resolve(entry.name)
-                .unwrap_or_else(|_| "<unresolved>".into())
-        ));
-    }
     if entry.name == Symbol::ERROR {
         reasons.insert("a target-filtered function has no valid declaration name".to_owned());
         return;
@@ -803,11 +796,243 @@ fn collect_function(
         }
     };
     current_symbols.push(CurrentSymbol::new(
-        canonical_path,
+        canonical_path.clone(),
         def_path_hash,
         SymbolKind::Fn,
         fingerprint,
     ));
+    collect_function_generic_params(
+        entry,
+        &function,
+        &canonical_path,
+        descriptor.owner.def_id,
+        &def_path,
+        input,
+        package_id,
+        canonical_paths,
+        current_symbols,
+        reasons,
+        def_paths,
+        packages,
+        symbols,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_function_generic_params(
+    entry: &ItemTreeEntry,
+    function: &ast::FnDecl,
+    function_path: &str,
+    function_owner: LocalDefId,
+    function_def_path: &sai_hir::DefPath,
+    input: &OwnedPhase1ModuleInput,
+    package_id: PackageId,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    reasons: &mut HashSet<String>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) {
+    let generic_param_list = function.generic_params();
+    let ast_params = generic_param_list
+        .as_ref()
+        .map(|params| params.params().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if generic_param_list.as_ref().is_some_and(|params| {
+        input.parser_diagnostics.iter().any(|diagnostic| {
+            parser_diagnostic_overlaps_syntax(
+                diagnostic,
+                input.filtered.item_tree.file,
+                &params.syntax(),
+            )
+        })
+    }) {
+        reasons.insert("a function generic-parameter list has a parser diagnostic".to_owned());
+        return;
+    }
+    if entry.children.len() != ast_params.len() {
+        reasons.insert(
+            "a function's ItemTree generic-parameter count does not match its snapshot AST"
+                .to_owned(),
+        );
+        return;
+    }
+
+    let mut validated = Vec::with_capacity(ast_params.len());
+    for (parameter, child) in ast_params.iter().zip(&entry.children) {
+        let (expected_kind, ast_id, name_node, syntax, is_const) = match parameter {
+            ast::GenericParam::Type(parameter) => (
+                ItemTreeKind::TypeParam,
+                input.ast_ids.ast_id(parameter).map(|id| id.erase()),
+                parameter.name(),
+                parameter.syntax().clone(),
+                false,
+            ),
+            ast::GenericParam::Const(parameter) => (
+                ItemTreeKind::ConstParam,
+                input.ast_ids.ast_id(parameter).map(|id| id.erase()),
+                parameter.name(),
+                parameter.syntax().clone(),
+                true,
+            ),
+        };
+        if child.kind != expected_kind {
+            reasons.insert(
+                "a function's ItemTree generic-parameter kind does not match its snapshot AST"
+                    .to_owned(),
+            );
+            return;
+        }
+        if ast_id != Some(child.ast_id) || input.ast_ids.pointer(child.ast_id).is_none() {
+            reasons.insert(
+                "a function's ItemTree generic-parameter ID does not match its snapshot AST"
+                    .to_owned(),
+            );
+            return;
+        }
+        if !child.children.is_empty() {
+            reasons.insert("a generic parameter has unexpected child declarations".to_owned());
+            return;
+        }
+        if child.name == Symbol::ERROR {
+            reasons.insert("a function generic parameter has no valid ItemTree name".to_owned());
+            return;
+        }
+        let name = match symbols.resolve(child.name) {
+            Ok(name) if !name.is_empty() => name.to_string(),
+            _ => {
+                reasons.insert("a function generic parameter name cannot be resolved".to_owned());
+                return;
+            }
+        };
+        let Some(name_node) = name_node else {
+            reasons.insert("a function generic-parameter AST has no name node".to_owned());
+            return;
+        };
+        let Some(name_token) = name_node.token() else {
+            reasons.insert("a function generic-parameter AST has no name token".to_owned());
+            return;
+        };
+        let raw_name = name_token
+            .text()
+            .strip_prefix("r#")
+            .unwrap_or(name_token.text());
+        if sai_syntax::normalize_identifier(raw_name) != name {
+            reasons.insert(
+                "the ItemTree and generic-parameter AST disagree about the declaration name"
+                    .to_owned(),
+            );
+            return;
+        }
+        if syntax_has_errors(&syntax) || name_token.has_error() {
+            reasons.insert(
+                "a function generic-parameter AST contains recovery or parse errors".to_owned(),
+            );
+            return;
+        }
+        validated.push((child.name, name, name_token, syntax, is_const));
+    }
+
+    // Match lower::prepare_generic_params: disambiguators are ordinals for
+    // equal kind-and-name components, in source order.
+    let mut next_disambiguator = HashMap::<DefPathData, u32>::new();
+    let mut path_parameters = Vec::with_capacity(validated.len());
+    let mut expected_components = Vec::with_capacity(validated.len());
+    for (name, _, _, _, is_const) in &validated {
+        let component = if *is_const {
+            DefPathData::ConstParam(*name)
+        } else {
+            DefPathData::TypeParam(*name)
+        };
+        let disambiguator = next_disambiguator.entry(component.clone()).or_default();
+        let ordinal = *disambiguator;
+        let Some(next) = ordinal.checked_add(1) else {
+            reasons.insert("function generic-parameter disambiguator overflowed".to_owned());
+            return;
+        };
+        *disambiguator = next;
+        path_parameters.push((*name, *is_const, ordinal));
+        expected_components.push((component, ordinal));
+    }
+    let parameter_def_ids = match def_paths.intern_generic_params(function_owner, &path_parameters)
+    {
+        Ok(def_ids) if def_ids.len() == validated.len() => def_ids,
+        Ok(_) => {
+            reasons.insert(
+                "HIR returned the wrong number of function generic-parameter definitions".into(),
+            );
+            return;
+        }
+        Err(_) => {
+            reasons.insert("function generic-parameter definitions cannot be interned".to_owned());
+            return;
+        }
+    };
+
+    let mut generic_symbols = Vec::with_capacity(validated.len());
+    for (((_, name, name_token, syntax, _), def_id), (expected_component, disambiguator)) in
+        validated
+            .iter()
+            .zip(parameter_def_ids)
+            .zip(expected_components)
+    {
+        let def_path = match def_paths.resolve(def_id) {
+            Ok(Some(path)) if path.package() == package_id => path,
+            _ => {
+                reasons.insert(
+                    "a function generic parameter has no definition path in the selected package"
+                        .to_owned(),
+                );
+                return;
+            }
+        };
+        let parent_len = function_def_path.data().len();
+        let exact_path = def_path.data().len() == parent_len + 1
+            && &def_path.data()[..parent_len] == function_def_path.data()
+            && def_path.data().last().is_some_and(|component| {
+                component.data == expected_component && component.disambiguator == disambiguator
+            });
+        if !exact_path {
+            reasons.insert(
+                "a function generic-parameter DefPath disagrees with lowering order or kind"
+                    .to_owned(),
+            );
+            return;
+        }
+        let def_path_hash = match DefPathHash::compute(&def_path, packages, symbols) {
+            Ok(hash) => Fingerprint::new(hash.raw()),
+            Err(_) => {
+                reasons.insert(
+                    "a function generic-parameter definition path hash cannot be computed"
+                        .to_owned(),
+                );
+                return;
+            }
+        };
+        let fingerprint =
+            match declaration_fingerprint(SymbolKind::GenericParam, syntax, Some(name_token)) {
+                Ok(fingerprint) => fingerprint,
+                Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                    reasons.insert(
+                        "a generic-parameter name token is outside its declaration syntax node"
+                            .to_owned(),
+                    );
+                    return;
+                }
+            };
+        let canonical_path = format!("{function_path}.generic[{name}]");
+        if !canonical_paths.insert(canonical_path.clone()) {
+            reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+        }
+        generic_symbols.push(CurrentSymbol::new(
+            canonical_path,
+            def_path_hash,
+            SymbolKind::GenericParam,
+            fingerprint,
+        ));
+    }
+    current_symbols.extend(generic_symbols);
 }
 
 fn syntax_has_errors(root: &SyntaxNode) -> bool {
@@ -825,4 +1050,20 @@ fn syntax_has_errors(root: &SyntaxNode) -> bool {
         }
     }
     false
+}
+
+fn parser_diagnostic_overlaps_syntax(
+    diagnostic: &sai_diagnostics::Diagnostic,
+    file_id: FileId,
+    syntax: &SyntaxNode,
+) -> bool {
+    let Some(primary) = diagnostic.primary() else {
+        return true;
+    };
+    if primary.span.file != file_id {
+        return false;
+    }
+    let diagnostic_range = primary.span.range;
+    let syntax_range = syntax.text_range();
+    diagnostic_range.start() <= syntax_range.end() && syntax_range.start() <= diagnostic_range.end()
 }
