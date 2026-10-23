@@ -1,9 +1,9 @@
 use crate::canonical_path::is_canonical_symbol_path;
-use crate::symbol_index::decode_package_entries;
+use crate::symbol_index::{SymbolIndexHeader, decode_package_entries};
 use crate::{PackageIndexFileName, SymbolHex};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use sai_stable_hash::hash_bytes;
+use sai_stable_hash::{ContentHash, hash_bytes};
 use semver::Version;
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
@@ -227,13 +227,7 @@ impl IndexOperationJournal {
         if files.is_empty() {
             return Err(IndexJournalCodecError::EmptyPlannedIndex);
         }
-        files
-            .keys()
-            .map(|file| {
-                PackageIndexFileName::parse(file)
-                    .map_err(|_| IndexJournalCodecError::InvalidIndexHeader)
-            })
-            .collect()
+        Ok(files.iter().map(|record| record.file().clone()).collect())
     }
 
     fn validate(&self) -> Result<(), IndexJournalCodecError> {
@@ -566,28 +560,13 @@ where
     Option::<T>::deserialize(deserializer)
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct IndexHeaderJson {
-    format: String,
-    version: u32,
-    packages: Vec<IndexPackageFileJson>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct IndexPackageFileJson {
-    file: String,
-    blake3: String,
-}
-
 struct PackageNodeKey {
     package_id: String,
     index_file: PackageIndexFileName,
 }
 
 struct ValidatedIndexSnapshot<'a> {
-    header: BTreeMap<String, String>,
+    header: BTreeMap<String, ContentHash>,
     files: BTreeMap<&'a str, &'a FileState>,
     symbol_paths: BTreeMap<(String, SymbolHex), String>,
 }
@@ -637,7 +616,10 @@ fn validate_index_snapshot<'a>(
     snapshot: &'a IndexSnapshot,
     planned_after: bool,
 ) -> Result<ValidatedIndexSnapshot<'a>, IndexJournalCodecError> {
-    let header = parse_index_header(&snapshot.header)?;
+    let header = parse_index_header(&snapshot.header)?
+        .into_iter()
+        .map(|record| (record.file().as_str().to_owned(), record.digest()))
+        .collect::<BTreeMap<_, _>>();
     let mut files = BTreeMap::new();
     let mut symbol_paths = BTreeMap::new();
     let mut previous_name: Option<&str> = None;
@@ -655,7 +637,7 @@ fn validate_index_snapshot<'a>(
                 let Some(bytes) = package_file.state.bytes() else {
                     return Err(IndexJournalCodecError::IndexFileStateMismatch);
                 };
-                if hash_bytes(bytes).to_hex() != *expected_digest {
+                if hash_bytes(bytes) != *expected_digest {
                     return Err(IndexJournalCodecError::IndexFileStateMismatch);
                 }
                 let entries = decode_package_entries(bytes, &package_file.file)
@@ -683,38 +665,14 @@ fn validate_index_snapshot<'a>(
 
 fn parse_index_header(
     state: &FileState,
-) -> Result<BTreeMap<String, String>, IndexJournalCodecError> {
+) -> Result<Vec<crate::PackageIndexFileRecord>, IndexJournalCodecError> {
     let bytes = match state {
-        FileState::Absent => return Ok(BTreeMap::new()),
+        FileState::Absent => return Ok(Vec::new()),
         FileState::RegularFile(bytes) => bytes,
     };
-    let header: IndexHeaderJson =
-        parse_canonical_document(bytes).map_err(|_| IndexJournalCodecError::InvalidIndexHeader)?;
-    if header.format != "sai-index" || header.version != 1 {
-        return Err(IndexJournalCodecError::InvalidIndexHeader);
-    }
-
-    let mut files = BTreeMap::new();
-    let mut previous_name: Option<String> = None;
-    for package_file in header.packages {
-        let parsed_file = PackageIndexFileName::parse(&package_file.file)
-            .map_err(|_| IndexJournalCodecError::InvalidIndexHeader)?;
-        if !is_canonical_blake3(&package_file.blake3)
-            || previous_name
-                .as_ref()
-                .is_some_and(|previous| previous.as_bytes() >= parsed_file.as_str().as_bytes())
-        {
-            return Err(IndexJournalCodecError::InvalidIndexHeader);
-        }
-        previous_name = Some(parsed_file.as_str().to_owned());
-        if files
-            .insert(parsed_file.as_str().to_owned(), package_file.blake3)
-            .is_some()
-        {
-            return Err(IndexJournalCodecError::InvalidIndexHeader);
-        }
-    }
-    Ok(files)
+    SymbolIndexHeader::decode(bytes)
+        .map(|header| header.records().to_vec())
+        .map_err(|_| IndexJournalCodecError::InvalidIndexHeader)
 }
 
 fn validate_mapping_side(
@@ -813,13 +771,6 @@ fn is_canonical_uuid_v4(value: &str) -> bool {
             19 => matches!(*byte, b'8' | b'9' | b'a' | b'b'),
             _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(byte),
         })
-}
-
-fn is_canonical_blake3(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn compare_source_keys(left: (&str, &str, &str), right: (&str, &str, &str)) -> std::cmp::Ordering {
@@ -1044,19 +995,40 @@ fn encode_canonical_document<T: Serialize>(value: &T) -> Result<Vec<u8>, IndexJo
 #[cfg(test)]
 mod tests {
     use super::{
-        FileState, IndexHeaderJson, IndexJournalCodecError, IndexJournalOrigin, IndexJournalState,
-        IndexOperationJournal, IndexPackageFileJson, IndexSnapshot, JournalJson,
-        MAX_OPERATION_JOURNAL_BYTES, PackageFileState, SourceFileChange, SymbolIdMapping,
-        check_document_size, encode_canonical_document,
+        FileState, FileStateJson, IndexJournalCodecError, IndexJournalOrigin, IndexJournalState,
+        IndexOperationJournal, IndexSnapshot, JournalJson, MAX_OPERATION_JOURNAL_BYTES,
+        PackageFileState, SourceFileChange, SymbolIdMapping, check_document_size,
+        encode_canonical_document,
     };
-    use crate::{PackageIndexFileName, SymbolHex, SymbolIndexEntry, SymbolKind};
+    use crate::{
+        PackageIndexFileName, SymbolHex, SymbolIndexCodecError, SymbolIndexEntry,
+        SymbolIndexHeader, SymbolKind,
+    };
+    use base64::Engine;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use sai_stable_hash::{Fingerprint, hash_bytes};
+    use serde::{Deserialize, Serialize};
 
     const OPERATION_ID: &str = "1c71050c-1e25-4acd-8a56-03af72c9ce7a";
     const PACKAGE_NODE_KEY: &str = "package:acme:user@1.0.0";
     const INDEX_FILE: &str = "acme.user.1.jsonl";
     const BEFORE_PATH: &str = "acme:user/src.greet";
     const AFTER_PATH: &str = "acme:user/src.say";
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct IndexHeaderJson {
+        format: String,
+        version: u32,
+        packages: Vec<IndexPackageFileJson>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct IndexPackageFileJson {
+        file: String,
+        blake3: String,
+    }
 
     fn package_file_state(bytes: &[u8]) -> PackageFileState {
         PackageFileState {
@@ -1531,6 +1503,124 @@ mod tests {
         assert_eq!(
             empty.planned_index_package_files(),
             Err(IndexJournalCodecError::EmptyPlannedIndex)
+        );
+    }
+
+    #[test]
+    fn journal_header_validation_uses_the_shared_symbol_index_parser() {
+        let package = |file: &str, blake3: &str| IndexPackageFileJson {
+            file: file.into(),
+            blake3: blake3.into(),
+        };
+        let header = |format: &str, version, packages| {
+            encode_canonical_document(&IndexHeaderJson {
+                format: format.into(),
+                version,
+                packages,
+            })
+            .unwrap()
+        };
+        let valid_digest = hash_bytes(&[]).to_hex();
+        let valid_header = match sample_journal().index_after.header {
+            FileState::RegularFile(header) => header,
+            FileState::Absent => unreachable!(),
+        };
+        let cases = [
+            (valid_header.clone(), None),
+            (
+                header(
+                    "sai-index",
+                    1,
+                    vec![
+                        package("acme.user.1.jsonl", &valid_digest),
+                        package("acme.user.1.jsonl", &valid_digest),
+                    ],
+                ),
+                Some(SymbolIndexCodecError::DuplicatePackageFile),
+            ),
+            (
+                header(
+                    "sai-index",
+                    1,
+                    vec![
+                        package("acme.z.1.jsonl", &valid_digest),
+                        package("acme.a.1.jsonl", &valid_digest),
+                    ],
+                ),
+                Some(SymbolIndexCodecError::UnorderedPackageFiles),
+            ),
+            (
+                header(
+                    "sai-index",
+                    1,
+                    vec![package("../outside.jsonl", &valid_digest)],
+                ),
+                Some(SymbolIndexCodecError::InvalidPackageFileName),
+            ),
+            (
+                header(
+                    "sai-index",
+                    1,
+                    vec![package(INDEX_FILE, "A".repeat(64).as_str())],
+                ),
+                Some(SymbolIndexCodecError::InvalidDigest),
+            ),
+            (
+                header("other-index", 1, Vec::new()),
+                Some(SymbolIndexCodecError::UnsupportedFormat),
+            ),
+            (
+                header("sai-index", 2, Vec::new()),
+                Some(SymbolIndexCodecError::UnsupportedVersion),
+            ),
+        ];
+
+        for (header_bytes, expected_error) in cases {
+            if let Some(expected_error) = expected_error {
+                assert_eq!(
+                    SymbolIndexHeader::decode(&header_bytes),
+                    Err(expected_error)
+                );
+                let mut journal = sample_journal();
+                journal.index_after.header = FileState::RegularFile(header_bytes);
+                assert_eq!(
+                    journal.encode(),
+                    Err(IndexJournalCodecError::InvalidIndexHeader),
+                    "{expected_error:?}"
+                );
+            } else {
+                assert!(SymbolIndexHeader::decode(&header_bytes).is_ok());
+                let mut journal = sample_journal();
+                journal.index_after.header = FileState::RegularFile(header_bytes);
+                assert!(journal.encode().is_ok());
+            }
+        }
+
+        let noncanonical = String::from_utf8(valid_header.clone())
+            .unwrap()
+            .replace("\"format\":\"sai-index\"", "\"format\": \"sai-index\"")
+            .into_bytes();
+        assert_eq!(
+            SymbolIndexHeader::decode(&noncanonical),
+            Err(SymbolIndexCodecError::NonCanonicalJson)
+        );
+        let mut journal = sample_journal();
+        journal.index_after.header = FileState::RegularFile(noncanonical);
+        assert_eq!(
+            journal.encode(),
+            Err(IndexJournalCodecError::InvalidIndexHeader)
+        );
+
+        let invalid_header = header("sai-index", 1, vec![package(INDEX_FILE, &"A".repeat(64))]);
+        let encoded_journal = sample_journal().encode().unwrap();
+        let mut json: JournalJson =
+            serde_json::from_slice(&encoded_journal[..encoded_journal.len() - 1]).unwrap();
+        json.index_after.header = FileStateJson::RegularFile {
+            bytes: URL_SAFE_NO_PAD.encode(invalid_header),
+        };
+        assert_eq!(
+            IndexOperationJournal::decode(&encoded_json(&json)),
+            Err(IndexJournalCodecError::InvalidIndexHeader)
         );
     }
 }
