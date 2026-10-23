@@ -70,6 +70,7 @@ pub enum IndexOperationJournalStoreError {
     IndexFileNotRecorded,
     IndexStateNotRecorded,
     IndexFileChanged,
+    IndexHeaderNotBefore,
 }
 
 impl fmt::Display for IndexOperationJournalStoreError {
@@ -118,6 +119,9 @@ impl fmt::Display for IndexOperationJournalStoreError {
             ),
             Self::IndexFileChanged => formatter
                 .write_str("the index file no longer matches either recorded operation state"),
+            Self::IndexHeaderNotBefore => {
+                formatter.write_str("the index header is not at its recorded before state")
+            }
         }
     }
 }
@@ -136,7 +140,8 @@ impl Error for IndexOperationJournalStoreError {
             | Self::OperationIdChanged
             | Self::IndexFileNotRecorded
             | Self::IndexStateNotRecorded
-            | Self::IndexFileChanged => None,
+            | Self::IndexFileChanged
+            | Self::IndexHeaderNotBefore => None,
         }
     }
 }
@@ -223,6 +228,56 @@ impl<'lock> IndexOperationJournalStore<'lock> {
         expected: &FileState,
         desired: &FileState,
     ) -> Result<ConditionalFileUpdate, IndexOperationJournalStoreError> {
+        self.update_index_file_if_matches_with_header_condition(
+            journal, target, expected, desired, None,
+        )
+    }
+
+    /// Conditionally updates one journaled package-index file only while the
+    /// recorded before header is current.
+    ///
+    /// This is the rollback primitive for the package-file stage: callers
+    /// restore `index.json` first, then restore one package file at a time.
+    /// The header check and package-file update use the same opened index
+    /// directory handle while the caller holds the exclusive workspace lock.
+    /// The package target and exact planned-after-to-before byte pair must be
+    /// recorded by `journal`; this method cannot move a package file forward.
+    /// A changed header returns `IndexHeaderNotBefore` and leaves the package
+    /// file untouched. Third-state package bytes return `IndexFileChanged`.
+    /// Post-publication directory-flush failures remain uncertain and require
+    /// readback with the journal retained.
+    pub fn update_package_index_file_if_before_header(
+        &self,
+        journal: &IndexOperationJournal,
+        file: &PackageIndexFileName,
+        expected: &FileState,
+        desired: &FileState,
+    ) -> Result<ConditionalFileUpdate, IndexOperationJournalStoreError> {
+        self.require_exclusive()?;
+        let Some((before, after)) = affected_file_state(journal, file) else {
+            return Err(IndexOperationJournalStoreError::IndexFileNotRecorded);
+        };
+        if expected != after || desired != before {
+            return Err(IndexOperationJournalStoreError::IndexStateNotRecorded);
+        }
+
+        self.update_index_file_if_matches_with_header_condition(
+            journal,
+            IndexOperationJournalIndexTarget::Package(file.clone()),
+            expected,
+            desired,
+            Some(&journal.index_before.header),
+        )
+    }
+
+    fn update_index_file_if_matches_with_header_condition(
+        &self,
+        journal: &IndexOperationJournal,
+        target: IndexOperationJournalIndexTarget,
+        expected: &FileState,
+        desired: &FileState,
+        required_header: Option<&FileState>,
+    ) -> Result<ConditionalFileUpdate, IndexOperationJournalStoreError> {
         self.require_exclusive()?;
 
         let (file_name, before, after) = match &target {
@@ -266,6 +321,31 @@ impl<'lock> IndexOperationJournalStore<'lock> {
         };
         if current.journal != *journal || current.bytes != encoded_journal {
             return Err(IndexOperationJournalStoreError::JournalChanged);
+        }
+
+        if let Some(required_header) = required_header {
+            let maximum_header_bytes = state_bytes(&journal.index_before.header)
+                .map_or(0, <[u8]>::len)
+                .max(state_bytes(&journal.index_after.header).map_or(0, <[u8]>::len));
+            let header_observation = observe_stable_bounded_file(
+                &index_directory,
+                &self.index_directory_path(),
+                OsStr::new("index.json"),
+                maximum_header_bytes,
+            )
+            .map_err(|source| {
+                self.io_error(self.index_directory_path().join("index.json"), source)
+            })?;
+            let header_matches_required = match (required_header, header_observation.state) {
+                (FileState::Absent, ObservedFileState::Absent) => true,
+                (FileState::RegularFile(expected), ObservedFileState::Bytes(actual)) => {
+                    expected == &actual
+                }
+                _ => false,
+            };
+            if !header_matches_required {
+                return Err(IndexOperationJournalStoreError::IndexHeaderNotBefore);
+            }
         }
 
         update_file_in_directory_if_matches(
@@ -2046,6 +2126,46 @@ mod tests {
                 .unwrap(),
             sai_windows_fs::ConditionalFileUpdate::AlreadyDesired,
             "a retry that already observes the requested state is idempotent"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn before_header_package_rollback_rejects_a_forward_transition() {
+        let directory = TestDirectory::new();
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let store = IndexOperationJournalStore::new(&lock);
+        let journal = journal();
+        let index_directory = lock.package_directory().join(".sai/index");
+        write_snapshot(&index_directory, &journal.index_before);
+        write_current_journal(&index_directory, &journal);
+        let file = &journal.index_before.package_files[0].file;
+        let path = index_directory.join(file.as_str());
+
+        assert!(matches!(
+            store.update_package_index_file_if_before_header(
+                &journal,
+                file,
+                &journal.index_before.package_files[0].state,
+                &journal.index_after.package_files[0].state,
+            ),
+            Err(IndexOperationJournalStoreError::IndexStateNotRecorded)
+        ));
+        assert_eq!(
+            fs::read(path).unwrap(),
+            match &journal.index_before.package_files[0].state {
+                FileState::RegularFile(bytes) => bytes.clone(),
+                FileState::Absent => panic!("fixture before package file is present"),
+            }
         );
     }
 
