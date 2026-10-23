@@ -412,12 +412,18 @@ fn run_check(
         }
     };
 
+    let index_writer_path = check_uses_writable_symbol_index(command);
+    let lock_mode = if index_writer_path {
+        WorkspaceLockMode::Exclusive
+    } else {
+        WorkspaceLockMode::Shared
+    };
     let mut waiting_reported = false;
-    let _workspace_lock = loop {
+    let workspace_lock = loop {
         if cancellation.is_cancelled() {
             return report_interrupted(parsed, stdout, stderr);
         }
-        match WorkspaceLockGuard::try_acquire(&package_root, WorkspaceLockMode::Shared) {
+        match WorkspaceLockGuard::try_acquire(&package_root, lock_mode) {
             Ok(Some(guard)) => break guard,
             Ok(None) => {
                 if !waiting_reported
@@ -456,6 +462,48 @@ fn run_check(
             }
         }
     };
+
+    let mut journal_recovered_to_before_state = false;
+    if index_writer_path {
+        let toolchain_version = sai_package::version::Version::parse(env!("CARGO_PKG_VERSION"))
+            .expect("the CLI package version is a valid language version");
+        match sai_driver::index_operation_journal_cli_preflight::preflight_cli_index_operation_journal(
+                &workspace_lock,
+                sai_package::validation::PackageValidationContext {
+                    compiler_version: Some(&toolchain_version),
+                },
+            ) {
+            Ok(
+                sai_driver::index_operation_journal_cli_preflight::CliIndexJournalPreflight::Clean,
+            ) => {}
+            Ok(
+                sai_driver::index_operation_journal_cli_preflight::CliIndexJournalPreflight::Recovered(
+                    sai_driver::index_operation_journal_cli_preflight::CliIndexJournalRecovery::ClearedBefore
+                    | sai_driver::index_operation_journal_cli_preflight::CliIndexJournalRecovery::RestoredBefore,
+                ),
+            ) => journal_recovered_to_before_state = true,
+            Ok(
+                sai_driver::index_operation_journal_cli_preflight::CliIndexJournalPreflight::Recovered(
+                    sai_driver::index_operation_journal_cli_preflight::CliIndexJournalRecovery::ClearedCommitted,
+                ),
+            ) => {}
+            Err(error) => {
+                return report_check_diagnostics(
+                    parsed,
+                    vec![symbol_index_recovery_required_diagnostic(
+                        &error.to_string(),
+                        None,
+                    )],
+                    1,
+                    0,
+                    0,
+                    None,
+                    stdout,
+                    stderr,
+                );
+            }
+        }
+    }
 
     let mut diagnostics = Vec::new();
     let mut total_errors = 0usize;
@@ -1705,6 +1753,82 @@ fn run_check(
         && !applies_fixes;
 
     if check_slice_is_supported && total_errors == 0 {
+        if root_coverage.empty_root_module_only_covered {
+            let header = parsed_manifest
+                .as_ref()
+                .and_then(|manifest| manifest.file().header.as_ref())
+                .expect("a supported root manifest has a package header");
+            let package_file = match sai_semantic::PackageIndexFileName::new(
+                header.value.identity.namespace(),
+                header.value.identity.name(),
+                &header.value.version.compatibility_line().to_string(),
+            ) {
+                Ok(file) => file,
+                Err(error) => {
+                    diagnostics.push(symbol_index_recovery_required_diagnostic(
+                        &format!("could not construct the root package index filename: {error}"),
+                        root_identity.as_deref(),
+                    ));
+                    total_errors = total_errors.saturating_add(1);
+                    return report_check_diagnostics(
+                        parsed,
+                        diagnostics,
+                        total_errors,
+                        total_warnings,
+                        total_infos,
+                        root_identity.as_deref(),
+                        stdout,
+                        stderr,
+                    );
+                }
+            };
+            let reconciliation = if journal_recovered_to_before_state {
+                sai_driver::symbol_index_store::reconcile_empty_symbol_index_after_journal_rollback(
+                    &workspace_lock,
+                    package_file,
+                )
+            } else {
+                sai_driver::symbol_index_store::reconcile_empty_symbol_index(
+                    &workspace_lock,
+                    package_file,
+                )
+            };
+            match reconciliation {
+                Ok(sai_driver::symbol_index_store::EmptySymbolIndexReconciliation::Unchanged) => {}
+                Ok(sai_driver::symbol_index_store::EmptySymbolIndexReconciliation::Rebuilt {
+                    discarded_reason: Some(reason),
+                }) => {
+                    diagnostics.push(symbol_index_discarded_diagnostic(
+                        &reason,
+                        root_identity.as_deref(),
+                    ));
+                    total_infos = total_infos.saturating_add(1);
+                }
+                Ok(sai_driver::symbol_index_store::EmptySymbolIndexReconciliation::Rebuilt {
+                    discarded_reason: None,
+                }) => {}
+                Err(error) => {
+                    diagnostics.push(symbol_index_store_diagnostic(
+                        &error,
+                        &package_root,
+                        &cwd,
+                        root_identity.as_deref(),
+                    ));
+                    total_errors = total_errors.saturating_add(1);
+                    return report_check_diagnostics(
+                        parsed,
+                        diagnostics,
+                        total_errors,
+                        total_warnings,
+                        total_infos,
+                        root_identity.as_deref(),
+                        stdout,
+                        stderr,
+                    );
+                }
+            }
+        }
+
         let Some(target) = target else {
             diagnostics.push(check_incomplete_diagnostic(command));
             total_errors = total_errors.saturating_add(1);
@@ -2769,6 +2893,13 @@ fn check_locked_mode(command: &crate::args::ParsedCommand) -> bool {
     command_tail(command)
         .iter()
         .any(|(argument, _)| matches!(argument.to_str(), Some("--locked" | "--frozen")))
+}
+
+fn check_uses_writable_symbol_index(command: &crate::args::ParsedCommand) -> bool {
+    !check_locked_mode(command)
+        && !command_tail(command)
+            .iter()
+            .any(|(argument, _)| matches!(argument.to_str(), Some("--tests" | "--fix")))
 }
 
 fn check_has_lint_overrides(command: &crate::args::ParsedCommand) -> bool {
@@ -4428,6 +4559,94 @@ fn check_cache_corrupt_warning(
         package: root_package_identity.map(str::to_owned),
         related: Vec::new(),
         children: Vec::new(),
+        node: None,
+        symbol: None,
+    }
+}
+
+fn symbol_index_recovery_required_diagnostic(
+    reason: &str,
+    package_identity: Option<&str>,
+) -> CheckDiagnostic {
+    CheckDiagnostic {
+        diagnostic: CliDiagnostic {
+            code: "SYMBOL_INDEX_RECOVERY_REQUIRED",
+            message: format!("symbol-index recovery is required: {reason}"),
+            primary: None,
+            primary_label: String::new(),
+            argument_index: None,
+            argument: String::new(),
+            help: None,
+            data: None,
+        },
+        severity: sai_diagnostics::Severity::Error,
+        package: package_identity.map(str::to_owned),
+        related: Vec::new(),
+        children: Vec::new(),
+        node: None,
+        symbol: None,
+    }
+}
+
+fn symbol_index_store_diagnostic(
+    error: &sai_driver::symbol_index_store::EmptySymbolIndexStoreError,
+    package_root: &Path,
+    cwd: &Path,
+    package_identity: Option<&str>,
+) -> CheckDiagnostic {
+    let (code, message) = if matches!(
+        error,
+        sai_driver::symbol_index_store::EmptySymbolIndexStoreError::LockNotExclusive
+    ) {
+        (
+            "WORKSPACE_LOCK_FAILED",
+            "could not reconcile the symbol index",
+        )
+    } else if error.is_write_failure() {
+        ("OUTPUT_WRITE_FAILED", "could not publish the symbol index")
+    } else {
+        ("SOURCE_READ_FAILED", "could not read the symbol index")
+    };
+    let path = error
+        .path()
+        .map_or_else(|| package_root.join(".sai/index"), Path::to_path_buf);
+    let path = fmt_path_reference(&path, cwd, Some(package_root));
+    check_diagnostic_with_package(
+        check_cli_diagnostic(fmt_io_diagnostic(
+            code,
+            &path,
+            message,
+            &io::Error::other(error.to_string()),
+        )),
+        package_identity,
+    )
+}
+
+fn symbol_index_discarded_diagnostic(
+    reason: &str,
+    package_identity: Option<&str>,
+) -> CheckDiagnostic {
+    CheckDiagnostic {
+        diagnostic: CliDiagnostic {
+            code: "SYMBOL_INDEX_DISCARDED",
+            message: format!("the symbol index in `.sai/index/` was discarded: {reason}"),
+            primary: None,
+            primary_label: String::new(),
+            argument_index: None,
+            argument: String::new(),
+            help: None,
+            data: None,
+        },
+        severity: sai_diagnostics::Severity::Info,
+        package: package_identity.map(str::to_owned),
+        related: Vec::new(),
+        children: vec![CheckChild {
+            kind: sai_diagnostics::ChildKind::Note,
+            message:
+                "symbols that were renamed or moved since they were created get new symbol IDs"
+                    .to_owned(),
+            location: None,
+        }],
         node: None,
         symbol: None,
     }
@@ -7851,6 +8070,11 @@ fn report_check_outcome(
         .any(|diagnostic| diagnostic.diagnostic.code == "INTERNAL_COMPILER_ERROR")
     {
         101
+    } else if diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.diagnostic.code == "OUTPUT_WRITE_FAILED")
+    {
+        4
     } else if diagnostics
         .iter()
         .any(|diagnostic| diagnostic.diagnostic.code == "NO_PACKAGE_FOUND")

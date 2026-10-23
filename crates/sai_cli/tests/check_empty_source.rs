@@ -32,7 +32,33 @@ fn run_check(
     options: &[&str],
 ) -> Output {
     let temporary = TestDirectory::new();
-    let root = &temporary.0;
+    run_check_in(
+        &temporary.0,
+        root_source,
+        manifest_additions,
+        extra_files,
+        options,
+    )
+}
+
+fn run_check_in(
+    root: &std::path::Path,
+    root_source: &str,
+    manifest_additions: &str,
+    extra_files: &[(&str, &str)],
+    options: &[&str],
+) -> Output {
+    prepare_check_workspace(root, root_source, manifest_additions, extra_files, options);
+    execute_check(root, options)
+}
+
+fn prepare_check_workspace(
+    root: &std::path::Path,
+    root_source: &str,
+    manifest_additions: &str,
+    extra_files: &[(&str, &str)],
+    options: &[&str],
+) {
     fs::create_dir_all(root.join("src")).expect("create source directory");
     let default_targets = if manifest_additions.contains("targets {") {
         ""
@@ -70,7 +96,9 @@ fn run_check(
             .expect("create test file parent directory");
         fs::write(path, contents).expect("write extra test file");
     }
+}
 
+fn execute_check(root: &std::path::Path, options: &[&str]) -> Output {
     let mut arguments = vec!["--format=json", "check"];
     arguments.extend_from_slice(options);
     Command::new(env!("CARGO_BIN_EXE_sai"))
@@ -78,6 +106,64 @@ fn run_check(
         .args(arguments)
         .output()
         .expect("run sai check subprocess")
+}
+
+fn prepare_cli_rollback_journal(
+    root: &std::path::Path,
+    source_before: &[u8],
+    source_after: &[u8],
+) -> (PathBuf, Vec<u8>, Vec<u8>) {
+    let source_after_text = std::str::from_utf8(source_after).expect("test source is UTF-8");
+    prepare_check_workspace(root, source_after_text, "", &[], &[]);
+    fs::write(
+        root.join("sai.lock"),
+        concat!(
+            "lock 2\n",
+            "\n",
+            "root acme:empty @ 0.1.0\n",
+            "    targets { wasm32-core, wasm32-wasi }\n"
+        ),
+    )
+    .unwrap();
+
+    let file = sai_semantic::PackageIndexFileName::parse("acme.empty.0.1.jsonl").unwrap();
+    let after_index = empty_root_package_index();
+    let journal = sai_semantic::IndexOperationJournal {
+        operation_id: "5197cf1c-dbec-4b13-9077-1c2c1ce2d664".to_owned(),
+        origin: sai_semantic::IndexJournalOrigin::Cli,
+        state: sai_semantic::IndexJournalState::Prepared,
+        sources: vec![sai_semantic::SourceFileChange {
+            package_node_key: "package:acme:empty@0.1.0".to_owned(),
+            package_root: ".".to_owned(),
+            path: "src/lib.sai".to_owned(),
+            before: sai_semantic::FileState::RegularFile(source_before.to_vec()),
+            planned_after: sai_semantic::FileState::RegularFile(source_after.to_vec()),
+        }],
+        index_before: sai_semantic::IndexSnapshot {
+            header: sai_semantic::FileState::Absent,
+            package_files: vec![sai_semantic::PackageFileState {
+                file: file.clone(),
+                state: sai_semantic::FileState::Absent,
+            }],
+        },
+        index_after: sai_semantic::IndexSnapshot {
+            header: sai_semantic::FileState::RegularFile(after_index.header().to_vec()),
+            package_files: vec![sai_semantic::PackageFileState {
+                file,
+                state: sai_semantic::FileState::RegularFile(Vec::new()),
+            }],
+        },
+        symbol_mappings: Vec::new(),
+    };
+    let index_directory = root.join(".sai/index");
+    fs::create_dir_all(&index_directory).unwrap();
+    let journal_bytes = journal.encode().expect("prepared journal encodes");
+    fs::write(index_directory.join("operation.json"), &journal_bytes).unwrap();
+    (
+        index_directory,
+        journal_bytes,
+        after_index.header().to_vec(),
+    )
 }
 
 fn assert_check_stays_gated(output: &Output, context: &str) {
@@ -185,6 +271,380 @@ fn assert_success_result(output: Output, target: &str, profile: &str) {
         "{}",
         records[2]
     );
+}
+
+fn empty_root_package_index() -> sai_semantic::EncodedSymbolIndex {
+    let file = sai_semantic::PackageIndexFileName::parse("acme.empty.0.1.jsonl")
+        .expect("root package index filename is valid");
+    sai_semantic::SymbolIndex::empty_for_package(file)
+        .encode()
+        .expect("empty root package index encodes")
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+#[test]
+fn empty_root_check_creates_a_canonical_index_when_absent() {
+    let temporary = TestDirectory::new();
+    let output = run_check_in(&temporary.0, "", "", &[], &[]);
+    assert_success_result(output, "wasm32-core", "dev");
+
+    let expected = empty_root_package_index();
+    assert_eq!(
+        fs::read(temporary.0.join(".sai/index/index.json")).unwrap(),
+        expected.header()
+    );
+    assert_eq!(
+        fs::read(temporary.0.join(".sai/index/acme.empty.0.1.jsonl")).unwrap(),
+        b"",
+        "the canonical package file for an empty inventory is zero bytes"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn empty_root_index_creation_fails_closed_without_mutation_on_windows() {
+    let temporary = TestDirectory::new();
+    prepare_check_workspace(&temporary.0, "", "", &[], &[]);
+    let source_before = fs::read(temporary.0.join("src/lib.sai")).unwrap();
+
+    let output = execute_check(&temporary.0, &[]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(4), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"OUTPUT_WRITE_FAILED\"") && stdout.contains("\"exit_code\":4"),
+        "unsupported durable directory flush is an output failure:\n{stdout}"
+    );
+    assert_eq!(
+        fs::read(temporary.0.join("src/lib.sai")).unwrap(),
+        source_before
+    );
+    assert!(
+        !temporary.0.join(".sai/index").exists(),
+        "Windows fails before creating the index directory"
+    );
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+#[test]
+fn empty_root_check_does_not_rewrite_a_canonical_index() {
+    let temporary = TestDirectory::new();
+    assert_success_result(
+        run_check_in(&temporary.0, "", "", &[], &[]),
+        "wasm32-core",
+        "dev",
+    );
+    let package_path = temporary.0.join(".sai/index/acme.empty.0.1.jsonl");
+    let header_path = temporary.0.join(".sai/index/index.json");
+    let package_identity =
+        sai_windows_fs::file_identity(&fs::File::open(&package_path).unwrap()).unwrap();
+    let header_identity =
+        sai_windows_fs::file_identity(&fs::File::open(&header_path).unwrap()).unwrap();
+
+    assert_success_result(
+        run_check_in(&temporary.0, "", "", &[], &[]),
+        "wasm32-core",
+        "dev",
+    );
+    assert_eq!(
+        sai_windows_fs::file_identity(&fs::File::open(package_path).unwrap()).unwrap(),
+        package_identity
+    );
+    assert_eq!(
+        sai_windows_fs::file_identity(&fs::File::open(header_path).unwrap()).unwrap(),
+        header_identity
+    );
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+#[test]
+fn empty_root_check_discards_a_corrupt_index_and_rebuilds_it() {
+    let temporary = TestDirectory::new();
+    let index_directory = temporary.0.join(".sai/index");
+    fs::create_dir_all(&index_directory).unwrap();
+    fs::write(index_directory.join("index.json"), b"{corrupt\n").unwrap();
+    fs::write(
+        index_directory.join("acme.empty.0.1.jsonl"),
+        b"{stale package entry}\n",
+    )
+    .unwrap();
+
+    let output = run_check_in(&temporary.0, "", "", &[], &[]);
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("\"code\":\"SYMBOL_INDEX_DISCARDED\"")
+            && stdout.contains("\"severity\":\"info\"")
+            && stdout.contains(
+                "the symbol index in `.sai/index/` was discarded: invalid symbol-index JSON"
+            )
+            && stdout.contains(
+                "symbols that were renamed or moved since they were created get new symbol IDs"
+            ),
+        "malformed committed index is reported with the specified info diagnostic:\n{stdout}"
+    );
+    let expected = empty_root_package_index();
+    assert_eq!(
+        fs::read(index_directory.join("index.json")).unwrap(),
+        expected.header()
+    );
+    assert_eq!(
+        fs::read(index_directory.join("acme.empty.0.1.jsonl")).unwrap(),
+        b""
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn empty_root_index_rebuild_fails_closed_without_mutation_on_windows() {
+    let temporary = TestDirectory::new();
+    prepare_check_workspace(&temporary.0, "", "", &[], &[]);
+    let index_directory = temporary.0.join(".sai/index");
+    fs::create_dir_all(&index_directory).unwrap();
+    let header_before = b"{corrupt\n";
+    let package_before = b"old package bytes\n";
+    fs::write(index_directory.join("index.json"), header_before).unwrap();
+    fs::write(index_directory.join("acme.empty.0.1.jsonl"), package_before).unwrap();
+
+    let output = execute_check(&temporary.0, &[]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(4), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"OUTPUT_WRITE_FAILED\"") && stdout.contains("\"exit_code\":4"),
+        "unsupported durable directory flush blocks corrupt-index rebuild:\n{stdout}"
+    );
+    assert_eq!(
+        fs::read(index_directory.join("index.json")).unwrap(),
+        header_before
+    );
+    assert_eq!(
+        fs::read(index_directory.join("acme.empty.0.1.jsonl")).unwrap(),
+        package_before
+    );
+    assert_eq!(
+        fs::read_dir(&index_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            std::ffi::OsString::from("acme.empty.0.1.jsonl"),
+            std::ffi::OsString::from("index.json"),
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn empty_root_canonical_index_is_read_only_success_on_windows() {
+    let temporary = TestDirectory::new();
+    prepare_check_workspace(&temporary.0, "", "", &[], &[]);
+    let index_directory = temporary.0.join(".sai/index");
+    fs::create_dir_all(&index_directory).unwrap();
+    let expected = empty_root_package_index();
+    fs::write(index_directory.join("index.json"), expected.header()).unwrap();
+    fs::write(
+        index_directory.join("acme.empty.0.1.jsonl"),
+        expected
+            .package_files()
+            .values()
+            .next()
+            .expect("empty package file exists"),
+    )
+    .unwrap();
+
+    let output = execute_check(&temporary.0, &[]);
+    assert_success_result(output, "wasm32-core", "dev");
+    assert_eq!(
+        fs::read(index_directory.join("index.json")).unwrap(),
+        expected.header()
+    );
+    assert_eq!(
+        fs::read(index_directory.join("acme.empty.0.1.jsonl")).unwrap(),
+        b""
+    );
+    assert_eq!(
+        fs::read_dir(&index_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        [
+            std::ffi::OsString::from("acme.empty.0.1.jsonl"),
+            std::ffi::OsString::from("index.json"),
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+#[test]
+fn corrupt_journal_blocks_before_index_processing_and_preserves_sources() {
+    let temporary = TestDirectory::new();
+    let index_directory = temporary.0.join(".sai/index");
+    prepare_check_workspace(&temporary.0, "source must stay untouched\n", "", &[], &[]);
+    fs::create_dir_all(&index_directory).unwrap();
+    let source_before = b"source must stay untouched\n";
+    let header_before = b"header must stay untouched\n";
+    let package_before = b"package index must stay untouched\n";
+    fs::write(index_directory.join("index.json"), header_before).unwrap();
+    fs::write(index_directory.join("acme.empty.0.1.jsonl"), package_before).unwrap();
+    fs::write(
+        index_directory.join("operation.json"),
+        b"{corrupt operation journal}\n",
+    )
+    .unwrap();
+
+    let output = execute_check(&temporary.0, &[]);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("\"code\":\"SYMBOL_INDEX_RECOVERY_REQUIRED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "an unreadable journal blocks the normal check:\n{stdout}"
+    );
+    assert_eq!(
+        fs::read(temporary.0.join("src/lib.sai")).unwrap(),
+        source_before
+    );
+    assert_eq!(
+        fs::read(index_directory.join("index.json")).unwrap(),
+        header_before
+    );
+    assert_eq!(
+        fs::read(index_directory.join("acme.empty.0.1.jsonl")).unwrap(),
+        package_before
+    );
+    assert_eq!(
+        fs::read(index_directory.join("operation.json")).unwrap(),
+        b"{corrupt operation journal}\n"
+    );
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+#[test]
+fn unreadable_committed_package_reports_source_read_failure_without_discard() {
+    let temporary = TestDirectory::new();
+    prepare_check_workspace(&temporary.0, "", "", &[], &[]);
+    let index_directory = temporary.0.join(".sai/index");
+    fs::create_dir_all(&index_directory).unwrap();
+    let committed_file = sai_semantic::PackageIndexFileName::parse("other.pkg.1.jsonl").unwrap();
+    let committed_index = sai_semantic::SymbolIndex::empty_for_package(committed_file.clone())
+        .encode()
+        .unwrap();
+    let header_before = committed_index.header().to_vec();
+    fs::write(index_directory.join("index.json"), &header_before).unwrap();
+    fs::create_dir(index_directory.join(committed_file.as_str())).unwrap();
+
+    let output = execute_check(&temporary.0, &[]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"SOURCE_READ_FAILED\"")
+            && !stdout.contains("\"code\":\"SYMBOL_INDEX_DISCARDED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "an unsafe committed path is a read failure, not discardable corruption:\n{stdout}"
+    );
+    assert_eq!(
+        fs::read(index_directory.join("index.json")).unwrap(),
+        header_before
+    );
+    assert!(
+        index_directory.join(committed_file.as_str()).is_dir(),
+        "the unsafe committed path is not followed, removed, or replaced"
+    );
+    assert!(
+        !index_directory.join("acme.empty.0.1.jsonl").exists(),
+        "the selected package file is not created after the read failure"
+    );
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+#[test]
+fn prepared_cli_journal_is_rolled_back_before_the_index_is_read() {
+    let temporary = TestDirectory::new();
+    let planned_source = b"// planned source state\n";
+    let (index_directory, _, after_header) =
+        prepare_cli_rollback_journal(&temporary.0, b"", planned_source);
+
+    let output = execute_check(&temporary.0, &[]);
+    assert_success_result(output, "wasm32-core", "dev");
+    assert_eq!(fs::read(temporary.0.join("src/lib.sai")).unwrap(), b"");
+    assert!(
+        !index_directory.join("operation.json").exists(),
+        "the recoverable CLI journal is settled before normal index reconciliation"
+    );
+    assert_eq!(
+        fs::read(index_directory.join("index.json")).unwrap(),
+        after_header
+    );
+    assert_eq!(
+        fs::read(index_directory.join("acme.empty.0.1.jsonl")).unwrap(),
+        b""
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn prepared_cli_journal_recovery_fails_closed_without_mutation_on_windows() {
+    let temporary = TestDirectory::new();
+    let planned_source = b"// planned source state\n";
+    let (index_directory, journal_before, _) =
+        prepare_cli_rollback_journal(&temporary.0, b"", planned_source);
+
+    let output = execute_check(&temporary.0, &[]);
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(1), "{stdout}");
+    assert!(
+        stdout.contains("\"code\":\"SYMBOL_INDEX_RECOVERY_REQUIRED\"")
+            && !stdout.contains("\"type\":\"result\""),
+        "unsupported durable rollback remains recovery-gated:\n{stdout}"
+    );
+    assert_eq!(
+        fs::read(temporary.0.join("src/lib.sai")).unwrap(),
+        planned_source
+    );
+    assert_eq!(
+        fs::read(index_directory.join("operation.json")).unwrap(),
+        journal_before
+    );
+    assert_eq!(
+        fs::read_dir(&index_directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        [std::ffi::OsString::from("operation.json")]
+            .into_iter()
+            .collect()
+    );
+}
+
+#[test]
+fn tests_and_fix_checks_do_not_read_or_write_the_symbol_index() {
+    for option in ["--tests", "--fix"] {
+        let temporary = TestDirectory::new();
+        let output = run_check_in(&temporary.0, "", "", &[], &[option]);
+        assert_check_stays_gated(&output, option);
+        assert!(
+            !temporary.0.join(".sai/index").exists(),
+            "{option} remains outside the current index-writing path"
+        );
+    }
 }
 
 #[test]
@@ -7935,6 +8395,10 @@ fn function_body_forms_outside_direct_parameter_slice_remain_gated() {
     }
 }
 
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
 #[test]
 fn empty_root_source_emits_check_result_for_default_and_selected_target() {
     assert_success_result(run_check("", "", &[], &[]), "wasm32-core", "dev");

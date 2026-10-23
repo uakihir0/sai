@@ -395,6 +395,18 @@ impl UnvalidatedSymbolIndex {
 }
 
 impl SymbolIndex {
+    /// Constructs the complete symbol index for a package whose semantic
+    /// inventory is known to be empty.
+    ///
+    /// This is safe only when the caller has established that the package has
+    /// no indexable declarations. An empty index is still a package entry in
+    /// the committed workspace index.
+    pub fn empty_for_package(file: PackageIndexFileName) -> Self {
+        Self {
+            packages: BTreeMap::from([(file, Vec::new())]),
+        }
+    }
+
     /// Serializes all package files and the matching committed header.
     pub fn encode(&self) -> Result<EncodedSymbolIndex, SymbolIndexCodecError> {
         if self.packages.is_empty() {
