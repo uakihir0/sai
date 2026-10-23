@@ -6,7 +6,8 @@
 //! rollback through before-state verification and journal clearing. Forward
 //! recovery can publish package-index files and then the planned index header,
 //! followed by one-at-a-time deletion of files omitted from that durable
-//! header. Journal transitions and production integration remain later slices.
+//! header. It can also durably mark a fully committed index generation before
+//! a later, freshly planned journal-clear step.
 
 use crate::index_operation_journal_recovery::{
     IndexJournalRecoveryDecision, ObservedFileState as PlannerObservedFileState,
@@ -18,7 +19,7 @@ use crate::index_operation_journal_store::{
 use crate::index_operation_journal_validation::IndexJournalRecoveryContext;
 use sai_package::local_source::LocalPackageSourceFileUpdateError;
 use sai_package::package_path::{ContentPackagePath, RepositoryPackageDirectory};
-use sai_semantic::{FileState, IndexOperationJournal, PackageIndexFileName};
+use sai_semantic::{FileState, IndexJournalState, IndexOperationJournal, PackageIndexFileName};
 use sai_windows_fs::ConditionalFileUpdate;
 use std::error::Error;
 use std::fmt;
@@ -40,6 +41,25 @@ pub enum IndexJournalClearExecution {
     Cleared {
         decision: IndexJournalRecoveryDecision,
     },
+}
+
+/// Result of durably marking a fully committed index generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexJournalCommitMarkerExecution {
+    /// The fresh observation produced a different planner decision.
+    DecisionChanged {
+        planned: IndexJournalRecoveryDecision,
+        observed: IndexJournalRecoveryDecision,
+    },
+    /// The current planner decision does not authorize a commit marker.
+    NotCommittable {
+        decision: IndexJournalRecoveryDecision,
+    },
+    /// The journal was durably updated to record `IndexCommitted`.
+    MarkedCommitted,
+    /// The journal already recorded `IndexCommitted`, and its directory was
+    /// synchronized to make an earlier uncertain replacement durable.
+    AlreadyCommitted,
 }
 
 /// Result of restoring one source file from a journal's before snapshot.
@@ -286,9 +306,10 @@ impl From<IndexJournalSourceRestoreError> for IndexJournalRestoreBeforeError {
 /// from an observation made under the same exclusive workspace lock. Before
 /// clearing, this function obtains a fresh source and index observation,
 /// recomputes the decision, and refuses to clear if it changed. Only
-/// `ClearBefore`, `ClearRejected`, and `ClearCommitted` are executable here.
-/// The other planner decisions are returned without mutation for later
-/// executor slices.
+/// `ClearBefore` and `ClearRejected` are executable directly. `ClearCommitted`
+/// is executable only after `journal.state` is already `IndexCommitted`; a
+/// committed generation in any earlier state must first pass through the
+/// durable marker executor and then be freshly replanned.
 ///
 /// The store's [`IndexOperationJournalStore::clear_if_current`] also verifies
 /// that the durable record still equals `journal` while removing it and
@@ -304,6 +325,36 @@ pub fn execute_index_operation_journal_clear(
     planned_decision: IndexJournalRecoveryDecision,
 ) -> Result<IndexJournalClearExecution, IndexOperationJournalStoreError> {
     execute_index_operation_journal_clear_with_hook(
+        store,
+        journal,
+        context,
+        planned_decision,
+        || {},
+    )
+}
+
+/// Re-observes a fully committed operation and durably records `IndexCommitted`.
+///
+/// `planned_decision` must be the decision previously produced for `journal`
+/// from an observation made under the same exclusive workspace lock. This
+/// function obtains a fresh source and index observation, runs the pure
+/// planner, and changes the journal only when that decision is
+/// `ClearCommitted`. It preserves every journal field except `state`, keeps
+/// the journal in place, and synchronizes the index directory even when
+/// retrying an already visible `IndexCommitted` record. A later clear must use
+/// the returned journal and a new observation and plan; one plan cannot
+/// authorize both the durable state transition and journal removal.
+///
+/// On any error, the caller must read the journal back under the same
+/// exclusive lock and keep recovery gated until a later observation resolves
+/// the state.
+pub fn execute_index_operation_journal_mark_committed(
+    store: &IndexOperationJournalStore<'_>,
+    journal: &IndexOperationJournal,
+    context: &IndexJournalRecoveryContext,
+    planned_decision: IndexJournalRecoveryDecision,
+) -> Result<IndexJournalCommitMarkerExecution, IndexOperationJournalStoreError> {
+    execute_index_operation_journal_mark_committed_with_hook(
         store,
         journal,
         context,
@@ -1085,12 +1136,16 @@ fn execute_index_operation_journal_clear_with_hook(
         });
     }
 
-    if !matches!(
-        observed_decision,
-        IndexJournalRecoveryDecision::ClearBefore
-            | IndexJournalRecoveryDecision::ClearRejected
-            | IndexJournalRecoveryDecision::ClearCommitted
-    ) {
+    let clearable = match observed_decision {
+        IndexJournalRecoveryDecision::ClearBefore | IndexJournalRecoveryDecision::ClearRejected => {
+            true
+        }
+        IndexJournalRecoveryDecision::ClearCommitted => {
+            journal.state == IndexJournalState::IndexCommitted
+        }
+        _ => false,
+    };
+    if !clearable {
         return Ok(IndexJournalClearExecution::NotClearable {
             decision: observed_decision,
         });
@@ -1110,15 +1165,65 @@ fn execute_index_operation_journal_clear_with_hook(
     }
 }
 
+fn execute_index_operation_journal_mark_committed_with_hook(
+    store: &IndexOperationJournalStore<'_>,
+    journal: &IndexOperationJournal,
+    context: &IndexJournalRecoveryContext,
+    planned_decision: IndexJournalRecoveryDecision,
+    after_initial_observation: impl FnOnce(),
+) -> Result<IndexJournalCommitMarkerExecution, IndexOperationJournalStoreError> {
+    let observation = store.observe_recovery(journal, context)?;
+    let observed_decision = plan_index_operation_journal_recovery(journal, &observation);
+    if observed_decision != planned_decision {
+        return Ok(IndexJournalCommitMarkerExecution::DecisionChanged {
+            planned: planned_decision,
+            observed: observed_decision,
+        });
+    }
+
+    if observed_decision != IndexJournalRecoveryDecision::ClearCommitted {
+        return Ok(IndexJournalCommitMarkerExecution::NotCommittable {
+            decision: observed_decision,
+        });
+    }
+
+    after_initial_observation();
+
+    // The hook represents the gap after the caller's plan. Reobserve all
+    // source and index state after that gap, then replan immediately before
+    // replacing the journal.
+    let observation = store.observe_recovery(journal, context)?;
+    let final_decision = plan_index_operation_journal_recovery(journal, &observation);
+    if final_decision != planned_decision {
+        return Ok(IndexJournalCommitMarkerExecution::DecisionChanged {
+            planned: planned_decision,
+            observed: final_decision,
+        });
+    }
+
+    store.verify_recovery_context(context)?;
+    if journal.state == IndexJournalState::IndexCommitted {
+        store.replace_if_current(journal, journal)?;
+        Ok(IndexJournalCommitMarkerExecution::AlreadyCommitted)
+    } else {
+        let mut committed = journal.clone();
+        committed.state = IndexJournalState::IndexCommitted;
+        store.replace_if_current(journal, &committed)?;
+        Ok(IndexJournalCommitMarkerExecution::MarkedCommitted)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexJournalClearExecution, IndexJournalHeaderPublishExecution,
-        IndexJournalHeaderRestoreExecution, IndexJournalPackageDeleteExecution,
-        IndexJournalPackagePublishExecution, IndexJournalPackageRestoreExecution,
-        IndexJournalRestoreBeforeExecution, IndexJournalSourceRestoreError,
-        IndexJournalSourceRestoreExecution, execute_index_operation_journal_clear,
+        IndexJournalClearExecution, IndexJournalCommitMarkerExecution,
+        IndexJournalHeaderPublishExecution, IndexJournalHeaderRestoreExecution,
+        IndexJournalPackageDeleteExecution, IndexJournalPackagePublishExecution,
+        IndexJournalPackageRestoreExecution, IndexJournalRestoreBeforeExecution,
+        IndexJournalSourceRestoreError, IndexJournalSourceRestoreExecution,
+        execute_index_operation_journal_clear,
         execute_index_operation_journal_delete_package_after_header,
+        execute_index_operation_journal_mark_committed,
         execute_index_operation_journal_publish_header_after,
         execute_index_operation_journal_publish_package_after,
         execute_index_operation_journal_restore_before,
@@ -3569,6 +3674,330 @@ mod tests {
             );
             assert!(!journal_still_exists(&workspace));
         }
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
+    fn committed_marker_preserves_journal_and_requires_a_fresh_clear_plan() {
+        let cases = [
+            (IndexJournalOrigin::Cli, IndexJournalState::Prepared),
+            (IndexJournalOrigin::Cli, IndexJournalState::SourcesApplied),
+            (
+                IndexJournalOrigin::LspApplyEdit,
+                IndexJournalState::Prepared,
+            ),
+            (
+                IndexJournalOrigin::LspApplyEdit,
+                IndexJournalState::AwaitingClient,
+            ),
+            (
+                IndexJournalOrigin::LspApplyEdit,
+                IndexJournalState::ClientApplied,
+            ),
+            (
+                IndexJournalOrigin::LspReturnedEdit,
+                IndexJournalState::Prepared,
+            ),
+            (
+                IndexJournalOrigin::LspReturnedEdit,
+                IndexJournalState::AwaitingClient,
+            ),
+        ];
+
+        for (origin, state) in cases {
+            let journal = journal(origin, state);
+            let source_before = journal.sources[0].planned_after.clone();
+            let (workspace, lock, context) = setup(&journal, &source_before, true);
+            let store = IndexOperationJournalStore::new(&lock);
+            let planned = expected_decision(&store, &journal, &context);
+            assert_eq!(
+                planned,
+                IndexJournalRecoveryDecision::ClearCommitted,
+                "{origin:?} {state:?}"
+            );
+            let source_bytes_before =
+                fs::read(workspace.0.join("src/lib.sai")).expect("read planned-after source");
+            let index_before = index_files(&workspace);
+
+            assert_eq!(
+                execute_index_operation_journal_clear(&store, &journal, &context, planned)
+                    .expect("require marker before committed clear"),
+                IndexJournalClearExecution::NotClearable {
+                    decision: IndexJournalRecoveryDecision::ClearCommitted,
+                },
+                "{origin:?} {state:?}"
+            );
+            assert_eq!(
+                store.read().expect("read journal before marker"),
+                Some(journal.clone())
+            );
+
+            assert_eq!(
+                execute_index_operation_journal_mark_committed(&store, &journal, &context, planned)
+                    .expect("mark committed"),
+                IndexJournalCommitMarkerExecution::MarkedCommitted,
+                "{origin:?} {state:?}"
+            );
+
+            let mut committed = journal.clone();
+            committed.state = IndexJournalState::IndexCommitted;
+            assert_eq!(
+                store.read().expect("read marked journal"),
+                Some(committed.clone())
+            );
+            assert_eq!(
+                journal_bytes(&workspace),
+                committed.encode().expect("encode marked journal")
+            );
+            assert_eq!(
+                fs::read(workspace.0.join("src/lib.sai")).expect("reread source"),
+                source_bytes_before
+            );
+            assert_eq!(index_files(&workspace), index_before);
+
+            let fresh_plan = expected_decision(&store, &committed, &context);
+            assert_eq!(fresh_plan, IndexJournalRecoveryDecision::ClearCommitted);
+            assert_eq!(
+                execute_index_operation_journal_clear(&store, &committed, &context, fresh_plan)
+                    .expect("clear with a fresh plan"),
+                IndexJournalClearExecution::Cleared {
+                    decision: IndexJournalRecoveryDecision::ClearCommitted,
+                }
+            );
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
+    fn committed_marker_retries_durability_and_refuses_other_decisions() {
+        let committed = journal(IndexJournalOrigin::Cli, IndexJournalState::IndexCommitted);
+        let (workspace, lock, context) =
+            setup(&committed, &committed.sources[0].planned_after, true);
+        let store = IndexOperationJournalStore::new(&lock);
+        let index_before = index_files(&workspace);
+        assert_eq!(
+            execute_index_operation_journal_mark_committed(
+                &store,
+                &committed,
+                &context,
+                IndexJournalRecoveryDecision::ClearCommitted,
+            )
+            .expect("retry commit marker"),
+            IndexJournalCommitMarkerExecution::AlreadyCommitted
+        );
+        assert_eq!(
+            store.read().expect("read committed journal"),
+            Some(committed.clone())
+        );
+        assert_eq!(index_files(&workspace), index_before);
+
+        let before = journal(IndexJournalOrigin::Cli, IndexJournalState::Prepared);
+        let (before_workspace, before_lock, before_context) =
+            setup(&before, &before.sources[0].before, false);
+        let before_store = IndexOperationJournalStore::new(&before_lock);
+        let before_plan = expected_decision(&before_store, &before, &before_context);
+        assert_eq!(before_plan, IndexJournalRecoveryDecision::ClearBefore);
+        assert_eq!(
+            execute_index_operation_journal_mark_committed(
+                &before_store,
+                &before,
+                &before_context,
+                before_plan,
+            )
+            .expect("refuse before-state marker"),
+            IndexJournalCommitMarkerExecution::NotCommittable {
+                decision: IndexJournalRecoveryDecision::ClearBefore,
+            }
+        );
+        assert_eq!(
+            journal_bytes(&before_workspace),
+            before.encode().expect("encode before journal")
+        );
+
+        let pending = journal(
+            IndexJournalOrigin::LspReturnedEdit,
+            IndexJournalState::AwaitingClient,
+        );
+        let (pending_workspace, pending_lock, pending_context) =
+            setup(&pending, &pending.sources[0].before, false);
+        let pending_store = IndexOperationJournalStore::new(&pending_lock);
+        let pending_plan = expected_decision(&pending_store, &pending, &pending_context);
+        assert_eq!(pending_plan, IndexJournalRecoveryDecision::PendingClient);
+        assert_eq!(
+            execute_index_operation_journal_mark_committed(
+                &pending_store,
+                &pending,
+                &pending_context,
+                pending_plan,
+            )
+            .expect("refuse pending-client marker"),
+            IndexJournalCommitMarkerExecution::NotCommittable {
+                decision: IndexJournalRecoveryDecision::PendingClient,
+            }
+        );
+        assert_eq!(
+            journal_bytes(&pending_workspace),
+            pending.encode().expect("encode pending journal")
+        );
+
+        let rejected = journal(
+            IndexJournalOrigin::LspApplyEdit,
+            IndexJournalState::ClientRejected,
+        );
+        let (rejected_workspace, rejected_lock, rejected_context) =
+            setup(&rejected, &rejected.sources[0].before, false);
+        let rejected_store = IndexOperationJournalStore::new(&rejected_lock);
+        let rejected_plan = expected_decision(&rejected_store, &rejected, &rejected_context);
+        assert_eq!(rejected_plan, IndexJournalRecoveryDecision::ClearRejected);
+        assert_eq!(
+            execute_index_operation_journal_mark_committed(
+                &rejected_store,
+                &rejected,
+                &rejected_context,
+                rejected_plan,
+            )
+            .expect("refuse rejected marker"),
+            IndexJournalCommitMarkerExecution::NotCommittable {
+                decision: IndexJournalRecoveryDecision::ClearRejected,
+            }
+        );
+        assert_eq!(
+            journal_bytes(&rejected_workspace),
+            rejected.encode().expect("encode rejected journal")
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
+    fn committed_marker_rechecks_sources_index_and_journal_after_the_plan() {
+        let journal = journal(IndexJournalOrigin::Cli, IndexJournalState::Prepared);
+
+        let (source_workspace, source_lock, source_context) =
+            setup(&journal, &journal.sources[0].planned_after, true);
+        let source_store = IndexOperationJournalStore::new(&source_lock);
+        let planned = expected_decision(&source_store, &journal, &source_context);
+        let result = super::execute_index_operation_journal_mark_committed_with_hook(
+            &source_store,
+            &journal,
+            &source_context,
+            planned,
+            || {
+                fs::write(
+                    source_workspace.0.join("src/lib.sai"),
+                    b"third-party source",
+                )
+                .expect("change source after initial observation");
+            },
+        )
+        .expect("report stale source");
+        assert_eq!(
+            result,
+            IndexJournalCommitMarkerExecution::DecisionChanged {
+                planned: IndexJournalRecoveryDecision::ClearCommitted,
+                observed: IndexJournalRecoveryDecision::Ambiguous(
+                    IndexJournalRecoveryAmbiguity::UnexpectedSourceState
+                ),
+            }
+        );
+        assert_eq!(
+            source_store.read().expect("read unchanged journal"),
+            Some(journal.clone())
+        );
+
+        let (index_workspace, index_lock, index_context) =
+            setup(&journal, &journal.sources[0].planned_after, true);
+        let index_store = IndexOperationJournalStore::new(&index_lock);
+        let planned = expected_decision(&index_store, &journal, &index_context);
+        let result = super::execute_index_operation_journal_mark_committed_with_hook(
+            &index_store,
+            &journal,
+            &index_context,
+            planned,
+            || {
+                fs::write(
+                    index_workspace.0.join(".sai/index/index.json"),
+                    b"{\"third-party\":\"header\"}\n",
+                )
+                .expect("change index after initial observation");
+            },
+        )
+        .expect("report stale index");
+        assert_eq!(
+            result,
+            IndexJournalCommitMarkerExecution::DecisionChanged {
+                planned: IndexJournalRecoveryDecision::ClearCommitted,
+                observed: IndexJournalRecoveryDecision::Ambiguous(
+                    IndexJournalRecoveryAmbiguity::ContradictoryIndex
+                ),
+            }
+        );
+        assert_eq!(
+            index_store.read().expect("read unchanged journal"),
+            Some(journal.clone())
+        );
+
+        let (journal_workspace, journal_lock, journal_context) =
+            setup(&journal, &journal.sources[0].planned_after, true);
+        let journal_store = IndexOperationJournalStore::new(&journal_lock);
+        let planned = expected_decision(&journal_store, &journal, &journal_context);
+        let mut replacement = journal.clone();
+        replacement.state = IndexJournalState::IndexCommitted;
+        fs::write(
+            journal_workspace.0.join(".sai/index/operation.json"),
+            replacement.encode().expect("encode concurrent journal"),
+        )
+        .expect("replace journal after initial observation");
+        let index_before = index_files(&journal_workspace);
+
+        let result = super::execute_index_operation_journal_mark_committed_with_hook(
+            &journal_store,
+            &journal,
+            &journal_context,
+            planned,
+            || {},
+        )
+        .expect("report a stale journal observation");
+        assert_eq!(
+            result,
+            IndexJournalCommitMarkerExecution::DecisionChanged {
+                planned: IndexJournalRecoveryDecision::ClearCommitted,
+                observed: IndexJournalRecoveryDecision::Ambiguous(
+                    IndexJournalRecoveryAmbiguity::IndexUnavailable
+                ),
+            }
+        );
+        assert_eq!(
+            journal_store.read().expect("read winning journal"),
+            Some(replacement)
+        );
+        assert_eq!(index_files(&journal_workspace), index_before);
     }
 
     #[cfg(all(

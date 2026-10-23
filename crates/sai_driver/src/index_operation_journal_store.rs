@@ -1237,7 +1237,9 @@ impl<'lock> IndexOperationJournalStore<'lock> {
     /// State-transition legality belongs to the transaction coordinator.
     /// If the final directory flush fails, the replacement may already be
     /// visible while its durability is unknown; reread under the exclusive
-    /// workspace lock before deciding whether to retry.
+    /// workspace lock before deciding whether to retry. An already-current
+    /// replacement still synchronizes the directory so an idempotent retry
+    /// can establish durability after an earlier uncertain flush.
     pub fn replace_if_current(
         &self,
         expected: &IndexOperationJournal,
@@ -1259,7 +1261,7 @@ impl<'lock> IndexOperationJournalStore<'lock> {
             return Err(IndexOperationJournalStoreError::JournalChanged);
         }
         if current.journal == *replacement {
-            return Ok(());
+            return self.sync_index_directory(&index_directory);
         }
 
         let (temporary_name, temporary_identity) =
@@ -2816,6 +2818,11 @@ mod tests {
         sources_applied.state = IndexJournalState::SourcesApplied;
         store
             .replace_if_current(&prepared, &sources_applied)
+            .unwrap();
+        assert_eq!(store.read().unwrap(), Some(sources_applied.clone()));
+
+        store
+            .replace_if_current(&sources_applied, &sources_applied)
             .unwrap();
         assert_eq!(store.read().unwrap(), Some(sources_applied.clone()));
 
