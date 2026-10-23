@@ -13,3 +13,6 @@ unicode-ident.workspace = true
 unicode-normalization.workspace = true
 sai_stable_hash = { path = "../sai_stable_hash" }
 sai_syntax = { path = "../sai_syntax" }
+
+[dev-dependencies]
+sai_vfs = { path = "../sai_vfs" }
