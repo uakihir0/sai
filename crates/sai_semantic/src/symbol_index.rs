@@ -407,6 +407,11 @@ impl SymbolIndex {
         }
     }
 
+    /// Returns the trusted entries for an exact package-index file, if present.
+    pub fn package_entries(&self, file: &PackageIndexFileName) -> Option<&[SymbolIndexEntry]> {
+        self.packages.get(file).map(Vec::as_slice)
+    }
+
     /// Serializes all package files and the matching committed header.
     pub fn encode(&self) -> Result<EncodedSymbolIndex, SymbolIndexCodecError> {
         if self.packages.is_empty() {

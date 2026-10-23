@@ -4,12 +4,17 @@
 
 mod canonical_path;
 mod index_journal;
+mod reconciliation;
 mod symbol_index;
 
 pub use index_journal::{
     FileState, IndexJournalCodecError, IndexJournalOrigin, IndexJournalState,
     IndexOperationJournal, IndexSnapshot, MAX_OPERATION_JOURNAL_BYTES, PackageFileState,
     SourceFileChange, SymbolIdMapping,
+};
+pub use reconciliation::{
+    CurrentSymbol, InventoryCoverage, PackageSymbolInventory, SymbolIndexReconciliationError,
+    reconcile_package,
 };
 pub use symbol_index::{
     EncodedSymbolIndex, PackageIndexFileName, PackageIndexFileRecord, SymbolIndex,

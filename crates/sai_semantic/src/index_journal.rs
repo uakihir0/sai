@@ -728,6 +728,10 @@ fn parse_package_node_key(value: &str) -> Option<PackageNodeKey> {
     })
 }
 
+pub(crate) fn package_index_file_for_node_key(value: &str) -> Option<PackageIndexFileName> {
+    parse_package_node_key(value).map(|key| key.index_file)
+}
+
 fn is_canonical_package_node_key(value: &str) -> bool {
     parse_package_node_key(value).is_some()
 }
