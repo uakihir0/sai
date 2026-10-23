@@ -13,6 +13,7 @@ sai_diagnostics = { path = "../sai_diagnostics" }
 sai_driver = { path = "../sai_driver" }
 sai_fmt = { path = "../sai_fmt" }
 sai_package = { path = "../sai_package" }
+sai_semantic = { path = "../sai_semantic" }
 sai_query = { path = "../sai_query" }
 sai_syntax = { path = "../sai_syntax" }
 sha2.workspace = true

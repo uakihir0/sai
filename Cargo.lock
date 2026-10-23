@@ -3045,6 +3045,7 @@ dependencies = [
  "sai_fmt",
  "sai_package",
  "sai_query",
+ "sai_semantic",
  "sai_syntax",
  "sai_vfs",
  "sai_windows_fs",
