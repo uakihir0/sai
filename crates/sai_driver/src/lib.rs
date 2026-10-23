@@ -25419,6 +25419,269 @@ mod tests {
     }
 
     #[test]
+    fn module_test_property_inventory_collects_verified_symbols() {
+        let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            br#"test "say \"hi\"\\path" { assert true }
+property "roundtrip"() { assert true }
+"#,
+            b"test \"child\" { assert true }\n",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+
+        for (path, kind, name, owner_kind, module_index) in [
+            (
+                r#"acme:phase1.test["say \"hi\"\\path"]"#,
+                sai_semantic::SymbolKind::Test,
+                "say \"hi\"\\path",
+                TopLevelOwnerKind::Test,
+                0,
+            ),
+            (
+                r#"acme:phase1.property["roundtrip"]"#,
+                sai_semantic::SymbolKind::Property,
+                "roundtrip",
+                TopLevelOwnerKind::Property,
+                0,
+            ),
+            (
+                r#"acme:phase1/child.test["child"]"#,
+                sai_semantic::SymbolKind::Test,
+                "child",
+                TopLevelOwnerKind::Test,
+                1,
+            ),
+        ] {
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == path)
+                .expect("the declaration has its canonical inventory path");
+            assert_eq!(symbol.kind(), kind);
+
+            let owner = collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .find(|owner| {
+                    owner.kind == owner_kind && owner.file == module_tree.modules[module_index].file
+                })
+                .expect("the declaration has a Phase 1 owner");
+            let def_path = database
+                .resolve_def_path(owner.owner.def_id.to_def_id())
+                .expect("the owner DefId is valid")
+                .expect("the owner has a DefPath");
+            assert_eq!(def_path.package(), module_tree.package);
+            let module_segments: &[&str] = match module_index {
+                0 => &[],
+                1 => &["child"],
+                _ => unreachable!("the fixture has two source modules"),
+            };
+            assert_eq!(def_path.data().len(), module_segments.len() + 1);
+            for (component, expected_segment) in def_path.data().iter().zip(module_segments.iter())
+            {
+                assert!(matches!(
+                    &component.data,
+                    DefPathData::Module(segment)
+                        if database.symbols.resolve(*segment).is_ok_and(|name| name.as_ref() == *expected_segment)
+                ));
+            }
+            assert!(matches!(
+                def_path.data().last(),
+                Some(component)
+                    if component.disambiguator == 0
+                        && match (&component.data, kind) {
+                            (DefPathData::Test(value), sai_semantic::SymbolKind::Test) => value.as_ref() == name,
+                            (DefPathData::Property(value), sai_semantic::SymbolKind::Property) => value.as_ref() == name,
+                            _ => false,
+                        }
+            ));
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&def_path, &database.packages, &database.symbols)
+                    .expect("the verified DefPath hashes");
+            assert_eq!(
+                symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+
+            let parsed = sai_syntax::parse(&snapshot, owner.file).expect("the module parses");
+            let (declaration, name_token) = match kind {
+                sai_semantic::SymbolKind::Test => {
+                    let declaration = parsed
+                        .root
+                        .descendants()
+                        .find_map(ast::TestDecl::cast)
+                        .expect("the test declaration is in the AST");
+                    let name_token = declaration
+                        .name()
+                        .expect("the test name exists")
+                        .syntax()
+                        .clone();
+                    (declaration.syntax().clone(), name_token)
+                }
+                sai_semantic::SymbolKind::Property => {
+                    let declaration = parsed
+                        .root
+                        .descendants()
+                        .find_map(ast::PropertyDecl::cast)
+                        .expect("the property declaration is in the AST");
+                    let name_token = declaration
+                        .name()
+                        .expect("the property name exists")
+                        .syntax()
+                        .clone();
+                    (declaration.syntax().clone(), name_token)
+                }
+                _ => unreachable!("the fixture only contains tests and properties"),
+            };
+            assert_eq!(
+                symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint(kind, &declaration, Some(&name_token))
+                    .expect("the actual string token is the fingerprint omission point")
+            );
+        }
+    }
+
+    #[test]
+    fn module_test_property_inventory_canonicalizes_simple_raw_and_multiline_strings() {
+        let sources: [&[u8]; 3] = [
+            br#"test "say \"hi\"\\path" { assert true }
+"#,
+            br###"test r#"say "hi"\path"# { assert true }
+"###,
+            br###"test """
+  say \"hi\"\\path
+  """
+{ assert true }
+"###,
+        ];
+        let results = sources.map(|source| {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert_eq!(
+                inventory.coverage(),
+                &sai_semantic::InventoryCoverage::Complete
+            );
+            let symbol = inventory
+                .symbols()
+                .first()
+                .expect("the test symbol is inventoried");
+            (symbol.path().to_owned(), symbol.fingerprint())
+        });
+        assert_eq!(results[0].0, r#"acme:phase1.test["say \"hi\"\\path"]"#);
+        assert_eq!(results[0], results[1]);
+        assert_eq!(results[0], results[2]);
+    }
+
+    #[test]
+    fn module_test_property_names_are_not_unicode_normalized() {
+        let (_, _, _, collection) = collect_package_inventory_for_target(
+            r#"test "é" {}
+test "e\u{301}" {}
+"#
+            .as_bytes(),
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        let paths = inventory
+            .symbols()
+            .iter()
+            .map(|symbol| symbol.path())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            paths,
+            ["acme:phase1.test[\"é\"]", "acme:phase1.test[\"e\u{301}\"]",]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn module_test_property_duplicates_are_checked_after_target_filtering() {
+        let source = br#"test "shared" {}
+@target("wasm64-core")
+property "shared"() {}
+"#;
+        let (_, _, _, wasm32) = collect_package_inventory_for_target(source, b"", "wasm32-core");
+        let wasm32 = inventory_symbols(&wasm32);
+        assert_eq!(
+            wasm32.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            wasm32
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.kind())
+                .collect::<Vec<_>>(),
+            [sai_semantic::SymbolKind::Test]
+        );
+
+        let (_, _, _, wasm64) = collect_package_inventory_for_target(source, b"", "wasm64-core");
+        let wasm64 = inventory_symbols(&wasm64);
+        assert!(matches!(
+            wasm64.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("duplicate test or property names")
+        ));
+        assert_eq!(
+            wasm64
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.kind())
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                sai_semantic::SymbolKind::Test,
+                sai_semantic::SymbolKind::Property
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let (_, _, _, invalid_target) = collect_package_inventory_for_target(
+            b"@target(\"wasm32-linux\")\ntest \"uncertain\" {}\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(matches!(
+            inventory_symbols(&invalid_target).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("target-selection error")
+        ));
+    }
+
+    #[test]
+    fn module_test_property_inventory_rejects_empty_control_and_malformed_names() {
+        let invalid_sources: [&[u8]; 4] = [
+            br#"test "" {}
+"#,
+            br#"property "bad\nname"() {}
+"#,
+            br#"test "malformed\q" {}
+"#,
+            b"test \"unterminated\" { assert true\n",
+        ];
+        for source in invalid_sources {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            assert!(matches!(
+                inventory_symbols(&collection).coverage(),
+                sai_semantic::InventoryCoverage::Incomplete { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn module_symbol_inventory_collects_plain_aliases_and_mixed_generic_parameters() {
         let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
             b"type Scalar = I32\ntype Packet<T: Bound, const N: I32, U> = Array<(T, U), N>\n",
@@ -25987,7 +26250,7 @@ mod tests {
     fn module_function_inventory_fails_closed_for_other_symbol_forms() {
         for (source, expected_reason) in [(
             &b"type Marker {}\n"[..],
-            "outside the function-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect inventory",
+            "outside the function-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect-test-property inventory",
         )] {
             let (_, _, _, collection) =
                 collect_package_inventory_for_target(source, b"", "wasm32-core");
