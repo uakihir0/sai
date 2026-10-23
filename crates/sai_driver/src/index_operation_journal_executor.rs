@@ -4,9 +4,9 @@
 //! immediately before acting. It can clear confirmed terminal decisions,
 //! restore one source file or index file, and coordinate a complete CLI
 //! rollback through before-state verification and journal clearing. Forward
-//! recovery can publish package-index files and then the planned index header;
-//! deleting files omitted from that header, journal transitions, and
-//! production integration remain later slices.
+//! recovery can publish package-index files and then the planned index header,
+//! followed by one-at-a-time deletion of files omitted from that durable
+//! header. Journal transitions and production integration remain later slices.
 
 use crate::index_operation_journal_recovery::{
     IndexJournalRecoveryDecision, ObservedFileState as PlannerObservedFileState,
@@ -147,6 +147,32 @@ pub enum IndexJournalHeaderPublishExecution {
     Published,
     /// The planned header was already current and its directory was flushed.
     AlreadyAfter,
+}
+
+/// Result of deleting one package-index file omitted from the durable
+/// planned-after header.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexJournalPackageDeleteExecution {
+    /// The fresh observation produced a different planner decision.
+    DecisionChanged {
+        planned: IndexJournalRecoveryDecision,
+        observed: IndexJournalRecoveryDecision,
+    },
+    /// The current planner decision does not authorize package-file deletion.
+    NotCommittable {
+        decision: IndexJournalRecoveryDecision,
+    },
+    /// The planned-after header is not durably current.
+    HeaderNotAfter,
+    /// A package file named by the planned-after header is not ready.
+    PackageFilesNotAfter,
+    /// A source file changed after the fresh planner observation.
+    SourceFilesNotAfter,
+    /// The selected recorded orphan was conditionally deleted.
+    Deleted,
+    /// The selected recorded orphan was already absent and the directory was
+    /// durably flushed.
+    AlreadyAbsent,
 }
 
 /// Result of completing a `RestoreBefore` decision and clearing its journal.
@@ -441,6 +467,95 @@ pub fn execute_index_operation_journal_publish_header_after(
         planned_decision,
         || {},
     )
+}
+
+/// Deletes one package-index file omitted from the committed planned-after
+/// header.
+///
+/// `planned_decision` must have been produced for `journal` under the same
+/// exclusive workspace lock and lock-bound recovery context. A fresh complete
+/// observation and a second observation after the test hook must both still
+/// authorize `CommitPlannedIndex`. The store then verifies that the durable
+/// after header is current, every listed package file matches its exact bytes
+/// or digest, and all affected files remain at a recorded state. It
+/// conditionally removes only `file`, whose journaled after state must be
+/// absent, and leaves the header and journal untouched.
+///
+/// A successful deletion is one recovery step, not transaction completion.
+/// Callers must obtain a fresh plan before deleting another file or clearing
+/// the journal. Filesystem observations do not validate LSP open-document
+/// versions; production LSP wiring must validate its current snapshot.
+pub fn execute_index_operation_journal_delete_package_after_header(
+    store: &IndexOperationJournalStore<'_>,
+    journal: &IndexOperationJournal,
+    context: &IndexJournalRecoveryContext,
+    file: &PackageIndexFileName,
+    planned_decision: IndexJournalRecoveryDecision,
+) -> Result<IndexJournalPackageDeleteExecution, IndexOperationJournalStoreError> {
+    execute_index_operation_journal_delete_package_after_header_with_hook(
+        store,
+        journal,
+        context,
+        file,
+        planned_decision,
+        || {},
+    )
+}
+
+fn execute_index_operation_journal_delete_package_after_header_with_hook(
+    store: &IndexOperationJournalStore<'_>,
+    journal: &IndexOperationJournal,
+    context: &IndexJournalRecoveryContext,
+    file: &PackageIndexFileName,
+    planned_decision: IndexJournalRecoveryDecision,
+    after_initial_observation: impl FnOnce(),
+) -> Result<IndexJournalPackageDeleteExecution, IndexOperationJournalStoreError> {
+    let observation = store.observe_recovery(journal, context)?;
+    let observed_decision = plan_index_operation_journal_recovery(journal, &observation);
+    if observed_decision != planned_decision {
+        return Ok(IndexJournalPackageDeleteExecution::DecisionChanged {
+            planned: planned_decision,
+            observed: observed_decision,
+        });
+    }
+    if observed_decision != IndexJournalRecoveryDecision::CommitPlannedIndex {
+        return Ok(IndexJournalPackageDeleteExecution::NotCommittable {
+            decision: observed_decision,
+        });
+    }
+
+    after_initial_observation();
+    let immediate_observation = store.observe_recovery(journal, context)?;
+    let immediate_decision = plan_index_operation_journal_recovery(journal, &immediate_observation);
+    if immediate_decision != planned_decision {
+        return Ok(IndexJournalPackageDeleteExecution::DecisionChanged {
+            planned: planned_decision,
+            observed: immediate_decision,
+        });
+    }
+    if immediate_decision != IndexJournalRecoveryDecision::CommitPlannedIndex {
+        return Ok(IndexJournalPackageDeleteExecution::NotCommittable {
+            decision: immediate_decision,
+        });
+    }
+
+    store.verify_recovery_context(context)?;
+    match store.delete_omitted_package_index_file_after_header(journal, context, file) {
+        Ok(ConditionalFileUpdate::Updated) => Ok(IndexJournalPackageDeleteExecution::Deleted),
+        Ok(ConditionalFileUpdate::AlreadyDesired) => {
+            Ok(IndexJournalPackageDeleteExecution::AlreadyAbsent)
+        }
+        Err(IndexOperationJournalStoreError::IndexHeaderNotAfter) => {
+            Ok(IndexJournalPackageDeleteExecution::HeaderNotAfter)
+        }
+        Err(IndexOperationJournalStoreError::PlannedAfterPackageFilesNotReady) => {
+            Ok(IndexJournalPackageDeleteExecution::PackageFilesNotAfter)
+        }
+        Err(IndexOperationJournalStoreError::PlannedAfterSourceFilesNotReady) => {
+            Ok(IndexJournalPackageDeleteExecution::SourceFilesNotAfter)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn execute_index_operation_journal_publish_header_after_with_hook(
@@ -999,10 +1114,11 @@ fn execute_index_operation_journal_clear_with_hook(
 mod tests {
     use super::{
         IndexJournalClearExecution, IndexJournalHeaderPublishExecution,
-        IndexJournalHeaderRestoreExecution, IndexJournalPackagePublishExecution,
-        IndexJournalPackageRestoreExecution, IndexJournalRestoreBeforeExecution,
-        IndexJournalSourceRestoreError, IndexJournalSourceRestoreExecution,
-        execute_index_operation_journal_clear,
+        IndexJournalHeaderRestoreExecution, IndexJournalPackageDeleteExecution,
+        IndexJournalPackagePublishExecution, IndexJournalPackageRestoreExecution,
+        IndexJournalRestoreBeforeExecution, IndexJournalSourceRestoreError,
+        IndexJournalSourceRestoreExecution, execute_index_operation_journal_clear,
+        execute_index_operation_journal_delete_package_after_header,
         execute_index_operation_journal_publish_header_after,
         execute_index_operation_journal_publish_package_after,
         execute_index_operation_journal_restore_before,
@@ -1144,6 +1260,61 @@ mod tests {
         ]));
         journal.encode().expect("fixture remains a valid journal");
         journal
+    }
+
+    fn journal_with_two_omitted_package_files() -> (
+        IndexOperationJournal,
+        PackageIndexFileName,
+        Vec<u8>,
+        PackageIndexFileName,
+        Vec<u8>,
+    ) {
+        let mut journal = journal(
+            IndexJournalOrigin::LspApplyEdit,
+            IndexJournalState::ClientApplied,
+        );
+        let current_file = journal.index_before.package_files[0].file.clone();
+        let current_before = match &journal.index_before.package_files[0].state {
+            FileState::RegularFile(bytes) => bytes.clone(),
+            FileState::Absent => panic!("fixture before package file is regular"),
+        };
+        let current_after = match &journal.index_after.package_files[0].state {
+            FileState::RegularFile(bytes) => bytes.clone(),
+            FileState::Absent => panic!("fixture after package file is regular"),
+        };
+        let first_orphan = PackageIndexFileName::parse("acme.old.1.jsonl").unwrap();
+        let first_orphan_bytes = Vec::new();
+        let second_orphan = PackageIndexFileName::parse("zeta.old.1.jsonl").unwrap();
+        let second_orphan_bytes = Vec::new();
+        for (file, bytes) in [
+            (&first_orphan, &first_orphan_bytes),
+            (&second_orphan, &second_orphan_bytes),
+        ] {
+            journal.index_before.package_files.push(PackageFileState {
+                file: file.clone(),
+                state: FileState::RegularFile(bytes.clone()),
+            });
+            journal.index_after.package_files.push(PackageFileState {
+                file: file.clone(),
+                state: FileState::Absent,
+            });
+        }
+        journal.index_before.header = FileState::RegularFile(header_with_package_files(&[
+            (&current_file, &current_before),
+            (&first_orphan, &first_orphan_bytes),
+            (&second_orphan, &second_orphan_bytes),
+        ]));
+        journal.index_after.header = FileState::RegularFile(header(&current_file, &current_after));
+        journal
+            .encode()
+            .expect("omitted-file journal remains valid");
+        (
+            journal,
+            first_orphan,
+            first_orphan_bytes,
+            second_orphan,
+            second_orphan_bytes,
+        )
     }
 
     fn journal_with_package_file_absent_before() -> IndexOperationJournal {
@@ -1529,6 +1700,148 @@ mod tests {
         assert_eq!(
             fs::read(workspace.0.join(".sai/index/index.json")).expect("read untouched header"),
             before_header
+        );
+        assert_eq!(journal_bytes(&workspace), journal_before);
+        assert!(journal_still_exists(&workspace));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
+    fn commit_plan_deletes_omitted_files_one_at_a_time_after_header_commit() {
+        let (journal, first_file, first_bytes, second_file, second_bytes) =
+            journal_with_two_omitted_package_files();
+        let (workspace, lock, context) = setup(&journal, &journal.sources[0].planned_after, true);
+        let store = IndexOperationJournalStore::new(&lock);
+        let index_directory = workspace.0.join(".sai/index");
+        let first_path = index_directory.join(first_file.as_str());
+        let second_path = index_directory.join(second_file.as_str());
+        fs::write(&first_path, &first_bytes).expect("restore first omitted package file");
+        fs::write(&second_path, &second_bytes).expect("restore second omitted package file");
+        let journal_before = journal_bytes(&workspace);
+        let FileState::RegularFile(header_after) = &journal.index_after.header else {
+            panic!("after header is regular");
+        };
+        let current_file = &journal.index_after.package_files[0].file;
+        let FileState::RegularFile(current_after) = &journal.index_after.package_files[0].state
+        else {
+            panic!("after current package file is regular");
+        };
+
+        let planned = expected_decision(&store, &journal, &context);
+        assert_eq!(planned, IndexJournalRecoveryDecision::CommitPlannedIndex);
+        assert_eq!(
+            execute_index_operation_journal_delete_package_after_header(
+                &store,
+                &journal,
+                &context,
+                &first_file,
+                planned,
+            )
+            .expect("delete first omitted package file"),
+            IndexJournalPackageDeleteExecution::Deleted
+        );
+        assert!(!first_path.exists());
+        assert_eq!(
+            fs::read(&second_path).expect("preserve unselected omitted file"),
+            second_bytes
+        );
+        assert_eq!(
+            fs::read(index_directory.join(current_file.as_str()))
+                .expect("preserve after-header package file"),
+            *current_after
+        );
+        assert_eq!(
+            fs::read(index_directory.join("index.json")).expect("preserve after header"),
+            *header_after
+        );
+        assert_eq!(journal_bytes(&workspace), journal_before);
+        assert!(journal_still_exists(&workspace));
+
+        let planned = expected_decision(&store, &journal, &context);
+        assert_eq!(planned, IndexJournalRecoveryDecision::CommitPlannedIndex);
+        assert_eq!(
+            execute_index_operation_journal_delete_package_after_header(
+                &store,
+                &journal,
+                &context,
+                &first_file,
+                planned,
+            )
+            .expect("repeat the already-completed deletion"),
+            IndexJournalPackageDeleteExecution::AlreadyAbsent
+        );
+
+        let planned = expected_decision(&store, &journal, &context);
+        assert_eq!(planned, IndexJournalRecoveryDecision::CommitPlannedIndex);
+        assert_eq!(
+            execute_index_operation_journal_delete_package_after_header(
+                &store,
+                &journal,
+                &context,
+                &second_file,
+                planned,
+            )
+            .expect("delete second omitted package file"),
+            IndexJournalPackageDeleteExecution::Deleted
+        );
+        assert!(!second_path.exists());
+        assert_eq!(
+            expected_decision(&store, &journal, &context),
+            IndexJournalRecoveryDecision::ClearCommitted
+        );
+        assert_eq!(journal_bytes(&workspace), journal_before);
+        assert!(journal_still_exists(&workspace));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
+    fn commit_plan_refuses_to_delete_an_orphan_before_header_commit() {
+        let (journal, orphan_file, orphan_bytes, _, _) = journal_with_two_omitted_package_files();
+        let (workspace, lock, context) = setup(&journal, &journal.sources[0].planned_after, false);
+        let store = IndexOperationJournalStore::new(&lock);
+        let planned = expected_decision(&store, &journal, &context);
+        assert_eq!(planned, IndexJournalRecoveryDecision::CommitPlannedIndex);
+        let orphan_path = workspace.0.join(".sai/index").join(orphan_file.as_str());
+        let header_before =
+            fs::read(workspace.0.join(".sai/index/index.json")).expect("read before header");
+        let journal_before = journal_bytes(&workspace);
+
+        assert_eq!(
+            execute_index_operation_journal_delete_package_after_header(
+                &store,
+                &journal,
+                &context,
+                &orphan_file,
+                planned,
+            )
+            .expect("report the uncommitted-header condition"),
+            IndexJournalPackageDeleteExecution::HeaderNotAfter
+        );
+        assert_eq!(
+            fs::read(orphan_path).expect("preserve file listed by before header"),
+            orphan_bytes
+        );
+        assert_eq!(
+            fs::read(workspace.0.join(".sai/index/index.json")).expect("preserve before header"),
+            header_before
         );
         assert_eq!(journal_bytes(&workspace), journal_before);
         assert!(journal_still_exists(&workspace));

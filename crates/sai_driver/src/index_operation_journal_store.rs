@@ -73,6 +73,7 @@ pub enum IndexOperationJournalStoreError {
     IndexStateNotRecorded,
     IndexFileChanged,
     IndexHeaderNotBefore,
+    IndexHeaderNotAfter,
     PackageFileDeletionRequiresAfterHeader,
     PlannedAfterPackageFilesNotReady,
     PlannedAfterSourceFilesNotReady,
@@ -128,6 +129,9 @@ impl fmt::Display for IndexOperationJournalStoreError {
             Self::IndexHeaderNotBefore => {
                 formatter.write_str("the index header is not at its recorded before state")
             }
+            Self::IndexHeaderNotAfter => {
+                formatter.write_str("the index header is not at its recorded planned-after state")
+            }
             Self::PackageFileDeletionRequiresAfterHeader => formatter.write_str(
                 "a package-index file omitted from the planned header cannot be removed before that header is committed",
             ),
@@ -158,6 +162,7 @@ impl Error for IndexOperationJournalStoreError {
             | Self::IndexStateNotRecorded
             | Self::IndexFileChanged
             | Self::IndexHeaderNotBefore
+            | Self::IndexHeaderNotAfter
             | Self::PackageFileDeletionRequiresAfterHeader
             | Self::PlannedAfterPackageFilesNotReady
             | Self::PlannedAfterSourceFilesNotReady => None,
@@ -584,6 +589,261 @@ impl<'lock> IndexOperationJournalStore<'lock> {
                 IndexOperationJournalStoreError::IndexFileChanged
             } else {
                 self.io_error(self.index_directory_path().join("index.json"), source)
+            }
+        })?;
+        if update == ConditionalFileUpdate::AlreadyDesired {
+            self.sync_index_directory(&current_index_directory)?;
+        }
+        Ok(update)
+    }
+
+    /// Deletes one affected package-index file omitted from the durable
+    /// planned-after header.
+    ///
+    /// The file must be recorded as regular bytes before the operation and
+    /// absent afterward. The planned-after header must already be current and
+    /// durable. Every package file named by that header is revalidated against
+    /// its exact planned-after bytes or digest, and all other affected files
+    /// must still be at a recorded before or after state. Only the selected
+    /// file is conditionally removed; the header, journal, sources, and other
+    /// package files are preserved.
+    ///
+    /// The caller must first make a fresh recovery observation and confirm
+    /// `CommitPlannedIndex`. The method revalidates the lock-bound context and
+    /// source after state immediately before removal. A retry that already
+    /// observes the selected file absent syncs the directory before reporting
+    /// success. External editors remain outside the workspace-lock contract.
+    pub fn delete_omitted_package_index_file_after_header(
+        &self,
+        journal: &IndexOperationJournal,
+        context: &IndexJournalRecoveryContext,
+        file: &PackageIndexFileName,
+    ) -> Result<ConditionalFileUpdate, IndexOperationJournalStoreError> {
+        self.delete_omitted_package_index_file_after_header_with_hook(journal, context, file, || {})
+    }
+
+    fn delete_omitted_package_index_file_after_header_with_hook(
+        &self,
+        journal: &IndexOperationJournal,
+        context: &IndexJournalRecoveryContext,
+        file: &PackageIndexFileName,
+        after_initial_scan: impl FnOnce(),
+    ) -> Result<ConditionalFileUpdate, IndexOperationJournalStoreError> {
+        self.require_exclusive()?;
+        self.verify_recovery_context(context)?;
+
+        let Some((before_state, after_state)) = affected_file_state(journal, file) else {
+            return Err(IndexOperationJournalStoreError::IndexFileNotRecorded);
+        };
+        let FileState::RegularFile(before_bytes) = before_state else {
+            return Err(IndexOperationJournalStoreError::IndexStateNotRecorded);
+        };
+        if after_state != &FileState::Absent {
+            return Err(IndexOperationJournalStoreError::IndexStateNotRecorded);
+        }
+        let Some(after_header_bytes) = state_bytes(&journal.index_after.header) else {
+            return Err(IndexOperationJournalStoreError::IndexStateNotRecorded);
+        };
+        let after_header = SymbolIndexHeader::decode(after_header_bytes)
+            .map_err(|_| IndexOperationJournalStoreError::IndexStateNotRecorded)?;
+        if after_header
+            .records()
+            .iter()
+            .any(|record| record.file() == file)
+        {
+            return Err(IndexOperationJournalStoreError::PackageFileDeletionRequiresAfterHeader);
+        }
+
+        let encoded_journal = self.encode_at_journal_path(journal)?;
+        let state_directory_identity = file_identity(self.lock.state_directory_handle())
+            .map_err(|source| self.io_error(self.state_directory_path(), source))?;
+        let index_directory = self
+            .open_existing_index_directory_for_mutation(self.lock.state_directory_handle())?
+            .ok_or(IndexOperationJournalStoreError::JournalChanged)?;
+        let index_directory_identity = file_identity(&index_directory)
+            .map_err(|source| self.io_error(self.index_directory_path(), source))?;
+        let Some(current) = self.read_current(&index_directory)? else {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        };
+        if current.journal != *journal || current.bytes != encoded_journal {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        }
+
+        let maximum_header_bytes = state_bytes(&journal.index_before.header)
+            .map_or(0, <[u8]>::len)
+            .max(after_header_bytes.len());
+        let header_observation = observe_stable_bounded_file(
+            &index_directory,
+            &self.index_directory_path(),
+            OsStr::new("index.json"),
+            maximum_header_bytes,
+        )
+        .map_err(|source| self.io_error(self.index_directory_path().join("index.json"), source))?;
+        if !matches!(
+            &header_observation.state,
+            ObservedFileState::Bytes(bytes) if bytes == after_header_bytes
+        ) {
+            return Err(IndexOperationJournalStoreError::IndexHeaderNotAfter);
+        }
+        let mut rechecks = vec![EntryRecheck::Bounded {
+            name: OsString::from("index.json"),
+            maximum_bytes: maximum_header_bytes,
+            expected: header_observation.fingerprint,
+            identity: header_observation.identity,
+            metadata: header_observation.metadata,
+        }];
+
+        let after_header_files = after_header
+            .records()
+            .iter()
+            .map(|record| record.file().clone())
+            .collect::<BTreeSet<_>>();
+        for record in after_header.records() {
+            if let Some((_, after_state)) = affected_file_state(journal, record.file()) {
+                let Some(expected_bytes) = state_bytes(after_state) else {
+                    return Err(IndexOperationJournalStoreError::PlannedAfterPackageFilesNotReady);
+                };
+                let observation = observe_stable_bounded_file(
+                    &index_directory,
+                    &self.index_directory_path(),
+                    OsStr::new(record.file().as_str()),
+                    expected_bytes.len(),
+                )
+                .map_err(|source| {
+                    self.io_error(
+                        self.index_directory_path().join(record.file().as_str()),
+                        source,
+                    )
+                })?;
+                let matches_after = matches!(
+                    &observation.state,
+                    ObservedFileState::Bytes(bytes) if bytes == expected_bytes
+                );
+                rechecks.push(EntryRecheck::Bounded {
+                    name: OsString::from(record.file().as_str()),
+                    maximum_bytes: expected_bytes.len(),
+                    expected: observation.fingerprint,
+                    identity: observation.identity,
+                    metadata: observation.metadata,
+                });
+                if !matches_after {
+                    return Err(IndexOperationJournalStoreError::PlannedAfterPackageFilesNotReady);
+                }
+            } else {
+                let observation = observe_stable_file_digest(
+                    &index_directory,
+                    &self.index_directory_path(),
+                    OsStr::new(record.file().as_str()),
+                )
+                .map_err(|source| {
+                    self.io_error(
+                        self.index_directory_path().join(record.file().as_str()),
+                        source,
+                    )
+                })?;
+                let matches_digest = matches!(
+                    observation.state,
+                    ObservedDigestState::Digest(actual) if actual == record.digest()
+                );
+                rechecks.push(EntryRecheck::Digest {
+                    name: OsString::from(record.file().as_str()),
+                    expected: observation.fingerprint,
+                    identity: observation.identity,
+                    metadata: observation.metadata,
+                });
+                if !matches_digest {
+                    return Err(IndexOperationJournalStoreError::PlannedAfterPackageFilesNotReady);
+                }
+            }
+        }
+
+        for affected_file in affected_package_file_names(journal)
+            .map_err(|_| IndexOperationJournalStoreError::IndexFileNotRecorded)?
+        {
+            if after_header_files.contains(&affected_file) {
+                continue;
+            }
+            let (before, after) = affected_file_state(journal, &affected_file)
+                .ok_or(IndexOperationJournalStoreError::IndexFileNotRecorded)?;
+            let maximum_bytes = state_bytes(before)
+                .map_or(0, <[u8]>::len)
+                .max(state_bytes(after).map_or(0, <[u8]>::len));
+            let observation = observe_stable_bounded_file(
+                &index_directory,
+                &self.index_directory_path(),
+                OsStr::new(affected_file.as_str()),
+                maximum_bytes,
+            )
+            .map_err(|source| {
+                self.io_error(
+                    self.index_directory_path().join(affected_file.as_str()),
+                    source,
+                )
+            })?;
+            let observed_state = match &observation.state {
+                ObservedFileState::Absent => FileState::Absent,
+                ObservedFileState::Bytes(bytes) => FileState::RegularFile(bytes.clone()),
+                ObservedFileState::Oversized => {
+                    return Err(IndexOperationJournalStoreError::PlannedAfterPackageFilesNotReady);
+                }
+            };
+            rechecks.push(EntryRecheck::Bounded {
+                name: OsString::from(affected_file.as_str()),
+                maximum_bytes,
+                expected: observation.fingerprint,
+                identity: observation.identity,
+                metadata: observation.metadata,
+            });
+            if &observed_state != before && &observed_state != after {
+                return Err(IndexOperationJournalStoreError::PlannedAfterPackageFilesNotReady);
+            }
+        }
+
+        after_initial_scan();
+        let (revalidated_handles, entries_stable) = revalidate_entries(
+            Some(&index_directory),
+            &self.index_directory_path(),
+            &rechecks,
+        );
+        if !entries_stable
+            || file_identity(self.lock.state_directory_handle()).ok()
+                != Some(state_directory_identity)
+            || file_identity(&index_directory).ok() != Some(index_directory_identity)
+        {
+            return Err(IndexOperationJournalStoreError::IndexFileChanged);
+        }
+        let Some(current_after) = self.read_current(&index_directory)? else {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        };
+        if current_after.journal != current.journal || current_after.bytes != current.bytes {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        }
+        self.verify_recovery_context(context)?;
+        let Some(current_index_directory) = self.open_index_directory_for_read()? else {
+            return Err(IndexOperationJournalStoreError::IndexFileChanged);
+        };
+        if file_identity(&current_index_directory).ok() != Some(index_directory_identity) {
+            return Err(IndexOperationJournalStoreError::IndexFileChanged);
+        }
+        if !self.source_files_match_planned_after(journal, context) {
+            return Err(IndexOperationJournalStoreError::PlannedAfterSourceFilesNotReady);
+        }
+
+        // The after header is the commit point. Flush it before the first
+        // orphan removal even when this is an already-deleted retry.
+        self.sync_index_directory(&current_index_directory)?;
+        drop(revalidated_handles);
+        let update = update_file_in_directory_if_matches(
+            &current_index_directory,
+            OsStr::new(file.as_str()),
+            Some(before_bytes),
+            None,
+        )
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::WouldBlock {
+                IndexOperationJournalStoreError::IndexFileChanged
+            } else {
+                self.io_error(self.index_directory_path().join(file.as_str()), source)
             }
         })?;
         if update == ConditionalFileUpdate::AlreadyDesired {
@@ -2241,7 +2501,9 @@ mod tests {
         IndexOperationJournalStoreError, read_bounded_file,
     };
     use crate::index_operation_journal_recovery::IndexGenerationObservation;
-    use crate::index_operation_journal_validation::capture_index_journal_recovery_context;
+    use crate::index_operation_journal_validation::{
+        IndexJournalRecoveryContext, capture_index_journal_recovery_context,
+    };
     use sai_package::validation::PackageValidationContext;
     use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
     use sai_semantic::{
@@ -2249,6 +2511,7 @@ mod tests {
         PackageFileState, PackageIndexFileName, SourceFileChange, SymbolHex, SymbolIdMapping,
     };
     use sai_stable_hash::hash_bytes;
+    use sai_windows_fs::ConditionalFileUpdate;
     use std::fs;
     #[cfg(windows)]
     use std::io;
@@ -2291,6 +2554,45 @@ mod tests {
                  targets { wasm32-core, wasm32-wasi }\n",
         )
         .expect("write workspace lock");
+    }
+
+    fn prepare_omitted_file_recovery(
+        index_after: bool,
+    ) -> (
+        TestDirectory,
+        WorkspaceLockGuard,
+        IndexJournalRecoveryContext,
+        IndexOperationJournal,
+        PackageIndexFileName,
+        Vec<u8>,
+    ) {
+        let directory = TestDirectory::new();
+        prepare_recovery_workspace(&directory);
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let context =
+            capture_index_journal_recovery_context(&lock, PackageValidationContext::default())
+                .expect("capture lock-bound recovery context");
+        let (journal, orphan_file, orphan_bytes) = journal_with_omitted_file();
+        let index_directory = lock.package_directory().join(".sai/index");
+        write_snapshot(
+            &index_directory,
+            if index_after {
+                &journal.index_after
+            } else {
+                &journal.index_before
+            },
+        );
+        if index_after {
+            fs::write(index_directory.join(orphan_file.as_str()), &orphan_bytes)
+                .expect("restore recorded orphan after header publication");
+        }
+        write_current_journal(&index_directory, &journal);
+        let FileState::RegularFile(source_after) = &journal.sources[0].planned_after else {
+            panic!("fixture source after state is regular");
+        };
+        fs::write(directory.0.join("src/lib.sai"), source_after)
+            .expect("write planned-after source");
+        (directory, lock, context, journal, orphan_file, orphan_bytes)
     }
 
     fn journal() -> IndexOperationJournal {
@@ -2397,6 +2699,49 @@ mod tests {
         journal.index_after.header = FileState::RegularFile(after_header);
         journal.encode().expect("fixture is a valid journal");
         (journal, unaffected_file)
+    }
+
+    fn journal_with_omitted_file() -> (IndexOperationJournal, PackageIndexFileName, Vec<u8>) {
+        let mut journal = journal();
+        let current_file = journal.index_before.package_files[0].file.clone();
+        let current_before = match &journal.index_before.package_files[0].state {
+            FileState::RegularFile(bytes) => bytes.clone(),
+            FileState::Absent => panic!("fixture before package file is regular"),
+        };
+        let current_after = match &journal.index_after.package_files[0].state {
+            FileState::RegularFile(bytes) => bytes.clone(),
+            FileState::Absent => panic!("fixture after package file is regular"),
+        };
+        let orphan_file =
+            PackageIndexFileName::parse("zeta.tools.1.jsonl").expect("valid orphan filename");
+        let orphan_bytes = Vec::new();
+        journal.index_before.package_files.push(PackageFileState {
+            file: orphan_file.clone(),
+            state: FileState::RegularFile(orphan_bytes.clone()),
+        });
+        journal.index_after.package_files.push(PackageFileState {
+            file: orphan_file.clone(),
+            state: FileState::Absent,
+        });
+        journal.index_before.header = FileState::RegularFile(header_with_two_files(
+            &current_file,
+            &current_before,
+            &orphan_file,
+            &orphan_bytes,
+        ));
+        journal.index_after.header =
+            FileState::RegularFile(header_with_one_file(&current_file, &current_after));
+        journal.encode().expect("omitted-file fixture is valid");
+        (journal, orphan_file, orphan_bytes)
+    }
+
+    fn header_with_one_file(file: &PackageIndexFileName, bytes: &[u8]) -> Vec<u8> {
+        format!(
+            "{{\"format\":\"sai-index\",\"version\":1,\"packages\":[{{\"file\":\"{}\",\"blake3\":\"{}\"}}]}}\n",
+            file.as_str(),
+            hash_bytes(bytes).to_hex()
+        )
+        .into_bytes()
     }
 
     fn header_with_two_files(
@@ -2592,6 +2937,235 @@ mod tests {
         assert_eq!(
             fs::read(index_directory.join("operation.json")).unwrap(),
             journal_before
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn deletes_one_recorded_omitted_file_after_the_header_is_published() {
+        let (directory, lock, context, journal, orphan_file, _orphan_bytes) =
+            prepare_omitted_file_recovery(true);
+        let store = IndexOperationJournalStore::new(&lock);
+        let index_directory = lock.package_directory().join(".sai/index");
+        let orphan_path = index_directory.join(orphan_file.as_str());
+        let header_after = fs::read(index_directory.join("index.json")).unwrap();
+        let journal_before = fs::read(index_directory.join("operation.json")).unwrap();
+        let current_file = &journal.index_after.package_files[0].file;
+        let FileState::RegularFile(current_after) = &journal.index_after.package_files[0].state
+        else {
+            panic!("after current package file is regular");
+        };
+        let source_after = fs::read(directory.0.join("src/lib.sai")).unwrap();
+
+        assert_eq!(
+            store
+                .delete_omitted_package_index_file_after_header(&journal, &context, &orphan_file,)
+                .unwrap(),
+            ConditionalFileUpdate::Updated
+        );
+        assert!(!orphan_path.exists());
+        assert_eq!(
+            fs::read(index_directory.join(current_file.as_str())).unwrap(),
+            *current_after
+        );
+        assert_eq!(
+            fs::read(index_directory.join("index.json")).unwrap(),
+            header_after
+        );
+        assert_eq!(
+            fs::read(index_directory.join("operation.json")).unwrap(),
+            journal_before
+        );
+        assert_eq!(
+            fs::read(directory.0.join("src/lib.sai")).unwrap(),
+            source_after
+        );
+
+        assert_eq!(
+            store
+                .delete_omitted_package_index_file_after_header(&journal, &context, &orphan_file,)
+                .unwrap(),
+            ConditionalFileUpdate::AlreadyDesired,
+            "an already-absent target is a durable retry"
+        );
+        assert!(!orphan_path.exists());
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn omitted_file_deletion_requires_the_planned_after_header() {
+        let (directory, lock, context, journal, orphan_file, orphan_bytes) =
+            prepare_omitted_file_recovery(false);
+        let store = IndexOperationJournalStore::new(&lock);
+        let index_directory = lock.package_directory().join(".sai/index");
+        let header_before = fs::read(index_directory.join("index.json")).unwrap();
+        let journal_before = fs::read(index_directory.join("operation.json")).unwrap();
+
+        assert!(matches!(
+            store.delete_omitted_package_index_file_after_header(&journal, &context, &orphan_file),
+            Err(IndexOperationJournalStoreError::IndexHeaderNotAfter)
+        ));
+        assert_eq!(
+            fs::read(index_directory.join(orphan_file.as_str())).unwrap(),
+            orphan_bytes
+        );
+        assert_eq!(
+            fs::read(index_directory.join("index.json")).unwrap(),
+            header_before
+        );
+        assert_eq!(
+            fs::read(index_directory.join("operation.json")).unwrap(),
+            journal_before
+        );
+        assert_eq!(
+            fs::read(directory.0.join("src/lib.sai")).unwrap(),
+            match &journal.sources[0].planned_after {
+                FileState::RegularFile(bytes) => bytes.clone(),
+                FileState::Absent => panic!("fixture source after state is regular"),
+            }
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn omitted_file_deletion_checks_after_header_package_digests() {
+        let (_directory, lock, context, journal, orphan_file, orphan_bytes) =
+            prepare_omitted_file_recovery(true);
+        let store = IndexOperationJournalStore::new(&lock);
+        let index_directory = lock.package_directory().join(".sai/index");
+        let current_file = &journal.index_after.package_files[0].file;
+        let package_path = index_directory.join(current_file.as_str());
+        fs::write(&package_path, b"changed after-header package bytes")
+            .expect("tamper with a listed package file");
+
+        assert!(matches!(
+            store.delete_omitted_package_index_file_after_header(&journal, &context, &orphan_file),
+            Err(IndexOperationJournalStoreError::PlannedAfterPackageFilesNotReady)
+        ));
+        assert_eq!(
+            fs::read(index_directory.join(orphan_file.as_str())).unwrap(),
+            orphan_bytes
+        );
+        assert_eq!(
+            fs::read(package_path).unwrap(),
+            b"changed after-header package bytes"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn omitted_file_deletion_rechecks_target_after_the_initial_scan() {
+        let (_directory, lock, context, journal, orphan_file, orphan_bytes) =
+            prepare_omitted_file_recovery(true);
+        let store = IndexOperationJournalStore::new(&lock);
+        let index_directory = lock.package_directory().join(".sai/index");
+        let unexpected = b"external orphan edit";
+
+        assert!(matches!(
+            store.delete_omitted_package_index_file_after_header_with_hook(
+                &journal,
+                &context,
+                &orphan_file,
+                || {
+                    fs::write(index_directory.join(orphan_file.as_str()), unexpected)
+                        .expect("mutate the orphan after its initial scan");
+                }
+            ),
+            Err(IndexOperationJournalStoreError::IndexFileChanged)
+        ));
+        assert_ne!(orphan_bytes.as_slice(), unexpected);
+        assert_eq!(
+            fs::read(index_directory.join(orphan_file.as_str())).unwrap(),
+            unexpected
+        );
+        assert_eq!(
+            fs::read(index_directory.join("index.json")).unwrap(),
+            match &journal.index_after.header {
+                FileState::RegularFile(bytes) => bytes.clone(),
+                FileState::Absent => panic!("after header is regular"),
+            }
+        );
+        assert_eq!(
+            fs::read(index_directory.join("operation.json")).unwrap(),
+            journal.encode().unwrap()
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn omitted_file_deletion_rechecks_sources_after_index_file_readiness() {
+        let (directory, lock, context, journal, orphan_file, orphan_bytes) =
+            prepare_omitted_file_recovery(true);
+        let store = IndexOperationJournalStore::new(&lock);
+        let source_path = directory.0.join("src/lib.sai");
+        let unexpected = b"external source edit after package readiness scan";
+        let index_directory = lock.package_directory().join(".sai/index");
+
+        assert!(matches!(
+            store.delete_omitted_package_index_file_after_header_with_hook(
+                &journal,
+                &context,
+                &orphan_file,
+                || {
+                    fs::write(&source_path, unexpected)
+                        .expect("mutate the source after package readiness scan");
+                }
+            ),
+            Err(IndexOperationJournalStoreError::PlannedAfterSourceFilesNotReady)
+        ));
+        assert_eq!(fs::read(&source_path).unwrap(), unexpected);
+        assert_eq!(
+            fs::read(index_directory.join(orphan_file.as_str())).unwrap(),
+            orphan_bytes
+        );
+        assert_eq!(
+            fs::read(index_directory.join("operation.json")).unwrap(),
+            journal.encode().unwrap()
         );
     }
 
