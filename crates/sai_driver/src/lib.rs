@@ -11,6 +11,7 @@ mod interface_resource_alias;
 mod interface_use_queries;
 pub mod package_graph;
 mod package_wit_name_queries;
+pub mod symbol_index_store;
 mod wit_package_queries;
 mod world_elaboration_adapter;
 mod world_resource_containment;
