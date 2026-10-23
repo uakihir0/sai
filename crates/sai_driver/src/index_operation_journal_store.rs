@@ -318,6 +318,33 @@ impl<'lock> IndexOperationJournalStore<'lock> {
         )
     }
 
+    /// Verifies that the durable journal still exactly matches `journal`.
+    ///
+    /// The caller must hold the exclusive workspace lock. This read-only
+    /// check is intended immediately before a recovery mutation to a file
+    /// outside `.sai/index`; it does not make that separate mutation atomic
+    /// with the journal read. Cooperating workspace operations are excluded
+    /// by the lock, and the target file must still be updated conditionally.
+    pub fn verify_current(
+        &self,
+        journal: &IndexOperationJournal,
+    ) -> Result<(), IndexOperationJournalStoreError> {
+        self.require_exclusive()?;
+        let encoded_journal = self.encode_at_journal_path(journal)?;
+        let Some(index_directory) =
+            self.open_existing_index_directory_for_mutation(self.lock.state_directory_handle())?
+        else {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        };
+        let Some(current) = self.read_current(&index_directory)? else {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        };
+        if current.journal != *journal || current.bytes != encoded_journal {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        }
+        Ok(())
+    }
+
     /// Test-only entry point for exercising conservative aggregate byte limits.
     #[cfg(test)]
     pub(crate) fn observe_recovery_with_source_byte_budget(
