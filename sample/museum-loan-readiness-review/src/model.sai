@@ -1,0 +1,79 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ConditionStatus {
+    Stable
+    Monitor
+    Unstable
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum LoanOutcome {
+    Accepted
+    Held
+    Deferred
+    Rejected
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReviewReason {
+    DuplicateAccession
+    LenderConsentMissing
+    LoanFileIncomplete
+    UnstableCondition
+    InsuranceShortfall
+    CrateUnavailable
+    EnvironmentOutOfRange
+    GalleryFull
+    ClimateCaseFull
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type LoanRequest {
+    pub id: U32
+    pub accession: U32
+    pub priority: U32
+    pub appraised_value_dollars: U32
+    pub insured_value_dollars: U32
+    pub lender_consent: Bool
+    pub file_complete: Bool
+    pub condition: ConditionStatus
+    pub climate_sensitive: Bool
+    pub minimum_humidity_percent: U32
+    pub maximum_humidity_percent: U32
+    pub required_crate_rating: U32
+    pub available_crate_rating: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Gallery {
+    pub display_slots: USize
+    pub climate_cases: USize
+    pub humidity_percent: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type LoanBatch {
+    pub gallery: Gallery
+    pub requests: Array<Option<LoanRequest>, 10>
+    pub request_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type LoanDecision {
+    pub request_id: U32
+    pub accession: U32
+    pub outcome: LoanOutcome
+    pub reason: Option<ReviewReason>
+    pub display_slot_used: Bool
+    pub climate_case_used: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type LoanReport {
+    pub decisions: Array<Option<LoanDecision>, 10>
+    pub decision_count: USize
+    pub input_valid: Bool
+    pub accepted_count: USize
+    pub held_count: USize
+    pub deferred_count: USize
+    pub rejected_count: USize
+}

@@ -1,0 +1,41 @@
+use acme:community-solar-credit-auditor/fixtures
+use acme:community-solar-credit-auditor/model.{DataIssue, SubscriberMonth}
+
+pub fn data_issue(subscriber: SubscriberMonth) -> Option<DataIssue> {
+    match subscriber.metered_usage_kwh {
+        None => Some(DataIssue.MissingMeterUsage)
+        Some(usage) => {
+            if usage > fixtures.maximum_metered_usage_kwh() {
+                Some(DataIssue.MeterUsageOutOfRange)
+            } else {
+                match subscriber.contract_cap_kwh {
+                    None => Some(DataIssue.MissingContractCap)
+                    Some(cap) => {
+                        if cap == 0 or cap > fixtures.maximum_contract_cap_kwh() {
+                            Some(DataIssue.ContractCapOutOfRange)
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn eligible_demand_kwh(subscriber: SubscriberMonth) -> U32 {
+    match data_issue(subscriber) {
+        Some(_) => 0
+        None => match subscriber.metered_usage_kwh {
+            Some(usage) => match subscriber.contract_cap_kwh {
+                Some(cap) => if usage < cap {
+                    usage
+                } else {
+                    cap
+                }
+                None => 0
+            }
+            None => 0
+        }
+    }
+}

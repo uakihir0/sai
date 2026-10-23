@@ -1,0 +1,88 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SubscriberMonth {
+    pub account_id: U32
+    pub household: Str
+    // Lower values receive credits first; account ID breaks ties.
+    pub priority: U32
+    pub metered_usage_kwh: Option<U32>
+    pub contract_cap_kwh: Option<U32>
+    // Missing means that no utility credit statement was supplied.
+    pub reported_credit_kwh: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum DataIssue {
+    MissingMeterUsage
+    MeterUsageOutOfRange
+    MissingContractCap
+    ContractCapOutOfRange
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CreditIssue {
+    MissingCreditStatement
+    OverAllocated
+    UnderAllocated
+    CreditToInvalidAccount
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ExpectedAllocation {
+    pub rank: USize
+    pub subscriber: SubscriberMonth
+    pub data_issue: Option<DataIssue>
+    pub eligible_demand_kwh: U32
+    pub planned_credit_kwh: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AllocationPlan {
+    pub allocations: Array<Option<ExpectedAllocation>, 8>
+    pub allocation_count: USize
+    pub generation_credit_kwh: U32
+    pub eligible_demand_kwh: U32
+    pub planned_credit_kwh: U32
+    pub unused_generation_kwh: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AccountAudit {
+    pub rank: USize
+    pub subscriber: SubscriberMonth
+    pub data_issue: Option<DataIssue>
+    pub eligible_demand_kwh: U32
+    pub planned_credit_kwh: U32
+    pub reported_credit_kwh: Option<U32>
+    pub credit_issue: Option<CreditIssue>
+    pub over_allocated_kwh: U32
+    pub under_allocated_kwh: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditSummary {
+    pub households_reviewed: USize
+    pub valid_households: USize
+    pub missing_meter_usage_count: USize
+    pub meter_usage_out_of_range_count: USize
+    pub missing_contract_cap_count: USize
+    pub contract_cap_out_of_range_count: USize
+    pub missing_statement_count: USize
+    pub over_allocated_household_count: USize
+    pub over_allocated_kwh: U32
+    pub under_allocated_household_count: USize
+    pub under_allocated_kwh: U32
+    pub invalid_account_credit_count: USize
+    pub invalid_account_credit_kwh: U32
+    pub eligible_demand_kwh: U32
+    pub planned_credit_kwh: U32
+    pub reported_statement_count: USize
+    pub reported_credit_kwh: U32
+    pub source_overage_kwh: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type MonthlyAudit {
+    pub accounts: Array<Option<AccountAudit>, 8>
+    pub account_count: USize
+    pub summary: AuditSummary
+}

@@ -1,0 +1,51 @@
+use acme:community-solar-credit-auditor/fixtures
+use acme:community-solar-credit-auditor/model.{AllocationPlan, ExpectedAllocation}
+use acme:community-solar-credit-auditor/ranking
+use acme:community-solar-credit-auditor/validation
+
+pub fn build_plan() -> AllocationPlan {
+    var allocations = Array<Option<ExpectedAllocation>, 8>.filled(None)
+    var remaining_kwh = fixtures.generation_credit_kwh()
+    var eligible_demand_kwh: U32 = 0
+    var planned_credit_kwh: U32 = 0
+    var allocation_count: USize = 0
+    var rank: USize = 0
+
+    while rank < 8 {
+        match ranking.subscriber_at_rank(rank) {
+            Some(subscriber) => {
+                let issue = validation.data_issue(subscriber)
+                let demand = validation.eligible_demand_kwh(subscriber)
+                let planned = if demand < remaining_kwh {
+                    demand
+                } else {
+                    remaining_kwh
+                }
+                allocations[rank] = Some(
+                    ExpectedAllocation(
+                        rank: rank + 1,
+                        subscriber: subscriber,
+                        data_issue: issue,
+                        eligible_demand_kwh: demand,
+                        planned_credit_kwh: planned,
+                    ),
+                )
+                allocation_count += 1
+                eligible_demand_kwh += demand
+                planned_credit_kwh += planned
+                remaining_kwh -= planned
+            }
+            None => {}
+        }
+        rank += 1
+    }
+
+    AllocationPlan(
+        allocations: allocations,
+        allocation_count: allocation_count,
+        generation_credit_kwh: fixtures.generation_credit_kwh(),
+        eligible_demand_kwh: eligible_demand_kwh,
+        planned_credit_kwh: planned_credit_kwh,
+        unused_generation_kwh: remaining_kwh,
+    )
+}

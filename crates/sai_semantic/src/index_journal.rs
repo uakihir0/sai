@@ -215,6 +215,27 @@ impl IndexOperationJournal {
         Ok(bytes)
     }
 
+    /// Returns the package files named by the planned index header.
+    ///
+    /// This validates the canonical header grammar. Callers that need the
+    /// complete journal validity check should decode its persisted bytes (or
+    /// call [`Self::encode`]) as well.
+    pub fn planned_index_package_files(
+        &self,
+    ) -> Result<Vec<PackageIndexFileName>, IndexJournalCodecError> {
+        let files = parse_index_header(&self.index_after.header)?;
+        if files.is_empty() {
+            return Err(IndexJournalCodecError::EmptyPlannedIndex);
+        }
+        files
+            .keys()
+            .map(|file| {
+                PackageIndexFileName::parse(file)
+                    .map_err(|_| IndexJournalCodecError::InvalidIndexHeader)
+            })
+            .collect()
+    }
+
     fn validate(&self) -> Result<(), IndexJournalCodecError> {
         if !is_canonical_uuid_v4(&self.operation_id) {
             return Err(IndexJournalCodecError::InvalidOperationId);
@@ -1493,6 +1514,23 @@ mod tests {
         assert_eq!(
             check_document_size(MAX_OPERATION_JOURNAL_BYTES + 1),
             Err(IndexJournalCodecError::DocumentTooLarge)
+        );
+    }
+
+    #[test]
+    fn exposes_canonical_planned_index_package_files() {
+        let journal = sample_journal();
+        let files = journal
+            .planned_index_package_files()
+            .expect("planned header is valid");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].as_str(), INDEX_FILE);
+
+        let mut empty = sample_journal();
+        empty.index_after = empty_generation_snapshot();
+        assert_eq!(
+            empty.planned_index_package_files(),
+            Err(IndexJournalCodecError::EmptyPlannedIndex)
         );
     }
 }

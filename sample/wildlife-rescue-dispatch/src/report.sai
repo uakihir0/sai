@@ -1,0 +1,58 @@
+use acme:wildlife-rescue-dispatch/model.{DispatchPlan, DispatchReport, Disposition}
+
+pub fn summarize(plan: DispatchPlan) -> DispatchReport {
+    var placed_count: USize = 0
+    var authorization_hold_count: USize = 0
+    var outside_area_count: USize = 0
+    var invalid_estimate_count: USize = 0
+    var specialist_deferral_count: USize = 0
+    var permit_deferral_count: USize = 0
+    var travel_deferral_count: USize = 0
+    var capacity_deferral_count: USize = 0
+
+    for entry in plan.decisions {
+        match entry {
+            Some(decision) => {
+                match decision.disposition {
+                    Disposition.Placed => {
+                        placed_count += 1
+                    }
+                    Disposition.AwaitingAuthorization => {
+                        authorization_hold_count += 1
+                    }
+                    Disposition.OutsideServiceArea => {
+                        outside_area_count += 1
+                    }
+                    Disposition.InvalidTreatmentEstimate => {
+                        invalid_estimate_count += 1
+                    }
+                    Disposition.NoSpecialistClinic => {
+                        specialist_deferral_count += 1
+                    }
+                    Disposition.NoLicensedClinic => {
+                        permit_deferral_count += 1
+                    }
+                    Disposition.OutsideTravelRadius => {
+                        travel_deferral_count += 1
+                    }
+                    Disposition.CapacityDeferred => {
+                        capacity_deferral_count += 1
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    DispatchReport(
+        plan: plan,
+        placed_count: placed_count,
+        authorization_hold_count: authorization_hold_count,
+        outside_area_count: outside_area_count,
+        invalid_estimate_count: invalid_estimate_count,
+        specialist_deferral_count: specialist_deferral_count,
+        permit_deferral_count: permit_deferral_count,
+        travel_deferral_count: travel_deferral_count,
+        capacity_deferral_count: capacity_deferral_count,
+    )
+}

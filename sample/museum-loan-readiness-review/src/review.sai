@@ -1,0 +1,202 @@
+use acme:museum-loan-readiness-review/model.{
+    ConditionStatus
+    Gallery
+    LoanBatch
+    LoanDecision
+    LoanOutcome
+    LoanReport
+    LoanRequest
+    ReviewReason
+}
+
+fn precedes(left: LoanRequest, right: LoanRequest) -> Bool {
+    if left.priority != right.priority {
+        return left.priority < right.priority
+    }
+    left.id < right.id
+}
+
+fn has_duplicate_accession(batch: LoanBatch, accession: U32) -> Bool {
+    var matches: USize = 0
+    for index in 0..batch.request_count {
+        let request = batch.requests[index].unwrap()
+        if request.accession == accession {
+            matches += 1
+        }
+    }
+    matches > 1
+}
+
+fn precheck(request: LoanRequest, gallery: Gallery, duplicate_accession: Bool) -> Option<
+    ReviewReason,
+> {
+    if duplicate_accession {
+        return Some(ReviewReason.DuplicateAccession)
+    }
+    if not request.lender_consent {
+        return Some(ReviewReason.LenderConsentMissing)
+    }
+    if not request.file_complete {
+        return Some(ReviewReason.LoanFileIncomplete)
+    }
+    if request.condition == ConditionStatus.Unstable {
+        return Some(ReviewReason.UnstableCondition)
+    }
+    if request.insured_value_dollars < request.appraised_value_dollars {
+        return Some(ReviewReason.InsuranceShortfall)
+    }
+    if request.available_crate_rating < request.required_crate_rating {
+        return Some(ReviewReason.CrateUnavailable)
+    }
+    if (
+        request.climate_sensitive
+        and (
+            gallery.humidity_percent < request.minimum_humidity_percent
+            or gallery.humidity_percent > request.maximum_humidity_percent
+        )
+    ) {
+        return Some(ReviewReason.EnvironmentOutOfRange)
+    }
+    None
+}
+
+fn held(reason: ReviewReason) -> Bool {
+    match reason {
+        ReviewReason.LenderConsentMissing => true
+        ReviewReason.LoanFileIncomplete => true
+        ReviewReason.UnstableCondition => true
+        ReviewReason.InsuranceShortfall => true
+        _ => false
+    }
+}
+
+fn rejected(reason: ReviewReason) -> Bool {
+    reason == ReviewReason.DuplicateAccession
+}
+
+fn input_is_valid(batch: LoanBatch) -> Bool {
+    if batch.request_count > 10 {
+        return false
+    }
+    for index in 0..batch.request_count {
+        if batch.requests[index] == None {
+            return false
+        }
+    }
+    true
+}
+
+fn invalid_report() -> LoanReport {
+    LoanReport(
+        decisions: [None, None, None, None, None, None, None, None, None, None],
+        decision_count: 0,
+        input_valid: false,
+        accepted_count: 0,
+        held_count: 0,
+        deferred_count: 0,
+        rejected_count: 0,
+    )
+}
+
+pub fn review(batch: LoanBatch) -> LoanReport {
+    if not input_is_valid(batch) {
+        return invalid_report()
+    }
+
+    var ordered = batch.requests
+    for index in 1..batch.request_count {
+        let candidate = ordered[index].unwrap()
+        var cursor = index
+        while cursor > 0 {
+            if precedes(candidate, ordered[cursor - 1].unwrap()) {
+                ordered[cursor] = ordered[cursor - 1]
+                cursor -= 1
+            } else {
+                break
+            }
+        }
+        ordered[cursor] = Some(candidate)
+    }
+
+    var display_remaining = batch.gallery.display_slots
+    var climate_remaining = batch.gallery.climate_cases
+    var decisions: Array<Option<LoanDecision>, 10> =
+        [None, None, None, None, None, None, None, None, None, None]
+    var accepted_count: USize = 0
+    var held_count: USize = 0
+    var deferred_count: USize = 0
+    var rejected_count: USize = 0
+
+    for index in 0..batch.request_count {
+        let request = ordered[index].unwrap()
+        var outcome = LoanOutcome.Accepted
+        var reason: Option<ReviewReason> = None
+        var display_slot_used = false
+        var climate_case_used = false
+
+        match precheck(request, batch.gallery, has_duplicate_accession(batch, request.accession)) {
+            Some(review_reason) => {
+                reason = Some(review_reason)
+                if rejected(review_reason) {
+                    outcome = LoanOutcome.Rejected
+                } else if held(review_reason) {
+                    outcome = LoanOutcome.Held
+                } else {
+                    outcome = LoanOutcome.Deferred
+                }
+            }
+            None => {
+                if display_remaining == 0 {
+                    outcome = LoanOutcome.Deferred
+                    reason = Some(ReviewReason.GalleryFull)
+                } else if request.climate_sensitive and climate_remaining == 0 {
+                    outcome = LoanOutcome.Deferred
+                    reason = Some(ReviewReason.ClimateCaseFull)
+                } else {
+                    display_remaining -= 1
+                    display_slot_used = true
+                    if request.climate_sensitive {
+                        climate_remaining -= 1
+                        climate_case_used = true
+                    }
+                }
+            }
+        }
+
+        match outcome {
+            LoanOutcome.Accepted => {
+                accepted_count += 1
+            }
+            LoanOutcome.Held => {
+                held_count += 1
+            }
+            LoanOutcome.Deferred => {
+                deferred_count += 1
+            }
+            LoanOutcome.Rejected => {
+                rejected_count += 1
+            }
+        }
+
+        decisions[index] = Some(
+            LoanDecision(
+                request_id: request.id,
+                accession: request.accession,
+                outcome: outcome,
+                reason: reason,
+                display_slot_used: display_slot_used,
+                climate_case_used: climate_case_used,
+            ),
+        )
+    }
+
+    LoanReport(
+        decisions: decisions,
+        decision_count: batch.request_count,
+        input_valid: true,
+        accepted_count: accepted_count,
+        held_count: held_count,
+        deferred_count: deferred_count,
+        rejected_count: rejected_count,
+    )
+}

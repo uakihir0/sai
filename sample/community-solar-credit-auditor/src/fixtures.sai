@@ -1,0 +1,82 @@
+use acme:community-solar-credit-auditor/model.{SubscriberMonth}
+
+pub fn generation_credit_kwh() -> U32 {
+    400
+}
+
+pub fn maximum_metered_usage_kwh() -> U32 {
+    6000
+}
+
+pub fn maximum_contract_cap_kwh() -> U32 {
+    250
+}
+
+pub fn subscribers() -> Array<SubscriberMonth, 8> {
+    [
+        SubscriberMonth(
+            account_id: 104,
+            household: "Dai Suzuki",
+            priority: 4,
+            metered_usage_kwh: Some(90),
+            contract_cap_kwh: Some(75),
+            reported_credit_kwh: None,
+        ),
+        SubscriberMonth(
+            account_id: 108,
+            household: "Hana Watanabe",
+            priority: 3,
+            metered_usage_kwh: Some(6001),
+            contract_cap_kwh: Some(70),
+            reported_credit_kwh: Some(0),
+        ),
+        SubscriberMonth(
+            account_id: 103,
+            household: "Chika Tanaka",
+            priority: 3,
+            metered_usage_kwh: Some(250),
+            contract_cap_kwh: Some(200),
+            reported_credit_kwh: Some(155),
+        ),
+        SubscriberMonth(
+            account_id: 107,
+            household: "Goro Arai",
+            priority: 2,
+            metered_usage_kwh: Some(75),
+            contract_cap_kwh: None,
+            reported_credit_kwh: Some(0),
+        ),
+        SubscriberMonth(
+            account_id: 106,
+            household: "Fumi Ito",
+            priority: 1,
+            metered_usage_kwh: Some(130),
+            contract_cap_kwh: Some(300),
+            reported_credit_kwh: Some(0),
+        ),
+        SubscriberMonth(
+            account_id: 101,
+            household: "Aki Sato",
+            priority: 1,
+            metered_usage_kwh: Some(200),
+            contract_cap_kwh: Some(150),
+            reported_credit_kwh: Some(155),
+        ),
+        SubscriberMonth(
+            account_id: 102,
+            household: "Ben Mori",
+            priority: 2,
+            metered_usage_kwh: Some(110),
+            contract_cap_kwh: Some(100),
+            reported_credit_kwh: Some(90),
+        ),
+        SubscriberMonth(
+            account_id: 105,
+            household: "Emi Kato",
+            priority: 1,
+            metered_usage_kwh: None,
+            contract_cap_kwh: Some(80),
+            reported_credit_kwh: Some(12),
+        ),
+    ]
+}

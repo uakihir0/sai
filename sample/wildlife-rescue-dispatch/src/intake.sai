@@ -1,0 +1,17 @@
+use acme:wildlife-rescue-dispatch/fixtures
+use acme:wildlife-rescue-dispatch/model.{Disposition, RescueCase}
+
+pub fn precheck(rescue: RescueCase) -> Option<Disposition> {
+    if not rescue.in_service_area {
+        Some(Disposition.OutsideServiceArea)
+    } else if (
+        rescue.estimated_treatment_hours == 0
+        or rescue.estimated_treatment_hours > fixtures.maximum_treatment_hours_per_case()
+    ) {
+        Some(Disposition.InvalidTreatmentEstimate)
+    } else if rescue.protected and not rescue.authorization_confirmed {
+        Some(Disposition.AwaitingAuthorization)
+    } else {
+        None
+    }
+}
