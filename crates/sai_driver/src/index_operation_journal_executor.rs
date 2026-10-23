@@ -10,7 +10,7 @@ use crate::index_operation_journal_recovery::{
     plan_index_operation_journal_recovery,
 };
 use crate::index_operation_journal_store::{
-    IndexOperationJournalStore, IndexOperationJournalStoreError,
+    IndexOperationJournalIndexTarget, IndexOperationJournalStore, IndexOperationJournalStoreError,
 };
 use crate::index_operation_journal_validation::IndexJournalWorkspaceInventory;
 use sai_package::local_source::LocalPackageSourceFileUpdateError;
@@ -57,6 +57,24 @@ pub enum IndexJournalSourceRestoreExecution {
     AlreadyBefore { source_index: usize },
     /// The selected source was conditionally restored to its before state.
     Restored { source_index: usize },
+}
+
+/// Result of restoring the committed index header to its before snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexJournalHeaderRestoreExecution {
+    /// The fresh observation produced a different planner decision.
+    DecisionChanged {
+        planned: IndexJournalRecoveryDecision,
+        observed: IndexJournalRecoveryDecision,
+    },
+    /// The current planner decision requires another recovery action.
+    NotRestorable {
+        decision: IndexJournalRecoveryDecision,
+    },
+    /// The header already has the recorded before state.
+    AlreadyBefore,
+    /// The header was conditionally restored to its before snapshot.
+    Restored,
 }
 
 /// Failure while resolving or conditionally restoring one journal source.
@@ -167,6 +185,67 @@ pub fn execute_index_operation_journal_restore_source_before(
         source_index,
         || {},
     )
+}
+
+/// Re-observes and restores the index header for a `RestoreBefore` decision.
+///
+/// `planned_decision` must have been produced for `journal` under the same
+/// exclusive workspace lock. The fresh observation and planner must still
+/// authorize `RestoreBefore`. The journal store accepts only the exact
+/// recorded before/after header pair, treats an already-before header as an
+/// idempotent no-op, verifies the current journal, and conditionally updates
+/// only `index.json`.
+///
+/// This slice never updates package-index files or sources, changes journal
+/// state, or clears the journal. The caller must retain the journal and
+/// re-plan before each subsequent recovery action.
+pub fn execute_index_operation_journal_restore_header_before(
+    store: &IndexOperationJournalStore<'_>,
+    journal: &IndexOperationJournal,
+    inventory: &IndexJournalWorkspaceInventory,
+    planned_decision: IndexJournalRecoveryDecision,
+) -> Result<IndexJournalHeaderRestoreExecution, IndexOperationJournalStoreError> {
+    execute_index_operation_journal_restore_header_before_with_hook(
+        store,
+        journal,
+        inventory,
+        planned_decision,
+        || {},
+    )
+}
+
+fn execute_index_operation_journal_restore_header_before_with_hook(
+    store: &IndexOperationJournalStore<'_>,
+    journal: &IndexOperationJournal,
+    inventory: &IndexJournalWorkspaceInventory,
+    planned_decision: IndexJournalRecoveryDecision,
+    before_update: impl FnOnce(),
+) -> Result<IndexJournalHeaderRestoreExecution, IndexOperationJournalStoreError> {
+    let observation = store.observe_recovery(journal, inventory)?;
+    let observed_decision = plan_index_operation_journal_recovery(journal, &observation);
+    if observed_decision != planned_decision {
+        return Ok(IndexJournalHeaderRestoreExecution::DecisionChanged {
+            planned: planned_decision,
+            observed: observed_decision,
+        });
+    }
+    if observed_decision != IndexJournalRecoveryDecision::RestoreBefore {
+        return Ok(IndexJournalHeaderRestoreExecution::NotRestorable {
+            decision: observed_decision,
+        });
+    }
+
+    before_update();
+    let update = store.update_index_file_if_matches(
+        journal,
+        IndexOperationJournalIndexTarget::Header,
+        &journal.index_after.header,
+        &journal.index_before.header,
+    )?;
+    Ok(match update {
+        ConditionalFileUpdate::Updated => IndexJournalHeaderRestoreExecution::Restored,
+        ConditionalFileUpdate::AlreadyDesired => IndexJournalHeaderRestoreExecution::AlreadyBefore,
+    })
 }
 
 fn execute_index_operation_journal_restore_source_before_with_hook(
@@ -301,8 +380,10 @@ fn execute_index_operation_journal_clear_with_hook(
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexJournalClearExecution, IndexJournalSourceRestoreError,
-        IndexJournalSourceRestoreExecution, execute_index_operation_journal_clear,
+        IndexJournalClearExecution, IndexJournalHeaderRestoreExecution,
+        IndexJournalSourceRestoreError, IndexJournalSourceRestoreExecution,
+        execute_index_operation_journal_clear,
+        execute_index_operation_journal_restore_header_before,
         execute_index_operation_journal_restore_source_before,
     };
     use crate::index_operation_journal_recovery::{
@@ -510,6 +591,32 @@ mod tests {
         (workspace, lock, inventory)
     }
 
+    fn setup_recoverable_partial_index(
+        journal: &IndexOperationJournal,
+        source_state: &FileState,
+    ) -> (
+        TestWorkspace,
+        WorkspaceLockGuard,
+        crate::index_operation_journal_validation::IndexJournalWorkspaceInventory,
+    ) {
+        let (workspace, lock, inventory) = setup(journal, source_state, true);
+        for package_file in &journal.index_before.package_files {
+            let path = workspace
+                .0
+                .join(".sai/index")
+                .join(package_file.file.as_str());
+            match &package_file.state {
+                FileState::Absent => {
+                    let _ = fs::remove_file(path);
+                }
+                FileState::RegularFile(bytes) => {
+                    fs::write(path, bytes).expect("write before package index file");
+                }
+            }
+        }
+        (workspace, lock, inventory)
+    }
+
     fn expected_decision(
         store: &IndexOperationJournalStore<'_>,
         journal: &IndexOperationJournal,
@@ -531,6 +638,238 @@ mod tests {
             fs::read(index_directory.join("index.json")).expect("read index header"),
             fs::read(index_directory.join("acme.app.1.jsonl")).expect("read package index"),
         )
+    }
+
+    fn journal_bytes(workspace: &TestWorkspace) -> Vec<u8> {
+        fs::read(workspace.0.join(".sai/index/operation.json")).expect("read operation journal")
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn restore_before_restores_only_the_header_and_keeps_the_journal() {
+        let journal = journal(IndexJournalOrigin::Cli, IndexJournalState::Prepared);
+        let (workspace, lock, inventory) =
+            setup_recoverable_partial_index(&journal, &journal.sources[0].planned_after);
+        let store = IndexOperationJournalStore::new(&lock);
+        let planned = expected_decision(&store, &journal, &inventory);
+        assert_eq!(planned, IndexJournalRecoveryDecision::RestoreBefore);
+        let source_before = fs::read(workspace.0.join("src/lib.sai")).expect("read source");
+        let package_file = &journal.index_before.package_files[0];
+        let FileState::RegularFile(package_before) = &package_file.state else {
+            panic!("before package file is regular");
+        };
+        let package_before = package_before.clone();
+        let header_before = match &journal.index_before.header {
+            FileState::RegularFile(bytes) => bytes.clone(),
+            FileState::Absent => panic!("before header is regular"),
+        };
+        let journal_before = journal_bytes(&workspace);
+
+        let result = execute_index_operation_journal_restore_header_before(
+            &store, &journal, &inventory, planned,
+        )
+        .expect("restore before header");
+
+        assert_eq!(result, IndexJournalHeaderRestoreExecution::Restored);
+        assert_eq!(
+            fs::read(workspace.0.join(".sai/index/index.json")).expect("read restored header"),
+            header_before
+        );
+        assert_eq!(
+            fs::read(
+                workspace
+                    .0
+                    .join(".sai/index")
+                    .join(package_file.file.as_str())
+            )
+            .expect("read package file"),
+            package_before
+        );
+        assert_eq!(
+            fs::read(workspace.0.join("src/lib.sai")).expect("read unchanged source"),
+            source_before
+        );
+        assert_eq!(journal_bytes(&workspace), journal_before);
+        assert_eq!(
+            expected_decision(&store, &journal, &inventory),
+            IndexJournalRecoveryDecision::RestoreBefore,
+            "the remaining source rollback requires a new planner pass"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn before_header_is_an_idempotent_noop_for_restore_before() {
+        let journal = journal(IndexJournalOrigin::Cli, IndexJournalState::Prepared);
+        let (workspace, lock, inventory) =
+            setup(&journal, &journal.sources[0].planned_after, false);
+        let store = IndexOperationJournalStore::new(&lock);
+        let planned = expected_decision(&store, &journal, &inventory);
+        assert_eq!(planned, IndexJournalRecoveryDecision::RestoreBefore);
+        let index_before = index_files(&workspace);
+        let journal_before = journal_bytes(&workspace);
+
+        let result = execute_index_operation_journal_restore_header_before(
+            &store, &journal, &inventory, planned,
+        )
+        .expect("report already-before header");
+
+        assert_eq!(result, IndexJournalHeaderRestoreExecution::AlreadyBefore);
+        assert_eq!(index_files(&workspace), index_before);
+        assert_eq!(journal_bytes(&workspace), journal_before);
+        assert!(journal_still_exists(&workspace));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn stale_or_non_restore_decisions_do_not_change_the_header() {
+        let journal = journal(IndexJournalOrigin::Cli, IndexJournalState::Prepared);
+        let (workspace, lock, inventory) =
+            setup_recoverable_partial_index(&journal, &journal.sources[0].planned_after);
+        let store = IndexOperationJournalStore::new(&lock);
+        let observed = expected_decision(&store, &journal, &inventory);
+        assert_eq!(observed, IndexJournalRecoveryDecision::RestoreBefore);
+        let index_after = index_files(&workspace);
+
+        let stale = execute_index_operation_journal_restore_header_before(
+            &store,
+            &journal,
+            &inventory,
+            IndexJournalRecoveryDecision::ClearBefore,
+        )
+        .expect("report stale decision");
+        assert_eq!(
+            stale,
+            IndexJournalHeaderRestoreExecution::DecisionChanged {
+                planned: IndexJournalRecoveryDecision::ClearBefore,
+                observed,
+            }
+        );
+        assert_eq!(index_files(&workspace), index_after);
+
+        let (before_workspace, before_lock, before_inventory) =
+            setup(&journal, &journal.sources[0].before, false);
+        let before_store = IndexOperationJournalStore::new(&before_lock);
+        let clear_before = expected_decision(&before_store, &journal, &before_inventory);
+        assert_eq!(clear_before, IndexJournalRecoveryDecision::ClearBefore);
+        assert_eq!(
+            execute_index_operation_journal_restore_header_before(
+                &before_store,
+                &journal,
+                &before_inventory,
+                clear_before,
+            )
+            .expect("report non-restore decision"),
+            IndexJournalHeaderRestoreExecution::NotRestorable {
+                decision: IndexJournalRecoveryDecision::ClearBefore,
+            }
+        );
+        assert_eq!(
+            index_files(&before_workspace),
+            (
+                match &journal.index_before.header {
+                    FileState::RegularFile(bytes) => bytes.clone(),
+                    FileState::Absent => panic!("before header is regular"),
+                },
+                match &journal.index_before.package_files[0].state {
+                    FileState::RegularFile(bytes) => bytes.clone(),
+                    FileState::Absent => panic!("before package file is regular"),
+                },
+            )
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn third_party_header_after_observation_is_preserved_as_a_conflict() {
+        let journal = journal(IndexJournalOrigin::Cli, IndexJournalState::Prepared);
+        let (workspace, lock, inventory) =
+            setup_recoverable_partial_index(&journal, &journal.sources[0].planned_after);
+        let store = IndexOperationJournalStore::new(&lock);
+        let planned = expected_decision(&store, &journal, &inventory);
+        let index_before = index_files(&workspace);
+        let journal_before = journal_bytes(&workspace);
+        let third_party = b"{\"third-party\":\"header\"}\n";
+
+        let error = super::execute_index_operation_journal_restore_header_before_with_hook(
+            &store,
+            &journal,
+            &inventory,
+            planned,
+            || {
+                fs::write(workspace.0.join(".sai/index/index.json"), third_party)
+                    .expect("replace header after observation");
+            },
+        )
+        .expect_err("conditional header update must reject third-party bytes");
+
+        assert!(matches!(
+            error,
+            IndexOperationJournalStoreError::IndexFileChanged
+        ));
+        assert_eq!(
+            fs::read(workspace.0.join(".sai/index/index.json")).expect("read conflicting header"),
+            third_party
+        );
+        let (_, package_after) = index_files(&workspace);
+        assert_eq!(package_after, index_before.1);
+        assert_eq!(journal_bytes(&workspace), journal_before);
+        assert!(journal_still_exists(&workspace));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn changed_journal_after_observation_prevents_header_update() {
+        let journal = journal(IndexJournalOrigin::Cli, IndexJournalState::Prepared);
+        let (workspace, lock, inventory) =
+            setup_recoverable_partial_index(&journal, &journal.sources[0].planned_after);
+        let store = IndexOperationJournalStore::new(&lock);
+        let planned = expected_decision(&store, &journal, &inventory);
+        let index_before = index_files(&workspace);
+        let mut replacement = journal.clone();
+        replacement.operation_id = "f8547899-0982-4d1f-85d6-9d3207deea14".to_owned();
+        let replacement_bytes = replacement.encode().expect("encode replacement journal");
+
+        let error = super::execute_index_operation_journal_restore_header_before_with_hook(
+            &store,
+            &journal,
+            &inventory,
+            planned,
+            || {
+                fs::write(
+                    workspace.0.join(".sai/index/operation.json"),
+                    &replacement_bytes,
+                )
+                .expect("replace journal after observation");
+            },
+        )
+        .expect_err("header update must reject a changed journal");
+
+        assert!(matches!(
+            error,
+            IndexOperationJournalStoreError::JournalChanged
+        ));
+        assert_eq!(index_files(&workspace), index_before);
+        assert_eq!(journal_bytes(&workspace), replacement_bytes);
+        assert_eq!(
+            store.read().expect("read replacement journal"),
+            Some(replacement)
+        );
     }
 
     #[cfg(all(
