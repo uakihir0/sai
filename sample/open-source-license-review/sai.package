@@ -1,0 +1,5 @@
+package acme:open-source-license-review @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Review fixed component license evidence against a sample distribution policy"

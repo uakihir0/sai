@@ -1,0 +1,30 @@
+use acme:open-source-license-review/model.{Component, EvidenceState, PolicyClass, ReviewOutcome}
+
+pub fn review(component: Component) -> ReviewOutcome {
+    match component.evidence {
+        EvidenceState.LicenseTextMissing => ReviewOutcome.MissingLicenseText
+        EvidenceState.NoticeFileMissing => ReviewOutcome.MissingNotice
+        EvidenceState.ConflictingMetadata => ReviewOutcome.ConflictingMetadata
+        EvidenceState.Complete => {
+            if (
+                component.exception_approved
+                and component.policy_class != PolicyClass.RestrictedByDemoPolicy
+            ) {
+                ReviewOutcome.ExceptionScopeMismatch
+            } else {
+                match component.policy_class {
+                    PolicyClass.NoticeBasedAllowed => ReviewOutcome.ClearedBySamplePolicy
+                    PolicyClass.ReviewRequired => ReviewOutcome.ManualReviewRequired
+                    PolicyClass.RestrictedByDemoPolicy => {
+                        if component.exception_approved {
+                            ReviewOutcome.ExceptionApproved
+                        } else {
+                            ReviewOutcome.BlockedBySamplePolicy
+                        }
+                    }
+                    PolicyClass.Unclassified => ReviewOutcome.ManualReviewRequired
+                }
+            }
+        }
+    }
+}

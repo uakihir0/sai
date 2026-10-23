@@ -1,0 +1,78 @@
+use acme:open-source-license-review/model.{Component, EvidenceState, PolicyClass}
+
+pub fn inventory() -> Array<Component, 9> {
+    [
+        Component(
+            id: 101,
+            name: "image-optimizer",
+            license_label: "Demo-Notice-1",
+            policy_class: PolicyClass.NoticeBasedAllowed,
+            evidence: EvidenceState.Complete,
+            exception_approved: false,
+        ),
+        Component(
+            id: 102,
+            name: "templating-engine",
+            license_label: "Demo-Review-2",
+            policy_class: PolicyClass.ReviewRequired,
+            evidence: EvidenceState.Complete,
+            exception_approved: false,
+        ),
+        Component(
+            id: 103,
+            name: "copyleft-plugin",
+            license_label: "Demo-Restricted-3",
+            policy_class: PolicyClass.RestrictedByDemoPolicy,
+            evidence: EvidenceState.Complete,
+            exception_approved: false,
+        ),
+        Component(
+            id: 104,
+            name: "font-bundle",
+            license_label: "Demo-Notice-4",
+            policy_class: PolicyClass.NoticeBasedAllowed,
+            evidence: EvidenceState.NoticeFileMissing,
+            exception_approved: false,
+        ),
+        Component(
+            id: 105,
+            name: "codec-wrapper",
+            license_label: "Demo-Notice-5",
+            policy_class: PolicyClass.NoticeBasedAllowed,
+            evidence: EvidenceState.ConflictingMetadata,
+            exception_approved: false,
+        ),
+        Component(
+            id: 106,
+            name: "legacy-connector",
+            license_label: "Demo-Restricted-6",
+            policy_class: PolicyClass.RestrictedByDemoPolicy,
+            evidence: EvidenceState.Complete,
+            exception_approved: true,
+        ),
+        Component(
+            id: 107,
+            name: "build-helper",
+            license_label: "Unmapped-Demo-License",
+            policy_class: PolicyClass.Unclassified,
+            evidence: EvidenceState.Complete,
+            exception_approved: false,
+        ),
+        Component(
+            id: 108,
+            name: "theme-pack",
+            license_label: "Demo-Restricted-8",
+            policy_class: PolicyClass.RestrictedByDemoPolicy,
+            evidence: EvidenceState.LicenseTextMissing,
+            exception_approved: true,
+        ),
+        Component(
+            id: 109,
+            name: "experimental-sdk",
+            license_label: "Demo-Notice-9",
+            policy_class: PolicyClass.NoticeBasedAllowed,
+            evidence: EvidenceState.Complete,
+            exception_approved: true,
+        ),
+    ]
+}

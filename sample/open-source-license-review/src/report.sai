@@ -1,0 +1,82 @@
+use acme:open-source-license-review/model.{AuditReport, Component, ReviewFinding, ReviewOutcome}
+use acme:open-source-license-review/policy
+
+pub fn review_inventory(components: Array<Component, 9>) -> AuditReport {
+    var findings = Array<ReviewFinding, 9>.filled(
+        ReviewFinding(
+            component_id: 0,
+            name: "",
+            license_label: "",
+            outcome: ReviewOutcome.ManualReviewRequired,
+        ),
+    )
+    var cleared_count: USize = 0
+    var manual_review_count: USize = 0
+    var blocked_count: USize = 0
+    var missing_license_text_count: USize = 0
+    var missing_notice_count: USize = 0
+    var conflicting_metadata_count: USize = 0
+    var exception_approved_count: USize = 0
+    var exception_scope_mismatch_count: USize = 0
+    var index: USize = 0
+
+    for component in components {
+        let outcome = policy.review(component)
+        findings[index] = ReviewFinding(
+            component_id: component.id,
+            name: component.name,
+            license_label: component.license_label,
+            outcome: outcome,
+        )
+        match outcome {
+            ReviewOutcome.ClearedBySamplePolicy => {
+                cleared_count += 1
+            }
+            ReviewOutcome.ManualReviewRequired => {
+                manual_review_count += 1
+            }
+            ReviewOutcome.BlockedBySamplePolicy => {
+                blocked_count += 1
+            }
+            ReviewOutcome.MissingLicenseText => {
+                missing_license_text_count += 1
+            }
+            ReviewOutcome.MissingNotice => {
+                missing_notice_count += 1
+            }
+            ReviewOutcome.ConflictingMetadata => {
+                conflicting_metadata_count += 1
+            }
+            ReviewOutcome.ExceptionApproved => {
+                exception_approved_count += 1
+            }
+            ReviewOutcome.ExceptionScopeMismatch => {
+                exception_scope_mismatch_count += 1
+            }
+        }
+        index += 1
+    }
+
+    let ready_under_sample_policy = (
+        manual_review_count == 0
+        and blocked_count == 0
+        and missing_license_text_count == 0
+        and missing_notice_count == 0
+        and conflicting_metadata_count == 0
+        and exception_scope_mismatch_count == 0
+    )
+
+    AuditReport(
+        findings: findings,
+        component_count: index,
+        cleared_count: cleared_count,
+        manual_review_count: manual_review_count,
+        blocked_count: blocked_count,
+        missing_license_text_count: missing_license_text_count,
+        missing_notice_count: missing_notice_count,
+        conflicting_metadata_count: conflicting_metadata_count,
+        exception_approved_count: exception_approved_count,
+        exception_scope_mismatch_count: exception_scope_mismatch_count,
+        ready_under_sample_policy: ready_under_sample_policy,
+    )
+}

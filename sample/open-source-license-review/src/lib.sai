@@ -1,0 +1,40 @@
+use acme:open-source-license-review/fixtures
+use acme:open-source-license-review/model.{AuditReport, ReviewOutcome}
+use acme:open-source-license-review/policy
+use acme:open-source-license-review/report
+
+pub fn example_report() -> AuditReport {
+    report.review_inventory(fixtures.inventory())
+}
+
+test "the fixed inventory reports each component in fixture order" {
+    let summary = example_report()
+    assert summary.component_count == 9
+    assert summary.findings[0].component_id == 101
+    assert summary.findings[0].outcome == ReviewOutcome.ClearedBySamplePolicy
+    assert summary.findings[8].component_id == 109
+    assert summary.findings[8].outcome == ReviewOutcome.ExceptionScopeMismatch
+}
+
+test "evidence defects cannot be overridden by an approved exception" {
+    let summary = example_report()
+    assert summary.findings[7].outcome == ReviewOutcome.MissingLicenseText
+    assert summary.missing_license_text_count == 1
+    assert summary.exception_approved_count == 1
+}
+
+test "only a restricted sample class can use an approved exception" {
+    let summary = example_report()
+    assert summary.findings[5].outcome == ReviewOutcome.ExceptionApproved
+    assert summary.exception_scope_mismatch_count == 1
+}
+
+test "the fixture is not ready while unresolved findings remain" {
+    let summary = example_report()
+    assert summary.cleared_count == 1
+    assert summary.manual_review_count == 2
+    assert summary.blocked_count == 1
+    assert summary.missing_notice_count == 1
+    assert summary.conflicting_metadata_count == 1
+    assert not summary.ready_under_sample_policy
+}
