@@ -26090,6 +26090,367 @@ property "shared"() {}
     }
 
     #[test]
+    fn module_record_inventory_collects_root_nested_empty_and_generic_records() {
+        let (database, module_tree, _, collection) = collect_package_inventory_for_target(
+            b"type Marker {}\ntype Pair<T, const N: I32, U> {\n    left: T\n    right: U\n}\n",
+            b"type ChildMarker {}\ntype ChildValue {\n    pub value: U32\n}\n",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<BTreeSet<_>>(),
+            [
+                ("acme:phase1.Marker", sai_semantic::SymbolKind::Record),
+                ("acme:phase1.Pair", sai_semantic::SymbolKind::Record),
+                (
+                    "acme:phase1.Pair.generic[T]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.Pair.generic[N]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.Pair.generic[U]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.Pair.field[left]",
+                    sai_semantic::SymbolKind::Field
+                ),
+                (
+                    "acme:phase1.Pair.field[right]",
+                    sai_semantic::SymbolKind::Field
+                ),
+                (
+                    "acme:phase1/child.ChildMarker",
+                    sai_semantic::SymbolKind::Record
+                ),
+                (
+                    "acme:phase1/child.ChildValue",
+                    sai_semantic::SymbolKind::Record
+                ),
+                (
+                    "acme:phase1/child.ChildValue.field[value]",
+                    sai_semantic::SymbolKind::Field
+                ),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let def_paths = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("the selected package has a DefPath interner");
+        for (module_index, record_name, record_path, fields, generic_params) in [
+            (
+                0,
+                "Pair",
+                "acme:phase1.Pair",
+                vec!["left", "right"],
+                vec![("T", false), ("N", true), ("U", false)],
+            ),
+            (
+                1,
+                "ChildValue",
+                "acme:phase1/child.ChildValue",
+                vec!["value"],
+                vec![],
+            ),
+            (0, "Marker", "acme:phase1.Marker", vec![], vec![]),
+            (
+                1,
+                "ChildMarker",
+                "acme:phase1/child.ChildMarker",
+                vec![],
+                vec![],
+            ),
+        ] {
+            let owner = collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .find(|owner| {
+                    owner.file == module_tree.modules[module_index].file
+                        && owner.kind == TopLevelOwnerKind::Struct
+                        && database
+                            .resolve_def_path(owner.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                matches!(
+                                    path.data().last().map(|component| &component.data),
+                                    Some(DefPathData::TypeNs(name))
+                                        if database.symbols.resolve(*name).is_ok_and(|name| name.as_ref() == record_name)
+                                )
+                            })
+                })
+                .expect("each record has exactly its top-level HIR owner");
+            let record_def_path = database
+                .resolve_def_path(owner.owner.def_id.to_def_id())
+                .expect("record owner DefId is valid")
+                .expect("record owner DefPath exists");
+            let record_symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == record_path)
+                .expect("the record has a canonical inventory symbol");
+            let expected_record_hash = sai_hir::DefPathHash::compute(
+                &record_def_path,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("record DefPath hashes");
+            assert_eq!(
+                record_symbol.def_path_hash(),
+                Fingerprint::new(expected_record_hash.raw())
+            );
+            for field_name in &fields {
+                let field_symbol = database
+                    .symbols
+                    .intern(field_name)
+                    .expect("field name interns");
+                let field_id = def_paths
+                    .intern_fields(owner.owner.def_id, &[(field_symbol, 0)])
+                    .expect("HIR interns fields below their record owner")
+                    .into_iter()
+                    .next()
+                    .expect("one field definition is returned");
+                let field_def_path = database
+                    .resolve_def_path(field_id.to_def_id())
+                    .expect("field DefId is valid")
+                    .expect("field DefPath exists");
+                assert_eq!(
+                    &field_def_path.data()[..record_def_path.data().len()],
+                    record_def_path.data()
+                );
+                assert_eq!(
+                    field_def_path.data().last(),
+                    Some(&sai_hir::DisambiguatedDefPathData {
+                        data: DefPathData::Field(field_symbol),
+                        disambiguator: 0,
+                    })
+                );
+                let field_symbol = inventory
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.path() == format!("{record_path}.field[{field_name}]"))
+                    .expect("the field has a canonical inventory path");
+                let expected_field_hash = sai_hir::DefPathHash::compute(
+                    &field_def_path,
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("field DefPath hashes");
+                assert_eq!(
+                    field_symbol.def_path_hash(),
+                    Fingerprint::new(expected_field_hash.raw())
+                );
+            }
+            let generic_path_params = generic_params
+                .iter()
+                .map(|(name, is_const)| {
+                    (
+                        database.symbols.intern(name).expect("generic name interns"),
+                        *is_const,
+                        0,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let generic_ids = def_paths
+                .intern_generic_params(owner.owner.def_id, &generic_path_params)
+                .expect("HIR interns generic parameters below their record owner");
+            for ((name, _), generic_id) in generic_params.iter().zip(generic_ids) {
+                let generic_path = database
+                    .resolve_def_path(generic_id.to_def_id())
+                    .expect("generic DefId is valid")
+                    .expect("generic DefPath exists");
+                assert_eq!(
+                    &generic_path.data()[..record_def_path.data().len()],
+                    record_def_path.data()
+                );
+                let generic_symbol = inventory
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.path() == format!("{record_path}.generic[{name}]"))
+                    .expect("the generic parameter has its canonical path");
+                let expected_generic_hash = sai_hir::DefPathHash::compute(
+                    &generic_path,
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("generic DefPath hashes");
+                assert_eq!(
+                    generic_symbol.def_path_hash(),
+                    Fingerprint::new(expected_generic_hash.raw())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn module_record_and_field_fingerprints_ignore_renames_and_track_content() {
+        let fingerprints_for = |source: &[u8]| {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert_eq!(
+                inventory.coverage(),
+                &sai_semantic::InventoryCoverage::Complete
+            );
+            let record = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind() == sai_semantic::SymbolKind::Record)
+                .expect("the record is inventoried")
+                .fingerprint();
+            let field = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind() == sai_semantic::SymbolKind::Field)
+                .expect("the record field is inventoried")
+                .fingerprint();
+            (record, field)
+        };
+        let original = fingerprints_for(b"type Original { first: U32 }\n");
+        let renamed_record = fingerprints_for(b"type Renamed { first: U32 }\n");
+        let renamed_field = fingerprints_for(b"type Original { second: U32 }\n");
+        let changed_field_type = fingerprints_for(b"type Original { first: U64 }\n");
+
+        assert_eq!(
+            original.0, renamed_record.0,
+            "renaming the record preserves its declaration fingerprint"
+        );
+        assert_eq!(
+            original.1, renamed_record.1,
+            "an unchanged field preserves its declaration fingerprint"
+        );
+        assert_eq!(
+            original.1, renamed_field.1,
+            "renaming the field preserves its declaration fingerprint"
+        );
+        assert_ne!(
+            original.0, renamed_field.0,
+            "the field name contributes to the parent record fingerprint"
+        );
+        assert_ne!(
+            original.0, changed_field_type.0,
+            "field type changes contribute to the record fingerprint"
+        );
+        assert_ne!(
+            original.1, changed_field_type.1,
+            "field type changes contribute to the field fingerprint"
+        );
+    }
+
+    #[test]
+    fn module_record_inventory_filters_record_targets_and_rejects_field_targets() {
+        let (_, _, _, wasm32) = collect_package_inventory_for_target(
+            b"@target(\"wasm64-core\")\ntype Targeted { value: U32 }\n",
+            b"",
+            "wasm32-core",
+        );
+        assert_eq!(
+            inventory_symbols(&wasm32).coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert!(inventory_symbols(&wasm32).symbols().is_empty());
+
+        let (_, _, _, wasm64) = collect_package_inventory_for_target(
+            b"@target(\"wasm64-core\")\ntype Targeted { value: U32 }\n",
+            b"",
+            "wasm64-core",
+        );
+        assert_eq!(
+            inventory_symbols(&wasm64).coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory_symbols(&wasm64)
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.path())
+                .collect::<Vec<_>>(),
+            ["acme:phase1.Targeted", "acme:phase1.Targeted.field[value]"]
+        );
+
+        let (_, _, _, invalid_record_target) = collect_package_inventory_for_target(
+            b"@target(\"wasm32-linux\")\ntype Uncertain {}\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(matches!(
+            inventory_symbols(&invalid_record_target).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("target-selection error")
+        ));
+
+        let (_, _, _, invalid_field_target) = collect_package_inventory_for_target(
+            b"type InvalidField { @target(\"wasm64-core\")\n    value: U32 }\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(
+            invalid_field_target
+                .scopes()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget),
+            "field @target must remain an attribute-target diagnostic"
+        );
+        assert!(matches!(
+            inventory_symbols(&invalid_field_target).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("attribute or target-selection error")
+        ));
+    }
+
+    #[test]
+    fn module_record_inventory_fails_closed_for_bad_children_and_unsupported_symbols() {
+        for source in [
+            &b"type Malformed<T:> { value: U32 }\n"[..],
+            &b"type MissingFieldName { : U32 }\n"[..],
+            &b"type DuplicateFields { value: U32\n    value: U64 }\n"[..],
+            &b"enum Unsupported { Empty }\n"[..],
+            &b"resource Unsupported { handle: U32 }\n"[..],
+            &b"type WithImpl {}\nimpl WithImpl { fn method() {} }\n"[..],
+            &b"@derive(Clone)\ntype Derived {}\n"[..],
+        ] {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            assert!(
+                matches!(
+                    inventory_symbols(&collection).coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { .. }
+                ),
+                "unsupported or malformed record fixture must remain incomplete: {}",
+                String::from_utf8_lossy(source)
+            );
+        }
+
+        let (_, _, _, duplicate_fields) = collect_package_inventory_for_target(
+            b"type DuplicateFields { value: U32\n    value: U64 }\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(matches!(
+            inventory_symbols(&duplicate_fields).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("duplicate field name")
+                    || reason.contains("duplicate canonical symbol path")
+        ));
+    }
+
+    #[test]
     fn module_alias_fingerprints_ignore_names_and_track_the_target_type() {
         let fingerprint_for = |source: &[u8]| {
             let (_, _, _, collection) =
@@ -26249,8 +26610,8 @@ property "shared"() {}
     #[test]
     fn module_function_inventory_fails_closed_for_other_symbol_forms() {
         for (source, expected_reason) in [(
-            &b"type Marker {}\n"[..],
-            "outside the function-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect-test-property inventory",
+            &b"enum Marker { Empty }\n"[..],
+            "outside the function-generic-parameter-record-generic-parameter-field-type-alias-generic-parameter-refined-type-constant-effect-test-property inventory",
         )] {
             let (_, _, _, collection) =
                 collect_package_inventory_for_target(source, b"", "wasm32-core");

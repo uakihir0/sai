@@ -43,8 +43,9 @@ impl Phase1PackageSymbolInventory {
 }
 
 /// Collects target-visible module-level functions and their generic
-/// parameters, plain type aliases and their generic parameters, non-generic
-/// refined types, constants, user effects, tests, and properties. Every other
+/// parameters, records with their generic parameters and direct named fields,
+/// plain type aliases and their generic parameters, non-generic refined types,
+/// constants, user effects, tests, and properties. Every other
 /// symbol-bearing declaration makes the result incomplete until its symbol
 /// kind and path are collected as well.
 pub(super) fn collect_module_function_inventory(
@@ -141,6 +142,8 @@ pub(super) fn collect_module_function_inventory(
 
     let mut owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), FunctionOwnerDescriptor>::new();
+    let mut record_owners_by_item =
+        HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut const_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut effect_owners_by_item =
@@ -172,6 +175,11 @@ pub(super) fn collect_module_function_inventory(
     for descriptor in &scopes.top_level_owners {
         let key = (descriptor.file, descriptor.item_id);
         match descriptor.kind {
+            TopLevelOwnerKind::Struct => {
+                if record_owners_by_item.insert(key, *descriptor).is_some() {
+                    reasons.insert("Phase 1 contains duplicate record owner descriptors".into());
+                }
+            }
             TopLevelOwnerKind::Alias => {
                 if alias_owners_by_item.insert(key, *descriptor).is_some() {
                     reasons
@@ -220,6 +228,7 @@ pub(super) fn collect_module_function_inventory(
 
     let mut seen_items = HashSet::new();
     let mut consumed_owners = HashSet::new();
+    let mut consumed_record_owners = HashSet::new();
     let mut consumed_const_owners = HashSet::new();
     let mut consumed_effect_owners = HashSet::new();
     let mut consumed_alias_owners = HashSet::new();
@@ -250,6 +259,25 @@ pub(super) fn collect_module_function_inventory(
         let mut test_property_names = HashSet::<String>::new();
         for entry in &input.filtered.item_tree.items {
             match entry.kind {
+                ItemTreeKind::Struct => {
+                    collect_record(
+                        entry,
+                        module.file,
+                        &module_path,
+                        package_version.package(),
+                        input,
+                        prepared.module_tree.package,
+                        &record_owners_by_item,
+                        &mut seen_items,
+                        &mut consumed_record_owners,
+                        &mut canonical_paths,
+                        &mut current_symbols,
+                        &mut reasons,
+                        def_paths,
+                        packages,
+                        symbols,
+                    );
+                }
                 ItemTreeKind::Function => {
                     collect_function(
                         entry,
@@ -381,7 +409,7 @@ pub(super) fn collect_module_function_inventory(
                 // functions are children of ExternBlock and are symbols.
                 _ => {
                     reasons.insert(format!(
-                        "target-filtered declaration {:?} is outside the function-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect-test-property inventory",
+                        "target-filtered declaration {:?} is outside the function-generic-parameter-record-generic-parameter-field-type-alias-generic-parameter-refined-type-constant-effect-test-property inventory",
                         entry.kind
                     ));
                 }
@@ -392,6 +420,12 @@ pub(super) fn collect_module_function_inventory(
     if consumed_owners.len() != owners_by_item.len() {
         reasons.insert(
             "the Phase 1 function owner descriptors do not exactly match the filtered ItemTree"
+                .to_owned(),
+        );
+    }
+    if consumed_record_owners.len() != record_owners_by_item.len() {
+        reasons.insert(
+            "the Phase 1 record owner descriptors do not exactly match the filtered ItemTree"
                 .to_owned(),
         );
     }
@@ -429,6 +463,13 @@ pub(super) fn collect_module_function_inventory(
         if !seen_items.contains(&(*file_id, *item_id)) {
             reasons.insert(
                 "a Phase 1 function owner has no target-filtered ItemTree declaration".to_owned(),
+            );
+        }
+    }
+    for ((file_id, item_id), _) in &record_owners_by_item {
+        if !seen_items.contains(&(*file_id, *item_id)) {
+            reasons.insert(
+                "a Phase 1 record owner has no target-filtered ItemTree declaration".to_owned(),
             );
         }
     }
@@ -947,6 +988,435 @@ fn collect_const(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn collect_record(
+    entry: &ItemTreeEntry,
+    file_id: FileId,
+    module_path: &[String],
+    package_identity: &str,
+    input: &OwnedPhase1ModuleInput,
+    package_id: PackageId,
+    owners_by_item: &HashMap<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>,
+    seen_items: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    consumed_owners: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    reasons: &mut HashSet<String>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) {
+    #[derive(Clone)]
+    enum RecordChild {
+        Generic(ast::GenericParam),
+        Field(ast::FieldDecl),
+    }
+
+    let key = (file_id, entry.ast_id);
+    if !seen_items.insert(key) {
+        reasons.insert("the target-filtered ItemTree contains a duplicate record AST ID".into());
+    }
+    if entry.kind != ItemTreeKind::Struct {
+        reasons.insert("a non-record ItemTree entry reached the record collector".into());
+        return;
+    }
+    if entry.name == Symbol::ERROR {
+        reasons.insert("a target-filtered record has no valid declaration name".into());
+        return;
+    }
+    let name = match symbols.resolve(entry.name) {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            reasons.insert("a target-filtered record name cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let Some(descriptor) = owners_by_item.get(&key).copied() else {
+        reasons.insert("a target-filtered record has no matching Phase 1 owner".to_owned());
+        return;
+    };
+    if descriptor.kind != TopLevelOwnerKind::Struct
+        || descriptor.file != file_id
+        || descriptor.item_id != entry.ast_id
+    {
+        reasons.insert("a target-filtered record has a mismatched Phase 1 owner".to_owned());
+        return;
+    }
+    consumed_owners.insert(key);
+
+    let Some(pointer) = input.ast_ids.pointer(entry.ast_id) else {
+        reasons.insert("a target-filtered record AST ID has no source pointer".to_owned());
+        return;
+    };
+    let Some(syntax) = pointer.resolve(file_id, &input.root) else {
+        reasons.insert(
+            "a target-filtered record source pointer cannot resolve in its AST root".to_owned(),
+        );
+        return;
+    };
+    let Some(declaration) = ast::TypeDecl::cast(syntax.clone()) else {
+        reasons.insert(
+            "a target-filtered record source pointer resolves to a non-type node".to_owned(),
+        );
+        return;
+    };
+    let Some(definition) = declaration.struct_def() else {
+        reasons.insert("a target-filtered record has no struct definition".to_owned());
+        return;
+    };
+    if declaration.alias_def().is_some() {
+        reasons.insert("a target-filtered record has an unsupported type form".to_owned());
+        return;
+    }
+    if input.ast_ids.ast_id(&declaration).map(|id| id.erase()) != Some(entry.ast_id) {
+        reasons.insert("a target-filtered record AST ID does not match its declaration".into());
+        return;
+    }
+    let Some(name_node) = declaration.name() else {
+        reasons.insert("a target-filtered record AST has no name node".to_owned());
+        return;
+    };
+    let Some(name_token) = name_node.token() else {
+        reasons.insert("a target-filtered record AST has no name token".to_owned());
+        return;
+    };
+    let raw_name = name_token
+        .text()
+        .strip_prefix("r#")
+        .unwrap_or(name_token.text());
+    if sai_syntax::normalize_identifier(raw_name) != name {
+        reasons.insert("the ItemTree and record AST disagree about the declaration name".into());
+        return;
+    }
+    if syntax_has_errors(&syntax) || name_token.has_error() {
+        reasons.insert("a target-filtered record AST contains recovery or parse errors".into());
+        return;
+    }
+    if entry
+        .raw_attrs
+        .iter()
+        .any(|attribute| attribute.name == sai_hir::item_tree::AttrName::Derive)
+    {
+        reasons
+            .insert("a record has derived impl symbols outside the supported inventory".to_owned());
+    }
+
+    // Record ItemTree children are a source-ordered merge of generic
+    // parameters and fields. Validate that complete sequence before passing
+    // the generic-only subset to the shared generic collector.
+    let mut expected_children = Vec::<(usize, RecordChild)>::new();
+    if let Some(list) = declaration.generic_params() {
+        expected_children.extend(list.params().map(|parameter| {
+            (
+                parameter.syntax().text_range().start().to_usize(),
+                RecordChild::Generic(parameter),
+            )
+        }));
+    }
+    if let Some(list) = definition.fields() {
+        expected_children.extend(list.fields().map(|field| {
+            (
+                field.syntax().text_range().start().to_usize(),
+                RecordChild::Field(field),
+            )
+        }));
+    }
+    expected_children.sort_by_key(|(offset, _)| *offset);
+    if entry.children.len() != expected_children.len() {
+        reasons
+            .insert("a record's ItemTree child count does not match its snapshot AST".to_owned());
+        return;
+    }
+
+    let mut generic_children = Vec::<ItemTreeEntry>::new();
+    let mut validated_fields = Vec::<(
+        ItemTreeEntry,
+        ast::FieldDecl,
+        String,
+        SyntaxNode,
+        sai_syntax::SyntaxToken,
+    )>::new();
+    let mut field_names = HashSet::<String>::new();
+    for ((_, ast_child), child) in expected_children.iter().zip(&entry.children) {
+        let (expected_kind, ast_id, name_node, child_syntax) = match ast_child {
+            RecordChild::Generic(ast::GenericParam::Type(parameter)) => (
+                ItemTreeKind::TypeParam,
+                input.ast_ids.ast_id(parameter).map(|id| id.erase()),
+                parameter.name(),
+                parameter.syntax().clone(),
+            ),
+            RecordChild::Generic(ast::GenericParam::Const(parameter)) => (
+                ItemTreeKind::ConstParam,
+                input.ast_ids.ast_id(parameter).map(|id| id.erase()),
+                parameter.name(),
+                parameter.syntax().clone(),
+            ),
+            RecordChild::Field(field) => (
+                ItemTreeKind::Field,
+                input.ast_ids.ast_id(field).map(|id| id.erase()),
+                field.name(),
+                field.syntax().clone(),
+            ),
+        };
+        if child.kind != expected_kind {
+            reasons.insert(
+                "a record's ItemTree child kind or source order does not match its snapshot AST"
+                    .to_owned(),
+            );
+            return;
+        }
+        if ast_id != Some(child.ast_id) || input.ast_ids.pointer(child.ast_id).is_none() {
+            reasons
+                .insert("a record's ItemTree child ID does not match its snapshot AST".to_owned());
+            return;
+        }
+        if !child.children.is_empty() {
+            reasons.insert("a record child has unexpected nested declarations".to_owned());
+            return;
+        }
+        if child.name == Symbol::ERROR {
+            reasons.insert("a record child has no valid ItemTree name".to_owned());
+            return;
+        }
+        let child_name = match symbols.resolve(child.name) {
+            Ok(name) if !name.is_empty() => name.to_string(),
+            _ => {
+                reasons.insert("a record child name cannot be resolved".to_owned());
+                return;
+            }
+        };
+        let Some(name_node) = name_node else {
+            reasons.insert("a record child AST has no name node".to_owned());
+            return;
+        };
+        let Some(child_name_token) = name_node.token() else {
+            reasons.insert("a record child AST has no name token".to_owned());
+            return;
+        };
+        let raw_child_name = child_name_token
+            .text()
+            .strip_prefix("r#")
+            .unwrap_or(child_name_token.text());
+        if sai_syntax::normalize_identifier(raw_child_name) != child_name {
+            reasons.insert("the record ItemTree and AST child names disagree".to_owned());
+            return;
+        }
+        if syntax_has_errors(&child_syntax) || child_name_token.has_error() {
+            reasons.insert("a record child AST contains recovery or parse errors".to_owned());
+            return;
+        }
+        match ast_child {
+            RecordChild::Generic(_) => generic_children.push(child.clone()),
+            RecordChild::Field(field) => {
+                if !field_names.insert(child_name.clone()) {
+                    reasons.insert(format!(
+                        "record `{name}` has duplicate field name `{child_name}`"
+                    ));
+                }
+                validated_fields.push((
+                    child.clone(),
+                    field.clone(),
+                    child_name,
+                    child_syntax,
+                    child_name_token,
+                ));
+            }
+        }
+    }
+
+    let canonical_path = format!(
+        "{}{}.{name}",
+        package_identity,
+        module_path
+            .iter()
+            .map(|segment| format!("/{segment}"))
+            .collect::<String>()
+    );
+    if !canonical_paths.insert(canonical_path.clone()) {
+        reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+    }
+
+    let owner_component = DefPathData::TypeNs(entry.name);
+    let Some(item_position) = input
+        .filtered
+        .item_tree
+        .items
+        .iter()
+        .position(|candidate| candidate.ast_id == entry.ast_id)
+    else {
+        reasons.insert("a target-filtered record is absent from its module ItemTree".to_owned());
+        return;
+    };
+    let owner_disambiguator = input.filtered.item_tree.items[..item_position]
+        .iter()
+        .filter(|candidate| DefPathData::TypeNs(candidate.name) == owner_component)
+        .count();
+    let Ok(owner_disambiguator) = u32::try_from(owner_disambiguator) else {
+        reasons.insert("a record owner DefPath disambiguator overflowed".to_owned());
+        return;
+    };
+    let def_path = match def_paths.resolve(descriptor.owner.def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        Ok(Some(_)) => {
+            reasons
+                .insert("a record owner resolves to a definition path from another package".into());
+            return;
+        }
+        Ok(None) => {
+            reasons.insert("a record owner has no canonical definition path".to_owned());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("a record owner definition path cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let path_matches_declaration = def_path.data().len() == module_path.len() + 1
+        && def_path
+            .data()
+            .iter()
+            .take(module_path.len())
+            .zip(module_path)
+            .all(|(component, name)| {
+                component.disambiguator == 0
+                    && matches!(&component.data, DefPathData::Module(segment)
+                        if symbols.resolve(*segment).is_ok_and(|resolved| resolved.as_ref() == name))
+            })
+        && def_path.data().last().is_some_and(|component| {
+            component.data == owner_component && component.disambiguator == owner_disambiguator
+        });
+    if !path_matches_declaration {
+        reasons.insert(
+            "the record DefPath does not match its module, TypeNs name, or disambiguator"
+                .to_owned(),
+        );
+        return;
+    }
+    let def_path_hash = match DefPathHash::compute(&def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert("a record definition path hash cannot be computed".to_owned());
+            return;
+        }
+    };
+    let fingerprint = match declaration_fingerprint(SymbolKind::Record, &syntax, Some(&name_token))
+    {
+        Ok(fingerprint) => fingerprint,
+        Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+            reasons.insert("a record name token is outside its declaration syntax node".into());
+            return;
+        }
+    };
+    current_symbols.push(CurrentSymbol::new(
+        canonical_path.clone(),
+        def_path_hash,
+        SymbolKind::Record,
+        fingerprint,
+    ));
+
+    collect_item_generic_params(
+        &generic_children,
+        declaration.generic_params(),
+        &canonical_path,
+        descriptor.owner.def_id,
+        &def_path,
+        input,
+        package_id,
+        "record",
+        canonical_paths,
+        current_symbols,
+        reasons,
+        def_paths,
+        packages,
+        symbols,
+    );
+
+    let mut next_disambiguator = HashMap::<Symbol, u32>::new();
+    let mut field_paths = Vec::with_capacity(validated_fields.len());
+    for (field, _, _, _, _) in &validated_fields {
+        let disambiguator = next_disambiguator.entry(field.name).or_default();
+        let ordinal = *disambiguator;
+        let Some(next) = ordinal.checked_add(1) else {
+            reasons.insert("record field DefPath disambiguator overflowed".to_owned());
+            return;
+        };
+        *disambiguator = next;
+        field_paths.push((field.name, ordinal));
+    }
+    let field_def_ids = match def_paths.intern_fields(descriptor.owner.def_id, &field_paths) {
+        Ok(def_ids) if def_ids.len() == validated_fields.len() => def_ids,
+        Ok(_) => {
+            reasons.insert("HIR returned the wrong number of record field definitions".to_owned());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("record field definitions cannot be interned".to_owned());
+            return;
+        }
+    };
+    let mut field_symbols = Vec::with_capacity(validated_fields.len());
+    for (
+        ((field_entry, _, field_name, field_syntax, field_name_token), field_def_id),
+        (_, ordinal),
+    ) in validated_fields.iter().zip(field_def_ids).zip(field_paths)
+    {
+        let field_def_path = match def_paths.resolve(field_def_id) {
+            Ok(Some(path)) if path.package() == package_id => path,
+            _ => {
+                reasons
+                    .insert("a record field has no definition path in the selected package".into());
+                return;
+            }
+        };
+        let parent_len = def_path.data().len();
+        let exact_path = field_def_path.data().len() == parent_len + 1
+            && &field_def_path.data()[..parent_len] == def_path.data()
+            && field_def_path.data().last().is_some_and(|component| {
+                component.data == DefPathData::Field(field_entry.name)
+                    && component.disambiguator == ordinal
+            });
+        if !exact_path {
+            reasons.insert(
+                "a record field DefPath disagrees with its parent, name, or sibling order".into(),
+            );
+            return;
+        }
+        let field_def_path_hash = match DefPathHash::compute(&field_def_path, packages, symbols) {
+            Ok(hash) => Fingerprint::new(hash.raw()),
+            Err(_) => {
+                reasons.insert("a record field definition path hash cannot be computed".into());
+                return;
+            }
+        };
+        let field_fingerprint = match declaration_fingerprint(
+            SymbolKind::Field,
+            field_syntax,
+            Some(field_name_token),
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                reasons.insert(
+                    "a record field name token is outside its declaration syntax node".into(),
+                );
+                return;
+            }
+        };
+        let field_canonical_path = format!("{canonical_path}.field[{field_name}]");
+        if !canonical_paths.insert(field_canonical_path.clone()) {
+            reasons.insert(format!(
+                "duplicate canonical symbol path {field_canonical_path}"
+            ));
+        }
+        field_symbols.push(CurrentSymbol::new(
+            field_canonical_path,
+            field_def_path_hash,
+            SymbolKind::Field,
+            field_fingerprint,
+        ));
+    }
+    current_symbols.extend(field_symbols);
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_alias(
     entry: &ItemTreeEntry,
     file_id: FileId,
@@ -1110,7 +1580,7 @@ fn collect_alias(
         fingerprint,
     ));
     collect_item_generic_params(
-        entry,
+        &entry.children,
         declaration.generic_params(),
         &canonical_path,
         descriptor.owner.def_id,
@@ -1645,7 +2115,7 @@ fn collect_function(
         fingerprint,
     ));
     collect_item_generic_params(
-        entry,
+        &entry.children,
         function.generic_params(),
         &canonical_path,
         descriptor.owner.def_id,
@@ -1664,7 +2134,7 @@ fn collect_function(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_item_generic_params(
-    entry: &ItemTreeEntry,
+    generic_children: &[ItemTreeEntry],
     generic_param_list: Option<ast::GenericParamList>,
     function_path: &str,
     function_owner: LocalDefId,
@@ -1697,7 +2167,7 @@ fn collect_item_generic_params(
         ));
         return;
     }
-    if entry.children.len() != ast_params.len() {
+    if generic_children.len() != ast_params.len() {
         reasons.insert(format!(
             "a {owner_kind}'s ItemTree generic-parameter count does not match its snapshot AST"
         ));
@@ -1705,7 +2175,7 @@ fn collect_item_generic_params(
     }
 
     let mut validated = Vec::with_capacity(ast_params.len());
-    for (parameter, child) in ast_params.iter().zip(&entry.children) {
+    for (parameter, child) in ast_params.iter().zip(generic_children) {
         let (expected_kind, ast_id, name_node, syntax, is_const) = match parameter {
             ast::GenericParam::Type(parameter) => (
                 ItemTreeKind::TypeParam,
