@@ -1,0 +1,67 @@
+use acme:court-calendar-planner/data
+use acme:court-calendar-planner/planner
+use acme:court-calendar-planner/report
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        report.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    let command = args[1].as_str()
+    if command == "calendar" {
+        report.print_calendar(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "audit" {
+        report.print_audit(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "unresolved" {
+        report.print_unresolved(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "summary" {
+        report.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    out.write_str("usage: court-calendar-planner [calendar|audit|unresolved|summary]\n")
+    process.ExitCode.failure()
+}
+
+test "summary counts every failed check for both sides of each conflict" {
+    assert planner.ready_count() == 1
+    assert planner.unresolved_count() == 6
+    assert planner.total_failed_check_count() == 10
+}
+
+test "shared witnesses and repeated resources invalidate affected proposals" {
+    let hearings = data.hearings()
+    let park = planner.review(hearings[0])
+    let northline = planner.review(hearings[1])
+    let blue = planner.review(hearings[6])
+    assert not park.no_participant_overlap
+    assert not northline.no_participant_overlap
+    assert not park.no_judge_overlap
+    assert not park.no_room_overlap
+    assert not blue.no_judge_overlap
+    assert not blue.no_room_overlap
+}
+
+test "half-open adjacent hearings do not overlap" {
+    let hearings = data.hearings()
+    assert not planner.hearings_overlap(hearings[2], hearings[6])
+}
+
+test "late proposals fail the filing-based court-day window" {
+    let hearings = data.hearings()
+    assert planner.before_hearing_deadline(hearings[0])
+    assert not planner.before_hearing_deadline(hearings[5])
+}

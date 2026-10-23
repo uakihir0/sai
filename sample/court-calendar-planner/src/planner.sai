@@ -1,0 +1,290 @@
+use acme:court-calendar-planner/data
+use acme:court-calendar-planner/model.{CalendarSlot, CaseFile, Courtroom, Hearing, Judge, Review}
+
+pub fn find_case(id: U32) -> Option<CaseFile> {
+    for case_file in data.cases() {
+        if case_file.id == id {
+            return Some(case_file)
+        }
+    }
+    None
+}
+
+pub fn find_slot(id: U32) -> Option<CalendarSlot> {
+    for slot in data.slots() {
+        if slot.id == id {
+            return Some(slot)
+        }
+    }
+    None
+}
+
+pub fn find_judge(id: U32) -> Option<Judge> {
+    for judge in data.judges() {
+        if judge.id == id {
+            return Some(judge)
+        }
+    }
+    None
+}
+
+pub fn find_room(id: U32) -> Option<Courtroom> {
+    for room in data.courtrooms() {
+        if room.id == id {
+            return Some(room)
+        }
+    }
+    None
+}
+
+pub fn judge_name(id: U32) -> Str {
+    match find_judge(id) { Some(judge) => judge.name, None => "(unknown judge)" }
+}
+
+pub fn room_name(id: U32) -> Str {
+    match find_room(id) { Some(room) => room.name, None => "(unknown courtroom)" }
+}
+
+pub fn case_caption(id: U32) -> Str {
+    match find_case(id) { Some(case_file) => case_file.caption, None => "(unknown case)" }
+}
+
+pub fn slot_label(id: U32) -> Str {
+    match find_slot(id) { Some(slot) => slot.label, None => "(unknown slot)" }
+}
+
+pub fn participant_count(case_id: U32) -> U32 {
+    var count: U32 = 0
+    for participant in data.participants() {
+        if participant.case_id == case_id {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn judge_is_available(judge_id: U32, slot_id: U32) -> Bool {
+    var found = false
+    var available = false
+    for row in data.judge_availability() {
+        if row.judge_id == judge_id and row.slot_id == slot_id {
+            found = true
+            available = row.available
+        }
+    }
+    found and available
+}
+
+pub fn room_is_available(room_id: U32, slot_id: U32) -> Bool {
+    var found = false
+    var available = false
+    for row in data.room_availability() {
+        if row.room_id == room_id and row.slot_id == slot_id {
+            found = true
+            available = row.available
+        }
+    }
+    found and available
+}
+
+pub fn before_hearing_deadline(hearing: Hearing) -> Bool {
+    match find_case(hearing.case_id) {
+        Some(case_file) => {
+            match find_slot(hearing.slot_id) {
+                Some(slot) => slot.court_day <= case_file.filed_day + case_file.hearing_window_days
+                None => false
+            }
+        }
+        None => false
+    }
+}
+
+fn slots_overlap(first: CalendarSlot, second: CalendarSlot) -> Bool {
+    first.start_minute < second.end_minute and second.start_minute < first.end_minute
+}
+
+pub fn hearings_overlap(first: Hearing, second: Hearing) -> Bool {
+    match find_slot(first.slot_id) {
+        Some(first_slot) => {
+            match find_slot(second.slot_id) {
+                Some(second_slot) => slots_overlap(first_slot, second_slot)
+                None => false
+            }
+        }
+        None => false
+    }
+}
+
+pub fn cases_share_participant(first_case_id: U32, second_case_id: U32) -> Bool {
+    var shared = false
+    for first in data.participants() {
+        if first.case_id == first_case_id {
+            for second in data.participants() {
+                if second.case_id == second_case_id and first.person_id == second.person_id {
+                    shared = true
+                }
+            }
+        }
+    }
+    shared
+}
+
+pub fn first_shared_participant_name(first_case_id: U32, second_case_id: U32) -> Str {
+    for first in data.participants() {
+        if first.case_id == first_case_id {
+            for second in data.participants() {
+                if second.case_id == second_case_id and first.person_id == second.person_id {
+                    return first.name
+                }
+            }
+        }
+    }
+    "(unknown participant)"
+}
+
+fn no_judge_overlap(hearing: Hearing) -> Bool {
+    var clear = true
+    for other in data.hearings() {
+        if (
+            other.id != hearing.id
+            and other.judge_id == hearing.judge_id
+            and hearings_overlap(hearing, other)
+        ) {
+            clear = false
+        }
+    }
+    clear
+}
+
+fn no_room_overlap(hearing: Hearing) -> Bool {
+    var clear = true
+    for other in data.hearings() {
+        if (
+            other.id != hearing.id
+            and other.room_id == hearing.room_id
+            and hearings_overlap(hearing, other)
+        ) {
+            clear = false
+        }
+    }
+    clear
+}
+
+fn no_participant_overlap(hearing: Hearing) -> Bool {
+    var clear = true
+    for other in data.hearings() {
+        if (
+            other.id != hearing.id
+            and hearings_overlap(hearing, other)
+            and cases_share_participant(hearing.case_id, other.case_id)
+        ) {
+            clear = false
+        }
+    }
+    clear
+}
+
+fn room_capacity_is_sufficient(hearing: Hearing) -> Bool {
+    match find_room(hearing.room_id) {
+        Some(room) => participant_count(hearing.case_id) <= room.capacity
+        None => false
+    }
+}
+
+pub fn review(hearing: Hearing) -> Review {
+    Review(
+        case_known: match find_case(hearing.case_id) { Some(_) => true, None => false },
+        slot_known: match find_slot(hearing.slot_id) { Some(_) => true, None => false },
+        judge_known: match find_judge(hearing.judge_id) { Some(_) => true, None => false },
+        room_known: match find_room(hearing.room_id) { Some(_) => true, None => false },
+        before_deadline: before_hearing_deadline(hearing),
+        judge_available: judge_is_available(hearing.judge_id, hearing.slot_id),
+        room_available: room_is_available(hearing.room_id, hearing.slot_id),
+        within_capacity: room_capacity_is_sufficient(hearing),
+        no_judge_overlap: no_judge_overlap(hearing),
+        no_room_overlap: no_room_overlap(hearing),
+        no_participant_overlap: no_participant_overlap(hearing),
+    )
+}
+
+pub fn is_ready(result: Review) -> Bool {
+    (
+        result.case_known
+        and result.slot_known
+        and result.judge_known
+        and result.room_known
+        and result.before_deadline
+        and result.judge_available
+        and result.room_available
+        and result.within_capacity
+        and result.no_judge_overlap
+        and result.no_room_overlap
+        and result.no_participant_overlap
+    )
+}
+
+pub fn failed_check_count(result: Review) -> U32 {
+    var count: U32 = 0
+    if not result.case_known {
+        count += 1
+    }
+    if not result.slot_known {
+        count += 1
+    }
+    if not result.judge_known {
+        count += 1
+    }
+    if not result.room_known {
+        count += 1
+    }
+    if not result.before_deadline {
+        count += 1
+    }
+    if not result.judge_available {
+        count += 1
+    }
+    if not result.room_available {
+        count += 1
+    }
+    if not result.within_capacity {
+        count += 1
+    }
+    if not result.no_judge_overlap {
+        count += 1
+    }
+    if not result.no_room_overlap {
+        count += 1
+    }
+    if not result.no_participant_overlap {
+        count += 1
+    }
+    count
+}
+
+pub fn ready_count() -> U32 {
+    var count: U32 = 0
+    for hearing in data.hearings() {
+        if is_ready(review(hearing)) {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn unresolved_count() -> U32 {
+    var count: U32 = 0
+    for hearing in data.hearings() {
+        if not is_ready(review(hearing)) {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn total_failed_check_count() -> U32 {
+    var count: U32 = 0
+    for hearing in data.hearings() {
+        count += failed_check_count(review(hearing))
+    }
+    count
+}

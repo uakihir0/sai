@@ -1,0 +1,286 @@
+use acme:court-calendar-planner/model.{
+    CalendarSlot
+    CaseFile
+    CaseParticipant
+    Courtroom
+    Hearing
+    Judge
+    JudgeAvailability
+    ParticipantRole
+    RoomAvailability
+}
+
+pub fn cases() -> Array<CaseFile, 7> {
+    [
+        CaseFile(id: 201, caption: "Park v. Harbor Works", filed_day: 1, hearing_window_days: 0),
+        CaseFile(
+            id: 202,
+            caption: "Northline v. Market Square",
+            filed_day: 1,
+            hearing_window_days: 1,
+        ),
+        CaseFile(
+            id: 203,
+            caption: "Riley Chen emergency motion",
+            filed_day: 1,
+            hearing_window_days: 0,
+        ),
+        CaseFile(id: 204, caption: "Fox v. Skyway Storage", filed_day: 1, hearing_window_days: 1),
+        CaseFile(
+            id: 205,
+            caption: "Patel v. Granite Transit",
+            filed_day: 1,
+            hearing_window_days: 1,
+        ),
+        CaseFile(
+            id: 206,
+            caption: "Rowan v. Metro Authority",
+            filed_day: 1,
+            hearing_window_days: 1,
+        ),
+        CaseFile(id: 207, caption: "Blue v. Northbank", filed_day: 1, hearing_window_days: 0),
+    ]
+}
+
+pub fn slots() -> Array<CalendarSlot, 6> {
+    [
+        CalendarSlot(
+            id: 1,
+            court_day: 1,
+            label: "Mon 09:00-10:00",
+            start_minute: 540,
+            end_minute: 600,
+        ),
+        CalendarSlot(
+            id: 2,
+            court_day: 1,
+            label: "Mon 09:30-10:30",
+            start_minute: 570,
+            end_minute: 630,
+        ),
+        CalendarSlot(
+            id: 3,
+            court_day: 1,
+            label: "Mon 10:30-11:30",
+            start_minute: 630,
+            end_minute: 690,
+        ),
+        CalendarSlot(
+            id: 4,
+            court_day: 2,
+            label: "Tue 09:00-10:00",
+            start_minute: 1980,
+            end_minute: 2040,
+        ),
+        CalendarSlot(
+            id: 5,
+            court_day: 2,
+            label: "Tue 11:00-12:00",
+            start_minute: 2100,
+            end_minute: 2160,
+        ),
+        CalendarSlot(
+            id: 6,
+            court_day: 3,
+            label: "Wed 09:00-10:00",
+            start_minute: 3420,
+            end_minute: 3480,
+        ),
+    ]
+}
+
+pub fn judges() -> Array<Judge, 3> {
+    [
+        Judge(id: 1, name: "Judge Avery"),
+        Judge(id: 2, name: "Judge Brooks"),
+        Judge(id: 3, name: "Judge Chen"),
+    ]
+}
+
+pub fn courtrooms() -> Array<Courtroom, 2> {
+    [
+        Courtroom(id: 1, name: "Courtroom Cedar", capacity: 8),
+        Courtroom(id: 2, name: "Courtroom Birch", capacity: 5),
+    ]
+}
+
+// Every row is one person expected to attend, including counsel.
+pub fn participants() -> Array<CaseParticipant, 23> {
+    [
+        CaseParticipant(
+            case_id: 201,
+            person_id: 101,
+            name: "Alex Park",
+            role: ParticipantRole.Party,
+        ),
+        CaseParticipant(
+            case_id: 201,
+            person_id: 102,
+            name: "Morgan Reed",
+            role: ParticipantRole.Witness,
+        ),
+        CaseParticipant(
+            case_id: 201,
+            person_id: 103,
+            name: "Dana Kim",
+            role: ParticipantRole.Counsel,
+        ),
+        CaseParticipant(
+            case_id: 202,
+            person_id: 201,
+            name: "Jordan Vale",
+            role: ParticipantRole.Party,
+        ),
+        CaseParticipant(
+            case_id: 202,
+            person_id: 102,
+            name: "Morgan Reed",
+            role: ParticipantRole.Witness,
+        ),
+        CaseParticipant(
+            case_id: 202,
+            person_id: 202,
+            name: "Lee Ortiz",
+            role: ParticipantRole.Counsel,
+        ),
+        CaseParticipant(
+            case_id: 203,
+            person_id: 301,
+            name: "Riley Chen",
+            role: ParticipantRole.Party,
+        ),
+        CaseParticipant(
+            case_id: 203,
+            person_id: 302,
+            name: "Pat Ellis",
+            role: ParticipantRole.Witness,
+        ),
+        CaseParticipant(
+            case_id: 203,
+            person_id: 303,
+            name: "Ari Singh",
+            role: ParticipantRole.Witness,
+        ),
+        CaseParticipant(
+            case_id: 203,
+            person_id: 304,
+            name: "Mika Wong",
+            role: ParticipantRole.Counsel,
+        ),
+        CaseParticipant(
+            case_id: 204,
+            person_id: 401,
+            name: "Taylor Fox",
+            role: ParticipantRole.Party,
+        ),
+        CaseParticipant(
+            case_id: 204,
+            person_id: 402,
+            name: "Sky Nolan",
+            role: ParticipantRole.Witness,
+        ),
+        CaseParticipant(
+            case_id: 204,
+            person_id: 403,
+            name: "Quinn Hart",
+            role: ParticipantRole.Counsel,
+        ),
+        CaseParticipant(
+            case_id: 205,
+            person_id: 501,
+            name: "Uma Patel",
+            role: ParticipantRole.Party,
+        ),
+        CaseParticipant(
+            case_id: 205,
+            person_id: 502,
+            name: "Noah Diaz",
+            role: ParticipantRole.Party,
+        ),
+        CaseParticipant(
+            case_id: 205,
+            person_id: 503,
+            name: "Evan Cole",
+            role: ParticipantRole.Witness,
+        ),
+        CaseParticipant(
+            case_id: 205,
+            person_id: 504,
+            name: "Harper Lane",
+            role: ParticipantRole.Witness,
+        ),
+        CaseParticipant(
+            case_id: 205,
+            person_id: 505,
+            name: "Robin Gray",
+            role: ParticipantRole.Counsel,
+        ),
+        CaseParticipant(
+            case_id: 205,
+            person_id: 506,
+            name: "Avery James",
+            role: ParticipantRole.Counsel,
+        ),
+        CaseParticipant(
+            case_id: 206,
+            person_id: 601,
+            name: "Riley Rowan",
+            role: ParticipantRole.Party,
+        ),
+        CaseParticipant(
+            case_id: 206,
+            person_id: 602,
+            name: "Devon Lake",
+            role: ParticipantRole.Counsel,
+        ),
+        CaseParticipant(
+            case_id: 207,
+            person_id: 701,
+            name: "Casey Blue",
+            role: ParticipantRole.Party,
+        ),
+        CaseParticipant(
+            case_id: 207,
+            person_id: 702,
+            name: "Jules Park",
+            role: ParticipantRole.Counsel,
+        ),
+    ]
+}
+
+pub fn judge_availability() -> Array<JudgeAvailability, 7> {
+    [
+        JudgeAvailability(judge_id: 1, slot_id: 1, available: true),
+        JudgeAvailability(judge_id: 2, slot_id: 2, available: true),
+        JudgeAvailability(judge_id: 1, slot_id: 3, available: true),
+        JudgeAvailability(judge_id: 3, slot_id: 4, available: false),
+        JudgeAvailability(judge_id: 2, slot_id: 5, available: true),
+        JudgeAvailability(judge_id: 1, slot_id: 6, available: true),
+        JudgeAvailability(judge_id: 1, slot_id: 2, available: true),
+    ]
+}
+
+pub fn room_availability() -> Array<RoomAvailability, 7> {
+    [
+        RoomAvailability(room_id: 1, slot_id: 1, available: true),
+        RoomAvailability(room_id: 2, slot_id: 2, available: true),
+        RoomAvailability(room_id: 2, slot_id: 3, available: true),
+        RoomAvailability(room_id: 1, slot_id: 4, available: true),
+        RoomAvailability(room_id: 2, slot_id: 5, available: false),
+        RoomAvailability(room_id: 1, slot_id: 6, available: true),
+        RoomAvailability(room_id: 1, slot_id: 2, available: true),
+    ]
+}
+
+// These are proposals to review, not assignments produced by a search.
+pub fn hearings() -> Array<Hearing, 7> {
+    [
+        Hearing(id: 301, case_id: 201, slot_id: 1, judge_id: 1, room_id: 1),
+        Hearing(id: 302, case_id: 202, slot_id: 2, judge_id: 2, room_id: 2),
+        Hearing(id: 303, case_id: 203, slot_id: 3, judge_id: 1, room_id: 2),
+        Hearing(id: 304, case_id: 204, slot_id: 4, judge_id: 3, room_id: 1),
+        Hearing(id: 305, case_id: 205, slot_id: 5, judge_id: 2, room_id: 2),
+        Hearing(id: 306, case_id: 206, slot_id: 6, judge_id: 1, room_id: 1),
+        Hearing(id: 307, case_id: 207, slot_id: 2, judge_id: 1, room_id: 1),
+    ]
+}

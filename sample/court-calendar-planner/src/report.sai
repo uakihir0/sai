@@ -1,0 +1,136 @@
+use acme:court-calendar-planner/data
+use acme:court-calendar-planner/model.{Hearing, Review}
+use acme:court-calendar-planner/planner
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn print_hearing(out: borrow mut Stdout, hearing: Hearing, details: Bool)
+    effects { stdio.write, alloc }
+{
+    let result = planner.review(hearing)
+    out.write_str(
+        f"{planner.slot_label(hearing.slot_id)} | {planner.case_caption(hearing.case_id)} | {planner.judge_name(hearing.judge_id)} | {planner.room_name(hearing.room_id)}".as_str(),
+    )
+    if planner.is_ready(result) {
+        out.write_str(" | READY\n")
+    } else {
+        out.write_str(" | UNRESOLVED\n")
+    }
+    if details and not planner.is_ready(result) {
+        print_findings(borrow mut out, hearing, result)
+    }
+}
+
+fn print_overlap_findings(out: borrow mut Stdout, hearing: Hearing)
+    effects { stdio.write, alloc }
+{
+    for other in data.hearings() {
+        if other.id != hearing.id and planner.hearings_overlap(hearing, other) {
+            if other.judge_id == hearing.judge_id {
+                out.write_str(f"  judge is also scheduled for hearing {other.id}\n".as_str())
+            }
+            if other.room_id == hearing.room_id {
+                out.write_str(f"  courtroom is also booked for hearing {other.id}\n".as_str())
+            }
+            if planner.cases_share_participant(hearing.case_id, other.case_id) {
+                out.write_str(
+                    f"  shared participant {planner.first_shared_participant_name(hearing.case_id, other.case_id)} also appears in hearing {other.id}\n".as_str(),
+                )
+            }
+        }
+    }
+}
+
+fn print_findings(out: borrow mut Stdout, hearing: Hearing, result: Review)
+    effects { stdio.write, alloc }
+{
+    if not result.case_known {
+        out.write_str("  unknown case reference\n")
+    }
+    if not result.slot_known {
+        out.write_str("  unknown calendar slot\n")
+    }
+    if not result.judge_known {
+        out.write_str("  unknown judge reference\n")
+    }
+    if not result.room_known {
+        out.write_str("  unknown courtroom reference\n")
+    }
+    if not result.before_deadline {
+        match planner.find_case(hearing.case_id) {
+            Some(case_file) => {
+                match planner.find_slot(hearing.slot_id) {
+                    Some(slot) => {
+                        let deadline_day = case_file.filed_day + case_file.hearing_window_days
+                        out.write_str(
+                            f"  hearing deadline is court day {deadline_day}; proposal is court day {slot.court_day}\n".as_str(),
+                        )
+                    }
+                    None => out.write_str("  proposal has no known court day for deadline review\n")
+                }
+            }
+            None => out.write_str("  proposal has no known case for deadline review\n")
+        }
+    }
+    if not result.judge_available {
+        out.write_str("  judge unavailable for the proposed slot\n")
+    }
+    if not result.room_available {
+        out.write_str("  courtroom unavailable for the proposed slot\n")
+    }
+    if not result.within_capacity {
+        match planner.find_room(hearing.room_id) {
+            Some(room) => {
+                out.write_str(
+                    f"  {planner.participant_count(hearing.case_id)} listed attendees exceed courtroom capacity {room.capacity}\n".as_str(),
+                )
+            }
+            None => out.write_str("  courtroom capacity cannot be checked\n")
+        }
+    }
+    print_overlap_findings(borrow mut out, hearing)
+}
+
+pub fn print_calendar(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Harbor County proposed calendar\n\n")
+    for hearing in data.hearings() {
+        print_hearing(borrow mut out, hearing, false)
+    }
+}
+
+pub fn print_audit(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Harbor County docket audit\n\n")
+    for hearing in data.hearings() {
+        print_hearing(borrow mut out, hearing, true)
+    }
+}
+
+pub fn print_unresolved(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    var found = false
+    out.write_str("Unresolved hearing proposals\n")
+    for hearing in data.hearings() {
+        if not planner.is_ready(planner.review(hearing)) {
+            found = true
+            print_hearing(borrow mut out, hearing, true)
+        }
+    }
+    if not found {
+        out.write_str("No unresolved proposals.\n")
+    }
+}
+
+pub fn print_summary(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    out.write_str("Harbor County docket review\n")
+    out.write_str(f"Proposed hearings: {data.hearings().len()}\n".as_str())
+    out.write_str(f"Ready: {planner.ready_count()}\n".as_str())
+    out.write_str(f"Unresolved: {planner.unresolved_count()}\n".as_str())
+    out.write_str(f"Failed per-hearing checks: {planner.total_failed_check_count()}\n".as_str())
+}

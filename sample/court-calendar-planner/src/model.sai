@@ -1,0 +1,82 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ParticipantRole {
+    Party
+    Witness
+    Counsel
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CaseFile {
+    pub id: U32
+    pub caption: Str
+    pub filed_day: U32
+    pub hearing_window_days: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CalendarSlot {
+    pub id: U32
+    pub court_day: U32
+    pub label: Str
+    pub start_minute: U32
+    pub end_minute: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Judge {
+    pub id: U32
+    pub name: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Courtroom {
+    pub id: U32
+    pub name: Str
+    pub capacity: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CaseParticipant {
+    pub case_id: U32
+    pub person_id: U32
+    pub name: Str
+    pub role: ParticipantRole
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type JudgeAvailability {
+    pub judge_id: U32
+    pub slot_id: U32
+    pub available: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RoomAvailability {
+    pub room_id: U32
+    pub slot_id: U32
+    pub available: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Hearing {
+    pub id: U32
+    pub case_id: U32
+    pub slot_id: U32
+    pub judge_id: U32
+    pub room_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Review {
+    pub case_known: Bool
+    pub slot_known: Bool
+    pub judge_known: Bool
+    pub room_known: Bool
+    pub before_deadline: Bool
+    pub judge_available: Bool
+    pub room_available: Bool
+    pub within_capacity: Bool
+    pub no_judge_overlap: Bool
+    pub no_room_overlap: Bool
+    pub no_participant_overlap: Bool
+}
