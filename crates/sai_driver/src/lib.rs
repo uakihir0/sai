@@ -1148,6 +1148,7 @@ impl Drop for StagedPhase1InputGuard {
 struct OwnedPhase1ModuleInput {
     filtered: TargetFilterResult,
     ast_ids: sai_syntax::ast::AstIdMap,
+    parser_diagnostics: Vec<sai_diagnostics::Diagnostic>,
     root: sai_syntax::SyntaxNode,
     source: Arc<SourceFile>,
     source_ref: SourceRef,
@@ -13808,9 +13809,11 @@ impl RootDatabase {
                 snapshot,
                 target_cfg,
             )?;
+            let parser_diagnostics = parsed.parser_diagnostics().to_vec();
             owned_inputs.push(OwnedPhase1ModuleInput {
                 filtered,
                 ast_ids,
+                parser_diagnostics,
                 root: parsed.root,
                 source,
                 source_ref: SourceRef {
@@ -25180,6 +25183,56 @@ mod tests {
             sai_semantic::InventoryCoverage::Incomplete { reason }
                 if reason.contains("syntax tree contains recovery or parse errors")
         ));
+    }
+
+    #[test]
+    fn module_function_inventory_fails_closed_for_generic_parameter_parser_diagnostics() {
+        let (mut database, module_tree, snapshot, collection) =
+            collect_package_inventory_for_target(
+                b"fn invalid<@target(\"wasm64-core\") T>() {}\n",
+                b"",
+                "wasm32-core",
+            );
+        let file_id = module_tree.modules[0].file;
+        let parsed = sai_syntax::parse(&snapshot, file_id)
+            .expect("the generic-parameter fixture parses with a diagnostic");
+        assert!(parsed.parser_diagnostics().iter().any(|diagnostic| {
+            diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget
+        }));
+        assert!(matches!(
+            inventory_symbols(&collection).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("generic-parameter list has a parser diagnostic")
+        ));
+
+        let ast_ids = database
+            .ast_id_map(&snapshot, file_id)
+            .expect("module AST ID map is available");
+        let item_tree = database
+            .def_collector(&snapshot, file_id)
+            .expect("the module ItemTree is available");
+        let source = snapshot
+            .file(file_id)
+            .expect("module snapshot file exists")
+            .source()
+            .text();
+        let filtered = item_tree
+            .filter_for_target(
+                source,
+                &parsed.root,
+                &ast_ids,
+                &database.symbols,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").expect("target config is valid"),
+            )
+            .expect("target filtering keeps the invalid generic parameter");
+        assert!(
+            filtered
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::InvalidAttributeTarget),
+            "the regression fixture must stay outside filtered-item diagnostics"
+        );
     }
 
     #[test]

@@ -834,10 +834,23 @@ fn collect_function_generic_params(
     packages: &PackageInterner,
     symbols: &Interner,
 ) {
-    let ast_params = function
-        .generic_params()
+    let generic_param_list = function.generic_params();
+    let ast_params = generic_param_list
+        .as_ref()
         .map(|params| params.params().collect::<Vec<_>>())
         .unwrap_or_default();
+    if generic_param_list.as_ref().is_some_and(|params| {
+        input.parser_diagnostics.iter().any(|diagnostic| {
+            parser_diagnostic_overlaps_syntax(
+                diagnostic,
+                input.filtered.item_tree.file,
+                &params.syntax(),
+            )
+        })
+    }) {
+        reasons.insert("a function generic-parameter list has a parser diagnostic".to_owned());
+        return;
+    }
     if entry.children.len() != ast_params.len() {
         reasons.insert(
             "a function's ItemTree generic-parameter count does not match its snapshot AST"
@@ -1037,4 +1050,20 @@ fn syntax_has_errors(root: &SyntaxNode) -> bool {
         }
     }
     false
+}
+
+fn parser_diagnostic_overlaps_syntax(
+    diagnostic: &sai_diagnostics::Diagnostic,
+    file_id: FileId,
+    syntax: &SyntaxNode,
+) -> bool {
+    let Some(primary) = diagnostic.primary() else {
+        return true;
+    };
+    if primary.span.file != file_id {
+        return false;
+    }
+    let diagnostic_range = primary.span.range;
+    let syntax_range = syntax.text_range();
+    diagnostic_range.start() <= syntax_range.end() && syntax_range.start() <= diagnostic_range.end()
 }
