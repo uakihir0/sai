@@ -1,0 +1,248 @@
+use acme:festival-settlement-auditor/fixtures
+use acme:festival-settlement-auditor/model.{
+    AuditSummary
+    Finding
+    OrderAudit
+    PaymentStatus
+    PaymentTotals
+    SettlementAudit
+    Ticket
+    TicketOrder
+}
+
+fn has_order(order_id: U32) -> Bool {
+    for order in fixtures.orders() {
+        if order.id == order_id {
+            return true
+        }
+    }
+    false
+}
+
+fn find_ticket(ticket_id: U32) -> Option<Ticket> {
+    for order in fixtures.orders() {
+        for slot in order.tickets {
+            match slot {
+                Some(ticket) => {
+                    if ticket.id == ticket_id {
+                        return Some(ticket)
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    None
+}
+
+fn payment_totals(order_id: U32) -> PaymentTotals {
+    var totals = PaymentTotals(
+        record_count: 0,
+        captured_cents: 0,
+        processor_fee_cents: 0,
+        refund_cents: 0,
+        status: None,
+    )
+    for payment in fixtures.payments() {
+        if payment.order_id == order_id {
+            totals.record_count += 1
+            totals.captured_cents += payment.captured_cents
+            totals.processor_fee_cents += payment.processor_fee_cents
+            totals.refund_cents += payment.refund_cents
+            totals.status = Some(payment.status)
+        }
+    }
+    totals
+}
+
+fn face_value(order: TicketOrder) -> U32 {
+    var total: U32 = 0
+    for slot in order.tickets {
+        match slot {
+            Some(ticket) => {
+                total += ticket.face_value_cents
+            }
+            None => {}
+        }
+    }
+    total
+}
+
+fn scans_for(ticket_id: U32) -> USize {
+    var count: USize = 0
+    for scan in fixtures.scans() {
+        if scan.ticket_id == ticket_id {
+            count += 1
+        }
+    }
+    count
+}
+
+fn has_repeated_admission(order: TicketOrder) -> Bool {
+    for slot in order.tickets {
+        match slot {
+            Some(ticket) => {
+                if scans_for(ticket.id) > 1 {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+fn finding(order: TicketOrder, expected_cents: U32, totals: PaymentTotals) -> Option<Finding> {
+    if totals.record_count > 1 {
+        return Some(Finding.DuplicatePayment)
+    }
+    if expected_cents > 0 and totals.record_count == 0 {
+        return Some(Finding.MissingPayment)
+    }
+    if totals.record_count > 0 and totals.captured_cents != expected_cents {
+        return Some(Finding.AmountMismatch)
+    }
+    if totals.record_count > 0 and totals.processor_fee_cents > totals.captured_cents {
+        return Some(Finding.FeeExceedsCapture)
+    }
+    if totals.refund_cents > 0 or totals.status == Some(PaymentStatus.Refunded) {
+        return Some(Finding.RefundReview)
+    }
+    if has_repeated_admission(order) {
+        return Some(Finding.DuplicateAdmission)
+    }
+    None
+}
+
+fn order_audit(order: TicketOrder) -> OrderAudit {
+    let expected_cents = face_value(order)
+    let totals = payment_totals(order.id)
+    let issue = finding(order, expected_cents, totals)
+    let releasable_cents = match issue {
+        Some(_) => 0
+        None => if totals.captured_cents > totals.processor_fee_cents {
+            totals.captured_cents - totals.processor_fee_cents
+        } else {
+            0
+        }
+    }
+    OrderAudit(
+        order_id: order.id,
+        buyer: order.buyer,
+        ticket_count: order.ticket_count,
+        face_value_cents: expected_cents,
+        payment_count: totals.record_count,
+        captured_cents: totals.captured_cents,
+        processor_fee_cents: totals.processor_fee_cents,
+        refund_cents: totals.refund_cents,
+        finding: issue,
+        releasable_cents: releasable_cents,
+    )
+}
+
+fn has_ticket(ticket_id: U32) -> Bool {
+    match find_ticket(ticket_id) { Some(_) => true, None => false }
+}
+
+fn count_unmatched_payments() -> USize {
+    var count: USize = 0
+    for payment in fixtures.payments() {
+        if not has_order(payment.order_id) {
+            count += 1
+        }
+    }
+    count
+}
+
+fn unmatched_payment_cents() -> U32 {
+    var total: U32 = 0
+    for payment in fixtures.payments() {
+        if not has_order(payment.order_id) {
+            total += payment.captured_cents
+        }
+    }
+    total
+}
+
+fn count_unknown_scans() -> USize {
+    var count: USize = 0
+    for scan in fixtures.scans() {
+        if not has_ticket(scan.ticket_id) {
+            count += 1
+        }
+    }
+    count
+}
+
+fn count_repeatedly_scanned_tickets() -> USize {
+    var count: USize = 0
+    for order in fixtures.orders() {
+        for slot in order.tickets {
+            match slot {
+                Some(ticket) => {
+                    if scans_for(ticket.id) > 1 {
+                        count += 1
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    count
+}
+
+fn all_payment_totals() -> PaymentTotals {
+    var totals = PaymentTotals(
+        record_count: 0,
+        captured_cents: 0,
+        processor_fee_cents: 0,
+        refund_cents: 0,
+        status: None,
+    )
+    for payment in fixtures.payments() {
+        totals.record_count += 1
+        totals.captured_cents += payment.captured_cents
+        totals.processor_fee_cents += payment.processor_fee_cents
+        totals.refund_cents += payment.refund_cents
+    }
+    totals
+}
+
+pub fn audit() -> SettlementAudit {
+    var orders = Array<Option<OrderAudit>, 4>.filled(None)
+    var summary = AuditSummary(
+        orders_reviewed: 0,
+        orders_released: 0,
+        orders_held: 0,
+        unmatched_payment_count: count_unmatched_payments(),
+        unmatched_payment_cents: unmatched_payment_cents(),
+        unknown_scan_count: count_unknown_scans(),
+        repeatedly_scanned_ticket_count: count_repeatedly_scanned_tickets(),
+        captured_cents: 0,
+        processor_fee_cents: 0,
+        refund_cents: 0,
+        releasable_cents: 0,
+    )
+    var index: USize = 0
+    for order in fixtures.orders() {
+        let result = order_audit(order)
+        orders[index] = Some(result)
+        summary.orders_reviewed += 1
+        match result.finding {
+            Some(_) => {
+                summary.orders_held += 1
+            }
+            None => {
+                summary.orders_released += 1
+                summary.releasable_cents += result.releasable_cents
+            }
+        }
+        index += 1
+    }
+
+    let totals = all_payment_totals()
+    summary.captured_cents = totals.captured_cents
+    summary.processor_fee_cents = totals.processor_fee_cents
+    summary.refund_cents = totals.refund_cents
+    SettlementAudit(orders: orders, order_count: index, summary: summary)
+}

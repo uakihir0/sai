@@ -1,0 +1,70 @@
+use acme:festival-settlement-auditor/model.{Finding, SettlementAudit}
+use acme:festival-settlement-auditor/reconcile
+
+pub fn weekend_audit() -> SettlementAudit {
+    reconcile.audit()
+}
+
+test "a consistent captured order releases only its net proceeds" {
+    let result = weekend_audit()
+    match result.orders[0] {
+        Some(order) => {
+            assert order.order_id == 5011
+            assert order.face_value_cents == 8500
+            assert order.captured_cents == 8500
+            assert order.processor_fee_cents == 290
+            assert order.releasable_cents == 8210
+            assert order.finding == None
+        }
+        None => {
+            assert false
+        }
+    }
+    assert result.summary.releasable_cents == 8210
+}
+
+test "refunds, repeated admissions, and amount mismatches hold orders" {
+    let result = weekend_audit()
+    match result.orders[1] {
+        Some(order) => {
+            assert order.finding == Some(Finding.RefundReview)
+            assert order.refund_cents == 500
+            assert order.releasable_cents == 0
+        }
+        None => {
+            assert false
+        }
+    }
+    match result.orders[2] {
+        Some(order) => {
+            assert order.finding == Some(Finding.DuplicateAdmission)
+            assert order.releasable_cents == 0
+        }
+        None => {
+            assert false
+        }
+    }
+    match result.orders[3] {
+        Some(order) => {
+            assert order.finding == Some(Finding.AmountMismatch)
+            assert order.captured_cents == 5500
+            assert order.releasable_cents == 0
+        }
+        None => {
+            assert false
+        }
+    }
+    assert result.summary.orders_released == 1
+    assert result.summary.orders_held == 3
+}
+
+test "unmatched source records remain in payment totals and are counted" {
+    let result = weekend_audit()
+    assert result.summary.unmatched_payment_count == 1
+    assert result.summary.unmatched_payment_cents == 2000
+    assert result.summary.unknown_scan_count == 1
+    assert result.summary.repeatedly_scanned_ticket_count == 1
+    assert result.summary.captured_cents == 21000
+    assert result.summary.processor_fee_cents == 715
+    assert result.summary.refund_cents == 500
+}
