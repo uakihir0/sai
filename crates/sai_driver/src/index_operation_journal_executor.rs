@@ -13,7 +13,7 @@ use crate::index_operation_journal_recovery::{
 use crate::index_operation_journal_store::{
     IndexOperationJournalIndexTarget, IndexOperationJournalStore, IndexOperationJournalStoreError,
 };
-use crate::index_operation_journal_validation::IndexJournalWorkspaceInventory;
+use crate::index_operation_journal_validation::IndexJournalRecoveryContext;
 use sai_package::local_source::LocalPackageSourceFileUpdateError;
 use sai_package::package_path::{ContentPackagePath, RepositoryPackageDirectory};
 use sai_semantic::{FileState, IndexOperationJournal, PackageIndexFileName};
@@ -223,13 +223,13 @@ impl From<IndexJournalSourceRestoreError> for IndexJournalRestoreBeforeError {
 pub fn execute_index_operation_journal_clear(
     store: &IndexOperationJournalStore<'_>,
     journal: &IndexOperationJournal,
-    inventory: &IndexJournalWorkspaceInventory,
+    context: &IndexJournalRecoveryContext,
     planned_decision: IndexJournalRecoveryDecision,
 ) -> Result<IndexJournalClearExecution, IndexOperationJournalStoreError> {
     execute_index_operation_journal_clear_with_hook(
         store,
         journal,
-        inventory,
+        context,
         planned_decision,
         || {},
     )
@@ -254,14 +254,14 @@ pub fn execute_index_operation_journal_clear(
 pub fn execute_index_operation_journal_restore_source_before(
     store: &IndexOperationJournalStore<'_>,
     journal: &IndexOperationJournal,
-    inventory: &IndexJournalWorkspaceInventory,
+    context: &IndexJournalRecoveryContext,
     planned_decision: IndexJournalRecoveryDecision,
     source_index: usize,
 ) -> Result<IndexJournalSourceRestoreExecution, IndexJournalSourceRestoreError> {
     execute_index_operation_journal_restore_source_before_with_hook(
         store,
         journal,
-        inventory,
+        context,
         planned_decision,
         source_index,
         || {},
@@ -283,13 +283,13 @@ pub fn execute_index_operation_journal_restore_source_before(
 pub fn execute_index_operation_journal_restore_header_before(
     store: &IndexOperationJournalStore<'_>,
     journal: &IndexOperationJournal,
-    inventory: &IndexJournalWorkspaceInventory,
+    context: &IndexJournalRecoveryContext,
     planned_decision: IndexJournalRecoveryDecision,
 ) -> Result<IndexJournalHeaderRestoreExecution, IndexOperationJournalStoreError> {
     execute_index_operation_journal_restore_header_before_with_hook(
         store,
         journal,
-        inventory,
+        context,
         planned_decision,
         || {},
     )
@@ -308,14 +308,14 @@ pub fn execute_index_operation_journal_restore_header_before(
 pub fn execute_index_operation_journal_restore_package_before(
     store: &IndexOperationJournalStore<'_>,
     journal: &IndexOperationJournal,
-    inventory: &IndexJournalWorkspaceInventory,
+    context: &IndexJournalRecoveryContext,
     file: &PackageIndexFileName,
     planned_decision: IndexJournalRecoveryDecision,
 ) -> Result<IndexJournalPackageRestoreExecution, IndexOperationJournalStoreError> {
     execute_index_operation_journal_restore_package_before_with_hook(
         store,
         journal,
-        inventory,
+        context,
         file,
         planned_decision,
         || {},
@@ -325,12 +325,12 @@ pub fn execute_index_operation_journal_restore_package_before(
 fn execute_index_operation_journal_restore_package_before_with_hook(
     store: &IndexOperationJournalStore<'_>,
     journal: &IndexOperationJournal,
-    inventory: &IndexJournalWorkspaceInventory,
+    context: &IndexJournalRecoveryContext,
     file: &PackageIndexFileName,
     planned_decision: IndexJournalRecoveryDecision,
     before_update: impl FnOnce(),
 ) -> Result<IndexJournalPackageRestoreExecution, IndexOperationJournalStoreError> {
-    let observation = store.observe_recovery(journal, inventory)?;
+    let observation = store.observe_recovery(journal, context)?;
     let observed_decision = plan_index_operation_journal_recovery(journal, &observation);
     if observed_decision != planned_decision {
         return Ok(IndexJournalPackageRestoreExecution::DecisionChanged {
@@ -345,6 +345,7 @@ fn execute_index_operation_journal_restore_package_before_with_hook(
     }
 
     before_update();
+    store.verify_recovery_context(context)?;
     match store.update_package_index_file_if_before_header(
         journal,
         file,
@@ -383,7 +384,7 @@ fn package_file_state(
 /// Completes a CLI rollback in deterministic reverse-publication order.
 ///
 /// `planned_decision` must be the fresh planner result obtained under the same
-/// exclusive workspace lock and complete inventory used by `store`. Only
+/// exclusive workspace lock and lock-bound recovery context used by `store`. Only
 /// `RestoreBefore` and an already-completed `ClearBefore` may proceed. For a
 /// rollback this restores the index header first, affected package-index files
 /// in their recorded order, then source files in journal order. Each
@@ -402,13 +403,13 @@ fn package_file_state(
 pub fn execute_index_operation_journal_restore_before(
     store: &IndexOperationJournalStore<'_>,
     journal: &IndexOperationJournal,
-    inventory: &IndexJournalWorkspaceInventory,
+    context: &IndexJournalRecoveryContext,
     planned_decision: IndexJournalRecoveryDecision,
 ) -> Result<IndexJournalRestoreBeforeExecution, IndexJournalRestoreBeforeError> {
     execute_index_operation_journal_restore_before_with_hook(
         store,
         journal,
-        inventory,
+        context,
         planned_decision,
         || {},
     )
@@ -417,7 +418,7 @@ pub fn execute_index_operation_journal_restore_before(
 fn execute_index_operation_journal_restore_before_with_hook(
     store: &IndexOperationJournalStore<'_>,
     journal: &IndexOperationJournal,
-    inventory: &IndexJournalWorkspaceInventory,
+    context: &IndexJournalRecoveryContext,
     planned_decision: IndexJournalRecoveryDecision,
     after_before_verification: impl FnOnce(),
 ) -> Result<IndexJournalRestoreBeforeExecution, IndexJournalRestoreBeforeError> {
@@ -434,7 +435,7 @@ fn execute_index_operation_journal_restore_before_with_hook(
         return clear_verified_before_state(
             store,
             journal,
-            inventory,
+            context,
             planned_decision,
             after_before_verification,
         );
@@ -443,7 +444,7 @@ fn execute_index_operation_journal_restore_before_with_hook(
     match execute_index_operation_journal_restore_header_before(
         store,
         journal,
-        inventory,
+        context,
         IndexJournalRecoveryDecision::RestoreBefore,
     )? {
         IndexJournalHeaderRestoreExecution::Restored
@@ -454,7 +455,7 @@ fn execute_index_operation_journal_restore_before_with_hook(
             return clear_verified_before_state(
                 store,
                 journal,
-                inventory,
+                context,
                 observed,
                 after_before_verification,
             );
@@ -471,7 +472,7 @@ fn execute_index_operation_journal_restore_before_with_hook(
         match execute_index_operation_journal_restore_package_before(
             store,
             journal,
-            inventory,
+            context,
             &package_file.file,
             IndexJournalRecoveryDecision::RestoreBefore,
         )? {
@@ -483,7 +484,7 @@ fn execute_index_operation_journal_restore_before_with_hook(
                 return clear_verified_before_state(
                     store,
                     journal,
-                    inventory,
+                    context,
                     observed,
                     after_before_verification,
                 );
@@ -507,7 +508,7 @@ fn execute_index_operation_journal_restore_before_with_hook(
         match execute_index_operation_journal_restore_source_before(
             store,
             journal,
-            inventory,
+            context,
             IndexJournalRecoveryDecision::RestoreBefore,
             source_index,
         )? {
@@ -519,7 +520,7 @@ fn execute_index_operation_journal_restore_before_with_hook(
                 return clear_verified_before_state(
                     store,
                     journal,
-                    inventory,
+                    context,
                     observed,
                     after_before_verification,
                 );
@@ -542,7 +543,7 @@ fn execute_index_operation_journal_restore_before_with_hook(
     clear_verified_before_state(
         store,
         journal,
-        inventory,
+        context,
         IndexJournalRecoveryDecision::ClearBefore,
         after_before_verification,
     )
@@ -551,11 +552,11 @@ fn execute_index_operation_journal_restore_before_with_hook(
 fn clear_verified_before_state(
     store: &IndexOperationJournalStore<'_>,
     journal: &IndexOperationJournal,
-    inventory: &IndexJournalWorkspaceInventory,
+    context: &IndexJournalRecoveryContext,
     planned_decision: IndexJournalRecoveryDecision,
     after_before_verification: impl FnOnce(),
 ) -> Result<IndexJournalRestoreBeforeExecution, IndexJournalRestoreBeforeError> {
-    let observation = store.observe_recovery(journal, inventory)?;
+    let observation = store.observe_recovery(journal, context)?;
     let observed_decision = plan_index_operation_journal_recovery(journal, &observation);
     if observed_decision != planned_decision {
         return Ok(IndexJournalRestoreBeforeExecution::DecisionChanged {
@@ -574,7 +575,7 @@ fn clear_verified_before_state(
         match execute_index_operation_journal_clear(
             store,
             journal,
-            inventory,
+            context,
             IndexJournalRecoveryDecision::ClearBefore,
         )? {
             IndexJournalClearExecution::Cleared {
@@ -596,11 +597,11 @@ fn clear_verified_before_state(
 fn execute_index_operation_journal_restore_header_before_with_hook(
     store: &IndexOperationJournalStore<'_>,
     journal: &IndexOperationJournal,
-    inventory: &IndexJournalWorkspaceInventory,
+    context: &IndexJournalRecoveryContext,
     planned_decision: IndexJournalRecoveryDecision,
     before_update: impl FnOnce(),
 ) -> Result<IndexJournalHeaderRestoreExecution, IndexOperationJournalStoreError> {
-    let observation = store.observe_recovery(journal, inventory)?;
+    let observation = store.observe_recovery(journal, context)?;
     let observed_decision = plan_index_operation_journal_recovery(journal, &observation);
     if observed_decision != planned_decision {
         return Ok(IndexJournalHeaderRestoreExecution::DecisionChanged {
@@ -615,6 +616,7 @@ fn execute_index_operation_journal_restore_header_before_with_hook(
     }
 
     before_update();
+    store.verify_recovery_context(context)?;
     let update = store.update_index_file_if_matches(
         journal,
         IndexOperationJournalIndexTarget::Header,
@@ -630,12 +632,12 @@ fn execute_index_operation_journal_restore_header_before_with_hook(
 fn execute_index_operation_journal_restore_source_before_with_hook(
     store: &IndexOperationJournalStore<'_>,
     journal: &IndexOperationJournal,
-    inventory: &IndexJournalWorkspaceInventory,
+    context: &IndexJournalRecoveryContext,
     planned_decision: IndexJournalRecoveryDecision,
     source_index: usize,
     before_update: impl FnOnce(),
 ) -> Result<IndexJournalSourceRestoreExecution, IndexJournalSourceRestoreError> {
-    let observation = store.observe_recovery(journal, inventory)?;
+    let observation = store.observe_recovery(journal, context)?;
     let observed_decision = plan_index_operation_journal_recovery(journal, &observation);
     if observed_decision != planned_decision {
         return Ok(IndexJournalSourceRestoreExecution::DecisionChanged {
@@ -660,14 +662,15 @@ fn execute_index_operation_journal_restore_source_before_with_hook(
         _ => unreachable!("RestoreBefore requires every source to match a recorded state"),
     }
 
-    let context = inventory
+    let package_context = context
+        .inventory()
         .contexts()
         .iter()
         .find(|context| context.package_node_key() == source.package_node_key)
         .ok_or_else(|| IndexJournalSourceRestoreError::MissingPackageContext {
             package_node_key: source.package_node_key.clone(),
         })?;
-    let source_directory = context.source_directory().ok_or_else(|| {
+    let source_directory = package_context.source_directory().ok_or_else(|| {
         IndexJournalSourceRestoreError::MissingSourceDirectory {
             package_node_key: source.package_node_key.clone(),
         }
@@ -676,13 +679,14 @@ fn execute_index_operation_journal_restore_source_before_with_hook(
         .map_err(|_| IndexJournalSourceRestoreError::InvalidSourcePath)?;
     let package_root = RepositoryPackageDirectory::parse(&source.package_root)
         .map_err(|_| IndexJournalSourceRestoreError::InvalidPackageRoot)?;
-    let package_directory = inventory
+    let package_directory = context
+        .inventory()
         .directory_for_package(&source.package_node_key)
         .ok_or_else(|| IndexJournalSourceRestoreError::MissingPackageContext {
             package_node_key: source.package_node_key.clone(),
         })?;
     let package_directory = package_directory
-        .reopen_from_workspace_root(inventory.root_directory(), &package_root)
+        .reopen_from_workspace_root(context.inventory().root_directory(), &package_root)
         .map_err(|error| {
             IndexJournalSourceRestoreError::SourceUpdate(
                 LocalPackageSourceFileUpdateError::Directory(error),
@@ -692,7 +696,7 @@ fn execute_index_operation_journal_restore_source_before_with_hook(
         .map_err(|_| IndexJournalSourceRestoreError::InvalidSourcePath)?;
 
     before_update();
-    store.verify_current(journal)?;
+    store.verify_current(journal, context)?;
     let update = package_directory.update_source_file_if_matches(
         &source_directory,
         &source_path,
@@ -719,11 +723,11 @@ fn file_state_bytes(state: &FileState) -> Option<&[u8]> {
 fn execute_index_operation_journal_clear_with_hook(
     store: &IndexOperationJournalStore<'_>,
     journal: &IndexOperationJournal,
-    inventory: &IndexJournalWorkspaceInventory,
+    context: &IndexJournalRecoveryContext,
     planned_decision: IndexJournalRecoveryDecision,
     after_observation: impl FnOnce(),
 ) -> Result<IndexJournalClearExecution, IndexOperationJournalStoreError> {
-    let observation = store.observe_recovery(journal, inventory)?;
+    let observation = store.observe_recovery(journal, context)?;
     let observed_decision = plan_index_operation_journal_recovery(journal, &observation);
     if observed_decision != planned_decision {
         return Ok(IndexJournalClearExecution::DecisionChanged {
@@ -744,6 +748,7 @@ fn execute_index_operation_journal_clear_with_hook(
     }
 
     after_observation();
+    store.verify_recovery_context(context)?;
     if store.clear_if_current(journal)? {
         Ok(IndexJournalClearExecution::Cleared {
             decision: observed_decision,
@@ -774,7 +779,9 @@ mod tests {
     use crate::index_operation_journal_store::{
         IndexOperationJournalStore, IndexOperationJournalStoreError,
     };
-    use sai_package::local_source::LocalPackageDirectory;
+    use crate::index_operation_journal_validation::{
+        IndexJournalRecoveryContext, capture_index_journal_recovery_context,
+    };
     use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
     use sai_semantic::{
         FileState, IndexJournalOrigin, IndexJournalState, IndexOperationJournal, IndexSnapshot,
@@ -786,6 +793,17 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_TEST_WORKSPACE: AtomicU64 = AtomicU64::new(0);
+
+    const ROOT_LOCK_BYTES: &[u8] = b"lock 2\n\
+        root acme:app @ 1.0.0\n\
+            targets { wasm32-core, wasm32-wasi }\n";
+    const TWO_PACKAGE_LOCK_BYTES: &[u8] = b"lock 2\n\
+        root acme:app @ 1.0.0\n\
+            targets { wasm32-core, wasm32-wasi }\n\
+            requires acme:extra @ ^1 -> 1.0.0 from path \"packages/extra\"\n\
+        \n\
+        package acme:extra @ 1.0.0\n\
+            source path \"packages/extra\"\n";
 
     struct TestWorkspace(PathBuf);
 
@@ -1007,6 +1025,14 @@ mod tests {
         .expect("write operation journal");
     }
 
+    fn capture_recovery_context(lock: &WorkspaceLockGuard) -> IndexJournalRecoveryContext {
+        capture_index_journal_recovery_context(
+            lock,
+            sai_package::validation::PackageValidationContext::default(),
+        )
+        .expect("capture lock-bound recovery context")
+    }
+
     fn setup(
         journal: &IndexOperationJournal,
         source_state: &FileState,
@@ -1014,7 +1040,7 @@ mod tests {
     ) -> (
         TestWorkspace,
         WorkspaceLockGuard,
-        crate::index_operation_journal_validation::IndexJournalWorkspaceInventory,
+        IndexJournalRecoveryContext,
     ) {
         let workspace = TestWorkspace::new();
         fs::create_dir_all(workspace.0.join("src")).expect("create source directory");
@@ -1025,24 +1051,13 @@ mod tests {
              targets { wasm32-core, wasm32-wasi }\n",
         )
         .expect("write package manifest");
+        fs::write(workspace.0.join("sai.lock"), ROOT_LOCK_BYTES).expect("write workspace lock");
         let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive)
             .expect("acquire workspace lock");
-        let root = LocalPackageDirectory::open(&workspace.0).expect("open root package");
-        let parsed_lock = sai_package::lock::parse(
-            b"lock 2\n\
-              root acme:app @ 1.0.0\n\
-                  targets { wasm32-core, wasm32-wasi }\n",
-        );
-        let inventory =
-            crate::index_operation_journal_validation::build_index_journal_workspace_inventory(
-                &root,
-                &parsed_lock,
-                sai_package::validation::PackageValidationContext::default(),
-            )
-            .expect("build workspace inventory");
+        let context = capture_recovery_context(&lock);
         set_source_state(&workspace.0, source_state);
         write_index_state(&workspace.0, journal, index_after);
-        (workspace, lock, inventory)
+        (workspace, lock, context)
     }
 
     fn setup_source_states(
@@ -1052,7 +1067,7 @@ mod tests {
     ) -> (
         TestWorkspace,
         WorkspaceLockGuard,
-        crate::index_operation_journal_validation::IndexJournalWorkspaceInventory,
+        IndexJournalRecoveryContext,
     ) {
         assert_eq!(source_states.len(), journal.sources.len());
         let (workspace, lock, inventory) = setup(journal, &source_states[0], index_after);
@@ -1068,7 +1083,7 @@ mod tests {
     ) -> (
         TestWorkspace,
         WorkspaceLockGuard,
-        crate::index_operation_journal_validation::IndexJournalWorkspaceInventory,
+        IndexJournalRecoveryContext,
     ) {
         let (workspace, lock, inventory) = setup(journal, source_state, true);
         for package_file in &journal.index_before.package_files {
@@ -1093,7 +1108,7 @@ mod tests {
     ) -> (
         TestWorkspace,
         WorkspaceLockGuard,
-        crate::index_operation_journal_validation::IndexJournalWorkspaceInventory,
+        IndexJournalRecoveryContext,
     ) {
         let workspace = TestWorkspace::new();
         fs::create_dir_all(workspace.0.join("src")).expect("create root source directory");
@@ -1114,25 +1129,11 @@ mod tests {
              targets { wasm32-core, wasm32-wasi }\n",
         )
         .expect("write member package manifest");
+        fs::write(workspace.0.join("sai.lock"), TWO_PACKAGE_LOCK_BYTES)
+            .expect("write workspace lock");
         let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive)
             .expect("acquire workspace lock");
-        let root = LocalPackageDirectory::open(&workspace.0).expect("open root package");
-        let parsed_lock = sai_package::lock::parse(
-            b"lock 2\n\
-              root acme:app @ 1.0.0\n\
-                  targets { wasm32-core, wasm32-wasi }\n\
-                  requires acme:extra @ ^1 -> 1.0.0 from path \"packages/extra\"\n\
-              \n\
-              package acme:extra @ 1.0.0\n\
-                  source path \"packages/extra\"\n",
-        );
-        let inventory =
-            crate::index_operation_journal_validation::build_index_journal_workspace_inventory(
-                &root,
-                &parsed_lock,
-                sai_package::validation::PackageValidationContext::default(),
-            )
-            .expect("build root and member workspace inventory");
+        let inventory = capture_recovery_context(&lock);
         for source in &journal.sources {
             let source_root = if source.package_root == "." {
                 workspace.0.clone()
@@ -1162,7 +1163,7 @@ mod tests {
     fn expected_decision(
         store: &IndexOperationJournalStore<'_>,
         journal: &IndexOperationJournal,
-        inventory: &crate::index_operation_journal_validation::IndexJournalWorkspaceInventory,
+        inventory: &IndexJournalRecoveryContext,
     ) -> IndexJournalRecoveryDecision {
         let observation = store
             .observe_recovery(journal, inventory)
@@ -1618,6 +1619,50 @@ mod tests {
             fs::read(workspace.0.join(".sai/index/index.json")).expect("read raced header"),
             header_after
         );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
+    fn changed_lock_after_observation_prevents_header_restore() {
+        let journal = journal(IndexJournalOrigin::Cli, IndexJournalState::Prepared);
+        let (workspace, lock, context) =
+            setup_recoverable_partial_index(&journal, &journal.sources[0].planned_after);
+        let store = IndexOperationJournalStore::new(&lock);
+        let planned = expected_decision(&store, &journal, &context);
+        assert_eq!(planned, IndexJournalRecoveryDecision::RestoreBefore);
+        let index_before = index_files(&workspace);
+        let journal_before = journal_bytes(&workspace);
+
+        let error = super::execute_index_operation_journal_restore_header_before_with_hook(
+            &store,
+            &journal,
+            &context,
+            planned,
+            || {
+                fs::write(workspace.0.join("sai.lock"), b"changed workspace lock\n")
+                    .expect("change lock after observation");
+            },
+        )
+        .expect_err("a changed lock must stop the index mutation");
+
+        assert!(matches!(
+            error,
+            IndexOperationJournalStoreError::RecoveryContext(
+                crate::index_operation_journal_validation::IndexJournalRecoveryContextError::LockSnapshotChanged
+            )
+        ));
+        assert_eq!(index_files(&workspace), index_before);
+        assert_eq!(journal_bytes(&workspace), journal_before);
+        assert!(journal_still_exists(&workspace));
     }
 
     #[cfg(all(
@@ -2495,6 +2540,58 @@ mod tests {
         ))
     ))]
     #[test]
+    fn changed_lock_after_observation_prevents_source_restore() {
+        let journal = journal(IndexJournalOrigin::Cli, IndexJournalState::Prepared);
+        let (workspace, lock, context) = setup(&journal, &journal.sources[0].planned_after, false);
+        let store = IndexOperationJournalStore::new(&lock);
+        let planned = expected_decision(&store, &journal, &context);
+        assert_eq!(planned, IndexJournalRecoveryDecision::RestoreBefore);
+        let source_before = fs::read(workspace.0.join("src/lib.sai"))
+            .expect("read source before attempted restore");
+        let index_before = index_files(&workspace);
+        let journal_before = journal_bytes(&workspace);
+
+        let error = super::execute_index_operation_journal_restore_source_before_with_hook(
+            &store,
+            &journal,
+            &context,
+            planned,
+            0,
+            || {
+                fs::write(workspace.0.join("sai.lock"), b"changed workspace lock\n")
+                    .expect("change lock after observation");
+            },
+        )
+        .expect_err("a changed lock must stop the source mutation");
+
+        assert!(matches!(
+            error,
+            super::IndexJournalSourceRestoreError::Store(
+                IndexOperationJournalStoreError::RecoveryContext(
+                    crate::index_operation_journal_validation::IndexJournalRecoveryContextError::LockSnapshotChanged
+                )
+            )
+        ));
+        assert_eq!(
+            fs::read(workspace.0.join("src/lib.sai")).expect("read source after rejected restore"),
+            source_before
+        );
+        assert_eq!(index_files(&workspace), index_before);
+        assert_eq!(journal_bytes(&workspace), journal_before);
+        assert!(journal_still_exists(&workspace));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
     fn restoring_to_absence_removes_only_the_selected_source() {
         let mut journal = two_source_journal();
         journal.sources[0].before = FileState::Absent;
@@ -2920,14 +3017,14 @@ mod tests {
     fn execute_clear_only_with_hook_for_test(
         store: &IndexOperationJournalStore<'_>,
         journal: &IndexOperationJournal,
-        inventory: &crate::index_operation_journal_validation::IndexJournalWorkspaceInventory,
+        context: &IndexJournalRecoveryContext,
         planned_decision: IndexJournalRecoveryDecision,
         after_observation: impl FnOnce(),
     ) -> Result<IndexJournalClearExecution, IndexOperationJournalStoreError> {
         super::execute_index_operation_journal_clear_with_hook(
             store,
             journal,
-            inventory,
+            context,
             planned_decision,
             after_observation,
         )
