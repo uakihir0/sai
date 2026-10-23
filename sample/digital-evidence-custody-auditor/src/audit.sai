@@ -1,0 +1,514 @@
+use acme:digital-evidence-custody-auditor/model.{
+    Actor
+    AuditReport
+    CustodyAction
+    CustodyEvent
+    Disposition
+    EvidenceItem
+    Finding
+    FindingCode
+    SealState
+    StorageLocation
+}
+use acme:digital-evidence-custody-auditor/policy
+use acme:digital-evidence-custody-auditor/timeline
+
+fn finding_precedes(left: Finding, right: Finding) -> Bool {
+    if left.evidence_id != right.evidence_id {
+        return left.evidence_id < right.evidence_id
+    }
+    match left.actor_id {
+        Some(left_actor_id) => match right.actor_id {
+            Some(right_actor_id) => {
+                if left_actor_id != right_actor_id {
+                    return left_actor_id < right_actor_id
+                }
+            }
+            None => return true
+        }
+        None => match right.actor_id { Some(_) => return false, None => {} }
+    }
+    if left.minute != right.minute {
+        return left.minute < right.minute
+    }
+    if left.event_id != right.event_id {
+        return left.event_id < right.event_id
+    }
+    finding_code_rank(left.code) < finding_code_rank(right.code)
+}
+
+fn finding_code_rank(code: FindingCode) -> USize {
+    match code {
+        FindingCode.DuplicateEvidenceId => 0
+        FindingCode.DuplicateEventId => 1
+        FindingCode.UnknownEvidence => 2
+        FindingCode.UnknownActor => 3
+        FindingCode.UnauthorizedActor => 4
+        FindingCode.NonMonotoneTimestamp => 5
+        FindingCode.EventBeforeCollection => 6
+        FindingCode.DuplicateCollection => 7
+        FindingCode.SealTransitionInvalid => 8
+        FindingCode.MissingStorageDestination => 9
+        FindingCode.MissingCurrentLocation => 10
+        FindingCode.MoveWithOpenSeal => 11
+        FindingCode.StorageMoveNoOp => 12
+        FindingCode.AccessWhileSealed => 13
+        FindingCode.MissingAccessPurpose => 14
+        FindingCode.UnauthorizedAccessPurpose => 15
+        FindingCode.MissingDispositionValue => 16
+        FindingCode.DispositionMismatch => 17
+        FindingCode.DispositionWithOpenSeal => 18
+        FindingCode.EventAfterDisposition => 19
+        FindingCode.MissingFinalDisposition => 20
+        FindingCode.DuplicateActorId => 21
+    }
+}
+
+fn insert_finding(report: borrow mut AuditReport, finding: Finding) {
+    var position = report.finding_count
+    while position > 0 {
+        match report.findings[position - 1] {
+            Some(current) => {
+                if finding_precedes(finding, current) {
+                    position -= 1
+                } else {
+                    break
+                }
+            }
+            None => break
+        }
+    }
+    var cursor = report.finding_count
+    while cursor > position {
+        report.findings[cursor] = report.findings[cursor - 1]
+        cursor -= 1
+    }
+    report.findings[position] = Some(finding)
+    report.finding_count += 1
+}
+
+fn record(
+    report: borrow mut AuditReport,
+    evidence_id: U32,
+    event_id: U32,
+    minute: U32,
+    code: FindingCode,
+) {
+    insert_finding(
+        borrow mut report,
+        Finding(
+            evidence_id: evidence_id,
+            actor_id: None,
+            event_id: event_id,
+            minute: minute,
+            code: code,
+        ),
+    )
+}
+
+fn record_duplicate_actor_id(report: borrow mut AuditReport, actor_id: U32) {
+    insert_finding(
+        borrow mut report,
+        Finding(
+            evidence_id: 0,
+            actor_id: Some(actor_id),
+            event_id: 0,
+            minute: 0,
+            code: FindingCode.DuplicateActorId,
+        ),
+    )
+}
+
+fn expected_disposition(evidence: EvidenceItem, value: Disposition) -> Bool {
+    evidence.required_disposition == value
+}
+
+fn update_timestamp(
+    report: borrow mut AuditReport,
+    last_timestamp: borrow mut Array<Option<U32>, 4>,
+    evidence_index: USize,
+    event: CustodyEvent,
+) {
+    match last_timestamp[evidence_index] {
+        Some(previous) => {
+            if event.minute < previous {
+                record(
+                    borrow mut report,
+                    event.evidence_id,
+                    event.event_id,
+                    event.minute,
+                    FindingCode.NonMonotoneTimestamp,
+                )
+            } else {
+                last_timestamp[evidence_index] = Some(event.minute)
+            }
+        }
+        None => {
+            last_timestamp[evidence_index] = Some(event.minute)
+        }
+    }
+}
+
+fn record_actor_findings(
+    report: borrow mut AuditReport,
+    actors: Array<Actor, 4>,
+    actor_id: U32,
+    event: CustodyEvent,
+) {
+    let actor_position = policy.actor_index(actors, actor_id)
+    match actor_position {
+        Some(index) => {
+            if not policy.actor_may_perform(actors[index], event.action) {
+                record(
+                    borrow mut report,
+                    event.evidence_id,
+                    event.event_id,
+                    event.minute,
+                    FindingCode.UnauthorizedActor,
+                )
+            }
+        }
+        None => {
+            record(
+                borrow mut report,
+                event.evidence_id,
+                event.event_id,
+                event.minute,
+                FindingCode.UnknownActor,
+            )
+        }
+    }
+
+    if event.action == CustodyAction.Access {
+        match event.purpose {
+            Some(purpose) => match actor_position {
+                Some(index) => {
+                    if not policy.actor_allows_purpose(actors[index], purpose) {
+                        record(
+                            borrow mut report,
+                            event.evidence_id,
+                            event.event_id,
+                            event.minute,
+                            FindingCode.UnauthorizedAccessPurpose,
+                        )
+                    }
+                }
+                None => {}
+            }
+            None => {
+                record(
+                    borrow mut report,
+                    event.evidence_id,
+                    event.event_id,
+                    event.minute,
+                    FindingCode.MissingAccessPurpose,
+                )
+            }
+        }
+    }
+}
+
+fn record_missing_destination(report: borrow mut AuditReport, event: CustodyEvent) {
+    match event.destination {
+        Some(_) => {}
+        None => {
+            record(
+                borrow mut report,
+                event.evidence_id,
+                event.event_id,
+                event.minute,
+                FindingCode.MissingStorageDestination,
+            )
+        }
+    }
+}
+
+fn process_event(
+    report: borrow mut AuditReport,
+    evidence: Array<EvidenceItem, 4>,
+    event: CustodyEvent,
+    index: USize,
+    collected: borrow mut Array<Bool, 4>,
+    seals: borrow mut Array<SealState, 4>,
+    locations: borrow mut Array<Option<StorageLocation>, 4>,
+    disposed: borrow mut Array<Bool, 4>,
+) {
+    if disposed[index] {
+        record(
+            borrow mut report,
+            event.evidence_id,
+            event.event_id,
+            event.minute,
+            FindingCode.EventAfterDisposition,
+        )
+        return
+    }
+
+    if event.action == CustodyAction.Collected {
+        if collected[index] {
+            record(
+                borrow mut report,
+                event.evidence_id,
+                event.event_id,
+                event.minute,
+                FindingCode.DuplicateCollection,
+            )
+        } else {
+            collected[index] = true
+            seals[index] = SealState.Open
+            record_missing_destination(borrow mut report, event)
+            match event.destination {
+                Some(destination) => {
+                    locations[index] = Some(destination)
+                }
+                None => {}
+            }
+        }
+        return
+    }
+
+    if not collected[index] {
+        record(
+            borrow mut report,
+            event.evidence_id,
+            event.event_id,
+            event.minute,
+            FindingCode.EventBeforeCollection,
+        )
+        return
+    }
+
+    match event.action {
+        CustodyAction.Collected => {}
+        CustodyAction.SealApplied => match seals[index] {
+            SealState.Open => {
+                seals[index] = SealState.Sealed
+            }
+            SealState.NotInCustody => {
+                record(
+                    borrow mut report,
+                    event.evidence_id,
+                    event.event_id,
+                    event.minute,
+                    FindingCode.SealTransitionInvalid,
+                )
+            }
+            SealState.Sealed => {
+                record(
+                    borrow mut report,
+                    event.evidence_id,
+                    event.event_id,
+                    event.minute,
+                    FindingCode.SealTransitionInvalid,
+                )
+            }
+        }
+        CustodyAction.SealBroken => match seals[index] {
+            SealState.Sealed => {
+                seals[index] = SealState.Open
+            }
+            SealState.NotInCustody => {
+                record(
+                    borrow mut report,
+                    event.evidence_id,
+                    event.event_id,
+                    event.minute,
+                    FindingCode.SealTransitionInvalid,
+                )
+            }
+            SealState.Open => {
+                record(
+                    borrow mut report,
+                    event.evidence_id,
+                    event.event_id,
+                    event.minute,
+                    FindingCode.SealTransitionInvalid,
+                )
+            }
+        }
+        CustodyAction.StorageMove => {
+            if seals[index] != SealState.Sealed {
+                record(
+                    borrow mut report,
+                    event.evidence_id,
+                    event.event_id,
+                    event.minute,
+                    FindingCode.MoveWithOpenSeal,
+                )
+            }
+            record_missing_destination(borrow mut report, event)
+            match event.destination {
+                Some(destination) => {
+                    match locations[index] {
+                        Some(current) => {
+                            if current == destination {
+                                record(
+                                    borrow mut report,
+                                    event.evidence_id,
+                                    event.event_id,
+                                    event.minute,
+                                    FindingCode.StorageMoveNoOp,
+                                )
+                            } else {
+                                locations[index] = Some(destination)
+                            }
+                        }
+                        None => {
+                            record(
+                                borrow mut report,
+                                event.evidence_id,
+                                event.event_id,
+                                event.minute,
+                                FindingCode.MissingCurrentLocation,
+                            )
+                            locations[index] = Some(destination)
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        CustodyAction.Access => {
+            if seals[index] == SealState.Sealed {
+                record(
+                    borrow mut report,
+                    event.evidence_id,
+                    event.event_id,
+                    event.minute,
+                    FindingCode.AccessWhileSealed,
+                )
+            }
+        }
+        CustodyAction.Disposition => {
+            if seals[index] != SealState.Sealed {
+                record(
+                    borrow mut report,
+                    event.evidence_id,
+                    event.event_id,
+                    event.minute,
+                    FindingCode.DispositionWithOpenSeal,
+                )
+            }
+            match event.disposition {
+                Some(value) => {
+                    if not expected_disposition(evidence[index], value) {
+                        record(
+                            borrow mut report,
+                            event.evidence_id,
+                            event.event_id,
+                            event.minute,
+                            FindingCode.DispositionMismatch,
+                        )
+                    }
+                }
+                None => {
+                    record(
+                        borrow mut report,
+                        event.evidence_id,
+                        event.event_id,
+                        event.minute,
+                        FindingCode.MissingDispositionValue,
+                    )
+                }
+            }
+            disposed[index] = true
+        }
+    }
+}
+
+pub fn audit(
+    evidence: Array<EvidenceItem, 4>,
+    actors: Array<Actor, 4>,
+    events: Array<CustodyEvent, 20>,
+) -> AuditReport {
+    var report = AuditReport(
+        findings: Array<Option<Finding>, 192>.filled(None),
+        finding_count: 0,
+        timeline: Array<Option<CustodyEvent>, 20>.filled(None),
+        timeline_count: 0,
+        evidence_reviewed: evidence.len(),
+        events_reviewed: events.len(),
+    )
+    var collected = Array<Bool, 4>.filled(false)
+    var seals = Array<SealState, 4>.filled(SealState.NotInCustody)
+    var locations = Array<Option<StorageLocation>, 4>.filled(None)
+    var disposed = Array<Bool, 4>.filled(false)
+    var has_disposition = Array<Bool, 4>.filled(false)
+    var last_timestamp = Array<Option<U32>, 4>.filled(None)
+
+    for duplicate_index in 0..actors.len() {
+        if policy.has_prior_duplicate_actor_id(actors, duplicate_index) {
+            record_duplicate_actor_id(borrow mut report, actors[duplicate_index].actor_id)
+        }
+    }
+
+    for duplicate_index in 0..evidence.len() {
+        if policy.has_prior_duplicate_evidence_id(evidence, duplicate_index) {
+            record(
+                borrow mut report,
+                evidence[duplicate_index].evidence_id,
+                0,
+                0,
+                FindingCode.DuplicateEvidenceId,
+            )
+        }
+    }
+
+    for event_index in 0..events.len() {
+        let event = events[event_index]
+        timeline.insert_event(borrow mut report, event)
+        if policy.has_prior_duplicate_event_id(events, event_index) {
+            record(
+                borrow mut report,
+                event.evidence_id,
+                event.event_id,
+                event.minute,
+                FindingCode.DuplicateEventId,
+            )
+        }
+
+        record_actor_findings(borrow mut report, actors, event.actor_id, event)
+
+        match policy.evidence_index(evidence, event.evidence_id) {
+            Some(index) => {
+                update_timestamp(borrow mut report, borrow mut last_timestamp, index, event)
+                if event.action == CustodyAction.Disposition {
+                    has_disposition[index] = true
+                }
+                process_event(
+                    borrow mut report,
+                    evidence,
+                    event,
+                    index,
+                    borrow mut collected,
+                    borrow mut seals,
+                    borrow mut locations,
+                    borrow mut disposed,
+                )
+            }
+            None => {
+                record(
+                    borrow mut report,
+                    event.evidence_id,
+                    event.event_id,
+                    event.minute,
+                    FindingCode.UnknownEvidence,
+                )
+            }
+        }
+    }
+
+    for index in 0..evidence.len() {
+        if not has_disposition[index] {
+            record(
+                borrow mut report,
+                evidence[index].evidence_id,
+                0,
+                0,
+                FindingCode.MissingFinalDisposition,
+            )
+        }
+    }
+
+    report
+}

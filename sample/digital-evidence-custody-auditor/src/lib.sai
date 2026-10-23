@@ -1,0 +1,72 @@
+use acme:digital-evidence-custody-auditor/audit
+use acme:digital-evidence-custody-auditor/fixtures
+use acme:digital-evidence-custody-auditor/model.{AuditReport, FindingCode}
+use acme:digital-evidence-custody-auditor/policy
+
+pub fn audit_fixture() -> AuditReport {
+    audit.audit(fixtures.evidence(), fixtures.actors(), fixtures.events())
+}
+
+test "findings are complete and sorted by evidence then event time" {
+    let report = audit_fixture()
+    assert report.evidence_reviewed == 4
+    assert report.events_reviewed == 20
+    assert report.finding_count == 4
+    assert report.findings[0].unwrap().evidence_id == 4102
+    assert report.findings[0].unwrap().event_id == 9013
+    assert report.findings[0].unwrap().code == FindingCode.NonMonotoneTimestamp
+    assert report.findings[1].unwrap().evidence_id == 4102
+    assert report.findings[1].unwrap().event_id == 9014
+    assert report.findings[1].unwrap().code == FindingCode.UnauthorizedAccessPurpose
+    assert report.findings[2].unwrap().evidence_id == 4103
+    assert report.findings[2].unwrap().event_id == 9024
+    assert report.findings[2].unwrap().code == FindingCode.DispositionWithOpenSeal
+    assert report.findings[3].unwrap().evidence_id == 4104
+    assert report.findings[3].unwrap().code == FindingCode.MissingFinalDisposition
+}
+
+test "timeline is chronological with evidence and event IDs as stable ties" {
+    let report = audit_fixture()
+    assert report.timeline_count == 20
+    assert report.timeline[0].unwrap().event_id == 9001
+    assert report.timeline[1].unwrap().event_id == 9002
+    assert report.timeline[2].unwrap().event_id == 9010
+    assert report.timeline[3].unwrap().event_id == 9011
+    assert report.timeline[4].unwrap().event_id == 9020
+    assert report.timeline[5].unwrap().event_id == 9021
+    assert report.timeline[6].unwrap().event_id == 9003
+    assert report.timeline[7].unwrap().event_id == 9004
+    assert report.timeline[8].unwrap().event_id == 9022
+    assert report.timeline[9].unwrap().event_id == 9005
+    assert report.timeline[10].unwrap().event_id == 9023
+    assert report.timeline[11].unwrap().event_id == 9006
+    assert report.timeline[12].unwrap().event_id == 9024
+    assert report.timeline[13].unwrap().event_id == 9013
+    assert report.timeline[14].unwrap().event_id == 9012
+    assert report.timeline[15].unwrap().event_id == 9014
+    assert report.timeline[16].unwrap().event_id == 9015
+    assert report.timeline[17].unwrap().event_id == 9007
+    assert report.timeline[18].unwrap().event_id == 9016
+    assert report.timeline[19].unwrap().event_id == 9008
+}
+
+test "a repeated evidence identifier is detected once for the later record" {
+    var evidence = fixtures.evidence()
+    evidence[3] = evidence[0]
+    assert policy.has_prior_duplicate_evidence_id(evidence, 3)
+    assert not policy.has_prior_duplicate_evidence_id(evidence, 0)
+    let report = audit.audit(evidence, fixtures.actors(), fixtures.events())
+    assert report.finding_count == 5
+    assert report.findings[0].unwrap().code == FindingCode.DuplicateEvidenceId
+    assert report.findings[0].unwrap().evidence_id == 4101
+}
+
+test "a repeated actor identifier is reported before event authorization is resolved" {
+    var actors = fixtures.actors()
+    actors[3] = actors[2]
+    assert policy.has_prior_duplicate_actor_id(actors, 3)
+    assert not policy.has_prior_duplicate_actor_id(actors, 0)
+    let report = audit.audit(fixtures.evidence(), actors, fixtures.events())
+    assert report.findings[0].unwrap().code == FindingCode.DuplicateActorId
+    assert report.findings[0].unwrap().actor_id == Some(503)
+}

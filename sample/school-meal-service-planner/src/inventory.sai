@@ -1,0 +1,65 @@
+use acme:school-meal-service-planner/data
+use acme:school-meal-service-planner/model.{Ingredient, InventoryLot, MenuOption, StockShortfall}
+
+pub fn find_ingredient(id: Str) -> Option<Ingredient> {
+    for ingredient in data.ingredients() {
+        if ingredient.id == id {
+            return Some(ingredient)
+        }
+    }
+    None
+}
+
+pub fn usable_grams(id: Str, as_of_day: U32) -> U32 {
+    var grams: U32 = 0
+    for lot in data.inventory_lots() {
+        if lot.ingredient_id == id and lot.use_by_day >= as_of_day {
+            grams += lot.quantity_grams
+        }
+    }
+    grams
+}
+
+pub fn expired_grams(id: Str, as_of_day: U32) -> U32 {
+    var grams: U32 = 0
+    for lot in data.inventory_lots() {
+        if lot.ingredient_id == id and lot.use_by_day < as_of_day {
+            grams += lot.quantity_grams
+        }
+    }
+    grams
+}
+
+pub fn first_shortfall(menu: MenuOption, portions: U32, as_of_day: U32) -> Option<StockShortfall> {
+    for line in menu.lines {
+        if line.grams_per_portion > 0 {
+            let required = line.grams_per_portion * portions
+            let usable = usable_grams(line.ingredient_id, as_of_day)
+            if required > usable {
+                match find_ingredient(line.ingredient_id) {
+                    Some(ingredient) => {
+                        return Some(
+                            StockShortfall(
+                                ingredient_name: ingredient.name,
+                                required_grams: required,
+                                usable_grams: usable,
+                                expired_grams: expired_grams(line.ingredient_id, as_of_day),
+                            ),
+                        )
+                    }
+                    None => {
+                        return Some(
+                            StockShortfall(
+                                ingredient_name: line.ingredient_id,
+                                required_grams: required,
+                                usable_grams: usable,
+                                expired_grams: expired_grams(line.ingredient_id, as_of_day),
+                            ),
+                        )
+                    }
+                }
+            }
+        }
+    }
+    None
+}

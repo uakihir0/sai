@@ -1,0 +1,120 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum StorageLocation {
+    IntakeDesk
+    AnalysisRoom
+    VaultNorth
+    VaultSouth
+    OwnerOffice
+    DestructionRoom
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum SealState {
+    NotInCustody
+    Open
+    Sealed
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum AccessPurpose {
+    ForensicImaging
+    HashVerification
+    LegalReview
+    MalwareAnalysis
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Disposition {
+    RetainInArchive
+    ReturnToOwner
+    DestroyAfterReview
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CustodyAction {
+    Collected
+    SealApplied
+    SealBroken
+    StorageMove
+    Access
+    Disposition
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum FindingCode {
+    DuplicateEvidenceId
+    DuplicateActorId
+    DuplicateEventId
+    UnknownEvidence
+    UnknownActor
+    UnauthorizedActor
+    NonMonotoneTimestamp
+    EventBeforeCollection
+    DuplicateCollection
+    SealTransitionInvalid
+    MissingStorageDestination
+    MissingCurrentLocation
+    MoveWithOpenSeal
+    StorageMoveNoOp
+    AccessWhileSealed
+    MissingAccessPurpose
+    UnauthorizedAccessPurpose
+    MissingDispositionValue
+    DispositionMismatch
+    DispositionWithOpenSeal
+    EventAfterDisposition
+    MissingFinalDisposition
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type EvidenceItem {
+    pub evidence_id: U32
+    pub description: Str
+    pub required_disposition: Disposition
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Actor {
+    pub actor_id: U32
+    pub display_name: Str
+    pub may_collect: Bool
+    pub may_apply_seal: Bool
+    pub may_break_seal: Bool
+    pub may_move: Bool
+    pub may_access: Bool
+    pub may_dispose: Bool
+    pub allowed_purposes: Array<Option<AccessPurpose>, 4>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CustodyEvent {
+    pub event_id: U32
+    pub evidence_id: U32
+    pub actor_id: U32
+    // Minutes after 09:00 on the fictional audit date.
+    pub minute: U32
+    pub action: CustodyAction
+    pub destination: Option<StorageLocation>
+    pub purpose: Option<AccessPurpose>
+    pub disposition: Option<Disposition>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Finding {
+    pub evidence_id: U32
+    // None for evidence/event findings; populated for actor-register findings.
+    pub actor_id: Option<U32>
+    pub event_id: U32
+    pub minute: U32
+    pub code: FindingCode
+}
+
+pub type AuditReport {
+    pub findings: Array<Option<Finding>, 192>
+    pub finding_count: USize
+    // Entries are sorted by minute, evidence ID, then event ID.
+    pub timeline: Array<Option<CustodyEvent>, 20>
+    pub timeline_count: USize
+    pub evidence_reviewed: USize
+    pub events_reviewed: USize
+}

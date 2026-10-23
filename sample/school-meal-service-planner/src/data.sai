@@ -1,0 +1,309 @@
+use acme:school-meal-service-planner/model.{
+    Ingredient
+    InventoryLot
+    KitchenCapacity
+    MenuOption
+    RecipeLine
+    SchoolPolicy
+}
+
+pub fn service_day() -> U32 {
+    18
+}
+
+pub fn school_policy() -> SchoolPolicy {
+    SchoolPolicy(
+        enrolled_students: 96,
+        reserve_portions: 4,
+        avoid_peanuts: true,
+        avoid_sesame: true,
+        avoid_dairy: false,
+        avoid_wheat: false,
+        minimum_calories: 500,
+        maximum_calories: 700,
+        minimum_protein_grams: 18,
+        maximum_protein_grams: 32,
+        daily_budget_cents: 7800,
+    )
+}
+
+pub fn kitchen_capacity() -> KitchenCapacity {
+    KitchenCapacity(portions_per_batch: 60, available_prep_minutes: 90)
+}
+
+pub fn ingredients() -> Array<Ingredient, 17> {
+    [
+        Ingredient(
+            id: "rice",
+            name: "Brown rice",
+            cents_per_100g: 8,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "chickpeas",
+            name: "Chickpeas",
+            cents_per_100g: 22,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "carrots",
+            name: "Carrots",
+            cents_per_100g: 18,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "oil",
+            name: "Olive oil",
+            cents_per_100g: 30,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "barley",
+            name: "Pearl barley",
+            cents_per_100g: 16,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "tomato",
+            name: "Tomato",
+            cents_per_100g: 14,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "potato",
+            name: "Potatoes",
+            cents_per_100g: 10,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "noodles",
+            name: "Wheat noodles",
+            cents_per_100g: 12,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: true,
+        ),
+        Ingredient(
+            id: "peanut-sauce",
+            name: "Peanut sauce",
+            cents_per_100g: 30,
+            contains_peanuts: true,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "cabbage",
+            name: "Cabbage",
+            cents_per_100g: 20,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "lentils",
+            name: "Lentils",
+            cents_per_100g: 24,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "corn",
+            name: "Sweet corn",
+            cents_per_100g: 17,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "beans",
+            name: "White beans",
+            cents_per_100g: 20,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "salmon",
+            name: "Salmon",
+            cents_per_100g: 90,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "spinach",
+            name: "Spinach",
+            cents_per_100g: 30,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+        Ingredient(
+            id: "pasta",
+            name: "Whole-wheat pasta",
+            cents_per_100g: 12,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: true,
+        ),
+        Ingredient(
+            id: "chicken",
+            name: "Chicken",
+            cents_per_100g: 48,
+            contains_peanuts: false,
+            contains_sesame: false,
+            contains_dairy: false,
+            contains_wheat: false,
+        ),
+    ]
+}
+
+pub fn inventory_lots() -> Array<InventoryLot, 18> {
+    [
+        InventoryLot(ingredient_id: "rice", quantity_grams: 20000, use_by_day: 24),
+        InventoryLot(ingredient_id: "chickpeas", quantity_grams: 12000, use_by_day: 22),
+        InventoryLot(ingredient_id: "carrots", quantity_grams: 10000, use_by_day: 21),
+        InventoryLot(ingredient_id: "oil", quantity_grams: 3000, use_by_day: 90),
+        InventoryLot(ingredient_id: "barley", quantity_grams: 12000, use_by_day: 30),
+        InventoryLot(ingredient_id: "tomato", quantity_grams: 12000, use_by_day: 22),
+        InventoryLot(ingredient_id: "potato", quantity_grams: 20000, use_by_day: 25),
+        InventoryLot(ingredient_id: "noodles", quantity_grams: 16000, use_by_day: 60),
+        InventoryLot(ingredient_id: "peanut-sauce", quantity_grams: 5000, use_by_day: 25),
+        InventoryLot(ingredient_id: "cabbage", quantity_grams: 14000, use_by_day: 20),
+        InventoryLot(ingredient_id: "lentils", quantity_grams: 15000, use_by_day: 40),
+        InventoryLot(ingredient_id: "corn", quantity_grams: 6000, use_by_day: 20),
+        InventoryLot(ingredient_id: "corn", quantity_grams: 5000, use_by_day: 16),
+        InventoryLot(ingredient_id: "beans", quantity_grams: 12000, use_by_day: 25),
+        InventoryLot(ingredient_id: "salmon", quantity_grams: 12000, use_by_day: 19),
+        InventoryLot(ingredient_id: "spinach", quantity_grams: 10000, use_by_day: 19),
+        InventoryLot(ingredient_id: "pasta", quantity_grams: 16000, use_by_day: 40),
+        InventoryLot(ingredient_id: "chicken", quantity_grams: 12000, use_by_day: 19),
+    ]
+}
+
+pub fn menu_options() -> Array<MenuOption, 7> {
+    [
+        MenuOption(
+            id: 301,
+            name: "Tomato barley stew",
+            lines: [
+                RecipeLine(ingredient_id: "barley", grams_per_portion: 110),
+                RecipeLine(ingredient_id: "tomato", grams_per_portion: 80),
+                RecipeLine(ingredient_id: "potato", grams_per_portion: 80),
+                RecipeLine(ingredient_id: "oil", grams_per_portion: 10),
+            ],
+            calories: 540,
+            protein_grams: 19,
+            prep_minutes_per_batch: 25,
+        ),
+        MenuOption(
+            id: 302,
+            name: "Chickpea rice bowl",
+            lines: [
+                RecipeLine(ingredient_id: "rice", grams_per_portion: 180),
+                RecipeLine(ingredient_id: "chickpeas", grams_per_portion: 90),
+                RecipeLine(ingredient_id: "carrots", grams_per_portion: 60),
+                RecipeLine(ingredient_id: "oil", grams_per_portion: 8),
+            ],
+            calories: 610,
+            protein_grams: 22,
+            prep_minutes_per_batch: 28,
+        ),
+        MenuOption(
+            id: 303,
+            name: "Peanut noodle bowl",
+            lines: [
+                RecipeLine(ingredient_id: "noodles", grams_per_portion: 100),
+                RecipeLine(ingredient_id: "peanut-sauce", grams_per_portion: 40),
+                RecipeLine(ingredient_id: "cabbage", grams_per_portion: 80),
+                RecipeLine(ingredient_id: "rice", grams_per_portion: 0),
+            ],
+            calories: 650,
+            protein_grams: 24,
+            prep_minutes_per_batch: 22,
+        ),
+        MenuOption(
+            id: 304,
+            name: "Lentil potato soup",
+            lines: [
+                RecipeLine(ingredient_id: "lentils", grams_per_portion: 90),
+                RecipeLine(ingredient_id: "potato", grams_per_portion: 90),
+                RecipeLine(ingredient_id: "carrots", grams_per_portion: 50),
+                RecipeLine(ingredient_id: "oil", grams_per_portion: 5),
+            ],
+            calories: 480,
+            protein_grams: 16,
+            prep_minutes_per_batch: 20,
+        ),
+        MenuOption(
+            id: 305,
+            name: "Corn and white bean bake",
+            lines: [
+                RecipeLine(ingredient_id: "corn", grams_per_portion: 90),
+                RecipeLine(ingredient_id: "beans", grams_per_portion: 70),
+                RecipeLine(ingredient_id: "tomato", grams_per_portion: 40),
+                RecipeLine(ingredient_id: "oil", grams_per_portion: 6),
+            ],
+            calories: 585,
+            protein_grams: 22,
+            prep_minutes_per_batch: 30,
+        ),
+        MenuOption(
+            id: 306,
+            name: "Salmon rice bowl",
+            lines: [
+                RecipeLine(ingredient_id: "salmon", grams_per_portion: 100),
+                RecipeLine(ingredient_id: "rice", grams_per_portion: 100),
+                RecipeLine(ingredient_id: "spinach", grams_per_portion: 60),
+                RecipeLine(ingredient_id: "rice", grams_per_portion: 0),
+            ],
+            calories: 650,
+            protein_grams: 31,
+            prep_minutes_per_batch: 30,
+        ),
+        MenuOption(
+            id: 307,
+            name: "Baked chicken pasta",
+            lines: [
+                RecipeLine(ingredient_id: "pasta", grams_per_portion: 140),
+                RecipeLine(ingredient_id: "chicken", grams_per_portion: 80),
+                RecipeLine(ingredient_id: "tomato", grams_per_portion: 60),
+                RecipeLine(ingredient_id: "rice", grams_per_portion: 0),
+            ],
+            calories: 620,
+            protein_grams: 28,
+            prep_minutes_per_batch: 50,
+        ),
+    ]
+}
