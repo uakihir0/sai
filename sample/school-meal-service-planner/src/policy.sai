@@ -1,0 +1,96 @@
+use acme:school-meal-service-planner/inventory
+use acme:school-meal-service-planner/model.{
+    AllergenConflict
+    MenuOption
+    NutritionViolation
+    RejectionCode
+    SchoolPolicy
+}
+
+pub fn first_allergen_conflict(menu: MenuOption, school: SchoolPolicy) -> Option<AllergenConflict> {
+    // Recipe-line order is checked first; allergen order is peanut, sesame, dairy, wheat.
+    for line in menu.lines {
+        if line.grams_per_portion > 0 {
+            match inventory.find_ingredient(line.ingredient_id) {
+                Some(ingredient) => {
+                    if ingredient.contains_peanuts and school.avoid_peanuts {
+                        return Some(
+                            AllergenConflict(
+                                ingredient_name: ingredient.name,
+                                allergen_name: "peanut",
+                            ),
+                        )
+                    }
+                    if ingredient.contains_sesame and school.avoid_sesame {
+                        return Some(
+                            AllergenConflict(
+                                ingredient_name: ingredient.name,
+                                allergen_name: "sesame",
+                            ),
+                        )
+                    }
+                    if ingredient.contains_dairy and school.avoid_dairy {
+                        return Some(
+                            AllergenConflict(
+                                ingredient_name: ingredient.name,
+                                allergen_name: "dairy",
+                            ),
+                        )
+                    }
+                    if ingredient.contains_wheat and school.avoid_wheat {
+                        return Some(
+                            AllergenConflict(
+                                ingredient_name: ingredient.name,
+                                allergen_name: "wheat",
+                            ),
+                        )
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    None
+}
+
+pub fn nutrition_violation(menu: MenuOption, school: SchoolPolicy) -> Option<NutritionViolation> {
+    if menu.calories < school.minimum_calories {
+        Some(
+            NutritionViolation(
+                code: RejectionCode.CaloriesBelowMinimum,
+                subject: "calories",
+                actual: menu.calories,
+                threshold: school.minimum_calories,
+            ),
+        )
+    } else if menu.calories > school.maximum_calories {
+        Some(
+            NutritionViolation(
+                code: RejectionCode.CaloriesAboveMaximum,
+                subject: "calories",
+                actual: menu.calories,
+                threshold: school.maximum_calories,
+            ),
+        )
+    } else if menu.protein_grams < school.minimum_protein_grams {
+        Some(
+            NutritionViolation(
+                code: RejectionCode.ProteinBelowMinimum,
+                subject: "protein",
+                actual: menu.protein_grams,
+                threshold: school.minimum_protein_grams,
+            ),
+        )
+    } else if menu.protein_grams > school.maximum_protein_grams {
+        Some(
+            NutritionViolation(
+                code: RejectionCode.ProteinAboveMaximum,
+                subject: "protein",
+                actual: menu.protein_grams,
+                threshold: school.maximum_protein_grams,
+            ),
+        )
+    } else {
+        None
+    }
+}

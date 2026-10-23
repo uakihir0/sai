@@ -1,0 +1,164 @@
+use acme:school-meal-service-planner/data
+use acme:school-meal-service-planner/model.{CandidateEvaluation, RejectionCode}
+use acme:school-meal-service-planner/planner
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn write_money(out: borrow mut Stdout, cents: U32) {
+    let dollars = cents / 100
+    let remainder = cents % 100
+    out.write_str(f"${dollars}.{remainder:zpad(2)}".as_str())
+}
+
+fn print_candidate(out: borrow mut Stdout, result: CandidateEvaluation)
+    effects { stdio.write, alloc }
+{
+    out.write_str(f"#{result.menu.id} {result.menu.name}: ".as_str())
+    match result.code {
+        RejectionCode.Eligible => {
+            out.write_str("eligible — projected food cost ")
+            write_money(borrow mut out, result.total_cost_cents)
+            out.write_str(
+                f", {result.batch_count} batches, {result.prep_minutes} prep minutes\n".as_str(),
+            )
+        }
+        RejectionCode.AllergenExcluded => {
+            out.write_str(
+                f"rejected — {result.subject} contains excluded {result.qualifier} from the school allergy roster\n".as_str(),
+            )
+        }
+        RejectionCode.CaloriesBelowMinimum => {
+            out.write_str(
+                f"rejected — {result.actual} kcal is below the {result.threshold} kcal minimum\n".as_str(),
+            )
+        }
+        RejectionCode.CaloriesAboveMaximum => {
+            out.write_str(
+                f"rejected — {result.actual} kcal is above the {result.threshold} kcal maximum\n".as_str(),
+            )
+        }
+        RejectionCode.ProteinBelowMinimum => {
+            out.write_str(
+                f"rejected — {result.actual} g protein is below the {result.threshold} g minimum\n".as_str(),
+            )
+        }
+        RejectionCode.ProteinAboveMaximum => {
+            out.write_str(
+                f"rejected — {result.actual} g protein is above the {result.threshold} g maximum\n".as_str(),
+            )
+        }
+        RejectionCode.KitchenMinutesExceeded => {
+            out.write_str(
+                f"rejected — {result.batch_count} batches need {result.actual} prep minutes; kitchen limit is {result.threshold}\n".as_str(),
+            )
+        }
+        RejectionCode.UsableInventoryShortfall => {
+            out.write_str(
+                f"rejected — {result.subject} needs {result.actual} g; {result.threshold} g is usable and {result.expired_grams} g is expired\n".as_str(),
+            )
+        }
+        RejectionCode.DailyBudgetExceeded => {
+            out.write_str("rejected — projected food cost ")
+            write_money(borrow mut out, result.actual)
+            out.write_str(" exceeds the ")
+            write_money(borrow mut out, result.threshold)
+            out.write_str(" daily limit\n")
+        }
+    }
+}
+
+fn print_candidates(out: borrow mut Stdout, evaluations: Array<CandidateEvaluation, 7>)
+    effects { stdio.write, alloc }
+{
+    for result in evaluations {
+        print_candidate(borrow mut out, result)
+    }
+}
+
+pub fn print_options(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let school = data.school_policy()
+    let portions = school.enrolled_students + school.reserve_portions
+    let kitchen = data.kitchen_capacity()
+    out.write_str("School meal candidate review — all values are fixture estimates\n")
+    out.write_str(f"Service day: {data.service_day()}\n".as_str())
+    out.write_str(
+        f"Portions: {school.enrolled_students} students + {school.reserve_portions} reserve = {portions}\n".as_str(),
+    )
+    out.write_str(
+        f"Nutrition band: {school.minimum_calories}–{school.maximum_calories} kcal and {school.minimum_protein_grams}–{school.maximum_protein_grams} g protein per portion\n".as_str(),
+    )
+    out.write_str(
+        f"Kitchen: {kitchen.portions_per_batch} portions per batch, {kitchen.available_prep_minutes} prep minutes available\n".as_str(),
+    )
+    out.write_str(
+        "First-rejection order: allergy, nutrition, kitchen time, usable stock, budget\n\n",
+    )
+    print_candidates(borrow mut out, planner.evaluate_all())
+}
+
+pub fn print_plan(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let school = data.school_policy()
+    let portions = school.enrolled_students + school.reserve_portions
+    let kitchen = data.kitchen_capacity()
+    let evaluations = planner.evaluate_all()
+    out.write_str(f"School meal service plan — day {data.service_day()}\n".as_str())
+    out.write_str(
+        f"Coverage: {school.enrolled_students} enrolled students plus {school.reserve_portions} reserve portions ({portions} total)\n".as_str(),
+    )
+    out.write_str(
+        f"Kitchen: {kitchen.portions_per_batch} portions per batch; {kitchen.available_prep_minutes} prep minutes available\n".as_str(),
+    )
+    out.write_str("\nCandidate decisions (first blocking rule shown):\n")
+    print_candidates(borrow mut out, evaluations)
+    out.write_str("\nSelected menu: ")
+    match planner.choose(evaluations) {
+        Some(selected) => {
+            out.write_str(f"{selected.menu.name} — {portions} portions, ".as_str())
+            write_money(borrow mut out, selected.total_cost_cents)
+            out.write_str(
+                f" projected food cost, {selected.batch_count} batches and {selected.prep_minutes}/{kitchen.available_prep_minutes} prep minutes\n".as_str(),
+            )
+        }
+        None => out.write_str("none; no candidate meets every listed rule\n")
+    }
+    out.write_str("Only the selected candidate is intended to be prepared.\n")
+}
+
+pub fn print_summary(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let school = data.school_policy()
+    let portions = school.enrolled_students + school.reserve_portions
+    let evaluations = planner.evaluate_all()
+    var accepted_count: U32 = 0
+    var rejected_count: U32 = 0
+    for result in evaluations {
+        if result.code == RejectionCode.Eligible {
+            accepted_count += 1
+        } else {
+            rejected_count += 1
+        }
+    }
+
+    out.write_str("School meal service summary\n")
+    out.write_str(
+        f"Menu candidates: {accepted_count} eligible, {rejected_count} rejected\n".as_str(),
+    )
+    out.write_str(f"Planned portions if selected: {portions}\n")
+    out.write_str("Selection: lowest projected food cost, then prep minutes, then menu ID\n")
+    out.write_str("Daily ingredient budget: ")
+    write_money(borrow mut out, school.daily_budget_cents)
+    out.write_str("\nSelected option: ")
+    match planner.choose(evaluations) {
+        Some(selected) => {
+            out.write_str(f"{selected.menu.name} at ".as_str())
+            write_money(borrow mut out, selected.total_cost_cents)
+            out.write_str("\n")
+        }
+        None => out.write_str("none\n")
+    }
+}

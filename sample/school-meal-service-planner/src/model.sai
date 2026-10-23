@@ -1,0 +1,104 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Ingredient {
+    pub id: Str
+    pub name: Str
+    pub cents_per_100g: U32
+    pub contains_peanuts: Bool
+    pub contains_sesame: Bool
+    pub contains_dairy: Bool
+    pub contains_wheat: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type InventoryLot {
+    pub ingredient_id: Str
+    pub quantity_grams: U32
+    pub use_by_day: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RecipeLine {
+    pub ingredient_id: Str
+    pub grams_per_portion: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type MenuOption {
+    pub id: U32
+    pub name: Str
+    pub lines: Array<RecipeLine, 4>
+    pub calories: U32
+    pub protein_grams: U32
+    pub prep_minutes_per_batch: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SchoolPolicy {
+    pub enrolled_students: U32
+    pub reserve_portions: U32
+    pub avoid_peanuts: Bool
+    pub avoid_sesame: Bool
+    pub avoid_dairy: Bool
+    pub avoid_wheat: Bool
+    pub minimum_calories: U32
+    pub maximum_calories: U32
+    pub minimum_protein_grams: U32
+    pub maximum_protein_grams: U32
+    pub daily_budget_cents: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type KitchenCapacity {
+    pub portions_per_batch: U32
+    pub available_prep_minutes: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RejectionCode {
+    Eligible
+    AllergenExcluded
+    CaloriesBelowMinimum
+    CaloriesAboveMaximum
+    ProteinBelowMinimum
+    ProteinAboveMaximum
+    KitchenMinutesExceeded
+    UsableInventoryShortfall
+    DailyBudgetExceeded
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AllergenConflict {
+    pub ingredient_name: Str
+    pub allergen_name: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type NutritionViolation {
+    pub code: RejectionCode
+    pub subject: Str
+    pub actual: U32
+    pub threshold: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type StockShortfall {
+    pub ingredient_name: Str
+    pub required_grams: U32
+    pub usable_grams: U32
+    pub expired_grams: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CandidateEvaluation {
+    pub menu: MenuOption
+    pub code: RejectionCode
+    // The interpretation depends on code: ingredient for allergen/stock, or a metric.
+    pub subject: Str
+    pub qualifier: Str
+    pub actual: U32
+    pub threshold: U32
+    pub expired_grams: U32
+    pub batch_count: U32
+    pub prep_minutes: U32
+    pub total_cost_cents: U32
+}

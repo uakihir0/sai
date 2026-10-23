@@ -1,0 +1,188 @@
+use acme:school-meal-service-planner/data
+use acme:school-meal-service-planner/inventory
+use acme:school-meal-service-planner/model.{CandidateEvaluation, MenuOption, RejectionCode}
+use acme:school-meal-service-planner/policy
+
+fn evaluation(
+    menu: MenuOption,
+    code: RejectionCode,
+    subject: Str,
+    qualifier: Str,
+    actual: U32,
+    threshold: U32,
+    expired_grams: U32,
+    batch_count: U32,
+    prep_minutes: U32,
+    total_cost_cents: U32,
+) -> CandidateEvaluation {
+    CandidateEvaluation(
+        menu: menu,
+        code: code,
+        subject: subject,
+        qualifier: qualifier,
+        actual: actual,
+        threshold: threshold,
+        expired_grams: expired_grams,
+        batch_count: batch_count,
+        prep_minutes: prep_minutes,
+        total_cost_cents: total_cost_cents,
+    )
+}
+
+fn projected_cost_cents(menu: MenuOption, portions: U32) -> U32 {
+    var cents: U32 = 0
+    for line in menu.lines {
+        if line.grams_per_portion > 0 {
+            match inventory.find_ingredient(line.ingredient_id) {
+                Some(ingredient) => {
+                    cents += line.grams_per_portion * portions * ingredient.cents_per_100g / 100
+                }
+                None => {}
+            }
+        }
+    }
+    cents
+}
+
+fn evaluate(menu: MenuOption) -> CandidateEvaluation {
+    let school = data.school_policy()
+    let kitchen = data.kitchen_capacity()
+    let portions = school.enrolled_students + school.reserve_portions
+    let batches = (portions + kitchen.portions_per_batch - 1) / kitchen.portions_per_batch
+    let prep_minutes = batches * menu.prep_minutes_per_batch
+    let cost_cents = projected_cost_cents(menu, portions)
+
+    match policy.first_allergen_conflict(menu, school) {
+        Some(conflict) => {
+            return evaluation(
+                menu,
+                RejectionCode.AllergenExcluded,
+                conflict.ingredient_name,
+                conflict.allergen_name,
+                0,
+                0,
+                0,
+                batches,
+                prep_minutes,
+                cost_cents,
+            )
+        }
+        None => {}
+    }
+
+    match policy.nutrition_violation(menu, school) {
+        Some(violation) => {
+            return evaluation(
+                menu,
+                violation.code,
+                violation.subject,
+                "",
+                violation.actual,
+                violation.threshold,
+                0,
+                batches,
+                prep_minutes,
+                cost_cents,
+            )
+        }
+        None => {}
+    }
+
+    if prep_minutes > kitchen.available_prep_minutes {
+        return evaluation(
+            menu,
+            RejectionCode.KitchenMinutesExceeded,
+            "prep minutes",
+            "",
+            prep_minutes,
+            kitchen.available_prep_minutes,
+            0,
+            batches,
+            prep_minutes,
+            cost_cents,
+        )
+    }
+
+    match inventory.first_shortfall(menu, portions, data.service_day()) {
+        Some(shortfall) => {
+            return evaluation(
+                menu,
+                RejectionCode.UsableInventoryShortfall,
+                shortfall.ingredient_name,
+                "",
+                shortfall.required_grams,
+                shortfall.usable_grams,
+                shortfall.expired_grams,
+                batches,
+                prep_minutes,
+                cost_cents,
+            )
+        }
+        None => {}
+    }
+
+    if cost_cents > school.daily_budget_cents {
+        return evaluation(
+            menu,
+            RejectionCode.DailyBudgetExceeded,
+            "",
+            "",
+            cost_cents,
+            school.daily_budget_cents,
+            0,
+            batches,
+            prep_minutes,
+            cost_cents,
+        )
+    }
+
+    evaluation(menu, RejectionCode.Eligible, "", "", 0, 0, 0, batches, prep_minutes, cost_cents)
+}
+
+pub fn evaluate_all() -> Array<CandidateEvaluation, 7> {
+    let menus = data.menu_options()
+    [
+        evaluate(menus[0]),
+        evaluate(menus[1]),
+        evaluate(menus[2]),
+        evaluate(menus[3]),
+        evaluate(menus[4]),
+        evaluate(menus[5]),
+        evaluate(menus[6]),
+    ]
+}
+
+fn precedes(candidate: CandidateEvaluation, current: CandidateEvaluation) -> Bool {
+    (
+        candidate.total_cost_cents < current.total_cost_cents
+        or (
+            candidate.total_cost_cents == current.total_cost_cents
+            and (
+                candidate.prep_minutes < current.prep_minutes
+                or (
+                    candidate.prep_minutes == current.prep_minutes
+                    and candidate.menu.id < current.menu.id
+                )
+            )
+        )
+    )
+}
+
+pub fn choose(evaluations: Array<CandidateEvaluation, 7>) -> Option<CandidateEvaluation> {
+    var best: Option<CandidateEvaluation> = None
+    for candidate in evaluations {
+        if candidate.code == RejectionCode.Eligible {
+            match best {
+                Some(current) => {
+                    if precedes(candidate, current) {
+                        best = Some(candidate)
+                    }
+                }
+                None => {
+                    best = Some(candidate)
+                }
+            }
+        }
+    }
+    best
+}
