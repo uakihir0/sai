@@ -1,0 +1,54 @@
+use acme:transit-fare-cap-auditor/model.{Tap}
+
+pub fn full_fare_cents() -> U32 {
+    240
+}
+
+pub fn transfer_fare_cents() -> U32 {
+    60
+}
+
+pub fn transfer_window_minutes() -> U32 {
+    30
+}
+
+pub fn daily_cap_cents() -> U32 {
+    650
+}
+
+pub fn has_prior_tap_id(taps: Array<Tap, 12>, index: USize, tap_id: U32) -> Bool {
+    for prior_index in 0..index {
+        if taps[prior_index].id == tap_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn fare_for_boarding(
+    minute: U32,
+    has_boarded: Bool,
+    first_boarding_minute: U32,
+    charged_so_far: U32,
+) -> U32 {
+    if charged_so_far >= daily_cap_cents() {
+        return 0
+    }
+
+    let within_transfer_window = (
+        has_boarded
+        and minute >= first_boarding_minute
+        and minute - first_boarding_minute <= transfer_window_minutes()
+    )
+    let uncapped_fare = if within_transfer_window {
+        transfer_fare_cents()
+    } else {
+        full_fare_cents()
+    }
+    let remaining_cap = daily_cap_cents() - charged_so_far
+    if uncapped_fare < remaining_cap {
+        uncapped_fare
+    } else {
+        remaining_cap
+    }
+}
