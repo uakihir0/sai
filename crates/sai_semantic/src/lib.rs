@@ -3,8 +3,14 @@
 //! Stable symbol identifiers used by semantic tooling.
 
 mod canonical_path;
+mod index_journal;
 mod symbol_index;
 
+pub use index_journal::{
+    FileState, IndexJournalCodecError, IndexJournalOrigin, IndexJournalState,
+    IndexOperationJournal, IndexSnapshot, MAX_OPERATION_JOURNAL_BYTES, PackageFileState,
+    SourceFileChange, SymbolIdMapping,
+};
 pub use symbol_index::{
     EncodedSymbolIndex, PackageIndexFileName, PackageIndexFileRecord, SymbolIndex,
     SymbolIndexCodecError, SymbolIndexEntry, SymbolKind, UnvalidatedSymbolIndex,

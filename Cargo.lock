@@ -3162,8 +3162,10 @@ dependencies = [
 name = "sai_semantic"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "sai_stable_hash",
  "sai_syntax",
+ "semver",
  "serde",
  "serde_json",
  "unicode-ident",

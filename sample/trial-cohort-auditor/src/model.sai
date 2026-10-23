@@ -1,0 +1,102 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ConsentStatus {
+    Signed
+    Declined
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ScreenFailure {
+    DuplicateParticipantId
+    ConsentNotSigned
+    AgeOutOfRange
+    ExclusionCriterion
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum VisitKind {
+    Baseline
+    Week4
+    Week12
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum VisitFindingKind {
+    VisitForIneligibleParticipant
+    DuplicateVisitRecords
+    MissingRequiredVisit
+    VisitOutsideWindow
+    LateSafetyReport
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ScreeningRecord {
+    pub record_id: U32
+    pub participant_id: U32
+    pub age_years: U32
+    pub consent: ConsentStatus
+    pub has_exclusion_criterion: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type VisitRecord {
+    pub participant_id: U32
+    pub visit: VisitKind
+    pub study_day: U32
+    pub serious_event_onset_day: Option<U32>
+    pub serious_event_report_day: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TrialDataset {
+    pub screenings: Array<Option<ScreeningRecord>, 7>
+    pub screening_count: USize
+    pub visits: Array<Option<VisitRecord>, 6>
+    pub visit_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ScreeningDecision {
+    pub record_id: U32
+    pub participant_id: U32
+    pub enrolled: Bool
+    pub failure: Option<ScreenFailure>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ScreeningReport {
+    pub rows: Array<Option<ScreeningDecision>, 7>
+    pub row_count: USize
+    pub enrolled_count: U32
+    pub duplicate_id_count: U32
+    pub consent_not_signed_count: U32
+    pub age_out_of_range_count: U32
+    pub exclusion_criterion_count: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type VisitFinding {
+    pub participant_id: U32
+    pub visit: VisitKind
+    pub kind: VisitFindingKind
+    pub observed_day: Option<U32>
+    pub due_day: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type VisitReport {
+    pub findings: Array<Option<VisitFinding>, 40>
+    pub finding_count: USize
+    pub expected_visit_count: U32
+    pub observed_enrolled_visit_count: U32
+    pub ineligible_visit_count: U32
+    pub missing_visit_count: U32
+    pub out_of_window_count: U32
+    pub serious_event_count: U32
+    pub late_safety_report_count: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TrialAudit {
+    pub screening: ScreeningReport
+    pub visits: VisitReport
+}

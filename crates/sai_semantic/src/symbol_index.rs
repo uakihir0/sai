@@ -554,7 +554,9 @@ fn encode_canonical_document<T: Serialize>(value: &T) -> Result<Vec<u8>, SymbolI
     Ok(bytes)
 }
 
-fn encode_package_entries(entries: &[SymbolIndexEntry]) -> Result<Vec<u8>, SymbolIndexCodecError> {
+pub(crate) fn encode_package_entries(
+    entries: &[SymbolIndexEntry],
+) -> Result<Vec<u8>, SymbolIndexCodecError> {
     let mut bytes = Vec::new();
     for entry in entries {
         let json = EntryJson {
@@ -572,7 +574,7 @@ fn encode_package_entries(entries: &[SymbolIndexEntry]) -> Result<Vec<u8>, Symbo
     Ok(bytes)
 }
 
-fn decode_package_entries(
+pub(crate) fn decode_package_entries(
     bytes: &[u8],
     file: &PackageIndexFileName,
 ) -> Result<Vec<SymbolIndexEntry>, SymbolIndexCodecError> {
