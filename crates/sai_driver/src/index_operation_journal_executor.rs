@@ -388,7 +388,7 @@ mod tests {
         execute_index_operation_journal_restore_source_before,
     };
     use crate::index_operation_journal_recovery::{
-        IndexJournalRecoveryAmbiguity, IndexJournalRecoveryDecision,
+        IndexGenerationObservation, IndexJournalRecoveryAmbiguity, IndexJournalRecoveryDecision,
         plan_index_operation_journal_recovery,
     };
     use crate::index_operation_journal_store::{
@@ -863,8 +863,15 @@ mod tests {
             member_source_before
         );
         assert_eq!(journal_bytes(&workspace), journal_before);
+        let remaining_observation = store
+            .observe_recovery(&journal, &inventory)
+            .expect("observe remaining mixed package files");
         assert_eq!(
-            expected_decision(&store, &journal, &inventory),
+            remaining_observation.index_generation,
+            IndexGenerationObservation::RecoverablePartial
+        );
+        assert_eq!(
+            plan_index_operation_journal_recovery(&journal, &remaining_observation),
             IndexJournalRecoveryDecision::RestoreBefore,
             "the remaining mixed package files require a new planner pass"
         );
