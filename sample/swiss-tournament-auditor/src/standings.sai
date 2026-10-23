@@ -1,0 +1,89 @@
+use acme:swiss-tournament-auditor/lookup
+use acme:swiss-tournament-auditor/model.{AuditError, MatchResult, Standing, Standings, Tournament}
+use acme:swiss-tournament-auditor/standings/order
+use acme:swiss-tournament-auditor/validate
+
+fn points_for_white(result: MatchResult) -> U32 {
+    match result { MatchResult.WhiteWin => 3, MatchResult.Draw => 1, MatchResult.BlackWin => 0 }
+}
+
+fn points_for_black(result: MatchResult) -> U32 {
+    match result { MatchResult.WhiteWin => 0, MatchResult.Draw => 1, MatchResult.BlackWin => 3 }
+}
+
+pub fn rank(tournament: Tournament) -> Result<Standings, AuditError> {
+    match validate.tournament(tournament) { Ok(()) => {}, Err(error) => return Err(error) }
+
+    var match_points: Array<U32, 6> = [0, 0, 0, 0, 0, 0]
+    for index in 0..tournament.game_count {
+        let game = tournament.games[index].unwrap()
+        let white_index = lookup.player_index(tournament, game.white_player_id).unwrap()
+        let black_index = lookup.player_index(tournament, game.black_player_id).unwrap()
+        match_points[white_index] += points_for_white(game.result)
+        match_points[black_index] += points_for_black(game.result)
+    }
+
+    var buchholz: Array<U32, 6> = [0, 0, 0, 0, 0, 0]
+    for index in 0..tournament.game_count {
+        let game = tournament.games[index].unwrap()
+        let white_index = lookup.player_index(tournament, game.white_player_id).unwrap()
+        let black_index = lookup.player_index(tournament, game.black_player_id).unwrap()
+        buchholz[white_index] += match_points[black_index]
+        buchholz[black_index] += match_points[white_index]
+    }
+
+    var rows: Array<Standing, 6> = [
+        Standing(
+            player_id: tournament.players[0].id,
+            player_name: tournament.players[0].name,
+            match_points: match_points[0],
+            buchholz: buchholz[0],
+        ),
+        Standing(
+            player_id: tournament.players[1].id,
+            player_name: tournament.players[1].name,
+            match_points: match_points[1],
+            buchholz: buchholz[1],
+        ),
+        Standing(
+            player_id: tournament.players[2].id,
+            player_name: tournament.players[2].name,
+            match_points: match_points[2],
+            buchholz: buchholz[2],
+        ),
+        Standing(
+            player_id: tournament.players[3].id,
+            player_name: tournament.players[3].name,
+            match_points: match_points[3],
+            buchholz: buchholz[3],
+        ),
+        Standing(
+            player_id: tournament.players[4].id,
+            player_name: tournament.players[4].name,
+            match_points: match_points[4],
+            buchholz: buchholz[4],
+        ),
+        Standing(
+            player_id: tournament.players[5].id,
+            player_name: tournament.players[5].name,
+            match_points: match_points[5],
+            buchholz: buchholz[5],
+        ),
+    ]
+
+    for index in 1..rows.len() {
+        let candidate = rows[index]
+        var cursor = index
+        while cursor > 0 {
+            if order.precedes(candidate, rows[cursor - 1]) {
+                rows[cursor] = rows[cursor - 1]
+                cursor -= 1
+            } else {
+                break
+            }
+        }
+        rows[cursor] = candidate
+    }
+
+    Ok(Standings(rows: rows))
+}

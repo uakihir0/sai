@@ -1,0 +1,10 @@
+use acme:swiss-tournament-auditor/model.{Tournament}
+
+pub fn player_index(tournament: Tournament, player_id: U32) -> Option<USize> {
+    for index in 0..tournament.players.len() {
+        if tournament.players[index].id == player_id {
+            return Some(index)
+        }
+    }
+    None
+}

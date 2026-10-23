@@ -1,0 +1,83 @@
+use acme:swiss-tournament-auditor/model.{Game, MatchResult, Player, Tournament}
+
+pub fn players() -> Array<Player, 6> {
+    [
+        Player(id: 1, name: "Ada"),
+        Player(id: 2, name: "Bex"),
+        Player(id: 3, name: "Cora"),
+        Player(id: 4, name: "Dev"),
+        Player(id: 5, name: "Eli"),
+        Player(id: 6, name: "Finn"),
+    ]
+}
+
+pub fn valid_games() -> Array<Option<Game>, 9> {
+    [
+        Some(Game(round: 1, white_player_id: 1, black_player_id: 2, result: MatchResult.WhiteWin)),
+        Some(Game(round: 1, white_player_id: 3, black_player_id: 4, result: MatchResult.Draw)),
+        Some(Game(round: 1, white_player_id: 5, black_player_id: 6, result: MatchResult.WhiteWin)),
+        Some(Game(round: 2, white_player_id: 1, black_player_id: 3, result: MatchResult.Draw)),
+        Some(Game(round: 2, white_player_id: 2, black_player_id: 5, result: MatchResult.BlackWin)),
+        Some(Game(round: 2, white_player_id: 4, black_player_id: 6, result: MatchResult.WhiteWin)),
+        Some(Game(round: 3, white_player_id: 1, black_player_id: 4, result: MatchResult.Draw)),
+        Some(Game(round: 3, white_player_id: 2, black_player_id: 6, result: MatchResult.WhiteWin)),
+        Some(Game(round: 3, white_player_id: 3, black_player_id: 5, result: MatchResult.WhiteWin)),
+    ]
+}
+
+pub fn tournament() -> Tournament {
+    Tournament(players: players(), games: valid_games(), game_count: 9)
+}
+
+pub fn unknown_player() -> Tournament {
+    var games = valid_games()
+    games[0] =
+        Some(Game(round: 1, white_player_id: 99, black_player_id: 2, result: MatchResult.WhiteWin))
+    Tournament(players: players(), games: games, game_count: 9)
+}
+
+pub fn duplicate_player_id() -> Tournament {
+    var roster = players()
+    roster[1] = Player(id: 1, name: "Bex")
+    Tournament(players: roster, games: valid_games(), game_count: 9)
+}
+
+pub fn invalid_round() -> Tournament {
+    var games = valid_games()
+    games[0] =
+        Some(Game(round: 4, white_player_id: 1, black_player_id: 2, result: MatchResult.WhiteWin))
+    Tournament(players: players(), games: games, game_count: 9)
+}
+
+pub fn self_pairing() -> Tournament {
+    var games = valid_games()
+    games[0] =
+        Some(Game(round: 1, white_player_id: 1, black_player_id: 1, result: MatchResult.WhiteWin))
+    Tournament(players: players(), games: games, game_count: 9)
+}
+
+pub fn missing_game() -> Tournament {
+    var games = valid_games()
+    games[0] = None
+    Tournament(players: players(), games: games, game_count: 9)
+}
+
+pub fn repeated_pairing() -> Tournament {
+    var games = valid_games()
+    games[7] =
+        Some(Game(round: 3, white_player_id: 2, black_player_id: 5, result: MatchResult.WhiteWin))
+    Tournament(players: players(), games: games, game_count: 9)
+}
+
+pub fn double_booked_player() -> Tournament {
+    var games = valid_games()
+    games[7] =
+        Some(Game(round: 3, white_player_id: 2, black_player_id: 6, result: MatchResult.WhiteWin))
+    games[8] =
+        Some(Game(round: 3, white_player_id: 3, black_player_id: 6, result: MatchResult.WhiteWin))
+    Tournament(players: players(), games: games, game_count: 9)
+}
+
+pub fn incomplete_schedule() -> Tournament {
+    Tournament(players: players(), games: valid_games(), game_count: 8)
+}

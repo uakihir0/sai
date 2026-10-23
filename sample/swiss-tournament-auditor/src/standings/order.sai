@@ -1,0 +1,22 @@
+use acme:swiss-tournament-auditor/model.{Standing}
+
+pub fn precedes(candidate: Standing, current: Standing) -> Bool {
+    (
+        candidate.match_points > current.match_points
+        or (
+            candidate.match_points == current.match_points and candidate.buchholz > current.buchholz
+        )
+        or (
+            candidate.match_points == current.match_points
+            and candidate.buchholz == current.buchholz
+            and candidate.player_id < current.player_id
+        )
+    )
+}
+
+test "player ID breaks ties after both score fields" {
+    let first = Standing(player_id: 1, player_name: "Ada", match_points: 5, buchholz: 10)
+    let second = Standing(player_id: 2, player_name: "Bex", match_points: 5, buchholz: 10)
+    assert precedes(first, second)
+    assert not precedes(second, first)
+}
