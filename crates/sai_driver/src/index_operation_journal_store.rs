@@ -74,6 +74,8 @@ pub enum IndexOperationJournalStoreError {
     IndexFileChanged,
     IndexHeaderNotBefore,
     PackageFileDeletionRequiresAfterHeader,
+    PlannedAfterPackageFilesNotReady,
+    PlannedAfterSourceFilesNotReady,
 }
 
 impl fmt::Display for IndexOperationJournalStoreError {
@@ -129,6 +131,12 @@ impl fmt::Display for IndexOperationJournalStoreError {
             Self::PackageFileDeletionRequiresAfterHeader => formatter.write_str(
                 "a package-index file omitted from the planned header cannot be removed before that header is committed",
             ),
+            Self::PlannedAfterPackageFilesNotReady => formatter.write_str(
+                "one or more package-index files required by the planned header are not in their planned-after state",
+            ),
+            Self::PlannedAfterSourceFilesNotReady => formatter.write_str(
+                "one or more source files are no longer in their planned-after state",
+            ),
         }
     }
 }
@@ -150,7 +158,9 @@ impl Error for IndexOperationJournalStoreError {
             | Self::IndexStateNotRecorded
             | Self::IndexFileChanged
             | Self::IndexHeaderNotBefore
-            | Self::PackageFileDeletionRequiresAfterHeader => None,
+            | Self::PackageFileDeletionRequiresAfterHeader
+            | Self::PlannedAfterPackageFilesNotReady
+            | Self::PlannedAfterSourceFilesNotReady => None,
         }
     }
 }
@@ -318,6 +328,306 @@ impl<'lock> IndexOperationJournalStore<'lock> {
             desired,
             Some(&journal.index_before.header),
         )
+    }
+
+    /// Publishes the planned-after header after verifying every package file
+    /// named by that header.
+    ///
+    /// Affected package files must contain their exact recorded after bytes.
+    /// Unaffected files must still match the digest in the planned header.
+    /// Every source is re-observed after the final index-entry, journal,
+    /// lock-context, and directory-identity checks, immediately before the
+    /// header update.
+    /// The journal and before header are checked through the same opened
+    /// index-directory handle, and every observed entry is revalidated before
+    /// only `index.json` is conditionally replaced. Files omitted by the
+    /// planned header are deliberately left in place for a later cleanup
+    /// step.
+    ///
+    /// The caller must first make a fresh recovery observation and confirm
+    /// `CommitPlannedIndex`. This method also binds the mutation to the
+    /// current lock snapshot. A retry that already sees the planned header
+    /// still verifies package and source readiness and flushes the directory
+    /// before returning success. An absent before header is a valid empty
+    /// starting index and is conditionally replaced by the planned header.
+    /// The workspace lock serializes cooperating writers; external editors
+    /// remain outside that lock and require caller-side snapshot validation.
+    pub fn publish_index_header_if_package_files_after(
+        &self,
+        journal: &IndexOperationJournal,
+        context: &IndexJournalRecoveryContext,
+    ) -> Result<ConditionalFileUpdate, IndexOperationJournalStoreError> {
+        self.publish_index_header_if_package_files_after_with_hook(journal, context, || {})
+    }
+
+    fn publish_index_header_if_package_files_after_with_hook(
+        &self,
+        journal: &IndexOperationJournal,
+        context: &IndexJournalRecoveryContext,
+        after_initial_scan: impl FnOnce(),
+    ) -> Result<ConditionalFileUpdate, IndexOperationJournalStoreError> {
+        self.require_exclusive()?;
+        self.verify_recovery_context(context)?;
+
+        let encoded_journal = self.encode_at_journal_path(journal)?;
+        let before_header = state_bytes(&journal.index_before.header);
+        let Some(after_header_bytes) = state_bytes(&journal.index_after.header) else {
+            return Err(IndexOperationJournalStoreError::IndexStateNotRecorded);
+        };
+        let after_header = SymbolIndexHeader::decode(after_header_bytes)
+            .map_err(|_| IndexOperationJournalStoreError::IndexStateNotRecorded)?;
+        let state_directory_identity = file_identity(self.lock.state_directory_handle())
+            .map_err(|source| self.io_error(self.state_directory_path(), source))?;
+        let index_directory = self
+            .open_index_directory_for_mutation(false)?
+            .ok_or(IndexOperationJournalStoreError::JournalChanged)?;
+        let index_directory_identity = file_identity(&index_directory)
+            .map_err(|source| self.io_error(self.index_directory_path(), source))?;
+        let Some(current) = self.read_current(&index_directory)? else {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        };
+        if current.journal != *journal || current.bytes != encoded_journal {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        }
+
+        let maximum_header_bytes = before_header
+            .map_or(0, <[u8]>::len)
+            .max(after_header_bytes.len());
+        let header_observation = observe_stable_bounded_file(
+            &index_directory,
+            &self.index_directory_path(),
+            OsStr::new("index.json"),
+            maximum_header_bytes,
+        )
+        .map_err(|source| self.io_error(self.index_directory_path().join("index.json"), source))?;
+        let observed_header_state = match &header_observation.state {
+            ObservedFileState::Absent => FileState::Absent,
+            ObservedFileState::Bytes(bytes) => FileState::RegularFile(bytes.clone()),
+            ObservedFileState::Oversized => {
+                return Err(IndexOperationJournalStoreError::IndexHeaderNotBefore);
+            }
+        };
+        if observed_header_state != journal.index_before.header
+            && observed_header_state != journal.index_after.header
+        {
+            return Err(IndexOperationJournalStoreError::IndexHeaderNotBefore);
+        }
+
+        let mut rechecks = vec![EntryRecheck::Bounded {
+            name: OsString::from("index.json"),
+            maximum_bytes: maximum_header_bytes,
+            expected: header_observation.fingerprint,
+            identity: header_observation.identity,
+            metadata: header_observation.metadata,
+        }];
+        let mut initial_handles = Vec::new();
+        if let Some(handle) = header_observation.handle {
+            initial_handles.push(handle);
+        }
+
+        let after_header_files = after_header
+            .records()
+            .iter()
+            .map(|record| record.file().clone())
+            .collect::<BTreeSet<_>>();
+        for record in after_header.records() {
+            if let Some((_, after_state)) = affected_file_state(journal, record.file()) {
+                let Some(expected_bytes) = state_bytes(after_state) else {
+                    return Err(IndexOperationJournalStoreError::PlannedAfterPackageFilesNotReady);
+                };
+                let observation = observe_stable_bounded_file(
+                    &index_directory,
+                    &self.index_directory_path(),
+                    OsStr::new(record.file().as_str()),
+                    expected_bytes.len(),
+                )
+                .map_err(|source| {
+                    self.io_error(
+                        self.index_directory_path().join(record.file().as_str()),
+                        source,
+                    )
+                })?;
+                let matches_after = matches!(
+                    &observation.state,
+                    ObservedFileState::Bytes(bytes) if bytes == expected_bytes
+                );
+                rechecks.push(EntryRecheck::Bounded {
+                    name: OsString::from(record.file().as_str()),
+                    maximum_bytes: expected_bytes.len(),
+                    expected: observation.fingerprint,
+                    identity: observation.identity,
+                    metadata: observation.metadata,
+                });
+                if let Some(handle) = observation.handle {
+                    initial_handles.push(handle);
+                }
+                if !matches_after {
+                    return Err(IndexOperationJournalStoreError::PlannedAfterPackageFilesNotReady);
+                }
+            } else {
+                let observation = observe_stable_file_digest(
+                    &index_directory,
+                    &self.index_directory_path(),
+                    OsStr::new(record.file().as_str()),
+                )
+                .map_err(|source| {
+                    self.io_error(
+                        self.index_directory_path().join(record.file().as_str()),
+                        source,
+                    )
+                })?;
+                let matches_digest = matches!(
+                    observation.state,
+                    ObservedDigestState::Digest(actual) if actual == record.digest()
+                );
+                rechecks.push(EntryRecheck::Digest {
+                    name: OsString::from(record.file().as_str()),
+                    expected: observation.fingerprint,
+                    identity: observation.identity,
+                    metadata: observation.metadata,
+                });
+                if let Some(handle) = observation.handle {
+                    initial_handles.push(handle);
+                }
+                if !matches_digest {
+                    return Err(IndexOperationJournalStoreError::PlannedAfterPackageFilesNotReady);
+                }
+            }
+        }
+
+        for file in affected_package_file_names(journal)
+            .map_err(|_| IndexOperationJournalStoreError::IndexFileNotRecorded)?
+        {
+            if after_header_files.contains(&file) {
+                continue;
+            }
+            let (before_state, after_state) = affected_file_state(journal, &file)
+                .ok_or(IndexOperationJournalStoreError::IndexFileNotRecorded)?;
+            let maximum_bytes = state_bytes(before_state)
+                .map_or(0, <[u8]>::len)
+                .max(state_bytes(after_state).map_or(0, <[u8]>::len));
+            let observation = observe_stable_bounded_file(
+                &index_directory,
+                &self.index_directory_path(),
+                OsStr::new(file.as_str()),
+                maximum_bytes,
+            )
+            .map_err(|source| {
+                self.io_error(self.index_directory_path().join(file.as_str()), source)
+            })?;
+            let observed_state = match &observation.state {
+                ObservedFileState::Absent => FileState::Absent,
+                ObservedFileState::Bytes(bytes) => FileState::RegularFile(bytes.clone()),
+                ObservedFileState::Oversized => {
+                    return Err(IndexOperationJournalStoreError::PlannedAfterPackageFilesNotReady);
+                }
+            };
+            rechecks.push(EntryRecheck::Bounded {
+                name: OsString::from(file.as_str()),
+                maximum_bytes,
+                expected: observation.fingerprint,
+                identity: observation.identity,
+                metadata: observation.metadata,
+            });
+            if let Some(handle) = observation.handle {
+                initial_handles.push(handle);
+            }
+            if &observed_state != before_state && &observed_state != after_state {
+                return Err(IndexOperationJournalStoreError::PlannedAfterPackageFilesNotReady);
+            }
+        }
+
+        after_initial_scan();
+        let (mut final_handles, entries_stable) = revalidate_entries(
+            Some(&index_directory),
+            &self.index_directory_path(),
+            &rechecks,
+        );
+        initial_handles.append(&mut final_handles);
+        if !entries_stable
+            || file_identity(self.lock.state_directory_handle()).ok()
+                != Some(state_directory_identity)
+            || file_identity(&index_directory).ok() != Some(index_directory_identity)
+        {
+            return Err(IndexOperationJournalStoreError::IndexFileChanged);
+        }
+        let Some(current_after) = self.read_current(&index_directory)? else {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        };
+        if current_after.journal != current.journal || current_after.bytes != current.bytes {
+            return Err(IndexOperationJournalStoreError::JournalChanged);
+        }
+        self.verify_recovery_context(context)?;
+        let Some(current_index_directory) = self.open_index_directory_for_read()? else {
+            return Err(IndexOperationJournalStoreError::IndexFileChanged);
+        };
+        if file_identity(&current_index_directory).ok() != Some(index_directory_identity) {
+            return Err(IndexOperationJournalStoreError::IndexFileChanged);
+        }
+        if !self.source_files_match_planned_after(journal, context) {
+            return Err(IndexOperationJournalStoreError::PlannedAfterSourceFilesNotReady);
+        }
+
+        if observed_header_state == journal.index_after.header {
+            self.sync_index_directory(&current_index_directory)?;
+            return Ok(ConditionalFileUpdate::AlreadyDesired);
+        }
+
+        let update = update_file_in_directory_if_matches(
+            &current_index_directory,
+            OsStr::new("index.json"),
+            before_header,
+            Some(state_bytes(&journal.index_after.header).expect("after header is regular")),
+        )
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::WouldBlock {
+                IndexOperationJournalStoreError::IndexFileChanged
+            } else {
+                self.io_error(self.index_directory_path().join("index.json"), source)
+            }
+        })?;
+        if update == ConditionalFileUpdate::AlreadyDesired {
+            self.sync_index_directory(&current_index_directory)?;
+        }
+        Ok(update)
+    }
+
+    fn source_files_match_planned_after(
+        &self,
+        journal: &IndexOperationJournal,
+        context: &IndexJournalRecoveryContext,
+    ) -> bool {
+        let inventory = context.inventory();
+        let inventory_matches_locked_workspace = inventory.root_directory().path()
+            == self.lock.package_directory()
+            && self
+                .lock
+                .package_directory_handle()
+                .is_some_and(|locked_root| {
+                    inventory
+                        .root_directory()
+                        .is_same_open_directory(locked_root)
+                });
+        if !inventory_matches_locked_workspace
+            || validate_index_operation_journal_package_context(journal, inventory.contexts())
+                .is_err()
+        {
+            return false;
+        }
+
+        let mut remaining_source_bytes = MAX_RECOVERY_SOURCE_OBSERVATION_BYTES;
+        for source in &journal.sources {
+            let (observed, observed_bytes) =
+                observe_journal_source(source, inventory, remaining_source_bytes);
+            remaining_source_bytes = remaining_source_bytes.saturating_sub(observed_bytes);
+            if !matches!(
+                observed,
+                PlannerObservedFileState::Available(state) if state == source.planned_after
+            ) {
+                return false;
+            }
+        }
+        true
     }
 
     fn update_index_file_if_matches_with_header_condition(
@@ -1931,6 +2241,8 @@ mod tests {
         IndexOperationJournalStoreError, read_bounded_file,
     };
     use crate::index_operation_journal_recovery::IndexGenerationObservation;
+    use crate::index_operation_journal_validation::capture_index_journal_recovery_context;
+    use sai_package::validation::PackageValidationContext;
     use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
     use sai_semantic::{
         FileState, IndexJournalOrigin, IndexJournalState, IndexOperationJournal, IndexSnapshot,
@@ -1961,6 +2273,24 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn prepare_recovery_workspace(directory: &TestDirectory) {
+        fs::create_dir_all(directory.0.join("src")).expect("create package source directory");
+        fs::write(
+            directory.0.join("sai.package"),
+            "package acme:user @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n",
+        )
+        .expect("write package manifest");
+        fs::write(
+            directory.0.join("sai.lock"),
+            "lock 2\n\
+             root acme:user @ 1.0.0\n\
+                 targets { wasm32-core, wasm32-wasi }\n",
+        )
+        .expect("write workspace lock");
     }
 
     fn journal() -> IndexOperationJournal {
@@ -2415,6 +2745,263 @@ mod tests {
             ),
             Err(IndexOperationJournalStoreError::JournalChanged)
         ));
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn header_publication_rejects_an_unaffected_file_with_a_wrong_after_digest() {
+        let directory = TestDirectory::new();
+        prepare_recovery_workspace(&directory);
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let context =
+            capture_index_journal_recovery_context(&lock, PackageValidationContext::default())
+                .expect("capture lock-bound recovery context");
+        let store = IndexOperationJournalStore::new(&lock);
+        let (journal, unaffected_file) = journal_with_unaffected_file();
+        let index_directory = lock.package_directory().join(".sai/index");
+        write_snapshot(&index_directory, &journal.index_before);
+        write_current_journal(&index_directory, &journal);
+        let FileState::RegularFile(affected_after) = &journal.index_after.package_files[0].state
+        else {
+            panic!("affected after package file is regular");
+        };
+        fs::write(
+            index_directory.join(journal.index_after.package_files[0].file.as_str()),
+            affected_after,
+        )
+        .expect("publish affected package file");
+        let unexpected_unaffected = b"unaffected file no longer matches its digest";
+        fs::write(
+            index_directory.join(unaffected_file.as_str()),
+            unexpected_unaffected,
+        )
+        .expect("write changed unaffected package file");
+        let before_header =
+            fs::read(index_directory.join("index.json")).expect("read before header");
+        let journal_before =
+            fs::read(index_directory.join("operation.json")).expect("read journal");
+
+        assert!(matches!(
+            store.publish_index_header_if_package_files_after(&journal, &context),
+            Err(IndexOperationJournalStoreError::PlannedAfterPackageFilesNotReady)
+        ));
+        assert_eq!(
+            fs::read(index_directory.join("index.json")).expect("read unchanged header"),
+            before_header
+        );
+        assert_eq!(
+            fs::read(index_directory.join(unaffected_file.as_str()))
+                .expect("read unchanged unexpected package bytes"),
+            unexpected_unaffected
+        );
+        assert_eq!(
+            fs::read(index_directory.join("operation.json")).expect("read unchanged journal"),
+            journal_before
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn header_publication_revalidates_package_files_after_the_initial_scan() {
+        let directory = TestDirectory::new();
+        prepare_recovery_workspace(&directory);
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let context =
+            capture_index_journal_recovery_context(&lock, PackageValidationContext::default())
+                .expect("capture lock-bound recovery context");
+        let store = IndexOperationJournalStore::new(&lock);
+        let journal = journal();
+        let index_directory = lock.package_directory().join(".sai/index");
+        write_snapshot(&index_directory, &journal.index_before);
+        write_current_journal(&index_directory, &journal);
+        let FileState::RegularFile(source_after) = &journal.sources[0].planned_after else {
+            panic!("planned source is regular");
+        };
+        fs::write(directory.0.join("src/lib.sai"), source_after)
+            .expect("write planned source before header publication");
+        let FileState::RegularFile(package_after) = &journal.index_after.package_files[0].state
+        else {
+            panic!("after package file is regular");
+        };
+        let package_path = index_directory.join(journal.index_after.package_files[0].file.as_str());
+        fs::write(&package_path, package_after).expect("publish package file before header");
+        let before_header =
+            fs::read(index_directory.join("index.json")).expect("read before header");
+        let journal_before =
+            fs::read(index_directory.join("operation.json")).expect("read journal");
+        let external_package_edit = b"external package-index edit";
+
+        let error = store
+            .publish_index_header_if_package_files_after_with_hook(&journal, &context, || {
+                fs::write(&package_path, external_package_edit)
+                    .expect("change package bytes after initial scan");
+            })
+            .expect_err("a changed package file must prevent header publication");
+
+        assert!(matches!(
+            error,
+            IndexOperationJournalStoreError::IndexFileChanged
+        ));
+        assert_eq!(
+            fs::read(index_directory.join("index.json")).expect("read unchanged header"),
+            before_header
+        );
+        assert_eq!(
+            fs::read(&package_path).expect("read preserved external package edit"),
+            external_package_edit
+        );
+        assert_eq!(
+            fs::read(index_directory.join("operation.json")).expect("read unchanged journal"),
+            journal_before
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn header_publication_rechecks_sources_after_the_package_scan() {
+        let directory = TestDirectory::new();
+        prepare_recovery_workspace(&directory);
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let context =
+            capture_index_journal_recovery_context(&lock, PackageValidationContext::default())
+                .expect("capture lock-bound recovery context");
+        let store = IndexOperationJournalStore::new(&lock);
+        let journal = journal();
+        let index_directory = lock.package_directory().join(".sai/index");
+        write_snapshot(&index_directory, &journal.index_before);
+        write_current_journal(&index_directory, &journal);
+        let FileState::RegularFile(package_after) = &journal.index_after.package_files[0].state
+        else {
+            panic!("after package file is regular");
+        };
+        fs::write(
+            index_directory.join(journal.index_after.package_files[0].file.as_str()),
+            package_after,
+        )
+        .expect("publish package file before header");
+        let FileState::RegularFile(source_after) = &journal.sources[0].planned_after else {
+            panic!("planned source is regular");
+        };
+        let source_path = directory.0.join("src/lib.sai");
+        fs::write(&source_path, source_after).expect("write planned source");
+        let before_header =
+            fs::read(index_directory.join("index.json")).expect("read before header");
+        let journal_before =
+            fs::read(index_directory.join("operation.json")).expect("read journal");
+        let unexpected_source = b"external source edit after index readiness scan";
+
+        let error = store
+            .publish_index_header_if_package_files_after_with_hook(&journal, &context, || {
+                fs::write(&source_path, unexpected_source)
+                    .expect("change source after the package readiness scan");
+            })
+            .expect_err("a changed source must prevent header publication");
+
+        assert!(matches!(
+            error,
+            IndexOperationJournalStoreError::PlannedAfterSourceFilesNotReady
+        ));
+        assert_eq!(
+            fs::read(index_directory.join("index.json")).expect("read unchanged header"),
+            before_header
+        );
+        assert_eq!(
+            fs::read(&source_path).expect("read preserved external source edit"),
+            unexpected_source
+        );
+        assert_eq!(
+            fs::read(index_directory.join("operation.json")).expect("read unchanged journal"),
+            journal_before
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn header_publication_rejects_a_replaced_index_directory() {
+        let directory = TestDirectory::new();
+        prepare_recovery_workspace(&directory);
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let context =
+            capture_index_journal_recovery_context(&lock, PackageValidationContext::default())
+                .expect("capture lock-bound recovery context");
+        let store = IndexOperationJournalStore::new(&lock);
+        let journal = journal();
+        let index_directory = lock.package_directory().join(".sai/index");
+        write_snapshot(&index_directory, &journal.index_before);
+        write_current_journal(&index_directory, &journal);
+        let FileState::RegularFile(source_after) = &journal.sources[0].planned_after else {
+            panic!("planned source is regular");
+        };
+        fs::write(directory.0.join("src/lib.sai"), source_after)
+            .expect("write planned source before replacing the index directory");
+        let FileState::RegularFile(package_after) = &journal.index_after.package_files[0].state
+        else {
+            panic!("after package file is regular");
+        };
+        fs::write(
+            index_directory.join(journal.index_after.package_files[0].file.as_str()),
+            package_after,
+        )
+        .expect("publish package file before header");
+        let before_header =
+            fs::read(index_directory.join("index.json")).expect("read before header");
+        let retired_index_directory = lock.package_directory().join(".sai/index-retired");
+
+        let error = store
+            .publish_index_header_if_package_files_after_with_hook(&journal, &context, || {
+                fs::rename(&index_directory, &retired_index_directory)
+                    .expect("move the observed index directory");
+                fs::create_dir(&index_directory).expect("replace the index directory");
+            })
+            .expect_err("a replaced index directory must prevent header publication");
+
+        assert!(matches!(
+            error,
+            IndexOperationJournalStoreError::IndexFileChanged
+        ));
+        assert!(!index_directory.join("index.json").exists());
+        assert_eq!(
+            fs::read(retired_index_directory.join("index.json"))
+                .expect("read retained original header"),
+            before_header
+        );
+        assert!(retired_index_directory.join("operation.json").exists());
     }
 
     #[cfg(windows)]
