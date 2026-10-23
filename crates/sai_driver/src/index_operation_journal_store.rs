@@ -13,7 +13,7 @@ use sai_windows_fs::{
     open_child_directory_for_file_updates_without_following,
     open_child_directory_without_following, open_file_without_following,
     remove_file_in_directory_if_identity, remove_file_in_directory_if_unchanged,
-    replace_file_in_directory_if_unchanged, sync_directory,
+    replace_file_in_directory_if_unchanged, sync_directory, visit_directory_entry_names,
 };
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
@@ -158,6 +158,7 @@ impl<'lock> IndexOperationJournalStore<'lock> {
                     io::Error::from(io::ErrorKind::NotFound),
                 )
             })?;
+        self.cleanup_staged_files(&index_directory)?;
         if self.read_current(&index_directory)?.is_some() {
             return Err(IndexOperationJournalStoreError::JournalAlreadyExists);
         }
@@ -201,6 +202,7 @@ impl<'lock> IndexOperationJournalStore<'lock> {
         let index_directory = self
             .open_index_directory_for_mutation(false)?
             .ok_or(IndexOperationJournalStoreError::JournalChanged)?;
+        self.cleanup_staged_files(&index_directory)?;
         let Some(current) = self.read_current(&index_directory)? else {
             return Err(IndexOperationJournalStoreError::JournalChanged);
         };
@@ -246,6 +248,7 @@ impl<'lock> IndexOperationJournalStore<'lock> {
         let Some(index_directory) = self.open_index_directory_for_mutation(false)? else {
             return Ok(false);
         };
+        self.cleanup_staged_files(&index_directory)?;
         let Some(current) = self.read_current(&index_directory)? else {
             return Ok(false);
         };
@@ -261,6 +264,52 @@ impl<'lock> IndexOperationJournalStore<'lock> {
         .map_err(|source| self.io_error(self.journal_path(), source))?;
         self.sync_index_directory(&index_directory)?;
         Ok(true)
+    }
+
+    /// Best-effort removal of crash-left journal staging files.
+    ///
+    /// Only exact lowercase staging names are considered. Entries are opened
+    /// relative to the already-open index directory without following links,
+    /// and only regular files with one link are removed. Candidates that
+    /// cannot be verified or removed are preserved. Enumeration and directory
+    /// flush errors still fail the store operation.
+    fn cleanup_staged_files(
+        &self,
+        index_directory: &File,
+    ) -> Result<(), IndexOperationJournalStoreError> {
+        self.require_exclusive()?;
+        let index_path = self.index_directory_path();
+        let mut removed_any = false;
+        let enumeration = visit_directory_entry_names(index_directory, |name| {
+            if !is_staged_file_name(name) {
+                return Ok(());
+            }
+
+            let file = match open_file_without_following(index_directory, &index_path, name) {
+                Ok(file) => file,
+                // Staging-looking symlinks, directories, and entries changed
+                // by an external actor are not cleanup targets.
+                Err(_) => return Ok(()),
+            };
+            if !matches!(has_one_link(&file), Ok(true)) {
+                return Ok(());
+            }
+            let Ok(identity) = file_identity(&file) else {
+                return Ok(());
+            };
+            drop(file);
+
+            if remove_file_in_directory_if_identity(index_directory, name, identity).is_ok() {
+                removed_any = true;
+            }
+            Ok(())
+        });
+
+        if removed_any {
+            self.sync_index_directory(index_directory)?;
+        }
+        enumeration.map_err(|source| self.io_error(index_path, source))?;
+        Ok(())
     }
 
     fn require_exclusive(&self) -> Result<(), IndexOperationJournalStoreError> {
@@ -508,6 +557,42 @@ fn random_temporary_name() -> io::Result<OsString> {
     Ok(OsString::from(format!(".operation-{hex}.tmp")))
 }
 
+fn is_staged_file_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(hex) = name
+        .strip_prefix(".operation-")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    hex.len() == 32
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn has_one_link(file: &File) -> io::Result<bool> {
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        Ok(metadata.nlink() == 1)
+    }
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        Ok(sai_windows_fs::number_of_links(file)? == 1)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = metadata;
+        Ok(false)
+    }
+}
+
 fn read_bounded_file(
     file: &mut File,
     path: &Path,
@@ -568,6 +653,7 @@ fn read_bounded_file(
 
 #[cfg(test)]
 mod tests {
+    use super::is_staged_file_name;
     use super::{IndexOperationJournalStore, IndexOperationJournalStoreError, read_bounded_file};
     use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
     use sai_semantic::{
@@ -734,6 +820,90 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn recognizes_only_canonical_staging_names() {
+        assert!(is_staged_file_name(std::ffi::OsStr::new(
+            ".operation-0123456789abcdef0123456789abcdef.tmp"
+        )));
+        for name in [
+            ".operation-0123456789abcdef0123456789abcdeg.tmp",
+            ".operation-0123456789ABCDEF0123456789ABCDEF.tmp",
+            ".operation-0123456789abcdef0123456789abcdef.TMP",
+            ".operation-0123456789abcdef0123456789abcdef.tmp.extra",
+            ".operation-0123456789abcdef0123456789abcde.tmp",
+            "operation-0123456789abcdef0123456789abcdef.tmp",
+        ] {
+            assert!(!is_staged_file_name(std::ffi::OsStr::new(name)), "{name}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_prepared_removes_only_single_link_staging_orphans() {
+        use std::os::unix::fs::symlink;
+
+        let directory = TestDirectory::new();
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let index_directory = lock.package_directory().join(".sai").join("index");
+        fs::create_dir_all(&index_directory).unwrap();
+
+        let stale = ".operation-0123456789abcdef0123456789abcdef.tmp";
+        fs::write(index_directory.join(stale), b"interrupted staging bytes").unwrap();
+        let near_match = ".operation-0123456789abcdef0123456789abcdef.tmp.extra";
+        fs::write(index_directory.join(near_match), b"preserve").unwrap();
+        let hard_link = ".operation-1123456789abcdef0123456789abcdef.tmp";
+        fs::write(index_directory.join("linked-data"), b"preserve").unwrap();
+        fs::hard_link(
+            index_directory.join("linked-data"),
+            index_directory.join(hard_link),
+        )
+        .unwrap();
+        let symlink_name = ".operation-2123456789abcdef0123456789abcdef.tmp";
+        symlink("linked-data", index_directory.join(symlink_name)).unwrap();
+        let directory_name = ".operation-3123456789abcdef0123456789abcdef.tmp";
+        fs::create_dir(index_directory.join(directory_name)).unwrap();
+
+        let store = IndexOperationJournalStore::new(&lock);
+        store.write_prepared(&journal()).unwrap();
+
+        assert!(!index_directory.join(stale).exists());
+        assert!(index_directory.join(near_match).exists());
+        assert!(index_directory.join(hard_link).exists());
+        assert!(
+            index_directory
+                .join(symlink_name)
+                .symlink_metadata()
+                .is_ok()
+        );
+        assert!(index_directory.join(directory_name).is_dir());
+        assert_eq!(
+            fs::read(index_directory.join("linked-data")).unwrap(),
+            b"preserve"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_orphan_cleanup_is_not_run_with_a_shared_lock() {
+        let directory = TestDirectory::new();
+        let index_directory = directory.0.join(".sai").join("index");
+        fs::create_dir_all(&index_directory).unwrap();
+        let stale = ".operation-0123456789abcdef0123456789abcdef.tmp";
+        fs::write(index_directory.join(stale), b"preserve under shared lock").unwrap();
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Shared).unwrap();
+
+        let store = IndexOperationJournalStore::new(&lock);
+        assert!(store.read().unwrap().is_none());
+        assert!(matches!(
+            store.write_prepared(&journal()),
+            Err(IndexOperationJournalStoreError::LockNotExclusive)
+        ));
+        assert_eq!(
+            fs::read(index_directory.join(stale)).unwrap(),
+            b"preserve under shared lock"
+        );
     }
 
     #[cfg(windows)]
