@@ -1,0 +1,33 @@
+use acme:home-energy-bill-auditor/model.{PriceModel, RatePlan}
+
+pub fn flat_solar() -> RatePlan {
+    RatePlan(
+        id: "FLAT-SOLAR",
+        model: PriceModel.Flat,
+        service_charge_cents: 900,
+        flat_rate_cents_per_kwh: 15,
+        peak_rate_cents_per_kwh: 0,
+        off_peak_rate_cents_per_kwh: 0,
+        export_credit_cents_per_kwh: 4,
+        demand_charge_cents_per_kw: 0,
+        tax_percent: 5,
+    )
+}
+
+pub fn time_of_use_solar() -> RatePlan {
+    RatePlan(
+        id: "TOU-SOLAR",
+        model: PriceModel.TimeOfUse,
+        service_charge_cents: 900,
+        flat_rate_cents_per_kwh: 0,
+        peak_rate_cents_per_kwh: 19,
+        off_peak_rate_cents_per_kwh: 8,
+        export_credit_cents_per_kwh: 4,
+        demand_charge_cents_per_kw: 600,
+        tax_percent: 5,
+    )
+}
+
+pub fn comparison_plans() -> Array<RatePlan, 2> {
+    [flat_solar(), time_of_use_solar()]
+}

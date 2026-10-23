@@ -1,0 +1,41 @@
+use acme:home-energy-bill-auditor/model.{UsageProfile}
+
+pub fn solar_household() -> UsageProfile {
+    UsageProfile(
+        account_id: "SOLAR-17",
+        peak_kwh: 150,
+        off_peak_kwh: 450,
+        exported_kwh: 50,
+        peak_demand_kw: 3,
+    )
+}
+
+pub fn peak_heavy_household() -> UsageProfile {
+    UsageProfile(
+        account_id: "PEAK-42",
+        peak_kwh: 500,
+        off_peak_kwh: 100,
+        exported_kwh: 0,
+        peak_demand_kw: 12,
+    )
+}
+
+pub fn export_only_profile() -> UsageProfile {
+    UsageProfile(
+        account_id: "EXPORT-ONLY",
+        peak_kwh: 0,
+        off_peak_kwh: 1,
+        exported_kwh: 100,
+        peak_demand_kw: 0,
+    )
+}
+
+pub fn over_limit_profile() -> UsageProfile {
+    UsageProfile(
+        account_id: "OVER-LIMIT",
+        peak_kwh: 7_000,
+        off_peak_kwh: 4_000,
+        exported_kwh: 0,
+        peak_demand_kw: 1,
+    )
+}

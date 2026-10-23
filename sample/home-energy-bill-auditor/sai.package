@@ -1,0 +1,5 @@
+package acme:home-energy-bill-auditor @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Compare fixed electricity tariffs with export credits and demand charges"

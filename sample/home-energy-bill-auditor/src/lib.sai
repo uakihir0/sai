@@ -1,0 +1,19 @@
+use acme:home-energy-bill-auditor/model.{
+    BillError
+    BillQuote
+    PlanComparison
+    RatePlan
+    UsageProfile
+}
+use acme:home-energy-bill-auditor/quote
+
+pub fn quote_plan(usage: UsageProfile, plan: RatePlan) -> Result<BillQuote, BillError> {
+    quote.quote(usage, plan)
+}
+
+pub fn compare_plans(usage: UsageProfile, plans: Array<RatePlan, 2>) -> Result<
+    PlanComparison,
+    BillError,
+> {
+    quote.compare(usage, plans)
+}
