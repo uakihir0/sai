@@ -1,0 +1,96 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum TicketKind {
+    General
+    Student
+    Complimentary
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PaymentStatus {
+    Captured
+    Refunded
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Finding {
+    DuplicatePayment
+    MissingPayment
+    AmountMismatch
+    FeeExceedsCapture
+    RefundReview
+    DuplicateAdmission
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Ticket {
+    pub id: U32
+    pub kind: TicketKind
+    pub face_value_cents: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TicketOrder {
+    pub id: U32
+    pub buyer: Str
+    pub tickets: Array<Option<Ticket>, 2>
+    pub ticket_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Payment {
+    pub order_id: U32
+    pub captured_cents: U32
+    pub processor_fee_cents: U32
+    pub refund_cents: U32
+    pub status: PaymentStatus
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type GateScan {
+    pub ticket_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PaymentTotals {
+    pub record_count: USize
+    pub captured_cents: U32
+    pub processor_fee_cents: U32
+    pub refund_cents: U32
+    pub status: Option<PaymentStatus>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type OrderAudit {
+    pub order_id: U32
+    pub buyer: Str
+    pub ticket_count: USize
+    pub face_value_cents: U32
+    pub payment_count: USize
+    pub captured_cents: U32
+    pub processor_fee_cents: U32
+    pub refund_cents: U32
+    pub finding: Option<Finding>
+    pub releasable_cents: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditSummary {
+    pub orders_reviewed: USize
+    pub orders_released: USize
+    pub orders_held: USize
+    pub unmatched_payment_count: USize
+    pub unmatched_payment_cents: U32
+    pub unknown_scan_count: USize
+    pub repeatedly_scanned_ticket_count: USize
+    pub captured_cents: U32
+    pub processor_fee_cents: U32
+    pub refund_cents: U32
+    pub releasable_cents: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SettlementAudit {
+    pub orders: Array<Option<OrderAudit>, 4>
+    pub order_count: USize
+    pub summary: AuditSummary
+}

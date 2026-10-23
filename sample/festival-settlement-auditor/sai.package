@@ -1,0 +1,5 @@
+package acme:festival-settlement-auditor @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Reconcile festival ticket sales, admission scans, and processor settlements"

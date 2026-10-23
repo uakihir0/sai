@@ -1,0 +1,93 @@
+use acme:festival-settlement-auditor/model.{
+    GateScan
+    Payment
+    PaymentStatus
+    Ticket
+    TicketKind
+    TicketOrder
+}
+
+pub fn orders() -> Array<TicketOrder, 4> {
+    [
+        TicketOrder(
+            id: 5011,
+            buyer: "Aki",
+            tickets: [
+                Some(Ticket(id: 101, kind: TicketKind.General, face_value_cents: 5000)),
+                Some(Ticket(id: 102, kind: TicketKind.Student, face_value_cents: 3500)),
+            ],
+            ticket_count: 2,
+        ),
+        TicketOrder(
+            id: 5012,
+            buyer: "Ben",
+            tickets: [
+                Some(Ticket(id: 103, kind: TicketKind.General, face_value_cents: 5000)),
+                None,
+            ],
+            ticket_count: 1,
+        ),
+        TicketOrder(
+            id: 5013,
+            buyer: "Chika",
+            tickets: [
+                Some(Ticket(id: 104, kind: TicketKind.Complimentary, face_value_cents: 0)),
+                None,
+            ],
+            ticket_count: 1,
+        ),
+        TicketOrder(
+            id: 5014,
+            buyer: "Dai",
+            tickets: [
+                Some(Ticket(id: 105, kind: TicketKind.General, face_value_cents: 5000)),
+                None,
+            ],
+            ticket_count: 1,
+        ),
+    ]
+}
+
+pub fn payments() -> Array<Payment, 4> {
+    [
+        Payment(
+            order_id: 5011,
+            captured_cents: 8500,
+            processor_fee_cents: 290,
+            refund_cents: 0,
+            status: PaymentStatus.Captured,
+        ),
+        Payment(
+            order_id: 5012,
+            captured_cents: 5000,
+            processor_fee_cents: 175,
+            refund_cents: 500,
+            status: PaymentStatus.Refunded,
+        ),
+        Payment(
+            order_id: 5014,
+            captured_cents: 5500,
+            processor_fee_cents: 190,
+            refund_cents: 0,
+            status: PaymentStatus.Captured,
+        ),
+        Payment(
+            order_id: 9999,
+            captured_cents: 2000,
+            processor_fee_cents: 60,
+            refund_cents: 0,
+            status: PaymentStatus.Captured,
+        ),
+    ]
+}
+
+pub fn scans() -> Array<GateScan, 6> {
+    [
+        GateScan(ticket_id: 101),
+        GateScan(ticket_id: 102),
+        GateScan(ticket_id: 103),
+        GateScan(ticket_id: 104),
+        GateScan(ticket_id: 104),
+        GateScan(ticket_id: 999),
+    ]
+}
