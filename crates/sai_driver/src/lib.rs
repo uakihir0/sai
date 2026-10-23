@@ -24861,10 +24861,10 @@ mod tests {
     }
 
     #[test]
-    fn module_symbol_inventory_collects_functions_and_constants_with_stable_metadata() {
+    fn module_symbol_inventory_collects_functions_constants_and_effects_with_stable_metadata() {
         let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
-            b"fn root_fn() {}\nconst ROOT_VALUE: I32 = 7\n",
-            b"const CHILD_VALUE: I32 = 13\n",
+            b"fn root_fn() {}\nconst ROOT_VALUE: I32 = 7\neffect audit\n",
+            b"const CHILD_VALUE: I32 = 13\neffect telemetry\n",
             "wasm32-core",
         );
         let inventory = inventory_symbols(&collection);
@@ -24884,6 +24884,11 @@ mod tests {
                 (
                     "acme:phase1/child.CHILD_VALUE",
                     sai_semantic::SymbolKind::Const
+                ),
+                ("acme:phase1.audit", sai_semantic::SymbolKind::Effect),
+                (
+                    "acme:phase1/child.telemetry",
+                    sai_semantic::SymbolKind::Effect
                 ),
             ]
             .into_iter()
@@ -24906,11 +24911,25 @@ mod tests {
                 TopLevelOwnerKind::Const,
             ),
             (
+                module_tree.modules[0].file,
+                "audit",
+                "acme:phase1.audit",
+                sai_semantic::SymbolKind::Effect,
+                TopLevelOwnerKind::Effect,
+            ),
+            (
                 module_tree.modules[1].file,
                 "CHILD_VALUE",
                 "acme:phase1/child.CHILD_VALUE",
                 sai_semantic::SymbolKind::Const,
                 TopLevelOwnerKind::Const,
+            ),
+            (
+                module_tree.modules[1].file,
+                "telemetry",
+                "acme:phase1/child.telemetry",
+                sai_semantic::SymbolKind::Effect,
+                TopLevelOwnerKind::Effect,
             ),
         ] {
             let symbol = inventory
@@ -24935,8 +24954,15 @@ mod tests {
                     let Some(component) = path.data().last() else {
                         return false;
                     };
-                    let DefPathData::ValueNs(symbol) = component.data else {
-                        return false;
+                    let symbol = match (kind, &component.data) {
+                        (
+                            sai_semantic::SymbolKind::Fn | sai_semantic::SymbolKind::Const,
+                            DefPathData::ValueNs(symbol),
+                        )
+                        | (sai_semantic::SymbolKind::Effect, DefPathData::Effect(symbol)) => {
+                            *symbol
+                        }
+                        _ => return false,
                     };
                     database
                         .symbols
@@ -24990,7 +25016,25 @@ mod tests {
                         .expect("the constant has its declared name token");
                     (declaration.syntax().clone(), name_token)
                 }
-                _ => unreachable!("the mixed fixture contains only functions and constants"),
+                sai_semantic::SymbolKind::Effect => {
+                    let declaration = parsed
+                        .root
+                        .descendants()
+                        .find_map(ast::EffectDecl::cast)
+                        .filter(|effect| {
+                            effect
+                                .name()
+                                .and_then(|name| name.token())
+                                .is_some_and(|token| token.text() == name)
+                        })
+                        .expect("the module contains the expected effect declaration");
+                    let name_token = declaration
+                        .name()
+                        .and_then(|name| name.token())
+                        .expect("the effect has its declared name token");
+                    (declaration.syntax().clone(), name_token)
+                }
+                _ => unreachable!("the mixed fixture contains supported module-level symbols"),
             };
             let expected_fingerprint =
                 sai_semantic::declaration_fingerprint(kind, &declaration, Some(&name_token))
@@ -25002,7 +25046,7 @@ mod tests {
     #[test]
     fn module_function_inventory_filters_by_target_and_rejects_target_errors() {
         let (_, _, _, wasm32) = collect_package_inventory_for_target(
-            b"@target(\"wasm64-core\")\nfn target_only() {}\n@target(\"wasm64-core\")\nconst TARGET_VALUE: Bool = true\n",
+            b"@target(\"wasm64-core\")\nfn target_only() {}\n@target(\"wasm64-core\")\nconst TARGET_VALUE: Bool = true\n@target(\"wasm64-core\")\neffect target_audit\n",
             b"",
             "wasm32-core",
         );
@@ -25014,7 +25058,7 @@ mod tests {
         assert!(wasm32_inventory.symbols().is_empty());
 
         let (_, _, _, wasm64) = collect_package_inventory_for_target(
-            b"@target(\"wasm64-core\")\nfn target_only() {}\n@target(\"wasm64-core\")\nconst TARGET_VALUE: Bool = true\n",
+            b"@target(\"wasm64-core\")\nfn target_only() {}\n@target(\"wasm64-core\")\nconst TARGET_VALUE: Bool = true\n@target(\"wasm64-core\")\neffect target_audit\n",
             b"",
             "wasm64-core",
         );
@@ -25029,7 +25073,11 @@ mod tests {
                 .iter()
                 .map(|symbol| symbol.path())
                 .collect::<Vec<_>>(),
-            ["acme:phase1.target_only", "acme:phase1.TARGET_VALUE"]
+            [
+                "acme:phase1.target_only",
+                "acme:phase1.TARGET_VALUE",
+                "acme:phase1.target_audit"
+            ]
         );
         assert_eq!(
             wasm64_inventory
@@ -25040,9 +25088,18 @@ mod tests {
                 .kind(),
             sai_semantic::SymbolKind::Const
         );
+        assert_eq!(
+            wasm64_inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == "acme:phase1.target_audit")
+                .expect("the target-selected effect is inventoried")
+                .kind(),
+            sai_semantic::SymbolKind::Effect
+        );
 
         let (_, _, _, invalid_target) = collect_package_inventory_for_target(
-            b"@target(\"wasm32-linux\")\nconst UNCERTAIN_VALUE: Bool = true\n",
+            b"@target(\"wasm32-linux\")\neffect uncertain_audit\n",
             b"",
             "wasm32-core",
         );
@@ -25060,7 +25117,7 @@ mod tests {
             (&b"fn generic<T>() {}\n"[..], "generic function"),
             (
                 &b"type Marker {}\n"[..],
-                "outside the function-and-constant inventory",
+                "outside the function-constant-effect inventory",
             ),
         ] {
             let (_, _, _, collection) =
@@ -25085,6 +25142,18 @@ mod tests {
             b"",
             "wasm32-core",
         );
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("syntax tree contains recovery or parse errors")
+        ));
+    }
+
+    #[test]
+    fn module_symbol_inventory_fails_closed_for_malformed_effect_tokens() {
+        let (_, _, _, collection) =
+            collect_package_inventory_for_target(b"effect 1__2\n", b"", "wasm32-core");
         let inventory = inventory_symbols(&collection);
         assert!(matches!(
             inventory.coverage(),
@@ -25126,6 +25195,37 @@ mod tests {
         assert_ne!(
             original, changed_initializer,
             "the initializer contributes to the fingerprint"
+        );
+    }
+
+    #[test]
+    fn module_effect_fingerprint_ignores_name_and_tracks_covers() {
+        let fingerprint_for = |source: &[u8]| {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert_eq!(
+                inventory.coverage(),
+                &sai_semantic::InventoryCoverage::Complete
+            );
+            inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind() == sai_semantic::SymbolKind::Effect)
+                .expect("the fixture effect is inventoried")
+                .fingerprint()
+        };
+        let original = fingerprint_for(b"effect original\n");
+        let renamed = fingerprint_for(b"effect renamed\n");
+        let changed_covers = fingerprint_for(b"effect original\n    covers { alloc }\n");
+
+        assert_eq!(
+            original, renamed,
+            "renaming preserves the effect declaration fingerprint"
+        );
+        assert_ne!(
+            original, changed_covers,
+            "the covers clause contributes to the effect fingerprint"
         );
     }
 
