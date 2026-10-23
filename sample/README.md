@@ -58,10 +58,13 @@ source repository before a package resolver can fetch them.
 | Advanced | [`museum-loan-readiness-review`](museum-loan-readiness-review/README.md) | Audit incoming museum loans for duplicate accessions, lender documents, condition, insurance, shipping crates, gallery humidity, and scarce display capacity. |
 | Advanced | [`community-solar-credit-auditor`](community-solar-credit-auditor/README.md) | Reconcile shared solar generation against subscriber demand, contract caps, utility statements, and data-quality exceptions. |
 | Advanced | [`festival-settlement-auditor`](festival-settlement-auditor/README.md) | Reconcile multi-ticket festival orders with processor captures, fees, refunds, and admission scans; release only records that pass checks. |
+| Advanced | [`school-meal-service-planner`](school-meal-service-planner/README.md) | Choose an affordable school menu while checking allergy exclusions, nutrition bands, dated inventory, and kitchen capacity. |
+| Advanced | [`digital-evidence-custody-auditor`](digital-evidence-custody-auditor/README.md) | Audit a custody event stream for actor permissions, seal and storage transitions, timestamp regressions, and final disposition. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or
 persistent state. `quota-ledger` is a pure library with generated property
 cases instead of a command-line workflow. Each project README lists the
 language features it illustrates and the compiler stages that are still
-needed to build and run it.
+needed to build and run it. Fixture policy choices that merit domain review
+are called out with their reasons in each sample's **Review required** section.
