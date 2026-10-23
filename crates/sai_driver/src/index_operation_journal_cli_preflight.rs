@@ -303,6 +303,10 @@ mod tests {
         CliIndexJournalPreflight, CliIndexJournalPreflightError, CliIndexJournalRecovery,
         preflight_cli_index_operation_journal,
     };
+    use crate::index_operation_journal_recovery::{
+        IndexJournalRecoveryAmbiguity, IndexJournalRecoveryDecision,
+    };
+    use crate::index_operation_journal_validation::IndexJournalRecoveryContextError;
     use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
     use sai_semantic::{
         FileState, IndexJournalOrigin, IndexJournalState, IndexOperationJournal, IndexSnapshot,
@@ -678,9 +682,18 @@ mod tests {
         let journal_path = workspace.0.join(".sai/index/operation.json");
         let original_journal = fs::read(&journal_path).expect("read original journal");
 
+        // Platforms without open root-directory identity support cannot
+        // authenticate this workspace yet; supported platforms must classify
+        // the third-party bytes as ambiguous. Both outcomes preserve state.
         assert!(matches!(
             preflight(&lock),
-            Err(CliIndexJournalPreflightError::RecoveryRequired { .. })
+            Err(CliIndexJournalPreflightError::RecoveryContext(
+                IndexJournalRecoveryContextError::LockedWorkspaceRootIdentityUnsupported
+            )) | Err(CliIndexJournalPreflightError::RecoveryRequired {
+                decision: IndexJournalRecoveryDecision::Ambiguous(
+                    IndexJournalRecoveryAmbiguity::UnexpectedSourceState
+                )
+            })
         ));
         assert_eq!(fs::read(journal_path).unwrap(), original_journal);
         assert_eq!(
