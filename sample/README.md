@@ -33,6 +33,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`incident-response-console`](incident-response-console/README.md) | Score incidents, apply response deadlines, and identify SLA breaches and escalations. |
 | Advanced | [`island-grid-dispatch`](island-grid-dispatch/README.md) | Allocate a constrained one-hour power budget by criticality while preserving a battery reserve. |
 | Advanced | [`clinic-shift-roster`](clinic-shift-roster/README.md) | Validate clinician credentials, availability, shift caps, rest periods, and required coverage. |
+| Advanced | [`court-calendar-planner`](court-calendar-planner/README.md) | Schedule fixed hearings around deadlines, judges, courtrooms, parties, witnesses, and session capacity; report unscheduled cases. |
 | Advanced | [`community-food-bank`](community-food-bank/README.md) | Allocate expiring pantry stock across household requests with dietary eligibility and priority rules. |
 | Advanced | [`warehouse-fulfillment`](warehouse-fulfillment/README.md) | Reserve date-eligible inventory for prioritized orders, then choose a warehouse and route under cold-chain, delivery-deadline, and lane-capacity constraints. |
 | Advanced | [`rail-shuttle-dispatch`](rail-shuttle-dispatch/README.md) | Assign a fixed replacement-bus fleet to disrupted transit services under corridor, passenger-capacity, and wheelchair-space constraints; report unresolved requests deterministically. |
@@ -55,6 +56,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`wildlife-rescue-dispatch`](wildlife-rescue-dispatch/README.md) | Triage wildlife rescue calls and place animals at qualified clinics under permit, veterinarian, travel-radius, intake-slot, and treatment-hour constraints. |
 | Advanced | [`museum-loan-readiness-review`](museum-loan-readiness-review/README.md) | Audit incoming museum loans for duplicate accessions, lender documents, condition, insurance, shipping crates, gallery humidity, and scarce display capacity. |
 | Advanced | [`community-solar-credit-auditor`](community-solar-credit-auditor/README.md) | Reconcile shared solar generation against subscriber demand, contract caps, utility statements, and data-quality exceptions. |
+| Advanced | [`festival-settlement-auditor`](festival-settlement-auditor/README.md) | Reconcile multi-ticket festival orders with processor captures, fees, refunds, and admission scans; release only records that pass checks. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or
