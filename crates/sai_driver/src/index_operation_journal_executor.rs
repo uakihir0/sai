@@ -914,7 +914,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn restore_before_restores_only_the_header_and_keeps_the_journal() {
@@ -1011,7 +1017,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn restore_before_removes_a_header_whose_before_state_was_absent() {
@@ -1058,7 +1070,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn before_header_is_an_idempotent_noop_for_restore_before() {
@@ -1084,7 +1102,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn restore_package_file_changes_only_the_selected_file_after_header_restore() {
@@ -1193,7 +1217,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn package_restore_waits_for_the_before_header() {
@@ -1246,7 +1276,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn changed_header_after_observation_prevents_package_restore() {
@@ -1312,7 +1348,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn third_party_package_file_after_observation_is_preserved() {
@@ -1371,7 +1413,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn replaced_journal_after_observation_prevents_package_restore() {
@@ -1431,7 +1479,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn package_restore_removes_a_file_whose_before_state_was_absent() {
@@ -1480,7 +1534,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn stale_or_non_restore_decisions_do_not_change_the_header() {
@@ -1542,7 +1602,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn third_party_header_after_observation_is_preserved_as_a_conflict() {
@@ -1583,7 +1649,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn changed_journal_after_observation_prevents_header_update() {
@@ -1626,7 +1698,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn clear_before_rejected_and_committed_decisions_are_executed() {
@@ -1678,7 +1756,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn recovery_decisions_outside_clear_only_slice_are_reported_without_mutation() {
@@ -1735,7 +1819,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn second_observation_that_changes_the_decision_prevents_clear() {
@@ -1766,7 +1856,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn current_journal_race_is_rejected_after_fresh_observation() {
@@ -1799,7 +1895,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn restore_before_changes_only_the_selected_source_and_keeps_the_journal() {
@@ -1846,7 +1948,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn already_before_source_is_a_noop_while_other_after_source_remains() {
@@ -1879,7 +1987,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn changed_fresh_plan_and_invalid_source_index_do_not_mutate() {
@@ -1940,7 +2054,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn source_state_changed_after_observation_is_preserved_as_a_conflict() {
@@ -1983,7 +2103,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn source_parent_replaced_by_symlink_after_observation_cannot_redirect_restore() {
@@ -2031,7 +2157,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn changed_journal_after_observation_prevents_source_update() {
@@ -2080,7 +2212,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn restoring_to_absence_removes_only_the_selected_source() {
@@ -2115,7 +2253,13 @@ mod tests {
 
     #[cfg(all(
         unix,
-        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
     ))]
     #[test]
     fn journal_removed_after_observation_is_unconfirmed_and_never_successful() {
