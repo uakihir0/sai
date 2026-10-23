@@ -2,9 +2,9 @@
 //!
 //! Recovery planning is read-only. This module re-observes the workspace
 //! immediately before acting. It can clear confirmed terminal decisions,
-//! restore one source file or the index header, and restore one affected
-//! package-index file after the before header is current. Index commit, journal
-//! transitions, complete verification, and final clearing remain later slices.
+//! restore one source file or index file, and coordinate a complete CLI
+//! rollback through before-state verification and journal clearing. Index
+//! commit, journal transitions, and forward recovery remain later slices.
 
 use crate::index_operation_journal_recovery::{
     IndexJournalRecoveryDecision, ObservedFileState as PlannerObservedFileState,
@@ -98,6 +98,29 @@ pub enum IndexJournalPackageRestoreExecution {
     Restored,
 }
 
+/// Result of completing a `RestoreBefore` decision and clearing its journal.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IndexJournalRestoreBeforeExecution {
+    /// A fresh observation no longer matches the decision used for an action.
+    DecisionChanged {
+        planned: IndexJournalRecoveryDecision,
+        observed: IndexJournalRecoveryDecision,
+    },
+    /// The current decision is not eligible for CLI before-state restoration.
+    NotRestorable {
+        decision: IndexJournalRecoveryDecision,
+    },
+    /// The package rollback precondition no longer has the before header.
+    HeaderNotBefore,
+    /// All restore steps returned, but a fresh observation did not verify the
+    /// complete before state, so the journal was retained.
+    NotVerified {
+        decision: IndexJournalRecoveryDecision,
+    },
+    /// The complete before state was freshly verified and the journal cleared.
+    Cleared,
+}
+
 /// Failure while resolving or conditionally restoring one journal source.
 #[derive(Debug)]
 pub enum IndexJournalSourceRestoreError {
@@ -140,6 +163,43 @@ impl From<IndexOperationJournalStoreError> for IndexJournalSourceRestoreError {
 impl From<LocalPackageSourceFileUpdateError> for IndexJournalSourceRestoreError {
     fn from(error: LocalPackageSourceFileUpdateError) -> Self {
         Self::SourceUpdate(error)
+    }
+}
+
+/// Failure while coordinating a complete `RestoreBefore` operation.
+#[derive(Debug)]
+pub enum IndexJournalRestoreBeforeError {
+    Store(IndexOperationJournalStoreError),
+    SourceRestore(IndexJournalSourceRestoreError),
+}
+
+impl fmt::Display for IndexJournalRestoreBeforeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "index journal rollback did not complete: {self:?}"
+        )
+    }
+}
+
+impl Error for IndexJournalRestoreBeforeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Store(source) => Some(source),
+            Self::SourceRestore(source) => Some(source),
+        }
+    }
+}
+
+impl From<IndexOperationJournalStoreError> for IndexJournalRestoreBeforeError {
+    fn from(error: IndexOperationJournalStoreError) -> Self {
+        Self::Store(error)
+    }
+}
+
+impl From<IndexJournalSourceRestoreError> for IndexJournalRestoreBeforeError {
+    fn from(error: IndexJournalSourceRestoreError) -> Self {
+        Self::SourceRestore(error)
     }
 }
 
@@ -320,6 +380,219 @@ fn package_file_state(
         .ok_or(IndexOperationJournalStoreError::IndexFileNotRecorded)
 }
 
+/// Completes a CLI rollback in deterministic reverse-publication order.
+///
+/// `planned_decision` must be the fresh planner result obtained under the same
+/// exclusive workspace lock and complete inventory used by `store`. Only
+/// `RestoreBefore` and an already-completed `ClearBefore` may proceed. For a
+/// rollback this restores the index header first, affected package-index files
+/// in their recorded order, then source files in journal order. Each
+/// one-file executor obtains its own observation and planner result before
+/// mutating. If a step reports that the state has already reached
+/// `ClearBefore`, the coordinator re-observes that state before attempting the
+/// clear.
+///
+/// The journal remains unchanged throughout restoration. A fresh complete
+/// observation must classify as `ClearBefore` before the journal is removed.
+/// Any changed plan, unexpected or unavailable state, I/O error, or uncertain
+/// durability outcome stops the coordinator; the caller must retain recovery
+/// gating and read back the journal and workspace before retrying. An already
+/// cleared `ClearBefore` operation can be resumed by calling this function
+/// with a fresh `ClearBefore` plan while the journal is still present.
+pub fn execute_index_operation_journal_restore_before(
+    store: &IndexOperationJournalStore<'_>,
+    journal: &IndexOperationJournal,
+    inventory: &IndexJournalWorkspaceInventory,
+    planned_decision: IndexJournalRecoveryDecision,
+) -> Result<IndexJournalRestoreBeforeExecution, IndexJournalRestoreBeforeError> {
+    execute_index_operation_journal_restore_before_with_hook(
+        store,
+        journal,
+        inventory,
+        planned_decision,
+        || {},
+    )
+}
+
+fn execute_index_operation_journal_restore_before_with_hook(
+    store: &IndexOperationJournalStore<'_>,
+    journal: &IndexOperationJournal,
+    inventory: &IndexJournalWorkspaceInventory,
+    planned_decision: IndexJournalRecoveryDecision,
+    after_before_verification: impl FnOnce(),
+) -> Result<IndexJournalRestoreBeforeExecution, IndexJournalRestoreBeforeError> {
+    if !matches!(
+        planned_decision,
+        IndexJournalRecoveryDecision::RestoreBefore | IndexJournalRecoveryDecision::ClearBefore
+    ) {
+        return Ok(IndexJournalRestoreBeforeExecution::NotRestorable {
+            decision: planned_decision,
+        });
+    }
+
+    if planned_decision == IndexJournalRecoveryDecision::ClearBefore {
+        return clear_verified_before_state(
+            store,
+            journal,
+            inventory,
+            planned_decision,
+            after_before_verification,
+        );
+    }
+
+    match execute_index_operation_journal_restore_header_before(
+        store,
+        journal,
+        inventory,
+        IndexJournalRecoveryDecision::RestoreBefore,
+    )? {
+        IndexJournalHeaderRestoreExecution::Restored
+        | IndexJournalHeaderRestoreExecution::AlreadyBefore => {}
+        IndexJournalHeaderRestoreExecution::DecisionChanged { observed, .. }
+            if observed == IndexJournalRecoveryDecision::ClearBefore =>
+        {
+            return clear_verified_before_state(
+                store,
+                journal,
+                inventory,
+                observed,
+                after_before_verification,
+            );
+        }
+        IndexJournalHeaderRestoreExecution::DecisionChanged { planned, observed } => {
+            return Ok(IndexJournalRestoreBeforeExecution::DecisionChanged { planned, observed });
+        }
+        IndexJournalHeaderRestoreExecution::NotRestorable { decision } => {
+            return Ok(IndexJournalRestoreBeforeExecution::NotRestorable { decision });
+        }
+    }
+
+    for package_file in &journal.index_before.package_files {
+        match execute_index_operation_journal_restore_package_before(
+            store,
+            journal,
+            inventory,
+            &package_file.file,
+            IndexJournalRecoveryDecision::RestoreBefore,
+        )? {
+            IndexJournalPackageRestoreExecution::Restored
+            | IndexJournalPackageRestoreExecution::AlreadyBefore => {}
+            IndexJournalPackageRestoreExecution::DecisionChanged { observed, .. }
+                if observed == IndexJournalRecoveryDecision::ClearBefore =>
+            {
+                return clear_verified_before_state(
+                    store,
+                    journal,
+                    inventory,
+                    observed,
+                    after_before_verification,
+                );
+            }
+            IndexJournalPackageRestoreExecution::DecisionChanged { planned, observed } => {
+                return Ok(IndexJournalRestoreBeforeExecution::DecisionChanged {
+                    planned,
+                    observed,
+                });
+            }
+            IndexJournalPackageRestoreExecution::NotRestorable { decision } => {
+                return Ok(IndexJournalRestoreBeforeExecution::NotRestorable { decision });
+            }
+            IndexJournalPackageRestoreExecution::HeaderNotBefore => {
+                return Ok(IndexJournalRestoreBeforeExecution::HeaderNotBefore);
+            }
+        }
+    }
+
+    for source_index in 0..journal.sources.len() {
+        match execute_index_operation_journal_restore_source_before(
+            store,
+            journal,
+            inventory,
+            IndexJournalRecoveryDecision::RestoreBefore,
+            source_index,
+        )? {
+            IndexJournalSourceRestoreExecution::Restored { .. }
+            | IndexJournalSourceRestoreExecution::AlreadyBefore { .. } => {}
+            IndexJournalSourceRestoreExecution::DecisionChanged { observed, .. }
+                if observed == IndexJournalRecoveryDecision::ClearBefore =>
+            {
+                return clear_verified_before_state(
+                    store,
+                    journal,
+                    inventory,
+                    observed,
+                    after_before_verification,
+                );
+            }
+            IndexJournalSourceRestoreExecution::DecisionChanged { planned, observed } => {
+                return Ok(IndexJournalRestoreBeforeExecution::DecisionChanged {
+                    planned,
+                    observed,
+                });
+            }
+            IndexJournalSourceRestoreExecution::NotRestorable { decision } => {
+                return Ok(IndexJournalRestoreBeforeExecution::NotRestorable { decision });
+            }
+            IndexJournalSourceRestoreExecution::InvalidSourceIndex { .. } => {
+                unreachable!("coordinator iterates over the recorded source entries");
+            }
+        }
+    }
+
+    clear_verified_before_state(
+        store,
+        journal,
+        inventory,
+        IndexJournalRecoveryDecision::ClearBefore,
+        after_before_verification,
+    )
+}
+
+fn clear_verified_before_state(
+    store: &IndexOperationJournalStore<'_>,
+    journal: &IndexOperationJournal,
+    inventory: &IndexJournalWorkspaceInventory,
+    planned_decision: IndexJournalRecoveryDecision,
+    after_before_verification: impl FnOnce(),
+) -> Result<IndexJournalRestoreBeforeExecution, IndexJournalRestoreBeforeError> {
+    let observation = store.observe_recovery(journal, inventory)?;
+    let observed_decision = plan_index_operation_journal_recovery(journal, &observation);
+    if observed_decision != planned_decision {
+        return Ok(IndexJournalRestoreBeforeExecution::DecisionChanged {
+            planned: planned_decision,
+            observed: observed_decision,
+        });
+    }
+    if observed_decision != IndexJournalRecoveryDecision::ClearBefore {
+        return Ok(IndexJournalRestoreBeforeExecution::NotVerified {
+            decision: observed_decision,
+        });
+    }
+
+    after_before_verification();
+    Ok(
+        match execute_index_operation_journal_clear(
+            store,
+            journal,
+            inventory,
+            IndexJournalRecoveryDecision::ClearBefore,
+        )? {
+            IndexJournalClearExecution::Cleared {
+                decision: IndexJournalRecoveryDecision::ClearBefore,
+            } => IndexJournalRestoreBeforeExecution::Cleared,
+            IndexJournalClearExecution::DecisionChanged { planned, observed } => {
+                IndexJournalRestoreBeforeExecution::DecisionChanged { planned, observed }
+            }
+            IndexJournalClearExecution::NotClearable { decision } => {
+                IndexJournalRestoreBeforeExecution::NotVerified { decision }
+            }
+            IndexJournalClearExecution::Cleared { .. } => {
+                unreachable!("clear was requested only after a ClearBefore decision");
+            }
+        },
+    )
+}
+
 fn execute_index_operation_journal_restore_header_before_with_hook(
     store: &IndexOperationJournalStore<'_>,
     journal: &IndexOperationJournal,
@@ -487,8 +760,9 @@ fn execute_index_operation_journal_clear_with_hook(
 mod tests {
     use super::{
         IndexJournalClearExecution, IndexJournalHeaderRestoreExecution,
-        IndexJournalPackageRestoreExecution, IndexJournalSourceRestoreError,
-        IndexJournalSourceRestoreExecution, execute_index_operation_journal_clear,
+        IndexJournalPackageRestoreExecution, IndexJournalRestoreBeforeExecution,
+        IndexJournalSourceRestoreError, IndexJournalSourceRestoreExecution,
+        execute_index_operation_journal_clear, execute_index_operation_journal_restore_before,
         execute_index_operation_journal_restore_header_before,
         execute_index_operation_journal_restore_package_before,
         execute_index_operation_journal_restore_source_before,
@@ -2308,6 +2582,339 @@ mod tests {
             *expected_package
         );
         assert_eq!(store.read().expect("read back missing journal"), None);
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
+    fn coordinator_restores_mixed_sources_and_packages_before_clearing() {
+        let journal = journal_with_two_affected_package_files(
+            IndexJournalOrigin::Cli,
+            IndexJournalState::Prepared,
+        );
+        let (workspace, lock, inventory) = setup_two_package_recoverable_index(&journal);
+        let store = IndexOperationJournalStore::new(&lock);
+        let index_directory = workspace.0.join(".sai/index");
+        let first_file = &journal.index_after.package_files[0];
+        let FileState::RegularFile(first_after) = &first_file.state else {
+            panic!("first after package file is regular");
+        };
+        fs::write(index_directory.join(first_file.file.as_str()), first_after)
+            .expect("leave one package file at its planned-after state");
+        let planned = expected_decision(&store, &journal, &inventory);
+        assert_eq!(planned, IndexJournalRecoveryDecision::RestoreBefore);
+        assert_eq!(
+            store.read().expect("read original journal"),
+            Some(journal.clone())
+        );
+
+        let result =
+            execute_index_operation_journal_restore_before(&store, &journal, &inventory, planned)
+                .expect("complete the full CLI rollback");
+
+        assert_eq!(result, IndexJournalRestoreBeforeExecution::Cleared);
+        assert!(!journal_still_exists(&workspace));
+        assert_eq!(
+            fs::read(workspace.0.join("src/lib.sai")).expect("read restored root source"),
+            b"before"
+        );
+        assert_eq!(
+            fs::read(workspace.0.join("packages/extra/src/lib.sai"))
+                .expect("read restored member source"),
+            b"before extra source"
+        );
+        assert_eq!(
+            fs::read(index_directory.join("index.json")).expect("read restored header"),
+            match &journal.index_before.header {
+                FileState::RegularFile(bytes) => bytes.clone(),
+                FileState::Absent => panic!("before header is present"),
+            }
+        );
+        for package_file in &journal.index_before.package_files {
+            assert_eq!(
+                fs::read(index_directory.join(package_file.file.as_str()))
+                    .expect("read restored package file"),
+                match &package_file.state {
+                    FileState::RegularFile(bytes) => bytes.clone(),
+                    FileState::Absent => panic!("fixture package files are present"),
+                }
+            );
+        }
+        assert_eq!(
+            store.read().expect("read cleared journal"),
+            None,
+            "the journal has been removed only after the complete before state"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
+    fn coordinator_resumes_after_header_and_one_package_file_were_restored() {
+        let journal = journal_with_two_affected_package_files(
+            IndexJournalOrigin::Cli,
+            IndexJournalState::Prepared,
+        );
+        let (workspace, lock, inventory) = setup_two_package_recoverable_index(&journal);
+        let store = IndexOperationJournalStore::new(&lock);
+        let initial_plan = expected_decision(&store, &journal, &inventory);
+        assert_eq!(initial_plan, IndexJournalRecoveryDecision::RestoreBefore);
+        assert_eq!(
+            execute_index_operation_journal_restore_header_before(
+                &store,
+                &journal,
+                &inventory,
+                initial_plan,
+            )
+            .expect("restore header before crash"),
+            IndexJournalHeaderRestoreExecution::Restored
+        );
+        let second = &journal.index_after.package_files[1];
+        let FileState::RegularFile(second_after) = &second.state else {
+            panic!("second after package file is regular");
+        };
+        fs::write(
+            workspace.0.join(".sai/index").join(second.file.as_str()),
+            second_after,
+        )
+        .expect("leave second package file partially restored");
+        let resumed_plan = expected_decision(&store, &journal, &inventory);
+        assert_eq!(resumed_plan, IndexJournalRecoveryDecision::RestoreBefore);
+
+        let result = execute_index_operation_journal_restore_before(
+            &store,
+            &journal,
+            &inventory,
+            resumed_plan,
+        )
+        .expect("resume rollback from the mixed state");
+
+        assert_eq!(result, IndexJournalRestoreBeforeExecution::Cleared);
+        assert!(!journal_still_exists(&workspace));
+        assert_eq!(
+            fs::read(workspace.0.join("src/lib.sai")).expect("read restored source"),
+            b"before"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
+    fn coordinator_removes_package_file_with_absent_before_state() {
+        let journal = journal_with_package_file_absent_before();
+        let (workspace, lock, inventory) = setup(&journal, &journal.sources[0].planned_after, true);
+        let store = IndexOperationJournalStore::new(&lock);
+        let index_directory = workspace.0.join(".sai/index");
+        let FileState::RegularFile(before_header) = &journal.index_before.header else {
+            panic!("before header is regular");
+        };
+        fs::write(index_directory.join("index.json"), before_header)
+            .expect("restore header while package file remains");
+        let target = &journal.index_after.package_files[0].file;
+        assert!(index_directory.join(target.as_str()).exists());
+        let planned = expected_decision(&store, &journal, &inventory);
+        assert_eq!(planned, IndexJournalRecoveryDecision::RestoreBefore);
+
+        let result =
+            execute_index_operation_journal_restore_before(&store, &journal, &inventory, planned)
+                .expect("remove the package file created by the planned operation");
+
+        assert_eq!(result, IndexJournalRestoreBeforeExecution::Cleared);
+        assert!(!index_directory.join(target.as_str()).exists());
+        assert_eq!(
+            fs::read(index_directory.join("index.json")).expect("read before header"),
+            *before_header
+        );
+        assert_eq!(
+            fs::read(workspace.0.join("src/lib.sai")).expect("read before source"),
+            b"before"
+        );
+        assert!(!journal_still_exists(&workspace));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
+    fn coordinator_clears_a_completed_before_state_after_restart() {
+        let journal = journal(IndexJournalOrigin::Cli, IndexJournalState::Prepared);
+        let (workspace, lock, inventory) = setup(&journal, &journal.sources[0].before, false);
+        let store = IndexOperationJournalStore::new(&lock);
+        let planned = expected_decision(&store, &journal, &inventory);
+        assert_eq!(planned, IndexJournalRecoveryDecision::ClearBefore);
+
+        let result =
+            execute_index_operation_journal_restore_before(&store, &journal, &inventory, planned)
+                .expect("finish clearing after a crash between restore and clear");
+
+        assert_eq!(result, IndexJournalRestoreBeforeExecution::Cleared);
+        assert!(!journal_still_exists(&workspace));
+        assert_eq!(
+            fs::read(workspace.0.join("src/lib.sai")).expect("read unchanged source"),
+            b"before"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
+    fn coordinator_preserves_journal_for_a_client_pending_decision() {
+        let journal = journal(
+            IndexJournalOrigin::LspReturnedEdit,
+            IndexJournalState::AwaitingClient,
+        );
+        let (workspace, lock, inventory) = setup(&journal, &journal.sources[0].before, false);
+        let store = IndexOperationJournalStore::new(&lock);
+        let planned = expected_decision(&store, &journal, &inventory);
+        assert_eq!(planned, IndexJournalRecoveryDecision::PendingClient);
+        let index_before = index_files(&workspace);
+        let journal_before = journal_bytes(&workspace);
+
+        let result =
+            execute_index_operation_journal_restore_before(&store, &journal, &inventory, planned)
+                .expect("report that an awaiting client is not rollbackable");
+
+        assert_eq!(
+            result,
+            IndexJournalRestoreBeforeExecution::NotRestorable {
+                decision: IndexJournalRecoveryDecision::PendingClient,
+            }
+        );
+        assert_eq!(index_files(&workspace), index_before);
+        assert_eq!(journal_bytes(&workspace), journal_before);
+        assert!(journal_still_exists(&workspace));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
+    fn coordinator_stops_when_a_source_changes_outside_the_recorded_states() {
+        let journal = journal(IndexJournalOrigin::Cli, IndexJournalState::Prepared);
+        let (workspace, lock, inventory) =
+            setup(&journal, &journal.sources[0].planned_after, false);
+        let store = IndexOperationJournalStore::new(&lock);
+        let planned = expected_decision(&store, &journal, &inventory);
+        assert_eq!(planned, IndexJournalRecoveryDecision::RestoreBefore);
+        let journal_before = journal_bytes(&workspace);
+        let index_before = index_files(&workspace);
+        fs::write(workspace.0.join("src/lib.sai"), b"third-party bytes")
+            .expect("introduce an unexpected source state");
+
+        let result =
+            execute_index_operation_journal_restore_before(&store, &journal, &inventory, planned)
+                .expect("stop cleanly on the changed planner decision");
+
+        assert_eq!(
+            result,
+            IndexJournalRestoreBeforeExecution::DecisionChanged {
+                planned: IndexJournalRecoveryDecision::RestoreBefore,
+                observed: IndexJournalRecoveryDecision::Ambiguous(
+                    IndexJournalRecoveryAmbiguity::UnexpectedSourceState
+                ),
+            }
+        );
+        assert_eq!(index_files(&workspace), index_before);
+        assert_eq!(journal_bytes(&workspace), journal_before);
+        assert_eq!(
+            fs::read(workspace.0.join("src/lib.sai")).expect("read third-party source"),
+            b"third-party bytes"
+        );
+        assert!(journal_still_exists(&workspace));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "vita"
+        ))
+    ))]
+    #[test]
+    fn coordinator_rechecks_before_clear_and_retains_journal_if_state_changes() {
+        let journal = journal(IndexJournalOrigin::Cli, IndexJournalState::Prepared);
+        let (workspace, lock, inventory) = setup(&journal, &journal.sources[0].before, false);
+        let store = IndexOperationJournalStore::new(&lock);
+        let planned = expected_decision(&store, &journal, &inventory);
+        assert_eq!(planned, IndexJournalRecoveryDecision::ClearBefore);
+        let journal_before = journal_bytes(&workspace);
+
+        let result = super::execute_index_operation_journal_restore_before_with_hook(
+            &store,
+            &journal,
+            &inventory,
+            planned,
+            || {
+                fs::write(workspace.0.join("src/lib.sai"), b"third-party bytes")
+                    .expect("change source after full before verification");
+            },
+        )
+        .expect("report the fresh clear observation");
+
+        assert_eq!(
+            result,
+            IndexJournalRestoreBeforeExecution::DecisionChanged {
+                planned: IndexJournalRecoveryDecision::ClearBefore,
+                observed: IndexJournalRecoveryDecision::Ambiguous(
+                    IndexJournalRecoveryAmbiguity::UnexpectedSourceState
+                ),
+            }
+        );
+        assert_eq!(journal_bytes(&workspace), journal_before);
+        assert_eq!(
+            fs::read(workspace.0.join("src/lib.sai")).expect("read changed source"),
+            b"third-party bytes"
+        );
+        assert!(journal_still_exists(&workspace));
     }
 
     fn execute_clear_only_with_hook_for_test(
