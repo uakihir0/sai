@@ -1,0 +1,5 @@
+package acme:swiss-tournament-auditor @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Validate a fixed tournament and rank standings by match points and Buchholz"

@@ -1,0 +1,30 @@
+use acme:corpus-search-ranker/model.{Document}
+
+pub const MAX_QUERY_TERMS: USize = 8
+pub const MAX_QUERY_BYTES: USize = 64
+
+pub fn documents() -> Array<Document, 5> {
+    [
+        Document(
+            id: 101,
+            title: "River Cleanup Planning",
+            body: "river teams record water samples after storms",
+        ),
+        Document(
+            id: 202,
+            title: "Water Quality Guide",
+            body: "water quality river samples reveal pollution",
+        ),
+        Document(
+            id: 303,
+            title: "Stormwater Field Notes",
+            body: "after storms teams map runoff into the river",
+        ),
+        Document(
+            id: 404,
+            title: "Library Catalog",
+            body: "catalog search indexes books by author and subject",
+        ),
+        Document(id: 505, title: "Urban Gardens", body: "soil water garden plants compost"),
+    ]
+}

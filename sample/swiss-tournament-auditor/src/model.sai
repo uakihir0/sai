@@ -1,0 +1,52 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Player {
+    pub id: U32
+    pub name: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum MatchResult {
+    WhiteWin
+    Draw
+    BlackWin
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Game {
+    pub round: USize
+    pub white_player_id: U32
+    pub black_player_id: U32
+    pub result: MatchResult
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Tournament {
+    pub players: Array<Player, 6>
+    pub games: Array<Option<Game>, 9>
+    pub game_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Standing {
+    pub player_id: U32
+    pub player_name: Str
+    pub match_points: U32
+    pub buchholz: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Standings {
+    pub rows: Array<Standing, 6>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum AuditError {
+    IncompleteTournament
+    MissingGame
+    DuplicatePlayerId
+    InvalidRound
+    UnknownPlayer
+    SelfPairing
+    RepeatedPairing
+    DoubleBooked
+}

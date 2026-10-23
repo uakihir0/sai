@@ -1,0 +1,72 @@
+use acme:swiss-tournament-auditor/lookup
+use acme:swiss-tournament-auditor/model.{AuditError, Tournament}
+
+pub fn tournament(tournament: Tournament) -> Result<(), AuditError> {
+    if tournament.game_count != tournament.games.len() {
+        return Err(AuditError.IncompleteTournament)
+    }
+
+    for first in 0..tournament.players.len() {
+        for second in 0..first {
+            if tournament.players[first].id == tournament.players[second].id {
+                return Err(AuditError.DuplicatePlayerId)
+            }
+        }
+    }
+
+    for index in 0..tournament.game_count {
+        match tournament.games[index] {
+            Some(game) => {
+                if game.round < 1 or game.round > 3 {
+                    return Err(AuditError.InvalidRound)
+                }
+                if game.white_player_id == game.black_player_id {
+                    return Err(AuditError.SelfPairing)
+                }
+                let white_is_unknown = match lookup.player_index(tournament, game.white_player_id) {
+                    Some(_) => false
+                    None => true
+                }
+                let black_is_unknown = match lookup.player_index(tournament, game.black_player_id) {
+                    Some(_) => false
+                    None => true
+                }
+                if white_is_unknown or black_is_unknown {
+                    return Err(AuditError.UnknownPlayer)
+                }
+            }
+            None => return Err(AuditError.MissingGame)
+        }
+    }
+
+    for current in 0..tournament.game_count {
+        let current_game = tournament.games[current].unwrap()
+        for previous in 0..current {
+            let previous_game = tournament.games[previous].unwrap()
+            let repeated_pairing = (
+                (
+                    current_game.white_player_id == previous_game.white_player_id
+                    and current_game.black_player_id == previous_game.black_player_id
+                )
+                or (
+                    current_game.white_player_id == previous_game.black_player_id
+                    and current_game.black_player_id == previous_game.white_player_id
+                )
+            )
+            if repeated_pairing {
+                return Err(AuditError.RepeatedPairing)
+            }
+            let shared_player = (
+                current_game.white_player_id == previous_game.white_player_id
+                or current_game.white_player_id == previous_game.black_player_id
+                or current_game.black_player_id == previous_game.white_player_id
+                or current_game.black_player_id == previous_game.black_player_id
+            )
+            if current_game.round == previous_game.round and shared_player {
+                return Err(AuditError.DoubleBooked)
+            }
+        }
+    }
+
+    Ok(())
+}

@@ -1,0 +1,42 @@
+use acme:swiss-tournament-auditor/data
+use acme:swiss-tournament-auditor/model.{AuditError, Standings, Tournament}
+use acme:swiss-tournament-auditor/standings
+
+pub fn audit(tournament: Tournament) -> Result<Standings, AuditError> {
+    standings.rank(tournament)
+}
+
+pub fn sample_standings() -> Result<Standings, AuditError> {
+    audit(data.tournament())
+}
+
+test "standings rank by points and Buchholz" {
+    let result = sample_standings().unwrap()
+    assert result.rows[0].player_id == 5
+    assert result.rows[0].match_points == 6
+    assert result.rows[0].buchholz == 8
+    assert result.rows[1].player_id == 3
+    assert result.rows[1].match_points == 5
+    assert result.rows[1].buchholz == 16
+    assert result.rows[2].player_id == 1
+    assert result.rows[2].match_points == 5
+    assert result.rows[2].buchholz == 13
+    assert result.rows[3].player_id == 4
+    assert result.rows[3].buchholz == 10
+    assert result.rows[4].player_id == 2
+    assert result.rows[4].match_points == 3
+    assert result.rows[4].buchholz == 11
+    assert result.rows[5].player_id == 6
+    assert result.rows[5].buchholz == 14
+}
+
+test "invalid schedules never produce standings" {
+    assert audit(data.duplicate_player_id()).unwrap_err() == AuditError.DuplicatePlayerId
+    assert audit(data.invalid_round()).unwrap_err() == AuditError.InvalidRound
+    assert audit(data.unknown_player()).unwrap_err() == AuditError.UnknownPlayer
+    assert audit(data.self_pairing()).unwrap_err() == AuditError.SelfPairing
+    assert audit(data.missing_game()).unwrap_err() == AuditError.MissingGame
+    assert audit(data.repeated_pairing()).unwrap_err() == AuditError.RepeatedPairing
+    assert audit(data.double_booked_player()).unwrap_err() == AuditError.DoubleBooked
+    assert audit(data.incomplete_schedule()).unwrap_err() == AuditError.IncompleteTournament
+}

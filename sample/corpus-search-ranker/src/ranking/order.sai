@@ -1,0 +1,22 @@
+use acme:corpus-search-ranker/model.{SearchHit}
+
+pub fn precedes(candidate: SearchHit, current: SearchHit) -> Bool {
+    (
+        candidate.score > current.score
+        or (candidate.score == current.score and candidate.document_id < current.document_id)
+    )
+}
+
+test "equal scores are ordered by ascending document ID" {
+    let lower_id = SearchHit(document_id: 101, score: 5, title_matches: 1, body_matches: 2)
+    let higher_id = SearchHit(document_id: 202, score: 5, title_matches: 1, body_matches: 2)
+    assert precedes(lower_id, higher_id)
+    assert not precedes(higher_id, lower_id)
+}
+
+test "higher score wins regardless of document ID" {
+    let high_score = SearchHit(document_id: 900, score: 6, title_matches: 2, body_matches: 0)
+    let low_score = SearchHit(document_id: 1, score: 5, title_matches: 1, body_matches: 2)
+    assert precedes(high_score, low_score)
+    assert not precedes(low_score, high_score)
+}
