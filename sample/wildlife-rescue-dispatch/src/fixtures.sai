@@ -1,0 +1,221 @@
+use acme:wildlife-rescue-dispatch/model.{Clinic, RescueCase, Species, Urgency}
+
+pub fn harbor_clinics() -> Array<Clinic, 3> {
+    [
+        Clinic(
+            name: "Cedar Wildlife Clinic",
+            handles_raptors: true,
+            handles_waterbirds: false,
+            handles_mammals: true,
+            handles_reptiles: false,
+            protected_species_permit: true,
+            on_call_veterinarian: true,
+            intake_slots: 2,
+            treatment_hour_limit: 7,
+        ),
+        Clinic(
+            name: "Marsh Bird Unit",
+            handles_raptors: false,
+            handles_waterbirds: true,
+            handles_mammals: false,
+            handles_reptiles: false,
+            protected_species_permit: true,
+            on_call_veterinarian: false,
+            intake_slots: 1,
+            treatment_hour_limit: 6,
+        ),
+        Clinic(
+            name: "Ridge Reptile Center",
+            handles_raptors: false,
+            handles_waterbirds: false,
+            handles_mammals: false,
+            handles_reptiles: true,
+            protected_species_permit: false,
+            on_call_veterinarian: true,
+            intake_slots: 1,
+            treatment_hour_limit: 4,
+        ),
+    ]
+}
+
+pub fn harbor_calls() -> Array<Option<RescueCase>, 13> {
+    [
+        Some(
+            RescueCase(
+                id: 101,
+                animal: "Peregrine falcon",
+                species: Species.Raptor,
+                urgency: Urgency.Critical,
+                protected: true,
+                authorization_confirmed: true,
+                in_service_area: true,
+                estimated_treatment_hours: 4,
+                clinic_travel_minutes: [22, 65, 90],
+            ),
+        ),
+        Some(
+            RescueCase(
+                id: 102,
+                animal: "Mute swan",
+                species: Species.Waterbird,
+                urgency: Urgency.Urgent,
+                protected: false,
+                authorization_confirmed: false,
+                in_service_area: true,
+                estimated_treatment_hours: 3,
+                clinic_travel_minutes: [42, 14, 60],
+            ),
+        ),
+        Some(
+            RescueCase(
+                id: 103,
+                animal: "Red fox",
+                species: Species.Mammal,
+                urgency: Urgency.Urgent,
+                protected: false,
+                authorization_confirmed: false,
+                in_service_area: true,
+                estimated_treatment_hours: 5,
+                clinic_travel_minutes: [12, 37, 88],
+            ),
+        ),
+        Some(
+            RescueCase(
+                id: 104,
+                animal: "Bog turtle",
+                species: Species.Reptile,
+                urgency: Urgency.Critical,
+                protected: true,
+                authorization_confirmed: true,
+                in_service_area: true,
+                estimated_treatment_hours: 2,
+                clinic_travel_minutes: [70, 95, 18],
+            ),
+        ),
+        Some(
+            RescueCase(
+                id: 105,
+                animal: "Barn owl",
+                species: Species.Raptor,
+                urgency: Urgency.Critical,
+                protected: true,
+                authorization_confirmed: false,
+                in_service_area: true,
+                estimated_treatment_hours: 2,
+                clinic_travel_minutes: [28, 58, 96],
+            ),
+        ),
+        Some(
+            RescueCase(
+                id: 106,
+                animal: "River otter",
+                species: Species.Mammal,
+                urgency: Urgency.Urgent,
+                protected: false,
+                authorization_confirmed: false,
+                in_service_area: false,
+                estimated_treatment_hours: 3,
+                clinic_travel_minutes: [10, 31, 79],
+            ),
+        ),
+        Some(
+            RescueCase(
+                id: 107,
+                animal: "Box turtle",
+                species: Species.Reptile,
+                urgency: Urgency.Routine,
+                protected: false,
+                authorization_confirmed: false,
+                in_service_area: true,
+                estimated_treatment_hours: 4,
+                clinic_travel_minutes: [66, 84, 16],
+            ),
+        ),
+        Some(
+            RescueCase(
+                id: 108,
+                animal: "Red-tailed hawk",
+                species: Species.Raptor,
+                urgency: Urgency.Routine,
+                protected: false,
+                authorization_confirmed: false,
+                in_service_area: true,
+                estimated_treatment_hours: 3,
+                clinic_travel_minutes: [18, 68, 110],
+            ),
+        ),
+        Some(
+            RescueCase(
+                id: 109,
+                animal: "Great blue heron",
+                species: Species.Waterbird,
+                urgency: Urgency.Critical,
+                protected: false,
+                authorization_confirmed: false,
+                in_service_area: true,
+                estimated_treatment_hours: 2,
+                clinic_travel_minutes: [52, 19, 70],
+            ),
+        ),
+        Some(
+            RescueCase(
+                id: 110,
+                animal: "Mink",
+                species: Species.Mammal,
+                urgency: Urgency.Routine,
+                protected: false,
+                authorization_confirmed: false,
+                in_service_area: true,
+                estimated_treatment_hours: 2,
+                clinic_travel_minutes: [30, 47, 93],
+            ),
+        ),
+        Some(
+            RescueCase(
+                id: 111,
+                animal: "Gray fox",
+                species: Species.Mammal,
+                urgency: Urgency.Routine,
+                protected: false,
+                authorization_confirmed: false,
+                in_service_area: true,
+                estimated_treatment_hours: 0,
+                clinic_travel_minutes: [26, 49, 98],
+            ),
+        ),
+        Some(
+            RescueCase(
+                id: 112,
+                animal: "Osprey",
+                species: Species.Raptor,
+                urgency: Urgency.Critical,
+                protected: true,
+                authorization_confirmed: true,
+                in_service_area: true,
+                estimated_treatment_hours: 2,
+                clinic_travel_minutes: [75, 95, 130],
+            ),
+        ),
+        Some(
+            RescueCase(
+                id: 113,
+                animal: "Salamander",
+                species: Species.Amphibian,
+                urgency: Urgency.Routine,
+                protected: false,
+                authorization_confirmed: false,
+                in_service_area: true,
+                estimated_treatment_hours: 2,
+                clinic_travel_minutes: [36, 50, 42],
+            ),
+        ),
+    ]
+}
+
+pub fn maximum_treatment_hours_per_case() -> U32 {
+    8
+}
+
+pub fn maximum_travel_minutes() -> U32 {
+    60
+}

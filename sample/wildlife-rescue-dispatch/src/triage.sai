@@ -1,0 +1,48 @@
+use acme:wildlife-rescue-dispatch/fixtures
+use acme:wildlife-rescue-dispatch/model.{RescueCase, Urgency}
+
+fn urgency_order(urgency: Urgency) -> U32 {
+    match urgency { Urgency.Critical => 0, Urgency.Urgent => 1, Urgency.Routine => 2 }
+}
+
+fn precedes(candidate: RescueCase, current: RescueCase) -> Bool {
+    let candidate_urgency = urgency_order(candidate.urgency)
+    let current_urgency = urgency_order(current.urgency)
+    (
+        candidate_urgency < current_urgency
+        or (candidate_urgency == current_urgency and candidate.id < current.id)
+    )
+}
+
+pub fn rank_of(rescue: RescueCase) -> USize {
+    var rank: USize = 0
+    for entry in fixtures.harbor_calls() {
+        match entry {
+            Some(candidate) => {
+                if candidate.id != rescue.id and precedes(candidate, rescue) {
+                    rank += 1
+                }
+            }
+            None => {}
+        }
+    }
+    rank
+}
+
+pub fn case_at_rank(rank: USize) -> Option<RescueCase> {
+    for entry in fixtures.harbor_calls() {
+        match entry {
+            Some(rescue) => {
+                if rank_of(rescue) == rank {
+                    return Some(rescue)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+pub fn call_count() -> USize {
+    13
+}

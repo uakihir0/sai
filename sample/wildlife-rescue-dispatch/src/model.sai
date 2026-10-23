@@ -1,0 +1,84 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Species {
+    Raptor
+    Waterbird
+    Mammal
+    Reptile
+    Amphibian
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Urgency {
+    Critical
+    Urgent
+    Routine
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Disposition {
+    Placed
+    AwaitingAuthorization
+    OutsideServiceArea
+    InvalidTreatmentEstimate
+    NoSpecialistClinic
+    NoLicensedClinic
+    OutsideTravelRadius
+    CapacityDeferred
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RescueCase {
+    pub id: U32
+    pub animal: Str
+    pub species: Species
+    pub urgency: Urgency
+    pub protected: Bool
+    pub authorization_confirmed: Bool
+    pub in_service_area: Bool
+    pub estimated_treatment_hours: U32
+    // Clinic order: Cedar Wildlife Clinic, Marsh Bird Unit, Ridge Reptile Center.
+    pub clinic_travel_minutes: Array<U32, 3>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Clinic {
+    pub name: Str
+    pub handles_raptors: Bool
+    pub handles_waterbirds: Bool
+    pub handles_mammals: Bool
+    pub handles_reptiles: Bool
+    pub protected_species_permit: Bool
+    pub on_call_veterinarian: Bool
+    pub intake_slots: USize
+    pub treatment_hour_limit: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DispatchDecision {
+    pub case_id: U32
+    pub animal: Str
+    pub species: Species
+    pub urgency: Urgency
+    pub disposition: Disposition
+    pub clinic_index: Option<USize>
+    pub travel_minutes: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DispatchPlan {
+    pub decisions: Array<Option<DispatchDecision>, 13>
+    pub decision_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DispatchReport {
+    pub plan: DispatchPlan
+    pub placed_count: USize
+    pub authorization_hold_count: USize
+    pub outside_area_count: USize
+    pub invalid_estimate_count: USize
+    pub specialist_deferral_count: USize
+    pub permit_deferral_count: USize
+    pub travel_deferral_count: USize
+    pub capacity_deferral_count: USize
+}

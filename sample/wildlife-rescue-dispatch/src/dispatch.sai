@@ -1,0 +1,140 @@
+use acme:wildlife-rescue-dispatch/fixtures
+use acme:wildlife-rescue-dispatch/intake
+use acme:wildlife-rescue-dispatch/model.{
+    Clinic
+    DispatchDecision
+    DispatchPlan
+    Disposition
+    RescueCase
+    Species
+    Urgency
+}
+use acme:wildlife-rescue-dispatch/triage
+
+fn clinic_handles(clinic: Clinic, species: Species) -> Bool {
+    match species {
+        Species.Raptor => clinic.handles_raptors
+        Species.Waterbird => clinic.handles_waterbirds
+        Species.Mammal => clinic.handles_mammals
+        Species.Reptile => clinic.handles_reptiles
+        Species.Amphibian => false
+    }
+}
+
+fn available(clinic: Clinic, rescue: RescueCase, used_slots: USize, used_hours: U32) -> Bool {
+    (
+        used_slots < clinic.intake_slots
+        and used_hours + rescue.estimated_treatment_hours <= clinic.treatment_hour_limit
+    )
+}
+
+fn decide(
+    rescue: RescueCase,
+    clinics: Array<Clinic, 3>,
+    used_slots: Array<USize, 3>,
+    used_hours: Array<U32, 3>,
+) -> DispatchDecision {
+    match intake.precheck(rescue) {
+        Some(disposition) => {
+            return DispatchDecision(
+                case_id: rescue.id,
+                animal: rescue.animal,
+                species: rescue.species,
+                urgency: rescue.urgency,
+                disposition: disposition,
+                clinic_index: None,
+                travel_minutes: None,
+            )
+        }
+        None => {}
+    }
+
+    var has_specialist = false
+    var has_permitted_clinic = false
+    var has_reachable_clinic = false
+    var chosen_clinic: Option<USize> = None
+    var chosen_travel_minutes: U32 = 0
+    for index in 0..3 {
+        let clinic = clinics[index]
+        let can_treat_urgency = (rescue.urgency != Urgency.Critical or clinic.on_call_veterinarian)
+        if clinic_handles(clinic, rescue.species) and can_treat_urgency {
+            has_specialist = true
+            if not rescue.protected or clinic.protected_species_permit {
+                has_permitted_clinic = true
+                let travel_minutes = rescue.clinic_travel_minutes[index]
+                if travel_minutes <= fixtures.maximum_travel_minutes() {
+                    has_reachable_clinic = true
+                    if available(clinic, rescue, used_slots[index], used_hours[index]) {
+                        let should_choose = match chosen_clinic {
+                            None => true
+                            Some(_) => travel_minutes < chosen_travel_minutes
+                        }
+                        if should_choose {
+                            chosen_clinic = Some(index)
+                            chosen_travel_minutes = travel_minutes
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    match chosen_clinic {
+        Some(index) => DispatchDecision(
+            case_id: rescue.id,
+            animal: rescue.animal,
+            species: rescue.species,
+            urgency: rescue.urgency,
+            disposition: Disposition.Placed,
+            clinic_index: Some(index),
+            travel_minutes: Some(chosen_travel_minutes),
+        )
+        None => {
+            let disposition = if not has_specialist {
+                Disposition.NoSpecialistClinic
+            } else if not has_permitted_clinic {
+                Disposition.NoLicensedClinic
+            } else if not has_reachable_clinic {
+                Disposition.OutsideTravelRadius
+            } else {
+                Disposition.CapacityDeferred
+            }
+            DispatchDecision(
+                case_id: rescue.id,
+                animal: rescue.animal,
+                species: rescue.species,
+                urgency: rescue.urgency,
+                disposition: disposition,
+                clinic_index: None,
+                travel_minutes: None,
+            )
+        }
+    }
+}
+
+pub fn build_plan() -> DispatchPlan {
+    let clinics = fixtures.harbor_clinics()
+    var used_slots: Array<USize, 3> = [0, 0, 0]
+    var used_hours: Array<U32, 3> = [0, 0, 0]
+    var decisions = Array<Option<DispatchDecision>, 13>.filled(None)
+    let count = triage.call_count()
+
+    for rank in 0..count {
+        match triage.case_at_rank(rank) {
+            Some(rescue) => {
+                let result = decide(rescue, clinics, used_slots, used_hours)
+                decisions[rank] = Some(result)
+                match result.clinic_index {
+                    Some(index) => {
+                        used_slots[index] += 1
+                        used_hours[index] += rescue.estimated_treatment_hours
+                    }
+                    None => {}
+                }
+            }
+            None => {}
+        }
+    }
+
+    DispatchPlan(decisions: decisions, decision_count: count)
+}

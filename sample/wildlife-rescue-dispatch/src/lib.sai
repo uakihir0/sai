@@ -1,0 +1,54 @@
+use acme:wildlife-rescue-dispatch/dispatch
+use acme:wildlife-rescue-dispatch/model.{DispatchReport, Disposition}
+use acme:wildlife-rescue-dispatch/report
+
+pub fn county_report() -> DispatchReport {
+    report.summarize(dispatch.build_plan())
+}
+
+test "critical calls precede urgent and routine calls with stable ID ties" {
+    let result = county_report()
+    assert result.plan.decision_count == 13
+    assert result.plan.decisions[0].unwrap().case_id == 101
+    assert result.plan.decisions[1].unwrap().case_id == 104
+    assert result.plan.decisions[2].unwrap().case_id == 105
+    assert result.plan.decisions[3].unwrap().case_id == 109
+    assert result.plan.decisions[4].unwrap().case_id == 112
+    assert result.plan.decisions[5].unwrap().case_id == 102
+    assert result.plan.decisions[8].unwrap().case_id == 107
+}
+
+test "permits, veterinarian coverage, and travel radius control clinic fit" {
+    let result = county_report()
+    assert result.plan.decisions[0].unwrap().disposition == Disposition.Placed
+    assert result.plan.decisions[0].unwrap().clinic_index == Some(0)
+    assert result.plan.decisions[1].unwrap().disposition == Disposition.NoLicensedClinic
+    assert result.plan.decisions[3].unwrap().disposition == Disposition.NoSpecialistClinic
+    assert result.plan.decisions[4].unwrap().disposition == Disposition.OutsideTravelRadius
+    assert result.specialist_deferral_count == 2
+}
+
+test "slot and treatment-hour limits leave deterministic deferrals" {
+    let result = county_report()
+    assert result.plan.decisions[6].unwrap().case_id == 103
+    assert result.plan.decisions[6].unwrap().disposition == Disposition.CapacityDeferred
+    assert result.plan.decisions[10].unwrap().disposition == Disposition.CapacityDeferred
+    assert result.plan.decisions[8].unwrap().disposition == Disposition.Placed
+    assert result.plan.decisions[9].unwrap().disposition == Disposition.Placed
+    assert result.capacity_deferral_count == 2
+    assert result.placed_count == 4
+}
+
+test "prechecks do not consume capacity and the report counts every disposition" {
+    let result = county_report()
+    assert result.plan.decisions[2].unwrap().disposition == Disposition.AwaitingAuthorization
+    assert result.plan.decisions[7].unwrap().disposition == Disposition.OutsideServiceArea
+    assert result.plan.decisions[11].unwrap().disposition == Disposition.InvalidTreatmentEstimate
+    assert result.plan.decisions[12].unwrap().disposition == Disposition.NoSpecialistClinic
+    assert result.authorization_hold_count == 1
+    assert result.outside_area_count == 1
+    assert result.invalid_estimate_count == 1
+    assert result.permit_deferral_count == 1
+    assert result.travel_deferral_count == 1
+    assert result.capacity_deferral_count == 2
+}
