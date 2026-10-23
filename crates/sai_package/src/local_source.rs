@@ -5,6 +5,11 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -124,6 +129,7 @@ pub enum LocalPackageIoOperation {
     OpenSourceFile,
     ReadSourceFile,
     InspectSourceEntry,
+    UpdateSourceFile,
     InspectWitDirectory,
     OpenWitDirectory,
     ReadWitDirectory,
@@ -235,6 +241,35 @@ pub enum LocalPackageSourceFileSnapshotError {
 }
 
 impl From<LocalPackageError> for LocalPackageSourceFileSnapshotError {
+    fn from(error: LocalPackageError) -> Self {
+        Self::Directory(error)
+    }
+}
+
+/// Why a guarded update to one local package source file could not complete.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalPackageSourceFileUpdateError {
+    /// A retained package-directory operation failed.
+    Directory(LocalPackageError),
+    /// The source root and path do not identify a canonical `.sai` module
+    /// beneath the declared source root.
+    InvalidSourcePath,
+    /// A parent directory beneath the source root does not exist.
+    MissingIntermediateDirectory,
+    /// A parent path component is a symlink or is not a directory.
+    UnsafePathComponent,
+    /// The target exists but is not a regular file.
+    NonRegularFile,
+    /// Expected or desired file bytes exceed the source-file byte limit.
+    FileTooLarge,
+    /// The current file state differs from `expected`, or changed during the
+    /// conditional update.
+    Conflict,
+    /// The host cannot perform the required handle-relative durable update.
+    PlatformNotSupported,
+}
+
+impl From<LocalPackageError> for LocalPackageSourceFileUpdateError {
     fn from(error: LocalPackageError) -> Self {
         Self::Directory(error)
     }
@@ -1018,6 +1053,108 @@ impl LocalPackageDirectory {
         {
             let _ = (self, source_path, maximum_bytes);
             Err(LocalPackageSourceFileSnapshotError::PlatformNotSupported)
+        }
+    }
+
+    /// Conditionally creates, replaces, or removes one source file beneath
+    /// the manifest-declared `source_directory`.
+    ///
+    /// `source_path` is a full package-relative path. It must be a canonical
+    /// `.sai` file strictly below `source_directory`, and its suffix relative
+    /// to that root must fit the source-tree path limit. Parent directories
+    /// must already exist. Traversal is anchored to the retained package
+    /// directory handle and rejects symlinks and non-directory parents.
+    ///
+    /// The caller must pass the source root parsed and validated from this
+    /// package's own manifest. This directory handle retains the manifest
+    /// bytes, but this method does not parse them to authenticate the supplied
+    /// source root.
+    ///
+    /// `expected` and `desired` distinguish absence (`None`) from an empty
+    /// regular file (`Some(&[])`). A mismatching or concurrently changed
+    /// target returns [`LocalPackageSourceFileUpdateError::Conflict`].
+    /// Successful writes report whether the file changed or already matched
+    /// `desired`. This operation fails closed on platforms that cannot
+    /// provide the required handle-relative durable update.
+    pub fn update_source_file_if_matches(
+        &self,
+        source_directory: &ContentPackagePath,
+        source_path: &ContentPackagePath,
+        expected: Option<&[u8]>,
+        desired: Option<&[u8]>,
+    ) -> Result<sai_windows_fs::ConditionalFileUpdate, LocalPackageSourceFileUpdateError> {
+        source_root_relative_module_path(source_directory, source_path)
+            .ok_or(LocalPackageSourceFileUpdateError::InvalidSourcePath)?;
+        if expected
+            .into_iter()
+            .chain(desired)
+            .any(|bytes| bytes.len() as u64 > MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES)
+        {
+            return Err(LocalPackageSourceFileUpdateError::FileTooLarge);
+        }
+
+        #[cfg(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        ))]
+        {
+            let package_relative_path = source_path.as_str();
+            let (parent_path, file_name) = package_relative_path
+                .rsplit_once('/')
+                .map_or(("", package_relative_path), |(parent, name)| (parent, name));
+            let parent = open_source_parent_for_update(&self.directory, parent_path)?;
+
+            match statat(&parent, file_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(metadata) => {
+                    let file_type = FileType::from_raw_mode(metadata.st_mode);
+                    if file_type.is_symlink() {
+                        return Err(LocalPackageSourceFileUpdateError::UnsafePathComponent);
+                    }
+                    if !file_type.is_file() {
+                        return Err(LocalPackageSourceFileUpdateError::NonRegularFile);
+                    }
+                    if metadata.st_size < 0
+                        || metadata.st_size as u64 > MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES
+                    {
+                        return Err(LocalPackageSourceFileUpdateError::FileTooLarge);
+                    }
+                }
+                Err(rustix::io::Errno::NOENT) => {}
+                Err(error) => {
+                    return Err(LocalPackageSourceFileUpdateError::Directory(
+                        local_source_io_error(LocalPackageIoOperation::InspectSourceEntry, error),
+                    ));
+                }
+            }
+
+            sai_windows_fs::update_file_in_directory_if_matches(
+                &parent,
+                OsStr::new(file_name),
+                expected,
+                desired,
+            )
+            .map_err(|error| {
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::AlreadyExists
+                ) {
+                    LocalPackageSourceFileUpdateError::Conflict
+                } else {
+                    LocalPackageSourceFileUpdateError::Directory(LocalPackageError::Io {
+                        operation: LocalPackageIoOperation::UpdateSourceFile,
+                        kind: error.kind(),
+                    })
+                }
+            })
+        }
+
+        #[cfg(not(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        )))]
+        {
+            let _ = (self, source_directory, source_path, expected, desired);
+            Err(LocalPackageSourceFileUpdateError::PlatformNotSupported)
         }
     }
 
@@ -2335,6 +2472,92 @@ fn is_valid_local_source_relative_path(path: &str) -> bool {
             .any(|component| component.is_empty() || matches!(component, "." | ".."))
 }
 
+fn source_root_relative_module_path<'a>(
+    source_directory: &ContentPackagePath,
+    source_path: &'a ContentPackagePath,
+) -> Option<&'a str> {
+    let package_path = source_path.as_str();
+    let relative_path = if source_directory.as_str() == "." {
+        package_path
+    } else {
+        package_path
+            .strip_prefix(source_directory.as_str())?
+            .strip_prefix('/')?
+    };
+    let file_name = relative_path.rsplit('/').next()?;
+    (relative_path.len() <= 4096 && file_name.len() > ".sai".len() && file_name.ends_with(".sai"))
+        .then_some(relative_path)
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn open_source_parent_for_update(
+    package_directory: &File,
+    parent_path: &str,
+) -> Result<File, LocalPackageSourceFileUpdateError> {
+    let mut parent = package_directory.try_clone().map_err(|error| {
+        LocalPackageSourceFileUpdateError::Directory(LocalPackageError::Io {
+            operation: LocalPackageIoOperation::OpenSourceDirectory,
+            kind: error.kind(),
+        })
+    })?;
+
+    if parent_path.is_empty() || parent_path == "." {
+        return Ok(parent);
+    }
+
+    for component in parent_path.split('/') {
+        let metadata = match statat(&parent, component, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(rustix::io::Errno::NOENT) => {
+                return Err(LocalPackageSourceFileUpdateError::MissingIntermediateDirectory);
+            }
+            Err(rustix::io::Errno::NOTDIR) => {
+                return Err(LocalPackageSourceFileUpdateError::UnsafePathComponent);
+            }
+            Err(error) => {
+                return Err(LocalPackageSourceFileUpdateError::Directory(
+                    local_source_io_error(LocalPackageIoOperation::InspectSourceEntry, error),
+                ));
+            }
+        };
+        if !FileType::from_raw_mode(metadata.st_mode).is_dir() {
+            return Err(LocalPackageSourceFileUpdateError::UnsafePathComponent);
+        }
+
+        let opened = openat(
+            &parent,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|error| {
+            let error: io::Error = error.into();
+            match error.kind() {
+                io::ErrorKind::NotFound => {
+                    LocalPackageSourceFileUpdateError::MissingIntermediateDirectory
+                }
+                io::ErrorKind::NotADirectory => {
+                    LocalPackageSourceFileUpdateError::UnsafePathComponent
+                }
+                kind => LocalPackageSourceFileUpdateError::Directory(LocalPackageError::Io {
+                    operation: LocalPackageIoOperation::OpenSourceDirectory,
+                    kind,
+                }),
+            }
+        })?;
+        if directory_identity(&opened)? != local_source_stat_identity(&metadata) {
+            return Err(LocalPackageError::DirectoryChanged.into());
+        }
+        parent = opened;
+    }
+
+    Ok(parent)
+}
+
 #[cfg(all(
     unix,
     not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
@@ -3595,6 +3818,35 @@ impl fmt::Display for LocalPackageSourceFileSnapshotError {
     }
 }
 
+impl fmt::Display for LocalPackageSourceFileUpdateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Directory(error) => fmt::Display::fmt(error, formatter),
+            Self::InvalidSourcePath => {
+                formatter.write_str("source update path is not a canonical `.sai` module below its declared source root")
+            }
+            Self::MissingIntermediateDirectory => {
+                formatter.write_str("a parent directory of the source update target is missing")
+            }
+            Self::UnsafePathComponent => {
+                formatter.write_str("source update path contains a symlink or non-directory parent")
+            }
+            Self::NonRegularFile => {
+                formatter.write_str("source update target is not a regular file")
+            }
+            Self::FileTooLarge => {
+                formatter.write_str("source update bytes exceed the local source-file byte limit")
+            }
+            Self::Conflict => {
+                formatter.write_str("source update target no longer matches its expected state")
+            }
+            Self::PlatformNotSupported => {
+                formatter.write_str("this host cannot safely update a local package source file")
+            }
+        }
+    }
+}
+
 impl fmt::Display for LocalPackageSourceLimit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -3656,6 +3908,7 @@ impl fmt::Display for LocalPackageIoOperation {
             Self::OpenSourceFile => "opening a SAI source file",
             Self::ReadSourceFile => "reading a SAI source file",
             Self::InspectSourceEntry => "inspecting a source-tree entry",
+            Self::UpdateSourceFile => "conditionally updating a SAI source file",
             Self::InspectWitDirectory => "inspecting a WIT directory",
             Self::OpenWitDirectory => "opening a WIT directory",
             Self::ReadWitDirectory => "reading a WIT directory",
@@ -3685,6 +3938,14 @@ impl std::error::Error for LocalPackageSourceSnapshotError {
     }
 }
 impl std::error::Error for LocalPackageSourceFileSnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Directory(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+impl std::error::Error for LocalPackageSourceFileUpdateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Directory(error) => Some(error),
@@ -4068,13 +4329,14 @@ mod tests {
         LocalPackageDirectoryIndexError, LocalPackageError, LocalPackageMvsError,
         LocalPackageMvsLoadError, LocalPackagePathIndexError, LocalPackagePathPinError,
         LocalPackageSourceEntryKind, LocalPackageSourceFileSnapshotError,
-        LocalPackageSourceFileState, LocalPackageSourceLimit, LocalPackageSourceResolveError,
-        LocalPackageSourceRootStatus, LocalPackageSourceSnapshotError,
-        LocalPackageSourceSnapshotLimits, LocalPackageSourceSnapshotProgress,
-        LocalPackageWitDirectorySnapshotError, LocalPackageWitDirectorySnapshotLimit,
-        LocalPackageWitDirectorySnapshotLimits, LocalPackageWitDirectorySnapshotProgress,
-        LocalPackageWitDirectoryStatus, LocalPackageWitEntryKind, MAX_LOCAL_PACKAGE_WIT_FILE_BYTES,
-        resolve_local_path_packages,
+        LocalPackageSourceFileState, LocalPackageSourceFileUpdateError, LocalPackageSourceLimit,
+        LocalPackageSourceResolveError, LocalPackageSourceRootStatus,
+        LocalPackageSourceSnapshotError, LocalPackageSourceSnapshotLimits,
+        LocalPackageSourceSnapshotProgress, LocalPackageWitDirectorySnapshotError,
+        LocalPackageWitDirectorySnapshotLimit, LocalPackageWitDirectorySnapshotLimits,
+        LocalPackageWitDirectorySnapshotProgress, LocalPackageWitDirectoryStatus,
+        LocalPackageWitEntryKind, MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES,
+        MAX_LOCAL_PACKAGE_WIT_FILE_BYTES, resolve_local_path_packages,
     };
     #[cfg(all(
         unix,
@@ -4553,6 +4815,317 @@ mod tests {
                     .expect("valid package-relative source path")
             ),
             Err(LocalPackageSourceFileSnapshotError::PlatformNotSupported)
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn source_file_update_supports_all_absent_and_regular_transitions() {
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        fs::create_dir_all(package_path.join("src")).expect("create source directory");
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        let source_root = ContentPackagePath::parse("src").expect("valid source root");
+        let source_path = ContentPackagePath::parse("src/lib.sai").expect("valid source path");
+
+        assert_eq!(
+            package
+                .update_source_file_if_matches(&source_root, &source_path, None, None)
+                .expect("absent remains absent"),
+            sai_windows_fs::ConditionalFileUpdate::AlreadyDesired
+        );
+        assert_eq!(
+            package
+                .update_source_file_if_matches(&source_root, &source_path, None, Some(b"first"))
+                .expect("create source file"),
+            sai_windows_fs::ConditionalFileUpdate::Updated
+        );
+        assert_eq!(
+            package
+                .update_source_file_if_matches(
+                    &source_root,
+                    &source_path,
+                    Some(b"first"),
+                    Some(b"second"),
+                )
+                .expect("replace source file"),
+            sai_windows_fs::ConditionalFileUpdate::Updated
+        );
+        assert_eq!(
+            package
+                .update_source_file_if_matches(&source_root, &source_path, Some(b"second"), None)
+                .expect("remove source file"),
+            sai_windows_fs::ConditionalFileUpdate::Updated
+        );
+        assert_eq!(
+            package
+                .read_source_file_snapshot(&source_path)
+                .expect("observe removed source"),
+            LocalPackageSourceFileState::Absent
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn source_file_update_distinguishes_empty_files_and_absence_and_is_idempotent() {
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        fs::create_dir_all(package_path.join("src")).expect("create source directory");
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        let source_root = ContentPackagePath::parse("src").expect("valid source root");
+        let source_path = ContentPackagePath::parse("src/empty.sai").expect("valid source path");
+
+        assert_eq!(
+            package
+                .update_source_file_if_matches(&source_root, &source_path, None, Some(b""))
+                .expect("create empty source file"),
+            sai_windows_fs::ConditionalFileUpdate::Updated
+        );
+        assert_eq!(
+            package
+                .read_source_file_snapshot(&source_path)
+                .expect("observe empty source"),
+            LocalPackageSourceFileState::RegularFile(Arc::from(&b""[..]))
+        );
+        assert_eq!(
+            package
+                .update_source_file_if_matches(&source_root, &source_path, None, Some(b""))
+                .expect("already desired bytes are idempotent"),
+            sai_windows_fs::ConditionalFileUpdate::AlreadyDesired
+        );
+        assert_eq!(
+            package
+                .update_source_file_if_matches(&source_root, &source_path, Some(b""), None)
+                .expect("remove empty source file"),
+            sai_windows_fs::ConditionalFileUpdate::Updated
+        );
+        assert_eq!(
+            package
+                .read_source_file_snapshot(&source_path)
+                .expect("observe absent source"),
+            LocalPackageSourceFileState::Absent
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn source_file_update_rejects_stale_expected_bytes_without_changing_the_target() {
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        let source_root = package_path.join("src");
+        fs::create_dir_all(&source_root).expect("create source directory");
+        fs::write(source_root.join("lib.sai"), b"third party").expect("write source file");
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+
+        assert_eq!(
+            package.update_source_file_if_matches(
+                &ContentPackagePath::parse("src").expect("valid source root"),
+                &ContentPackagePath::parse("src/lib.sai").expect("valid source path"),
+                Some(b"stale"),
+                Some(b"replacement"),
+            ),
+            Err(LocalPackageSourceFileUpdateError::Conflict)
+        );
+        assert_eq!(
+            fs::read(source_root.join("lib.sai")).expect("read unchanged source"),
+            b"third party"
+        );
+    }
+
+    #[test]
+    fn source_file_update_requires_a_canonical_sai_path_beneath_the_source_root() {
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        let source_root = ContentPackagePath::parse("src").expect("valid source root");
+
+        for source_path in [
+            "tests/lib.sai",
+            "src-old/lib.sai",
+            "src",
+            "src/.sai",
+            "src/lib.rs",
+        ] {
+            assert_eq!(
+                package.update_source_file_if_matches(
+                    &source_root,
+                    &ContentPackagePath::parse(source_path).expect("valid package path"),
+                    None,
+                    Some(b"source"),
+                ),
+                Err(LocalPackageSourceFileUpdateError::InvalidSourcePath),
+                "unexpectedly accepted {source_path}"
+            );
+        }
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn source_file_update_rejects_missing_and_symlinked_parent_directories() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        let source_root = package_path.join("src");
+        fs::create_dir_all(&source_root).expect("create source directory");
+        let outside = tree.path().join("outside");
+        fs::create_dir(&outside).expect("create outside directory");
+        symlink(&outside, source_root.join("linked")).expect("create source parent symlink");
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        let root = ContentPackagePath::parse("src").expect("valid source root");
+
+        assert_eq!(
+            package.update_source_file_if_matches(
+                &root,
+                &ContentPackagePath::parse("src/missing/lib.sai").expect("valid source path"),
+                None,
+                Some(b"source"),
+            ),
+            Err(LocalPackageSourceFileUpdateError::MissingIntermediateDirectory)
+        );
+        assert_eq!(
+            package.update_source_file_if_matches(
+                &root,
+                &ContentPackagePath::parse("src/linked/lib.sai").expect("valid source path"),
+                None,
+                Some(b"source"),
+            ),
+            Err(LocalPackageSourceFileUpdateError::UnsafePathComponent)
+        );
+        assert!(
+            fs::read_dir(outside)
+                .expect("inspect outside directory")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn source_file_update_rejects_symlink_and_non_regular_targets() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        let source_root = package_path.join("src");
+        fs::create_dir_all(&source_root).expect("create source directory");
+        let outside_file = tree.path().join("outside.sai");
+        fs::write(&outside_file, b"outside").expect("write external source");
+        symlink(&outside_file, source_root.join("linked.sai")).expect("create source symlink");
+        fs::create_dir(source_root.join("directory.sai")).expect("create directory target");
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        let root = ContentPackagePath::parse("src").expect("valid source root");
+
+        assert_eq!(
+            package.update_source_file_if_matches(
+                &root,
+                &ContentPackagePath::parse("src/linked.sai").expect("valid source path"),
+                Some(b"outside"),
+                Some(b"changed"),
+            ),
+            Err(LocalPackageSourceFileUpdateError::UnsafePathComponent)
+        );
+        assert_eq!(
+            package.update_source_file_if_matches(
+                &root,
+                &ContentPackagePath::parse("src/directory.sai").expect("valid source path"),
+                None,
+                Some(b"changed"),
+            ),
+            Err(LocalPackageSourceFileUpdateError::NonRegularFile)
+        );
+        assert_eq!(
+            fs::read(&outside_file).expect("read unchanged external source"),
+            b"outside"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn source_file_update_enforces_source_file_size_limit_for_both_states() {
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        fs::create_dir_all(package_path.join("src")).expect("create source directory");
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        let root = ContentPackagePath::parse("src").expect("valid source root");
+        let path = ContentPackagePath::parse("src/lib.sai").expect("valid source path");
+        let oversized = vec![0; MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES as usize + 1];
+
+        assert_eq!(
+            package.update_source_file_if_matches(&root, &path, Some(&oversized), None),
+            Err(LocalPackageSourceFileUpdateError::FileTooLarge)
+        );
+        assert_eq!(
+            package.update_source_file_if_matches(&root, &path, None, Some(&oversized)),
+            Err(LocalPackageSourceFileUpdateError::FileTooLarge)
+        );
+        assert_eq!(
+            package
+                .read_source_file_snapshot(&path)
+                .expect("observe untouched target"),
+            LocalPackageSourceFileState::Absent
+        );
+
+        let oversized_path = package_path.join("src/oversized.sai");
+        fs::File::create(&oversized_path)
+            .expect("create oversized source file")
+            .set_len(MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES + 1)
+            .expect("extend source beyond limit");
+        assert_eq!(
+            package.update_source_file_if_matches(
+                &root,
+                &ContentPackagePath::parse("src/oversized.sai")
+                    .expect("valid oversized source path"),
+                Some(b"expected"),
+                None,
+            ),
+            Err(LocalPackageSourceFileUpdateError::FileTooLarge)
+        );
+    }
+
+    #[cfg(not(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    )))]
+    #[test]
+    fn source_file_update_fails_closed_when_handle_relative_durable_updates_are_unavailable() {
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        fs::create_dir_all(package_path.join("src")).expect("create source directory");
+        let target = package_path.join("src/lib.sai");
+        fs::write(&target, b"unchanged").expect("write source file");
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+
+        assert_eq!(
+            package.update_source_file_if_matches(
+                &ContentPackagePath::parse("src").expect("valid source root"),
+                &ContentPackagePath::parse("src/lib.sai").expect("valid source path"),
+                Some(b"unchanged"),
+                Some(b"changed"),
+            ),
+            Err(LocalPackageSourceFileUpdateError::PlatformNotSupported)
+        );
+        assert_eq!(
+            fs::read(target).expect("read unchanged target"),
+            b"unchanged"
         );
     }
 
