@@ -1,3 +1,4 @@
+use sai_syntax::{is_reserved_identifier, is_strict_keyword};
 use unicode_ident::{is_xid_continue, is_xid_start};
 use unicode_normalization::is_nfc;
 
@@ -163,7 +164,7 @@ fn is_sai_module_segment(value: &str) -> bool {
             return false;
         }
     }
-    true
+    !is_strict_keyword(value) && !is_reserved_identifier(value) && value != "lib"
 }
 
 fn is_wit_interface_segment(value: &str) -> bool {
@@ -515,7 +516,13 @@ mod tests {
         assert!(is_package_segment("user"));
         assert!(is_module_path("/codec"));
         assert!(is_module_path("/internal_tools"));
+        assert!(is_module_path("/service/result"));
+        assert!(is_module_path("/service/fs"));
         assert!(is_module_path("/outgoing-handler"));
+        assert!(!is_module_path("/service/and"));
+        assert!(!is_module_path("/service/type"));
+        assert!(!is_module_path("/service/null"));
+        assert!(!is_module_path("/service/lib"));
         assert!(!is_module_path("/a_-b"));
         assert!(!is_module_path("/foo-bar/baz"));
         assert!(is_canonical_name("Parser"));
@@ -551,6 +558,11 @@ mod tests {
             "acme:user/../../outside",
             "acme:user//outside.item",
             "acme:user/Upper.item",
+            "acme:user/service/and.item",
+            "acme:user/service/type.item",
+            "acme:user/service/null.item",
+            "acme:user/service/try.item",
+            "acme:user/service/lib.item",
             "acme:user/trailing-.item",
             "acme:user/double--dash.item",
             "acme:user/a_-b.item",
