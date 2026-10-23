@@ -1564,6 +1564,10 @@ mod tests {
         ));
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn builds_target_independent_inventory_from_all_lock_edges() {
         let workspace = TestWorkspace::new();
@@ -1660,6 +1664,10 @@ mod tests {
         );
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn rejects_local_dependency_requirements_missing_from_the_lock() {
         let workspace = TestWorkspace::new();
@@ -1783,6 +1791,10 @@ mod tests {
         ));
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn includes_artifact_only_workspace_members_without_source_directories() {
         let workspace = TestWorkspace::new();
@@ -1822,6 +1834,10 @@ mod tests {
         assert!(artifact.source_directory().is_none());
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn excludes_external_path_and_git_sources_from_workspace_members() {
         let workspace = TestWorkspace::new();
@@ -1876,6 +1892,10 @@ mod tests {
         assert_eq!(inventory.directories().count(), 1);
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn materializes_lock_floor_path_entries_into_the_inventory() {
         let workspace = TestWorkspace::new();
@@ -1920,6 +1940,10 @@ mod tests {
         );
     }
 
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
     #[test]
     fn rejects_missing_and_mismatched_locked_packages_without_partial_inventory() {
         let workspace = TestWorkspace::new();
@@ -1968,6 +1992,39 @@ mod tests {
         );
         assert!(matches!(
             build_inventory(&workspace.0, &mismatched),
+            Err(IndexJournalWorkspaceInventoryBuildError::SourceValidation { .. })
+        ));
+    }
+
+    #[cfg(not(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    )))]
+    #[test]
+    fn local_path_inventory_fails_closed_when_directory_resolution_is_unsupported() {
+        let workspace = TestWorkspace::new();
+        write_package(
+            &workspace.0,
+            ".",
+            "package acme:app @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n\
+             requires { acme:dep @ ^1 from path \"packages/dep\" }\n",
+        );
+        write_package(
+            &workspace.0,
+            "packages/dep",
+            "package acme:dep @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n",
+        );
+        let lock = lock_root(
+            "    requires acme:dep @ ^1 -> 1.0.0 from path \"packages/dep\"\n",
+            &path_lock_entry("acme:dep", "1.0.0", "packages/dep", ""),
+        );
+
+        assert!(matches!(
+            build_inventory(&workspace.0, &lock),
             Err(IndexJournalWorkspaceInventoryBuildError::SourceValidation { .. })
         ));
     }
