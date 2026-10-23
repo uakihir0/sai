@@ -1,0 +1,53 @@
+use acme:insurance-claim-review/adjudicator
+use acme:insurance-claim-review/data
+use acme:insurance-claim-review/model.{ClaimOutcome, ClaimReport, ReviewReason}
+
+pub fn review_sample() -> ClaimReport {
+    adjudicator.review(data.batch())
+}
+
+test "claim batch applies deductible and shared aggregate in loss order" {
+    let report = review_sample()
+    assert report.decision_count == 8
+    assert report.paid_count == 1
+    assert report.capped_count == 1
+    assert report.denied_count == 5
+    assert report.pending_count == 1
+    assert report.total_payable_dollars == 5500
+    assert report.policy_balances[0].unwrap().policy_id == 501
+    assert report.policy_balances[0].unwrap().remaining_aggregate_dollars == 0
+    assert report.policy_balances[1].unwrap().policy_id == 502
+    assert report.policy_balances[1].unwrap().remaining_aggregate_dollars == 5000
+}
+
+test "sorted decisions explain pending, duplicate, excluded, exhausted, late, and unknown claims" {
+    let report = review_sample()
+    assert report.decisions[0].unwrap().claim_id == 9005
+    assert report.decisions[0].unwrap().outcome == ClaimOutcome.Pending
+    assert report.decisions[0].unwrap().reason == Some(ReviewReason.MissingDocuments)
+    assert report.decisions[0].unwrap().pre_aggregate_payment_dollars == None
+    assert report.decisions[0].unwrap().payable_dollars == 0
+    assert report.decisions[1].unwrap().claim_id == 9001
+    assert report.decisions[1].unwrap().pre_aggregate_payment_dollars == Some(4000)
+    assert report.decisions[1].unwrap().payable_dollars == 4000
+    assert report.decisions[2].unwrap().claim_id == 9002
+    assert report.decisions[2].unwrap().outcome == ClaimOutcome.Capped
+    assert report.decisions[2].unwrap().pre_aggregate_payment_dollars == Some(1800)
+    assert report.decisions[2].unwrap().payable_dollars == 1500
+    assert report.decisions[3].unwrap().claim_id == 9004
+    assert report.decisions[3].unwrap().reason == Some(ReviewReason.DuplicatePaidEvent)
+    assert report.decisions[3].unwrap().pre_aggregate_payment_dollars == None
+    assert report.decisions[4].unwrap().claim_id == 9003
+    assert report.decisions[4].unwrap().reason == Some(ReviewReason.PerilNotCovered)
+    assert report.decisions[4].unwrap().pre_aggregate_payment_dollars == None
+    assert report.decisions[5].unwrap().claim_id == 9008
+    assert report.decisions[5].unwrap().reason == Some(ReviewReason.AggregateExhausted)
+    assert report.decisions[5].unwrap().pre_aggregate_payment_dollars == Some(1600)
+    assert report.decisions[5].unwrap().payable_dollars == 0
+    assert report.decisions[6].unwrap().claim_id == 9006
+    assert report.decisions[6].unwrap().reason == Some(ReviewReason.LateNotice)
+    assert report.decisions[6].unwrap().pre_aggregate_payment_dollars == None
+    assert report.decisions[7].unwrap().claim_id == 9007
+    assert report.decisions[7].unwrap().reason == Some(ReviewReason.UnknownPolicy)
+    assert report.decisions[7].unwrap().pre_aggregate_payment_dollars == None
+}

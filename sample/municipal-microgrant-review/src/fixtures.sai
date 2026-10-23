@@ -1,0 +1,120 @@
+use acme:municipal-microgrant-review/model.{Application, District}
+
+pub fn applications() -> Array<Application, 7> {
+    [
+        Application(
+            id: 107,
+            applicant: "Harbor Youth Garden",
+            district: District.North,
+            registered_nonprofit: false,
+            documents_complete: true,
+            serves_city_residents: true,
+            match_percent: 40,
+            request_thousands: 18,
+            need_points: 39,
+            resident_impact_points: 22,
+            readiness_points: 19,
+            match_points: 10,
+        ),
+        Application(
+            id: 104,
+            applicant: "Riverside Neighbors",
+            district: District.East,
+            registered_nonprofit: true,
+            documents_complete: true,
+            serves_city_residents: true,
+            match_percent: 25,
+            request_thousands: 15,
+            need_points: 40,
+            resident_impact_points: 22,
+            readiness_points: 18,
+            match_points: 9,
+        ),
+        Application(
+            id: 101,
+            applicant: "Eastside Cooling Co-op",
+            district: District.East,
+            registered_nonprofit: true,
+            documents_complete: true,
+            serves_city_residents: true,
+            match_percent: 25,
+            request_thousands: 40,
+            need_points: 37,
+            resident_impact_points: 20,
+            readiness_points: 18,
+            match_points: 9,
+        ),
+        Application(
+            id: 106,
+            applicant: "West Porch Network",
+            district: District.West,
+            registered_nonprofit: true,
+            documents_complete: true,
+            serves_city_residents: true,
+            match_percent: 30,
+            request_thousands: 20,
+            need_points: 32,
+            resident_impact_points: 20,
+            readiness_points: 16,
+            match_points: 7,
+        ),
+        Application(
+            id: 103,
+            applicant: "Central Tree Commons",
+            district: District.Central,
+            registered_nonprofit: true,
+            documents_complete: true,
+            serves_city_residents: true,
+            match_percent: 30,
+            request_thousands: 30,
+            need_points: 38,
+            resident_impact_points: 24,
+            readiness_points: 20,
+            match_points: 11,
+        ),
+        Application(
+            id: 105,
+            applicant: "South Market Alliance",
+            district: District.South,
+            registered_nonprofit: true,
+            documents_complete: true,
+            serves_city_residents: true,
+            match_percent: 20,
+            request_thousands: 25,
+            need_points: 35,
+            resident_impact_points: 19,
+            readiness_points: 17,
+            match_points: 8,
+        ),
+        Application(
+            id: 102,
+            applicant: "North Block Trust",
+            district: District.North,
+            registered_nonprofit: true,
+            documents_complete: true,
+            serves_city_residents: true,
+            match_percent: 25,
+            request_thousands: 35,
+            need_points: 36,
+            resident_impact_points: 21,
+            readiness_points: 19,
+            match_points: 10,
+        ),
+    ]
+}
+
+pub fn cycle_budget_thousands() -> U32 {
+    100
+}
+
+pub fn minimum_match_percent() -> U32 {
+    20
+}
+
+pub fn maximum_request_thousands() -> U32 {
+    50
+}
+
+pub fn maximum_awards_per_district() -> USize {
+    1
+}

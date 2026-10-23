@@ -1,0 +1,63 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum District {
+    Central
+    East
+    North
+    South
+    West
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum DecisionReason {
+    MissingNonprofitRegistration
+    IncompleteApplication
+    OutsideCityServiceArea
+    MatchShareOutOfRange
+    InsufficientMatch
+    ZeroRequest
+    RequestAboveProgramLimit
+    RubricScoreOutOfRange
+    DistrictAwardLimit
+    InsufficientRemainingBudget
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Application {
+    pub id: U32
+    pub applicant: Str
+    pub district: District
+    pub registered_nonprofit: Bool
+    pub documents_complete: Bool
+    pub serves_city_residents: Bool
+    // Match is the applicant-funded share of the total project cost, in percent.
+    pub match_percent: U32
+    // Grant amounts are stored in whole thousands of dollars.
+    pub request_thousands: U32
+    // Committee rubric inputs. Maximums are 40, 25, 20, and 15 points.
+    pub need_points: U32
+    pub resident_impact_points: U32
+    pub readiness_points: U32
+    pub match_points: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type GrantDecision {
+    pub rank: USize
+    pub application: Application
+    pub score: U64
+    pub awarded: Bool
+    pub reason: Option<DecisionReason>
+    pub award_thousands: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type GrantPlan {
+    pub decisions: Array<Option<GrantDecision>, 7>
+    pub decision_count: USize
+    pub award_count: USize
+    pub ineligible_count: USize
+    pub district_limit_count: USize
+    pub budget_limit_count: USize
+    pub total_awarded_thousands: U32
+    pub remaining_budget_thousands: U32
+}

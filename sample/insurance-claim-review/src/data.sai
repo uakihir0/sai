@@ -1,0 +1,153 @@
+use acme:insurance-claim-review/model.{Claim, ClaimBatch, CoverageKind, PerilKind, Policy}
+
+pub fn policies() -> Array<Option<Policy>, 2> {
+    [
+        Some(
+            Policy(
+                id: 501,
+                term_start_day: 100,
+                term_end_day: 465,
+                notice_period_days: 30,
+                deductible_dollars: 1000,
+                dwelling_limit_dollars: 10000,
+                contents_limit_dollars: 5000,
+                aggregate_limit_dollars: 6500,
+                aggregate_paid_to_date_dollars: 1000,
+                covers_fire: true,
+                covers_wind: true,
+                covers_flood: false,
+                covers_theft: true,
+            ),
+        ),
+        Some(
+            Policy(
+                id: 502,
+                term_start_day: 200,
+                term_end_day: 565,
+                notice_period_days: 30,
+                deductible_dollars: 500,
+                dwelling_limit_dollars: 8000,
+                contents_limit_dollars: 4000,
+                aggregate_limit_dollars: 5000,
+                aggregate_paid_to_date_dollars: 0,
+                covers_fire: true,
+                covers_wind: true,
+                covers_flood: false,
+                covers_theft: true,
+            ),
+        ),
+    ]
+}
+
+pub fn claims() -> Array<Option<Claim>, 8> {
+    [
+        Some(
+            Claim(
+                id: 9005,
+                policy_id: 501,
+                event_id: 88,
+                loss_day: 217,
+                reported_day: 220,
+                coverage: CoverageKind.Dwelling,
+                peril: PerilKind.Wind,
+                estimated_damage_dollars: 2400,
+                documents_complete: false,
+            ),
+        ),
+        Some(
+            Claim(
+                id: 9001,
+                policy_id: 501,
+                event_id: 11,
+                loss_day: 219,
+                reported_day: 224,
+                coverage: CoverageKind.Contents,
+                peril: PerilKind.Fire,
+                estimated_damage_dollars: 6000,
+                documents_complete: true,
+            ),
+        ),
+        Some(
+            Claim(
+                id: 9002,
+                policy_id: 501,
+                event_id: 77,
+                loss_day: 220,
+                reported_day: 222,
+                coverage: CoverageKind.Dwelling,
+                peril: PerilKind.Wind,
+                estimated_damage_dollars: 2800,
+                documents_complete: true,
+            ),
+        ),
+        Some(
+            Claim(
+                id: 9004,
+                policy_id: 501,
+                event_id: 77,
+                loss_day: 221,
+                reported_day: 223,
+                coverage: CoverageKind.Dwelling,
+                peril: PerilKind.Wind,
+                estimated_damage_dollars: 1500,
+                documents_complete: true,
+            ),
+        ),
+        Some(
+            Claim(
+                id: 9003,
+                policy_id: 502,
+                event_id: 300,
+                loss_day: 222,
+                reported_day: 225,
+                coverage: CoverageKind.Dwelling,
+                peril: PerilKind.Flood,
+                estimated_damage_dollars: 12000,
+                documents_complete: true,
+            ),
+        ),
+        Some(
+            Claim(
+                id: 9006,
+                policy_id: 501,
+                event_id: 91,
+                loss_day: 230,
+                reported_day: 270,
+                coverage: CoverageKind.Contents,
+                peril: PerilKind.Fire,
+                estimated_damage_dollars: 3200,
+                documents_complete: true,
+            ),
+        ),
+        Some(
+            Claim(
+                id: 9007,
+                policy_id: 999,
+                event_id: 123,
+                loss_day: 235,
+                reported_day: 236,
+                coverage: CoverageKind.Contents,
+                peril: PerilKind.Theft,
+                estimated_damage_dollars: 1800,
+                documents_complete: true,
+            ),
+        ),
+        Some(
+            Claim(
+                id: 9008,
+                policy_id: 501,
+                event_id: 92,
+                loss_day: 223,
+                reported_day: 225,
+                coverage: CoverageKind.Contents,
+                peril: PerilKind.Fire,
+                estimated_damage_dollars: 2600,
+                documents_complete: true,
+            ),
+        ),
+    ]
+}
+
+pub fn batch() -> ClaimBatch {
+    ClaimBatch(policies: policies(), policy_count: 2, claims: claims(), claim_count: 8)
+}

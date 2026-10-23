@@ -1,0 +1,31 @@
+use acme:insurance-claim-review/model.{ClaimBatch, CoverageKind, PerilKind, Policy}
+
+pub fn index_of(batch: ClaimBatch, policy_id: U32) -> Option<USize> {
+    for index in 0..batch.policy_count {
+        let policy = batch.policies[index].unwrap()
+        if policy.id == policy_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn initial_aggregate_remaining(policy: Policy) -> U32 {
+    policy.aggregate_limit_dollars - policy.aggregate_paid_to_date_dollars
+}
+
+pub fn coverage_limit(policy: Policy, coverage: CoverageKind) -> U32 {
+    match coverage {
+        CoverageKind.Dwelling => policy.dwelling_limit_dollars
+        CoverageKind.Contents => policy.contents_limit_dollars
+    }
+}
+
+pub fn covers_peril(policy: Policy, peril: PerilKind) -> Bool {
+    match peril {
+        PerilKind.Fire => policy.covers_fire
+        PerilKind.Wind => policy.covers_wind
+        PerilKind.Flood => policy.covers_flood
+        PerilKind.Theft => policy.covers_theft
+    }
+}

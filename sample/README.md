@@ -38,6 +38,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`weighted-route-finder`](weighted-route-finder/README.md) | Find a minimum-time multi-edge route with Dijkstra's algorithm, stable tie-breaking, and predecessor-based path reconstruction. |
 | Advanced | [`access-policy-review`](access-policy-review/README.md) | Evaluate role, action, and resource rules with deny-overrides, default-deny, and stable decision explanations. |
 | Advanced | [`flood-evacuation-planner`](flood-evacuation-planner/README.md) | Assign whole households to safe shelters under deadlines, closed roads, hazard limits, accessible-space, and medical-support capacity constraints. |
+| Advanced | [`insurance-claim-review`](insurance-claim-review/README.md) | Adjudicate fixed property claims through policy checks, duplicate-event prevention, per-claim deductibles, and policy-wide aggregate limits. |
 | Advanced | [`package-lock-auditor`](package-lock-auditor/README.md) | Check a fixed dependency lock for missing packages, version-range conflicts, and cycles; produce a stable build order only when the graph is valid. |
 | Advanced | [`ranked-choice-audit`](ranked-choice-audit/README.md) | Tally fixed ranked ballots by round, track exhausted preferences, and apply a documented tie rule. |
 | Advanced | [`telemetry-frame-decoder`](telemetry-frame-decoder/README.md) | Validate and decode fixed sensor frames with byte masks, a checksum, and ordered structured errors. |
@@ -48,6 +49,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`nonogram-solver`](nonogram-solver/README.md) | Validate line clues, enumerate fixed-width candidates, prune partial grids, and backtrack to a deterministic solution. |
 | Advanced | [`invoice-reconciliation`](invoice-reconciliation/README.md) | Match invoices against purchase orders and receipts; flag price and reference issues, partial billing, and cumulative overbilling. |
 | Advanced | [`swiss-tournament-auditor`](swiss-tournament-auditor/README.md) | Validate a fixed Swiss-style tournament, calculate match points and Buchholz tie-breaks, then produce deterministic standings. |
+| Advanced | [`municipal-microgrant-review`](municipal-microgrant-review/README.md) | Screen community project applications, rank a review rubric, and allocate whole grants under budget and district limits. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or
