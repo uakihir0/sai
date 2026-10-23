@@ -25610,6 +25610,223 @@ mod tests {
     }
 
     #[test]
+    fn module_symbol_inventory_collects_refined_types_and_preserves_aliases() {
+        let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"type Quantity = I32 where self >= 0\ntype Count = Quantity\n",
+            b"type Positive = I32 where self > 0\n",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                ("acme:phase1.Quantity", sai_semantic::SymbolKind::Refined),
+                ("acme:phase1.Count", sai_semantic::SymbolKind::Alias),
+                (
+                    "acme:phase1/child.Positive",
+                    sai_semantic::SymbolKind::Refined
+                ),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        for (file_id, name, expected_path) in [
+            (
+                module_tree.modules[0].file,
+                "Quantity",
+                "acme:phase1.Quantity",
+            ),
+            (
+                module_tree.modules[1].file,
+                "Positive",
+                "acme:phase1/child.Positive",
+            ),
+        ] {
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == expected_path)
+                .expect("the refined type has its canonical module path");
+            assert_eq!(symbol.kind(), sai_semantic::SymbolKind::Refined);
+
+            let owner = collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .find(|owner| {
+                    owner.file == file_id
+                        && owner.kind == TopLevelOwnerKind::Refined
+                        && database
+                            .resolve_def_path(owner.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                matches!(
+                                    path.data().last().map(|component| &component.data),
+                                    Some(DefPathData::TypeNs(symbol))
+                                        if database.symbols.resolve(*symbol).is_ok_and(|resolved| resolved.as_ref() == name)
+                                )
+                            })
+                })
+                .expect("the refined declaration has the matching top-level owner");
+            let owner_path = database
+                .resolve_def_path(owner.owner.def_id.to_def_id())
+                .expect("refined owner DefId is valid")
+                .expect("refined owner DefPath exists");
+            assert_eq!(owner_path.package(), module_tree.package);
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&owner_path, &database.packages, &database.symbols)
+                    .expect("refined owner DefPath hashes");
+            assert_eq!(
+                symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+
+            let predicate_owner = collection
+                .scopes()
+                .refinement_predicate_owners
+                .iter()
+                .find(|predicate_owner| {
+                    predicate_owner.file == file_id
+                        && predicate_owner.item_id == owner.item_id
+                        && predicate_owner.owner == owner.owner
+                        && predicate_owner.kind
+                            == sai_resolve::package_scopes::RefinementPredicateOwnerKind::Refined
+                })
+                .expect("the refinement-predicate owner matches its refined item");
+            assert_eq!(predicate_owner.file, owner.file);
+            assert_eq!(predicate_owner.item_id, owner.item_id);
+
+            let parsed = sai_syntax::parse(&snapshot, file_id).expect("module parses");
+            let declaration = parsed
+                .root
+                .descendants()
+                .filter_map(ast::TypeDecl::cast)
+                .find(|declaration| {
+                    declaration
+                        .name()
+                        .and_then(|name| name.token())
+                        .is_some_and(|token| token.text() == name)
+                })
+                .expect("the expected refined declaration is in the source");
+            let name_token = declaration
+                .name()
+                .and_then(|name| name.token())
+                .expect("refined declaration has its own name token");
+            assert_eq!(
+                symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint(
+                    sai_semantic::SymbolKind::Refined,
+                    declaration.syntax(),
+                    Some(&name_token),
+                )
+                .expect("refined declaration fingerprint is defined")
+            );
+        }
+
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.path() == "acme:phase1.Count"
+                    && symbol.kind() == sai_semantic::SymbolKind::Alias),
+            "adding refined declarations preserves ordinary alias inventory"
+        );
+    }
+
+    #[test]
+    fn module_refined_type_fingerprint_ignores_names_and_tracks_base_and_predicate() {
+        let fingerprint_for = |source: &[u8]| {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert_eq!(
+                inventory.coverage(),
+                &sai_semantic::InventoryCoverage::Complete
+            );
+            inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind() == sai_semantic::SymbolKind::Refined)
+                .expect("the refined type is inventoried")
+                .fingerprint()
+        };
+        let original = fingerprint_for(b"type Original = I32 where self > 0\n");
+        let renamed = fingerprint_for(b"type Renamed = I32 where self > 0\n");
+        let changed_base = fingerprint_for(b"type Original = U32 where self > 0\n");
+        let changed_predicate = fingerprint_for(b"type Original = I32 where self > 1\n");
+
+        assert_eq!(
+            original, renamed,
+            "renaming a refined type preserves its declaration fingerprint"
+        );
+        assert_ne!(
+            original, changed_base,
+            "the refined base type contributes to its declaration fingerprint"
+        );
+        assert_ne!(
+            original, changed_predicate,
+            "the refinement predicate contributes to its declaration fingerprint"
+        );
+    }
+
+    #[test]
+    fn module_symbol_inventory_fails_closed_for_generic_refined_types() {
+        let (_, _, _, collection) = collect_package_inventory_for_target(
+            b"type Generic<T> = I32 where self > 0\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("refined type declares unsupported generic parameters")
+        ));
+        assert!(
+            inventory.symbols().iter().all(|symbol| {
+                symbol.kind() != sai_semantic::SymbolKind::Refined
+                    && symbol.kind() != sai_semantic::SymbolKind::GenericParam
+            }),
+            "a generic refined declaration contributes neither its parent nor generic symbols"
+        );
+    }
+
+    #[test]
+    fn module_symbol_inventory_fails_closed_for_malformed_or_target_error_refined_types() {
+        let (_, _, _, malformed) = collect_package_inventory_for_target(
+            b"type Malformed = I32 where\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(matches!(
+            inventory_symbols(&malformed).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("recovery or parse errors")
+        ));
+
+        let (_, _, _, invalid_target) = collect_package_inventory_for_target(
+            b"@target(\"wasm32-linux\")\ntype Uncertain = I32 where self > 0\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(matches!(
+            inventory_symbols(&invalid_target).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("target-selection error")
+        ));
+    }
+
+    #[test]
     fn module_alias_fingerprints_ignore_names_and_track_the_target_type() {
         let fingerprint_for = |source: &[u8]| {
             let (_, _, _, collection) =
@@ -25673,10 +25890,6 @@ mod tests {
             (
                 &b"type Duplicate<T, T> = T\n"[..],
                 "duplicate canonical symbol path",
-            ),
-            (
-                &b"type Refined = I32 where self >= 0\n"[..],
-                "outside the function-generic-parameter-type-alias-generic-parameter-constant-effect inventory",
             ),
         ] {
             let (_, _, _, collection) =
@@ -25774,7 +25987,7 @@ mod tests {
     fn module_function_inventory_fails_closed_for_other_symbol_forms() {
         for (source, expected_reason) in [(
             &b"type Marker {}\n"[..],
-            "outside the function-generic-parameter-type-alias-generic-parameter-constant-effect inventory",
+            "outside the function-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect inventory",
         )] {
             let (_, _, _, collection) =
                 collect_package_inventory_for_target(source, b"", "wasm32-core");
