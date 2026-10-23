@@ -5,7 +5,9 @@ use sai_hir::{
 };
 use sai_intern::{Interner, PackageInterner, Symbol};
 use sai_package::mvs::MvsPackageVersion;
-use sai_resolve::package_scopes::{FunctionOwnerDescriptor, Phase1PackageScopes};
+use sai_resolve::package_scopes::{
+    FunctionOwnerDescriptor, Phase1PackageScopes, TopLevelOwnerDescriptor, TopLevelOwnerKind,
+};
 use sai_semantic::{
     CurrentSymbol, DeclarationFingerprintError, PackageIndexFileName, PackageSymbolInventory,
     SymbolKind, declaration_fingerprint,
@@ -18,7 +20,7 @@ use sai_syntax::{
 use sai_vfs::{FileId, PackageKey};
 use std::collections::{HashMap, HashSet};
 
-/// Result of collecting the function-only first slice of a package inventory.
+/// Result of collecting the first package inventory slice.
 ///
 /// `Unavailable` means the current Phase 1 scope did not provide the exact
 /// package graph node needed to name an index file. It must not be guessed.
@@ -39,9 +41,9 @@ impl Phase1PackageSymbolInventory {
     }
 }
 
-/// Collects the first supported slice: target-visible, non-generic,
-/// module-level functions. Every other symbol-bearing declaration makes the
-/// result incomplete until its symbol kind and path are collected as well.
+/// Collects target-visible, non-generic module-level functions and constants.
+/// Every other symbol-bearing declaration makes the result incomplete until
+/// its symbol kind and path are collected as well.
 pub(super) fn collect_module_function_inventory(
     package_key: &PackageKey,
     package_version: Option<&MvsPackageVersion>,
@@ -136,6 +138,8 @@ pub(super) fn collect_module_function_inventory(
 
     let mut owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), FunctionOwnerDescriptor>::new();
+    let mut const_owners_by_item =
+        HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut owner_ids = HashSet::<LocalDefId>::new();
     for descriptor in &scopes.function_owners {
         if owners_by_item
@@ -150,9 +154,24 @@ pub(super) fn collect_module_function_inventory(
             );
         }
     }
+    for descriptor in &scopes.top_level_owners {
+        if descriptor.kind != TopLevelOwnerKind::Const {
+            continue;
+        }
+        let key = (descriptor.file, descriptor.item_id);
+        if const_owners_by_item.insert(key, *descriptor).is_some() {
+            reasons.insert("Phase 1 contains duplicate constant owner descriptors".to_owned());
+        }
+        if !owner_ids.insert(descriptor.owner.def_id) {
+            reasons.insert(
+                "Phase 1 assigns one definition ID to multiple supported declarations".to_owned(),
+            );
+        }
+    }
 
     let mut seen_items = HashSet::new();
     let mut consumed_owners = HashSet::new();
+    let mut consumed_const_owners = HashSet::new();
     let mut canonical_paths = HashSet::<String>::new();
     let mut current_symbols = Vec::new();
 
@@ -194,6 +213,25 @@ pub(super) fn collect_module_function_inventory(
                         symbols,
                     );
                 }
+                ItemTreeKind::Const => {
+                    collect_const(
+                        entry,
+                        module.file,
+                        &module_path,
+                        package_version.package(),
+                        input,
+                        prepared.module_tree.package,
+                        &const_owners_by_item,
+                        &mut seen_items,
+                        &mut consumed_const_owners,
+                        &mut canonical_paths,
+                        &mut current_symbols,
+                        &mut reasons,
+                        def_paths,
+                        packages,
+                        symbols,
+                    );
+                }
                 ItemTreeKind::Invariant => {
                     if !entry.children.is_empty() {
                         reasons.insert(
@@ -207,7 +245,7 @@ pub(super) fn collect_module_function_inventory(
                 // functions are children of ExternBlock and are symbols.
                 _ => {
                     reasons.insert(format!(
-                        "target-filtered declaration {:?} is outside the function-only inventory",
+                        "target-filtered declaration {:?} is outside the function-and-constant inventory",
                         entry.kind
                     ));
                 }
@@ -221,10 +259,23 @@ pub(super) fn collect_module_function_inventory(
                 .to_owned(),
         );
     }
+    if consumed_const_owners.len() != const_owners_by_item.len() {
+        reasons.insert(
+            "the Phase 1 constant owner descriptors do not exactly match the filtered ItemTree"
+                .to_owned(),
+        );
+    }
     for ((file_id, item_id), _) in &owners_by_item {
         if !seen_items.contains(&(*file_id, *item_id)) {
             reasons.insert(
                 "a Phase 1 function owner has no target-filtered ItemTree declaration".to_owned(),
+            );
+        }
+    }
+    for ((file_id, item_id), _) in &const_owners_by_item {
+        if !seen_items.contains(&(*file_id, *item_id)) {
+            reasons.insert(
+                "a Phase 1 constant owner has no target-filtered ItemTree declaration".to_owned(),
             );
         }
     }
@@ -245,6 +296,160 @@ pub(super) fn collect_module_function_inventory(
             current_symbols,
         ))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_const(
+    entry: &ItemTreeEntry,
+    file_id: FileId,
+    module_path: &[String],
+    package_identity: &str,
+    input: &OwnedPhase1ModuleInput,
+    package_id: PackageId,
+    owners_by_item: &HashMap<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>,
+    seen_items: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    consumed_owners: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    reasons: &mut HashSet<String>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) {
+    let key = (file_id, entry.ast_id);
+    if !seen_items.insert(key) {
+        reasons.insert("the target-filtered ItemTree contains a duplicate constant AST ID".into());
+    }
+    if !entry.children.is_empty() {
+        reasons.insert("a constant entry has unexpected child declarations".to_owned());
+    }
+    if entry.name == Symbol::ERROR {
+        reasons.insert("a target-filtered constant has no valid declaration name".to_owned());
+        return;
+    }
+    let name = match symbols.resolve(entry.name) {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            reasons.insert("a target-filtered constant name cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let Some(descriptor) = owners_by_item.get(&key).copied() else {
+        reasons.insert("a target-filtered constant has no matching Phase 1 owner".to_owned());
+        return;
+    };
+    consumed_owners.insert(key);
+
+    let Some(pointer) = input.ast_ids.pointer(entry.ast_id) else {
+        reasons.insert("a target-filtered constant AST ID has no source pointer".to_owned());
+        return;
+    };
+    let Some(syntax) = pointer.resolve(file_id, &input.root) else {
+        reasons.insert(
+            "a target-filtered constant source pointer cannot resolve in its AST root".to_owned(),
+        );
+        return;
+    };
+    let Some(declaration) = ast::ConstDecl::cast(syntax.clone()) else {
+        reasons.insert(
+            "a target-filtered constant source pointer resolves to a non-constant node".to_owned(),
+        );
+        return;
+    };
+    let Some(name_node) = declaration.name() else {
+        reasons.insert("a target-filtered constant AST has no name node".to_owned());
+        return;
+    };
+    let Some(name_token) = name_node.token() else {
+        reasons.insert("a target-filtered constant AST has no name token".to_owned());
+        return;
+    };
+    let raw_name = name_token
+        .text()
+        .strip_prefix("r#")
+        .unwrap_or(name_token.text());
+    if sai_syntax::normalize_identifier(raw_name) != name {
+        reasons
+            .insert("the ItemTree and constant AST disagree about the declaration name".to_owned());
+        return;
+    }
+    if syntax_has_errors(&syntax) || name_token.has_error() {
+        reasons
+            .insert("a target-filtered constant AST contains recovery or parse errors".to_owned());
+        return;
+    }
+
+    let canonical_path = format!(
+        "{}{}.{name}",
+        package_identity,
+        module_path
+            .iter()
+            .map(|segment| format!("/{segment}"))
+            .collect::<String>()
+    );
+    if !canonical_paths.insert(canonical_path.clone()) {
+        reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+    }
+
+    let def_path = match def_paths.resolve(descriptor.owner.def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        Ok(Some(_)) => {
+            reasons.insert(
+                "a constant owner resolves to a definition path from another package".to_owned(),
+            );
+            return;
+        }
+        Ok(None) => {
+            reasons.insert("a constant owner has no canonical definition path".to_owned());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("a constant owner definition path cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let path_matches_declaration = def_path.data().len() == module_path.len() + 1
+        && def_path
+            .data()
+            .iter()
+            .take(module_path.len())
+            .zip(module_path)
+            .all(|(component, name)| {
+                matches!(&component.data, DefPathData::Module(segment)
+                    if symbols.resolve(*segment).is_ok_and(|resolved| resolved.as_ref() == name))
+            })
+        && matches!(
+            def_path.data().last().map(|component| &component.data),
+            Some(DefPathData::ValueNs(symbol)) if *symbol == entry.name
+        );
+    if !path_matches_declaration {
+        reasons.insert(
+            "the canonical constant definition path does not match its module and ItemTree declaration"
+                .to_owned(),
+        );
+        return;
+    }
+    let def_path_hash = match DefPathHash::compute(&def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert("a constant definition path hash cannot be computed".to_owned());
+            return;
+        }
+    };
+    let fingerprint = match declaration_fingerprint(SymbolKind::Const, &syntax, Some(&name_token)) {
+        Ok(fingerprint) => fingerprint,
+        Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+            reasons
+                .insert("a constant declaration name token is outside its syntax node".to_owned());
+            return;
+        }
+    };
+    current_symbols.push(CurrentSymbol::new(
+        canonical_path,
+        def_path_hash,
+        SymbolKind::Const,
+        fingerprint,
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
