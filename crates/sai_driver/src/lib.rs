@@ -9,6 +9,7 @@ pub mod index_operation_journal_validation;
 mod interface_impl_resource_wit;
 mod interface_resource_alias;
 mod interface_use_queries;
+mod module_function_inventory;
 pub mod package_graph;
 mod package_wit_name_queries;
 pub mod symbol_index_store;
@@ -29,6 +30,8 @@ use interface_resource_alias::{
 use interface_use_queries::InterfaceUsesQueries;
 pub use interface_use_queries::InterfaceUsesQueryError;
 pub use interface_use_queries::WorldInterfaceUseGraph;
+pub use module_function_inventory::Phase1PackageSymbolInventory;
+use module_function_inventory::collect_module_function_inventory;
 pub use sai_wit::WitPackageDiagnosticTemplate;
 pub use wit_package_queries::{
     WitPackageFailure, WitPackageQueryError, WitPackageResult, WitPackageSourceFailure,
@@ -2292,6 +2295,7 @@ impl Phase1ActiveWitViewScopes {
 pub struct Phase1PackageScopesCollection {
     package_key: PackageKey,
     scopes: Phase1PackageScopes,
+    package_symbol_inventory: Phase1PackageSymbolInventory,
     package_wit_names: PackageWitNames,
     package_wit_names_fingerprint: Fingerprint,
     interface_uses: InterfaceUses,
@@ -2326,6 +2330,13 @@ impl Phase1PackageScopesCollection {
 
     pub fn scopes(&self) -> &Phase1PackageScopes {
         &self.scopes
+    }
+
+    /// Target-filtered symbols supported by the first package inventory
+    /// slice. An available inventory may be incomplete; callers must inspect
+    /// its coverage before reconciliation.
+    pub fn package_symbol_inventory(&self) -> &Phase1PackageSymbolInventory {
+        &self.package_symbol_inventory
     }
 
     /// The package-level WIT names and diagnostics derived from this exact
@@ -14055,9 +14066,19 @@ impl RootDatabase {
             );
         }
         sort_phase1_diagnostics(&mut scopes.diagnostics);
+        let package_symbol_inventory = collect_module_function_inventory(
+            &package_key,
+            prepared.generated_package_version.as_ref(),
+            &prepared,
+            &scopes,
+            &prepared.def_paths,
+            &self.packages,
+            &self.symbols,
+        );
         Ok(Phase1PackageScopesCollection {
             package_key,
             scopes,
+            package_symbol_inventory,
             package_wit_names,
             package_wit_names_fingerprint,
             interface_uses,
@@ -24702,6 +24723,287 @@ mod tests {
         )
         .expect("workspace snapshot is valid");
         (database, module_tree.as_ref().clone(), snapshot, package)
+    }
+
+    fn collect_package_inventory_for_target(
+        root_contents: &[u8],
+        child_contents: &[u8],
+        target: &str,
+    ) -> (
+        RootDatabase,
+        ModuleTree,
+        WorkspaceSnapshot,
+        Phase1PackageScopesCollection,
+    ) {
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root_contents, child_contents);
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check(target).expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection succeeds");
+        (database, module_tree, snapshot, collection)
+    }
+
+    fn inventory_symbols(
+        collection: &Phase1PackageScopesCollection,
+    ) -> &sai_semantic::PackageSymbolInventory {
+        collection
+            .package_symbol_inventory()
+            .inventory()
+            .expect("the selected package graph node makes the inventory available")
+    }
+
+    #[test]
+    fn module_function_inventory_collects_multiple_modules_and_stable_metadata() {
+        let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"fn root_fn() {}\n",
+            b"fn child_fn() {}\n",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(inventory.file().as_str(), "acme.phase1.1.jsonl");
+        assert_eq!(inventory.package_node_key(), "package:acme:phase1@1.0.0");
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.path())
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["acme:phase1.root_fn", "acme:phase1/child.child_fn",]
+                .into_iter()
+                .collect()
+        );
+
+        for (file_id, name, expected_path) in [
+            (
+                module_tree.modules[0].file,
+                "root_fn",
+                "acme:phase1.root_fn",
+            ),
+            (
+                module_tree.modules[1].file,
+                "child_fn",
+                "acme:phase1/child.child_fn",
+            ),
+        ] {
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == expected_path)
+                .expect("the function has a canonical inventory path");
+            let owner_path = collection
+                .scopes()
+                .function_owners
+                .iter()
+                .filter_map(|owner| {
+                    database
+                        .resolve_def_path(owner.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                })
+                .find(|path| {
+                    let Some(component) = path.data().last() else {
+                        return false;
+                    };
+                    let DefPathData::ValueNs(symbol) = component.data else {
+                        return false;
+                    };
+                    database
+                        .symbols
+                        .resolve(symbol)
+                        .is_ok_and(|resolved| resolved.as_ref() == name)
+                })
+                .expect("the matching HIR owner has a canonical definition path");
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&owner_path, &database.packages, &database.symbols)
+                    .expect("the matching HIR path hashes");
+            assert_eq!(
+                symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+
+            let parsed = sai_syntax::parse(&snapshot, file_id).expect("module parses");
+            let declaration = parsed
+                .root
+                .descendants()
+                .find_map(sai_syntax::ast::FnDecl::cast)
+                .filter(|function| {
+                    function
+                        .name()
+                        .and_then(|name| name.token())
+                        .is_some_and(|token| token.text() == name)
+                })
+                .expect("the module contains the expected function declaration");
+            let name_token = declaration
+                .name()
+                .and_then(|name| name.token())
+                .expect("the function has its declared name token");
+            let expected_fingerprint = sai_semantic::declaration_fingerprint(
+                sai_semantic::SymbolKind::Fn,
+                &declaration.syntax(),
+                Some(&name_token),
+            )
+            .expect("the declaration fingerprint is defined");
+            assert_eq!(symbol.fingerprint(), expected_fingerprint);
+        }
+    }
+
+    #[test]
+    fn module_function_inventory_filters_by_target_and_rejects_target_errors() {
+        let (_, _, _, wasm32) = collect_package_inventory_for_target(
+            b"@target(\"wasm64-core\")\nfn target_only() {}\n",
+            b"",
+            "wasm32-core",
+        );
+        let wasm32_inventory = inventory_symbols(&wasm32);
+        assert_eq!(
+            wasm32_inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert!(wasm32_inventory.symbols().is_empty());
+
+        let (_, _, _, wasm64) = collect_package_inventory_for_target(
+            b"@target(\"wasm64-core\")\nfn target_only() {}\n",
+            b"",
+            "wasm64-core",
+        );
+        let wasm64_inventory = inventory_symbols(&wasm64);
+        assert_eq!(
+            wasm64_inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            wasm64_inventory
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.path())
+                .collect::<Vec<_>>(),
+            ["acme:phase1.target_only"]
+        );
+
+        let (_, _, _, invalid_target) = collect_package_inventory_for_target(
+            b"@target(\"wasm32-linux\")\nfn uncertain_target() {}\n",
+            b"",
+            "wasm32-core",
+        );
+        let incomplete = inventory_symbols(&invalid_target);
+        assert!(matches!(
+            incomplete.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("target-selection error")
+        ));
+    }
+
+    #[test]
+    fn module_function_inventory_fails_closed_for_generic_functions_and_other_symbols() {
+        for (source, expected_reason) in [
+            (&b"fn generic<T>() {}\n"[..], "generic function"),
+            (
+                &b"type Marker {}\n"[..],
+                "outside the function-only inventory",
+            ),
+        ] {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert!(
+                matches!(
+                    inventory.coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { reason }
+                        if reason.contains(expected_reason)
+                ),
+                "expected incomplete reason containing {expected_reason:?}, got {:?}",
+                inventory.coverage()
+            );
+        }
+    }
+
+    #[test]
+    fn module_function_inventory_fails_closed_for_lexer_error_tokens() {
+        let (_, _, _, collection) = collect_package_inventory_for_target(
+            b"fn malformed() { let 1__2 = 3; }\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("syntax tree contains recovery or parse errors")
+        ));
+    }
+
+    #[test]
+    fn module_function_inventory_uses_the_selected_nodes_compatibility_line() {
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(b"fn selected() {}\n", b"");
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [graph_node(
+                "acme:phase1#1",
+                "acme:phase1",
+                "1.9.4",
+                PackageGraphRole::Root,
+                Vec::new(),
+            )],
+        )
+        .expect("active graph uses an exact selected package node");
+        database
+            .set_package_graph(Some(graph))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection succeeds");
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.file().as_str(),
+            "acme.phase1.1.jsonl",
+            "the index filename uses the active root node rather than another compatibility line"
+        );
+        assert_eq!(
+            inventory.package_node_key(),
+            "package:acme:phase1@1.9.4",
+            "the node key retains the exact selected version"
+        );
+    }
+
+    #[test]
+    fn module_function_inventory_is_unavailable_without_an_exact_graph_node() {
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(b"fn selected() {}\n", b"");
+        database
+            .set_package_graph(None)
+            .expect("the active package graph is absent");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection can proceed without a selected graph node");
+        assert!(matches!(
+            collection.package_symbol_inventory(),
+            Phase1PackageSymbolInventory::Unavailable { reason }
+                if reason.contains("no exact source package graph node")
+        ));
     }
 
     fn generated_wit_for_source(source: &[u8]) -> (WitUnit, WitPackageResult) {
