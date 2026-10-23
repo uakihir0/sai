@@ -888,6 +888,32 @@ impl LocalPackageDirectory {
         &self.canonical_path
     }
 
+    /// Returns whether this platform retains a directory identity that can
+    /// be compared with another open directory handle.
+    ///
+    /// Supported Unix targets retain the device and inode identity. Other
+    /// platforms retain only the canonical path, so callers must not use a
+    /// path comparison as proof that two opened directories are the same.
+    pub const fn supports_open_directory_identity(&self) -> bool {
+        #[cfg(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        ))]
+        {
+            let _ = self;
+            true
+        }
+
+        #[cfg(not(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        )))]
+        {
+            let _ = self;
+            false
+        }
+    }
+
     /// Returns whether `directory` is the same opened directory capability
     /// captured by this package directory.
     ///

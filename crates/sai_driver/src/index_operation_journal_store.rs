@@ -9,7 +9,8 @@ use crate::index_operation_journal_recovery::{
     ObservedFileState as PlannerObservedFileState,
 };
 use crate::index_operation_journal_validation::{
-    IndexJournalWorkspaceInventory, validate_index_operation_journal_package_context,
+    IndexJournalRecoveryContext, IndexJournalRecoveryContextError, IndexJournalWorkspaceInventory,
+    validate_index_operation_journal_package_context,
 };
 use sai_package::local_source::{LocalPackageSourceFileSnapshotError, LocalPackageSourceFileState};
 use sai_package::package_path::{ContentPackagePath, RepositoryPackageDirectory};
@@ -63,6 +64,7 @@ pub enum IndexOperationJournalStoreError {
         requested_bytes: usize,
     },
     LockNotExclusive,
+    RecoveryContext(IndexJournalRecoveryContextError),
     JournalAlreadyExists,
     JournalChanged,
     InvalidPreparedState,
@@ -101,6 +103,7 @@ impl fmt::Display for IndexOperationJournalStoreError {
             ),
             Self::LockNotExclusive => formatter
                 .write_str("operation journal mutation requires an exclusive workspace lock"),
+            Self::RecoveryContext(source) => source.fmt(formatter),
             Self::JournalAlreadyExists => {
                 formatter.write_str("an unresolved operation journal already exists")
             }
@@ -131,6 +134,7 @@ impl Error for IndexOperationJournalStoreError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::Codec { source, .. } => Some(source),
+            Self::RecoveryContext(source) => Some(source),
             Self::FileTooLarge { .. }
             | Self::AllocationFailed { .. }
             | Self::LockNotExclusive
@@ -366,17 +370,15 @@ impl<'lock> IndexOperationJournalStore<'lock> {
     /// Observes the journal's source files and committed index generation for
     /// the pure recovery planner.
     ///
-    /// The caller must build `inventory` from the complete current workspace
-    /// lock graph while holding this store's exclusive workspace lock. The
-    /// inventory builder accepts parsed lock data and this method cannot
-    /// independently prove that those parsed bytes came from the current
-    /// `sai.lock`. `journal` must be a complete codec-validated record, such
-    /// as one returned by [`Self::read`]. The journal package contexts are
-    /// checked against the inventory before any source read. The captured root
-    /// path and opened directory identity must match the root pinned by the
-    /// workspace lock; otherwise every source is `Unavailable`. Every source
-    /// read then reopens its recorded package root from the retained
-    /// workspace-root handle and uses handle-relative no-follow traversal.
+    /// The caller must supply a recovery context captured from the exact
+    /// current `sai.lock` under this store's exclusive workspace lock.
+    /// `journal` must be a complete codec-validated record, such as one
+    /// returned by [`Self::read`]. The exact lock bytes and pinned root
+    /// identity are checked before and after observing source and index state;
+    /// a mismatch is an error. The journal package contexts are checked
+    /// against the inventory before any source read. Each source read reopens
+    /// its recorded package root from the retained workspace-root handle and
+    /// uses handle-relative no-follow traversal.
     /// The total bytes retained for source observations are capped at the
     /// maximum encoded journal size, in addition to the per-file source limit.
     ///
@@ -389,13 +391,28 @@ impl<'lock> IndexOperationJournalStore<'lock> {
     pub fn observe_recovery(
         &self,
         journal: &IndexOperationJournal,
-        inventory: &IndexJournalWorkspaceInventory,
+        context: &IndexJournalRecoveryContext,
     ) -> Result<IndexJournalRecoveryObservation, IndexOperationJournalStoreError> {
         self.observe_recovery_with_source_byte_budget_impl(
             journal,
-            inventory,
+            context,
             MAX_RECOVERY_SOURCE_OBSERVATION_BYTES,
         )
+    }
+
+    /// Revalidates a recovery context's lock bytes and pinned workspace root.
+    ///
+    /// Observations call this both before and after collecting source and
+    /// index state. Executors should call it again immediately before a
+    /// recovery mutation.
+    pub fn verify_recovery_context(
+        &self,
+        context: &IndexJournalRecoveryContext,
+    ) -> Result<(), IndexOperationJournalStoreError> {
+        self.require_exclusive()?;
+        context
+            .verify_current_lock(self.lock)
+            .map_err(IndexOperationJournalStoreError::RecoveryContext)
     }
 
     /// Verifies that the durable journal still exactly matches `journal`.
@@ -408,8 +425,10 @@ impl<'lock> IndexOperationJournalStore<'lock> {
     pub fn verify_current(
         &self,
         journal: &IndexOperationJournal,
+        context: &IndexJournalRecoveryContext,
     ) -> Result<(), IndexOperationJournalStoreError> {
         self.require_exclusive()?;
+        self.verify_recovery_context(context)?;
         let encoded_journal = self.encode_at_journal_path(journal)?;
         let Some(index_directory) =
             self.open_existing_index_directory_for_mutation(self.lock.state_directory_handle())?
@@ -430,20 +449,22 @@ impl<'lock> IndexOperationJournalStore<'lock> {
     pub(crate) fn observe_recovery_with_source_byte_budget(
         &self,
         journal: &IndexOperationJournal,
-        inventory: &IndexJournalWorkspaceInventory,
+        context: &IndexJournalRecoveryContext,
         source_byte_budget: u64,
     ) -> Result<IndexJournalRecoveryObservation, IndexOperationJournalStoreError> {
-        self.observe_recovery_with_source_byte_budget_impl(journal, inventory, source_byte_budget)
+        self.observe_recovery_with_source_byte_budget_impl(journal, context, source_byte_budget)
     }
 
     fn observe_recovery_with_source_byte_budget_impl(
         &self,
         journal: &IndexOperationJournal,
-        inventory: &IndexJournalWorkspaceInventory,
+        context: &IndexJournalRecoveryContext,
         source_byte_budget: u64,
     ) -> Result<IndexJournalRecoveryObservation, IndexOperationJournalStoreError> {
         self.require_exclusive()?;
 
+        self.verify_recovery_context(context)?;
+        let inventory = context.inventory();
         let inventory_matches_locked_workspace = inventory.root_directory().path()
             == self.lock.package_directory()
             && self
@@ -474,6 +495,7 @@ impl<'lock> IndexOperationJournalStore<'lock> {
         };
 
         let index_generation = self.observe_index_generation(journal)?;
+        self.verify_recovery_context(context)?;
         Ok(IndexJournalRecoveryObservation {
             sources,
             index_generation,

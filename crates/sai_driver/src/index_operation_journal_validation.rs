@@ -32,12 +32,264 @@ use sai_package::package_path::{ContentPackagePath, RepositoryPackageDirectory};
 use sai_package::resolver_contract::{ResolverContractBuildError, ResolverContractContext};
 use sai_package::validation::PackageValidationContext;
 use sai_package::version::Version;
+use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
 use sai_semantic::{IndexOperationJournal, PackageIndexFileName};
 use sai_vfs::{PackageRelativePath, PackageSourceDirectory, PackageSourcePath};
+use sai_windows_fs::{
+    file_identity, open_file_for_stable_read_without_following, open_file_without_following,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path};
+use std::time::SystemTime;
+
+/// Maximum byte length accepted when capturing the current workspace lock
+/// file for journal recovery.
+///
+/// Lock files are normally much smaller. The fixed 64 MiB ceiling is generous
+/// for large workspaces while preventing an untrusted or damaged lock file
+/// from causing an unbounded allocation during recovery.
+pub const MAX_INDEX_JOURNAL_RECOVERY_LOCK_BYTES: usize = 64 * 1024 * 1024;
+
+const WORKSPACE_LOCK_FILE_NAME: &str = "sai.lock";
+
+/// A complete package inventory authenticated against one exact on-disk
+/// `sai.lock` snapshot.
+///
+/// Construct this only with [`capture_index_journal_recovery_context`] while
+/// holding the workspace's exclusive lock. Recovery observations and
+/// mutations revalidate the exact lock bytes before acting. The context owns
+/// its inventory and lock snapshot; callers must still keep the exclusive
+/// [`WorkspaceLockGuard`] alive for the full recovery operation.
+#[derive(Clone)]
+pub struct IndexJournalRecoveryContext {
+    inventory: IndexJournalWorkspaceInventory,
+    lock_bytes: std::sync::Arc<[u8]>,
+}
+
+impl fmt::Debug for IndexJournalRecoveryContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("IndexJournalRecoveryContext")
+            .field("lock_byte_count", &self.lock_bytes.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl IndexJournalRecoveryContext {
+    pub(crate) fn inventory(&self) -> &IndexJournalWorkspaceInventory {
+        &self.inventory
+    }
+
+    pub(crate) fn verify_current_lock(
+        &self,
+        lock: &WorkspaceLockGuard,
+    ) -> Result<(), IndexJournalRecoveryContextError> {
+        verify_locked_root(&self.inventory.root_directory, lock)?;
+        let current = read_workspace_lock_snapshot(lock)
+            .map_err(IndexJournalRecoveryContextError::LockFile)?;
+        if current.as_slice() != self.lock_bytes.as_ref() {
+            return Err(IndexJournalRecoveryContextError::LockSnapshotChanged);
+        }
+        Ok(())
+    }
+}
+
+/// Failure while authenticating the current lock file and workspace root for
+/// journal recovery.
+#[derive(Debug)]
+pub enum IndexJournalRecoveryContextError {
+    LockNotExclusive,
+    LockedWorkspaceRootUnavailable,
+    LockedWorkspaceRootIdentityUnsupported,
+    LockedWorkspaceRootChanged,
+    RootPackageDirectory(sai_package::local_source::LocalPackageError),
+    LockFile(io::Error),
+    InvalidLockSyntax,
+    InventoryBuild(IndexJournalWorkspaceInventoryBuildError),
+    LockSnapshotChanged,
+}
+
+impl fmt::Display for IndexJournalRecoveryContextError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "could not authenticate the workspace for index journal recovery: {self:?}"
+        )
+    }
+}
+
+impl Error for IndexJournalRecoveryContextError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::RootPackageDirectory(source) => Some(source),
+            Self::LockFile(source) => Some(source),
+            Self::InventoryBuild(source) => Some(source),
+            Self::LockNotExclusive
+            | Self::LockedWorkspaceRootUnavailable
+            | Self::LockedWorkspaceRootIdentityUnsupported
+            | Self::LockedWorkspaceRootChanged
+            | Self::InvalidLockSyntax
+            | Self::LockSnapshotChanged => None,
+        }
+    }
+}
+
+/// Captures a recovery context from the exact `sai.lock` bytes in the
+/// workspace protected by `lock`.
+///
+/// The lock must be exclusive. The workspace root is reopened and compared
+/// with the root handle pinned by the guard; the lock file is read through
+/// that same root handle without following links and with a bounded stable
+/// read. The exact bytes read are parsed and used to build the complete,
+/// target-independent inventory. No partial context is returned on failure.
+pub fn capture_index_journal_recovery_context(
+    lock: &WorkspaceLockGuard,
+    validation_context: PackageValidationContext<'_>,
+) -> Result<IndexJournalRecoveryContext, IndexJournalRecoveryContextError> {
+    if lock.mode() != WorkspaceLockMode::Exclusive {
+        return Err(IndexJournalRecoveryContextError::LockNotExclusive);
+    }
+    let root_directory = LocalPackageDirectory::open(lock.package_directory())
+        .map_err(IndexJournalRecoveryContextError::RootPackageDirectory)?;
+    verify_locked_root(&root_directory, lock)?;
+
+    let lock_bytes =
+        read_workspace_lock_snapshot(lock).map_err(IndexJournalRecoveryContextError::LockFile)?;
+    let parsed_lock = sai_package::lock::parse(&lock_bytes);
+    if !parsed_lock.is_syntax_valid() {
+        return Err(IndexJournalRecoveryContextError::InvalidLockSyntax);
+    }
+    let inventory =
+        build_index_journal_workspace_inventory(&root_directory, &parsed_lock, validation_context)
+            .map_err(IndexJournalRecoveryContextError::InventoryBuild)?;
+
+    Ok(IndexJournalRecoveryContext {
+        inventory,
+        lock_bytes: std::sync::Arc::from(lock_bytes),
+    })
+}
+
+fn verify_locked_root(
+    root_directory: &LocalPackageDirectory,
+    lock: &WorkspaceLockGuard,
+) -> Result<(), IndexJournalRecoveryContextError> {
+    if lock.mode() != WorkspaceLockMode::Exclusive {
+        return Err(IndexJournalRecoveryContextError::LockNotExclusive);
+    }
+    let Some(locked_root_handle) = lock.package_directory_handle() else {
+        return Err(IndexJournalRecoveryContextError::LockedWorkspaceRootUnavailable);
+    };
+    if root_directory.path() != lock.package_directory() {
+        return Err(IndexJournalRecoveryContextError::LockedWorkspaceRootChanged);
+    }
+    if !root_directory.supports_open_directory_identity() {
+        return Err(IndexJournalRecoveryContextError::LockedWorkspaceRootIdentityUnsupported);
+    }
+    if !root_directory.is_same_open_directory(locked_root_handle) {
+        return Err(IndexJournalRecoveryContextError::LockedWorkspaceRootChanged);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LockFileMetadata {
+    length: u64,
+    modified: Option<SystemTime>,
+}
+
+impl LockFileMetadata {
+    fn read(file: &File) -> io::Result<Self> {
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "sai.lock is not a regular file",
+            ));
+        }
+        Ok(Self {
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+fn read_workspace_lock_snapshot(lock: &WorkspaceLockGuard) -> io::Result<Vec<u8>> {
+    let Some(root_handle) = lock.package_directory_handle() else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the workspace root handle is unavailable",
+        ));
+    };
+    let root_path = lock.package_directory();
+    let lock_name = OsStr::new(WORKSPACE_LOCK_FILE_NAME);
+    let mut file = open_file_for_stable_read_without_following(root_handle, root_path, lock_name)?;
+    let identity = file_identity(&file)?;
+    let before = LockFileMetadata::read(&file)?;
+    if before.length > MAX_INDEX_JOURNAL_RECOVERY_LOCK_BYTES as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sai.lock exceeds the recovery read limit",
+        ));
+    }
+
+    let first = read_bounded_lock_bytes(&mut file)?;
+    let middle = LockFileMetadata::read(&file)?;
+    file.seek(SeekFrom::Start(0))?;
+    let second = read_bounded_lock_bytes(&mut file)?;
+    let after = LockFileMetadata::read(&file)?;
+    if first != second || before != middle || before != after || file_identity(&file)? != identity {
+        return Err(io::Error::other(
+            "sai.lock changed during recovery observation",
+        ));
+    }
+
+    let current = open_file_without_following(root_handle, root_path, lock_name)?;
+    if file_identity(&current)? != identity || LockFileMetadata::read(&current)? != before {
+        return Err(io::Error::other(
+            "sai.lock was replaced during recovery observation",
+        ));
+    }
+    Ok(first)
+}
+
+fn read_bounded_lock_bytes(file: &mut File) -> io::Result<Vec<u8>> {
+    let maximum_bytes = MAX_INDEX_JOURNAL_RECOVERY_LOCK_BYTES;
+    let length = file.metadata()?.len();
+    if length > maximum_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sai.lock exceeds the recovery read limit",
+        ));
+    }
+    let capacity = usize::try_from(length).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sai.lock length cannot be represented",
+        )
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "could not reserve memory for sai.lock",
+        )
+    })?;
+    (&mut *file)
+        .take(maximum_bytes as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > maximum_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "sai.lock exceeds the recovery read limit",
+        ));
+    }
+    Ok(bytes)
+}
 
 /// Current metadata for one exact package that could appear in a journal.
 ///
@@ -906,7 +1158,7 @@ mod tests {
     use super::{
         IndexJournalPackageContext, IndexJournalWorkspaceInventoryBuildError,
         IndexOperationJournalValidationError, LockRootContractInputError,
-        build_index_journal_workspace_inventory,
+        build_index_journal_workspace_inventory, capture_index_journal_recovery_context,
         validate_index_operation_journal_package_context as validate_package_context,
         validate_unique_inventory_contexts,
     };
@@ -1188,7 +1440,10 @@ mod tests {
         .expect("write current operation journal");
     }
 
-    fn recovery_inventory(root: &PathBuf) -> super::IndexJournalWorkspaceInventory {
+    fn recovery_context(
+        root: &PathBuf,
+        guard: &WorkspaceLockGuard,
+    ) -> super::IndexJournalRecoveryContext {
         let root_manifest = "package acme:app @ 1.0.0\n\
                              source \"src\"\n\
                              targets { wasm32-core, wasm32-wasi }\n\
@@ -1209,7 +1464,124 @@ mod tests {
             "    requires acme:widget @ ^1 -> 1.0.0 from path \"packages/widget\"\n",
             &path_lock_entry("acme:widget", "1.0.0", "packages/widget", ""),
         );
-        build_inventory(root, &lock).expect("build fresh workspace inventory")
+        fs::write(root.join("sai.lock"), lock).expect("write current workspace lock");
+        capture_index_journal_recovery_context(guard, PackageValidationContext::default())
+            .expect("capture current workspace recovery context")
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn recovery_context_retains_exact_lock_bytes_and_rejects_changed_bytes() {
+        let workspace = TestWorkspace::new();
+        let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
+        let context = recovery_context(&workspace.0, &lock);
+        let expected = fs::read(workspace.0.join("sai.lock")).expect("read fixture lock");
+        assert_eq!(context.lock_bytes.as_ref(), expected.as_slice());
+
+        fs::write(workspace.0.join("sai.lock"), b"changed lock snapshot\n")
+            .expect("replace current lock contents");
+        let error = context
+            .verify_current_lock(&lock)
+            .expect_err("changed current lock must invalidate recovery context");
+        assert!(matches!(
+            error,
+            super::IndexJournalRecoveryContextError::LockSnapshotChanged
+        ));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn recovery_context_requires_an_exclusive_lock_guard() {
+        let workspace = TestWorkspace::new();
+        let exclusive =
+            WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
+        let _context = recovery_context(&workspace.0, &exclusive);
+        drop(exclusive);
+        let shared = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Shared).unwrap();
+
+        let error =
+            capture_index_journal_recovery_context(&shared, PackageValidationContext::default())
+                .expect_err("recovery context requires exclusive workspace access");
+        assert!(matches!(
+            error,
+            super::IndexJournalRecoveryContextError::LockNotExclusive
+        ));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn recovery_context_rejects_invalid_lock_syntax() {
+        let workspace = TestWorkspace::new();
+        let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
+        let _context = recovery_context(&workspace.0, &lock);
+        fs::write(workspace.0.join("sai.lock"), b"not a lock file\n")
+            .expect("replace lock with invalid syntax");
+
+        let error =
+            capture_index_journal_recovery_context(&lock, PackageValidationContext::default())
+                .expect_err("invalid lock syntax must not produce recovery context");
+        assert!(matches!(
+            error,
+            super::IndexJournalRecoveryContextError::InvalidLockSyntax
+        ));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn recovery_context_rejects_a_symlink_lock_file() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TestWorkspace::new();
+        let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
+        let _context = recovery_context(&workspace.0, &lock);
+        fs::remove_file(workspace.0.join("sai.lock")).expect("remove fixture lock");
+        fs::write(workspace.0.join("other.lock"), b"lock 2\n").expect("write symlink target");
+        symlink("other.lock", workspace.0.join("sai.lock")).expect("symlink workspace lock");
+
+        let error =
+            capture_index_journal_recovery_context(&lock, PackageValidationContext::default())
+                .expect_err("lock snapshot must not follow a symlink");
+        assert!(matches!(
+            error,
+            super::IndexJournalRecoveryContextError::LockFile(_)
+        ));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn recovery_context_rejects_lock_files_over_the_fixed_read_limit() {
+        let workspace = TestWorkspace::new();
+        let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
+        let _context = recovery_context(&workspace.0, &lock);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(workspace.0.join("sai.lock"))
+            .expect("open workspace lock");
+        file.set_len(super::MAX_INDEX_JOURNAL_RECOVERY_LOCK_BYTES as u64 + 1)
+            .expect("extend lock beyond recovery read limit");
+
+        let error =
+            capture_index_journal_recovery_context(&lock, PackageValidationContext::default())
+                .expect_err("oversized lock must be rejected before allocation");
+        assert!(matches!(
+            error,
+            super::IndexJournalRecoveryContextError::LockFile(_)
+        ));
     }
 
     fn recovery_journal() -> IndexOperationJournal {
@@ -1239,14 +1611,14 @@ mod tests {
     fn observes_sources_in_journal_order_and_preserves_empty_vs_absent() {
         let workspace = TestWorkspace::new();
         let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
-        let inventory = recovery_inventory(&workspace.0);
+        let context = recovery_context(&workspace.0, &lock);
         let journal = recovery_journal();
         fs::write(workspace.0.join("src/empty.sai"), []).expect("write empty root source");
         let store = IndexOperationJournalStore::new(&lock);
         write_recovery_fixture_index(&workspace.0, &journal);
 
         let observation = store
-            .observe_recovery(&journal, &inventory)
+            .observe_recovery(&journal, &context)
             .expect("observe recovery state");
 
         assert_eq!(
@@ -1274,7 +1646,7 @@ mod tests {
     fn unavailable_package_root_blocks_source_classification() {
         let workspace = TestWorkspace::new();
         let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
-        let inventory = recovery_inventory(&workspace.0);
+        let context = recovery_context(&workspace.0, &lock);
         let journal = recovery_journal();
         fs::write(workspace.0.join("src/empty.sai"), []).expect("write empty root source");
         let store = IndexOperationJournalStore::new(&lock);
@@ -1286,7 +1658,7 @@ mod tests {
         .expect("replace recorded package-root path");
 
         let observation = store
-            .observe_recovery(&journal, &inventory)
+            .observe_recovery(&journal, &context)
             .expect("observe recovery state");
 
         assert_eq!(
@@ -1313,42 +1685,30 @@ mod tests {
         not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
     ))]
     #[test]
-    fn rejects_an_inventory_from_a_different_locked_workspace() {
+    fn rejects_a_recovery_context_from_a_different_locked_workspace() {
         let current_workspace = TestWorkspace::new();
         let foreign_workspace = TestWorkspace::new();
         let foreign_lock =
             WorkspaceLockGuard::acquire(&foreign_workspace.0, WorkspaceLockMode::Exclusive)
                 .unwrap();
-        let foreign_inventory = recovery_inventory(&foreign_workspace.0);
-        drop(foreign_lock);
+        let foreign_context = recovery_context(&foreign_workspace.0, &foreign_lock);
 
         let lock = WorkspaceLockGuard::acquire(&current_workspace.0, WorkspaceLockMode::Exclusive)
             .unwrap();
+        drop(foreign_lock);
         let journal = recovery_journal();
         let store = IndexOperationJournalStore::new(&lock);
         write_recovery_fixture_index(&current_workspace.0, &journal);
 
-        let observation = store
-            .observe_recovery(&journal, &foreign_inventory)
-            .expect("observe recovery state");
-
-        assert_eq!(
-            observation.sources,
-            [
-                ObservedFileState::Unavailable,
-                ObservedFileState::Unavailable
-            ]
-        );
-        assert_eq!(
-            observation.index_generation,
-            IndexGenerationObservation::Before
-        );
-        assert_eq!(
-            plan_index_operation_journal_recovery(&journal, &observation),
-            IndexJournalRecoveryDecision::Ambiguous(
-                crate::index_operation_journal_recovery::IndexJournalRecoveryAmbiguity::SourceUnavailable,
+        let error = store
+            .observe_recovery(&journal, &foreign_context)
+            .expect_err("a context from another locked workspace is rejected");
+        assert!(matches!(
+            error,
+            crate::index_operation_journal_store::IndexOperationJournalStoreError::RecoveryContext(
+                super::IndexJournalRecoveryContextError::LockedWorkspaceRootChanged
             )
-        );
+        ));
     }
 
     #[cfg(all(
@@ -1356,47 +1716,35 @@ mod tests {
         not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
     ))]
     #[test]
-    fn rejects_an_inventory_when_its_workspace_path_is_reused() {
+    fn rejects_a_recovery_context_when_its_workspace_path_is_reused() {
         let workspace = TestWorkspace::new();
         let original_lock =
             WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
-        let original_inventory = recovery_inventory(&workspace.0);
+        let original_context = recovery_context(&workspace.0, &original_lock);
         drop(original_lock);
 
         let moved_workspace = workspace.0.with_extension("moved");
         fs::rename(&workspace.0, &moved_workspace).expect("move the original workspace");
         fs::create_dir(&workspace.0).expect("reuse the original workspace path");
         let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
-        let _current_inventory = recovery_inventory(&workspace.0);
+        let _current_context = recovery_context(&workspace.0, &lock);
         let journal = recovery_journal();
         let store = IndexOperationJournalStore::new(&lock);
         write_recovery_fixture_index(&workspace.0, &journal);
 
-        let observation = store
-            .observe_recovery(&journal, &original_inventory)
-            .expect("observe recovery state");
-
-        assert_eq!(
-            observation.sources,
-            [
-                ObservedFileState::Unavailable,
-                ObservedFileState::Unavailable
-            ]
-        );
-        assert_eq!(
-            observation.index_generation,
-            IndexGenerationObservation::Before
-        );
-        assert_eq!(
-            plan_index_operation_journal_recovery(&journal, &observation),
-            IndexJournalRecoveryDecision::Ambiguous(
-                crate::index_operation_journal_recovery::IndexJournalRecoveryAmbiguity::SourceUnavailable,
+        let error = store
+            .observe_recovery(&journal, &original_context)
+            .expect_err("a replacement workspace cannot reuse the original context");
+        assert!(matches!(
+            error,
+            crate::index_operation_journal_store::IndexOperationJournalStoreError::RecoveryContext(
+                super::IndexJournalRecoveryContextError::LockedWorkspaceRootChanged
             )
-        );
+        ));
 
         drop(store);
         drop(lock);
-        drop(original_inventory);
+        drop(original_context);
         fs::remove_dir_all(&moved_workspace).expect("remove the moved workspace fixture");
     }
 
@@ -1408,7 +1756,7 @@ mod tests {
     fn aggregate_source_byte_limit_keeps_over_budget_sources_unavailable() {
         let workspace = TestWorkspace::new();
         let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
-        let inventory = recovery_inventory(&workspace.0);
+        let context = recovery_context(&workspace.0, &lock);
         let journal = recovery_journal();
         fs::write(workspace.0.join("src/empty.sai"), b"more than four bytes")
             .expect("write source over the test budget");
@@ -1416,7 +1764,7 @@ mod tests {
         write_recovery_fixture_index(&workspace.0, &journal);
 
         let observation = store
-            .observe_recovery_with_source_byte_budget(&journal, &inventory, 4)
+            .observe_recovery_with_source_byte_budget(&journal, &context, 4)
             .expect("observe recovery state within a bounded source budget");
 
         assert_eq!(
@@ -1440,88 +1788,34 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn unsupported_source_observation_stays_unavailable_on_windows() {
+    fn recovery_context_fails_closed_when_package_root_identity_is_unsupported() {
         let workspace = TestWorkspace::new();
         let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
+        let root_manifest = "package acme:app @ 1.0.0\n\
+                             source \"src\"\n\
+                             targets { wasm32-core, wasm32-wasi }\n\
+                             requires { acme:widget @ ^1 from path \"packages/widget\" }\n";
+        write_package(&workspace.0, ".", root_manifest);
         write_package(
-            &workspace.0,
-            ".",
-            "package acme:app @ 1.0.0\n\
-             source \"src\"\n\
-             targets { wasm32-core, wasm32-wasi }\n",
-        );
-        let member_path = write_package(
             &workspace.0,
             "packages/widget",
             "package acme:widget @ 1.0.0\n\
              source \"src\"\n\
              targets { wasm32-core, wasm32-wasi }\n",
         );
-        fs::create_dir_all(workspace.0.join("src")).expect("create root source directory");
-        fs::create_dir_all(member_path.join("src")).expect("create member source directory");
+        let lock_text = lock_root(
+            "    requires acme:widget @ ^1 -> 1.0.0 from path \"packages/widget\"\n",
+            &path_lock_entry("acme:widget", "1.0.0", "packages/widget", ""),
+        );
+        fs::write(workspace.0.join("sai.lock"), lock_text).expect("write workspace lock");
 
-        let root_directory =
-            LocalPackageDirectory::open(&workspace.0).expect("open workspace root");
-        let member_directory =
-            LocalPackageDirectory::open(&member_path).expect("open workspace member");
-        let root_node = graph_node(
-            "acme:app",
-            "1.0.0",
-            PackageGraphRole::Root,
-            PackageForm::Source,
-        );
-        let member_node = graph_node(
-            "acme:widget",
-            "1.0.0",
-            PackageGraphRole::WorkspaceMember,
-            PackageForm::Source,
-        );
-        let inventory = super::IndexJournalWorkspaceInventory {
-            root_directory,
-            contexts: vec![
-                IndexJournalPackageContext::from_test_metadata(&root_node, Some("."), Some("src"))
-                    .expect("root package context is valid"),
-                IndexJournalPackageContext::from_test_metadata(
-                    &member_node,
-                    Some("packages/widget"),
-                    Some("src"),
-                )
-                .expect("member package context is valid"),
-            ],
-            directories: std::collections::BTreeMap::from([
-                (
-                    "package:acme:app@1.0.0".to_owned(),
-                    LocalPackageDirectory::open(&workspace.0)
-                        .expect("retain root package directory"),
-                ),
-                ("package:acme:widget@1.0.0".to_owned(), member_directory),
-            ]),
-        };
-        let journal = recovery_journal();
-        let store = IndexOperationJournalStore::new(&lock);
-        write_recovery_fixture_index(&workspace.0, &journal);
-
-        let observation = store
-            .observe_recovery(&journal, &inventory)
-            .expect("observe recovery state");
-
-        assert_eq!(
-            observation.sources,
-            [
-                ObservedFileState::Unavailable,
-                ObservedFileState::Unavailable
-            ]
-        );
-        assert_eq!(
-            observation.index_generation,
-            IndexGenerationObservation::Before
-        );
-        assert_eq!(
-            plan_index_operation_journal_recovery(&journal, &observation),
-            IndexJournalRecoveryDecision::Ambiguous(
-                crate::index_operation_journal_recovery::IndexJournalRecoveryAmbiguity::SourceUnavailable,
-            )
-        );
+        let error =
+            capture_index_journal_recovery_context(&lock, PackageValidationContext::default())
+                .expect_err("package-root identity cannot be compared on Windows");
+        assert!(matches!(
+            error,
+            super::IndexJournalRecoveryContextError::LockedWorkspaceRootIdentityUnsupported
+        ));
     }
 
     #[test]
