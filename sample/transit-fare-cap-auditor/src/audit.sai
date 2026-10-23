@@ -1,0 +1,171 @@
+use acme:transit-fare-cap-auditor/model.{FareAudit, FindingCode, Rider, RiderAudit, Tap}
+use acme:transit-fare-cap-auditor/policy
+
+fn has_rider(riders: Array<Rider, 3>, rider_id: U32) -> Bool {
+    for rider in riders {
+        if rider.id == rider_id {
+            return true
+        }
+    }
+    false
+}
+
+fn audit_rider(rider: Rider, taps: Array<Tap, 12>) -> RiderAudit {
+    var tap_count: USize = 0
+    var expected_cents: U32 = 0
+    var recorded_cents: U32 = 0
+    var has_boarded = false
+    var first_boarding_minute: U32 = 0
+    var has_previous_tap = false
+    var previous_tap_minute: U32 = 0
+    var finding: Option<FindingCode> = None
+    var structural_hold = false
+
+    for tap_index in 0..taps.len() {
+        let tap = taps[tap_index]
+        if tap.rider_id == rider.id {
+            tap_count += 1
+            recorded_cents += tap.recorded_cents
+
+            if not structural_hold {
+                if policy.has_prior_tap_id(taps, tap_index, tap.id) {
+                    finding = Some(FindingCode.DuplicateTapId)
+                    structural_hold = true
+                } else if has_previous_tap and tap.minute < previous_tap_minute {
+                    finding = Some(FindingCode.OutOfOrderTap)
+                    structural_hold = true
+                } else {
+                    let fare = policy.fare_for_boarding(
+                        tap.minute,
+                        has_boarded,
+                        first_boarding_minute,
+                        expected_cents,
+                    )
+                    if (
+                        not has_boarded
+                        or tap.minute - first_boarding_minute > policy.transfer_window_minutes()
+                    ) {
+                        first_boarding_minute = tap.minute
+                    }
+
+                    expected_cents += fare
+                    has_boarded = true
+                    has_previous_tap = true
+                    previous_tap_minute = tap.minute
+                }
+            }
+        }
+    }
+
+    if finding == None and expected_cents != recorded_cents {
+        finding = Some(FindingCode.ChargeMismatch)
+    }
+
+    let overcharge_cents = if (
+        finding == Some(FindingCode.ChargeMismatch) and recorded_cents > expected_cents
+    ) {
+        recorded_cents - expected_cents
+    } else {
+        0
+    }
+    let undercharge_cents = if (
+        finding == Some(FindingCode.ChargeMismatch) and expected_cents > recorded_cents
+    ) {
+        expected_cents - recorded_cents
+    } else {
+        0
+    }
+
+    RiderAudit(
+        rider_id: rider.id,
+        name: rider.name,
+        tap_count: tap_count,
+        expected_cents: expected_cents,
+        recorded_cents: recorded_cents,
+        overcharge_cents: overcharge_cents,
+        undercharge_cents: undercharge_cents,
+        finding: finding,
+    )
+}
+
+fn unmatched_tap_count(riders: Array<Rider, 3>, taps: Array<Tap, 12>) -> USize {
+    var count: USize = 0
+    for tap in taps {
+        if not has_rider(riders, tap.rider_id) {
+            count += 1
+        }
+    }
+    count
+}
+
+fn unmatched_recorded_cents(riders: Array<Rider, 3>, taps: Array<Tap, 12>) -> U32 {
+    var total: U32 = 0
+    for tap in taps {
+        if not has_rider(riders, tap.rider_id) {
+            total += tap.recorded_cents
+        }
+    }
+    total
+}
+
+fn duplicate_tap_id_count(taps: Array<Tap, 12>) -> USize {
+    var count: USize = 0
+    for index in 0..taps.len() {
+        if policy.has_prior_tap_id(taps, index, taps[index].id) {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn audit(riders: Array<Rider, 3>, taps: Array<Tap, 12>) -> FareAudit {
+    var audits = Array<Option<RiderAudit>, 3>.filled(None)
+    var summary_expected: U32 = 0
+    var summary_recorded: U32 = 0
+    var summary_overcharge: U32 = 0
+    var summary_undercharge: U32 = 0
+    var summary_taps: USize = 0
+    var valid_sequences: USize = 0
+    var structurally_held: USize = 0
+    var index: USize = 0
+
+    for rider in riders {
+        let result = audit_rider(rider, taps)
+        audits[index] = Some(result)
+        summary_expected += result.expected_cents
+        summary_recorded += result.recorded_cents
+        summary_overcharge += result.overcharge_cents
+        summary_undercharge += result.undercharge_cents
+        summary_taps += result.tap_count
+        match result.finding {
+            Some(FindingCode.DuplicateTapId) => {
+                structurally_held += 1
+            }
+            Some(FindingCode.OutOfOrderTap) => {
+                structurally_held += 1
+            }
+            Some(FindingCode.ChargeMismatch) => {
+                valid_sequences += 1
+            }
+            None => {
+                valid_sequences += 1
+            }
+        }
+        index += 1
+    }
+
+    FareAudit(
+        riders: audits,
+        rider_count: index,
+        assigned_tap_count: summary_taps,
+        expected_cents: summary_expected,
+        recorded_cents: summary_recorded,
+        overcharge_cents: summary_overcharge,
+        undercharge_cents: summary_undercharge,
+        duplicate_tap_id_count: duplicate_tap_id_count(taps),
+        unmatched_tap_count: unmatched_tap_count(riders, taps),
+        unmatched_recorded_cents: unmatched_recorded_cents(riders, taps),
+        valid_sequence_count: valid_sequences,
+        structurally_held_count: structurally_held,
+    )
+}

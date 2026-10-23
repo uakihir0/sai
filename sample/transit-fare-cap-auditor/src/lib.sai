@@ -1,0 +1,60 @@
+use acme:transit-fare-cap-auditor/audit
+use acme:transit-fare-cap-auditor/data
+use acme:transit-fare-cap-auditor/model.{FareAudit, FindingCode, Tap}
+use acme:transit-fare-cap-auditor/policy
+
+pub fn audit_fixture() -> FareAudit {
+    audit.audit(data.riders(), data.taps())
+}
+
+test "the audit applies transfer windows and clips fares at the daily cap" {
+    let report = audit_fixture()
+    assert report.rider_count == 3
+    assert report.assigned_tap_count == 11
+    assert report.riders[0].unwrap().expected_cents == 600
+    assert report.riders[1].unwrap().expected_cents == 650
+    assert report.riders[1].unwrap().recorded_cents == 650
+    assert report.riders[2].unwrap().expected_cents == 540
+    assert report.expected_cents == 1790
+    assert report.recorded_cents == 1830
+    assert report.overcharge_cents == 40
+    assert report.undercharge_cents == 0
+    assert report.riders[2].unwrap().finding == Some(FindingCode.ChargeMismatch)
+}
+
+test "a later transfer does not extend the first boarding's window" {
+    assert policy.fare_for_boarding(22, true, 2, 240) == 60
+    assert policy.fare_for_boarding(40, true, 2, 300) == 240
+}
+
+test "unmatched charges stay visible instead of being assigned to a rider" {
+    let report = audit_fixture()
+    assert report.unmatched_tap_count == 1
+    assert report.unmatched_recorded_cents == 240
+}
+
+test "a duplicate event identifier holds its rider sequence" {
+    var taps = data.taps()
+    taps[1] = taps[0]
+    let report = audit.audit(data.riders(), taps)
+    assert report.riders[0].unwrap().finding == Some(FindingCode.DuplicateTapId)
+    assert report.riders[0].unwrap().expected_cents == 240
+    assert report.structurally_held_count == 1
+}
+
+test "an out-of-order rider ledger is held for review" {
+    var taps = data.taps()
+    taps[2] = Tap(id: 8003, rider_id: 1001, minute: 10, recorded_cents: 240)
+    let report = audit.audit(data.riders(), taps)
+    assert report.riders[0].unwrap().finding == Some(FindingCode.OutOfOrderTap)
+    assert report.riders[0].unwrap().expected_cents == 300
+    assert report.structurally_held_count == 1
+}
+
+test "duplicate identifiers are counted across assigned and unmatched rows" {
+    var taps = data.taps()
+    taps[11] = Tap(id: 8022, rider_id: 9999, minute: 50, recorded_cents: 240)
+    let report = audit.audit(data.riders(), taps)
+    assert report.duplicate_tap_id_count == 1
+    assert report.unmatched_tap_count == 1
+}

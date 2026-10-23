@@ -1,0 +1,23 @@
+use acme:transit-fare-cap-auditor/model.{Rider, Tap}
+
+pub fn riders() -> Array<Rider, 3> {
+    [Rider(id: 1001, name: "Maya"), Rider(id: 1002, name: "Ren"), Rider(id: 1003, name: "Aiko")]
+}
+
+// The final row has a rider ID absent from the register.
+pub fn taps() -> Array<Tap, 12> {
+    [
+        Tap(id: 8001, rider_id: 1001, minute: 0, recorded_cents: 240),
+        Tap(id: 8002, rider_id: 1001, minute: 20, recorded_cents: 60),
+        Tap(id: 8003, rider_id: 1001, minute: 55, recorded_cents: 240),
+        Tap(id: 8004, rider_id: 1001, minute: 70, recorded_cents: 60),
+        Tap(id: 8010, rider_id: 1002, minute: 5, recorded_cents: 240),
+        Tap(id: 8011, rider_id: 1002, minute: 40, recorded_cents: 240),
+        Tap(id: 8012, rider_id: 1002, minute: 75, recorded_cents: 170),
+        Tap(id: 8013, rider_id: 1002, minute: 110, recorded_cents: 0),
+        Tap(id: 8020, rider_id: 1003, minute: 2, recorded_cents: 240),
+        Tap(id: 8021, rider_id: 1003, minute: 22, recorded_cents: 100),
+        Tap(id: 8022, rider_id: 1003, minute: 40, recorded_cents: 240),
+        Tap(id: 8099, rider_id: 9999, minute: 50, recorded_cents: 240),
+    ]
+}

@@ -1,0 +1,60 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PolicyClass {
+    NoticeBasedAllowed
+    ReviewRequired
+    RestrictedByDemoPolicy
+    Unclassified
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum EvidenceState {
+    Complete
+    LicenseTextMissing
+    NoticeFileMissing
+    ConflictingMetadata
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReviewOutcome {
+    ClearedBySamplePolicy
+    ManualReviewRequired
+    BlockedBySamplePolicy
+    MissingLicenseText
+    MissingNotice
+    ConflictingMetadata
+    ExceptionApproved
+    ExceptionScopeMismatch
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Component {
+    pub id: U32
+    pub name: Str
+    pub license_label: Str
+    pub policy_class: PolicyClass
+    pub evidence: EvidenceState
+    pub exception_approved: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ReviewFinding {
+    pub component_id: U32
+    pub name: Str
+    pub license_label: Str
+    pub outcome: ReviewOutcome
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditReport {
+    pub findings: Array<ReviewFinding, 9>
+    pub component_count: USize
+    pub cleared_count: USize
+    pub manual_review_count: USize
+    pub blocked_count: USize
+    pub missing_license_text_count: USize
+    pub missing_notice_count: USize
+    pub conflicting_metadata_count: USize
+    pub exception_approved_count: USize
+    pub exception_scope_mismatch_count: USize
+    pub ready_under_sample_policy: Bool
+}

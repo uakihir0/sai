@@ -1,0 +1,51 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum FindingCode {
+    DuplicateTapId
+    OutOfOrderTap
+    ChargeMismatch
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Rider {
+    pub id: U32
+    pub name: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Tap {
+    pub id: U32
+    pub rider_id: U32
+    // Minutes after midnight on the fictional service day.
+    pub minute: U32
+    pub recorded_cents: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RiderAudit {
+    pub rider_id: U32
+    pub name: Str
+    pub tap_count: USize
+    pub expected_cents: U32
+    pub recorded_cents: U32
+    pub overcharge_cents: U32
+    pub undercharge_cents: U32
+    // Structural ledger findings take precedence over a charge mismatch.
+    pub finding: Option<FindingCode>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type FareAudit {
+    pub riders: Array<Option<RiderAudit>, 3>
+    pub rider_count: USize
+    pub assigned_tap_count: USize
+    pub expected_cents: U32
+    pub recorded_cents: U32
+    pub overcharge_cents: U32
+    pub undercharge_cents: U32
+    // Counts later occurrences of an ID anywhere in the source ledger.
+    pub duplicate_tap_id_count: USize
+    pub unmatched_tap_count: USize
+    pub unmatched_recorded_cents: U32
+    pub valid_sequence_count: USize
+    pub structurally_held_count: USize
+}
