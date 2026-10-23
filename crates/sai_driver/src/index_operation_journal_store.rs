@@ -4,11 +4,19 @@
 //! one canonical journal under `.sai/index/operation.json`, anchored to the
 //! directory handle owned by a workspace lock.
 
-use crate::index_operation_journal_recovery::IndexGenerationObservation;
+use crate::index_operation_journal_recovery::{
+    IndexGenerationObservation, IndexJournalRecoveryObservation,
+    ObservedFileState as PlannerObservedFileState,
+};
+use crate::index_operation_journal_validation::{
+    IndexJournalWorkspaceInventory, validate_index_operation_journal_package_context,
+};
+use sai_package::local_source::{LocalPackageSourceFileSnapshotError, LocalPackageSourceFileState};
+use sai_package::package_path::{ContentPackagePath, RepositoryPackageDirectory};
 use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
 use sai_semantic::{
     FileState, IndexJournalState, IndexOperationJournal, MAX_OPERATION_JOURNAL_BYTES,
-    PackageIndexFileName, SymbolIndexHeader,
+    PackageIndexFileName, SourceFileChange, SymbolIndexHeader,
 };
 use sai_stable_hash::{ContentHash, ContentHasher};
 use sai_windows_fs::{
@@ -33,6 +41,7 @@ use std::time::SystemTime;
 const INDEX_DIRECTORY_NAME: &str = "index";
 const JOURNAL_FILE_NAME: &str = "operation.json";
 const TEMP_FILE_ATTEMPTS: usize = 8;
+const MAX_RECOVERY_SOURCE_OBSERVATION_BYTES: u64 = MAX_OPERATION_JOURNAL_BYTES as u64;
 
 /// Errors from reading or durably updating `.sai/index/operation.json`.
 #[derive(Debug)]
@@ -163,6 +172,96 @@ impl<'lock> IndexOperationJournalStore<'lock> {
         journal: &IndexOperationJournal,
     ) -> Result<IndexGenerationObservation, IndexOperationJournalStoreError> {
         self.observe_index_generation_with_hook(journal, || {})
+    }
+
+    /// Observes the journal's source files and committed index generation for
+    /// the pure recovery planner.
+    ///
+    /// The caller must build `inventory` from the complete current workspace
+    /// lock graph while holding this store's exclusive workspace lock. The
+    /// inventory builder accepts parsed lock data and this method cannot
+    /// independently prove that those parsed bytes came from the current
+    /// `sai.lock`. `journal` must be a complete codec-validated record, such
+    /// as one returned by [`Self::read`]. The journal package contexts are
+    /// checked against the inventory before any source read. The captured root
+    /// path and opened directory identity must match the root pinned by the
+    /// workspace lock; otherwise every source is `Unavailable`. Every source
+    /// read then reopens its recorded package root from the retained
+    /// workspace-root handle and uses handle-relative no-follow traversal.
+    /// The total bytes retained for source observations are capped at the
+    /// maximum encoded journal size, in addition to the per-file source limit.
+    ///
+    /// Source states remain in journal order. Only a missing final source
+    /// component is reported as `Available(FileState::Absent)`; an absent
+    /// intermediate directory, changed package root, unsafe path, oversized
+    /// file, or unsupported platform is `Unavailable`. This is evidence for a
+    /// planner only, not authorization to mutate files. An executor must
+    /// re-observe and revalidate every path immediately before mutation.
+    pub fn observe_recovery(
+        &self,
+        journal: &IndexOperationJournal,
+        inventory: &IndexJournalWorkspaceInventory,
+    ) -> Result<IndexJournalRecoveryObservation, IndexOperationJournalStoreError> {
+        self.observe_recovery_with_source_byte_budget_impl(
+            journal,
+            inventory,
+            MAX_RECOVERY_SOURCE_OBSERVATION_BYTES,
+        )
+    }
+
+    /// Test-only entry point for exercising conservative aggregate byte limits.
+    #[cfg(test)]
+    pub(crate) fn observe_recovery_with_source_byte_budget(
+        &self,
+        journal: &IndexOperationJournal,
+        inventory: &IndexJournalWorkspaceInventory,
+        source_byte_budget: u64,
+    ) -> Result<IndexJournalRecoveryObservation, IndexOperationJournalStoreError> {
+        self.observe_recovery_with_source_byte_budget_impl(journal, inventory, source_byte_budget)
+    }
+
+    fn observe_recovery_with_source_byte_budget_impl(
+        &self,
+        journal: &IndexOperationJournal,
+        inventory: &IndexJournalWorkspaceInventory,
+        source_byte_budget: u64,
+    ) -> Result<IndexJournalRecoveryObservation, IndexOperationJournalStoreError> {
+        self.require_exclusive()?;
+
+        let inventory_matches_locked_workspace = inventory.root_directory().path()
+            == self.lock.package_directory()
+            && self
+                .lock
+                .package_directory_handle()
+                .is_some_and(|locked_root| {
+                    inventory
+                        .root_directory()
+                        .is_same_open_directory(locked_root)
+                });
+        let sources = if inventory_matches_locked_workspace
+            && validate_index_operation_journal_package_context(journal, inventory.contexts())
+                .is_ok()
+        {
+            let mut remaining_source_bytes = source_byte_budget;
+            journal
+                .sources
+                .iter()
+                .map(|source| {
+                    let (state, observed_bytes) =
+                        observe_journal_source(source, inventory, remaining_source_bytes);
+                    remaining_source_bytes = remaining_source_bytes.saturating_sub(observed_bytes);
+                    state
+                })
+                .collect()
+        } else {
+            vec![PlannerObservedFileState::Unavailable; journal.sources.len()]
+        };
+
+        let index_generation = self.observe_index_generation(journal)?;
+        Ok(IndexJournalRecoveryObservation {
+            sources,
+            index_generation,
+        })
     }
 
     fn observe_index_generation_with_hook(
@@ -897,6 +996,52 @@ impl<'lock> IndexOperationJournalStore<'lock> {
 
     fn io_error(&self, path: PathBuf, source: io::Error) -> IndexOperationJournalStoreError {
         IndexOperationJournalStoreError::Io { path, source }
+    }
+}
+
+fn observe_journal_source(
+    source: &SourceFileChange,
+    inventory: &IndexJournalWorkspaceInventory,
+    maximum_bytes: u64,
+) -> (PlannerObservedFileState, u64) {
+    let Some(package_directory) = inventory.directory_for_package(&source.package_node_key) else {
+        return (PlannerObservedFileState::Unavailable, 0);
+    };
+    let Ok(package_root) = RepositoryPackageDirectory::parse(&source.package_root) else {
+        return (PlannerObservedFileState::Unavailable, 0);
+    };
+    let Ok(source_path) = ContentPackagePath::parse(&source.path) else {
+        return (PlannerObservedFileState::Unavailable, 0);
+    };
+    let Ok(package_directory) =
+        package_directory.reopen_from_workspace_root(inventory.root_directory(), &package_root)
+    else {
+        return (PlannerObservedFileState::Unavailable, 0);
+    };
+
+    match package_directory.read_source_file_snapshot_with_limit(&source_path, maximum_bytes) {
+        Ok(LocalPackageSourceFileState::Absent) => {
+            (PlannerObservedFileState::Available(FileState::Absent), 0)
+        }
+        Ok(LocalPackageSourceFileState::RegularFile(bytes)) => {
+            let observed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+            (
+                PlannerObservedFileState::Available(FileState::RegularFile(
+                    bytes.as_ref().to_vec(),
+                )),
+                observed_bytes,
+            )
+        }
+        Err(
+            LocalPackageSourceFileSnapshotError::Directory(_)
+            | LocalPackageSourceFileSnapshotError::InvalidSourcePath
+            | LocalPackageSourceFileSnapshotError::MissingIntermediateDirectory
+            | LocalPackageSourceFileSnapshotError::UnsafePathComponent
+            | LocalPackageSourceFileSnapshotError::NonRegularFile
+            | LocalPackageSourceFileSnapshotError::FileTooLarge
+            | LocalPackageSourceFileSnapshotError::OutOfMemory
+            | LocalPackageSourceFileSnapshotError::PlatformNotSupported,
+        ) => (PlannerObservedFileState::Unavailable, 0),
     }
 }
 

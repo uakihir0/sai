@@ -910,11 +910,17 @@ mod tests {
         validate_index_operation_journal_package_context as validate_package_context,
         validate_unique_inventory_contexts,
     };
+    use crate::index_operation_journal_recovery::{
+        IndexGenerationObservation, IndexJournalRecoveryDecision, ObservedFileState,
+        plan_index_operation_journal_recovery,
+    };
+    use crate::index_operation_journal_store::IndexOperationJournalStore;
     use crate::package_graph::{PackageForm, PackageGraphNode, PackageGraphRole};
     use sai_package::local_source::LocalPackageDirectory;
     use sai_package::lock::parse as parse_lock;
     use sai_package::validation::PackageValidationContext;
     use sai_package::version::Version;
+    use sai_package::workspace_lock::{WorkspaceLockGuard, WorkspaceLockMode};
     use sai_semantic::{
         FileState, IndexJournalOrigin, IndexJournalState, IndexOperationJournal, IndexSnapshot,
         PackageFileState, PackageIndexFileName, SourceFileChange,
@@ -1159,6 +1165,363 @@ mod tests {
             source_change("package:acme:widget@1.2.3", "crates/widget", path),
             &["acme.widget.1.jsonl"],
         )
+    }
+
+    fn write_recovery_fixture_index(root: &PathBuf, journal: &IndexOperationJournal) {
+        let index_directory = root.join(".sai/index");
+        fs::create_dir_all(&index_directory).expect("create index directory");
+        let FileState::RegularFile(header) = &journal.index_before.header else {
+            panic!("recovery fixture has a before header");
+        };
+        fs::write(index_directory.join("index.json"), header).expect("write before index header");
+        for package_file in &journal.index_before.package_files {
+            let FileState::RegularFile(bytes) = &package_file.state else {
+                panic!("recovery fixture has before package-file bytes");
+            };
+            fs::write(index_directory.join(package_file.file.as_str()), bytes)
+                .expect("write before package index file");
+        }
+        fs::write(
+            index_directory.join("operation.json"),
+            journal.encode().expect("recovery fixture journal encodes"),
+        )
+        .expect("write current operation journal");
+    }
+
+    fn recovery_inventory(root: &PathBuf) -> super::IndexJournalWorkspaceInventory {
+        let root_manifest = "package acme:app @ 1.0.0\n\
+                             source \"src\"\n\
+                             targets { wasm32-core, wasm32-wasi }\n\
+                             requires { acme:widget @ ^1 from path \"packages/widget\" }\n";
+        write_package(root, ".", root_manifest);
+        write_package(
+            root,
+            "packages/widget",
+            "package acme:widget @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n",
+        );
+        fs::create_dir_all(root.join("src")).expect("create root source directory");
+        fs::create_dir_all(root.join("packages/widget/src"))
+            .expect("create member source directory");
+
+        let lock = lock_root(
+            "    requires acme:widget @ ^1 -> 1.0.0 from path \"packages/widget\"\n",
+            &path_lock_entry("acme:widget", "1.0.0", "packages/widget", ""),
+        );
+        build_inventory(root, &lock).expect("build fresh workspace inventory")
+    }
+
+    fn recovery_journal() -> IndexOperationJournal {
+        let mut root_source = source_change("package:acme:app@1.0.0", ".", "src/empty.sai");
+        root_source.before = FileState::RegularFile(Vec::new());
+        root_source.planned_after = FileState::RegularFile(b"planned root".to_vec());
+
+        let mut member_source = source_change(
+            "package:acme:widget@1.0.0",
+            "packages/widget",
+            "src/lib.sai",
+        );
+        member_source.before = FileState::Absent;
+        member_source.planned_after = FileState::RegularFile(b"planned member".to_vec());
+
+        let mut journal = journal(root_source, &["acme.app.1.jsonl", "acme.widget.1.jsonl"]);
+        journal.sources.push(member_source);
+        journal.encode().expect("recovery fixture journal is valid");
+        journal
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn observes_sources_in_journal_order_and_preserves_empty_vs_absent() {
+        let workspace = TestWorkspace::new();
+        let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
+        let inventory = recovery_inventory(&workspace.0);
+        let journal = recovery_journal();
+        fs::write(workspace.0.join("src/empty.sai"), []).expect("write empty root source");
+        let store = IndexOperationJournalStore::new(&lock);
+        write_recovery_fixture_index(&workspace.0, &journal);
+
+        let observation = store
+            .observe_recovery(&journal, &inventory)
+            .expect("observe recovery state");
+
+        assert_eq!(
+            observation.sources,
+            [
+                ObservedFileState::Available(FileState::RegularFile(Vec::new())),
+                ObservedFileState::Available(FileState::Absent),
+            ]
+        );
+        assert_eq!(
+            observation.index_generation,
+            IndexGenerationObservation::Before
+        );
+        assert_eq!(
+            plan_index_operation_journal_recovery(&journal, &observation),
+            IndexJournalRecoveryDecision::ClearBefore
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn unavailable_package_root_blocks_source_classification() {
+        let workspace = TestWorkspace::new();
+        let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
+        let inventory = recovery_inventory(&workspace.0);
+        let journal = recovery_journal();
+        fs::write(workspace.0.join("src/empty.sai"), []).expect("write empty root source");
+        let store = IndexOperationJournalStore::new(&lock);
+        write_recovery_fixture_index(&workspace.0, &journal);
+        fs::rename(
+            workspace.0.join("packages/widget"),
+            workspace.0.join("packages/renamed-widget"),
+        )
+        .expect("replace recorded package-root path");
+
+        let observation = store
+            .observe_recovery(&journal, &inventory)
+            .expect("observe recovery state");
+
+        assert_eq!(
+            observation.sources,
+            [
+                ObservedFileState::Available(FileState::RegularFile(Vec::new())),
+                ObservedFileState::Unavailable,
+            ]
+        );
+        assert_eq!(
+            observation.index_generation,
+            IndexGenerationObservation::Before
+        );
+        assert_eq!(
+            plan_index_operation_journal_recovery(&journal, &observation),
+            IndexJournalRecoveryDecision::Ambiguous(
+                crate::index_operation_journal_recovery::IndexJournalRecoveryAmbiguity::SourceUnavailable,
+            )
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn rejects_an_inventory_from_a_different_locked_workspace() {
+        let current_workspace = TestWorkspace::new();
+        let foreign_workspace = TestWorkspace::new();
+        let foreign_lock =
+            WorkspaceLockGuard::acquire(&foreign_workspace.0, WorkspaceLockMode::Exclusive)
+                .unwrap();
+        let foreign_inventory = recovery_inventory(&foreign_workspace.0);
+        drop(foreign_lock);
+
+        let lock = WorkspaceLockGuard::acquire(&current_workspace.0, WorkspaceLockMode::Exclusive)
+            .unwrap();
+        let journal = recovery_journal();
+        let store = IndexOperationJournalStore::new(&lock);
+        write_recovery_fixture_index(&current_workspace.0, &journal);
+
+        let observation = store
+            .observe_recovery(&journal, &foreign_inventory)
+            .expect("observe recovery state");
+
+        assert_eq!(
+            observation.sources,
+            [
+                ObservedFileState::Unavailable,
+                ObservedFileState::Unavailable
+            ]
+        );
+        assert_eq!(
+            observation.index_generation,
+            IndexGenerationObservation::Before
+        );
+        assert_eq!(
+            plan_index_operation_journal_recovery(&journal, &observation),
+            IndexJournalRecoveryDecision::Ambiguous(
+                crate::index_operation_journal_recovery::IndexJournalRecoveryAmbiguity::SourceUnavailable,
+            )
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn rejects_an_inventory_when_its_workspace_path_is_reused() {
+        let workspace = TestWorkspace::new();
+        let original_lock =
+            WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
+        let original_inventory = recovery_inventory(&workspace.0);
+        drop(original_lock);
+
+        let moved_workspace = workspace.0.with_extension("moved");
+        fs::rename(&workspace.0, &moved_workspace).expect("move the original workspace");
+        fs::create_dir(&workspace.0).expect("reuse the original workspace path");
+        let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
+        let _current_inventory = recovery_inventory(&workspace.0);
+        let journal = recovery_journal();
+        let store = IndexOperationJournalStore::new(&lock);
+        write_recovery_fixture_index(&workspace.0, &journal);
+
+        let observation = store
+            .observe_recovery(&journal, &original_inventory)
+            .expect("observe recovery state");
+
+        assert_eq!(
+            observation.sources,
+            [
+                ObservedFileState::Unavailable,
+                ObservedFileState::Unavailable
+            ]
+        );
+        assert_eq!(
+            observation.index_generation,
+            IndexGenerationObservation::Before
+        );
+        assert_eq!(
+            plan_index_operation_journal_recovery(&journal, &observation),
+            IndexJournalRecoveryDecision::Ambiguous(
+                crate::index_operation_journal_recovery::IndexJournalRecoveryAmbiguity::SourceUnavailable,
+            )
+        );
+
+        drop(store);
+        drop(lock);
+        drop(original_inventory);
+        fs::remove_dir_all(&moved_workspace).expect("remove the moved workspace fixture");
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn aggregate_source_byte_limit_keeps_over_budget_sources_unavailable() {
+        let workspace = TestWorkspace::new();
+        let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
+        let inventory = recovery_inventory(&workspace.0);
+        let journal = recovery_journal();
+        fs::write(workspace.0.join("src/empty.sai"), b"more than four bytes")
+            .expect("write source over the test budget");
+        let store = IndexOperationJournalStore::new(&lock);
+        write_recovery_fixture_index(&workspace.0, &journal);
+
+        let observation = store
+            .observe_recovery_with_source_byte_budget(&journal, &inventory, 4)
+            .expect("observe recovery state within a bounded source budget");
+
+        assert_eq!(
+            observation.sources,
+            [
+                ObservedFileState::Unavailable,
+                ObservedFileState::Available(FileState::Absent),
+            ]
+        );
+        assert_eq!(
+            observation.index_generation,
+            IndexGenerationObservation::Before
+        );
+        assert_eq!(
+            plan_index_operation_journal_recovery(&journal, &observation),
+            IndexJournalRecoveryDecision::Ambiguous(
+                crate::index_operation_journal_recovery::IndexJournalRecoveryAmbiguity::SourceUnavailable,
+            )
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unsupported_source_observation_stays_unavailable_on_windows() {
+        let workspace = TestWorkspace::new();
+        let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
+        write_package(
+            &workspace.0,
+            ".",
+            "package acme:app @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n",
+        );
+        let member_path = write_package(
+            &workspace.0,
+            "packages/widget",
+            "package acme:widget @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n",
+        );
+        fs::create_dir_all(workspace.0.join("src")).expect("create root source directory");
+        fs::create_dir_all(member_path.join("src")).expect("create member source directory");
+
+        let root_directory =
+            LocalPackageDirectory::open(&workspace.0).expect("open workspace root");
+        let member_directory =
+            LocalPackageDirectory::open(&member_path).expect("open workspace member");
+        let root_node = graph_node(
+            "acme:app",
+            "1.0.0",
+            PackageGraphRole::Root,
+            PackageForm::Source,
+        );
+        let member_node = graph_node(
+            "acme:widget",
+            "1.0.0",
+            PackageGraphRole::WorkspaceMember,
+            PackageForm::Source,
+        );
+        let inventory = super::IndexJournalWorkspaceInventory {
+            root_directory,
+            contexts: vec![
+                IndexJournalPackageContext::from_test_metadata(&root_node, Some("."), Some("src"))
+                    .expect("root package context is valid"),
+                IndexJournalPackageContext::from_test_metadata(
+                    &member_node,
+                    Some("packages/widget"),
+                    Some("src"),
+                )
+                .expect("member package context is valid"),
+            ],
+            directories: std::collections::BTreeMap::from([
+                (
+                    "package:acme:app@1.0.0".to_owned(),
+                    LocalPackageDirectory::open(&workspace.0)
+                        .expect("retain root package directory"),
+                ),
+                ("package:acme:widget@1.0.0".to_owned(), member_directory),
+            ]),
+        };
+        let journal = recovery_journal();
+        let store = IndexOperationJournalStore::new(&lock);
+        write_recovery_fixture_index(&workspace.0, &journal);
+
+        let observation = store
+            .observe_recovery(&journal, &inventory)
+            .expect("observe recovery state");
+
+        assert_eq!(
+            observation.sources,
+            [
+                ObservedFileState::Unavailable,
+                ObservedFileState::Unavailable
+            ]
+        );
+        assert_eq!(
+            observation.index_generation,
+            IndexGenerationObservation::Before
+        );
+        assert_eq!(
+            plan_index_operation_journal_recovery(&journal, &observation),
+            IndexJournalRecoveryDecision::Ambiguous(
+                crate::index_operation_journal_recovery::IndexJournalRecoveryAmbiguity::SourceUnavailable,
+            )
+        );
     }
 
     #[test]

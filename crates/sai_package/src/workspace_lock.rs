@@ -4,6 +4,14 @@
 //! never removes, replaces, or writes to it.
 
 use std::error::Error;
+#[cfg(any(
+    windows,
+    all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    )
+))]
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
 use std::io;
@@ -123,6 +131,12 @@ impl WorkspaceLockGuard {
         let package_directory = pin_package_directory(&package_directory_path)?;
         let (state_directory_path, path) = prepare_lock_paths(&package_directory_path)?;
         let state_directory = open_state_directory(&state_directory_path, mode)?;
+        validate_state_directory_binding(
+            package_directory.as_ref(),
+            &state_directory,
+            &package_directory_path,
+            &state_directory_path,
+        )?;
         let file = open_lock_file(&state_directory, &path)?;
         validate_regular_lock_file(&file, &path)?;
         let guard = Self {
@@ -176,6 +190,12 @@ impl WorkspaceLockGuard {
         let package_directory = pin_package_directory(&package_directory_path)?;
         let (state_directory_path, path) = prepare_lock_paths(&package_directory_path)?;
         let state_directory = open_state_directory(&state_directory_path, mode)?;
+        validate_state_directory_binding(
+            package_directory.as_ref(),
+            &state_directory,
+            &package_directory_path,
+            &state_directory_path,
+        )?;
         let file = open_lock_file(&state_directory, &path)?;
         validate_regular_lock_file(&file, &path)?;
         if !lock_platform(&file, mode, false).map_err(|source| WorkspaceLockError::Io {
@@ -210,6 +230,12 @@ impl WorkspaceLockGuard {
     /// The canonical package directory whose `.sai/lock` is held.
     pub fn package_directory(&self) -> &Path {
         &self.package_directory_path
+    }
+
+    /// The pinned package-root directory handle, when safe handle identity is
+    /// available on this platform.
+    pub fn package_directory_handle(&self) -> Option<&File> {
+        self._package_directory.as_ref()
     }
 
     /// The pinned `.sai` directory handle associated with this lock.
@@ -261,7 +287,13 @@ fn canonicalize_package_directory(path: &Path) -> Result<PathBuf, WorkspaceLockE
 }
 
 fn pin_package_directory(path: &Path) -> Result<Option<File>, WorkspaceLockError> {
-    #[cfg(windows)]
+    #[cfg(any(
+        windows,
+        all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        )
+    ))]
     {
         let directory =
             sai_windows_fs::open_directory_without_following(path).map_err(|source| {
@@ -273,11 +305,91 @@ fn pin_package_directory(path: &Path) -> Result<Option<File>, WorkspaceLockError
         Ok(Some(directory))
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(
+        windows,
+        all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        )
+    )))]
     {
         let _ = path;
         Ok(None)
     }
+}
+
+fn validate_state_directory_binding(
+    package_directory: Option<&File>,
+    state_directory: &File,
+    package_directory_path: &Path,
+    state_directory_path: &Path,
+) -> Result<(), WorkspaceLockError> {
+    #[cfg(any(
+        windows,
+        all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        )
+    ))]
+    {
+        let package_directory = package_directory.ok_or_else(|| {
+            WorkspaceLockError::InvalidPackageDirectory(package_directory_path.to_path_buf())
+        })?;
+        let pinned_state_directory = sai_windows_fs::open_child_directory_without_following(
+            package_directory,
+            package_directory_path,
+            OsStr::new(".sai"),
+        )
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::InvalidInput
+                || source.kind() == io::ErrorKind::NotFound
+                || source.kind() == io::ErrorKind::NotADirectory
+            {
+                return WorkspaceLockError::InvalidStateDirectory(
+                    state_directory_path.to_path_buf(),
+                );
+            }
+            WorkspaceLockError::Io {
+                path: state_directory_path.to_path_buf(),
+                source,
+            }
+        })?;
+        let pinned_identity =
+            sai_windows_fs::file_identity(&pinned_state_directory).map_err(|source| {
+                WorkspaceLockError::Io {
+                    path: state_directory_path.to_path_buf(),
+                    source,
+                }
+            })?;
+        let opened_identity = sai_windows_fs::file_identity(state_directory).map_err(|source| {
+            WorkspaceLockError::Io {
+                path: state_directory_path.to_path_buf(),
+                source,
+            }
+        })?;
+        if pinned_identity != opened_identity {
+            return Err(WorkspaceLockError::InvalidStateDirectory(
+                state_directory_path.to_path_buf(),
+            ));
+        }
+    }
+
+    #[cfg(not(any(
+        windows,
+        all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        )
+    )))]
+    {
+        let _ = (
+            package_directory,
+            state_directory,
+            package_directory_path,
+            state_directory_path,
+        );
+    }
+    Ok(())
 }
 
 fn prepare_lock_paths(package_directory: &Path) -> Result<(PathBuf, PathBuf), WorkspaceLockError> {
@@ -857,6 +969,42 @@ mod tests {
 
         assert!(matches!(
             WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Shared),
+            Err(WorkspaceLockError::InvalidStateDirectory(_))
+        ));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn rejects_a_state_directory_from_a_replacement_workspace() {
+        use super::{
+            open_state_directory, pin_package_directory, prepare_lock_paths,
+            validate_state_directory_binding,
+        };
+
+        let directory = TestDirectory::new();
+        let package_directory = directory.0.join("package");
+        fs::create_dir_all(package_directory.join(".sai")).unwrap();
+        let package_handle = pin_package_directory(&package_directory)
+            .unwrap()
+            .expect("supported Unix pins the package root");
+        let (state_directory_path, _) = prepare_lock_paths(&package_directory).unwrap();
+
+        let moved_package_directory = directory.0.join("moved-package");
+        fs::rename(&package_directory, &moved_package_directory).unwrap();
+        fs::create_dir_all(package_directory.join(".sai")).unwrap();
+        let replacement_state =
+            open_state_directory(&state_directory_path, WorkspaceLockMode::Exclusive).unwrap();
+
+        assert!(matches!(
+            validate_state_directory_binding(
+                Some(&package_handle),
+                &replacement_state,
+                &package_directory,
+                &state_directory_path,
+            ),
             Err(WorkspaceLockError::InvalidStateDirectory(_))
         ));
     }
