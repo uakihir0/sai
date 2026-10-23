@@ -198,6 +198,46 @@ impl From<LocalPackageError> for LocalPackageSourceSnapshotError {
     }
 }
 
+/// Exact observation of one package-relative SAI source file.
+///
+/// `Absent` is returned only when the final path component is missing and
+/// every parent component was opened as a real directory. An unavailable or
+/// unsafe path is returned as an error instead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalPackageSourceFileState {
+    /// The final package-relative source path does not exist.
+    Absent,
+    /// The final path is a regular file; these are its exact observed bytes.
+    RegularFile(Arc<[u8]>),
+}
+
+/// An exact source-file observation could not be made safely.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalPackageSourceFileSnapshotError {
+    /// A retained package-directory operation failed.
+    Directory(LocalPackageError),
+    /// The path is not a canonical package-relative `.sai` source file.
+    InvalidSourcePath,
+    /// A parent component does not exist.
+    MissingIntermediateDirectory,
+    /// A path component is a symlink or non-directory parent.
+    UnsafePathComponent,
+    /// The final path exists but is not a regular file.
+    NonRegularFile,
+    /// The file exceeds the source-file byte limit.
+    FileTooLarge,
+    /// Memory could not be reserved for the bounded file read.
+    OutOfMemory,
+    /// This platform does not support the required handle-relative traversal.
+    PlatformNotSupported,
+}
+
+impl From<LocalPackageError> for LocalPackageSourceFileSnapshotError {
+    fn from(error: LocalPackageError) -> Self {
+        Self::Directory(error)
+    }
+}
+
 /// Whether the manifest-declared source root could be opened safely.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalPackageSourceRootStatus {
@@ -833,6 +873,43 @@ impl LocalPackageDirectory {
         source_directory: &ContentPackagePath,
     ) -> Result<LocalPackageSourceSnapshot, LocalPackageSourceSnapshotError> {
         self.read_source_snapshot_with_cancel(source_directory, || false)
+    }
+
+    /// Reads one package-relative `.sai` file through the retained package
+    /// directory handle, without following symlinks.
+    ///
+    /// Only a missing final file component is reported as
+    /// [`LocalPackageSourceFileState::Absent`]. Every parent component must
+    /// already exist as a real directory. The final target must be a regular
+    /// file no larger than [`MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES`]. This
+    /// operation fails closed on platforms without handle-relative,
+    /// no-follow traversal.
+    pub fn read_source_file_snapshot(
+        &self,
+        source_path: &ContentPackagePath,
+    ) -> Result<LocalPackageSourceFileState, LocalPackageSourceFileSnapshotError> {
+        let path = source_path.as_str();
+        let file_name = path.rsplit('/').next().unwrap_or_default();
+        if path == "." || !file_name.ends_with(".sai") {
+            return Err(LocalPackageSourceFileSnapshotError::InvalidSourcePath);
+        }
+
+        #[cfg(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        ))]
+        {
+            read_source_file_from_directory(&self.directory, path)
+        }
+
+        #[cfg(not(all(
+            unix,
+            not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+        )))]
+        {
+            let _ = (self, source_path);
+            Err(LocalPackageSourceFileSnapshotError::PlatformNotSupported)
+        }
     }
 
     /// Reads a source snapshot, polling `is_cancelled` during tree traversal
@@ -1527,6 +1604,157 @@ fn record_local_wit_entry_path(
         ));
     }
     Ok(())
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+))]
+fn read_source_file_from_directory(
+    package_directory: &File,
+    source_path: &str,
+) -> Result<LocalPackageSourceFileState, LocalPackageSourceFileSnapshotError> {
+    const READ_BUFFER_BYTES: usize = 64 * 1024;
+
+    let (parent_path, file_name) = source_path
+        .rsplit_once('/')
+        .map_or(("", source_path), |(parent, file_name)| (parent, file_name));
+    let mut parent = package_directory
+        .try_clone()
+        .map_err(|error| LocalPackageError::Io {
+            operation: LocalPackageIoOperation::OpenSourceDirectory,
+            kind: error.kind(),
+        })?;
+
+    for component in parent_path
+        .split('/')
+        .filter(|component| !component.is_empty())
+    {
+        let metadata = match statat(&parent, component, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(metadata) => metadata,
+            Err(rustix::io::Errno::NOENT) => {
+                return Err(LocalPackageSourceFileSnapshotError::MissingIntermediateDirectory);
+            }
+            Err(error) => {
+                return Err(LocalPackageSourceFileSnapshotError::Directory(
+                    local_source_io_error(LocalPackageIoOperation::InspectSourceEntry, error),
+                ));
+            }
+        };
+        if !FileType::from_raw_mode(metadata.st_mode).is_dir() {
+            return Err(LocalPackageSourceFileSnapshotError::UnsafePathComponent);
+        }
+
+        let opened = openat(
+            &parent,
+            component,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(|error| {
+            LocalPackageSourceFileSnapshotError::Directory(local_source_io_error(
+                LocalPackageIoOperation::OpenSourceDirectory,
+                error,
+            ))
+        })?;
+        if directory_identity(&opened)? != local_source_stat_identity(&metadata) {
+            return Err(LocalPackageError::DirectoryChanged.into());
+        }
+        parent = opened;
+    }
+
+    let metadata = match statat(&parent, file_name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(metadata) => metadata,
+        Err(rustix::io::Errno::NOENT) => return Ok(LocalPackageSourceFileState::Absent),
+        Err(error) => {
+            return Err(LocalPackageSourceFileSnapshotError::Directory(
+                local_source_io_error(LocalPackageIoOperation::InspectSourceEntry, error),
+            ));
+        }
+    };
+    if FileType::from_raw_mode(metadata.st_mode).is_symlink() {
+        return Err(LocalPackageSourceFileSnapshotError::UnsafePathComponent);
+    }
+    if !FileType::from_raw_mode(metadata.st_mode).is_file() {
+        return Err(LocalPackageSourceFileSnapshotError::NonRegularFile);
+    }
+
+    let mut file = openat(
+        &parent,
+        file_name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map(File::from)
+    .map_err(|error| {
+        LocalPackageSourceFileSnapshotError::Directory(local_source_io_error(
+            LocalPackageIoOperation::OpenSourceFile,
+            error,
+        ))
+    })?;
+    let before = file.metadata().map_err(|error| LocalPackageError::Io {
+        operation: LocalPackageIoOperation::OpenSourceFile,
+        kind: error.kind(),
+    })?;
+    if !before.is_file()
+        || local_source_file_identity(&before) != local_source_stat_identity(&metadata)
+    {
+        return Err(LocalPackageError::DirectoryChanged.into());
+    }
+    if before.len() > MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES {
+        return Err(LocalPackageSourceFileSnapshotError::FileTooLarge);
+    }
+
+    let initial_capacity = usize::try_from(before.len())
+        .map_err(|_| LocalPackageSourceFileSnapshotError::FileTooLarge)?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(initial_capacity)
+        .map_err(|_| LocalPackageSourceFileSnapshotError::OutOfMemory)?;
+    let mut buffer = [0u8; READ_BUFFER_BYTES];
+    loop {
+        let read_so_far = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        let remaining = MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES.saturating_sub(read_so_far);
+        let request = usize::try_from(remaining.saturating_add(1).min(buffer.len() as u64))
+            .unwrap_or(buffer.len());
+        let read = file
+            .read(&mut buffer[..request])
+            .map_err(|error| LocalPackageError::Io {
+                operation: LocalPackageIoOperation::ReadSourceFile,
+                kind: error.kind(),
+            })?;
+        if read == 0 {
+            break;
+        }
+        if u64::try_from(read).unwrap_or(u64::MAX) > remaining {
+            return Err(LocalPackageSourceFileSnapshotError::FileTooLarge);
+        }
+        bytes
+            .try_reserve(read)
+            .map_err(|_| LocalPackageSourceFileSnapshotError::OutOfMemory)?;
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+
+    let after = file.metadata().map_err(|error| LocalPackageError::Io {
+        operation: LocalPackageIoOperation::ReadSourceFile,
+        kind: error.kind(),
+    })?;
+    if !local_source_file_metadata_unchanged(&before, &after)
+        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != before.len()
+    {
+        return Err(LocalPackageError::DirectoryChanged.into());
+    }
+    let current_entry = statat(&parent, file_name, AtFlags::SYMLINK_NOFOLLOW).map_err(|error| {
+        local_source_io_error(LocalPackageIoOperation::InspectSourceEntry, error)
+    })?;
+    if !FileType::from_raw_mode(current_entry.st_mode).is_file()
+        || local_source_stat_identity(&current_entry) != local_source_file_identity(&after)
+    {
+        return Err(LocalPackageError::DirectoryChanged.into());
+    }
+
+    Ok(LocalPackageSourceFileState::RegularFile(Arc::from(bytes)))
 }
 
 #[cfg(all(
@@ -3228,6 +3456,35 @@ impl fmt::Display for LocalPackageSourceSnapshotError {
     }
 }
 
+impl fmt::Display for LocalPackageSourceFileSnapshotError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Directory(error) => fmt::Display::fmt(error, formatter),
+            Self::InvalidSourcePath => {
+                formatter.write_str("local package source path is not a canonical `.sai` file")
+            }
+            Self::MissingIntermediateDirectory => formatter
+                .write_str("a parent directory of the local package source file is missing"),
+            Self::UnsafePathComponent => {
+                formatter.write_str("local package source path contains an unsafe component")
+            }
+            Self::NonRegularFile => {
+                formatter.write_str("local package source target is not a regular file")
+            }
+            Self::FileTooLarge => write!(
+                formatter,
+                "local package source file exceeds the {MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES} byte limit"
+            ),
+            Self::OutOfMemory => {
+                formatter.write_str("not enough memory to observe the local package source file")
+            }
+            Self::PlatformNotSupported => {
+                formatter.write_str("this host cannot safely observe a local package source file")
+            }
+        }
+    }
+}
+
 impl fmt::Display for LocalPackageSourceLimit {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -3310,6 +3567,14 @@ impl fmt::Debug for LocalPackageDirectory {
 
 impl std::error::Error for LocalPackageError {}
 impl std::error::Error for LocalPackageSourceSnapshotError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Directory(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+impl std::error::Error for LocalPackageSourceFileSnapshotError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Directory(error) => Some(error),
@@ -3568,7 +3833,8 @@ mod tests {
         LocalPackageContractLoadError, LocalPackageDirectory, LocalPackageDirectoryIndex,
         LocalPackageDirectoryIndexError, LocalPackageError, LocalPackageMvsError,
         LocalPackageMvsLoadError, LocalPackagePathIndexError, LocalPackagePathPinError,
-        LocalPackageSourceEntryKind, LocalPackageSourceLimit, LocalPackageSourceResolveError,
+        LocalPackageSourceEntryKind, LocalPackageSourceFileSnapshotError,
+        LocalPackageSourceFileState, LocalPackageSourceLimit, LocalPackageSourceResolveError,
         LocalPackageSourceRootStatus, LocalPackageSourceSnapshotError,
         LocalPackageSourceSnapshotLimits, LocalPackageSourceSnapshotProgress,
         LocalPackageWitDirectorySnapshotError, LocalPackageWitDirectorySnapshotLimit,
@@ -3727,6 +3993,187 @@ mod tests {
             &snapshot.sai_files()[0].bytes_arc(),
             &snapshot.sai_files()[0].bytes_arc()
         ));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn source_file_snapshot_reads_exact_bytes_and_only_reports_a_missing_leaf_as_absent() {
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        let nested = package_path.join("src/nested");
+        fs::create_dir_all(&nested).expect("create source parent");
+        fs::write(nested.join("filled.sai"), b"exact source\n").expect("write source");
+        fs::write(nested.join("empty.sai"), b"").expect("write empty source");
+
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        let read = |path: &str| {
+            package.read_source_file_snapshot(
+                &ContentPackagePath::parse(path).expect("valid package-relative source path"),
+            )
+        };
+        assert_eq!(
+            read("src/nested/filled.sai").expect("read regular source"),
+            LocalPackageSourceFileState::RegularFile(Arc::from(&b"exact source\n"[..]))
+        );
+        assert_eq!(
+            read("src/nested/empty.sai").expect("read empty source"),
+            LocalPackageSourceFileState::RegularFile(Arc::from(&b""[..]))
+        );
+        assert_eq!(
+            read("src/nested/missing.sai").expect("observe missing leaf"),
+            LocalPackageSourceFileState::Absent
+        );
+    }
+
+    #[test]
+    fn source_file_snapshot_rejects_non_sai_paths() {
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+
+        assert_eq!(
+            package.read_source_file_snapshot(
+                &ContentPackagePath::parse("README.md").expect("valid package-relative path")
+            ),
+            Err(LocalPackageSourceFileSnapshotError::InvalidSourcePath)
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn source_file_snapshot_does_not_treat_a_missing_parent_as_absence() {
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        fs::create_dir_all(package_path.join("src")).expect("create source directory");
+
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        assert_eq!(
+            package.read_source_file_snapshot(
+                &ContentPackagePath::parse("src/missing/lib.sai")
+                    .expect("valid package-relative source path")
+            ),
+            Err(LocalPackageSourceFileSnapshotError::MissingIntermediateDirectory)
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn source_file_snapshot_rejects_symlinks_and_non_regular_targets() {
+        use std::os::unix::fs::symlink;
+
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        let source_root = package_path.join("src");
+        fs::create_dir_all(&source_root).expect("create source directory");
+        let outside = tree.path().join("outside");
+        fs::create_dir(&outside).expect("create outside directory");
+        fs::write(outside.join("external.sai"), b"must not be read\n")
+            .expect("write outside source");
+        symlink(&outside, source_root.join("linked-dir")).expect("create directory symlink");
+        symlink(
+            outside.join("external.sai"),
+            source_root.join("linked-file.sai"),
+        )
+        .expect("create source symlink");
+        fs::create_dir(source_root.join("directory.sai")).expect("create directory target");
+
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        let read = |path: &str| {
+            package.read_source_file_snapshot(
+                &ContentPackagePath::parse(path).expect("valid package-relative source path"),
+            )
+        };
+        assert_eq!(
+            read("src/linked-dir/external.sai"),
+            Err(LocalPackageSourceFileSnapshotError::UnsafePathComponent)
+        );
+        assert_eq!(
+            read("src/linked-file.sai"),
+            Err(LocalPackageSourceFileSnapshotError::UnsafePathComponent)
+        );
+        assert_eq!(
+            read("src/directory.sai"),
+            Err(LocalPackageSourceFileSnapshotError::NonRegularFile)
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios")),
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn source_file_snapshot_rejects_fifo_targets_without_opening_them() {
+        use rustix::fs::{CWD, Mode, mkfifoat};
+
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        let source_root = package_path.join("src");
+        fs::create_dir_all(&source_root).expect("create source directory");
+        mkfifoat(CWD, source_root.join("fifo.sai"), Mode::RUSR | Mode::WUSR)
+            .expect("create source FIFO");
+
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        assert_eq!(
+            package.read_source_file_snapshot(
+                &ContentPackagePath::parse("src/fifo.sai")
+                    .expect("valid package-relative source path")
+            ),
+            Err(LocalPackageSourceFileSnapshotError::NonRegularFile)
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
+    fn source_file_snapshot_enforces_the_source_file_size_limit() {
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        let source_root = package_path.join("src");
+        fs::create_dir_all(&source_root).expect("create source directory");
+        fs::File::create(source_root.join("large.sai"))
+            .expect("create source file")
+            .set_len(super::MAX_LOCAL_PACKAGE_SOURCE_FILE_BYTES + 1)
+            .expect("extend source beyond limit");
+
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+        assert_eq!(
+            package.read_source_file_snapshot(
+                &ContentPackagePath::parse("src/large.sai")
+                    .expect("valid package-relative source path")
+            ),
+            Err(LocalPackageSourceFileSnapshotError::FileTooLarge)
+        );
+    }
+
+    #[cfg(not(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    )))]
+    #[test]
+    fn source_file_snapshot_fails_closed_when_handle_relative_reads_are_unavailable() {
+        let tree = TempTree::new();
+        let package_path = tree.package("root", ROOT_MANIFEST);
+        let package = LocalPackageDirectory::open(&package_path).expect("open local package");
+
+        assert_eq!(
+            package.read_source_file_snapshot(
+                &ContentPackagePath::parse("src/lib.sai")
+                    .expect("valid package-relative source path")
+            ),
+            Err(LocalPackageSourceFileSnapshotError::PlatformNotSupported)
+        );
     }
 
     #[cfg(all(
