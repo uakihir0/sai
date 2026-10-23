@@ -42,9 +42,9 @@ impl Phase1PackageSymbolInventory {
 }
 
 /// Collects target-visible module-level functions and their generic
-/// parameters, constants, and user effects. Every other symbol-bearing
-/// declaration makes the result incomplete until its symbol kind and path are
-/// collected as well.
+/// parameters, plain type aliases and their generic parameters, constants, and
+/// user effects. Every other symbol-bearing declaration makes the result
+/// incomplete until its symbol kind and path are collected as well.
 pub(super) fn collect_module_function_inventory(
     package_key: &PackageKey,
     package_version: Option<&MvsPackageVersion>,
@@ -143,6 +143,8 @@ pub(super) fn collect_module_function_inventory(
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut effect_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
+    let mut alias_owners_by_item =
+        HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut owner_ids = HashSet::<LocalDefId>::new();
     for descriptor in &scopes.function_owners {
         if owners_by_item
@@ -160,6 +162,12 @@ pub(super) fn collect_module_function_inventory(
     for descriptor in &scopes.top_level_owners {
         let key = (descriptor.file, descriptor.item_id);
         match descriptor.kind {
+            TopLevelOwnerKind::Alias => {
+                if alias_owners_by_item.insert(key, *descriptor).is_some() {
+                    reasons
+                        .insert("Phase 1 contains duplicate type-alias owner descriptors".into());
+                }
+            }
             TopLevelOwnerKind::Const => {
                 if const_owners_by_item.insert(key, *descriptor).is_some() {
                     reasons
@@ -185,6 +193,7 @@ pub(super) fn collect_module_function_inventory(
     let mut consumed_owners = HashSet::new();
     let mut consumed_const_owners = HashSet::new();
     let mut consumed_effect_owners = HashSet::new();
+    let mut consumed_alias_owners = HashSet::new();
     let mut canonical_paths = HashSet::<String>::new();
     let mut current_symbols = Vec::new();
 
@@ -218,6 +227,25 @@ pub(super) fn collect_module_function_inventory(
                         &owners_by_item,
                         &mut seen_items,
                         &mut consumed_owners,
+                        &mut canonical_paths,
+                        &mut current_symbols,
+                        &mut reasons,
+                        def_paths,
+                        packages,
+                        symbols,
+                    );
+                }
+                ItemTreeKind::Alias => {
+                    collect_alias(
+                        entry,
+                        module.file,
+                        &module_path,
+                        package_version.package(),
+                        input,
+                        prepared.module_tree.package,
+                        &alias_owners_by_item,
+                        &mut seen_items,
+                        &mut consumed_alias_owners,
                         &mut canonical_paths,
                         &mut current_symbols,
                         &mut reasons,
@@ -277,7 +305,7 @@ pub(super) fn collect_module_function_inventory(
                 // functions are children of ExternBlock and are symbols.
                 _ => {
                     reasons.insert(format!(
-                        "target-filtered declaration {:?} is outside the function-generic-parameter-constant-effect inventory",
+                        "target-filtered declaration {:?} is outside the function-generic-parameter-type-alias-generic-parameter-constant-effect inventory",
                         entry.kind
                     ));
                 }
@@ -303,6 +331,12 @@ pub(super) fn collect_module_function_inventory(
                 .to_owned(),
         );
     }
+    if consumed_alias_owners.len() != alias_owners_by_item.len() {
+        reasons.insert(
+            "the Phase 1 type-alias owner descriptors do not exactly match the filtered ItemTree"
+                .to_owned(),
+        );
+    }
     for ((file_id, item_id), _) in &owners_by_item {
         if !seen_items.contains(&(*file_id, *item_id)) {
             reasons.insert(
@@ -321,6 +355,13 @@ pub(super) fn collect_module_function_inventory(
         if !seen_items.contains(&(*file_id, *item_id)) {
             reasons.insert(
                 "a Phase 1 effect owner has no target-filtered ItemTree declaration".to_owned(),
+            );
+        }
+    }
+    for ((file_id, item_id), _) in &alias_owners_by_item {
+        if !seen_items.contains(&(*file_id, *item_id)) {
+            reasons.insert(
+                "a Phase 1 type-alias owner has no target-filtered ItemTree declaration".to_owned(),
             );
         }
     }
@@ -495,6 +536,187 @@ fn collect_const(
         SymbolKind::Const,
         fingerprint,
     ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_alias(
+    entry: &ItemTreeEntry,
+    file_id: FileId,
+    module_path: &[String],
+    package_identity: &str,
+    input: &OwnedPhase1ModuleInput,
+    package_id: PackageId,
+    owners_by_item: &HashMap<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>,
+    seen_items: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    consumed_owners: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    reasons: &mut HashSet<String>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) {
+    let key = (file_id, entry.ast_id);
+    if !seen_items.insert(key) {
+        reasons.insert("the target-filtered ItemTree contains a duplicate alias AST ID".into());
+    }
+    if entry.name == Symbol::ERROR {
+        reasons.insert("a target-filtered type alias has no valid declaration name".into());
+        return;
+    }
+    let name = match symbols.resolve(entry.name) {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            reasons.insert("a target-filtered type-alias name cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let Some(descriptor) = owners_by_item.get(&key).copied() else {
+        reasons.insert("a target-filtered type alias has no matching Phase 1 owner".to_owned());
+        return;
+    };
+    consumed_owners.insert(key);
+
+    let Some(pointer) = input.ast_ids.pointer(entry.ast_id) else {
+        reasons.insert("a target-filtered type-alias AST ID has no source pointer".to_owned());
+        return;
+    };
+    let Some(syntax) = pointer.resolve(file_id, &input.root) else {
+        reasons.insert(
+            "a target-filtered type-alias source pointer cannot resolve in its AST root".to_owned(),
+        );
+        return;
+    };
+    let Some(declaration) = ast::TypeDecl::cast(syntax.clone()) else {
+        reasons.insert(
+            "a target-filtered type-alias source pointer resolves to a non-type node".to_owned(),
+        );
+        return;
+    };
+    let Some(alias_definition) = declaration.alias_def() else {
+        reasons.insert("a target-filtered type alias has no alias definition".to_owned());
+        return;
+    };
+    if declaration.struct_def().is_some() || alias_definition.refinement().is_some() {
+        reasons.insert("a target-filtered type alias has an unsupported declaration form".into());
+        return;
+    }
+    if alias_definition.ty().is_none() {
+        reasons.insert("a target-filtered type alias has no aliased type".to_owned());
+        return;
+    }
+    let Some(name_node) = declaration.name() else {
+        reasons.insert("a target-filtered type-alias AST has no name node".to_owned());
+        return;
+    };
+    let Some(name_token) = name_node.token() else {
+        reasons.insert("a target-filtered type-alias AST has no name token".to_owned());
+        return;
+    };
+    let raw_name = name_token
+        .text()
+        .strip_prefix("r#")
+        .unwrap_or(name_token.text());
+    if sai_syntax::normalize_identifier(raw_name) != name {
+        reasons
+            .insert("the ItemTree and type-alias AST disagree about the declaration name".into());
+        return;
+    }
+    if syntax_has_errors(&syntax) || name_token.has_error() {
+        reasons.insert(
+            "a target-filtered type-alias AST contains recovery or parse errors".to_owned(),
+        );
+        return;
+    }
+
+    let canonical_path = format!(
+        "{}{}.{name}",
+        package_identity,
+        module_path
+            .iter()
+            .map(|segment| format!("/{segment}"))
+            .collect::<String>()
+    );
+    if !canonical_paths.insert(canonical_path.clone()) {
+        reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+    }
+
+    let def_path = match def_paths.resolve(descriptor.owner.def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        Ok(Some(_)) => {
+            reasons.insert(
+                "a type-alias owner resolves to a definition path from another package".to_owned(),
+            );
+            return;
+        }
+        Ok(None) => {
+            reasons.insert("a type-alias owner has no canonical definition path".to_owned());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("a type-alias owner definition path cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let path_matches_declaration = def_path.data().len() == module_path.len() + 1
+        && def_path
+            .data()
+            .iter()
+            .take(module_path.len())
+            .zip(module_path)
+            .all(|(component, name)| {
+                matches!(&component.data, DefPathData::Module(segment)
+                    if symbols.resolve(*segment).is_ok_and(|resolved| resolved.as_ref() == name))
+            })
+        && matches!(
+            def_path.data().last().map(|component| &component.data),
+            Some(DefPathData::TypeNs(symbol)) if *symbol == entry.name
+        );
+    if !path_matches_declaration {
+        reasons.insert(
+            "the canonical type-alias definition path does not match its module and ItemTree declaration"
+                .to_owned(),
+        );
+        return;
+    }
+    let def_path_hash = match DefPathHash::compute(&def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert("a type-alias definition path hash cannot be computed".to_owned());
+            return;
+        }
+    };
+    let fingerprint = match declaration_fingerprint(SymbolKind::Alias, &syntax, Some(&name_token)) {
+        Ok(fingerprint) => fingerprint,
+        Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+            reasons.insert(
+                "a type-alias declaration name token is outside its syntax node".to_owned(),
+            );
+            return;
+        }
+    };
+    current_symbols.push(CurrentSymbol::new(
+        canonical_path.clone(),
+        def_path_hash,
+        SymbolKind::Alias,
+        fingerprint,
+    ));
+    collect_item_generic_params(
+        entry,
+        declaration.generic_params(),
+        &canonical_path,
+        descriptor.owner.def_id,
+        &def_path,
+        input,
+        package_id,
+        "type alias",
+        canonical_paths,
+        current_symbols,
+        reasons,
+        def_paths,
+        packages,
+        symbols,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -801,14 +1023,15 @@ fn collect_function(
         SymbolKind::Fn,
         fingerprint,
     ));
-    collect_function_generic_params(
+    collect_item_generic_params(
         entry,
-        &function,
+        function.generic_params(),
         &canonical_path,
         descriptor.owner.def_id,
         &def_path,
         input,
         package_id,
+        "function",
         canonical_paths,
         current_symbols,
         reasons,
@@ -819,14 +1042,15 @@ fn collect_function(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_function_generic_params(
+fn collect_item_generic_params(
     entry: &ItemTreeEntry,
-    function: &ast::FnDecl,
+    generic_param_list: Option<ast::GenericParamList>,
     function_path: &str,
     function_owner: LocalDefId,
     function_def_path: &sai_hir::DefPath,
     input: &OwnedPhase1ModuleInput,
     package_id: PackageId,
+    owner_kind: &str,
     canonical_paths: &mut HashSet<String>,
     current_symbols: &mut Vec<CurrentSymbol>,
     reasons: &mut HashSet<String>,
@@ -834,7 +1058,6 @@ fn collect_function_generic_params(
     packages: &PackageInterner,
     symbols: &Interner,
 ) {
-    let generic_param_list = function.generic_params();
     let ast_params = generic_param_list
         .as_ref()
         .map(|params| params.params().collect::<Vec<_>>())
@@ -848,14 +1071,15 @@ fn collect_function_generic_params(
             )
         })
     }) {
-        reasons.insert("a function generic-parameter list has a parser diagnostic".to_owned());
+        reasons.insert(format!(
+            "a {owner_kind} generic-parameter list has a parser diagnostic"
+        ));
         return;
     }
     if entry.children.len() != ast_params.len() {
-        reasons.insert(
-            "a function's ItemTree generic-parameter count does not match its snapshot AST"
-                .to_owned(),
-        );
+        reasons.insert(format!(
+            "a {owner_kind}'s ItemTree generic-parameter count does not match its snapshot AST"
+        ));
         return;
     }
 
@@ -878,17 +1102,15 @@ fn collect_function_generic_params(
             ),
         };
         if child.kind != expected_kind {
-            reasons.insert(
-                "a function's ItemTree generic-parameter kind does not match its snapshot AST"
-                    .to_owned(),
-            );
+            reasons.insert(format!(
+                "a {owner_kind}'s ItemTree generic-parameter kind does not match its snapshot AST"
+            ));
             return;
         }
         if ast_id != Some(child.ast_id) || input.ast_ids.pointer(child.ast_id).is_none() {
-            reasons.insert(
-                "a function's ItemTree generic-parameter ID does not match its snapshot AST"
-                    .to_owned(),
-            );
+            reasons.insert(format!(
+                "a {owner_kind}'s ItemTree generic-parameter ID does not match its snapshot AST"
+            ));
             return;
         }
         if !child.children.is_empty() {
@@ -896,22 +1118,30 @@ fn collect_function_generic_params(
             return;
         }
         if child.name == Symbol::ERROR {
-            reasons.insert("a function generic parameter has no valid ItemTree name".to_owned());
+            reasons.insert(format!(
+                "a {owner_kind} generic parameter has no valid ItemTree name"
+            ));
             return;
         }
         let name = match symbols.resolve(child.name) {
             Ok(name) if !name.is_empty() => name.to_string(),
             _ => {
-                reasons.insert("a function generic parameter name cannot be resolved".to_owned());
+                reasons.insert(format!(
+                    "a {owner_kind} generic parameter name cannot be resolved"
+                ));
                 return;
             }
         };
         let Some(name_node) = name_node else {
-            reasons.insert("a function generic-parameter AST has no name node".to_owned());
+            reasons.insert(format!(
+                "a {owner_kind} generic-parameter AST has no name node"
+            ));
             return;
         };
         let Some(name_token) = name_node.token() else {
-            reasons.insert("a function generic-parameter AST has no name token".to_owned());
+            reasons.insert(format!(
+                "a {owner_kind} generic-parameter AST has no name token"
+            ));
             return;
         };
         let raw_name = name_token
@@ -919,16 +1149,15 @@ fn collect_function_generic_params(
             .strip_prefix("r#")
             .unwrap_or(name_token.text());
         if sai_syntax::normalize_identifier(raw_name) != name {
-            reasons.insert(
-                "the ItemTree and generic-parameter AST disagree about the declaration name"
-                    .to_owned(),
-            );
+            reasons.insert(format!(
+                "the ItemTree and {owner_kind} generic-parameter AST disagree about the declaration name"
+            ));
             return;
         }
         if syntax_has_errors(&syntax) || name_token.has_error() {
-            reasons.insert(
-                "a function generic-parameter AST contains recovery or parse errors".to_owned(),
-            );
+            reasons.insert(format!(
+                "a {owner_kind} generic-parameter AST contains recovery or parse errors"
+            ));
             return;
         }
         validated.push((child.name, name, name_token, syntax, is_const));
@@ -948,7 +1177,9 @@ fn collect_function_generic_params(
         let disambiguator = next_disambiguator.entry(component.clone()).or_default();
         let ordinal = *disambiguator;
         let Some(next) = ordinal.checked_add(1) else {
-            reasons.insert("function generic-parameter disambiguator overflowed".to_owned());
+            reasons.insert(format!(
+                "{owner_kind} generic-parameter disambiguator overflowed"
+            ));
             return;
         };
         *disambiguator = next;
@@ -959,13 +1190,15 @@ fn collect_function_generic_params(
     {
         Ok(def_ids) if def_ids.len() == validated.len() => def_ids,
         Ok(_) => {
-            reasons.insert(
-                "HIR returned the wrong number of function generic-parameter definitions".into(),
-            );
+            reasons.insert(format!(
+                "HIR returned the wrong number of {owner_kind} generic-parameter definitions"
+            ));
             return;
         }
         Err(_) => {
-            reasons.insert("function generic-parameter definitions cannot be interned".to_owned());
+            reasons.insert(format!(
+                "{owner_kind} generic-parameter definitions cannot be interned"
+            ));
             return;
         }
     };
@@ -980,10 +1213,9 @@ fn collect_function_generic_params(
         let def_path = match def_paths.resolve(def_id) {
             Ok(Some(path)) if path.package() == package_id => path,
             _ => {
-                reasons.insert(
-                    "a function generic parameter has no definition path in the selected package"
-                        .to_owned(),
-                );
+                reasons.insert(format!(
+                    "a {owner_kind} generic parameter has no definition path in the selected package"
+                ));
                 return;
             }
         };
@@ -994,33 +1226,33 @@ fn collect_function_generic_params(
                 component.data == expected_component && component.disambiguator == disambiguator
             });
         if !exact_path {
-            reasons.insert(
-                "a function generic-parameter DefPath disagrees with lowering order or kind"
-                    .to_owned(),
-            );
+            reasons.insert(format!(
+                "a {owner_kind} generic-parameter DefPath disagrees with lowering order or kind"
+            ));
             return;
         }
         let def_path_hash = match DefPathHash::compute(&def_path, packages, symbols) {
             Ok(hash) => Fingerprint::new(hash.raw()),
             Err(_) => {
-                reasons.insert(
-                    "a function generic-parameter definition path hash cannot be computed"
-                        .to_owned(),
-                );
+                reasons.insert(format!(
+                    "a {owner_kind} generic-parameter definition path hash cannot be computed"
+                ));
                 return;
             }
         };
-        let fingerprint =
-            match declaration_fingerprint(SymbolKind::GenericParam, syntax, Some(name_token)) {
-                Ok(fingerprint) => fingerprint,
-                Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
-                    reasons.insert(
-                        "a generic-parameter name token is outside its declaration syntax node"
-                            .to_owned(),
-                    );
-                    return;
-                }
-            };
+        let fingerprint = match declaration_fingerprint(
+            SymbolKind::GenericParam,
+            syntax,
+            Some(name_token),
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                reasons.insert(format!(
+                        "a {owner_kind} generic-parameter name token is outside its declaration syntax node"
+                    ));
+                return;
+            }
+        };
         let canonical_path = format!("{function_path}.generic[{name}]");
         if !canonical_paths.insert(canonical_path.clone()) {
             reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));

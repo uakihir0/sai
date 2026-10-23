@@ -25419,6 +25419,290 @@ mod tests {
     }
 
     #[test]
+    fn module_symbol_inventory_collects_plain_aliases_and_mixed_generic_parameters() {
+        let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"type Scalar = I32\ntype Packet<T: Bound, const N: I32, U> = Array<(T, U), N>\n",
+            b"type ChildAlias<V> = V\n",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                ("acme:phase1.Scalar", sai_semantic::SymbolKind::Alias),
+                ("acme:phase1.Packet", sai_semantic::SymbolKind::Alias),
+                (
+                    "acme:phase1.Packet.generic[T]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.Packet.generic[N]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.Packet.generic[U]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1/child.ChildAlias",
+                    sai_semantic::SymbolKind::Alias
+                ),
+                (
+                    "acme:phase1/child.ChildAlias.generic[V]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let packet_owner = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| {
+                owner.file == module_tree.modules[0].file
+                    && owner.kind == TopLevelOwnerKind::Alias
+                    && database
+                        .resolve_def_path(owner.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            matches!(
+                                path.data().last().map(|component| &component.data),
+                                Some(DefPathData::TypeNs(name))
+                                    if database.symbols.resolve(*name).is_ok_and(|name| name.as_ref() == "Packet")
+                            )
+                        })
+            })
+            .expect("the generic alias has a top-level HIR owner");
+        let packet_def_path = database
+            .resolve_def_path(packet_owner.owner.def_id.to_def_id())
+            .expect("alias owner DefId is valid")
+            .expect("alias owner DefPath exists");
+        assert_eq!(packet_def_path.package(), module_tree.package);
+        assert!(matches!(
+            packet_def_path.data().last().map(|component| &component.data),
+            Some(DefPathData::TypeNs(name))
+                if database.symbols.resolve(*name).is_ok_and(|name| name.as_ref() == "Packet")
+        ));
+        let packet_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.path() == "acme:phase1.Packet")
+            .expect("the alias has a canonical symbol");
+        let expected_alias_hash =
+            sai_hir::DefPathHash::compute(&packet_def_path, &database.packages, &database.symbols)
+                .expect("alias DefPath hashes");
+        assert_eq!(
+            packet_symbol.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(expected_alias_hash.raw())
+        );
+
+        let def_paths = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("the selected package has a DefPath interner");
+        let type_t = database
+            .symbols
+            .intern("T")
+            .expect("type parameter interns");
+        let const_n = database
+            .symbols
+            .intern("N")
+            .expect("const parameter interns");
+        let type_u = database
+            .symbols
+            .intern("U")
+            .expect("type parameter interns");
+        let parameter_def_ids = def_paths
+            .intern_generic_params(
+                packet_owner.owner.def_id,
+                &[(type_t, false, 0), (const_n, true, 0), (type_u, false, 0)],
+            )
+            .expect("alias generic parameters use the ordinary HIR owner paths");
+        let parsed =
+            sai_syntax::parse(&snapshot, module_tree.modules[0].file).expect("module parses");
+        let packet = parsed
+            .root
+            .descendants()
+            .filter_map(ast::TypeDecl::cast)
+            .find(|declaration| {
+                declaration
+                    .name()
+                    .and_then(|name| name.token())
+                    .is_some_and(|token| token.text() == "Packet")
+            })
+            .expect("the generic alias AST exists");
+        let parameters = packet
+            .generic_params()
+            .expect("the alias has a generic parameter list")
+            .params()
+            .collect::<Vec<_>>();
+        for (((parameter, expected_name), def_id), expected_component) in parameters
+            .iter()
+            .zip(["T", "N", "U"])
+            .zip(parameter_def_ids)
+            .zip([
+                DefPathData::TypeParam(type_t),
+                DefPathData::ConstParam(const_n),
+                DefPathData::TypeParam(type_u),
+            ])
+        {
+            let (name_token, parameter_syntax) = match parameter {
+                ast::GenericParam::Type(parameter) => (
+                    parameter.name().and_then(|name| name.token()),
+                    parameter.syntax().clone(),
+                ),
+                ast::GenericParam::Const(parameter) => (
+                    parameter.name().and_then(|name| name.token()),
+                    parameter.syntax().clone(),
+                ),
+            };
+            let name_token = name_token.expect("generic parameter has a name token");
+            assert_eq!(name_token.text(), expected_name);
+            let def_path = database
+                .resolve_def_path(def_id.to_def_id())
+                .expect("generic parameter DefId is valid")
+                .expect("generic parameter DefPath exists");
+            assert_eq!(def_path.package(), module_tree.package);
+            assert_eq!(
+                &def_path.data()[..packet_def_path.data().len()],
+                packet_def_path.data()
+            );
+            assert!(matches!(
+                def_path.data().last(),
+                Some(component)
+                    if component.data == expected_component && component.disambiguator == 0
+            ));
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| {
+                    symbol.path() == format!("acme:phase1.Packet.generic[{expected_name}]")
+                })
+                .expect("generic parameter has a canonical path");
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&def_path, &database.packages, &database.symbols)
+                    .expect("generic parameter DefPath hashes");
+            assert_eq!(
+                symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+            assert_eq!(
+                symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint(
+                    sai_semantic::SymbolKind::GenericParam,
+                    &parameter_syntax,
+                    Some(&name_token),
+                )
+                .expect("generic-parameter fingerprint is defined")
+            );
+        }
+    }
+
+    #[test]
+    fn module_alias_fingerprints_ignore_names_and_track_the_target_type() {
+        let fingerprint_for = |source: &[u8]| {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert_eq!(
+                inventory.coverage(),
+                &sai_semantic::InventoryCoverage::Complete
+            );
+            inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind() == sai_semantic::SymbolKind::Alias)
+                .expect("the fixture alias is inventoried")
+                .fingerprint()
+        };
+        let original = fingerprint_for(b"type Original<T: Bound> = (T,)\n");
+        let renamed_alias = fingerprint_for(b"type Renamed<T: Bound> = (T,)\n");
+        let changed_target = fingerprint_for(b"type Original<T: Bound> = T\n");
+
+        assert_eq!(
+            original, renamed_alias,
+            "renaming the alias preserves its declaration fingerprint"
+        );
+        assert_ne!(
+            original, changed_target,
+            "the aliased type contributes to the declaration fingerprint"
+        );
+    }
+
+    #[test]
+    fn module_alias_inventory_filters_targets_and_fails_closed_for_duplicates_or_unsupported_forms()
+    {
+        let source = b"@target(\"wasm64-core\")\ntype Only64<T> = T\n";
+        let (_, _, _, wasm32) = collect_package_inventory_for_target(source, b"", "wasm32-core");
+        assert_eq!(
+            inventory_symbols(&wasm32).coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert!(inventory_symbols(&wasm32).symbols().is_empty());
+
+        let (_, _, _, wasm64) = collect_package_inventory_for_target(source, b"", "wasm64-core");
+        assert_eq!(
+            inventory_symbols(&wasm64).coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory_symbols(&wasm64)
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.path())
+                .collect::<Vec<_>>(),
+            ["acme:phase1.Only64", "acme:phase1.Only64.generic[T]"]
+        );
+
+        for (source, expected_reason) in [
+            (
+                &b"type Duplicate = I32\ntype Duplicate = U32\n"[..],
+                "duplicate canonical symbol path",
+            ),
+            (
+                &b"type Duplicate<T, T> = T\n"[..],
+                "duplicate canonical symbol path",
+            ),
+            (
+                &b"type Refined = I32 where self >= 0\n"[..],
+                "outside the function-generic-parameter-type-alias-generic-parameter-constant-effect inventory",
+            ),
+        ] {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert!(
+                matches!(
+                    inventory.coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { reason }
+                        if reason.contains(expected_reason)
+                ),
+                "expected incomplete reason containing {expected_reason:?}, got {:?}",
+                inventory.coverage()
+            );
+        }
+
+        let (_, _, _, malformed) =
+            collect_package_inventory_for_target(b"type Malformed<T:> = T\n", b"", "wasm32-core");
+        assert!(matches!(
+            inventory_symbols(&malformed).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("syntax tree contains recovery or parse errors")
+        ));
+    }
+
+    #[test]
     fn module_function_inventory_filters_by_target_and_rejects_target_errors() {
         let (_, _, _, wasm32) = collect_package_inventory_for_target(
             b"@target(\"wasm64-core\")\nfn target_only() {}\n@target(\"wasm64-core\")\nconst TARGET_VALUE: Bool = true\n@target(\"wasm64-core\")\neffect target_audit\n",
@@ -25490,7 +25774,7 @@ mod tests {
     fn module_function_inventory_fails_closed_for_other_symbol_forms() {
         for (source, expected_reason) in [(
             &b"type Marker {}\n"[..],
-            "outside the function-generic-parameter-constant-effect inventory",
+            "outside the function-generic-parameter-type-alias-generic-parameter-constant-effect inventory",
         )] {
             let (_, _, _, collection) =
                 collect_package_inventory_for_target(source, b"", "wasm32-core");
