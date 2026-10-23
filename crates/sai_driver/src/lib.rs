@@ -24861,9 +24861,148 @@ mod tests {
     }
 
     #[test]
+    fn module_symbol_inventory_collects_functions_and_constants_with_stable_metadata() {
+        let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"fn root_fn() {}\nconst ROOT_VALUE: I32 = 7\n",
+            b"const CHILD_VALUE: I32 = 13\n",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                ("acme:phase1.root_fn", sai_semantic::SymbolKind::Fn),
+                ("acme:phase1.ROOT_VALUE", sai_semantic::SymbolKind::Const),
+                (
+                    "acme:phase1/child.CHILD_VALUE",
+                    sai_semantic::SymbolKind::Const
+                ),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        for (file_id, name, expected_path, kind, owner_kind) in [
+            (
+                module_tree.modules[0].file,
+                "root_fn",
+                "acme:phase1.root_fn",
+                sai_semantic::SymbolKind::Fn,
+                TopLevelOwnerKind::Function,
+            ),
+            (
+                module_tree.modules[0].file,
+                "ROOT_VALUE",
+                "acme:phase1.ROOT_VALUE",
+                sai_semantic::SymbolKind::Const,
+                TopLevelOwnerKind::Const,
+            ),
+            (
+                module_tree.modules[1].file,
+                "CHILD_VALUE",
+                "acme:phase1/child.CHILD_VALUE",
+                sai_semantic::SymbolKind::Const,
+                TopLevelOwnerKind::Const,
+            ),
+        ] {
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == expected_path)
+                .expect("the declaration has a canonical inventory path");
+            assert_eq!(symbol.kind(), kind);
+
+            let owner_path = collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .filter(|owner| owner.file == file_id && owner.kind == owner_kind)
+                .filter_map(|owner| {
+                    database
+                        .resolve_def_path(owner.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                })
+                .find(|path| {
+                    let Some(component) = path.data().last() else {
+                        return false;
+                    };
+                    let DefPathData::ValueNs(symbol) = component.data else {
+                        return false;
+                    };
+                    database
+                        .symbols
+                        .resolve(symbol)
+                        .is_ok_and(|resolved| resolved.as_ref() == name)
+                })
+                .expect("the matching HIR owner has a canonical definition path");
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&owner_path, &database.packages, &database.symbols)
+                    .expect("the matching HIR path hashes");
+            assert_eq!(
+                symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+
+            let parsed = sai_syntax::parse(&snapshot, file_id).expect("module parses");
+            let (declaration, name_token) = match kind {
+                sai_semantic::SymbolKind::Fn => {
+                    let declaration = parsed
+                        .root
+                        .descendants()
+                        .find_map(ast::FnDecl::cast)
+                        .filter(|function| {
+                            function
+                                .name()
+                                .and_then(|name| name.token())
+                                .is_some_and(|token| token.text() == name)
+                        })
+                        .expect("the module contains the expected function declaration");
+                    let name_token = declaration
+                        .name()
+                        .and_then(|name| name.token())
+                        .expect("the function has its declared name token");
+                    (declaration.syntax().clone(), name_token)
+                }
+                sai_semantic::SymbolKind::Const => {
+                    let declaration = parsed
+                        .root
+                        .descendants()
+                        .find_map(ast::ConstDecl::cast)
+                        .filter(|constant| {
+                            constant
+                                .name()
+                                .and_then(|name| name.token())
+                                .is_some_and(|token| token.text() == name)
+                        })
+                        .expect("the module contains the expected constant declaration");
+                    let name_token = declaration
+                        .name()
+                        .and_then(|name| name.token())
+                        .expect("the constant has its declared name token");
+                    (declaration.syntax().clone(), name_token)
+                }
+                _ => unreachable!("the mixed fixture contains only functions and constants"),
+            };
+            let expected_fingerprint =
+                sai_semantic::declaration_fingerprint(kind, &declaration, Some(&name_token))
+                    .expect("the declaration fingerprint is defined");
+            assert_eq!(symbol.fingerprint(), expected_fingerprint);
+        }
+    }
+
+    #[test]
     fn module_function_inventory_filters_by_target_and_rejects_target_errors() {
         let (_, _, _, wasm32) = collect_package_inventory_for_target(
-            b"@target(\"wasm64-core\")\nfn target_only() {}\n",
+            b"@target(\"wasm64-core\")\nfn target_only() {}\n@target(\"wasm64-core\")\nconst TARGET_VALUE: Bool = true\n",
             b"",
             "wasm32-core",
         );
@@ -24875,7 +25014,7 @@ mod tests {
         assert!(wasm32_inventory.symbols().is_empty());
 
         let (_, _, _, wasm64) = collect_package_inventory_for_target(
-            b"@target(\"wasm64-core\")\nfn target_only() {}\n",
+            b"@target(\"wasm64-core\")\nfn target_only() {}\n@target(\"wasm64-core\")\nconst TARGET_VALUE: Bool = true\n",
             b"",
             "wasm64-core",
         );
@@ -24890,11 +25029,20 @@ mod tests {
                 .iter()
                 .map(|symbol| symbol.path())
                 .collect::<Vec<_>>(),
-            ["acme:phase1.target_only"]
+            ["acme:phase1.target_only", "acme:phase1.TARGET_VALUE"]
+        );
+        assert_eq!(
+            wasm64_inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == "acme:phase1.TARGET_VALUE")
+                .expect("the target-selected constant is inventoried")
+                .kind(),
+            sai_semantic::SymbolKind::Const
         );
 
         let (_, _, _, invalid_target) = collect_package_inventory_for_target(
-            b"@target(\"wasm32-linux\")\nfn uncertain_target() {}\n",
+            b"@target(\"wasm32-linux\")\nconst UNCERTAIN_VALUE: Bool = true\n",
             b"",
             "wasm32-core",
         );
@@ -24912,7 +25060,7 @@ mod tests {
             (&b"fn generic<T>() {}\n"[..], "generic function"),
             (
                 &b"type Marker {}\n"[..],
-                "outside the function-only inventory",
+                "outside the function-and-constant inventory",
             ),
         ] {
             let (_, _, _, collection) =
@@ -24928,6 +25076,57 @@ mod tests {
                 inventory.coverage()
             );
         }
+    }
+
+    #[test]
+    fn module_symbol_inventory_fails_closed_for_malformed_constant_tokens() {
+        let (_, _, _, collection) = collect_package_inventory_for_target(
+            b"const MALFORMED: I32 = 1__2\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("syntax tree contains recovery or parse errors")
+        ));
+    }
+
+    #[test]
+    fn module_constant_fingerprint_ignores_name_and_tracks_type_and_initializer() {
+        let fingerprint_for = |source: &[u8]| {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert_eq!(
+                inventory.coverage(),
+                &sai_semantic::InventoryCoverage::Complete
+            );
+            inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind() == sai_semantic::SymbolKind::Const)
+                .expect("the fixture constant is inventoried")
+                .fingerprint()
+        };
+        let original = fingerprint_for(b"const ORIGINAL: I32 = 1\n");
+        let renamed = fingerprint_for(b"const RENAMED: I32 = 1\n");
+        let changed_type = fingerprint_for(b"const ORIGINAL: U32 = 1\n");
+        let changed_initializer = fingerprint_for(b"const ORIGINAL: I32 = 2\n");
+
+        assert_eq!(
+            original, renamed,
+            "renaming preserves the declaration fingerprint"
+        );
+        assert_ne!(
+            original, changed_type,
+            "the declared type contributes to the fingerprint"
+        );
+        assert_ne!(
+            original, changed_initializer,
+            "the initializer contributes to the fingerprint"
+        );
     }
 
     #[test]
