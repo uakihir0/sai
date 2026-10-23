@@ -16,7 +16,7 @@ use sai_semantic::{
 use sai_stable_hash::Fingerprint;
 use sai_syntax::{
     SyntaxElement, SyntaxNode,
-    ast::{self, AstNode},
+    ast::{self, AstNode, AstToken},
 };
 use sai_vfs::{FileId, PackageKey};
 use std::collections::{HashMap, HashSet};
@@ -44,9 +44,9 @@ impl Phase1PackageSymbolInventory {
 
 /// Collects target-visible module-level functions and their generic
 /// parameters, plain type aliases and their generic parameters, non-generic
-/// refined types, constants, and user effects. Every other symbol-bearing
-/// declaration makes the result incomplete until its symbol kind and path are
-/// collected as well.
+/// refined types, constants, user effects, tests, and properties. Every other
+/// symbol-bearing declaration makes the result incomplete until its symbol
+/// kind and path are collected as well.
 pub(super) fn collect_module_function_inventory(
     package_key: &PackageKey,
     package_version: Option<&MvsPackageVersion>,
@@ -149,6 +149,8 @@ pub(super) fn collect_module_function_inventory(
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut refined_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
+    let mut test_owners_by_item =
+        HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut refinement_predicate_owners_by_item = HashMap::<
         (FileId, sai_hir::item_tree::ErasedAstId),
         Vec<RefinementPredicateOwnerDescriptor>,
@@ -194,6 +196,13 @@ pub(super) fn collect_module_function_inventory(
                         .insert("Phase 1 contains duplicate effect owner descriptors".to_owned());
                 }
             }
+            TopLevelOwnerKind::Test | TopLevelOwnerKind::Property => {
+                if test_owners_by_item.insert(key, *descriptor).is_some() {
+                    reasons.insert(
+                        "Phase 1 contains duplicate test or property owner descriptors".to_owned(),
+                    );
+                }
+            }
             _ => continue,
         }
         if !owner_ids.insert(descriptor.owner.def_id) {
@@ -215,6 +224,7 @@ pub(super) fn collect_module_function_inventory(
     let mut consumed_effect_owners = HashSet::new();
     let mut consumed_alias_owners = HashSet::new();
     let mut consumed_refined_owners = HashSet::new();
+    let mut consumed_test_owners = HashSet::new();
     let mut consumed_refinement_predicate_owners = HashSet::new();
     let mut canonical_paths = HashSet::<String>::new();
     let mut current_symbols = Vec::new();
@@ -236,6 +246,8 @@ pub(super) fn collect_module_function_inventory(
             }
         }
 
+        let mut test_name_disambiguators = HashMap::<(ItemTreeKind, String), u32>::new();
+        let mut test_property_names = HashSet::<String>::new();
         for entry in &input.filtered.item_tree.items {
             match entry.kind {
                 ItemTreeKind::Function => {
@@ -335,6 +347,27 @@ pub(super) fn collect_module_function_inventory(
                         symbols,
                     );
                 }
+                ItemTreeKind::Test | ItemTreeKind::Property => {
+                    collect_test_or_property(
+                        entry,
+                        module.file,
+                        &module_path,
+                        package_version.package(),
+                        input,
+                        prepared.module_tree.package,
+                        &test_owners_by_item,
+                        &mut seen_items,
+                        &mut consumed_test_owners,
+                        &mut canonical_paths,
+                        &mut test_name_disambiguators,
+                        &mut test_property_names,
+                        &mut current_symbols,
+                        &mut reasons,
+                        def_paths,
+                        packages,
+                        symbols,
+                    );
+                }
                 ItemTreeKind::Invariant => {
                     if !entry.children.is_empty() {
                         reasons.insert(
@@ -348,7 +381,7 @@ pub(super) fn collect_module_function_inventory(
                 // functions are children of ExternBlock and are symbols.
                 _ => {
                     reasons.insert(format!(
-                        "target-filtered declaration {:?} is outside the function-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect inventory",
+                        "target-filtered declaration {:?} is outside the function-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect-test-property inventory",
                         entry.kind
                     ));
                 }
@@ -383,6 +416,12 @@ pub(super) fn collect_module_function_inventory(
     if consumed_refined_owners.len() != refined_owners_by_item.len() {
         reasons.insert(
             "the Phase 1 refined-type owner descriptors do not exactly match the filtered ItemTree"
+                .to_owned(),
+        );
+    }
+    if consumed_test_owners.len() != test_owners_by_item.len() {
+        reasons.insert(
+            "the Phase 1 test and property owner descriptors do not exactly match the filtered ItemTree"
                 .to_owned(),
         );
     }
@@ -422,6 +461,14 @@ pub(super) fn collect_module_function_inventory(
             );
         }
     }
+    for ((file_id, item_id), _) in &test_owners_by_item {
+        if !seen_items.contains(&(*file_id, *item_id)) {
+            reasons.insert(
+                "a Phase 1 test or property owner has no target-filtered ItemTree declaration"
+                    .to_owned(),
+            );
+        }
+    }
     for (key, descriptors) in &refinement_predicate_owners_by_item {
         if descriptors
             .iter()
@@ -451,6 +498,298 @@ pub(super) fn collect_module_function_inventory(
             current_symbols,
         ))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_test_or_property(
+    entry: &ItemTreeEntry,
+    file_id: FileId,
+    module_path: &[String],
+    package_identity: &str,
+    input: &OwnedPhase1ModuleInput,
+    package_id: PackageId,
+    owners_by_item: &HashMap<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>,
+    seen_items: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    consumed_owners: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    canonical_paths: &mut HashSet<String>,
+    name_disambiguators: &mut HashMap<(ItemTreeKind, String), u32>,
+    names_in_module: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    reasons: &mut HashSet<String>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) {
+    let key = (file_id, entry.ast_id);
+    if !seen_items.insert(key) {
+        reasons.insert(
+            "the target-filtered ItemTree contains a duplicate test or property AST ID".to_owned(),
+        );
+    }
+    if !entry.children.is_empty() {
+        reasons.insert("a test or property entry has unexpected child declarations".to_owned());
+    }
+
+    let (declaration, name_literal, ast_id, expected_owner_kind, symbol_kind, component_name) =
+        match entry.kind {
+            ItemTreeKind::Test => {
+                let Some(pointer) = input.ast_ids.pointer(entry.ast_id) else {
+                    reasons
+                        .insert("a target-filtered test AST ID has no source pointer".to_owned());
+                    return;
+                };
+                let Some(syntax) = pointer.resolve(file_id, &input.root) else {
+                    reasons.insert(
+                        "a target-filtered test source pointer cannot resolve in its AST root"
+                            .to_owned(),
+                    );
+                    return;
+                };
+                let Some(declaration) = ast::TestDecl::cast(syntax) else {
+                    reasons.insert(
+                        "a target-filtered test source pointer resolves to a non-test node"
+                            .to_owned(),
+                    );
+                    return;
+                };
+                let ast_id = input.ast_ids.ast_id(&declaration).map(|id| id.erase());
+                let Some(name_literal) = declaration.name() else {
+                    reasons.insert("a target-filtered test AST has no name string".to_owned());
+                    return;
+                };
+                (
+                    declaration.syntax().clone(),
+                    name_literal,
+                    ast_id,
+                    TopLevelOwnerKind::Test,
+                    SymbolKind::Test,
+                    "test",
+                )
+            }
+            ItemTreeKind::Property => {
+                let Some(pointer) = input.ast_ids.pointer(entry.ast_id) else {
+                    reasons.insert(
+                        "a target-filtered property AST ID has no source pointer".to_owned(),
+                    );
+                    return;
+                };
+                let Some(syntax) = pointer.resolve(file_id, &input.root) else {
+                    reasons.insert(
+                        "a target-filtered property source pointer cannot resolve in its AST root"
+                            .to_owned(),
+                    );
+                    return;
+                };
+                let Some(declaration) = ast::PropertyDecl::cast(syntax) else {
+                    reasons.insert(
+                        "a target-filtered property source pointer resolves to a non-property node"
+                            .to_owned(),
+                    );
+                    return;
+                };
+                let ast_id = input.ast_ids.ast_id(&declaration).map(|id| id.erase());
+                let Some(name_literal) = declaration.name() else {
+                    reasons.insert("a target-filtered property AST has no name string".to_owned());
+                    return;
+                };
+                (
+                    declaration.syntax().clone(),
+                    name_literal,
+                    ast_id,
+                    TopLevelOwnerKind::Property,
+                    SymbolKind::Property,
+                    "property",
+                )
+            }
+            _ => {
+                reasons.insert(
+                    "a non-test ItemTree declaration reached the test/property collector"
+                        .to_owned(),
+                );
+                return;
+            }
+        };
+
+    if ast_id != Some(entry.ast_id) {
+        reasons.insert(
+            "a test or property ItemTree AST ID does not exactly match its snapshot AST node"
+                .to_owned(),
+        );
+        return;
+    }
+    let Some(descriptor) = owners_by_item.get(&key).copied() else {
+        reasons.insert("a target-filtered test or property has no matching Phase 1 owner".into());
+        return;
+    };
+    consumed_owners.insert(key);
+    if descriptor.kind != expected_owner_kind {
+        reasons.insert(
+            "a test or property has a Phase 1 owner of the wrong declaration kind".to_owned(),
+        );
+        return;
+    }
+
+    let name_token = name_literal.syntax().clone();
+    if syntax_has_errors(&declaration) || name_token.has_error() {
+        reasons.insert(
+            "a target-filtered test or property AST contains recovery or parse errors".to_owned(),
+        );
+        return;
+    }
+    if input
+        .parser_diagnostics
+        .iter()
+        .any(|diagnostic| parser_diagnostic_overlaps_syntax(diagnostic, file_id, &declaration))
+    {
+        reasons.insert(
+            "a test or property declaration has an overlapping parser or target diagnostic"
+                .to_owned(),
+        );
+        return;
+    }
+
+    let name = name_literal.value().into_owned();
+    if entry.name == Symbol::ERROR {
+        reasons.insert("a target-filtered test or property has no valid ItemTree name".to_owned());
+        return;
+    }
+    let item_tree_name = match symbols.resolve(entry.name) {
+        Ok(name) => name.to_string(),
+        _ => {
+            reasons.insert(
+                "a target-filtered test or property ItemTree name cannot be resolved".to_owned(),
+            );
+            return;
+        }
+    };
+    if item_tree_name != name {
+        reasons
+            .insert("the test/property ItemTree name and decoded AST string disagree".to_owned());
+        return;
+    }
+
+    let disambiguator = name_disambiguators
+        .entry((entry.kind, name.clone()))
+        .or_default();
+    let expected_disambiguator = *disambiguator;
+    let Some(next_disambiguator) = disambiguator.checked_add(1) else {
+        reasons.insert("a test or property DefPath disambiguator overflowed".to_owned());
+        return;
+    };
+    *disambiguator = next_disambiguator;
+
+    if !names_in_module.insert(name.clone()) {
+        reasons.insert(
+            "duplicate test or property names remain in one target-filtered module".to_owned(),
+        );
+    }
+    let invalid_name = name.is_empty() || name.chars().any(char::is_control);
+    if invalid_name {
+        reasons.insert(
+            "a target-filtered test or property name is empty or contains a control character"
+                .to_owned(),
+        );
+    }
+
+    let canonical_string = canonical_test_string(&name);
+    let canonical_path = format!(
+        "{}{}.{component_name}[{canonical_string}]",
+        package_identity,
+        module_path
+            .iter()
+            .map(|segment| format!("/{segment}"))
+            .collect::<String>()
+    );
+    if !canonical_paths.insert(canonical_path.clone()) {
+        reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+    }
+
+    let def_path = match def_paths.resolve(descriptor.owner.def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        Ok(Some(_)) => {
+            reasons.insert(
+                "a test or property owner resolves to a definition path from another package"
+                    .to_owned(),
+            );
+            return;
+        }
+        Ok(None) => {
+            reasons.insert("a test or property owner has no canonical definition path".to_owned());
+            return;
+        }
+        Err(_) => {
+            reasons
+                .insert("a test or property owner definition path cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let path_matches_declaration = def_path.data().len() == module_path.len() + 1
+        && def_path
+            .data()
+            .iter()
+            .take(module_path.len())
+            .zip(module_path)
+            .all(|(component, name)| {
+                matches!(&component.data, DefPathData::Module(segment)
+                    if symbols.resolve(*segment).is_ok_and(|resolved| resolved.as_ref() == name))
+            })
+        && def_path.data().last().is_some_and(|component| {
+            component.disambiguator == expected_disambiguator
+                && match (&entry.kind, &component.data) {
+                    (ItemTreeKind::Test, DefPathData::Test(path_name)) => {
+                        path_name.as_ref() == name
+                    }
+                    (ItemTreeKind::Property, DefPathData::Property(path_name)) => {
+                        path_name.as_ref() == name
+                    }
+                    _ => false,
+                }
+        });
+    if !path_matches_declaration {
+        reasons.insert(
+            "the test or property DefPath does not match its module, decoded name, kind, and disambiguator"
+                .to_owned(),
+        );
+        return;
+    }
+    if invalid_name {
+        return;
+    }
+
+    let def_path_hash = match DefPathHash::compute(&def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert("a test or property definition path hash cannot be computed".to_owned());
+            return;
+        }
+    };
+    let fingerprint = match declaration_fingerprint(symbol_kind, &declaration, Some(&name_token)) {
+        Ok(fingerprint) => fingerprint,
+        Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+            reasons.insert("a test or property string token is outside its declaration".to_owned());
+            return;
+        }
+    };
+    current_symbols.push(CurrentSymbol::new(
+        canonical_path,
+        def_path_hash,
+        symbol_kind,
+        fingerprint,
+    ));
+}
+
+fn canonical_test_string(name: &str) -> String {
+    let mut canonical = String::with_capacity(name.len() + 2);
+    canonical.push('"');
+    for character in name.chars() {
+        match character {
+            '\\' => canonical.push_str("\\\\"),
+            '"' => canonical.push_str("\\\""),
+            character => canonical.push(character),
+        }
+    }
+    canonical.push('"');
+    canonical
 }
 
 #[allow(clippy::too_many_arguments)]
