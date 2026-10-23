@@ -1,19 +1,31 @@
 //! Safe wrappers for filesystem handles, range locking, and atomic replacement.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 #[cfg(not(windows))]
 use std::fs;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 #[cfg(not(windows))]
 use std::path::PathBuf;
 use std::path::{Component, Path};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FileIdentity {
     volume: u64,
     file: [u8; 16],
 }
+
+/// Outcome of a conditional update to one direct child file.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConditionalFileUpdate {
+    /// The requested file state was published.
+    Updated,
+    /// The child already had the requested file state.
+    AlreadyDesired,
+}
+
+static NEXT_CONDITIONAL_UPDATE_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 /// A verified directory handle opened for a handle-relative rename.
 ///
@@ -1461,7 +1473,16 @@ pub fn replace_file_in_directory_if_unchanged(
     expected_identity: FileIdentity,
     expected_contents: &[u8],
 ) -> io::Result<()> {
-    let mut current = open_file_without_following(parent, Path::new("."), destination_name)?;
+    let mut current = match open_file_without_following(parent, Path::new("."), destination_name) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "destination disappeared before guarded replacement",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     if file_identity(&current)? != expected_identity {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -1507,7 +1528,16 @@ pub fn remove_file_in_directory_if_unchanged(
     expected_identity: FileIdentity,
     expected_contents: &[u8],
 ) -> io::Result<()> {
-    let mut current = open_file_without_following(parent, Path::new("."), name)?;
+    let mut current = match open_file_without_following(parent, Path::new("."), name) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "file disappeared before guarded removal",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
     if file_identity(&current)? != expected_identity {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -1536,7 +1566,13 @@ pub fn remove_file_in_directory_if_unchanged(
     // The identity and contents check is complete; cooperating writers remain
     // serialized by the caller's workspace lock until removal below.
     drop(current);
-    remove_file_in_directory(parent, name)
+    match remove_file_in_directory(parent, name) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "file disappeared before guarded removal",
+        )),
+        result => result,
+    }
 }
 
 /// Remove one child file only when it still has the selected identity.
@@ -1557,6 +1593,209 @@ pub fn remove_file_in_directory_if_identity(
     }
     drop(current);
     remove_file_in_directory(parent, name)
+}
+
+/// Update one direct child file only when its current state matches `expected`.
+///
+/// `None` represents an absent child; `Some(&[])` represents an existing empty
+/// regular file. The requested state is idempotent: if the child already
+/// matches `desired`, this returns [`ConditionalFileUpdate::AlreadyDesired`]
+/// without changing it, even when it no longer matches `expected`.
+///
+/// Replacement files are staged in the same directory, synced, and then
+/// published with the handle-relative identity-and-content-guarded helpers.
+/// The directory is synced before staging so platforms that cannot provide
+/// durable directory updates fail before creating a temporary file. It is
+/// synced again after staging and after publication.
+///
+/// If the final directory sync fails, the namespace operation may already
+/// have happened. Callers must read the destination back before deciding
+/// whether to retry. Filesystems do not provide a portable atomic
+/// compare-and-replace or compare-and-unlink operation, so callers must
+/// serialize cooperating writers with their workspace lock.
+pub fn update_file_in_directory_if_matches(
+    parent: &File,
+    destination_name: &OsStr,
+    expected: Option<&[u8]>,
+    desired: Option<&[u8]>,
+) -> io::Result<ConditionalFileUpdate> {
+    validate_child_name(destination_name)?;
+
+    let maximum_state_length = expected
+        .map(<[u8]>::len)
+        .unwrap_or(0)
+        .max(desired.map(<[u8]>::len).unwrap_or(0));
+    let observed = read_child_file_state(parent, destination_name, maximum_state_length)?;
+    if observed.as_ref().map(|(_, bytes)| bytes.as_slice()) == desired {
+        return Ok(ConditionalFileUpdate::AlreadyDesired);
+    }
+    if observed.as_ref().map(|(_, bytes)| bytes.as_slice()) != expected {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "child file state did not match the expected state",
+        ));
+    }
+
+    match (observed, desired) {
+        (Some((identity, contents)), None) => {
+            // Fail closed before the first namespace mutation on platforms
+            // that cannot durably flush directory metadata (notably Windows).
+            sync_directory(parent)?;
+            remove_file_in_directory_if_unchanged(parent, destination_name, identity, &contents)?;
+            sync_directory_after_publication(parent)?;
+        }
+        (None, Some(contents)) => {
+            // Do not create a staging entry until directory durability has
+            // been confirmed.
+            sync_directory(parent)?;
+            let (temporary_name, temporary_identity) =
+                create_and_sync_conditional_update_temporary(parent, contents)?;
+            let result =
+                move_file_in_directory_without_replacing(parent, &temporary_name, destination_name)
+                    .map_err(map_no_replace_publication_error);
+            if let Err(error) = result {
+                cleanup_conditional_update_temporary(parent, &temporary_name, temporary_identity);
+                return Err(error);
+            }
+            sync_directory_after_publication(parent)?;
+        }
+        (Some((identity, expected_contents)), Some(contents)) => {
+            // Do not create a staging entry until directory durability has
+            // been confirmed.
+            sync_directory(parent)?;
+            let (temporary_name, temporary_identity) =
+                create_and_sync_conditional_update_temporary(parent, contents)?;
+            let result = replace_file_in_directory_if_unchanged(
+                parent,
+                &temporary_name,
+                destination_name,
+                identity,
+                &expected_contents,
+            );
+            if let Err(error) = result {
+                cleanup_conditional_update_temporary(parent, &temporary_name, temporary_identity);
+                return Err(error);
+            }
+            sync_directory_after_publication(parent)?;
+        }
+        (None, None) => {
+            // The no-op case was handled by the desired-state check above.
+            unreachable!("an absent child already matches an absent desired state");
+        }
+    }
+
+    Ok(ConditionalFileUpdate::Updated)
+}
+
+fn read_child_file_state(
+    parent: &File,
+    name: &OsStr,
+    maximum_contents_length: usize,
+) -> io::Result<Option<(FileIdentity, Vec<u8>)>> {
+    let mut file = match open_file_without_following(parent, Path::new("."), name) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let identity = file_identity(&file)?;
+    let contents = read_contents_up_to_limit(&mut file, maximum_contents_length)?;
+    Ok(Some((identity, contents)))
+}
+
+fn read_contents_up_to_limit(
+    reader: &mut impl Read,
+    maximum_contents_length: usize,
+) -> io::Result<Vec<u8>> {
+    let read_limit = maximum_contents_length
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file size limit overflow"))?;
+    let read_limit_u64 = u64::try_from(read_limit)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "file size limit overflow"))?;
+    let mut contents = Vec::new();
+    contents
+        .try_reserve_exact(read_limit)
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    reader.take(read_limit_u64).read_to_end(&mut contents)?;
+    Ok(contents)
+}
+
+fn map_no_replace_publication_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::AlreadyExists {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "destination appeared before no-replace publication",
+        )
+    } else {
+        error
+    }
+}
+
+fn create_and_sync_conditional_update_temporary(
+    parent: &File,
+    contents: &[u8],
+) -> io::Result<(OsString, FileIdentity)> {
+    const MAX_NAME_ATTEMPTS: usize = 64;
+
+    let mut temporary_name = None;
+    let mut temporary_file = None;
+    for _ in 0..MAX_NAME_ATTEMPTS {
+        let counter = NEXT_CONDITIONAL_UPDATE_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+        let name = OsString::from(format!(
+            ".conditional-update-{}-{counter}.tmp",
+            std::process::id()
+        ));
+        match create_new_file_in_directory_without_following(parent, &name) {
+            Ok(file) => {
+                temporary_name = Some(name);
+                temporary_file = Some(file);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let temporary_name = temporary_name.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique conditional-update temporary file",
+        )
+    })?;
+    let mut temporary_file = temporary_file.expect("temporary name and file are set together");
+    let temporary_identity = file_identity(&temporary_file)?;
+
+    let preparation = (|| {
+        temporary_file.write_all(contents)?;
+        temporary_file.sync_all()?;
+        drop(temporary_file);
+        sync_directory(parent)
+    })();
+    if let Err(error) = preparation {
+        cleanup_conditional_update_temporary(parent, &temporary_name, temporary_identity);
+        return Err(error);
+    }
+
+    Ok((temporary_name, temporary_identity))
+}
+
+fn cleanup_conditional_update_temporary(
+    parent: &File,
+    temporary_name: &OsStr,
+    temporary_identity: FileIdentity,
+) {
+    // Cleanup is deliberately limited to the temporary entry created by this
+    // call. Never scan for or remove older temporary names.
+    let _ = remove_file_in_directory_if_identity(parent, temporary_name, temporary_identity);
+}
+
+fn sync_directory_after_publication(parent: &File) -> io::Result<()> {
+    sync_directory(parent).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "directory sync failed after publication; the update may already have happened, so read the destination back before retrying: {error}"
+            ),
+        )
+    })
 }
 
 /// Remove one child file using an already-open directory handle.
@@ -2315,10 +2554,13 @@ mod unix_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        create_child_directory_without_following, create_new_file_in_directory_without_following,
+        ConditionalFileUpdate, create_child_directory_without_following,
+        create_new_file_in_directory_without_following, map_no_replace_publication_error,
         move_file_in_directory_without_replacing, open_child_directory_without_following,
-        open_directory_without_following, open_file_without_following, remove_file_in_directory,
-        remove_file_in_directory_if_unchanged, replace_file_between_directories, sync_directory,
+        open_directory_without_following, open_file_without_following, read_child_file_state,
+        read_contents_up_to_limit, remove_file_in_directory, remove_file_in_directory_if_unchanged,
+        replace_file_between_directories, replace_file_in_directory_if_unchanged, sync_directory,
+        update_file_in_directory_if_matches,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -2360,6 +2602,224 @@ mod unix_tests {
             .is_err()
         );
         assert!(open_directory_without_following(&link).is_err());
+    }
+
+    #[test]
+    fn conditional_update_publishes_an_absent_child() {
+        let directory = TestDirectory::new();
+        let parent = open_directory_without_following(&directory.0).unwrap();
+
+        assert_eq!(
+            update_file_in_directory_if_matches(
+                &parent,
+                std::ffi::OsStr::new("record"),
+                None,
+                Some(b"new contents"),
+            )
+            .unwrap(),
+            ConditionalFileUpdate::Updated
+        );
+        assert_eq!(
+            fs::read(directory.0.join("record")).unwrap(),
+            b"new contents"
+        );
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn conditional_update_replaces_expected_contents() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("record");
+        fs::write(&destination, b"old contents").unwrap();
+        let parent = open_directory_without_following(&directory.0).unwrap();
+
+        assert_eq!(
+            update_file_in_directory_if_matches(
+                &parent,
+                std::ffi::OsStr::new("record"),
+                Some(b"old contents"),
+                Some(b"new contents"),
+            )
+            .unwrap(),
+            ConditionalFileUpdate::Updated
+        );
+        assert_eq!(fs::read(destination).unwrap(), b"new contents");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn conditional_update_removes_expected_contents() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("record");
+        fs::write(&destination, b"old contents").unwrap();
+        let parent = open_directory_without_following(&directory.0).unwrap();
+
+        assert_eq!(
+            update_file_in_directory_if_matches(
+                &parent,
+                std::ffi::OsStr::new("record"),
+                Some(b"old contents"),
+                None,
+            )
+            .unwrap(),
+            ConditionalFileUpdate::Updated
+        );
+        assert!(!destination.exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn conditional_update_treats_absence_as_an_idempotent_desired_state() {
+        let directory = TestDirectory::new();
+        let parent = open_directory_without_following(&directory.0).unwrap();
+
+        assert_eq!(
+            update_file_in_directory_if_matches(
+                &parent,
+                std::ffi::OsStr::new("record"),
+                None,
+                None,
+            )
+            .unwrap(),
+            ConditionalFileUpdate::AlreadyDesired
+        );
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn conditional_update_distinguishes_empty_files_from_absence() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("record");
+        let parent = open_directory_without_following(&directory.0).unwrap();
+
+        assert_eq!(
+            update_file_in_directory_if_matches(
+                &parent,
+                std::ffi::OsStr::new("record"),
+                None,
+                Some(b""),
+            )
+            .unwrap(),
+            ConditionalFileUpdate::Updated
+        );
+        assert!(destination.is_file());
+        assert_eq!(fs::read(&destination).unwrap(), b"");
+
+        assert_eq!(
+            update_file_in_directory_if_matches(
+                &parent,
+                std::ffi::OsStr::new("record"),
+                Some(b""),
+                None,
+            )
+            .unwrap(),
+            ConditionalFileUpdate::Updated
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn conditional_update_returns_already_desired_without_rewriting() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("record");
+        fs::write(&destination, b"new contents").unwrap();
+        let parent = open_directory_without_following(&directory.0).unwrap();
+
+        assert_eq!(
+            update_file_in_directory_if_matches(
+                &parent,
+                std::ffi::OsStr::new("record"),
+                Some(b"old contents"),
+                Some(b"new contents"),
+            )
+            .unwrap(),
+            ConditionalFileUpdate::AlreadyDesired
+        );
+        assert_eq!(fs::read(destination).unwrap(), b"new contents");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn conditional_update_mismatch_preserves_the_third_state() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("record");
+        fs::write(&destination, b"third state").unwrap();
+        let parent = open_directory_without_following(&directory.0).unwrap();
+
+        let error = update_file_in_directory_if_matches(
+            &parent,
+            std::ffi::OsStr::new("record"),
+            Some(b"expected"),
+            Some(b"desired"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(destination).unwrap(), b"third state");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn conditional_update_bounds_existing_target_reads_to_state_length_plus_one() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("record");
+        fs::write(&destination, vec![b'x'; 1024 * 1024]).unwrap();
+        let parent = open_directory_without_following(&directory.0).unwrap();
+
+        let (_, observed) = read_child_file_state(&parent, std::ffi::OsStr::new("record"), 1)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(observed, b"xx");
+        let mut repeated = std::io::repeat(b'x');
+        assert_eq!(
+            read_contents_up_to_limit(&mut repeated, 3).unwrap(),
+            b"xxxx"
+        );
+    }
+
+    #[test]
+    fn no_replace_publication_collision_maps_to_a_state_conflict() {
+        let error = map_no_replace_publication_error(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "destination exists",
+        ));
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn conditional_update_rejects_symlinks_and_nonregular_children() {
+        let directory = TestDirectory::new();
+        let target = directory.0.join("target");
+        let link = directory.0.join("link");
+        let subdirectory = directory.0.join("subdirectory");
+        fs::write(&target, b"protected").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        fs::create_dir(&subdirectory).unwrap();
+        let parent = open_directory_without_following(&directory.0).unwrap();
+
+        assert!(
+            update_file_in_directory_if_matches(
+                &parent,
+                std::ffi::OsStr::new("link"),
+                Some(b"protected"),
+                Some(b"changed"),
+            )
+            .is_err()
+        );
+        assert!(
+            update_file_in_directory_if_matches(
+                &parent,
+                std::ffi::OsStr::new("subdirectory"),
+                Some(b""),
+                Some(b"changed"),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(target).unwrap(), b"protected");
+        assert!(link.is_symlink());
+        assert!(subdirectory.is_dir());
     }
 
     #[test]
@@ -2518,6 +2978,85 @@ mod unix_tests {
         remove_file_in_directory_if_unchanged(&handle, name, current_identity, b"changed").unwrap();
         assert!(!directory.0.join(name).exists());
     }
+
+    #[test]
+    fn guarded_replace_reports_a_missing_destination_as_a_conflict() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("record");
+        let staged = directory.0.join("staged");
+        fs::write(&destination, b"expected").unwrap();
+        fs::write(&staged, b"replacement").unwrap();
+        let parent = open_directory_without_following(&directory.0).unwrap();
+        let selected =
+            open_file_without_following(&parent, &directory.0, std::ffi::OsStr::new("record"))
+                .unwrap();
+        let identity = super::file_identity(&selected).unwrap();
+        drop(selected);
+        fs::remove_file(&destination).unwrap();
+
+        let error = replace_file_in_directory_if_unchanged(
+            &parent,
+            std::ffi::OsStr::new("staged"),
+            std::ffi::OsStr::new("record"),
+            identity,
+            b"expected",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(!destination.exists());
+        assert_eq!(fs::read(staged).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn guarded_remove_reports_a_missing_destination_as_a_conflict() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("record");
+        fs::write(&destination, b"expected").unwrap();
+        let parent = open_directory_without_following(&directory.0).unwrap();
+        let selected =
+            open_file_without_following(&parent, &directory.0, std::ffi::OsStr::new("record"))
+                .unwrap();
+        let identity = super::file_identity(&selected).unwrap();
+        drop(selected);
+        fs::remove_file(&destination).unwrap();
+
+        let error = remove_file_in_directory_if_unchanged(
+            &parent,
+            std::ffi::OsStr::new("record"),
+            identity,
+            b"expected",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn guarded_replace_preserves_not_found_for_a_missing_staged_source() {
+        let directory = TestDirectory::new();
+        let destination = directory.0.join("record");
+        fs::write(&destination, b"expected").unwrap();
+        let parent = open_directory_without_following(&directory.0).unwrap();
+        let selected =
+            open_file_without_following(&parent, &directory.0, std::ffi::OsStr::new("record"))
+                .unwrap();
+        let identity = super::file_identity(&selected).unwrap();
+        drop(selected);
+
+        let error = replace_file_in_directory_if_unchanged(
+            &parent,
+            std::ffi::OsStr::new("missing-stage"),
+            std::ffi::OsStr::new("record"),
+            identity,
+            b"expected",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(fs::read(destination).unwrap(), b"expected");
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -2528,15 +3067,16 @@ mod windows_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        create_child_directory_without_following, create_new_file_in_directory_without_following,
-        file_identity, move_directory_handle_to_child_without_replacing,
-        move_file_in_directory_without_replacing,
+        ConditionalFileUpdate, create_child_directory_without_following,
+        create_new_file_in_directory_without_following, file_identity,
+        move_directory_handle_to_child_without_replacing, move_file_in_directory_without_replacing,
         open_child_directory_for_rename_without_following, open_child_directory_without_following,
         open_directory_path_for_child_updates_without_following,
         open_directory_path_for_file_updates_without_following,
         open_directory_path_without_following, open_file_for_attribute_updates_without_following,
         remove_file_in_directory, replace_file_between_directories, replace_file_in_directory,
         replace_file_in_directory_if_unchanged, sync_directory,
+        update_file_in_directory_if_matches,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -2840,6 +3380,62 @@ mod windows_tests {
             fs::read(directory.0.join("index/operation.json")).unwrap(),
             b"prepared journal"
         );
+    }
+
+    #[test]
+    fn conditional_update_fails_closed_before_creating_a_temporary_file() {
+        let directory = TestDirectory::new();
+        let parent = open_directory_path_for_file_updates_without_following(&directory.0).unwrap();
+
+        let error = update_file_in_directory_if_matches(
+            &parent,
+            std::ffi::OsStr::new("record"),
+            None,
+            Some(b"new contents"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+        assert!(!directory.0.join("record").exists());
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn conditional_update_allows_an_absent_to_absent_no_op_without_directory_sync() {
+        let directory = TestDirectory::new();
+        let parent = open_directory_path_for_file_updates_without_following(&directory.0).unwrap();
+
+        assert_eq!(
+            update_file_in_directory_if_matches(
+                &parent,
+                std::ffi::OsStr::new("record"),
+                None,
+                None,
+            )
+            .unwrap(),
+            ConditionalFileUpdate::AlreadyDesired
+        );
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn conditional_update_allows_an_existing_desired_state_without_directory_sync() {
+        let directory = TestDirectory::new();
+        fs::write(directory.0.join("record"), b"desired").unwrap();
+        let parent = open_directory_path_for_file_updates_without_following(&directory.0).unwrap();
+
+        assert_eq!(
+            update_file_in_directory_if_matches(
+                &parent,
+                std::ffi::OsStr::new("record"),
+                Some(b"old"),
+                Some(b"desired"),
+            )
+            .unwrap(),
+            ConditionalFileUpdate::AlreadyDesired
+        );
+        assert_eq!(fs::read(directory.0.join("record")).unwrap(), b"desired");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
     }
 }
 
