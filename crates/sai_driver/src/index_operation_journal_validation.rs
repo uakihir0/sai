@@ -105,6 +105,7 @@ impl IndexJournalRecoveryContext {
 pub enum IndexJournalRecoveryContextError {
     LockNotExclusive,
     LockedWorkspaceRootUnavailable,
+    LockedWorkspaceRootIdentityUnsupported,
     LockedWorkspaceRootChanged,
     RootPackageDirectory(sai_package::local_source::LocalPackageError),
     LockFile(io::Error),
@@ -130,6 +131,7 @@ impl Error for IndexJournalRecoveryContextError {
             Self::InventoryBuild(source) => Some(source),
             Self::LockNotExclusive
             | Self::LockedWorkspaceRootUnavailable
+            | Self::LockedWorkspaceRootIdentityUnsupported
             | Self::LockedWorkspaceRootChanged
             | Self::InvalidLockSyntax
             | Self::LockSnapshotChanged => None,
@@ -182,9 +184,13 @@ fn verify_locked_root(
     let Some(locked_root_handle) = lock.package_directory_handle() else {
         return Err(IndexJournalRecoveryContextError::LockedWorkspaceRootUnavailable);
     };
-    if root_directory.path() != lock.package_directory()
-        || !root_directory.is_same_open_directory(locked_root_handle)
-    {
+    if root_directory.path() != lock.package_directory() {
+        return Err(IndexJournalRecoveryContextError::LockedWorkspaceRootChanged);
+    }
+    if !root_directory.supports_open_directory_identity() {
+        return Err(IndexJournalRecoveryContextError::LockedWorkspaceRootIdentityUnsupported);
+    }
+    if !root_directory.is_same_open_directory(locked_root_handle) {
         return Err(IndexJournalRecoveryContextError::LockedWorkspaceRootChanged);
     }
     Ok(())
@@ -1782,7 +1788,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn recovery_context_fails_closed_when_package_root_capabilities_are_unsupported() {
+    fn recovery_context_fails_closed_when_package_root_identity_is_unsupported() {
         let workspace = TestWorkspace::new();
         let lock = WorkspaceLockGuard::acquire(&workspace.0, WorkspaceLockMode::Exclusive).unwrap();
         let root_manifest = "package acme:app @ 1.0.0\n\
@@ -1805,10 +1811,10 @@ mod tests {
 
         let error =
             capture_index_journal_recovery_context(&lock, PackageValidationContext::default())
-                .expect_err("package-root capability cannot be pinned on Windows");
+                .expect_err("package-root identity cannot be compared on Windows");
         assert!(matches!(
             error,
-            super::IndexJournalRecoveryContextError::RootPackageDirectory(_)
+            super::IndexJournalRecoveryContextError::LockedWorkspaceRootIdentityUnsupported
         ));
     }
 
