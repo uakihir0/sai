@@ -1,0 +1,49 @@
+use acme:museum-loan-readiness-review/data
+use acme:museum-loan-readiness-review/model.{LoanOutcome, LoanReport, ReviewReason}
+use acme:museum-loan-readiness-review/review
+
+pub fn sample_report() -> LoanReport {
+    review.review(data.batch())
+}
+
+test "the intake order is priority then request ID" {
+    let result = sample_report()
+    assert result.decision_count == 10
+    assert result.decisions[0].unwrap().request_id == 4107
+    assert result.decisions[1].unwrap().request_id == 4102
+    assert result.decisions[2].unwrap().request_id == 4103
+    assert result.decisions[3].unwrap().request_id == 4106
+    assert result.decisions[4].unwrap().request_id == 4101
+}
+
+test "duplicate accession records are both quarantined" {
+    let result = sample_report()
+    assert result.decisions[0].unwrap().outcome == LoanOutcome.Rejected
+    assert result.decisions[0].unwrap().reason == Some(ReviewReason.DuplicateAccession)
+    assert result.decisions[4].unwrap().outcome == LoanOutcome.Rejected
+    assert result.decisions[4].unwrap().reason == Some(ReviewReason.DuplicateAccession)
+    assert result.rejected_count == 2
+}
+
+test "holds and transport or environmental deferrals do not use display capacity" {
+    let result = sample_report()
+    assert result.decisions[1].unwrap().reason == Some(ReviewReason.InsuranceShortfall)
+    assert result.decisions[2].unwrap().reason == Some(ReviewReason.LoanFileIncomplete)
+    assert result.decisions[5].unwrap().reason == Some(ReviewReason.CrateUnavailable)
+    assert result.decisions[8].unwrap().reason == Some(ReviewReason.EnvironmentOutOfRange)
+    assert result.decisions[9].unwrap().reason == Some(ReviewReason.UnstableCondition)
+    assert result.held_count == 3
+    assert result.deferred_count == 3
+}
+
+test "only ready loans consume the two display slots and one climate case" {
+    let result = sample_report()
+    assert result.decisions[3].unwrap().outcome == LoanOutcome.Accepted
+    assert result.decisions[3].unwrap().display_slot_used
+    assert result.decisions[3].unwrap().climate_case_used
+    assert result.decisions[6].unwrap().outcome == LoanOutcome.Accepted
+    assert result.decisions[6].unwrap().display_slot_used
+    assert not result.decisions[6].unwrap().climate_case_used
+    assert result.decisions[7].unwrap().reason == Some(ReviewReason.GalleryFull)
+    assert result.accepted_count == 2
+}
