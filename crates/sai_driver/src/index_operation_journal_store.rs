@@ -73,6 +73,7 @@ pub enum IndexOperationJournalStoreError {
     IndexStateNotRecorded,
     IndexFileChanged,
     IndexHeaderNotBefore,
+    PackageFileDeletionRequiresAfterHeader,
 }
 
 impl fmt::Display for IndexOperationJournalStoreError {
@@ -125,6 +126,9 @@ impl fmt::Display for IndexOperationJournalStoreError {
             Self::IndexHeaderNotBefore => {
                 formatter.write_str("the index header is not at its recorded before state")
             }
+            Self::PackageFileDeletionRequiresAfterHeader => formatter.write_str(
+                "a package-index file omitted from the planned header cannot be removed before that header is committed",
+            ),
         }
     }
 }
@@ -145,7 +149,8 @@ impl Error for IndexOperationJournalStoreError {
             | Self::IndexFileNotRecorded
             | Self::IndexStateNotRecorded
             | Self::IndexFileChanged
-            | Self::IndexHeaderNotBefore => None,
+            | Self::IndexHeaderNotBefore
+            | Self::PackageFileDeletionRequiresAfterHeader => None,
         }
     }
 }
@@ -263,6 +268,47 @@ impl<'lock> IndexOperationJournalStore<'lock> {
         };
         if expected != after || desired != before {
             return Err(IndexOperationJournalStoreError::IndexStateNotRecorded);
+        }
+
+        self.update_index_file_if_matches_with_header_condition(
+            journal,
+            IndexOperationJournalIndexTarget::Package(file.clone()),
+            expected,
+            desired,
+            Some(&journal.index_before.header),
+        )
+    }
+
+    /// Publishes one journaled package-index file while the recorded before
+    /// header remains current.
+    ///
+    /// This is the forward package-file primitive for a planned index commit.
+    /// Callers publish files included by the planned header before publishing
+    /// that header. The exact recorded before-to-after state pair is required.
+    /// A file omitted by the planned header cannot be removed until after the
+    /// header is durable, so that request returns
+    /// `PackageFileDeletionRequiresAfterHeader`. A changed header returns
+    /// `IndexHeaderNotBefore` without touching the package file. The current
+    /// journal and header are checked through the same opened index-directory
+    /// handle before the conditional update. A post-publication
+    /// directory-flush failure remains uncertain and requires readback with
+    /// the journal retained.
+    pub fn publish_package_index_file_if_before_header(
+        &self,
+        journal: &IndexOperationJournal,
+        file: &PackageIndexFileName,
+        expected: &FileState,
+        desired: &FileState,
+    ) -> Result<ConditionalFileUpdate, IndexOperationJournalStoreError> {
+        self.require_exclusive()?;
+        let Some((before, after)) = affected_file_state(journal, file) else {
+            return Err(IndexOperationJournalStoreError::IndexFileNotRecorded);
+        };
+        if expected != before || desired != after {
+            return Err(IndexOperationJournalStoreError::IndexStateNotRecorded);
+        }
+        if desired == &FileState::Absent {
+            return Err(IndexOperationJournalStoreError::PackageFileDeletionRequiresAfterHeader);
         }
 
         self.update_index_file_if_matches_with_header_condition(
@@ -2148,6 +2194,74 @@ mod tests {
                 .unwrap(),
             sai_windows_fs::ConditionalFileUpdate::AlreadyDesired,
             "a retry that already observes the requested state is idempotent"
+        );
+    }
+
+    #[cfg(all(
+        unix,
+        any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        )
+    ))]
+    #[test]
+    fn defers_removing_a_package_file_until_after_header_publication() {
+        let directory = TestDirectory::new();
+        let lock = WorkspaceLockGuard::acquire(&directory.0, WorkspaceLockMode::Exclusive).unwrap();
+        let store = IndexOperationJournalStore::new(&lock);
+        let mut journal = journal();
+        let indexed_file = journal.index_before.package_files[0].file.clone();
+        let orphan_file = PackageIndexFileName::parse("zeta.tools.1.jsonl")
+            .expect("valid package-index filename");
+        let orphan_bytes = Vec::new();
+        journal.index_before.header = FileState::RegularFile(header_with_two_files(
+            &indexed_file,
+            match &journal.index_before.package_files[0].state {
+                FileState::RegularFile(bytes) => bytes,
+                FileState::Absent => panic!("fixture indexed file is present"),
+            },
+            &orphan_file,
+            &orphan_bytes,
+        ));
+        journal.index_before.package_files.push(PackageFileState {
+            file: orphan_file.clone(),
+            state: FileState::RegularFile(orphan_bytes.clone()),
+        });
+        journal.index_after.package_files.push(PackageFileState {
+            file: orphan_file.clone(),
+            state: FileState::Absent,
+        });
+        journal.encode().expect("fixture is a valid journal");
+
+        let index_directory = lock.package_directory().join(".sai/index");
+        write_snapshot(&index_directory, &journal.index_before);
+        write_current_journal(&index_directory, &journal);
+        let header_before = fs::read(index_directory.join("index.json")).unwrap();
+        let journal_before = fs::read(index_directory.join("operation.json")).unwrap();
+
+        assert!(matches!(
+            store.publish_package_index_file_if_before_header(
+                &journal,
+                &orphan_file,
+                &FileState::RegularFile(orphan_bytes.clone()),
+                &FileState::Absent,
+            ),
+            Err(IndexOperationJournalStoreError::PackageFileDeletionRequiresAfterHeader)
+        ));
+        assert_eq!(
+            fs::read(index_directory.join(orphan_file.as_str())).unwrap(),
+            orphan_bytes
+        );
+        assert_eq!(
+            fs::read(index_directory.join("index.json")).unwrap(),
+            header_before
+        );
+        assert_eq!(
+            fs::read(index_directory.join("operation.json")).unwrap(),
+            journal_before
         );
     }
 
