@@ -1,18 +1,36 @@
 //! Package-context checks for decoded index-operation journals.
 //!
-//! This module performs no filesystem access. A caller must build its
-//! contexts from a fresh, complete workspace-package inventory while holding
-//! the exclusive workspace lock. The contexts must use roots derived from
-//! that inventory and source directories parsed from the packages' captured
-//! manifests. Recovery must still revalidate roots and traverse every path
-//! component relative to open directory handles immediately before I/O.
+//! The validator operates on contexts assembled from captured package
+//! directories. The inventory builder reads the complete lock graph before
+//! target activation and retains directory capabilities for its workspace
+//! packages. Callers must hold the exclusive workspace lock while building
+//! the inventory. Recovery must still revalidate roots and traverse every
+//! path component relative to open directory handles immediately before I/O.
 
 #[cfg(test)]
 use crate::package_graph::PackageGraphNode;
 use crate::package_graph::{PackageForm, PackageGraphRole};
-use sai_package::local_source::LocalPackageDirectory;
+use sai_package::local_source::{
+    LocalPackageDirectory, LocalPackageDirectoryIndex, LocalPackagePathIndexError,
+};
+use sai_package::lock::{LockParseOutput, LockSource};
+use sai_package::lock_dependency_contract::{
+    LockDependencyContractInputError, LockDependencyContractMismatch,
+};
+use sai_package::lock_root_contract::{LockRootContractInputError, LockRootContractMismatch};
+use sai_package::lock_source_canonicalizer::{
+    LockSourceCanonicalizationError, LockSourceCanonicalizerBuildError,
+    LockSourceIdentityCanonicalizer,
+};
+use sai_package::lock_source_selection::{
+    LockSourceCanonicalizer, LockSourceSelectionCheckError, LockSourceSelectionInputError,
+    plan_lock_source_selection, validate_lock_source_plan,
+};
 use sai_package::manifest::{PackageDeclaration, PackageRole};
+use sai_package::mvs::MvsPackageVersion;
 use sai_package::package_path::{ContentPackagePath, RepositoryPackageDirectory};
+use sai_package::resolver_contract::{ResolverContractBuildError, ResolverContractContext};
+use sai_package::validation::PackageValidationContext;
 use sai_package::version::Version;
 use sai_semantic::{IndexOperationJournal, PackageIndexFileName};
 use sai_vfs::{PackageRelativePath, PackageSourceDirectory, PackageSourcePath};
@@ -115,15 +133,6 @@ impl IndexJournalPackageContext {
         } else {
             PackageForm::Artifact
         };
-        if form == PackageForm::Artifact
-            && matches!(
-                role,
-                PackageGraphRole::Root | PackageGraphRole::WorkspaceMember
-            )
-        {
-            return Err(IndexOperationJournalValidationError::InvalidPackageManifest);
-        }
-
         Self::from_verified_metadata(
             &identity,
             version,
@@ -283,6 +292,376 @@ impl Error for IndexOperationJournalValidationError {
             _ => None,
         }
     }
+}
+
+/// A complete, target-independent inventory for journal package validation.
+///
+/// `contexts` contains the root and every workspace package selected by a
+/// local path source anywhere in the lock graph. `directories` retains the
+/// opened directory capability for each corresponding full package key, so a
+/// later recovery coordinator can use handle-relative operations. External
+/// path dependencies and Git packages are deliberately not workspace
+/// members.
+#[derive(Clone, Debug)]
+pub struct IndexJournalWorkspaceInventory {
+    root_directory: LocalPackageDirectory,
+    contexts: Vec<IndexJournalPackageContext>,
+    directories: BTreeMap<String, LocalPackageDirectory>,
+}
+
+impl IndexJournalWorkspaceInventory {
+    /// Returns the captured root directory used to build this inventory.
+    pub const fn root_directory(&self) -> &LocalPackageDirectory {
+        &self.root_directory
+    }
+
+    /// Returns the root and all lock-selected workspace package contexts,
+    /// sorted by their full identity-and-version key.
+    pub fn contexts(&self) -> &[IndexJournalPackageContext] {
+        &self.contexts
+    }
+
+    /// Returns the retained directory for a full journal package key.
+    pub fn directory_for_package(&self, package_node_key: &str) -> Option<&LocalPackageDirectory> {
+        self.directories.get(package_node_key)
+    }
+
+    /// Iterates over retained root and workspace-member directory handles in
+    /// deterministic package-key order.
+    pub fn directories(&self) -> impl Iterator<Item = (&str, &LocalPackageDirectory)> {
+        self.directories
+            .iter()
+            .map(|(package_node_key, directory)| (package_node_key.as_str(), directory))
+    }
+}
+
+/// A lock, source, or captured package could not produce a complete workspace
+/// inventory. The builder never returns a partially collected inventory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum IndexJournalWorkspaceInventoryBuildError {
+    RootPackageIndex(LocalPackagePathIndexError),
+    RootPathOverrides(LocalPackagePathIndexError),
+    RootContext(ResolverContractBuildError),
+    RootContractInput(LockRootContractInputError),
+    RootContractMismatch(Vec<LockRootContractMismatch>),
+    SourceCanonicalizer(LockSourceCanonicalizerBuildError),
+    SourcePlanning(LockSourceSelectionInputError),
+    SourceValidation {
+        package_version: MvsPackageVersion,
+        error: Box<LockSourceSelectionCheckError<LockSourceCanonicalizationError>>,
+    },
+    LocalSourceInventoryMismatch {
+        missing: Vec<MvsPackageVersion>,
+        unexpected: Vec<MvsPackageVersion>,
+    },
+    PackageContext {
+        package_version: MvsPackageVersion,
+        error: Box<IndexOperationJournalValidationError>,
+    },
+    MissingLockPackageContract {
+        package_version: MvsPackageVersion,
+    },
+    PackageContractInput {
+        package_version: MvsPackageVersion,
+        error: LockDependencyContractInputError,
+    },
+    PackageContractMismatch {
+        package_version: MvsPackageVersion,
+        mismatches: Vec<LockDependencyContractMismatch>,
+    },
+    PackageKeyMismatch {
+        expected: String,
+        found: String,
+    },
+    DuplicatePackageContext {
+        package_node_key: String,
+    },
+    DuplicateWorkspaceIndexFile {
+        file: String,
+    },
+}
+
+impl fmt::Display for IndexJournalWorkspaceInventoryBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "could not build complete index journal workspace inventory: {self:?}"
+        )
+    }
+}
+
+impl Error for IndexJournalWorkspaceInventoryBuildError {}
+
+/// Builds the authoritative root and workspace-member contexts from a
+/// complete lock graph without applying target or test-edge activation.
+///
+/// This must run while the caller holds the exclusive workspace lock. The
+/// root's path overrides are derived from its captured manifest; source
+/// selection and all package membership decisions then come from every
+/// recorded lock package, including test-only and target-inactive edges.
+/// Every local lock entry is canonicalized before it is classified. Only
+/// entries whose captured directory is beneath the captured workspace root
+/// become workspace members. On any incomplete evidence or validation error,
+/// the function returns an error and exposes no partial inventory.
+pub fn build_index_journal_workspace_inventory(
+    root_directory: &LocalPackageDirectory,
+    parsed_lock: &LockParseOutput,
+    validation_context: PackageValidationContext<'_>,
+) -> Result<IndexJournalWorkspaceInventory, IndexJournalWorkspaceInventoryBuildError> {
+    let root_manifest = root_directory.parse_manifest(PackageRole::Root);
+    let mut root_directory_index = LocalPackageDirectoryIndex::default();
+    let root_package_version = root_directory_index
+        .index_root_directory(root_directory)
+        .map_err(IndexJournalWorkspaceInventoryBuildError::RootPackageIndex)?;
+
+    let root_contract = sai_package::lock_root_contract::compare(&root_manifest, parsed_lock)
+        .map_err(IndexJournalWorkspaceInventoryBuildError::RootContractInput)?;
+    if !root_contract.matches_contract() {
+        return Err(
+            IndexJournalWorkspaceInventoryBuildError::RootContractMismatch(
+                root_contract.mismatches,
+            ),
+        );
+    }
+    // Initialize the full lock snapshot before following manifest override
+    // paths. This rejects malformed lock state before resolving any
+    // root-manifest path declarations.
+    let mut source_canonicalizer = LockSourceIdentityCanonicalizer::new(
+        root_directory.clone(),
+        root_package_version.clone(),
+        parsed_lock,
+    )
+    .map_err(IndexJournalWorkspaceInventoryBuildError::SourceCanonicalizer)?;
+
+    let root_path_overrides = root_directory_index
+        .index_root_path_overrides(root_directory)
+        .map_err(IndexJournalWorkspaceInventoryBuildError::RootPathOverrides)?;
+    let no_root_path_requirements = BTreeMap::new();
+    let resolver_context = ResolverContractContext::from_root_manifest(
+        &root_manifest,
+        &no_root_path_requirements,
+        &root_path_overrides,
+        validation_context,
+    )
+    .map_err(IndexJournalWorkspaceInventoryBuildError::RootContext)?;
+    if resolver_context.root_package() != &root_package_version {
+        return Err(
+            IndexJournalWorkspaceInventoryBuildError::PackageKeyMismatch {
+                expected: package_node_key(&root_package_version),
+                found: package_node_key(resolver_context.root_package()),
+            },
+        );
+    }
+
+    let source_plans = plan_lock_source_selection(parsed_lock, &resolver_context)
+        .map_err(IndexJournalWorkspaceInventoryBuildError::SourcePlanning)?;
+    for plan in &source_plans {
+        validate_lock_source_plan(plan, &mut source_canonicalizer).map_err(|error| {
+            IndexJournalWorkspaceInventoryBuildError::SourceValidation {
+                package_version: plan.package_version.clone(),
+                error: Box::new(error),
+            }
+        })?;
+
+        // LockFloor deliberately performs no identity lookup during source
+        // selection. Materialize every actual local entry explicitly so
+        // condition 5 and workspace membership see the complete lock graph.
+        if matches!(plan.actual.source, LockSource::Path(_)) {
+            source_canonicalizer
+                .canonicalize_entry(&plan.actual)
+                .map_err(
+                    |error| IndexJournalWorkspaceInventoryBuildError::SourceValidation {
+                        package_version: plan.package_version.clone(),
+                        error: Box::new(LockSourceSelectionCheckError::EntryCanonicalization {
+                            entry: Box::new(plan.actual.clone()),
+                            error: Box::new(error),
+                        }),
+                    },
+                )?;
+        }
+    }
+
+    let expected_local_sources = source_plans
+        .iter()
+        .filter(|plan| matches!(plan.actual.source, LockSource::Path(_)))
+        .map(|plan| plan.package_version.clone())
+        .collect::<BTreeSet<_>>();
+    let materialized_local_sources = source_canonicalizer
+        .local_directories()
+        .map(|(package_version, _)| package_version.clone())
+        .collect::<BTreeSet<_>>();
+    if expected_local_sources != materialized_local_sources {
+        return Err(
+            IndexJournalWorkspaceInventoryBuildError::LocalSourceInventoryMismatch {
+                missing: expected_local_sources
+                    .difference(&materialized_local_sources)
+                    .cloned()
+                    .collect(),
+                unexpected: materialized_local_sources
+                    .difference(&expected_local_sources)
+                    .cloned()
+                    .collect(),
+            },
+        );
+    }
+
+    for (package_version, package_directory) in source_canonicalizer.local_directories() {
+        let Some(locked_package) = parsed_lock.file().packages.iter().find(|package| {
+            package.value.package.as_ref() == package_version.package()
+                && &package.value.version == package_version.version()
+        }) else {
+            return Err(
+                IndexJournalWorkspaceInventoryBuildError::MissingLockPackageContract {
+                    package_version: package_version.clone(),
+                },
+            );
+        };
+        let package_manifest = package_directory.parse_manifest(PackageRole::Dependency);
+        let contract = sai_package::lock_dependency_contract::compare(
+            &package_manifest,
+            locked_package,
+            resolver_context.root_targets(),
+        )
+        .map_err(|error| {
+            IndexJournalWorkspaceInventoryBuildError::PackageContractInput {
+                package_version: package_version.clone(),
+                error,
+            }
+        })?;
+        if !contract.matches_contract() {
+            return Err(
+                IndexJournalWorkspaceInventoryBuildError::PackageContractMismatch {
+                    package_version: package_version.clone(),
+                    mismatches: contract.mismatches,
+                },
+            );
+        }
+    }
+
+    let mut contexts = Vec::with_capacity(materialized_local_sources.len() + 1);
+    let mut directories = BTreeMap::new();
+    let root_context = IndexJournalPackageContext::from_workspace_package(
+        PackageGraphRole::Root,
+        root_directory,
+        root_directory,
+    )
+    .map_err(
+        |error| IndexJournalWorkspaceInventoryBuildError::PackageContext {
+            package_version: root_package_version.clone(),
+            error: Box::new(error),
+        },
+    )?;
+    require_package_context_key(&root_context, &root_package_version)?;
+    directories.insert(
+        root_context.package_node_key.clone(),
+        root_directory.clone(),
+    );
+    contexts.push(root_context);
+
+    for (package_version, package_directory) in source_canonicalizer.local_directories() {
+        if package_directory.path() == root_directory.path() {
+            // The root may not also appear as a dependency package entry.
+            return Err(IndexJournalWorkspaceInventoryBuildError::PackageContext {
+                package_version: package_version.clone(),
+                error: Box::new(
+                    IndexOperationJournalValidationError::DuplicatePackageContext {
+                        package_node_key: package_node_key(package_version),
+                    },
+                ),
+            });
+        }
+        if !package_directory.path().starts_with(root_directory.path()) {
+            // A lock-selected local package may live outside the workspace.
+            // Its source identity was validated above, but it is not a
+            // workspace package and cannot participate in the index header.
+            continue;
+        }
+
+        let context = IndexJournalPackageContext::from_workspace_package(
+            PackageGraphRole::WorkspaceMember,
+            root_directory,
+            package_directory,
+        )
+        .map_err(
+            |error| IndexJournalWorkspaceInventoryBuildError::PackageContext {
+                package_version: package_version.clone(),
+                error: Box::new(error),
+            },
+        )?;
+        require_package_context_key(&context, package_version)?;
+        if directories
+            .insert(context.package_node_key.clone(), package_directory.clone())
+            .is_some()
+        {
+            return Err(
+                IndexJournalWorkspaceInventoryBuildError::DuplicatePackageContext {
+                    package_node_key: context.package_node_key,
+                },
+            );
+        }
+        contexts.push(context);
+    }
+
+    contexts.sort_by(|left, right| left.package_node_key.cmp(&right.package_node_key));
+    validate_unique_inventory_contexts(&contexts)?;
+
+    Ok(IndexJournalWorkspaceInventory {
+        root_directory: root_directory.clone(),
+        contexts,
+        directories,
+    })
+}
+
+fn package_node_key(package_version: &MvsPackageVersion) -> String {
+    format!(
+        "package:{}@{}",
+        package_version.package(),
+        package_version.version()
+    )
+}
+
+fn require_package_context_key(
+    context: &IndexJournalPackageContext,
+    expected_package_version: &MvsPackageVersion,
+) -> Result<(), IndexJournalWorkspaceInventoryBuildError> {
+    let expected = package_node_key(expected_package_version);
+    if context.package_node_key() == expected {
+        return Ok(());
+    }
+    Err(
+        IndexJournalWorkspaceInventoryBuildError::PackageKeyMismatch {
+            expected,
+            found: context.package_node_key().to_owned(),
+        },
+    )
+}
+
+fn validate_unique_inventory_contexts(
+    contexts: &[IndexJournalPackageContext],
+) -> Result<(), IndexJournalWorkspaceInventoryBuildError> {
+    let mut package_keys = BTreeSet::new();
+    let mut index_files = BTreeMap::<&str, &str>::new();
+    for context in contexts {
+        if !package_keys.insert(context.package_node_key()) {
+            return Err(
+                IndexJournalWorkspaceInventoryBuildError::DuplicatePackageContext {
+                    package_node_key: context.package_node_key().to_owned(),
+                },
+            );
+        }
+        if context.package_root().is_some()
+            && let Some(previous_package_key) =
+                index_files.insert(context.index_file().as_str(), context.package_node_key())
+            && previous_package_key != context.package_node_key()
+        {
+            return Err(
+                IndexJournalWorkspaceInventoryBuildError::DuplicateWorkspaceIndexFile {
+                    file: context.index_file().as_str().to_owned(),
+                },
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Validates all journal package keys, roots, source paths, and planned index
@@ -525,11 +904,16 @@ fn is_valid_module_segment(segment: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexJournalPackageContext, IndexOperationJournalValidationError,
+        IndexJournalPackageContext, IndexJournalWorkspaceInventoryBuildError,
+        IndexOperationJournalValidationError, LockRootContractInputError,
+        build_index_journal_workspace_inventory,
         validate_index_operation_journal_package_context as validate_package_context,
+        validate_unique_inventory_contexts,
     };
     use crate::package_graph::{PackageForm, PackageGraphNode, PackageGraphRole};
     use sai_package::local_source::LocalPackageDirectory;
+    use sai_package::lock::parse as parse_lock;
+    use sai_package::validation::PackageValidationContext;
     use sai_package::version::Version;
     use sai_semantic::{
         FileState, IndexJournalOrigin, IndexJournalState, IndexOperationJournal, IndexSnapshot,
@@ -562,6 +946,44 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn write_package(root: &PathBuf, relative: &str, manifest: &str) -> PathBuf {
+        let path = root.join(relative);
+        fs::create_dir_all(&path).expect("create package directory");
+        fs::write(path.join("sai.package"), manifest).expect("write package manifest");
+        path
+    }
+
+    fn build_inventory(
+        root: &PathBuf,
+        lock_text: &str,
+    ) -> Result<super::IndexJournalWorkspaceInventory, IndexJournalWorkspaceInventoryBuildError>
+    {
+        let root_directory = LocalPackageDirectory::open(root).expect("open root package");
+        let parsed_lock = parse_lock(lock_text.as_bytes());
+        build_index_journal_workspace_inventory(
+            &root_directory,
+            &parsed_lock,
+            PackageValidationContext::default(),
+        )
+    }
+
+    fn lock_root(requirements: &str, entries: &str) -> String {
+        format!(
+            "lock 2\n\
+             root acme:app @ 1.0.0\n\
+                 targets {{ wasm32-core, wasm32-wasi }}\n\
+             {requirements}{entries}"
+        )
+    }
+
+    fn path_lock_entry(package: &str, version: &str, path: &str, requirements: &str) -> String {
+        format!(
+            "\npackage {package} @ {version}\n\
+                 source path \"{path}\"\n\
+                 {requirements}"
+        )
     }
 
     fn graph_node(
@@ -814,19 +1236,22 @@ mod tests {
         fs::create_dir_all(&source_less_path).expect("create source-less member");
         fs::write(
             source_less_path.join("sai.package"),
-            "package acme:source-less @ 1.2.3\n",
+            "package acme:source-less @ 1.2.3\n\
+             wit \"wit\"\n\
+             export world api\n\
+             targets { wasm32-wasi }\n\
+             artifact component { wasm32-wasi \"dist/app.wasm\" }\n",
         )
-        .expect("write source-less member manifest");
+        .expect("write artifact-only member manifest");
         let source_less_directory = LocalPackageDirectory::open(&source_less_path)
-            .expect("open source-less member capability");
-        assert!(matches!(
-            IndexJournalPackageContext::from_workspace_package(
-                PackageGraphRole::WorkspaceMember,
-                &workspace_root,
-                &source_less_directory,
-            ),
-            Err(IndexOperationJournalValidationError::InvalidPackageManifest)
-        ));
+            .expect("open artifact-only member capability");
+        let artifact = IndexJournalPackageContext::from_workspace_package(
+            PackageGraphRole::WorkspaceMember,
+            &workspace_root,
+            &source_less_directory,
+        )
+        .expect("artifact-only member has an index context");
+        assert!(artifact.source_directory().is_none());
     }
 
     #[test]
@@ -1136,6 +1561,450 @@ mod tests {
         assert!(matches!(
             IndexJournalPackageContext::from_test_metadata(&member, Some("."), Some("src")),
             Err(IndexOperationJournalValidationError::InvalidPackageRoot)
+        ));
+    }
+
+    #[test]
+    fn builds_target_independent_inventory_from_all_lock_edges() {
+        let workspace = TestWorkspace::new();
+        let root_manifest = "package acme:app @ 1.0.0\n\
+            source \"src\"\n\
+            targets { wasm32-core, wasm32-wasi }\n\
+            requires {\n\
+                acme:parent @ ^1 from path \"packages/parent\"\n\
+                acme:only @ ^1 from path \"packages/only\" only { wasm32-wasi }\n\
+            }\n\
+            requires test {\n\
+                acme:fixture @ ^1 from path \"packages/fixture\"\n\
+            }\n";
+        write_package(&workspace.0, ".", root_manifest);
+        write_package(
+            &workspace.0,
+            "packages/parent",
+            "package acme:parent @ 1.0.0\n\
+             targets { wasm32-core, wasm32-wasi }\n\
+             source \"src\"\n\
+             requires {\n\
+                 acme:child @ ^1 from path \"../child\"\n\
+             }\n",
+        );
+        write_package(
+            &workspace.0,
+            "packages/child",
+            "package acme:child @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n",
+        );
+        write_package(
+            &workspace.0,
+            "packages/only",
+            "package acme:only @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n",
+        );
+        write_package(
+            &workspace.0,
+            "packages/fixture",
+            "package acme:fixture @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n",
+        );
+
+        let lock = lock_root(
+            "    requires acme:parent @ ^1 -> 1.0.0 from path \"packages/parent\"\n\
+                 requires acme:only @ ^1 -> 1.0.0 from path \"packages/only\" only { wasm32-wasi }\n\
+                 requires test acme:fixture @ ^1 -> 1.0.0 from path \"packages/fixture\"\n",
+            &format!(
+                "{}{}{}{}",
+                path_lock_entry(
+                    "acme:parent",
+                    "1.0.0",
+                    "packages/parent",
+                    "    requires acme:child @ ^1 -> 1.0.0 from path \"../child\"\n",
+                ),
+                path_lock_entry("acme:child", "1.0.0", "packages/child", ""),
+                path_lock_entry("acme:only", "1.0.0", "packages/only", ""),
+                path_lock_entry("acme:fixture", "1.0.0", "packages/fixture", ""),
+            ),
+        );
+        let inventory =
+            build_inventory(&workspace.0, &lock).expect("all lock-selected packages are valid");
+        let keys = inventory
+            .contexts()
+            .iter()
+            .map(IndexJournalPackageContext::package_node_key)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "package:acme:app@1.0.0",
+                "package:acme:child@1.0.0",
+                "package:acme:fixture@1.0.0",
+                "package:acme:only@1.0.0",
+                "package:acme:parent@1.0.0",
+            ]
+        );
+        assert_eq!(
+            inventory
+                .directory_for_package("package:acme:child@1.0.0")
+                .unwrap()
+                .path(),
+            fs::canonicalize(workspace.0.join("packages/child"))
+                .unwrap()
+                .as_path()
+        );
+        assert_eq!(
+            inventory.contexts()[0].package_root(),
+            Some("."),
+            "the root context is retained alongside non-active workspace members"
+        );
+    }
+
+    #[test]
+    fn rejects_local_dependency_requirements_missing_from_the_lock() {
+        let workspace = TestWorkspace::new();
+        write_package(
+            &workspace.0,
+            ".",
+            "package acme:app @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n\
+             requires { acme:parent @ ^1 from path \"packages/parent\" }\n",
+        );
+        write_package(
+            &workspace.0,
+            "packages/parent",
+            "package acme:parent @ 1.0.0\n\
+             targets { wasm32-core }\n\
+             source \"src\"\n\
+             requires {\n\
+                 acme:child @ ^1 from path \"../child\"\n\
+             }\n",
+        );
+        write_package(
+            &workspace.0,
+            "packages/child",
+            "package acme:child @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core }\n",
+        );
+
+        let stale_lock = lock_root(
+            "    requires acme:parent @ ^1 -> 1.0.0 from path \"packages/parent\"\n",
+            &path_lock_entry("acme:parent", "1.0.0", "packages/parent", ""),
+        );
+        let error = build_inventory(&workspace.0, &stale_lock)
+            .expect_err("the captured member differs from its lock entry");
+        assert!(
+            matches!(
+                &error,
+                IndexJournalWorkspaceInventoryBuildError::PackageContractMismatch {
+                    package_version,
+                    ..
+                } if package_version.package() == "acme:parent"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_root_requirements_missing_from_the_lock() {
+        let workspace = TestWorkspace::new();
+        write_package(
+            &workspace.0,
+            ".",
+            "package acme:app @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n\
+             requires { acme:dep @ ^1 from path \"packages/dep\" }\n",
+        );
+        write_package(
+            &workspace.0,
+            "packages/dep",
+            "package acme:dep @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n",
+        );
+
+        let stale_lock = lock_root(
+            "",
+            &path_lock_entry("acme:dep", "1.0.0", "packages/dep", ""),
+        );
+        assert!(matches!(
+            build_inventory(&workspace.0, &stale_lock),
+            Err(IndexJournalWorkspaceInventoryBuildError::RootContractMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_test_edges_in_dependency_lock_syntax() {
+        let workspace = TestWorkspace::new();
+        write_package(
+            &workspace.0,
+            ".",
+            "package acme:app @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n\
+             requires { acme:parent @ ^1 from path \"packages/parent\" }\n",
+        );
+        write_package(
+            &workspace.0,
+            "packages/parent",
+            "package acme:parent @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n",
+        );
+        write_package(
+            &workspace.0,
+            "packages/helper",
+            "package acme:helper @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n",
+        );
+
+        let lock = lock_root(
+            "    requires acme:parent @ ^1 -> 1.0.0 from path \"packages/parent\"\n",
+            &format!(
+                "{}{}",
+                path_lock_entry(
+                    "acme:parent",
+                    "1.0.0",
+                    "packages/parent",
+                    "    requires test acme:helper @ ^1 -> 1.0.0 from path \"../helper\"\n",
+                ),
+                path_lock_entry("acme:helper", "1.0.0", "packages/helper", ""),
+            ),
+        );
+        assert!(matches!(
+            build_inventory(&workspace.0, &lock),
+            Err(IndexJournalWorkspaceInventoryBuildError::RootContractInput(
+                LockRootContractInputError::InvalidLockSyntax { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn includes_artifact_only_workspace_members_without_source_directories() {
+        let workspace = TestWorkspace::new();
+        write_package(
+            &workspace.0,
+            ".",
+            "package acme:app @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n\
+             requires {\n\
+                 acme:artifact @ ^1 from path \"packages/artifact\"\n\
+                     only { wasm32-wasi }\n\
+             }\n",
+        );
+        write_package(
+            &workspace.0,
+            "packages/artifact",
+            "package acme:artifact @ 1.0.0\n\
+             wit \"wit\"\n\
+             export world api\n\
+             targets { wasm32-wasi }\n\
+             artifact component { wasm32-wasi \"dist/app.wasm\" }\n",
+        );
+
+        let lock = lock_root(
+            "    requires acme:artifact @ ^1 -> 1.0.0 from path \"packages/artifact\" only { wasm32-wasi }\n",
+            &path_lock_entry("acme:artifact", "1.0.0", "packages/artifact", ""),
+        );
+        let inventory = build_inventory(&workspace.0, &lock)
+            .expect("artifact-only packages are valid workspace members");
+        let artifact = inventory
+            .contexts()
+            .iter()
+            .find(|context| context.package_node_key() == "package:acme:artifact@1.0.0")
+            .expect("artifact member appears in the workspace index set");
+        assert_eq!(artifact.package_root(), Some("packages/artifact"));
+        assert!(artifact.source_directory().is_none());
+    }
+
+    #[test]
+    fn excludes_external_path_and_git_sources_from_workspace_members() {
+        let workspace = TestWorkspace::new();
+        let outside = TestWorkspace::new();
+        let outside_name = outside.0.file_name().unwrap().to_str().unwrap();
+        write_package(
+            &outside.0,
+            ".",
+            "package acme:outside @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n",
+        );
+        let root_manifest = format!(
+            "package acme:app @ 1.0.0\n\
+             source \"src\"\n\
+             targets {{ wasm32-core, wasm32-wasi }}\n\
+             requires {{\n\
+                 acme:outside @ ^1 from path \"../{outside_name}\"\n\
+                 acme:remote @ ^1 from git \"https://example.invalid/remote\"\n\
+             }}\n"
+        );
+        write_package(&workspace.0, ".", &root_manifest);
+
+        let lock = lock_root(
+            &format!(
+                "    requires acme:outside @ ^1 -> 1.0.0 from path \"../{}\"\n\
+                     requires acme:remote @ ^1 -> 1.0.0 from git \"https://example.invalid/remote\"\n",
+                outside_name
+            ),
+            &format!(
+                "{}\n\
+                 package acme:remote @ 1.0.0\n\
+                     source git \"https://example.invalid/remote\"\n\
+                     commit \"0123456789012345678901234567890123456789\"\n\
+                     checksum \"sai1:0123456789012345678901234567890123456789012345678901234567890123\"\n\
+                     capabilities {{ }}\n",
+                path_lock_entry(
+                    "acme:outside",
+                    "1.0.0",
+                    &format!("../{}", outside.0.file_name().unwrap().to_str().unwrap()),
+                    "",
+                )
+            ),
+        );
+        let inventory = build_inventory(&workspace.0, &lock)
+            .expect("external path and Git lock entries validate");
+        assert_eq!(inventory.contexts().len(), 1);
+        assert_eq!(
+            inventory.contexts()[0].package_node_key(),
+            "package:acme:app@1.0.0"
+        );
+        assert_eq!(inventory.directories().count(), 1);
+    }
+
+    #[test]
+    fn materializes_lock_floor_path_entries_into_the_inventory() {
+        let workspace = TestWorkspace::new();
+        write_package(
+            &workspace.0,
+            ".",
+            "package acme:app @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n\
+             requires {\n\
+                 acme:floor @ ^1 from git \"https://example.invalid/floor\"\n\
+             }\n",
+        );
+        write_package(
+            &workspace.0,
+            "packages/floor",
+            "package acme:floor @ 1.1.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n",
+        );
+        let lock = lock_root(
+            "    requires acme:floor @ ^1 -> 1.1.0 from git \"https://example.invalid/floor\"\n",
+            &path_lock_entry("acme:floor", "1.1.0", "packages/floor", ""),
+        );
+
+        let inventory =
+            build_inventory(&workspace.0, &lock).expect("LockFloor local source is materialized");
+        assert!(
+            inventory
+                .contexts()
+                .iter()
+                .any(|context| context.package_node_key() == "package:acme:floor@1.1.0")
+        );
+        assert_eq!(
+            inventory
+                .directory_for_package("package:acme:floor@1.1.0")
+                .unwrap()
+                .path(),
+            fs::canonicalize(workspace.0.join("packages/floor"))
+                .unwrap()
+                .as_path()
+        );
+    }
+
+    #[test]
+    fn rejects_missing_and_mismatched_locked_packages_without_partial_inventory() {
+        let workspace = TestWorkspace::new();
+        write_package(
+            &workspace.0,
+            ".",
+            "package acme:app @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n\
+             requires { acme:missing @ ^1 from path \"packages/missing\" }\n",
+        );
+        let missing = lock_root(
+            "    requires acme:missing @ ^1 -> 1.0.0 from path \"packages/missing\"\n",
+            "",
+        );
+        let missing_error = build_inventory(&workspace.0, &missing)
+            .expect_err("missing path package cannot produce an inventory");
+        assert!(
+            matches!(
+                &missing_error,
+                IndexJournalWorkspaceInventoryBuildError::SourceCanonicalizer(_)
+                    | IndexJournalWorkspaceInventoryBuildError::RootPathOverrides(_)
+                    | IndexJournalWorkspaceInventoryBuildError::SourcePlanning(_)
+            ),
+            "{missing_error:?}"
+        );
+
+        write_package(
+            &workspace.0,
+            "packages/dep",
+            "package acme:dep @ 1.1.0\n\
+             source \"src\"\n\
+             targets { wasm32-core }\n",
+        );
+        write_package(
+            &workspace.0,
+            ".",
+            "package acme:app @ 1.0.0\n\
+             source \"src\"\n\
+             targets { wasm32-core, wasm32-wasi }\n\
+             requires { acme:dep @ ^1 from path \"packages/dep\" }\n",
+        );
+        let mismatched = lock_root(
+            "    requires acme:dep @ ^1 -> 1.0.0 from path \"packages/dep\"\n",
+            &path_lock_entry("acme:dep", "1.0.0", "packages/dep", ""),
+        );
+        assert!(matches!(
+            build_inventory(&workspace.0, &mismatched),
+            Err(IndexJournalWorkspaceInventoryBuildError::SourceValidation { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_full_keys_and_compatibility_index_filenames() {
+        let root = graph_node(
+            "acme:app",
+            "1.2.3",
+            PackageGraphRole::Root,
+            PackageForm::Source,
+        );
+        let root_context =
+            IndexJournalPackageContext::from_test_metadata(&root, Some("."), Some("src"))
+                .expect("root context");
+        assert!(matches!(
+            validate_unique_inventory_contexts(&[root_context.clone(), root_context.clone()]),
+            Err(IndexJournalWorkspaceInventoryBuildError::DuplicatePackageContext { .. })
+        ));
+
+        let newer = graph_node(
+            "acme:app",
+            "1.8.0",
+            PackageGraphRole::WorkspaceMember,
+            PackageForm::Source,
+        );
+        let member_context = IndexJournalPackageContext::from_test_metadata(
+            &newer,
+            Some("members/app"),
+            Some("src"),
+        )
+        .expect("member context");
+        assert_eq!(root_context.package_node_key(), "package:acme:app@1.2.3");
+        assert_eq!(member_context.package_node_key(), "package:acme:app@1.8.0");
+        assert!(matches!(
+            validate_unique_inventory_contexts(&[root_context, member_context]),
+            Err(IndexJournalWorkspaceInventoryBuildError::DuplicateWorkspaceIndexFile { .. })
         ));
     }
 }
