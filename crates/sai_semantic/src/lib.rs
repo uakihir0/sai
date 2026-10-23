@@ -13,7 +13,7 @@ pub use index_journal::{
 };
 pub use symbol_index::{
     EncodedSymbolIndex, PackageIndexFileName, PackageIndexFileRecord, SymbolIndex,
-    SymbolIndexCodecError, SymbolIndexEntry, SymbolKind, UnvalidatedSymbolIndex,
+    SymbolIndexCodecError, SymbolIndexEntry, SymbolIndexHeader, SymbolKind, UnvalidatedSymbolIndex,
 };
 
 use sai_stable_hash::StableHasher;

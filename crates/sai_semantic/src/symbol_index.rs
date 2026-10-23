@@ -239,6 +239,61 @@ impl PackageIndexFileRecord {
     }
 }
 
+/// The canonical package-file records from one symbol-index header.
+///
+/// This validates the header's exact JSON encoding, format, version, package
+/// filenames, digests, uniqueness, and ordering. It does not read or verify
+/// any package-file contents.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SymbolIndexHeader {
+    records: Vec<PackageIndexFileRecord>,
+}
+
+impl SymbolIndexHeader {
+    /// Decodes one canonical symbol-index header from caller-provided bytes.
+    ///
+    /// An empty package list is valid at this codec layer. Journal validation
+    /// applies the stricter nonempty rule to a planned-after generation.
+    pub fn decode(bytes: &[u8]) -> Result<Self, SymbolIndexCodecError> {
+        let header: HeaderJson = parse_canonical_document(bytes)?;
+        if header.format != INDEX_FORMAT {
+            return Err(SymbolIndexCodecError::UnsupportedFormat);
+        }
+        if header.version != INDEX_VERSION {
+            return Err(SymbolIndexCodecError::UnsupportedVersion);
+        }
+
+        let mut seen_files = BTreeSet::new();
+        let mut previous_file: Option<PackageIndexFileName> = None;
+        let mut records = Vec::with_capacity(header.packages.len());
+        for record in header.packages {
+            let file = PackageIndexFileName::parse(&record.file)?;
+            if !seen_files.insert(file.clone()) {
+                return Err(SymbolIndexCodecError::DuplicatePackageFile);
+            }
+            if previous_file
+                .as_ref()
+                .is_some_and(|previous| previous.as_str().as_bytes() >= file.as_str().as_bytes())
+            {
+                return Err(SymbolIndexCodecError::UnorderedPackageFiles);
+            }
+            previous_file = Some(file.clone());
+
+            records.push(PackageIndexFileRecord {
+                file,
+                digest: parse_content_hash(&record.blake3)?,
+            });
+        }
+
+        Ok(Self { records })
+    }
+
+    /// Returns package records in canonical filename order.
+    pub fn records(&self) -> &[PackageIndexFileRecord] {
+        &self.records
+    }
+}
+
 /// An in-memory symbol index whose entries were matched against a semantic
 /// inventory.
 ///
@@ -295,37 +350,16 @@ impl UnvalidatedSymbolIndex {
         header_bytes: &[u8],
         package_files: &BTreeMap<String, Vec<u8>>,
     ) -> Result<Self, SymbolIndexCodecError> {
-        let header: HeaderJson = parse_canonical_document(header_bytes)?;
-        if header.format != INDEX_FORMAT {
-            return Err(SymbolIndexCodecError::UnsupportedFormat);
-        }
-        if header.version != INDEX_VERSION {
-            return Err(SymbolIndexCodecError::UnsupportedVersion);
-        }
+        let header = SymbolIndexHeader::decode(header_bytes)?;
+        let mut packages = Vec::with_capacity(header.records.len());
 
-        let mut seen_files = BTreeSet::new();
-        let mut previous_file: Option<PackageIndexFileName> = None;
-        let mut packages = Vec::with_capacity(header.packages.len());
-
-        for record in header.packages {
-            let file = PackageIndexFileName::parse(&record.file)?;
-            if !seen_files.insert(file.clone()) {
-                return Err(SymbolIndexCodecError::DuplicatePackageFile);
-            }
-            if previous_file
-                .as_ref()
-                .is_some_and(|previous| previous.as_str().as_bytes() >= file.as_str().as_bytes())
-            {
-                return Err(SymbolIndexCodecError::UnorderedPackageFiles);
-            }
-            previous_file = Some(file.clone());
-
-            let expected_digest = parse_content_hash(&record.blake3)?;
+        for record in header.records {
+            let file = record.file;
             let snapshot = package_files
                 .get(file.as_str())
                 .ok_or(SymbolIndexCodecError::MissingPackageFile)?;
             let actual_digest = hash_bytes(snapshot);
-            if actual_digest != expected_digest {
+            if actual_digest != record.digest {
                 return Err(SymbolIndexCodecError::PackageDigestMismatch);
             }
 
@@ -397,17 +431,7 @@ impl SymbolIndex {
     /// Returns package records in the header's canonical filename order.
     pub fn records(&self) -> Result<Vec<PackageIndexFileRecord>, SymbolIndexCodecError> {
         let encoded = self.encode()?;
-        let header: HeaderJson = parse_canonical_document(&encoded.header)?;
-        header
-            .packages
-            .into_iter()
-            .map(|record| {
-                Ok(PackageIndexFileRecord {
-                    file: PackageIndexFileName::parse(&record.file)?,
-                    digest: parse_content_hash(&record.blake3)?,
-                })
-            })
-            .collect()
+        Ok(SymbolIndexHeader::decode(&encoded.header)?.records)
     }
 
     /// Iterates over package filenames and entries in canonical order.
@@ -739,8 +763,8 @@ fn parse_canonical_u64(value: &str) -> Option<u64> {
 mod tests {
     use super::{
         EntryJson, HeaderJson, INDEX_FORMAT, PackageFileJson, PackageIndexFileName, SymbolIndex,
-        SymbolIndexCodecError, SymbolIndexEntry, SymbolKind, UnvalidatedSymbolIndex,
-        encode_canonical_document, parse_canonical_document,
+        SymbolIndexCodecError, SymbolIndexEntry, SymbolIndexHeader, SymbolKind,
+        UnvalidatedSymbolIndex, encode_canonical_document,
     };
     use crate::SymbolHex;
     use sai_stable_hash::{Fingerprint, hash_bytes};
@@ -1085,7 +1109,7 @@ mod tests {
             let mut document = bytes.to_vec();
             document.push(b'\n');
             assert!(matches!(
-                parse_canonical_document::<HeaderJson>(&document),
+                SymbolIndexHeader::decode(&document),
                 Err(SymbolIndexCodecError::InvalidJson | SymbolIndexCodecError::NonCanonicalJson)
             ));
         }
@@ -1096,8 +1120,42 @@ mod tests {
             b"{\"format\":\"sai-index\",\"version\":1,\"packages\":[]}\r\n".as_slice(),
             b"{\"format\":\"sai-index\",\"version\":1,\"packages\":[]}\n\n".as_slice(),
         ] {
-            assert!(parse_canonical_document::<HeaderJson>(bytes).is_err());
+            assert!(SymbolIndexHeader::decode(bytes).is_err());
         }
+    }
+
+    #[test]
+    fn decodes_empty_canonical_headers_and_preserves_package_records() {
+        let empty = encode_canonical_document(&HeaderJson {
+            format: INDEX_FORMAT.into(),
+            version: 1,
+            packages: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(SymbolIndexHeader::decode(&empty).unwrap().records(), &[]);
+
+        let record = |name: &str| PackageFileJson {
+            file: name.into(),
+            blake3: hash_bytes(&[]).to_hex(),
+        };
+        let encoded = encode_canonical_document(&HeaderJson {
+            format: INDEX_FORMAT.into(),
+            version: 1,
+            packages: vec![record("acme.a.1.jsonl"), record("acme.z.1.jsonl")],
+        })
+        .unwrap();
+        let header = SymbolIndexHeader::decode(&encoded).unwrap();
+        assert_eq!(
+            header
+                .records()
+                .iter()
+                .map(|record| (record.file().as_str(), record.digest()))
+                .collect::<Vec<_>>(),
+            [
+                ("acme.a.1.jsonl", hash_bytes(&[])),
+                ("acme.z.1.jsonl", hash_bytes(&[])),
+            ]
+        );
     }
 
     #[test]
@@ -1113,6 +1171,7 @@ mod tests {
                 packages: Vec::new(),
             })
             .unwrap();
+            assert_eq!(SymbolIndexHeader::decode(&header), Err(expected));
             assert_eq!(decode_index(&header, &files), Err(expected));
         }
     }
@@ -1130,6 +1189,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
+            SymbolIndexHeader::decode(&duplicate),
+            Err(SymbolIndexCodecError::DuplicatePackageFile)
+        );
+        assert_eq!(
             decode_index(
                 &duplicate,
                 &BTreeMap::from([("acme.user.1.jsonl".into(), Vec::new())])
@@ -1144,6 +1207,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
+            SymbolIndexHeader::decode(&unordered),
+            Err(SymbolIndexCodecError::UnorderedPackageFiles)
+        );
+        assert_eq!(
             decode_index(
                 &unordered,
                 &BTreeMap::from([
@@ -1153,6 +1220,40 @@ mod tests {
             ),
             Err(SymbolIndexCodecError::UnorderedPackageFiles)
         );
+    }
+
+    #[test]
+    fn rejects_invalid_header_package_filenames_and_digests() {
+        let invalid_filename = encode_canonical_document(&HeaderJson {
+            format: INDEX_FORMAT.into(),
+            version: 1,
+            packages: vec![PackageFileJson {
+                file: "../outside.jsonl".into(),
+                blake3: hash_bytes(&[]).to_hex(),
+            }],
+        })
+        .unwrap();
+        assert_eq!(
+            SymbolIndexHeader::decode(&invalid_filename),
+            Err(SymbolIndexCodecError::InvalidPackageFileName)
+        );
+
+        for digest in [String::new(), "A".repeat(64), "0".repeat(63)] {
+            let invalid_digest = encode_canonical_document(&HeaderJson {
+                format: INDEX_FORMAT.into(),
+                version: 1,
+                packages: vec![PackageFileJson {
+                    file: "acme.user.1.jsonl".into(),
+                    blake3: digest.clone(),
+                }],
+            })
+            .unwrap();
+            assert_eq!(
+                SymbolIndexHeader::decode(&invalid_digest),
+                Err(SymbolIndexCodecError::InvalidDigest),
+                "{digest:?}"
+            );
+        }
     }
 
     #[test]
