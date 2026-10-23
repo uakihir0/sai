@@ -854,6 +854,13 @@ impl SyntaxToken {
         self.green.kind()
     }
 
+    /// Whether both handles point to the same token occurrence in one red tree.
+    pub fn is_same_token(&self, other: &Self) -> bool {
+        self.index_in_parent == other.index_in_parent
+            && Rc::ptr_eq(&self.parent.0, &other.parent.0)
+            && Rc::ptr_eq(&self.parent.1, &other.parent.1)
+    }
+
     pub fn text(&self) -> &str {
         self.green.text()
     }
