@@ -1,0 +1,35 @@
+use acme:digital-evidence-custody-auditor/model.{AuditReport, CustodyEvent}
+
+fn precedes(left: CustodyEvent, right: CustodyEvent) -> Bool {
+    if left.minute != right.minute {
+        return left.minute < right.minute
+    }
+    if left.evidence_id != right.evidence_id {
+        return left.evidence_id < right.evidence_id
+    }
+    left.event_id < right.event_id
+}
+
+pub fn insert_event(report: borrow mut AuditReport, event: CustodyEvent) {
+    var position = report.timeline_count
+    while position > 0 {
+        match report.timeline[position - 1] {
+            Some(current) => {
+                if precedes(event, current) {
+                    position -= 1
+                } else {
+                    break
+                }
+            }
+            None => break
+        }
+    }
+
+    var cursor = report.timeline_count
+    while cursor > position {
+        report.timeline[cursor] = report.timeline[cursor - 1]
+        cursor -= 1
+    }
+    report.timeline[position] = Some(event)
+    report.timeline_count += 1
+}

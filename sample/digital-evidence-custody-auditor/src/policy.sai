@@ -1,0 +1,80 @@
+use acme:digital-evidence-custody-auditor/model.{
+    AccessPurpose
+    Actor
+    CustodyAction
+    CustodyEvent
+    EvidenceItem
+}
+
+pub fn evidence_index(evidence: Array<EvidenceItem, 4>, evidence_id: U32) -> Option<USize> {
+    for index in 0..evidence.len() {
+        if evidence[index].evidence_id == evidence_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn actor_index(actors: Array<Actor, 4>, actor_id: U32) -> Option<USize> {
+    for index in 0..actors.len() {
+        if actors[index].actor_id == actor_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn has_prior_duplicate_evidence_id(evidence: Array<EvidenceItem, 4>, index: USize) -> Bool {
+    let evidence_id = evidence[index].evidence_id
+    for previous in 0..index {
+        if evidence[previous].evidence_id == evidence_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn has_prior_duplicate_actor_id(actors: Array<Actor, 4>, index: USize) -> Bool {
+    let actor_id = actors[index].actor_id
+    for previous in 0..index {
+        if actors[previous].actor_id == actor_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn has_prior_duplicate_event_id(events: Array<CustodyEvent, 20>, index: USize) -> Bool {
+    let event_id = events[index].event_id
+    for previous in 0..index {
+        if events[previous].event_id == event_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn actor_may_perform(person: Actor, action: CustodyAction) -> Bool {
+    match action {
+        CustodyAction.Collected => person.may_collect
+        CustodyAction.SealApplied => person.may_apply_seal
+        CustodyAction.SealBroken => person.may_break_seal
+        CustodyAction.StorageMove => person.may_move
+        CustodyAction.Access => person.may_access
+        CustodyAction.Disposition => person.may_dispose
+    }
+}
+
+pub fn actor_allows_purpose(person: Actor, purpose: AccessPurpose) -> Bool {
+    for slot in person.allowed_purposes {
+        match slot {
+            Some(allowed) => {
+                if allowed == purpose {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
