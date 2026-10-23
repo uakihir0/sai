@@ -1,0 +1,33 @@
+use acme:community-irrigation-rotation/model.{IrrigationRequest}
+
+pub fn precedes(left: IrrigationRequest, right: IrrigationRequest) -> Bool {
+    if left.priority < right.priority {
+        return true
+    }
+    if left.priority > right.priority {
+        return false
+    }
+    if left.latest_window < right.latest_window {
+        return true
+    }
+    if left.latest_window > right.latest_window {
+        return false
+    }
+    left.id < right.id
+}
+
+pub fn round_up_div(numerator: U64, denominator: U64) -> U64 {
+    let quotient = numerator / denominator
+    if numerator % denominator == 0 {
+        quotient
+    } else {
+        quotient + 1
+    }
+}
+
+pub fn gross_field_liters(request: IrrigationRequest) -> U64 {
+    round_up_div(
+        U64.from(request.target_delivery_liters) * 10000,
+        U64.from(request.application_efficiency_bps),
+    )
+}
