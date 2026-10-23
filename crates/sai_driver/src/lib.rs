@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod export_world_queries;
+pub mod index_operation_journal_recovery;
 pub mod index_operation_journal_store;
 pub mod index_operation_journal_validation;
 mod interface_impl_resource_wit;
