@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod export_world_queries;
+pub mod index_operation_journal_cli_preflight;
 pub mod index_operation_journal_executor;
 pub mod index_operation_journal_recovery;
 pub mod index_operation_journal_store;
