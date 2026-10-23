@@ -1,0 +1,91 @@
+use acme:community-solar-credit-auditor/audit
+use acme:community-solar-credit-auditor/model.{CreditIssue, DataIssue, MonthlyAudit}
+
+pub fn june_2026_audit() -> MonthlyAudit {
+    audit.audit_month()
+}
+
+test "the deterministic plan never spends more generation than the pool" {
+    let result = june_2026_audit()
+    assert result.summary.households_reviewed == 8
+    assert result.summary.valid_households == 4
+    assert result.summary.eligible_demand_kwh == 525
+    assert result.summary.planned_credit_kwh == 400
+    assert result.summary.reported_credit_kwh == 412
+    assert result.summary.source_overage_kwh == 12
+}
+
+test "an eligible account reported above its planned allocation is flagged" {
+    let result = june_2026_audit()
+    match result.accounts[0] {
+        Some(account) => {
+            assert account.subscriber.account_id == 101
+            assert account.planned_credit_kwh == 150
+            assert account.reported_credit_kwh == Some(155)
+            assert account.credit_issue == Some(CreditIssue.OverAllocated)
+            assert account.over_allocated_kwh == 5
+        }
+        None => {
+            assert false
+        }
+    }
+    match result.accounts[5] {
+        Some(account) => {
+            assert account.subscriber.account_id == 103
+            assert account.planned_credit_kwh == 150
+            assert account.over_allocated_kwh == 5
+        }
+        None => {
+            assert false
+        }
+    }
+    assert result.summary.over_allocated_household_count == 2
+    assert result.summary.over_allocated_kwh == 10
+}
+
+test "missing and invalid meter or contract data have distinct reasons" {
+    let result = june_2026_audit()
+    match result.accounts[1] {
+        Some(account) => {
+            assert account.subscriber.account_id == 105
+            assert account.data_issue == Some(DataIssue.MissingMeterUsage)
+            assert account.credit_issue == Some(CreditIssue.CreditToInvalidAccount)
+        }
+        None => {
+            assert false
+        }
+    }
+    match result.accounts[2] {
+        Some(account) => {
+            assert account.subscriber.account_id == 106
+            assert account.data_issue == Some(DataIssue.ContractCapOutOfRange)
+        }
+        None => {
+            assert false
+        }
+    }
+    assert result.summary.missing_meter_usage_count == 1
+    assert result.summary.contract_cap_out_of_range_count == 1
+    assert result.summary.invalid_account_credit_kwh == 12
+    assert result.summary.missing_contract_cap_count == 1
+    assert result.summary.meter_usage_out_of_range_count == 1
+    assert result.summary.missing_statement_count == 1
+}
+
+test "a valid account reporting fewer credits than planned is under-allocated" {
+    let result = june_2026_audit()
+    match result.accounts[3] {
+        Some(account) => {
+            assert account.subscriber.account_id == 102
+            assert account.planned_credit_kwh == 100
+            assert account.reported_credit_kwh == Some(90)
+            assert account.credit_issue == Some(CreditIssue.UnderAllocated)
+            assert account.under_allocated_kwh == 10
+        }
+        None => {
+            assert false
+        }
+    }
+    assert result.summary.under_allocated_household_count == 1
+    assert result.summary.under_allocated_kwh == 10
+}

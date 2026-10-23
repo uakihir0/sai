@@ -1,0 +1,206 @@
+use acme:community-solar-credit-auditor/allocation
+use acme:community-solar-credit-auditor/model.{
+    AccountAudit
+    AuditSummary
+    CreditIssue
+    DataIssue
+    MonthlyAudit
+}
+
+fn credit_issue(
+    data_issue: Option<DataIssue>,
+    reported_kwh: Option<U32>,
+    planned_kwh: U32,
+) -> Option<CreditIssue> {
+    match reported_kwh {
+        None => Some(CreditIssue.MissingCreditStatement)
+        Some(reported) => match data_issue {
+            Some(_) => {
+                if reported > 0 {
+                    Some(CreditIssue.CreditToInvalidAccount)
+                } else {
+                    None
+                }
+            }
+            None => {
+                if reported > planned_kwh {
+                    Some(CreditIssue.OverAllocated)
+                } else if reported < planned_kwh {
+                    Some(CreditIssue.UnderAllocated)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn overage(planned_kwh: U32, reported_kwh: Option<U32>, data_issue: Option<DataIssue>) -> U32 {
+    match data_issue {
+        Some(_) => 0
+        None => match reported_kwh {
+            Some(reported) => if reported > planned_kwh {
+                reported - planned_kwh
+            } else {
+                0
+            }
+            None => 0
+        }
+    }
+}
+
+fn shortfall(planned_kwh: U32, reported_kwh: Option<U32>, data_issue: Option<DataIssue>) -> U32 {
+    match data_issue {
+        Some(_) => 0
+        None => match reported_kwh {
+            Some(reported) => if reported < planned_kwh {
+                planned_kwh - reported
+            } else {
+                0
+            }
+            None => 0
+        }
+    }
+}
+
+fn add_data_issue(summary: AuditSummary, issue: Option<DataIssue>) -> AuditSummary {
+    match issue {
+        Some(DataIssue.MissingMeterUsage) => {
+            var updated = summary
+            updated.missing_meter_usage_count += 1
+            updated
+        }
+        Some(DataIssue.MeterUsageOutOfRange) => {
+            var updated = summary
+            updated.meter_usage_out_of_range_count += 1
+            updated
+        }
+        Some(DataIssue.MissingContractCap) => {
+            var updated = summary
+            updated.missing_contract_cap_count += 1
+            updated
+        }
+        Some(DataIssue.ContractCapOutOfRange) => {
+            var updated = summary
+            updated.contract_cap_out_of_range_count += 1
+            updated
+        }
+        None => {
+            var updated = summary
+            updated.valid_households += 1
+            updated
+        }
+    }
+}
+
+fn add_credit_issue(
+    summary: AuditSummary,
+    issue: Option<CreditIssue>,
+    over_allocated_kwh: U32,
+    under_allocated_kwh: U32,
+    reported_kwh: Option<U32>,
+) -> AuditSummary {
+    var updated = summary
+    match issue {
+        Some(CreditIssue.MissingCreditStatement) => {
+            updated.missing_statement_count += 1
+        }
+        Some(CreditIssue.OverAllocated) => {
+            updated.over_allocated_household_count += 1
+            updated.over_allocated_kwh += over_allocated_kwh
+        }
+        Some(CreditIssue.UnderAllocated) => {
+            updated.under_allocated_household_count += 1
+            updated.under_allocated_kwh += under_allocated_kwh
+        }
+        Some(CreditIssue.CreditToInvalidAccount) => {
+            updated.invalid_account_credit_count += 1
+            match reported_kwh {
+                Some(value) => {
+                    updated.invalid_account_credit_kwh += value
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+    match reported_kwh {
+        Some(value) => {
+            updated.reported_statement_count += 1
+            updated.reported_credit_kwh += value
+        }
+        None => {}
+    }
+    updated
+}
+
+pub fn audit_month() -> MonthlyAudit {
+    let plan = allocation.build_plan()
+    var accounts = Array<Option<AccountAudit>, 8>.filled(None)
+    var summary = AuditSummary(
+        households_reviewed: 0,
+        valid_households: 0,
+        missing_meter_usage_count: 0,
+        meter_usage_out_of_range_count: 0,
+        missing_contract_cap_count: 0,
+        contract_cap_out_of_range_count: 0,
+        missing_statement_count: 0,
+        over_allocated_household_count: 0,
+        over_allocated_kwh: 0,
+        under_allocated_household_count: 0,
+        under_allocated_kwh: 0,
+        invalid_account_credit_count: 0,
+        invalid_account_credit_kwh: 0,
+        eligible_demand_kwh: plan.eligible_demand_kwh,
+        planned_credit_kwh: plan.planned_credit_kwh,
+        reported_statement_count: 0,
+        reported_credit_kwh: 0,
+        source_overage_kwh: 0,
+    )
+    var index: USize = 0
+
+    for slot in plan.allocations {
+        match slot {
+            Some(expected) => {
+                let reported = expected.subscriber.reported_credit_kwh
+                let issue = credit_issue(expected.data_issue, reported, expected.planned_credit_kwh)
+                let over_allocated_kwh =
+                    overage(expected.planned_credit_kwh, reported, expected.data_issue)
+                let under_allocated_kwh =
+                    shortfall(expected.planned_credit_kwh, reported, expected.data_issue)
+                accounts[index] = Some(
+                    AccountAudit(
+                        rank: expected.rank,
+                        subscriber: expected.subscriber,
+                        data_issue: expected.data_issue,
+                        eligible_demand_kwh: expected.eligible_demand_kwh,
+                        planned_credit_kwh: expected.planned_credit_kwh,
+                        reported_credit_kwh: reported,
+                        credit_issue: issue,
+                        over_allocated_kwh: over_allocated_kwh,
+                        under_allocated_kwh: under_allocated_kwh,
+                    ),
+                )
+                summary.households_reviewed += 1
+                summary = add_data_issue(summary, expected.data_issue)
+                summary = add_credit_issue(
+                    summary,
+                    issue,
+                    over_allocated_kwh,
+                    under_allocated_kwh,
+                    reported,
+                )
+                index += 1
+            }
+            None => {}
+        }
+    }
+
+    summary.source_overage_kwh = if summary.reported_credit_kwh > plan.generation_credit_kwh {
+        summary.reported_credit_kwh - plan.generation_credit_kwh
+    } else {
+        0
+    }
+
+    MonthlyAudit(accounts: accounts, account_count: index, summary: summary)
+}

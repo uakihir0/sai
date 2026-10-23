@@ -1,0 +1,28 @@
+use acme:community-solar-credit-auditor/fixtures
+use acme:community-solar-credit-auditor/model.{SubscriberMonth}
+
+fn precedes(candidate: SubscriberMonth, other: SubscriberMonth) -> Bool {
+    (
+        candidate.priority < other.priority
+        or (candidate.priority == other.priority and candidate.account_id < other.account_id)
+    )
+}
+
+pub fn rank_of(subscriber: SubscriberMonth) -> USize {
+    var rank: USize = 0
+    for candidate in fixtures.subscribers() {
+        if candidate.account_id != subscriber.account_id and precedes(candidate, subscriber) {
+            rank += 1
+        }
+    }
+    rank
+}
+
+pub fn subscriber_at_rank(rank: USize) -> Option<SubscriberMonth> {
+    for subscriber in fixtures.subscribers() {
+        if rank_of(subscriber) == rank {
+            return Some(subscriber)
+        }
+    }
+    None
+}

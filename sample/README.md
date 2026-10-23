@@ -54,6 +54,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`municipal-microgrant-review`](municipal-microgrant-review/README.md) | Screen community project applications, rank a review rubric, and allocate whole grants under budget and district limits. |
 | Advanced | [`wildlife-rescue-dispatch`](wildlife-rescue-dispatch/README.md) | Triage wildlife rescue calls and place animals at qualified clinics under permit, veterinarian, travel-radius, intake-slot, and treatment-hour constraints. |
 | Advanced | [`museum-loan-readiness-review`](museum-loan-readiness-review/README.md) | Audit incoming museum loans for duplicate accessions, lender documents, condition, insurance, shipping crates, gallery humidity, and scarce display capacity. |
+| Advanced | [`community-solar-credit-auditor`](community-solar-credit-auditor/README.md) | Reconcile shared solar generation against subscriber demand, contract caps, utility statements, and data-quality exceptions. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or
