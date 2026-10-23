@@ -3163,6 +3163,7 @@ name = "sai_semantic"
 version = "0.1.0"
 dependencies = [
  "sai_stable_hash",
+ "sai_syntax",
  "serde",
  "serde_json",
  "unicode-ident",
