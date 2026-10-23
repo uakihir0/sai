@@ -895,6 +895,54 @@ mod tests {
         not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
     ))]
     #[test]
+    fn source_parent_replaced_by_symlink_after_observation_cannot_redirect_restore() {
+        let journal = two_source_journal();
+        let source_states = [
+            journal.sources[0].planned_after.clone(),
+            journal.sources[1].before.clone(),
+        ];
+        let (workspace, lock, inventory) = setup_source_states(&journal, &source_states, false);
+        let store = IndexOperationJournalStore::new(&lock);
+        let planned = expected_decision(&store, &journal, &inventory);
+        let index_before = index_files(&workspace);
+        let outside = workspace.0.join("outside");
+        fs::create_dir_all(&outside).expect("create outside directory");
+        fs::write(outside.join("lib.sai"), b"after").expect("write outside sentinel");
+
+        let error = super::execute_index_operation_journal_restore_source_before_with_hook(
+            &store,
+            &journal,
+            &inventory,
+            planned,
+            0,
+            || {
+                fs::rename(workspace.0.join("src"), workspace.0.join("src-captured"))
+                    .expect("move original source directory");
+                std::os::unix::fs::symlink(&outside, workspace.0.join("src"))
+                    .expect("replace source directory with symlink");
+            },
+        )
+        .expect_err("source update must reject a replaced symlink parent");
+
+        assert!(matches!(
+            error,
+            IndexJournalSourceRestoreError::SourceUpdate(
+                sai_package::local_source::LocalPackageSourceFileUpdateError::UnsafePathComponent
+            )
+        ));
+        assert_eq!(
+            fs::read(outside.join("lib.sai")).expect("read outside sentinel"),
+            b"after"
+        );
+        assert_eq!(index_files(&workspace), index_before);
+        assert!(journal_still_exists(&workspace));
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
+    ))]
+    #[test]
     fn changed_journal_after_observation_prevents_source_update() {
         let journal = two_source_journal();
         let source_states = [
