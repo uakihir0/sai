@@ -1,0 +1,76 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ComponentLot {
+    pub lot_id: U32
+    pub component_code: Str
+    pub received_units: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ProductionBatch {
+    pub batch_id: U32
+    pub component_lot_id: U32
+    pub finished_lot_id: U32
+    pub product_code: Str
+    pub component_units_used: U32
+    pub finished_units_produced: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RetailerShipment {
+    pub shipment_id: U32
+    pub finished_lot_id: U32
+    pub retailer_name: Str
+    pub units_shipped: U32
+    pub units_reported_sold: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RecallScenario {
+    pub component_lots: Array<Option<ComponentLot>, 3>
+    pub component_lot_count: USize
+    pub batches: Array<Option<ProductionBatch>, 6>
+    pub batch_count: USize
+    pub shipments: Array<Option<RetailerShipment>, 8>
+    pub shipment_count: USize
+    pub target_component_lot_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type FinishedLotTrace {
+    pub batch_id: U32
+    pub finished_lot_id: U32
+    pub product_code: Str
+    pub units_produced: U32
+    pub units_shipped: U32
+    pub units_at_factory: U32
+    pub units_reported_sold: U32
+    pub units_at_retailers: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ShipmentTrace {
+    pub shipment_id: U32
+    pub finished_lot_id: U32
+    pub retailer_name: Str
+    pub units_shipped: U32
+    pub units_reported_sold: U32
+    pub units_at_retailer: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RecallTrace {
+    pub target_component_lot_id: U32
+    pub component_units_received: U32
+    pub component_units_consumed: U32
+    pub component_units_unconsumed: U32
+    pub finished_lots: Array<Option<FinishedLotTrace>, 6>
+    pub finished_lot_count: USize
+    pub shipments: Array<Option<ShipmentTrace>, 8>
+    pub shipment_count: USize
+    pub affected_batch_count: USize
+    pub affected_finished_units: U32
+    pub units_shipped: U32
+    pub units_at_factory: U32
+    pub units_reported_sold: U32
+    pub units_at_retailers: U32
+}

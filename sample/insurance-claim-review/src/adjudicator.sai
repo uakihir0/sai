@@ -1,0 +1,207 @@
+use acme:insurance-claim-review/model.{
+    Claim
+    ClaimBatch
+    ClaimDecision
+    ClaimOutcome
+    ClaimReport
+    Policy
+    PolicyBalance
+    ReviewReason
+}
+use acme:insurance-claim-review/policy
+
+fn precedes(left: Claim, right: Claim) -> Bool {
+    if left.loss_day != right.loss_day {
+        return left.loss_day < right.loss_day
+    }
+    left.id < right.id
+}
+
+fn initial_review_reason(policy_record: Policy, claim: Claim) -> Option<ReviewReason> {
+    if (
+        claim.loss_day < policy_record.term_start_day
+        or claim.loss_day > policy_record.term_end_day
+    ) {
+        return Some(ReviewReason.LossOutsidePolicyTerm)
+    }
+    if claim.reported_day < claim.loss_day {
+        return Some(ReviewReason.InvalidReportDate)
+    }
+    if claim.reported_day - claim.loss_day > policy_record.notice_period_days {
+        return Some(ReviewReason.LateNotice)
+    }
+    if not policy.covers_peril(policy_record, claim.peril) {
+        return Some(ReviewReason.PerilNotCovered)
+    }
+    if not claim.documents_complete {
+        return Some(ReviewReason.MissingDocuments)
+    }
+    None
+}
+
+fn earlier_paid_event(
+    decisions: Array<Option<ClaimDecision>, 8>,
+    decision_count: USize,
+    policy_id: U32,
+    event_id: U32,
+) -> Bool {
+    for index in 0..decision_count {
+        let decision = decisions[index].unwrap()
+        if (
+            decision.policy_id == policy_id
+            and decision.event_id == event_id
+            and decision.payable_dollars > 0
+        ) {
+            return true
+        }
+    }
+    false
+}
+
+pub fn review(batch: ClaimBatch) -> ClaimReport {
+    var ordered_claims = batch.claims
+    for index in 1..batch.claim_count {
+        let candidate = ordered_claims[index].unwrap()
+        var cursor = index
+        while cursor > 0 {
+            if precedes(candidate, ordered_claims[cursor - 1].unwrap()) {
+                ordered_claims[cursor] = ordered_claims[cursor - 1]
+                cursor -= 1
+            } else {
+                break
+            }
+        }
+        ordered_claims[cursor] = Some(candidate)
+    }
+
+    var aggregate_remaining: Array<U32, 2> = [0, 0]
+    for index in 0..batch.policy_count {
+        let policy_record = batch.policies[index].unwrap()
+        aggregate_remaining[index] = policy.initial_aggregate_remaining(policy_record)
+    }
+
+    var decisions: Array<Option<ClaimDecision>, 8> = [None, None, None, None, None, None, None, None]
+    var paid_count: U32 = 0
+    var capped_count: U32 = 0
+    var denied_count: U32 = 0
+    var pending_count: U32 = 0
+    var total_payable_dollars: U32 = 0
+
+    for index in 0..batch.claim_count {
+        let claim = ordered_claims[index].unwrap()
+        var outcome = ClaimOutcome.Denied
+        var reason: Option<ReviewReason> = None
+        var pre_aggregate_payment_dollars: Option<U32> = None
+        var payable_dollars: U32 = 0
+        var remaining_after: Option<U32> = None
+
+        match policy.index_of(batch, claim.policy_id) {
+            None => {
+                reason = Some(ReviewReason.UnknownPolicy)
+            }
+            Some(policy_index) => {
+                let policy_record = batch.policies[policy_index].unwrap()
+                remaining_after = Some(aggregate_remaining[policy_index])
+                match initial_review_reason(policy_record, claim) {
+                    Some(ReviewReason.MissingDocuments) => {
+                        outcome = ClaimOutcome.Pending
+                        reason = Some(ReviewReason.MissingDocuments)
+                    }
+                    Some(review_reason) => {
+                        reason = Some(review_reason)
+                    }
+                    None => {
+                        if earlier_paid_event(decisions, index, claim.policy_id, claim.event_id) {
+                            reason = Some(ReviewReason.DuplicatePaidEvent)
+                        } else {
+                            let coverage_limit = policy.coverage_limit(policy_record, claim.coverage)
+                            let covered_damage = if claim.estimated_damage_dollars < coverage_limit {
+                                claim.estimated_damage_dollars
+                            } else {
+                                coverage_limit
+                            }
+                            let calculated_pre_aggregate_payment_dollars = if (
+                                covered_damage > policy_record.deductible_dollars
+                            ) {
+                                covered_damage - policy_record.deductible_dollars
+                            } else {
+                                0
+                            }
+                            pre_aggregate_payment_dollars = Some(
+                                calculated_pre_aggregate_payment_dollars
+                            )
+                            if calculated_pre_aggregate_payment_dollars == 0 {
+                                reason = Some(ReviewReason.BelowDeductible)
+                            } else if aggregate_remaining[policy_index] == 0 {
+                                reason = Some(ReviewReason.AggregateExhausted)
+                            } else {
+                                payable_dollars = if (
+                                    calculated_pre_aggregate_payment_dollars < aggregate_remaining[policy_index]
+                                ) {
+                                    calculated_pre_aggregate_payment_dollars
+                                } else {
+                                    aggregate_remaining[policy_index]
+                                }
+                                aggregate_remaining[policy_index] -= payable_dollars
+                                remaining_after = Some(aggregate_remaining[policy_index])
+                                if payable_dollars < calculated_pre_aggregate_payment_dollars {
+                                    outcome = ClaimOutcome.Capped
+                                    reason = Some(ReviewReason.AggregateLimitApplied)
+                                } else {
+                                    outcome = ClaimOutcome.Paid
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        decisions[index] = Some(ClaimDecision(
+            claim_id: claim.id,
+            policy_id: claim.policy_id,
+            event_id: claim.event_id,
+            outcome: outcome,
+            reason: reason,
+            pre_aggregate_payment_dollars: pre_aggregate_payment_dollars,
+            payable_dollars: payable_dollars,
+            remaining_aggregate_dollars: remaining_after,
+        ))
+        total_payable_dollars += payable_dollars
+        match outcome {
+            ClaimOutcome.Paid => {
+                paid_count += 1
+            }
+            ClaimOutcome.Capped => {
+                capped_count += 1
+            }
+            ClaimOutcome.Denied => {
+                denied_count += 1
+            }
+            ClaimOutcome.Pending => {
+                pending_count += 1
+            }
+        }
+    }
+
+    var policy_balances: Array<Option<PolicyBalance>, 2> = [None, None]
+    for index in 0..batch.policy_count {
+        let policy_record = batch.policies[index].unwrap()
+        policy_balances[index] = Some(PolicyBalance(
+            policy_id: policy_record.id,
+            remaining_aggregate_dollars: aggregate_remaining[index],
+        ))
+    }
+
+    ClaimReport(
+        decisions: decisions,
+        decision_count: batch.claim_count,
+        paid_count: paid_count,
+        capped_count: capped_count,
+        denied_count: denied_count,
+        pending_count: pending_count,
+        total_payable_dollars: total_payable_dollars,
+        policy_balances: policy_balances,
+        policy_balance_count: batch.policy_count,
+    )
+}

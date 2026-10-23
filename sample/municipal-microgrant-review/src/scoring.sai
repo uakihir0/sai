@@ -1,0 +1,37 @@
+use acme:municipal-microgrant-review/fixtures
+use acme:municipal-microgrant-review/model.{Application}
+
+pub fn total_score(application: Application) -> U64 {
+    // Keep ranking defined even when invalid U32 rubric components are rejected
+    // later by the eligibility check.
+    U64(application.need_points)
+        + U64(application.resident_impact_points)
+        + U64(application.readiness_points)
+        + U64(application.match_points)
+}
+
+fn precedes(candidate: Application, other: Application) -> Bool {
+    let candidate_score = total_score(candidate)
+    let other_score = total_score(other)
+    candidate_score > other_score
+        or (candidate_score == other_score and candidate.id < other.id)
+}
+
+pub fn review_rank(application: Application) -> USize {
+    var rank: USize = 0
+    for candidate in fixtures.applications() {
+        if candidate.id != application.id and precedes(candidate, application) {
+            rank += 1
+        }
+    }
+    rank
+}
+
+pub fn application_at_rank(rank: USize) -> Option<Application> {
+    for application in fixtures.applications() {
+        if review_rank(application) == rank {
+            return Some(application)
+        }
+    }
+    None
+}

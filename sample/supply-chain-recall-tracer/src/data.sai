@@ -1,0 +1,156 @@
+use acme:supply-chain-recall-tracer/model.{
+    ComponentLot
+    ProductionBatch
+    RecallScenario
+    RetailerShipment
+}
+
+pub fn scenario() -> RecallScenario {
+    RecallScenario(
+        component_lots: [
+            Some(ComponentLot(lot_id: 703, component_code: "BRKT-B", received_units: 100)),
+            Some(ComponentLot(lot_id: 701, component_code: "BRKT-A", received_units: 120)),
+            Some(ComponentLot(lot_id: 702, component_code: "BRKT-A", received_units: 140)),
+        ],
+        component_lot_count: 3,
+        batches: [
+            Some(
+                ProductionBatch(
+                    batch_id: 5004,
+                    component_lot_id: 703,
+                    finished_lot_id: 9004,
+                    product_code: "MX-8",
+                    component_units_used: 30,
+                    finished_units_produced: 30,
+                ),
+            ),
+            Some(
+                ProductionBatch(
+                    batch_id: 5002,
+                    component_lot_id: 701,
+                    finished_lot_id: 9002,
+                    product_code: "MX-7",
+                    component_units_used: 60,
+                    finished_units_produced: 60,
+                ),
+            ),
+            Some(
+                ProductionBatch(
+                    batch_id: 5001,
+                    component_lot_id: 702,
+                    finished_lot_id: 9001,
+                    product_code: "MX-7",
+                    component_units_used: 80,
+                    finished_units_produced: 80,
+                ),
+            ),
+            Some(
+                ProductionBatch(
+                    batch_id: 5005,
+                    component_lot_id: 701,
+                    finished_lot_id: 9005,
+                    product_code: "MX-8",
+                    component_units_used: 20,
+                    finished_units_produced: 20,
+                ),
+            ),
+            Some(
+                ProductionBatch(
+                    batch_id: 5003,
+                    component_lot_id: 701,
+                    finished_lot_id: 9003,
+                    product_code: "MX-7",
+                    component_units_used: 40,
+                    finished_units_produced: 40,
+                ),
+            ),
+            Some(
+                ProductionBatch(
+                    batch_id: 5006,
+                    component_lot_id: 702,
+                    finished_lot_id: 9006,
+                    product_code: "MX-8",
+                    component_units_used: 50,
+                    finished_units_produced: 50,
+                ),
+            ),
+        ],
+        batch_count: 6,
+        shipments: [
+            Some(
+                RetailerShipment(
+                    shipment_id: 8004,
+                    finished_lot_id: 9003,
+                    retailer_name: "Northstar Market",
+                    units_shipped: 25,
+                    units_reported_sold: 5,
+                ),
+            ),
+            Some(
+                RetailerShipment(
+                    shipment_id: 7999,
+                    finished_lot_id: 9001,
+                    retailer_name: "Northstar Market",
+                    units_shipped: 60,
+                    units_reported_sold: 20,
+                ),
+            ),
+            Some(
+                RetailerShipment(
+                    shipment_id: 8001,
+                    finished_lot_id: 9002,
+                    retailer_name: "Northstar Market",
+                    units_shipped: 20,
+                    units_reported_sold: 10,
+                ),
+            ),
+            Some(
+                RetailerShipment(
+                    shipment_id: 8005,
+                    finished_lot_id: 9005,
+                    retailer_name: "Value Outlet",
+                    units_shipped: 15,
+                    units_reported_sold: 7,
+                ),
+            ),
+            Some(
+                RetailerShipment(
+                    shipment_id: 8003,
+                    finished_lot_id: 9003,
+                    retailer_name: "City Market",
+                    units_shipped: 10,
+                    units_reported_sold: 10,
+                ),
+            ),
+            Some(
+                RetailerShipment(
+                    shipment_id: 8002,
+                    finished_lot_id: 9002,
+                    retailer_name: "Lakeside Stores",
+                    units_shipped: 35,
+                    units_reported_sold: 5,
+                ),
+            ),
+            Some(
+                RetailerShipment(
+                    shipment_id: 8006,
+                    finished_lot_id: 9004,
+                    retailer_name: "City Market",
+                    units_shipped: 20,
+                    units_reported_sold: 2,
+                ),
+            ),
+            Some(
+                RetailerShipment(
+                    shipment_id: 8007,
+                    finished_lot_id: 9001,
+                    retailer_name: "Lakeside Stores",
+                    units_shipped: 10,
+                    units_reported_sold: 3,
+                ),
+            ),
+        ],
+        shipment_count: 8,
+        target_component_lot_id: 701,
+    )
+}

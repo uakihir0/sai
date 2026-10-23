@@ -3066,16 +3066,19 @@ name = "sai_driver"
 version = "0.1.0"
 dependencies = [
  "ctrlc",
+ "getrandom 0.4.3",
  "sai_diagnostics",
  "sai_hir",
  "sai_intern",
  "sai_package",
  "sai_query",
  "sai_resolve",
+ "sai_semantic",
  "sai_stable_hash",
  "sai_syntax",
  "sai_ty",
  "sai_vfs",
+ "sai_windows_fs",
  "sai_wit",
  "wit-parser",
 ]

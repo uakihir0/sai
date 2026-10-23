@@ -1,0 +1,37 @@
+use acme:supply-chain-recall-tracer/model.{ProductionBatch, RecallScenario}
+
+fn precedes(left: ProductionBatch, right: ProductionBatch) -> Bool {
+    left.batch_id < right.batch_id
+}
+
+pub fn ordered_batches(scenario: RecallScenario) -> Array<Option<ProductionBatch>, 6> {
+    var ordered = scenario.batches
+    for index in 1..scenario.batch_count {
+        let candidate = ordered[index].unwrap()
+        var cursor = index
+        while cursor > 0 {
+            if precedes(candidate, ordered[cursor - 1].unwrap()) {
+                ordered[cursor] = ordered[cursor - 1]
+                cursor -= 1
+            } else {
+                break
+            }
+        }
+        ordered[cursor] = Some(candidate)
+    }
+    ordered
+}
+
+pub fn consumes_target_lot(batch: ProductionBatch, target_component_lot_id: U32) -> Bool {
+    batch.component_lot_id == target_component_lot_id
+}
+
+pub fn received_units(scenario: RecallScenario, component_lot_id: U32) -> U32 {
+    for index in 0..scenario.component_lot_count {
+        let component_lot = scenario.component_lots[index].unwrap()
+        if component_lot.lot_id == component_lot_id {
+            return component_lot.received_units
+        }
+    }
+    0
+}

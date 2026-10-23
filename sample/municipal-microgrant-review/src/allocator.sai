@@ -1,0 +1,133 @@
+use acme:municipal-microgrant-review/eligibility
+use acme:municipal-microgrant-review/fixtures
+use acme:municipal-microgrant-review/model.{Application, DecisionReason, District, GrantDecision, GrantPlan}
+use acme:municipal-microgrant-review/scoring
+
+fn awarded_in_district(
+    awards: Array<Option<District>, 7>,
+    award_count: USize,
+    district: District,
+) -> USize {
+    var count: USize = 0
+    for index in 0..award_count {
+        match awards[index] {
+            Some(awarded_district) => {
+                if awarded_district == district {
+                    count += 1
+                }
+            }
+            None => {}
+        }
+    }
+    count
+}
+
+fn decision(
+    rank: USize,
+    application: Application,
+    remaining_budget: U32,
+    awards: Array<Option<District>, 7>,
+    award_count: USize,
+) -> GrantDecision {
+    let score = scoring.total_score(application)
+    match eligibility.ineligibility_reason(application) {
+        Some(reason) => GrantDecision(
+            rank: rank + 1,
+            application: application,
+            score: score,
+            awarded: false,
+            reason: Some(reason),
+            award_thousands: 0,
+        )
+        None => {
+            if awarded_in_district(awards, award_count, application.district)
+                >= fixtures.maximum_awards_per_district()
+            {
+                GrantDecision(
+                    rank: rank + 1,
+                    application: application,
+                    score: score,
+                    awarded: false,
+                    reason: Some(DecisionReason.DistrictAwardLimit),
+                    award_thousands: 0,
+                )
+            } else if application.request_thousands > remaining_budget {
+                GrantDecision(
+                    rank: rank + 1,
+                    application: application,
+                    score: score,
+                    awarded: false,
+                    reason: Some(DecisionReason.InsufficientRemainingBudget),
+                    award_thousands: 0,
+                )
+            } else {
+                GrantDecision(
+                    rank: rank + 1,
+                    application: application,
+                    score: score,
+                    awarded: true,
+                    reason: None,
+                    award_thousands: application.request_thousands,
+                )
+            }
+        }
+    }
+}
+
+pub fn build_plan() -> GrantPlan {
+    var decisions = Array<Option<GrantDecision>, 7>.filled(None)
+    var awards = Array<Option<District>, 7>.filled(None)
+    var remaining_budget = fixtures.cycle_budget_thousands()
+    var decision_count: USize = 0
+    var award_count: USize = 0
+    var ineligible_count: USize = 0
+    var district_limit_count: USize = 0
+    var budget_limit_count: USize = 0
+    var rank: USize = 0
+
+    while rank < 7 {
+        match scoring.application_at_rank(rank) {
+            Some(application) => {
+                let selected = decision(
+                    rank,
+                    application,
+                    remaining_budget,
+                    awards,
+                    award_count,
+                )
+                decisions[rank] = Some(selected)
+                decision_count += 1
+                match selected.reason {
+                    Some(DecisionReason.MissingNonprofitRegistration) => ineligible_count += 1
+                    Some(DecisionReason.IncompleteApplication) => ineligible_count += 1
+                    Some(DecisionReason.OutsideCityServiceArea) => ineligible_count += 1
+                    Some(DecisionReason.MatchShareOutOfRange) => ineligible_count += 1
+                    Some(DecisionReason.InsufficientMatch) => ineligible_count += 1
+                    Some(DecisionReason.ZeroRequest) => ineligible_count += 1
+                    Some(DecisionReason.RequestAboveProgramLimit) => ineligible_count += 1
+                    Some(DecisionReason.RubricScoreOutOfRange) => ineligible_count += 1
+                    Some(DecisionReason.DistrictAwardLimit) => district_limit_count += 1
+                    Some(DecisionReason.InsufficientRemainingBudget) => budget_limit_count += 1
+                    None => {
+                        awards[award_count] = Some(application.district)
+                        award_count += 1
+                        remaining_budget -= application.request_thousands
+                    }
+                }
+            }
+            None => {}
+        }
+        rank += 1
+    }
+
+    GrantPlan(
+        decisions: decisions,
+        decision_count: decision_count,
+        award_count: award_count,
+        ineligible_count: ineligible_count,
+        district_limit_count: district_limit_count,
+        budget_limit_count: budget_limit_count,
+        total_awarded_thousands: fixtures.cycle_budget_thousands() - remaining_budget,
+        remaining_budget_thousands: remaining_budget,
+    )
+}

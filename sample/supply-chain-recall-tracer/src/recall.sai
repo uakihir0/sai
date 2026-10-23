@@ -1,0 +1,141 @@
+use acme:supply-chain-recall-tracer/lineage
+use acme:supply-chain-recall-tracer/model.{
+    FinishedLotTrace
+    ProductionBatch
+    RecallScenario
+    RecallTrace
+    RetailerShipment
+    ShipmentTrace
+}
+
+fn shipment_precedes(left: RetailerShipment, right: RetailerShipment) -> Bool {
+    left.shipment_id < right.shipment_id
+}
+
+fn ordered_shipments(scenario: RecallScenario) -> Array<Option<RetailerShipment>, 8> {
+    var ordered = scenario.shipments
+    for index in 1..scenario.shipment_count {
+        let candidate = ordered[index].unwrap()
+        var cursor = index
+        while cursor > 0 {
+            if shipment_precedes(candidate, ordered[cursor - 1].unwrap()) {
+                ordered[cursor] = ordered[cursor - 1]
+                cursor -= 1
+            } else {
+                break
+            }
+        }
+        ordered[cursor] = Some(candidate)
+    }
+    ordered
+}
+
+fn summarize_finished_lot(
+    batch: ProductionBatch,
+    shipments: Array<Option<RetailerShipment>, 8>,
+    shipment_count: USize,
+) -> FinishedLotTrace {
+    var units_shipped: U32 = 0
+    var units_reported_sold: U32 = 0
+    for index in 0..shipment_count {
+        let shipment = shipments[index].unwrap()
+        if shipment.finished_lot_id == batch.finished_lot_id {
+            units_shipped += shipment.units_shipped
+            units_reported_sold += shipment.units_reported_sold
+        }
+    }
+
+    FinishedLotTrace(
+        batch_id: batch.batch_id,
+        finished_lot_id: batch.finished_lot_id,
+        product_code: batch.product_code,
+        units_produced: batch.finished_units_produced,
+        units_shipped: units_shipped,
+        units_at_factory: batch.finished_units_produced - units_shipped,
+        units_reported_sold: units_reported_sold,
+        units_at_retailers: units_shipped - units_reported_sold,
+    )
+}
+
+fn traces_finished_lot(
+    trace: Array<Option<FinishedLotTrace>, 6>,
+    finished_lot_count: USize,
+    finished_lot_id: U32,
+) -> Bool {
+    for index in 0..finished_lot_count {
+        if trace[index].unwrap().finished_lot_id == finished_lot_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn trace(scenario: RecallScenario) -> RecallTrace {
+    let batches = lineage.ordered_batches(scenario)
+    let shipments = ordered_shipments(scenario)
+    var finished_lots: Array<Option<FinishedLotTrace>, 6> =
+        Array<Option<FinishedLotTrace>, 6>.filled(None)
+    var finished_lot_count: USize = 0
+    var affected_batch_count: USize = 0
+    var affected_finished_units: U32 = 0
+    var units_shipped: U32 = 0
+    var units_at_factory: U32 = 0
+    var units_reported_sold: U32 = 0
+    var units_at_retailers: U32 = 0
+    var component_units_consumed: U32 = 0
+
+    for index in 0..scenario.batch_count {
+        let batch = batches[index].unwrap()
+        if lineage.consumes_target_lot(batch, scenario.target_component_lot_id) {
+            let finished_lot = summarize_finished_lot(batch, shipments, scenario.shipment_count)
+            finished_lots[finished_lot_count] = Some(finished_lot)
+            finished_lot_count += 1
+            affected_batch_count += 1
+            affected_finished_units += finished_lot.units_produced
+            units_shipped += finished_lot.units_shipped
+            units_at_factory += finished_lot.units_at_factory
+            units_reported_sold += finished_lot.units_reported_sold
+            units_at_retailers += finished_lot.units_at_retailers
+            component_units_consumed += batch.component_units_used
+        }
+    }
+
+    var affected_shipments: Array<Option<ShipmentTrace>, 8> =
+        Array<Option<ShipmentTrace>, 8>.filled(None)
+    var shipment_count: USize = 0
+    for index in 0..scenario.shipment_count {
+        let shipment = shipments[index].unwrap()
+        if traces_finished_lot(finished_lots, finished_lot_count, shipment.finished_lot_id) {
+            affected_shipments[shipment_count] = Some(
+                ShipmentTrace(
+                    shipment_id: shipment.shipment_id,
+                    finished_lot_id: shipment.finished_lot_id,
+                    retailer_name: shipment.retailer_name,
+                    units_shipped: shipment.units_shipped,
+                    units_reported_sold: shipment.units_reported_sold,
+                    units_at_retailer: shipment.units_shipped - shipment.units_reported_sold,
+                ),
+            )
+            shipment_count += 1
+        }
+    }
+
+    let component_units_received =
+        lineage.received_units(scenario, scenario.target_component_lot_id)
+    RecallTrace(
+        target_component_lot_id: scenario.target_component_lot_id,
+        component_units_received: component_units_received,
+        component_units_consumed: component_units_consumed,
+        component_units_unconsumed: component_units_received - component_units_consumed,
+        finished_lots: finished_lots,
+        finished_lot_count: finished_lot_count,
+        shipments: affected_shipments,
+        shipment_count: shipment_count,
+        affected_batch_count: affected_batch_count,
+        affected_finished_units: affected_finished_units,
+        units_shipped: units_shipped,
+        units_at_factory: units_at_factory,
+        units_reported_sold: units_reported_sold,
+        units_at_retailers: units_at_retailers,
+    )
+}

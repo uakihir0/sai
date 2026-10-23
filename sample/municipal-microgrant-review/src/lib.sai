@@ -1,0 +1,73 @@
+use acme:municipal-microgrant-review/allocator
+use acme:municipal-microgrant-review/model.{DecisionReason}
+use acme:municipal-microgrant-review/model.{GrantPlan}
+
+pub fn fall_cycle_plan() -> GrantPlan {
+    allocator.build_plan()
+}
+
+test "the ranked review stays within the cycle budget" {
+    let plan = fall_cycle_plan()
+    assert plan.decision_count == 7
+    assert plan.award_count == 4
+    assert plan.total_awarded_thousands == 100
+    assert plan.remaining_budget_thousands == 0
+}
+
+test "an ineligible high-scoring request does not consume grant funds" {
+    let plan = fall_cycle_plan()
+    match plan.decisions[1] {
+        Some(decision) => {
+            assert decision.application.id == 107
+            assert not decision.awarded
+            assert decision.reason == Some(DecisionReason.MissingNonprofitRegistration)
+        }
+        None => {
+            assert false
+        }
+    }
+    match plan.decisions[2] {
+        Some(decision) => {
+            assert decision.application.id == 104
+            assert decision.awarded
+            assert decision.award_thousands == 15
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "the district cap and whole-request budget rule are reported" {
+    let plan = fall_cycle_plan()
+    match plan.decisions[4] {
+        Some(decision) => {
+            assert decision.application.id == 101
+            assert not decision.awarded
+            assert decision.reason == Some(DecisionReason.DistrictAwardLimit)
+        }
+        None => {
+            assert false
+        }
+    }
+    match plan.decisions[5] {
+        Some(decision) => {
+            assert decision.application.id == 105
+            assert not decision.awarded
+            assert decision.reason == Some(DecisionReason.InsufficientRemainingBudget)
+        }
+        None => {
+            assert false
+        }
+    }
+    match plan.decisions[6] {
+        Some(decision) => {
+            assert decision.application.id == 106
+            assert decision.awarded
+            assert decision.award_thousands == 20
+        }
+        None => {
+            assert false
+        }
+    }
+}

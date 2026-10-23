@@ -1,0 +1,311 @@
+use acme:home-energy-bill-auditor/fixtures
+use acme:home-energy-bill-auditor/model.{
+    BillError
+    BillQuote
+    MAX_MONTHLY_EXPORT_KWH
+    MAX_MONTHLY_IMPORT_KWH
+    MAX_PEAK_DEMAND_KW
+    PlanComparison
+    PriceModel
+    RatePlan
+    UsageProfile
+}
+use acme:home-energy-bill-auditor/tariffs
+
+const MAX_RATE_CENTS_PER_KWH: U32 = 100
+const MAX_DEMAND_CHARGE_CENTS_PER_KW: U32 = 1_000
+const MAX_SERVICE_CHARGE_CENTS: U32 = 100_000
+const MAX_TAX_PERCENT: U32 = 20
+
+fn validate_usage(usage: UsageProfile) -> Result<U32, BillError> {
+    if usage.peak_kwh > MAX_MONTHLY_IMPORT_KWH or usage.off_peak_kwh > MAX_MONTHLY_IMPORT_KWH {
+        return Err(BillError.MonthlyImportExceedsLimit)
+    }
+    if usage.peak_kwh + usage.off_peak_kwh > MAX_MONTHLY_IMPORT_KWH {
+        return Err(BillError.MonthlyImportExceedsLimit)
+    }
+    if usage.exported_kwh > MAX_MONTHLY_EXPORT_KWH {
+        return Err(BillError.ExportsExceedLimit)
+    }
+    if usage.peak_demand_kw > MAX_PEAK_DEMAND_KW {
+        return Err(BillError.DemandExceedsLimit)
+    }
+
+    Ok(usage.peak_kwh + usage.off_peak_kwh)
+}
+
+fn validate_plan(plan: RatePlan) -> Result<(), BillError> {
+    if plan.service_charge_cents > MAX_SERVICE_CHARGE_CENTS {
+        return Err(BillError.InvalidCharge)
+    }
+    if plan.tax_percent > MAX_TAX_PERCENT {
+        return Err(BillError.InvalidTaxRate)
+    }
+    if (
+        plan.flat_rate_cents_per_kwh > MAX_RATE_CENTS_PER_KWH
+        or plan.peak_rate_cents_per_kwh > MAX_RATE_CENTS_PER_KWH
+        or plan.off_peak_rate_cents_per_kwh > MAX_RATE_CENTS_PER_KWH
+        or plan.export_credit_cents_per_kwh > MAX_RATE_CENTS_PER_KWH
+    ) {
+        return Err(BillError.InvalidRate)
+    }
+    if plan.demand_charge_cents_per_kw > MAX_DEMAND_CHARGE_CENTS_PER_KW {
+        return Err(BillError.InvalidCharge)
+    }
+    match plan.model {
+        PriceModel.Flat => {
+            if plan.peak_rate_cents_per_kwh != 0 or plan.off_peak_rate_cents_per_kwh != 0 {
+                return Err(BillError.InactiveRateMustBeZero)
+            }
+        }
+        PriceModel.TimeOfUse => {
+            if plan.flat_rate_cents_per_kwh != 0 {
+                return Err(BillError.InactiveRateMustBeZero)
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn energy_charge_cents(usage: UsageProfile, plan: RatePlan, imported_kwh: U32) -> U32 {
+    match plan.model {
+        PriceModel.Flat => imported_kwh * plan.flat_rate_cents_per_kwh
+        PriceModel.TimeOfUse => {
+            (
+                usage.peak_kwh * plan.peak_rate_cents_per_kwh
+                + usage.off_peak_kwh * plan.off_peak_rate_cents_per_kwh
+            )
+        }
+    }
+}
+
+pub fn quote(usage: UsageProfile, plan: RatePlan) -> Result<BillQuote, BillError> {
+    let imported_kwh = validate_usage(usage)?
+    validate_plan(plan)?
+
+    let energy_charge = energy_charge_cents(usage, plan, imported_kwh)
+    let requested_export_credit = usage.exported_kwh * plan.export_credit_cents_per_kwh
+    let export_credit = if requested_export_credit > energy_charge {
+        energy_charge
+    } else {
+        requested_export_credit
+    }
+    let demand_charge = usage.peak_demand_kw * plan.demand_charge_cents_per_kw
+    let taxable_subtotal = energy_charge - export_credit + demand_charge + plan.service_charge_cents
+    let tax = taxable_subtotal * plan.tax_percent / 100
+
+    Ok(
+        BillQuote(
+            account_id: usage.account_id,
+            plan_id: plan.id,
+            imported_kwh: imported_kwh,
+            energy_charge_cents: energy_charge,
+            export_credit_cents: export_credit,
+            demand_charge_cents: demand_charge,
+            service_charge_cents: plan.service_charge_cents,
+            taxable_subtotal_cents: taxable_subtotal,
+            tax_cents: tax,
+            total_cents: taxable_subtotal + tax,
+        ),
+    )
+}
+
+fn is_lower_cost(first: BillQuote, second: BillQuote) -> Bool {
+    first.total_cents <= second.total_cents
+}
+
+pub fn compare(usage: UsageProfile, plans: Array<RatePlan, 2>) -> Result<
+    PlanComparison,
+    BillError,
+> {
+    if plans[0].id == plans[1].id {
+        return Err(BillError.DuplicatePlanId)
+    }
+
+    let first = quote(usage, plans[0])?
+    let second = quote(usage, plans[1])?
+    let recommended_index = if is_lower_cost(first, second) {
+        0
+    } else {
+        1
+    }
+
+    Ok(PlanComparison(quotes: [first, second], recommended_index: recommended_index))
+}
+
+test "the solar household prefers the lower total after capped credits and tax" {
+    match compare(fixtures.solar_household(), tariffs.comparison_plans()) {
+        Ok(comparison) => {
+            assert comparison.quotes[0].energy_charge_cents == 9_000
+            assert comparison.quotes[0].export_credit_cents == 200
+            assert comparison.quotes[0].taxable_subtotal_cents == 9_700
+            assert comparison.quotes[0].tax_cents == 485
+            assert comparison.quotes[0].total_cents == 10_185
+
+            assert comparison.quotes[1].energy_charge_cents == 6_450
+            assert comparison.quotes[1].demand_charge_cents == 1_800
+            assert comparison.quotes[1].taxable_subtotal_cents == 8_950
+            assert comparison.quotes[1].tax_cents == 447
+            assert comparison.quotes[1].total_cents == 9_397
+            assert comparison.recommended_index == 1
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "high peak demand can make the flat plan cheaper" {
+    match compare(fixtures.peak_heavy_household(), tariffs.comparison_plans()) {
+        Ok(comparison) => {
+            assert comparison.quotes[0].total_cents == 10_395
+            assert comparison.quotes[1].total_cents == 19_320
+            assert comparison.recommended_index == 0
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "export credits are capped at energy charges before fixed and demand charges" {
+    match quote(fixtures.export_only_profile(), tariffs.flat_solar()) {
+        Ok(bill) => {
+            assert bill.energy_charge_cents == 15
+            assert bill.export_credit_cents == 15
+            assert bill.service_charge_cents == 900
+            assert bill.taxable_subtotal_cents == 900
+            assert bill.total_cents == 945
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "usage above the monthly import limit is rejected before billing" {
+    assert (
+        quote(fixtures.over_limit_profile(), tariffs.flat_solar())
+        == Err(BillError.MonthlyImportExceedsLimit)
+    )
+}
+
+test "identical plan IDs are rejected instead of hiding which terms were chosen" {
+    let plan = tariffs.flat_solar()
+    assert (compare(fixtures.solar_household(), [plan, plan]) == Err(BillError.DuplicatePlanId))
+}
+
+test "an inactive price model rate must be zero" {
+    let invalid_flat = RatePlan(
+        id: "INVALID",
+        model: PriceModel.Flat,
+        service_charge_cents: 0,
+        flat_rate_cents_per_kwh: 10,
+        peak_rate_cents_per_kwh: 1,
+        off_peak_rate_cents_per_kwh: 0,
+        export_credit_cents_per_kwh: 0,
+        demand_charge_cents_per_kw: 0,
+        tax_percent: 0,
+    )
+    assert (
+        quote(fixtures.solar_household(), invalid_flat) == Err(BillError.InactiveRateMustBeZero)
+    )
+}
+
+test "equal totals keep the first plan in the caller's input order" {
+    let later_id = RatePlan(
+        id: "Z-PLAN",
+        model: PriceModel.Flat,
+        service_charge_cents: 0,
+        flat_rate_cents_per_kwh: 0,
+        peak_rate_cents_per_kwh: 0,
+        off_peak_rate_cents_per_kwh: 0,
+        export_credit_cents_per_kwh: 0,
+        demand_charge_cents_per_kw: 0,
+        tax_percent: 0,
+    )
+    let earlier_id = RatePlan(
+        id: "A-PLAN",
+        model: PriceModel.Flat,
+        service_charge_cents: 0,
+        flat_rate_cents_per_kwh: 0,
+        peak_rate_cents_per_kwh: 0,
+        off_peak_rate_cents_per_kwh: 0,
+        export_credit_cents_per_kwh: 0,
+        demand_charge_cents_per_kw: 0,
+        tax_percent: 0,
+    )
+    match compare(fixtures.solar_household(), [later_id, earlier_id]) {
+        Ok(comparison) => {
+            assert comparison.recommended_index == 0
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "tax on a sub-cent fractional amount rounds down" {
+    let small_flat = RatePlan(
+        id: "SMALL-FLAT",
+        model: PriceModel.Flat,
+        service_charge_cents: 0,
+        flat_rate_cents_per_kwh: 15,
+        peak_rate_cents_per_kwh: 0,
+        off_peak_rate_cents_per_kwh: 0,
+        export_credit_cents_per_kwh: 0,
+        demand_charge_cents_per_kw: 0,
+        tax_percent: 5,
+    )
+    let one_kwh = UsageProfile(
+        account_id: "ONE-KWH",
+        peak_kwh: 1,
+        off_peak_kwh: 0,
+        exported_kwh: 0,
+        peak_demand_kw: 0,
+    )
+    match quote(one_kwh, small_flat) {
+        Ok(bill) => {
+            assert bill.taxable_subtotal_cents == 15
+            assert bill.tax_cents == 0
+            assert bill.total_cents == 15
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}
+
+test "maximum allowed usage and rates keep every bill amount within U32" {
+    let maximum_plan = RatePlan(
+        id: "MAXIMUM",
+        model: PriceModel.TimeOfUse,
+        service_charge_cents: 100_000,
+        flat_rate_cents_per_kwh: 0,
+        peak_rate_cents_per_kwh: 100,
+        off_peak_rate_cents_per_kwh: 100,
+        export_credit_cents_per_kwh: 100,
+        demand_charge_cents_per_kw: 1_000,
+        tax_percent: 20,
+    )
+    let maximum_usage = UsageProfile(
+        account_id: "MAXIMUM",
+        peak_kwh: 10_000,
+        off_peak_kwh: 0,
+        exported_kwh: 0,
+        peak_demand_kw: 500,
+    )
+    match quote(maximum_usage, maximum_plan) {
+        Ok(bill) => {
+            assert bill.energy_charge_cents == 1_000_000
+            assert bill.demand_charge_cents == 500_000
+            assert bill.taxable_subtotal_cents == 1_600_000
+            assert bill.tax_cents == 320_000
+            assert bill.total_cents == 1_920_000
+        }
+        Err(_) => {
+            assert false
+        }
+    }
+}

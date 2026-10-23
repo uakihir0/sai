@@ -978,6 +978,182 @@ pub fn open_child_directory_for_file_updates_without_following(
     }
 }
 
+/// Create one direct child directory without following or replacing an
+/// existing entry.
+pub fn create_child_directory_without_following(
+    parent: &File,
+    child_name: &OsStr,
+) -> io::Result<File> {
+    validate_child_name(child_name)?;
+    #[cfg(windows)]
+    {
+        windows_handle::create_child_directory(parent, child_name)
+    }
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, mkdirat, openat};
+
+        mkdirat(parent, child_name, Mode::RUSR | Mode::WUSR | Mode::XUSR)
+            .map_err(io::Error::from)?;
+        openat(
+            parent,
+            child_name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map(File::from)
+        .map_err(io::Error::from)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, child_name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "handle-relative directory creation is unavailable on this platform",
+        ))
+    }
+}
+
+/// Create a new direct child regular file without following or replacing an
+/// existing entry. The returned handle is opened for writing and is suitable
+/// for `sync_all` before publication.
+pub fn create_new_file_in_directory_without_following(
+    parent: &File,
+    child_name: &OsStr,
+) -> io::Result<File> {
+    validate_child_name(child_name)?;
+    #[cfg(windows)]
+    {
+        windows_handle::create_child_file(parent, child_name)
+    }
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, openat};
+
+        let file = openat(
+            parent,
+            child_name,
+            OFlags::WRONLY
+                | OFlags::CREATE
+                | OFlags::EXCL
+                | OFlags::CLOEXEC
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map(File::from)
+        .map_err(io::Error::from)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "created child is not a regular file",
+            ));
+        }
+        Ok(file)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, child_name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "handle-relative file creation is unavailable on this platform",
+        ))
+    }
+}
+
+/// Atomically move one direct child file to a new direct child name without
+/// replacing an existing entry.
+///
+/// Unix support is provided where the platform has an atomic exclusive rename
+/// primitive (Linux, Android, Apple platforms, and Redox). Filesystems or
+/// kernels that reject the primitive return their error; callers must not
+/// fall back to a check-then-rename sequence.
+pub fn move_file_in_directory_without_replacing(
+    parent: &File,
+    source_name: &OsStr,
+    destination_name: &OsStr,
+) -> io::Result<()> {
+    validate_child_name(source_name)?;
+    validate_child_name(destination_name)?;
+    #[cfg(windows)]
+    {
+        windows_handle::move_child_without_replacing(parent, source_name, destination_name)
+    }
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "redox"
+    ))]
+    {
+        use rustix::fs::{RenameFlags, renameat_with};
+
+        renameat_with(
+            parent,
+            source_name,
+            parent,
+            destination_name,
+            RenameFlags::NOREPLACE,
+        )
+        .map_err(Into::into)
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "redox"
+        ))
+    ))]
+    {
+        let _ = (parent, source_name, destination_name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic no-replace file rename is unavailable on this Unix platform",
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (parent, source_name, destination_name);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic no-replace file rename is unavailable on this platform",
+        ))
+    }
+}
+
+/// Flush metadata for an open directory handle.
+///
+/// Unix uses `fsync` through `File::sync_all`. Windows does not expose a
+/// supported general directory-flush operation, so it returns
+/// [`io::ErrorKind::Unsupported`] rather than claiming durable namespace
+/// updates.
+pub fn sync_directory(directory: &File) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        directory.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        let _ = directory;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "durable directory metadata flush is unavailable on Windows",
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = directory;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "directory metadata flush is unavailable on this platform",
+        ))
+    }
+}
+
 /// Open a direct child regular file without following a symbolic link.
 ///
 /// `file_name` must be one normal path component. Both supported platforms
@@ -1212,7 +1388,10 @@ pub fn replace_file_in_directory_if_unchanged(
         .checked_add(1)
         .and_then(|length| u64::try_from(length).ok())
         .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-    let mut current_contents = Vec::with_capacity(expected_contents.len().saturating_add(1));
+    let mut current_contents = Vec::new();
+    current_contents
+        .try_reserve_exact(expected_contents.len().saturating_add(1))
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
     (&mut current)
         .take(read_limit)
         .read_to_end(&mut current_contents)?;
@@ -1228,6 +1407,71 @@ pub fn replace_file_in_directory_if_unchanged(
     // by the caller's workspace lock until the rename below.
     drop(current);
     replace_file_in_directory(parent, source_name, destination_name)
+}
+
+/// Remove one child file only when it still has the selected identity and
+/// contents.
+///
+/// Identity and contents are checked through the pinned parent directory
+/// immediately before removal. Filesystems do not provide a portable
+/// handle-relative compare-and-unlink operation, so callers must serialize
+/// cooperating writers with their workspace lock.
+pub fn remove_file_in_directory_if_unchanged(
+    parent: &File,
+    name: &OsStr,
+    expected_identity: FileIdentity,
+    expected_contents: &[u8],
+) -> io::Result<()> {
+    let mut current = open_file_without_following(parent, Path::new("."), name)?;
+    if file_identity(&current)? != expected_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "file identity changed after it was selected",
+        ));
+    }
+    let read_limit = expected_contents
+        .len()
+        .checked_add(1)
+        .and_then(|length| u64::try_from(length).ok())
+        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
+    let mut current_contents = Vec::new();
+    current_contents
+        .try_reserve_exact(expected_contents.len().saturating_add(1))
+        .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+    (&mut current)
+        .take(read_limit)
+        .read_to_end(&mut current_contents)?;
+    if current_contents != expected_contents {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "file contents changed after they were read",
+        ));
+    }
+    // Windows may reject removal while a handle to the child is still open.
+    // The identity and contents check is complete; cooperating writers remain
+    // serialized by the caller's workspace lock until removal below.
+    drop(current);
+    remove_file_in_directory(parent, name)
+}
+
+/// Remove one child file only when it still has the selected identity.
+///
+/// This is intended for best-effort cleanup of a uniquely created temporary
+/// file after a write failure, when its incomplete contents are unknown.
+pub fn remove_file_in_directory_if_identity(
+    parent: &File,
+    name: &OsStr,
+    expected_identity: FileIdentity,
+) -> io::Result<()> {
+    let current = open_file_without_following(parent, Path::new("."), name)?;
+    if file_identity(&current)? != expected_identity {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "file identity changed after it was selected",
+        ));
+    }
+    drop(current);
+    remove_file_in_directory(parent, name)
 }
 
 /// Remove one child file using an already-open directory handle.
@@ -1508,7 +1752,7 @@ mod windows_handle {
         FileRenameInformationEx, NtCreateFile, NtSetInformationFile,
     };
     use windows_sys::Win32::Foundation::{
-        GENERIC_READ, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+        GENERIC_READ, GENERIC_WRITE, OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         DELETE, FILE_DISPOSITION_INFO, FILE_READ_ATTRIBUTES, FileDispositionInfo, SYNCHRONIZE,
@@ -1729,6 +1973,125 @@ mod windows_handle {
         Ok(unsafe { File::from_raw_handle(handle.cast()) })
     }
 
+    pub(super) fn create_child_directory(parent: &File, name: &OsStr) -> io::Result<File> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD,
+        };
+
+        let file = create_child_with_access(
+            parent,
+            name,
+            true,
+            GENERIC_READ
+                | FILE_READ_ATTRIBUTES
+                | FILE_ADD_FILE
+                | FILE_ADD_SUBDIRECTORY
+                | FILE_DELETE_CHILD,
+            false,
+        )?;
+        validate_opened_child(file, true)
+    }
+
+    pub(super) fn create_child_file(parent: &File, name: &OsStr) -> io::Result<File> {
+        let file = create_child_with_access(
+            parent,
+            name,
+            false,
+            GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+            true,
+        )?;
+        validate_opened_child(file, false)
+    }
+
+    pub(super) fn move_child_without_replacing(
+        parent: &File,
+        source_name: &OsStr,
+        destination_name: &OsStr,
+    ) -> io::Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES};
+
+        let source = open_child_with_access(
+            parent,
+            source_name,
+            false,
+            DELETE | FILE_READ_ATTRIBUTES,
+            true,
+        )?;
+        validate_opened_child(source.try_clone()?, false)?;
+        rename_open_child(parent, &source, destination_name, false)
+    }
+
+    fn create_child_with_access(
+        parent: &File,
+        name: &OsStr,
+        directory: bool,
+        desired_access: u32,
+        write_through: bool,
+    ) -> io::Result<File> {
+        use windows_sys::Wdk::Storage::FileSystem::{FILE_CREATE, FILE_WRITE_THROUGH};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        super::validate_child_name(name)?;
+        let wide = name.encode_wide().collect::<Vec<_>>();
+        let byte_length = wide
+            .len()
+            .checked_mul(mem::size_of::<u16>())
+            .and_then(|length| u16::try_from(length).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "child name is too long"))?;
+        let mut object_name = UNICODE_STRING {
+            Length: byte_length,
+            MaximumLength: byte_length,
+            Buffer: wide.as_ptr().cast_mut(),
+        };
+        let object_attributes = OBJECT_ATTRIBUTES {
+            Length: mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: parent.as_raw_handle().cast(),
+            ObjectName: &mut object_name,
+            Attributes: OBJ_CASE_INSENSITIVE,
+            ..OBJECT_ATTRIBUTES::default()
+        };
+        let mut io_status = IO_STATUS_BLOCK::default();
+        let mut handle = ptr::null_mut();
+        let create_options = FILE_OPEN_REPARSE_POINT
+            | FILE_SYNCHRONOUS_IO_NONALERT
+            | if directory {
+                FILE_DIRECTORY_FILE
+            } else {
+                FILE_NON_DIRECTORY_FILE
+            }
+            | if write_through { FILE_WRITE_THROUGH } else { 0 };
+        // SAFETY: pointers refer to live stack or vector storage for the
+        // synchronous call. `RootDirectory` is an open directory handle and
+        // the validated single-component name cannot escape it.
+        let status = unsafe {
+            NtCreateFile(
+                &mut handle,
+                desired_access | SYNCHRONIZE,
+                &object_attributes,
+                &mut io_status,
+                ptr::null(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_CREATE,
+                create_options,
+                ptr::null(),
+                0,
+            )
+        };
+        if status < 0 {
+            // SAFETY: this conversion accepts any NTSTATUS value.
+            let win32_error = unsafe { RtlNtStatusToDosError(status) };
+            return Err(io::Error::from_raw_os_error(win32_error as i32));
+        }
+        if handle.is_null() {
+            return Err(io::Error::other("Windows returned an empty file handle"));
+        }
+        // SAFETY: NtCreateFile succeeded and transferred ownership of `handle`.
+        Ok(unsafe { File::from_raw_handle(handle.cast()) })
+    }
+
     pub(super) fn replace_child(
         source_parent: &File,
         source_name: &OsStr,
@@ -1854,8 +2217,10 @@ mod unix_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        open_child_directory_without_following, open_directory_without_following,
-        open_file_without_following, remove_file_in_directory, replace_file_between_directories,
+        create_child_directory_without_following, create_new_file_in_directory_without_following,
+        move_file_in_directory_without_replacing, open_child_directory_without_following,
+        open_directory_without_following, open_file_without_following, remove_file_in_directory,
+        remove_file_in_directory_if_unchanged, replace_file_between_directories, sync_directory,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -1961,6 +2326,100 @@ mod unix_tests {
         old_reader.read_to_end(&mut old_bytes).unwrap();
         assert_eq!(old_bytes, b"old record");
     }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "redox"
+    ))]
+    #[test]
+    fn creates_and_publishes_files_relative_to_durable_directory_handles() {
+        use std::io::Write;
+
+        let directory = TestDirectory::new();
+        let state = open_directory_without_following(&directory.0).unwrap();
+        let index = create_child_directory_without_following(&state, std::ffi::OsStr::new("index"))
+            .unwrap();
+        sync_directory(&state).unwrap();
+        let mut staged =
+            create_new_file_in_directory_without_following(&index, std::ffi::OsStr::new("stage"))
+                .unwrap();
+        staged.write_all(b"prepared journal").unwrap();
+        staged.sync_all().unwrap();
+        drop(staged);
+
+        move_file_in_directory_without_replacing(
+            &index,
+            std::ffi::OsStr::new("stage"),
+            std::ffi::OsStr::new("operation.json"),
+        )
+        .unwrap();
+        sync_directory(&index).unwrap();
+        assert_eq!(
+            fs::read(directory.0.join("index/operation.json")).unwrap(),
+            b"prepared journal"
+        );
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "redox"
+    ))]
+    #[test]
+    fn no_replace_publication_preserves_an_existing_entry() {
+        use std::io::Write;
+
+        let directory = TestDirectory::new();
+        let handle = open_directory_without_following(&directory.0).unwrap();
+        fs::write(directory.0.join("operation.json"), b"existing").unwrap();
+        let mut staged =
+            create_new_file_in_directory_without_following(&handle, std::ffi::OsStr::new("stage"))
+                .unwrap();
+        staged.write_all(b"replacement").unwrap();
+        staged.sync_all().unwrap();
+        drop(staged);
+
+        let error = move_file_in_directory_without_replacing(
+            &handle,
+            std::ffi::OsStr::new("stage"),
+            std::ffi::OsStr::new("operation.json"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read(directory.0.join("operation.json")).unwrap(),
+            b"existing"
+        );
+        assert_eq!(fs::read(directory.0.join("stage")).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn guarded_removal_requires_the_selected_identity_and_contents() {
+        let directory = TestDirectory::new();
+        let handle = open_directory_without_following(&directory.0).unwrap();
+        let name = std::ffi::OsStr::new("operation.json");
+        fs::write(directory.0.join(name), b"expected").unwrap();
+        let original = open_file_without_following(&handle, &directory.0, name).unwrap();
+        let identity = super::file_identity(&original).unwrap();
+        drop(original);
+
+        fs::write(directory.0.join(name), b"changed").unwrap();
+        let error = remove_file_in_directory_if_unchanged(&handle, name, identity, b"expected")
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert_eq!(fs::read(directory.0.join(name)).unwrap(), b"changed");
+
+        let current = open_file_without_following(&handle, &directory.0, name).unwrap();
+        let current_identity = super::file_identity(&current).unwrap();
+        drop(current);
+        remove_file_in_directory_if_unchanged(&handle, name, current_identity, b"changed").unwrap();
+        assert!(!directory.0.join(name).exists());
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -1971,13 +2430,15 @@ mod windows_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
+        create_child_directory_without_following, create_new_file_in_directory_without_following,
         file_identity, move_directory_handle_to_child_without_replacing,
+        move_file_in_directory_without_replacing,
         open_child_directory_for_rename_without_following, open_child_directory_without_following,
         open_directory_path_for_child_updates_without_following,
         open_directory_path_for_file_updates_without_following,
         open_directory_path_without_following, open_file_for_attribute_updates_without_following,
         remove_file_in_directory, replace_file_between_directories, replace_file_in_directory,
-        replace_file_in_directory_if_unchanged,
+        replace_file_in_directory_if_unchanged, sync_directory,
     };
 
     static NEXT_TEST_DIRECTORY: AtomicU64 = AtomicU64::new(0);
@@ -2248,6 +2709,38 @@ mod windows_tests {
         assert_eq!(
             file_identity(source_handle.as_file()).unwrap(),
             source_identity
+        );
+    }
+
+    #[test]
+    fn directory_flush_is_unsupported_and_child_publication_is_handle_relative() {
+        use std::io::Write;
+
+        let directory = TestDirectory::new();
+        let state_path = fs::canonicalize(&directory.0).unwrap();
+        let state = open_directory_path_for_child_updates_without_following(&state_path).unwrap();
+        assert_eq!(
+            sync_directory(&state).unwrap_err().kind(),
+            std::io::ErrorKind::Unsupported
+        );
+        let index = create_child_directory_without_following(&state, std::ffi::OsStr::new("index"))
+            .unwrap();
+        let mut staged =
+            create_new_file_in_directory_without_following(&index, std::ffi::OsStr::new("stage"))
+                .unwrap();
+        staged.write_all(b"prepared journal").unwrap();
+        staged.sync_all().unwrap();
+        drop(staged);
+
+        move_file_in_directory_without_replacing(
+            &index,
+            std::ffi::OsStr::new("stage"),
+            std::ffi::OsStr::new("operation.json"),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(directory.0.join("index/operation.json")).unwrap(),
+            b"prepared journal"
         );
     }
 }

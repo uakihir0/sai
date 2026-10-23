@@ -1,0 +1,104 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CoverageKind {
+    Dwelling
+    Contents
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PerilKind {
+    Fire
+    Wind
+    Flood
+    Theft
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ClaimOutcome {
+    Paid
+    Capped
+    Denied
+    Pending
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReviewReason {
+    UnknownPolicy
+    LossOutsidePolicyTerm
+    InvalidReportDate
+    LateNotice
+    PerilNotCovered
+    MissingDocuments
+    DuplicatePaidEvent
+    BelowDeductible
+    AggregateExhausted
+    AggregateLimitApplied
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Policy {
+    pub id: U32
+    pub term_start_day: U32
+    pub term_end_day: U32
+    pub notice_period_days: U32
+    pub deductible_dollars: U32
+    pub dwelling_limit_dollars: U32
+    pub contents_limit_dollars: U32
+    pub aggregate_limit_dollars: U32
+    pub aggregate_paid_to_date_dollars: U32
+    pub covers_fire: Bool
+    pub covers_wind: Bool
+    pub covers_flood: Bool
+    pub covers_theft: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Claim {
+    pub id: U32
+    pub policy_id: U32
+    pub event_id: U32
+    pub loss_day: U32
+    pub reported_day: U32
+    pub coverage: CoverageKind
+    pub peril: PerilKind
+    pub estimated_damage_dollars: U32
+    pub documents_complete: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ClaimBatch {
+    pub policies: Array<Option<Policy>, 2>
+    pub policy_count: USize
+    pub claims: Array<Option<Claim>, 8>
+    pub claim_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ClaimDecision {
+    pub claim_id: U32
+    pub policy_id: U32
+    pub event_id: U32
+    pub outcome: ClaimOutcome
+    pub reason: Option<ReviewReason>
+    pub pre_aggregate_payment_dollars: Option<U32>
+    pub payable_dollars: U32
+    pub remaining_aggregate_dollars: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PolicyBalance {
+    pub policy_id: U32
+    pub remaining_aggregate_dollars: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ClaimReport {
+    pub decisions: Array<Option<ClaimDecision>, 8>
+    pub decision_count: USize
+    pub paid_count: U32
+    pub capped_count: U32
+    pub denied_count: U32
+    pub pending_count: U32
+    pub total_payable_dollars: U32
+    pub policy_balances: Array<Option<PolicyBalance>, 2>
+    pub policy_balance_count: USize
+}

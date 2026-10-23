@@ -122,7 +122,7 @@ impl WorkspaceLockGuard {
         let package_directory_path = canonicalize_package_directory(package_directory.as_ref())?;
         let package_directory = pin_package_directory(&package_directory_path)?;
         let (state_directory_path, path) = prepare_lock_paths(&package_directory_path)?;
-        let state_directory = open_state_directory(&state_directory_path)?;
+        let state_directory = open_state_directory(&state_directory_path, mode)?;
         let file = open_lock_file(&state_directory, &path)?;
         validate_regular_lock_file(&file, &path)?;
         let guard = Self {
@@ -175,7 +175,7 @@ impl WorkspaceLockGuard {
         let package_directory_path = canonicalize_package_directory(package_directory.as_ref())?;
         let package_directory = pin_package_directory(&package_directory_path)?;
         let (state_directory_path, path) = prepare_lock_paths(&package_directory_path)?;
-        let state_directory = open_state_directory(&state_directory_path)?;
+        let state_directory = open_state_directory(&state_directory_path, mode)?;
         let file = open_lock_file(&state_directory, &path)?;
         validate_regular_lock_file(&file, &path)?;
         if !lock_platform(&file, mode, false).map_err(|source| WorkspaceLockError::Io {
@@ -210,6 +210,16 @@ impl WorkspaceLockGuard {
     /// The canonical package directory whose `.sai/lock` is held.
     pub fn package_directory(&self) -> &Path {
         &self.package_directory_path
+    }
+
+    /// The pinned `.sai` directory handle associated with this lock.
+    ///
+    /// Filesystem operations that touch workspace state should resolve
+    /// children relative to this handle so they remain anchored to the
+    /// directory whose lock is held. Mutating callers must still require an
+    /// exclusive lock before using write-capable child operations.
+    pub fn state_directory_handle(&self) -> &File {
+        &self._state_directory
     }
 
     fn validate_empty(&self) -> Result<(), WorkspaceLockError> {
@@ -310,7 +320,10 @@ fn prepare_lock_paths(package_directory: &Path) -> Result<(PathBuf, PathBuf), Wo
     Ok((state_directory, lock_path))
 }
 
-fn open_state_directory(path: &Path) -> Result<File, WorkspaceLockError> {
+fn open_state_directory(path: &Path, mode: WorkspaceLockMode) -> Result<File, WorkspaceLockError> {
+    #[cfg(not(windows))]
+    let _ = mode;
+
     #[cfg(all(
         unix,
         not(any(
@@ -348,16 +361,20 @@ fn open_state_directory(path: &Path) -> Result<File, WorkspaceLockError> {
 
     #[cfg(windows)]
     {
-        let directory =
-            sai_windows_fs::open_directory_without_following(path).map_err(|source| {
-                if source.kind() == io::ErrorKind::InvalidInput {
-                    return WorkspaceLockError::InvalidStateDirectory(path.to_path_buf());
-                }
-                WorkspaceLockError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                }
-            })?;
+        let directory = if mode == WorkspaceLockMode::Exclusive {
+            sai_windows_fs::open_directory_path_for_child_updates_without_following(path)
+        } else {
+            sai_windows_fs::open_directory_path_without_following(path)
+        }
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::InvalidInput {
+                return WorkspaceLockError::InvalidStateDirectory(path.to_path_buf());
+            }
+            WorkspaceLockError::Io {
+                path: path.to_path_buf(),
+                source,
+            }
+        })?;
         return Ok(directory);
     }
 
@@ -904,7 +921,7 @@ mod tests {
 
         let directory = TestDirectory::new();
         let (state_path, lock_path) = prepare_lock_paths(&directory.0).unwrap();
-        let state_handle = open_state_directory(&state_path).unwrap();
+        let state_handle = open_state_directory(&state_path, WorkspaceLockMode::Shared).unwrap();
         let original_state = directory.0.join(".sai-original");
         fs::rename(&state_path, &original_state).unwrap();
         let replacement = directory.0.join("replacement");

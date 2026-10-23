@@ -1,0 +1,63 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PriceModel {
+    Flat
+    TimeOfUse
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type UsageProfile {
+    pub account_id: Str
+    pub peak_kwh: U32
+    pub off_peak_kwh: U32
+    pub exported_kwh: U32
+    pub peak_demand_kw: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RatePlan {
+    pub id: Str
+    pub model: PriceModel
+    pub service_charge_cents: U32
+    pub flat_rate_cents_per_kwh: U32
+    pub peak_rate_cents_per_kwh: U32
+    pub off_peak_rate_cents_per_kwh: U32
+    pub export_credit_cents_per_kwh: U32
+    pub demand_charge_cents_per_kw: U32
+    pub tax_percent: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BillQuote {
+    pub account_id: Str
+    pub plan_id: Str
+    pub imported_kwh: U32
+    pub energy_charge_cents: U32
+    pub export_credit_cents: U32
+    pub demand_charge_cents: U32
+    pub service_charge_cents: U32
+    pub taxable_subtotal_cents: U32
+    pub tax_cents: U32
+    pub total_cents: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PlanComparison {
+    pub quotes: Array<BillQuote, 2>
+    pub recommended_index: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum BillError {
+    MonthlyImportExceedsLimit
+    ExportsExceedLimit
+    DemandExceedsLimit
+    DuplicatePlanId
+    InvalidRate
+    InvalidCharge
+    InvalidTaxRate
+    InactiveRateMustBeZero
+}
+
+pub const MAX_MONTHLY_IMPORT_KWH: U32 = 10_000
+pub const MAX_MONTHLY_EXPORT_KWH: U32 = 10_000
+pub const MAX_PEAK_DEMAND_KW: U32 = 500

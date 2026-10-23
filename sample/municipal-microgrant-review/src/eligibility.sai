@@ -1,0 +1,29 @@
+use acme:municipal-microgrant-review/fixtures
+use acme:municipal-microgrant-review/model.{Application, DecisionReason}
+
+pub fn ineligibility_reason(application: Application) -> Option<DecisionReason> {
+    if not application.registered_nonprofit {
+        Some(DecisionReason.MissingNonprofitRegistration)
+    } else if not application.documents_complete {
+        Some(DecisionReason.IncompleteApplication)
+    } else if not application.serves_city_residents {
+        Some(DecisionReason.OutsideCityServiceArea)
+    } else if application.match_percent > 100 {
+        Some(DecisionReason.MatchShareOutOfRange)
+    } else if application.match_percent < fixtures.minimum_match_percent() {
+        Some(DecisionReason.InsufficientMatch)
+    } else if application.request_thousands == 0 {
+        Some(DecisionReason.ZeroRequest)
+    } else if application.request_thousands > fixtures.maximum_request_thousands() {
+        Some(DecisionReason.RequestAboveProgramLimit)
+    } else if (
+        application.need_points > 40
+        or application.resident_impact_points > 25
+        or application.readiness_points > 20
+        or application.match_points > 15
+    ) {
+        Some(DecisionReason.RubricScoreOutOfRange)
+    } else {
+        None
+    }
+}

@@ -1,0 +1,5 @@
+package acme:supply-chain-recall-tracer @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Trace a contaminated component lot into finished lots and retailer shipments"

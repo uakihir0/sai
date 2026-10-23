@@ -1,0 +1,79 @@
+use acme:supply-chain-recall-tracer/data
+use acme:supply-chain-recall-tracer/model.{RecallTrace}
+use acme:supply-chain-recall-tracer/recall
+
+pub fn trace_sample() -> RecallTrace {
+    recall.trace(data.scenario())
+}
+
+test "the contaminated component lot reaches three finished lots" {
+    let trace = trace_sample()
+    assert trace.target_component_lot_id == 701
+    assert trace.component_units_received == 120
+    assert trace.component_units_consumed == 120
+    assert trace.component_units_unconsumed == 0
+    assert trace.affected_batch_count == 3
+    assert trace.finished_lot_count == 3
+    assert trace.finished_lots[0].unwrap().batch_id == 5002
+    assert trace.finished_lots[0].unwrap().finished_lot_id == 9002
+    assert trace.finished_lots[1].unwrap().batch_id == 5003
+    assert trace.finished_lots[1].unwrap().finished_lot_id == 9003
+    assert trace.finished_lots[2].unwrap().batch_id == 5005
+    assert trace.finished_lots[2].unwrap().finished_lot_id == 9005
+}
+
+test "factory and retailer quantities reconcile across the recall trace" {
+    let trace = trace_sample()
+    assert trace.affected_finished_units == 120
+    assert trace.units_shipped == 105
+    assert trace.units_at_factory == 15
+    assert trace.units_reported_sold == 37
+    assert trace.units_at_retailers == 68
+    assert trace.affected_finished_units == trace.units_shipped + trace.units_at_factory
+    assert trace.units_shipped == trace.units_reported_sold + trace.units_at_retailers
+}
+
+test "shipment targets are filtered by lineage and sorted by shipment ID" {
+    let trace = trace_sample()
+    assert trace.shipment_count == 5
+    assert trace.shipments[0].unwrap().shipment_id == 8001
+    assert trace.shipments[1].unwrap().shipment_id == 8002
+    assert trace.shipments[2].unwrap().shipment_id == 8003
+    assert trace.shipments[3].unwrap().shipment_id == 8004
+    assert trace.shipments[4].unwrap().shipment_id == 8005
+    assert trace.shipments[0].unwrap().units_at_retailer == 10
+    assert trace.shipments[1].unwrap().units_at_retailer == 30
+    assert trace.shipments[2].unwrap().units_at_retailer == 0
+    assert trace.shipments[3].unwrap().units_at_retailer == 20
+    assert trace.shipments[4].unwrap().units_at_retailer == 8
+}
+
+test "the fixed fixture stays within component, batch, and shipment quantities" {
+    let scenario = data.scenario()
+    for batch_index in 0..scenario.batch_count {
+        let batch = scenario.batches[batch_index].unwrap()
+        assert batch.component_units_used == batch.finished_units_produced
+
+        var shipped_from_lot: U32 = 0
+        for shipment_index in 0..scenario.shipment_count {
+            let shipment = scenario.shipments[shipment_index].unwrap()
+            if shipment.finished_lot_id == batch.finished_lot_id {
+                shipped_from_lot += shipment.units_shipped
+                assert shipment.units_reported_sold <= shipment.units_shipped
+            }
+        }
+        assert shipped_from_lot <= batch.finished_units_produced
+    }
+
+    for component_index in 0..scenario.component_lot_count {
+        let component_lot = scenario.component_lots[component_index].unwrap()
+        var units_used: U32 = 0
+        for batch_index in 0..scenario.batch_count {
+            let batch = scenario.batches[batch_index].unwrap()
+            if batch.component_lot_id == component_lot.lot_id {
+                units_used += batch.component_units_used
+            }
+        }
+        assert units_used <= component_lot.received_units
+    }
+}
