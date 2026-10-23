@@ -1,0 +1,76 @@
+use acme:service-dependency-incident-correlator/model.{
+    MetricSample,
+    ServiceSignal,
+    Snapshot,
+}
+
+fn latency_points(p95_latency_ms: U32) -> U32 {
+    if p95_latency_ms >= 1000 {
+        40
+    } else if p95_latency_ms >= 700 {
+        30
+    } else if p95_latency_ms >= 400 {
+        20
+    } else {
+        0
+    }
+}
+
+fn error_points(errors_per_1000: U32) -> U32 {
+    if errors_per_1000 >= 100 {
+        40
+    } else if errors_per_1000 >= 50 {
+        30
+    } else if errors_per_1000 >= 25 {
+        20
+    } else {
+        0
+    }
+}
+
+pub fn sample_score(sample: MetricSample) -> U32 {
+    latency_points(sample.p95_latency_ms) + error_points(sample.errors_per_1000)
+}
+
+pub fn service_signal(snapshot: Snapshot, service_id: U32) -> Option<ServiceSignal> {
+    var first_alert_minute: Option<U32> = None
+    var peak_score: U32 = 0
+    var alerting_sample_count: U32 = 0
+
+    for index in 0..snapshot.sample_count {
+        match snapshot.samples[index] {
+            Some(sample) => {
+                if sample.service_id == service_id {
+                    let score = sample_score(sample)
+                    if score > 0 {
+                        match first_alert_minute {
+                            Some(existing) => {
+                                if sample.minute < existing {
+                                    first_alert_minute = Some(sample.minute)
+                                }
+                            }
+                            None => {
+                                first_alert_minute = Some(sample.minute)
+                            }
+                        }
+                        if score > peak_score {
+                            peak_score = score
+                        }
+                        alerting_sample_count += 1
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    match first_alert_minute {
+        Some(minute) => Some(ServiceSignal(
+            service_id: service_id,
+            first_alert_minute: minute,
+            peak_score: peak_score,
+            alerting_sample_count: alerting_sample_count,
+        )),
+        None => None,
+    }
+}

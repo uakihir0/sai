@@ -1,0 +1,70 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Tier {
+    Edge
+    Application
+    Data
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Service {
+    pub id: U32
+    pub name: Str
+    pub tier: Tier
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Dependency {
+    pub caller_id: U32
+    pub provider_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type MetricSample {
+    pub service_id: U32
+    pub minute: U32
+    pub p95_latency_ms: U32
+    pub errors_per_1000: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Deployment {
+    pub id: U32
+    pub service_id: U32
+    pub minute: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Snapshot {
+    pub services: Array<Service, 7>
+    pub dependencies: Array<Option<Dependency>, 12>
+    pub dependency_count: USize
+    pub samples: Array<Option<MetricSample>, 24>
+    pub sample_count: USize
+    pub deployments: Array<Option<Deployment>, 8>
+    pub deployment_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ServiceSignal {
+    pub service_id: U32
+    pub first_alert_minute: U32
+    pub peak_score: U32
+    pub alerting_sample_count: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Hypothesis {
+    pub service_id: U32
+    pub first_alert_minute: U32
+    pub peak_score: U32
+    pub downstream_alert_count: U32
+    pub deployment_id: Option<U32>
+    pub total_score: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Report {
+    pub hypotheses: Array<Option<Hypothesis>, 7>
+    pub hypothesis_count: USize
+    pub alerting_service_count: USize
+}

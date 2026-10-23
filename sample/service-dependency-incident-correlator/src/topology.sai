@@ -1,0 +1,59 @@
+use acme:service-dependency-incident-correlator/lookup
+use acme:service-dependency-incident-correlator/model.{Snapshot}
+use acme:service-dependency-incident-correlator/signals
+
+fn reachable_callers(snapshot: Snapshot, provider_id: U32) -> Array<Bool, 7> {
+    var reached = Array<Bool, 7>.filled(false)
+    match lookup.service_index(snapshot, provider_id) {
+        Some(index) => {
+            reached[index] = true
+        }
+        None => {
+            return reached
+        }
+    }
+
+    var changed = true
+    var pass: USize = 0
+    while changed and pass < snapshot.services.len() {
+        changed = false
+        for edge_index in 0..snapshot.dependency_count {
+            match snapshot.dependencies[edge_index] {
+                Some(edge) => {
+                    match lookup.service_index(snapshot, edge.provider_id) {
+                        Some(provider_index) => {
+                            match lookup.service_index(snapshot, edge.caller_id) {
+                                Some(caller_index) => {
+                                    if reached[provider_index] and not reached[caller_index] {
+                                        reached[caller_index] = true
+                                        changed = true
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                        None => {}
+                    }
+                }
+                None => {}
+            }
+        }
+        pass += 1
+    }
+    reached
+}
+
+pub fn downstream_alert_count(snapshot: Snapshot, provider_id: U32) -> U32 {
+    let reached = reachable_callers(snapshot, provider_id)
+    var count: U32 = 0
+    for index in 0..snapshot.services.len() {
+        let service = snapshot.services[index]
+        if reached[index] and service.id != provider_id {
+            match signals.service_signal(snapshot, service.id) {
+                Some(_) => count += 1,
+                None => {}
+            }
+        }
+    }
+    count
+}

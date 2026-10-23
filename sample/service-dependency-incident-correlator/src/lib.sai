@@ -1,0 +1,33 @@
+use acme:service-dependency-incident-correlator/analysis
+use acme:service-dependency-incident-correlator/fixtures
+use acme:service-dependency-incident-correlator/model.{Deployment, Report}
+use acme:service-dependency-incident-correlator/scoring
+
+pub fn analyze_fixture() -> Report {
+    analysis.analyze(fixtures.incident_window())
+}
+
+test "the database leads because its alert precedes six affected callers" {
+    let report = analyze_fixture()
+    let first = report.hypotheses[0].unwrap()
+    assert report.alerting_service_count == 7
+    assert first.service_id == 601
+    assert first.first_alert_minute == 10
+    assert first.downstream_alert_count == 6
+    assert first.deployment_id == Some(9001)
+    assert first.total_score == 155
+}
+
+test "equal candidate scores use alert minute before service ID" {
+    let report = analyze_fixture()
+    assert report.hypotheses[5].unwrap().service_id == 301
+    assert report.hypotheses[6].unwrap().service_id == 101
+    assert report.hypotheses[5].unwrap().total_score == 50
+    assert report.hypotheses[6].unwrap().total_score == 50
+}
+
+test "a same-minute deployment is not treated as prior evidence" {
+    var snapshot = fixtures.incident_window()
+    snapshot.deployments[0] = Some(Deployment(id: 9001, service_id: 601, minute: 10))
+    assert scoring.recent_deployment_id(snapshot, 601, 10) == None
+}

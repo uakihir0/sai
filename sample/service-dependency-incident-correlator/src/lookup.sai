@@ -1,0 +1,10 @@
+use acme:service-dependency-incident-correlator/model.{Snapshot}
+
+pub fn service_index(snapshot: Snapshot, service_id: U32) -> Option<USize> {
+    for index in 0..snapshot.services.len() {
+        if snapshot.services[index].id == service_id {
+            return Some(index)
+        }
+    }
+    None
+}

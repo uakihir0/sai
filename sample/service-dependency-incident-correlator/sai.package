@@ -1,0 +1,5 @@
+package acme:service-dependency-incident-correlator @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Rank investigation leads from fixed service, metric, and deployment data"

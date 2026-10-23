@@ -1,0 +1,61 @@
+use acme:service-dependency-incident-correlator/model.{Hypothesis, Report, Snapshot}
+use acme:service-dependency-incident-correlator/scoring
+use acme:service-dependency-incident-correlator/signals
+use acme:service-dependency-incident-correlator/topology
+
+fn precedes(left: Hypothesis, right: Hypothesis) -> Bool {
+    if left.total_score != right.total_score {
+        left.total_score > right.total_score
+    } else if left.first_alert_minute != right.first_alert_minute {
+        left.first_alert_minute < right.first_alert_minute
+    } else {
+        left.service_id < right.service_id
+    }
+}
+
+pub fn analyze(snapshot: Snapshot) -> Report {
+    var hypotheses: Array<Option<Hypothesis>, 7> = Array<Option<Hypothesis>, 7>.filled(None)
+    var hypothesis_count: USize = 0
+
+    for service_index in 0..snapshot.services.len() {
+        let service = snapshot.services[service_index]
+        match signals.service_signal(snapshot, service.id) {
+            Some(signal) => {
+                let downstream = topology.downstream_alert_count(snapshot, service.id)
+                let deployment_id = scoring.recent_deployment_id(
+                    snapshot,
+                    service.id,
+                    signal.first_alert_minute,
+                )
+                let hypothesis = Hypothesis(
+                    service_id: service.id,
+                    first_alert_minute: signal.first_alert_minute,
+                    peak_score: signal.peak_score,
+                    downstream_alert_count: downstream,
+                    deployment_id: deployment_id,
+                    total_score: scoring.total_score(signal, downstream, deployment_id),
+                )
+
+                var cursor = hypothesis_count
+                while cursor > 0 {
+                    let previous = hypotheses[cursor - 1].unwrap()
+                    if precedes(hypothesis, previous) {
+                        hypotheses[cursor] = hypotheses[cursor - 1]
+                        cursor -= 1
+                    } else {
+                        break
+                    }
+                }
+                hypotheses[cursor] = Some(hypothesis)
+                hypothesis_count += 1
+            }
+            None => {}
+        }
+    }
+
+    Report(
+        hypotheses: hypotheses,
+        hypothesis_count: hypothesis_count,
+        alerting_service_count: hypothesis_count,
+    )
+}
