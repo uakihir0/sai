@@ -1123,19 +1123,26 @@ pub struct FlagsDef {
 
 `flags_def(D)` is `Some` exactly for a type whose `adt_def` is `AdtKind::Flags`. This includes the flags types of views.
 
-**Current implementation boundary (IR-886, IR-889, IR-891):** `sai_ty::iface`
-builds an opaque validated `FlagsDef` for local interface enums. It retains the
-flag names and spans in declaration order and selects the smallest
-representation. The interface-item check carries a valid descriptor to the
-transient WIT generator and to a flags-only `LocalFlagsAdtDef` projection.
-That projection has the specified single variant and hidden `bits` field, uses
-real child DefIds from the local package DefPath interner, and is available
-through the current package `interface_uses` result only when queried with its
-creating workspace snapshot. It does not implement the general
-`adt_def(DefId)` or `flags_def(DefId)` contracts above: imported WIT flags,
-other local ADT kinds, and general ADT semantic type queries are not covered.
-Invalid or empty local flags declarations remain ordinary enum inputs and have
-no flags projection. Stage 0 feature gates remain unchanged; local flag
+**Current implementation boundary (IR-886, IR-889, IR-891, IR-892):**
+`sai_ty::iface` builds an opaque validated `FlagsDef` for local interface
+enums. It retains the flag names and spans in declaration order and selects
+the smallest representation. The interface-item check carries a valid
+descriptor to the transient WIT generator and to the flags `LocalFlagsAdtDef`
+projection. The driver also exposes a snapshot-bound projection for local
+interface enums: unit-only enums have source-ordered variants with validated
+DefPaths and I64 discriminants; valid flags declarations retain the flags
+model; generic, payload, unvalidated-representation, and malformed enum forms
+carry explicit unsupported reasons. Invalid or empty `@flags` unit enums
+remain on the ordinary enum path; a payload form is unsupported by the
+unit-enum subset.
+
+These projections are carried by the current package `interface_uses` result
+and are available only with their creating workspace snapshot. They do not
+implement the general `adt_def(DefId)` or `flags_def(DefId)` contracts above:
+module-level enums, records, distinct/refined types, resources, imported WIT
+types, and general semantic field types are not covered. Payload enums depend
+on semantic type/HIR conversion in [impl/03](03-name-resolution-and-type-checking.md)
+§§3.5.1–3.5.7 and §3.6.1. Stage 0 feature gates remain unchanged; local flag
 constant resolution and generated methods are not implemented.
 
 ### 16.9.3 Constants
