@@ -1,6 +1,12 @@
 use acme:municipal-microgrant-review/eligibility
 use acme:municipal-microgrant-review/fixtures
-use acme:municipal-microgrant-review/model.{Application, DecisionReason, District, GrantDecision, GrantPlan}
+use acme:municipal-microgrant-review/model.{
+    Application
+    DecisionReason
+    District
+    GrantDecision
+    GrantPlan
+}
 use acme:municipal-microgrant-review/scoring
 
 fn awarded_in_district(
@@ -40,9 +46,10 @@ fn decision(
             award_thousands: 0,
         )
         None => {
-            if awarded_in_district(awards, award_count, application.district)
+            if (
+                awarded_in_district(awards, award_count, application.district)
                 >= fixtures.maximum_awards_per_district()
-            {
+            ) {
                 GrantDecision(
                     rank: rank + 1,
                     application: application,
@@ -88,26 +95,40 @@ pub fn build_plan() -> GrantPlan {
     while rank < 7 {
         match scoring.application_at_rank(rank) {
             Some(application) => {
-                let selected = decision(
-                    rank,
-                    application,
-                    remaining_budget,
-                    awards,
-                    award_count,
-                )
+                let selected = decision(rank, application, remaining_budget, awards, award_count)
                 decisions[rank] = Some(selected)
                 decision_count += 1
                 match selected.reason {
-                    Some(DecisionReason.MissingNonprofitRegistration) => ineligible_count += 1
-                    Some(DecisionReason.IncompleteApplication) => ineligible_count += 1
-                    Some(DecisionReason.OutsideCityServiceArea) => ineligible_count += 1
-                    Some(DecisionReason.MatchShareOutOfRange) => ineligible_count += 1
-                    Some(DecisionReason.InsufficientMatch) => ineligible_count += 1
-                    Some(DecisionReason.ZeroRequest) => ineligible_count += 1
-                    Some(DecisionReason.RequestAboveProgramLimit) => ineligible_count += 1
-                    Some(DecisionReason.RubricScoreOutOfRange) => ineligible_count += 1
-                    Some(DecisionReason.DistrictAwardLimit) => district_limit_count += 1
-                    Some(DecisionReason.InsufficientRemainingBudget) => budget_limit_count += 1
+                    Some(DecisionReason.MissingNonprofitRegistration) => {
+                        ineligible_count += 1
+                    }
+                    Some(DecisionReason.IncompleteApplication) => {
+                        ineligible_count += 1
+                    }
+                    Some(DecisionReason.OutsideCityServiceArea) => {
+                        ineligible_count += 1
+                    }
+                    Some(DecisionReason.MatchShareOutOfRange) => {
+                        ineligible_count += 1
+                    }
+                    Some(DecisionReason.InsufficientMatch) => {
+                        ineligible_count += 1
+                    }
+                    Some(DecisionReason.ZeroRequest) => {
+                        ineligible_count += 1
+                    }
+                    Some(DecisionReason.RequestAboveProgramLimit) => {
+                        ineligible_count += 1
+                    }
+                    Some(DecisionReason.RubricScoreOutOfRange) => {
+                        ineligible_count += 1
+                    }
+                    Some(DecisionReason.DistrictAwardLimit) => {
+                        district_limit_count += 1
+                    }
+                    Some(DecisionReason.InsufficientRemainingBudget) => {
+                        budget_limit_count += 1
+                    }
                     None => {
                         awards[award_count] = Some(application.district)
                         award_count += 1

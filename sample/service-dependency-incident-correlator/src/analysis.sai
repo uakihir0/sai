@@ -22,11 +22,8 @@ pub fn analyze(snapshot: Snapshot) -> Report {
         match signals.service_signal(snapshot, service.id) {
             Some(signal) => {
                 let downstream = topology.downstream_alert_count(snapshot, service.id)
-                let deployment_id = scoring.recent_deployment_id(
-                    snapshot,
-                    service.id,
-                    signal.first_alert_minute,
-                )
+                let deployment_id =
+                    scoring.recent_deployment_id(snapshot, service.id, signal.first_alert_minute)
                 let hypothesis = Hypothesis(
                     service_id: service.id,
                     first_alert_minute: signal.first_alert_minute,
