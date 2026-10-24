@@ -1,0 +1,58 @@
+use acme:construction-permit-review/model.{Application, PermitType, ProposedUse, ZoneClass}
+
+pub fn compatible_use(zone: ZoneClass, use_kind: ProposedUse) -> Bool {
+    match use_kind {
+        ProposedUse.Dwelling => (zone == ZoneClass.Residential or zone == ZoneClass.MixedUse)
+        ProposedUse.RetailOrFoodService =>
+            (zone == ZoneClass.MixedUse or zone == ZoneClass.Commercial)
+        ProposedUse.LightIndustrial => zone == ZoneClass.Industrial
+    }
+}
+
+pub fn requires_structural_drawings(permit_type: PermitType) -> Bool {
+    permit_type == PermitType.NewConstruction or permit_type == PermitType.StructuralRenovation
+}
+
+pub fn requires_accessibility_plan(application: Application) -> Bool {
+    application.public_entry or application.dwelling_units >= 4
+}
+
+pub fn requires_drainage_plan(application: Application) -> Bool {
+    application.in_flood_screening_area or application.soil_disturbance_sqm > 500
+}
+
+pub fn requires_environmental_note(application: Application) -> Bool {
+    application.in_flood_screening_area or application.near_waterway
+}
+
+pub fn requires_demolition_plan(permit_type: PermitType) -> Bool {
+    permit_type == PermitType.Demolition
+}
+
+pub fn requires_zoning_review(application: Application) -> Bool {
+    if application.permit_type == PermitType.Demolition {
+        return application.footprint_sqm > application.lot_area_sqm
+    }
+    (
+        not compatible_use(application.zone, application.proposed_use)
+        or application.footprint_sqm > application.lot_area_sqm
+        or application.front_setback_mm < application.required_front_setback_mm
+        or application.side_setback_mm < application.required_side_setback_mm
+    )
+}
+
+pub fn requires_accessibility_review(application: Application) -> Bool {
+    requires_accessibility_plan(application)
+}
+
+pub fn requires_environmental_review(application: Application) -> Bool {
+    (
+        application.in_flood_screening_area
+        or application.near_waterway
+        or application.soil_disturbance_sqm > 500
+    )
+}
+
+pub fn has_invalid_site_metrics(application: Application) -> Bool {
+    application.lot_area_sqm == 0 or application.footprint_sqm == 0
+}

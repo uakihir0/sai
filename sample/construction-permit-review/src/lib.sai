@@ -1,0 +1,64 @@
+use acme:construction-permit-review/fixtures
+use acme:construction-permit-review/model.{PermitReport, PermitType, ProposedUse, ReviewStatus}
+use acme:construction-permit-review/policy
+use acme:construction-permit-review/report
+
+pub fn example_report() -> PermitReport {
+    report.review_batch(fixtures.batch())
+}
+
+test "the fixed batch returns one deterministic review per application" {
+    let summary = example_report()
+    assert summary.application_count == 8
+    assert summary.reviews[0].application_id == 101
+    assert summary.reviews[0].status == ReviewStatus.StaffPlanReview
+    assert summary.reviews[7].application_id == 108
+    assert summary.reviews[7].status == ReviewStatus.DataCorrectionRequired
+}
+
+test "missing evidence is explicit and can coexist with specialist routes" {
+    let summary = example_report()
+    let cafe = summary.reviews[1]
+    assert cafe.status == ReviewStatus.IncompleteAndSpecialistReview
+    assert cafe.required_evidence_count == 3
+    assert cafe.missing_evidence_count == 2
+    assert cafe.missing_accessibility_plan
+    assert cafe.missing_drainage_plan
+    assert cafe.zoning_review
+    assert cafe.accessibility_review
+    assert cafe.environmental_review
+}
+
+test "specialist statuses and aggregate counts follow the fixed rule order" {
+    let summary = example_report()
+    assert summary.staff_plan_review_count == 1
+    assert summary.incomplete_evidence_count == 1
+    assert summary.incomplete_and_specialist_count == 1
+    assert summary.zoning_review_count == 1
+    assert summary.accessibility_review_count == 1
+    assert summary.environmental_review_count == 1
+    assert summary.multi_discipline_review_count == 1
+    assert summary.data_correction_count == 1
+    assert summary.follow_up_count == 7
+}
+
+test "zoning and environmental triggers are not lost in a combined review" {
+    let summary = example_report()
+    let hall = summary.reviews[6]
+    assert hall.status == ReviewStatus.MultiDisciplineReview
+    assert hall.zoning_review
+    assert hall.environmental_review
+    assert hall.missing_evidence_count == 0
+}
+
+test "demolition skips use and setback checks but still flags oversized footprints" {
+    var demolition = fixtures.batch().applications[0]
+    demolition.permit_type = PermitType.Demolition
+    demolition.proposed_use = ProposedUse.LightIndustrial
+    demolition.front_setback_mm = 0
+    demolition.footprint_sqm = demolition.lot_area_sqm
+
+    assert not policy.requires_zoning_review(demolition)
+    demolition.footprint_sqm += 1
+    assert policy.requires_zoning_review(demolition)
+}

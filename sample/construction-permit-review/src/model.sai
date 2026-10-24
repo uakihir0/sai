@@ -1,0 +1,105 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PermitType {
+    NewConstruction
+    StructuralRenovation
+    ChangeOfUse
+    Demolition
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ZoneClass {
+    Residential
+    MixedUse
+    Commercial
+    Industrial
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ProposedUse {
+    Dwelling
+    RetailOrFoodService
+    LightIndustrial
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReviewStatus {
+    StaffPlanReview
+    IncompleteEvidence
+    IncompleteAndSpecialistReview
+    ZoningReview
+    AccessibilityReview
+    EnvironmentalReview
+    MultiDisciplineReview
+    DataCorrectionRequired
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Application {
+    pub id: U32
+    pub name: Str
+    pub permit_type: PermitType
+    pub zone: ZoneClass
+    pub proposed_use: ProposedUse
+    pub lot_area_sqm: U32
+    pub footprint_sqm: U32
+    pub front_setback_mm: U32
+    pub required_front_setback_mm: U32
+    pub side_setback_mm: U32
+    pub required_side_setback_mm: U32
+    pub public_entry: Bool
+    pub dwelling_units: U32
+    pub in_flood_screening_area: Bool
+    pub near_waterway: Bool
+    pub soil_disturbance_sqm: U32
+    pub has_site_plan: Bool
+    pub has_structural_drawings: Bool
+    pub has_accessibility_plan: Bool
+    pub has_drainage_plan: Bool
+    pub has_environmental_note: Bool
+    pub has_demolition_plan: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PermitBatch {
+    pub applications: Array<Application, 8>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PermitReview {
+    pub application_id: U32
+    pub name: Str
+    pub status: ReviewStatus
+    pub required_evidence_count: USize
+    pub missing_evidence_count: USize
+    pub requires_site_plan: Bool
+    pub requires_structural_drawings: Bool
+    pub requires_accessibility_plan: Bool
+    pub requires_drainage_plan: Bool
+    pub requires_environmental_note: Bool
+    pub requires_demolition_plan: Bool
+    pub missing_site_plan: Bool
+    pub missing_structural_drawings: Bool
+    pub missing_accessibility_plan: Bool
+    pub missing_drainage_plan: Bool
+    pub missing_environmental_note: Bool
+    pub missing_demolition_plan: Bool
+    pub zoning_review: Bool
+    pub accessibility_review: Bool
+    pub environmental_review: Bool
+    pub data_correction_required: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PermitReport {
+    pub reviews: Array<PermitReview, 8>
+    pub application_count: USize
+    pub staff_plan_review_count: USize
+    pub incomplete_evidence_count: USize
+    pub incomplete_and_specialist_count: USize
+    pub zoning_review_count: USize
+    pub accessibility_review_count: USize
+    pub environmental_review_count: USize
+    pub multi_discipline_review_count: USize
+    pub data_correction_count: USize
+    pub follow_up_count: USize
+}
