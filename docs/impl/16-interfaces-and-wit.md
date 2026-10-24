@@ -451,6 +451,8 @@ Each unit that loads successfully has a **view package**. A view package is a `P
 | function `f` | `[Interface(i), ValueNs(f)]` | `Fn` |
 | function `f` of a world | `[World(w), WorldItem { import, name: f }]` | `WorldFn` |
 
+Flag constants are nameable `const` symbols under spec/13 §13.9.4, but `wit_view` does not allocate a view `DefId` or `VariantDef` for them. The symbol inventory derives their stable identity from the verified flags parent path and the `ValueNs(flag)` component; §16.9.3 defines its bit-index disambiguator and fingerprint. This derived identity is inventory-only.
+
 `WorldFn` is a new `DefKind` ([03](03-name-resolution-and-type-checking.md) §3.4.1). It is also used for the function items of local worlds (§16.8.2). `DefPathHash` is computed from the key string of the view package and the `DefPath`, as for any package. A view package retains one `DefPathInterner` for the compiler session. Its first population atomically interns candidates in `DefPathHash` order, making initial `DefIndex` assignment reproducible and preventing concurrent builds from interleaving allocations. Later builds reuse IDs for existing paths and append newly seen paths; removed definitions leave vacant indices. A `DefId` also carries its session-local interner scope, so cross-session identity is compared by `DefPathHash`, not by the runtime `DefId` value.
 
 ```rust
@@ -1110,7 +1112,7 @@ A valid flags type has `AdtKind::Flags`. Its `AdtDef` has one variant with one h
 - `U16` for up to 16 flags;
 - `U32` for up to 32 flags.
 
-The field's name is a symbol that is not an identifier, so it cannot be written. A source access `f.bits` is `UNKNOWN_FIELD` (spec/06 §6.6.1). The flag names are not `VariantDef`s.
+The field's name is a symbol that is not an identifier, so it cannot be written. A source access `f.bits` is `UNKNOWN_FIELD` (spec/06 §6.6.1). The flag names are not `VariantDef`s; each instead names a constant (§16.9.3).
 
 ```rust
 pub struct FlagsDef {
@@ -1125,6 +1127,12 @@ pub struct FlagsDef {
 ### 16.9.3 Constants
 
 `F.X`, with `F` a flags type and `X` one of its flags, is a constant of type `F` (spec/13 §13.9.4). Type-relative path resolution (impl/03 §3.9.5) records it as `TypeDependentDef::FlagsConst { flags: F, bit: i }` (impl/03 §3.15.1). Its value is `ConstValue::Aggregate { variant: None, fields: [Int(1 << i, repr)] }` (impl/03 §3.7.15).
+
+Each authored WIT flag `X` is also a semantic-tooling symbol of kind `const`, with public canonical path `ns:pkg/iface.F.X`; the WIT name is converted to upper camel case as in §16.4.2. `wit_view` does not assign the constant its own `DefId`, so inventory derives a path from the verified flags-parent view `DefPath` followed by `ValueNs(X)`, using the zero-based bit index `i` as the component disambiguator. It computes the stable identity with `DefPathHash::compute`. The fingerprint masks the flag's own source name and includes `i`, so moving a flag to a different bit changes both fingerprint and derived identity. This synthetic path is not a `VariantDef` or an allocated HIR definition.
+
+- The direct authored-WIT inventory emits flag constants only for non-empty declarations with at most 32 validated flags. Empty declarations have no parent or constant candidates; declarations over the limit may retain an independently verified parent `enum` candidate but emit no flag constants. Both leave coverage incomplete.
+- Builtin `empty`, `all`, `contains`, and `is_empty` remain `FlagsMethod` view entities, not source symbols. Direct WIT use aliases do not create new constant paths; a constant is inventoried only at its defining flags type.
+- The local SAI `@flags enum` source inventory is a separate path. It remains incomplete until that inventory emits constants instead of treating flag variants as enum variants.
 
 - A name that is not a flag of `F` and not a provided function is `UNKNOWN_VARIANT` (spec/05 §5.13.6).
 - An implicit member `.X` whose expected type is a flags type is `IMPLICIT_MEMBER_NOT_ENUM` (spec/06 §6.4.3). A flags type is not an enum for this rule, and flags are always written with their type (N-K-20).

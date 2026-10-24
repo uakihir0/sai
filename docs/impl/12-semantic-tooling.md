@@ -45,7 +45,7 @@ All components read the results of the ordinary compiler queries (impl/01): the 
 A **symbol** is an entity that has a canonical path ([spec/04-modules-and-names.md](../spec/04-modules-and-names.md) §4.9.1) and is not a package or a module (N-H-63). The symbols are:
 
 - module-level items: functions, record types, aliases, refined types, enums, distinct types, resources, traits, constants, user effects, interfaces, worlds, and extern functions;
-- members: enum variants, fields and tuple-variant payloads, inherent associated functions and methods, trait methods and associated types, trait impls (including derived impls, impl/02 §2.9.17) and their items, interface impls, interface members and interface resource methods;
+- members: enum variants, WIT flags constants, fields and tuple-variant payloads, inherent associated functions and methods, trait methods and associated types, trait impls (including derived impls, impl/02 §2.9.17) and their items, interface impls, interface members and interface resource methods;
 - generic parameters, `test` declarations, and `property` declarations;
 - the items of WIT packages (Stage 4), with the canonical paths of spec/04 §4.9.1.
 
@@ -61,7 +61,8 @@ Every symbol has a **kind**, used in JSON as one of these strings:
 | `record`, `alias`, `refined`, `enum`, `distinct`, `resource` | the type declarations of the same name ([spec/05-types.md](../spec/05-types.md)) |
 | `variant`, `field` | enum variant; record, resource, or record-variant field, or tuple-variant payload |
 | `trait`, `assoc_type`, `impl` | trait; associated type declaration or definition; trait impl or interface impl |
-| `const`, `effect`, `interface`, `world` | the declarations of the same name |
+| `const` | module constants and each WIT flags constant `F.X` at `ns:pkg/iface.F.X` (spec/13 §13.9.4) |
+| `effect`, `interface`, `world` | the declarations of the same name |
 | `generic_param` | type or const generic parameter |
 | `test`, `property` | `test` and `property` declarations ([spec/14-testing.md](../spec/14-testing.md)) |
 
@@ -115,6 +116,8 @@ The symbol index (§12.9) records, for each symbol of each workspace package, it
 6. **Removal.** Entries that are still unmatched are deleted.
 
 The **fingerprint** of a symbol is the SipHash-1-3 128-bit hash, with the all-zero key, of its kind, a `0x00` byte, and the sequence of the kinds and texts of the tokens of its declaration node, excluding trivia, `NEWLINE` tokens, and the `DOCS` node, in which the text of the declaration's own name token (the `NAME` child, or the string of a `test` or `property`) is replaced by the empty string. A symbol that is renamed, or moved to another file without other changes, keeps its fingerprint. A symbol whose body also changed is not rematched and gets a new ID.
+
+A WIT flag constant has no separate `VariantDef` or view `DefId`. Its fingerprint uses the source flag occurrence with its own name token masked, followed by the stable token pair `("WitFlagsBitIndex", <zero-based bit index>)`. Its inventory-only identity path extends the verified flags-parent view `DefPath` with `ValueNs(flag)` and that same bit index as the component disambiguator; `DefPathHash` of this path is the symbol key. Reordering flags therefore changes both the constant fingerprint and `DefPathHash`, even when the public path `ns:pkg/iface.F.X` remains the same. This derived path does not claim that HIR allocated a definition for the constant.
 
 Consequences:
 
