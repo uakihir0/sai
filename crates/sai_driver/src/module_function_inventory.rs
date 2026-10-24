@@ -15,7 +15,7 @@ use sai_semantic::{
 };
 use sai_stable_hash::Fingerprint;
 use sai_syntax::{
-    SyntaxElement, SyntaxNode,
+    SyntaxElement, SyntaxKind, SyntaxNode,
     ast::{self, AstNode, AstToken},
 };
 use sai_vfs::{FileId, PackageKey};
@@ -47,9 +47,10 @@ impl Phase1PackageSymbolInventory {
 /// enums with their generic parameters, variants and record-variant fields,
 /// non-refined distinct types and their generic parameters, plain type aliases
 /// and their generic parameters, non-generic refined types, constants, user
-/// effects, tests, and properties. Every other symbol-bearing declaration
-/// makes the result incomplete until its symbol kind and path are collected as
-/// well.
+/// effects, worlds, tests, and properties. World import/export/include entries
+/// are validated as world contents but do not produce symbols. Every other
+/// symbol-bearing declaration makes the result incomplete until its symbol
+/// kind and path are collected as well.
 pub(super) fn collect_module_function_inventory(
     package_key: &PackageKey,
     package_version: Option<&MvsPackageVersion>,
@@ -154,6 +155,8 @@ pub(super) fn collect_module_function_inventory(
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut effect_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
+    let mut world_owners_by_item =
+        HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut alias_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut refined_owners_by_item =
@@ -222,6 +225,11 @@ pub(super) fn collect_module_function_inventory(
                         .insert("Phase 1 contains duplicate effect owner descriptors".to_owned());
                 }
             }
+            TopLevelOwnerKind::World => {
+                if world_owners_by_item.insert(key, *descriptor).is_some() {
+                    reasons.insert("Phase 1 contains duplicate world owner descriptors".into());
+                }
+            }
             TopLevelOwnerKind::Test | TopLevelOwnerKind::Property => {
                 if test_owners_by_item.insert(key, *descriptor).is_some() {
                     reasons.insert(
@@ -251,6 +259,7 @@ pub(super) fn collect_module_function_inventory(
     let mut consumed_distinct_owners = HashSet::new();
     let mut consumed_const_owners = HashSet::new();
     let mut consumed_effect_owners = HashSet::new();
+    let mut consumed_world_owners = HashSet::new();
     let mut consumed_alias_owners = HashSet::new();
     let mut consumed_refined_owners = HashSet::new();
     let mut consumed_test_owners = HashSet::new();
@@ -277,6 +286,7 @@ pub(super) fn collect_module_function_inventory(
 
         let mut test_name_disambiguators = HashMap::<(ItemTreeKind, String), u32>::new();
         let mut test_property_names = HashSet::<String>::new();
+        let mut world_name_disambiguators = HashMap::<Symbol, u32>::new();
         for entry in &input.filtered.item_tree.items {
             match entry.kind {
                 ItemTreeKind::Enum => {
@@ -433,6 +443,33 @@ pub(super) fn collect_module_function_inventory(
                         symbols,
                     );
                 }
+                ItemTreeKind::World => {
+                    let disambiguator = world_name_disambiguators.entry(entry.name).or_default();
+                    let expected_disambiguator = *disambiguator;
+                    if let Some(next_disambiguator) = disambiguator.checked_add(1) {
+                        *disambiguator = next_disambiguator;
+                    } else {
+                        reasons.insert("a world DefPath disambiguator overflowed".to_owned());
+                    }
+                    collect_world(
+                        entry,
+                        module.file,
+                        &module_path,
+                        package_version.package(),
+                        input,
+                        prepared.module_tree.package,
+                        &world_owners_by_item,
+                        &mut seen_items,
+                        &mut consumed_world_owners,
+                        expected_disambiguator,
+                        &mut canonical_paths,
+                        &mut current_symbols,
+                        &mut reasons,
+                        def_paths,
+                        packages,
+                        symbols,
+                    );
+                }
                 ItemTreeKind::Test | ItemTreeKind::Property => {
                     collect_test_or_property(
                         entry,
@@ -467,7 +504,7 @@ pub(super) fn collect_module_function_inventory(
                 // functions are children of ExternBlock and are symbols.
                 _ => {
                     reasons.insert(format!(
-                        "target-filtered declaration {:?} is outside the function-generic-parameter-record-generic-parameter-field-enum-generic-parameter-variant-record-variant-field-distinct-type-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect-test-property inventory",
+                        "target-filtered declaration {:?} is outside the function-generic-parameter-record-generic-parameter-field-enum-generic-parameter-variant-record-variant-field-distinct-type-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect-world-test-property inventory",
                         entry.kind
                     ));
                 }
@@ -508,6 +545,12 @@ pub(super) fn collect_module_function_inventory(
     if consumed_effect_owners.len() != effect_owners_by_item.len() {
         reasons.insert(
             "the Phase 1 effect owner descriptors do not exactly match the filtered ItemTree"
+                .to_owned(),
+        );
+    }
+    if consumed_world_owners.len() != world_owners_by_item.len() {
+        reasons.insert(
+            "the Phase 1 world owner descriptors do not exactly match the filtered ItemTree"
                 .to_owned(),
         );
     }
@@ -569,6 +612,13 @@ pub(super) fn collect_module_function_inventory(
         if !seen_items.contains(&(*file_id, *item_id)) {
             reasons.insert(
                 "a Phase 1 effect owner has no target-filtered ItemTree declaration".to_owned(),
+            );
+        }
+    }
+    for ((file_id, item_id), _) in &world_owners_by_item {
+        if !seen_items.contains(&(*file_id, *item_id)) {
+            reasons.insert(
+                "a Phase 1 world owner has no target-filtered ItemTree declaration".to_owned(),
             );
         }
     }
@@ -3035,6 +3085,325 @@ fn collect_effect(
         SymbolKind::Effect,
         fingerprint,
     ));
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_world(
+    entry: &ItemTreeEntry,
+    file_id: FileId,
+    module_path: &[String],
+    package_identity: &str,
+    input: &OwnedPhase1ModuleInput,
+    package_id: PackageId,
+    owners_by_item: &HashMap<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>,
+    seen_items: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    consumed_owners: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    expected_disambiguator: u32,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    reasons: &mut HashSet<String>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) {
+    let key = (file_id, entry.ast_id);
+    if !seen_items.insert(key) {
+        reasons.insert("the target-filtered ItemTree contains a duplicate world AST ID".into());
+    }
+    if entry.kind != ItemTreeKind::World {
+        reasons.insert("a non-world ItemTree entry reached the world collector".to_owned());
+        return;
+    }
+    if entry.name == Symbol::ERROR {
+        reasons.insert("a target-filtered world has no valid declaration name".to_owned());
+        return;
+    }
+    let name = match symbols.resolve(entry.name) {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            reasons.insert("a target-filtered world name cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let Some(descriptor) = owners_by_item.get(&key).copied() else {
+        reasons.insert("a target-filtered world has no matching Phase 1 owner".to_owned());
+        return;
+    };
+    if descriptor.kind != TopLevelOwnerKind::World
+        || descriptor.file != file_id
+        || descriptor.item_id != entry.ast_id
+    {
+        reasons.insert("a target-filtered world has a mismatched Phase 1 owner".to_owned());
+        return;
+    }
+    consumed_owners.insert(key);
+
+    let Some(pointer) = input.ast_ids.pointer(entry.ast_id) else {
+        reasons.insert("a target-filtered world AST ID has no source pointer".to_owned());
+        return;
+    };
+    let Some(syntax) = pointer.resolve(file_id, &input.root) else {
+        reasons.insert(
+            "a target-filtered world source pointer cannot resolve in its AST root".to_owned(),
+        );
+        return;
+    };
+    let Some(declaration) = ast::WorldDecl::cast(syntax.clone()) else {
+        reasons.insert(
+            "a target-filtered world source pointer resolves to a non-world node".to_owned(),
+        );
+        return;
+    };
+    if input.ast_ids.ast_id(&declaration).map(|id| id.erase()) != Some(entry.ast_id) {
+        reasons.insert("a target-filtered world AST ID does not match its declaration".into());
+        return;
+    }
+    let Some(name_node) = declaration.name() else {
+        reasons.insert("a target-filtered world AST has no name node".to_owned());
+        return;
+    };
+    let Some(name_token) = name_node.token() else {
+        reasons.insert("a target-filtered world AST has no name token".to_owned());
+        return;
+    };
+    let raw_name = name_token
+        .text()
+        .strip_prefix("r#")
+        .unwrap_or(name_token.text());
+    if sai_syntax::normalize_identifier(raw_name) != name {
+        reasons.insert("the ItemTree and world AST disagree about the declaration name".into());
+        return;
+    }
+    if syntax_has_errors(&syntax) || name_token.has_error() {
+        reasons.insert("a target-filtered world AST contains recovery or parse errors".to_owned());
+        return;
+    }
+    if input
+        .parser_diagnostics
+        .iter()
+        .any(|diagnostic| parser_diagnostic_overlaps_syntax(diagnostic, file_id, &syntax))
+    {
+        reasons.insert("a world declaration has an overlapping parser diagnostic".to_owned());
+        return;
+    }
+
+    // A source world is one symbol. Its imports, exports and includes are
+    // world contents, represented by separate HIR owners, not child symbols.
+    // Validate that the ItemTree preserves every supported source member and
+    // does not silently omit an unsupported ItemList form.
+    let mut member_shapes = Vec::new();
+    if let Some(item_list) = declaration.items() {
+        for child in item_list.syntax().children() {
+            let shape = match child.kind() {
+                SyntaxKind::WORLD_IMPORT => ast::WorldImport::cast(child).map(|member| {
+                    (
+                        ItemTreeKind::WorldItem { import: true },
+                        input.ast_ids.ast_id(&member).map(|id| id.erase()),
+                        member.syntax().clone(),
+                    )
+                }),
+                SyntaxKind::WORLD_EXPORT => ast::WorldExport::cast(child).map(|member| {
+                    (
+                        ItemTreeKind::WorldItem { import: false },
+                        input.ast_ids.ast_id(&member).map(|id| id.erase()),
+                        member.syntax().clone(),
+                    )
+                }),
+                SyntaxKind::WORLD_INCLUDE => ast::WorldInclude::cast(child).map(|member| {
+                    (
+                        ItemTreeKind::WorldInclude,
+                        input.ast_ids.ast_id(&member).map(|id| id.erase()),
+                        member.syntax().clone(),
+                    )
+                }),
+                _ => None,
+            };
+            let Some(shape) = shape else {
+                reasons.insert(
+                    "a world contains an unsupported or unrecognized source ItemList form"
+                        .to_owned(),
+                );
+                return;
+            };
+            member_shapes.push(shape);
+        }
+    }
+    if member_shapes.len() != entry.children.len() {
+        reasons.insert("a world's ItemTree members do not match its source ItemList".to_owned());
+        return;
+    }
+    for ((expected_kind, expected_ast_id, member_syntax), child) in
+        member_shapes.iter().zip(&entry.children)
+    {
+        if child.kind != *expected_kind || *expected_ast_id != Some(child.ast_id) {
+            reasons.insert(
+                "a world's ItemTree member kind or AST ID does not match its source ItemList"
+                    .to_owned(),
+            );
+            return;
+        }
+        if !child.children.is_empty() {
+            reasons.insert("a world member has unexpected nested declarations".to_owned());
+            return;
+        }
+        if child.name == Symbol::ERROR
+            || !symbols
+                .resolve(child.name)
+                .is_ok_and(|member_name| !member_name.is_empty())
+        {
+            reasons.insert("a world member has no valid ItemTree name".to_owned());
+            return;
+        }
+        let Some(source_name) = source_world_member_name(input.source.text(), member_syntax) else {
+            reasons.insert("a world member has no valid source name".to_owned());
+            return;
+        };
+        if !symbols
+            .resolve(child.name)
+            .is_ok_and(|member_name| member_name.as_ref() == source_name)
+        {
+            reasons.insert("a world's ItemTree member name does not match its source AST".into());
+            return;
+        }
+        if syntax_has_errors(member_syntax)
+            || input.parser_diagnostics.iter().any(|diagnostic| {
+                parser_diagnostic_overlaps_syntax(diagnostic, file_id, member_syntax)
+            })
+        {
+            reasons.insert("a world member contains recovery or parser diagnostics".to_owned());
+            return;
+        }
+    }
+
+    let canonical_path = format!(
+        "{}{}.{name}",
+        package_identity,
+        module_path
+            .iter()
+            .map(|segment| format!("/{segment}"))
+            .collect::<String>()
+    );
+    if !canonical_paths.insert(canonical_path.clone()) {
+        reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+    }
+
+    let def_path = match def_paths.resolve(descriptor.owner.def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        Ok(Some(_)) => {
+            reasons.insert(
+                "a world owner resolves to a definition path from another package".to_owned(),
+            );
+            return;
+        }
+        Ok(None) => {
+            reasons.insert("a world owner has no canonical definition path".to_owned());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("a world owner definition path cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let path_matches_declaration = def_path.data().len() == module_path.len() + 1
+        && def_path
+            .data()
+            .iter()
+            .take(module_path.len())
+            .zip(module_path)
+            .all(|(component, module_name)| {
+                component.disambiguator == 0
+                    && matches!(&component.data, DefPathData::Module(segment)
+                        if symbols.resolve(*segment).is_ok_and(|resolved| resolved.as_ref() == module_name))
+            })
+        && def_path.data().last().is_some_and(|component| {
+            component.data == DefPathData::World(entry.name)
+                && component.disambiguator == expected_disambiguator
+        });
+    if !path_matches_declaration {
+        reasons.insert(
+            "the world DefPath does not match its module, name, and disambiguator".to_owned(),
+        );
+        return;
+    }
+    let def_path_hash = match DefPathHash::compute(&def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert("a world definition path hash cannot be computed".to_owned());
+            return;
+        }
+    };
+    let fingerprint = match declaration_fingerprint(SymbolKind::World, &syntax, Some(&name_token)) {
+        Ok(fingerprint) => fingerprint,
+        Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+            reasons.insert("a world name token is outside its declaration syntax node".into());
+            return;
+        }
+    };
+    current_symbols.push(CurrentSymbol::new(
+        canonical_path,
+        def_path_hash,
+        SymbolKind::World,
+        fingerprint,
+    ));
+}
+
+fn source_world_member_name(source: &str, syntax: &SyntaxNode) -> Option<String> {
+    match syntax.kind() {
+        SyntaxKind::WORLD_IMPORT => {
+            let item = ast::WorldImport::cast(syntax.clone())?;
+            source_world_item_name(source, item.function(), item.reference())
+        }
+        SyntaxKind::WORLD_EXPORT => {
+            let item = ast::WorldExport::cast(syntax.clone())?;
+            source_world_item_name(source, item.function(), item.reference())
+        }
+        SyntaxKind::WORLD_INCLUDE => {
+            let item = ast::WorldInclude::cast(syntax.clone())?;
+            source_world_reference_name(source, item.reference()?)
+        }
+        _ => None,
+    }
+}
+
+fn source_world_item_name(
+    source: &str,
+    function: Option<ast::FnDecl>,
+    reference: Option<ast::WorldRef>,
+) -> Option<String> {
+    if let Some(function) = function {
+        let token = function.name()?.token()?;
+        let token_text = token.text();
+        let raw_name = token_text.strip_prefix("r#");
+        if raw_name == Some("_")
+            || (raw_name.is_none() && sai_syntax::is_reserved_identifier(token_text))
+        {
+            return None;
+        }
+        return Some(sai_syntax::normalize_identifier(
+            raw_name.unwrap_or(token_text),
+        ));
+    }
+    source_world_reference_name(source, reference?)
+}
+
+fn source_world_reference_name(source: &str, reference: ast::WorldRef) -> Option<String> {
+    if let Some(package) = reference.package() {
+        return Some(package.syntax().text().to_owned());
+    }
+    let path = reference.mod_path()?;
+    let mut segments = Vec::new();
+    for segment in path.segments() {
+        let text = source_node_text(source, segment.syntax())?;
+        segments.push(sai_syntax::normalize_identifier(
+            text.strip_prefix("r#").unwrap_or(text),
+        ));
+    }
+    Some(segments.join("."))
+}
+
+fn source_node_text<'a>(source: &'a str, syntax: &SyntaxNode) -> Option<&'a str> {
+    let range = syntax.text_range();
+    source.get(range.start().to_usize()..range.end().to_usize())
 }
 
 #[allow(clippy::too_many_arguments)]
