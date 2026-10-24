@@ -12,7 +12,8 @@ use sai_vfs::{FileContents, FileKey, PackageKey, PackageRelativePath, WitFilesSn
 use sai_wit::{
     WitContract, WitIfaceIdx, WitItem, WitItemIdx, WitItemKind, WitMemberKind, WitPackage,
     WitPackageKind, WitType, WitUnit, WitUnitKind, WitView, WitViewDefKind, WitViewEntity,
-    authored_interface_function_tokens, authored_interface_resource_tokens, wit_name_to_sai,
+    authored_interface_enum_tokens, authored_interface_function_tokens,
+    authored_interface_resource_tokens, wit_name_to_sai,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str;
@@ -518,6 +519,22 @@ fn collect_root_interface_symbols(
                     reasons,
                     current_symbols,
                 ),
+                WitItemKind::Enum(_) => collect_root_interface_enum(
+                    view,
+                    view_interface,
+                    interface_index,
+                    item_index,
+                    item,
+                    &interface.name,
+                    &selected_identity,
+                    &expected_interface_name,
+                    source_files,
+                    packages,
+                    symbols_interner,
+                    &mut emitted_paths,
+                    reasons,
+                    current_symbols,
+                ),
                 _ => {
                     reasons.insert(format!(
                         "WIT interface item `{}`.{} is outside this inventory slice",
@@ -807,6 +824,255 @@ fn collect_root_interface_resource(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn collect_root_interface_enum(
+    view: &WitView,
+    view_interface: &sai_wit::ViewInterface,
+    interface_index: WitIfaceIdx,
+    item_index: WitItemIdx,
+    item: &WitItem,
+    interface_name: &str,
+    selected_identity: &str,
+    expected_interface_name: &str,
+    source_files: &BTreeMap<String, Arc<str>>,
+    packages: &sai_intern::PackageInterner,
+    symbols_interner: &sai_intern::Interner,
+    emitted_paths: &mut HashSet<String>,
+    reasons: &mut BTreeSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+) {
+    let WitItemKind::Enum(cases) = &item.kind else {
+        reasons.insert(format!(
+            "WIT item `{interface_name}.{}` is not a unit enum",
+            item.name
+        ));
+        return;
+    };
+    if item.unsupported.is_some() {
+        reasons.insert(format!(
+            "WIT enum `{interface_name}.{}` uses an unsupported declaration form",
+            item.name
+        ));
+        return;
+    }
+    let Some(source_enum) = enum_source_identity(item, interface_name, cases, source_files) else {
+        reasons.insert(format!(
+            "WIT enum `{interface_name}.{}` has no exact validated declaration and case spans",
+            item.name
+        ));
+        return;
+    };
+
+    let enum_sai_name = match wit_name_to_sai(&item.name, true) {
+        Ok(name) => name,
+        Err(_) => {
+            reasons.insert(format!(
+                "WIT enum `{interface_name}.{}` has no supported SAI type spelling",
+                item.name
+            ));
+            return;
+        }
+    };
+    let enum_view_name = enum_sai_name.strip_prefix("r#").unwrap_or(&enum_sai_name);
+    let Some(view_member) = view_interface.members.get(enum_view_name) else {
+        reasons.insert(format!(
+            "WIT enum `{interface_name}.{}` is absent from the selected view",
+            item.name
+        ));
+        return;
+    };
+    if view_member.item != item_index
+        || view_member.kind != WitViewDefKind::Enum
+        || view_member.unsupported.is_some()
+    {
+        reasons.insert(format!(
+            "WIT enum `{interface_name}.{}` does not match its selected view item",
+            item.name
+        ));
+        return;
+    }
+    let enum_entity = WitViewEntity::Item {
+        interface: interface_index,
+        item: item_index,
+    };
+    let Some(enum_def) = view.definition_for_entity(enum_entity) else {
+        reasons.insert(format!(
+            "WIT enum `{interface_name}.{}` has no selected view definition",
+            item.name
+        ));
+        return;
+    };
+    if view_member.def != enum_def {
+        reasons.insert(format!(
+            "WIT enum `{interface_name}.{}` view member does not identify its model item",
+            item.name
+        ));
+        return;
+    }
+    let Some(enum_definition) = view.definition(enum_def) else {
+        reasons.insert(format!(
+            "WIT enum `{interface_name}.{}` has no current selected view definition",
+            item.name
+        ));
+        return;
+    };
+    if !view_definition_matches_entity(enum_definition, enum_entity, WitViewDefKind::Enum) {
+        reasons.insert(format!(
+            "WIT enum `{interface_name}.{}` view definition does not identify its model item",
+            item.name
+        ));
+        return;
+    }
+    let enum_path = match view.def_path(enum_def) {
+        Ok(Some(path)) => path,
+        _ => {
+            reasons.insert(format!(
+                "WIT enum `{interface_name}.{}` has no canonical definition path",
+                item.name
+            ));
+            return;
+        }
+    };
+    if !view_definition_path_matches_enum(
+        &enum_path,
+        &enum_definition.canonical_path,
+        expected_interface_name,
+        enum_view_name,
+        symbols_interner,
+    ) {
+        reasons.insert(format!(
+            "WIT enum `{interface_name}.{}` does not match its canonical view definition path",
+            item.name
+        ));
+        return;
+    }
+    let Some(enum_hash) = verified_view_path_hash(
+        &enum_path,
+        enum_definition.path_hash,
+        packages,
+        symbols_interner,
+    ) else {
+        reasons.insert(format!(
+            "WIT enum `{interface_name}.{}` definition path hash is inconsistent",
+            item.name
+        ));
+        return;
+    };
+
+    let canonical_enum_path = format!("{selected_identity}/{interface_name}.{enum_view_name}");
+    if !emitted_paths.insert(canonical_enum_path.clone()) {
+        reasons.insert(format!(
+            "WIT enum canonical path `{canonical_enum_path}` is duplicated"
+        ));
+        return;
+    }
+    current_symbols.push(CurrentSymbol::new(
+        canonical_enum_path,
+        enum_hash,
+        SymbolKind::Enum,
+        declaration_fingerprint_from_token_pairs(SymbolKind::Enum, &source_enum.token_pairs),
+    ));
+
+    for (case_index, (case_name, source_case)) in
+        cases.iter().zip(source_enum.cases.iter()).enumerate()
+    {
+        let case_sai_name = match wit_name_to_sai(case_name, true) {
+            Ok(name) => name,
+            Err(_) => {
+                reasons.insert(format!(
+                    "WIT enum case `{interface_name}.{}`.{case_name} has no supported SAI spelling",
+                    item.name
+                ));
+                continue;
+            }
+        };
+        let case_view_name = case_sai_name.strip_prefix("r#").unwrap_or(&case_sai_name);
+        let Ok(case_ordinal) = u32::try_from(case_index) else {
+            reasons.insert(format!(
+                "WIT enum `{interface_name}.{}` has too many cases",
+                item.name
+            ));
+            continue;
+        };
+        let case_entity = WitViewEntity::Variant {
+            interface: interface_index,
+            item: item_index,
+            case: case_ordinal,
+        };
+        let Some(case_def) = view.definition_for_entity(case_entity) else {
+            reasons.insert(format!(
+                "WIT enum case `{interface_name}.{}`.{case_name} is missing from the selected view",
+                item.name
+            ));
+            continue;
+        };
+        let Some(case_definition) = view.definition(case_def) else {
+            reasons.insert(format!(
+                "WIT enum case `{interface_name}.{}`.{case_name} has no current selected view definition",
+                item.name
+            ));
+            continue;
+        };
+        if !view_definition_matches_entity(case_definition, case_entity, WitViewDefKind::Variant) {
+            reasons.insert(format!(
+                "WIT enum case `{interface_name}.{}`.{case_name} view definition does not identify its model case",
+                item.name
+            ));
+            continue;
+        }
+        let case_path = match view.def_path(case_def) {
+            Ok(Some(path)) => path,
+            _ => {
+                reasons.insert(format!(
+                    "WIT enum case `{interface_name}.{}`.{case_name} has no canonical definition path",
+                    item.name
+                ));
+                continue;
+            }
+        };
+        if !view_definition_path_matches_enum_case(
+            &case_path,
+            &case_definition.canonical_path,
+            expected_interface_name,
+            enum_view_name,
+            case_view_name,
+            symbols_interner,
+        ) {
+            reasons.insert(format!(
+                "WIT enum case `{interface_name}.{}`.{case_name} does not match its canonical view definition path",
+                item.name
+            ));
+            continue;
+        }
+        let Some(case_hash) = verified_view_path_hash(
+            &case_path,
+            case_definition.path_hash,
+            packages,
+            symbols_interner,
+        ) else {
+            reasons.insert(format!(
+                "WIT enum case `{interface_name}.{}`.{case_name} definition path hash is inconsistent",
+                item.name
+            ));
+            continue;
+        };
+        let canonical_case_path =
+            format!("{selected_identity}/{interface_name}.{enum_view_name}.{case_view_name}");
+        if !emitted_paths.insert(canonical_case_path.clone()) {
+            reasons.insert(format!(
+                "WIT enum case canonical path `{canonical_case_path}` is duplicated"
+            ));
+            continue;
+        }
+        current_symbols.push(CurrentSymbol::new(
+            canonical_case_path,
+            case_hash,
+            SymbolKind::Variant,
+            declaration_fingerprint_from_token_pairs(SymbolKind::Variant, &source_case.token_pairs),
+        ));
+    }
+}
+
 fn resource_source_identity(
     item: &WitItem,
     interface_name: &str,
@@ -845,6 +1111,71 @@ fn resource_source_identity(
         })
         .count();
     (name_token_count == 1).then_some(scanned)
+}
+
+fn enum_source_identity(
+    item: &WitItem,
+    interface_name: &str,
+    cases: &[String],
+    source_files: &BTreeMap<String, Arc<str>>,
+) -> Option<sai_wit::AuthoredInterfaceEnumTokens> {
+    let name_span = item.span.as_ref()?;
+    let source = source_files.get(&name_span.path)?;
+    let name_text = source.get(name_span.range.clone())?;
+    if normalized_wit_name(name_text) != Some(item.name.as_str()) {
+        return None;
+    }
+    let scanned =
+        authored_interface_enum_tokens(source, interface_name, &item.name, &name_span.range)?;
+    if scanned.cases.len() != cases.len()
+        || scanned.declaration_range.start > name_span.range.start
+        || name_span.range.end > scanned.declaration_range.end
+        || scanned.declaration_range.is_empty()
+        || source
+            .get(scanned.declaration_range.clone())
+            .is_none_or(|declaration| !declaration.ends_with('}'))
+        || scanned
+            .token_pairs
+            .last()
+            .map(|(kind, text)| (kind.as_str(), text.as_str()))
+            != Some(("RightBrace", "}"))
+        || scanned
+            .token_pairs
+            .iter()
+            .filter(|(kind, text)| {
+                text.is_empty() && matches!(kind.as_str(), "Id" | "ExplicitId" | "StringLiteral")
+            })
+            .count()
+            != 1
+    {
+        return None;
+    }
+    let mut previous_end = scanned.declaration_range.start;
+    for (model_case, source_case) in cases.iter().zip(&scanned.cases) {
+        let name_text = source.get(source_case.name_range.clone())?;
+        if source_case.name.as_str() != model_case.as_str()
+            || normalized_wit_name(name_text) != Some(model_case.as_str())
+            || source_case.declaration_range.start < scanned.declaration_range.start
+            || source_case.declaration_range.end > scanned.declaration_range.end
+            || source_case.declaration_range.start < previous_end
+            || source_case.declaration_range.is_empty()
+            || source_case.name_range.start < source_case.declaration_range.start
+            || source_case.name_range.end > source_case.declaration_range.end
+            || source_case
+                .token_pairs
+                .iter()
+                .filter(|(kind, text)| {
+                    text.is_empty()
+                        && matches!(kind.as_str(), "Id" | "ExplicitId" | "StringLiteral")
+                })
+                .count()
+                != 1
+        {
+            return None;
+        }
+        previous_end = source_case.declaration_range.end;
+    }
+    Some(scanned)
 }
 
 fn resource_members_match_source(
@@ -982,6 +1313,115 @@ fn view_definition_path_matches_resource(
         expected_resource.len(),
         expected_resource,
         resource_component.disambiguator,
+    );
+    definition_canonical_path == expected_canonical_path
+}
+
+fn view_definition_path_matches_enum(
+    path: &sai_hir::DefPath,
+    definition_canonical_path: &str,
+    expected_interface: &str,
+    expected_enum: &str,
+    symbols_interner: &sai_intern::Interner,
+) -> bool {
+    let [interface_component, enum_component] = path.data() else {
+        return false;
+    };
+    let (DefPathData::Interface(interface_symbol), DefPathData::TypeNs(enum_symbol)) =
+        (&interface_component.data, &enum_component.data)
+    else {
+        return false;
+    };
+    if interface_component.disambiguator != 0
+        || enum_component.disambiguator != 0
+        || !symbols_interner
+            .resolve(*interface_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_interface)
+        || !symbols_interner
+            .resolve(*enum_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_enum)
+    {
+        return false;
+    }
+    let expected_canonical_path = format!(
+        "interface[{}:{};{}]/type[{}:{};{}]/",
+        expected_interface.len(),
+        expected_interface,
+        interface_component.disambiguator,
+        expected_enum.len(),
+        expected_enum,
+        enum_component.disambiguator,
+    );
+    definition_canonical_path == expected_canonical_path
+}
+
+fn view_definition_matches_entity(
+    definition: &sai_wit::WitViewDef,
+    expected_entity: WitViewEntity,
+    expected_kind: WitViewDefKind,
+) -> bool {
+    definition.entity == expected_entity && definition.kind == expected_kind
+}
+
+fn verified_view_path_hash(
+    path: &sai_hir::DefPath,
+    expected_hash: DefPathHash,
+    packages: &sai_intern::PackageInterner,
+    symbols_interner: &sai_intern::Interner,
+) -> Option<Fingerprint> {
+    let hash = DefPathHash::compute(path, packages, symbols_interner).ok()?;
+    (hash == expected_hash).then(|| Fingerprint::new(hash.raw()))
+}
+
+fn view_definition_path_matches_enum_case(
+    path: &sai_hir::DefPath,
+    definition_canonical_path: &str,
+    expected_interface: &str,
+    expected_enum: &str,
+    expected_case: &str,
+    symbols_interner: &sai_intern::Interner,
+) -> bool {
+    let [interface_component, enum_component, case_component] = path.data() else {
+        return false;
+    };
+    let (
+        DefPathData::Interface(interface_symbol),
+        DefPathData::TypeNs(enum_symbol),
+        DefPathData::Variant(case_symbol),
+    ) = (
+        &interface_component.data,
+        &enum_component.data,
+        &case_component.data,
+    )
+    else {
+        return false;
+    };
+    if interface_component.disambiguator != 0
+        || enum_component.disambiguator != 0
+        || case_component.disambiguator != 0
+        || !symbols_interner
+            .resolve(*interface_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_interface)
+        || !symbols_interner
+            .resolve(*enum_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_enum)
+        || !symbols_interner
+            .resolve(*case_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_case)
+    {
+        return false;
+    }
+    let expected_canonical_path = format!(
+        "interface[{}:{};{}]/type[{}:{};{}]/variant[{}:{};{}]/",
+        expected_interface.len(),
+        expected_interface,
+        interface_component.disambiguator,
+        expected_enum.len(),
+        expected_enum,
+        enum_component.disambiguator,
+        expected_case.len(),
+        expected_case,
+        case_component.disambiguator,
     );
     definition_canonical_path == expected_canonical_path
 }
@@ -1183,11 +1623,18 @@ fn incomplete_inventory(
 mod tests {
     use super::{
         ValidatedFunctionSource, function_source_identity, resource_members_match_source,
-        resource_source_identity,
+        resource_source_identity, verified_view_path_hash, view_definition_matches_entity,
+        view_definition_path_matches_enum, view_definition_path_matches_enum_case,
     };
+    use sai_hir::{DefPath, DefPathData, DefPathHash, DisambiguatedDefPathData};
+    use sai_intern::{Interner, PackageInterner};
+    use sai_semantic::{SymbolKind, declaration_fingerprint_from_token_pairs};
+    use sai_stable_hash::Fingerprint;
     use sai_wit::{
-        WitFunc, WitItem, WitItemKind, WitMember, WitMemberKind, WitSpan,
-        authored_interface_function_tokens, authored_interface_resource_tokens,
+        WitFunc, WitIfaceIdx, WitIndexVec, WitItem, WitItemIdx, WitItemKind, WitMember,
+        WitMemberKind, WitSpan, WitViewDef, WitViewDefKind, WitViewEntity,
+        authored_interface_enum_tokens, authored_interface_function_tokens,
+        authored_interface_resource_tokens,
     };
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -1225,6 +1672,67 @@ mod tests {
 
     fn source_map(source: &str) -> BTreeMap<String, Arc<str>> {
         BTreeMap::from([("root.wit".to_owned(), Arc::<str>::from(source))])
+    }
+
+    fn def_path(
+        packages: &PackageInterner,
+        package: sai_intern::PackageId,
+        symbols: &Interner,
+        data: Vec<DisambiguatedDefPathData>,
+    ) -> DefPath {
+        DefPath::new(package, data, packages, symbols).expect("view path uses current interners")
+    }
+
+    fn path_symbol(symbols: &Interner, name: &str) -> sai_intern::Symbol {
+        symbols.intern(name).expect("path symbol interns")
+    }
+
+    fn enum_path(
+        packages: &PackageInterner,
+        package: sai_intern::PackageId,
+        symbols: &Interner,
+    ) -> DefPath {
+        def_path(
+            packages,
+            package,
+            symbols,
+            vec![
+                DisambiguatedDefPathData {
+                    data: DefPathData::Interface(path_symbol(symbols, "api")),
+                    disambiguator: 0,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::TypeNs(path_symbol(symbols, "Status")),
+                    disambiguator: 0,
+                },
+            ],
+        )
+    }
+
+    fn enum_case_path(
+        packages: &PackageInterner,
+        package: sai_intern::PackageId,
+        symbols: &Interner,
+    ) -> DefPath {
+        def_path(
+            packages,
+            package,
+            symbols,
+            vec![
+                DisambiguatedDefPathData {
+                    data: DefPathData::Interface(path_symbol(symbols, "api")),
+                    disambiguator: 0,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::TypeNs(path_symbol(symbols, "Status")),
+                    disambiguator: 0,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::Variant(path_symbol(symbols, "Ready")),
+                    disambiguator: 0,
+                },
+            ],
+        )
     }
 
     fn resource_item(source: &str) -> WitItem {
@@ -1398,6 +1906,152 @@ mod tests {
             &extra_member,
             &source_resource,
             &sources
+        ));
+    }
+
+    #[test]
+    fn enum_and_case_fingerprints_survive_renaming_their_own_names() {
+        fn fingerprints(source: &str, enum_name: &str) -> (Fingerprint, Fingerprint) {
+            let name_start = source.find(enum_name).expect("enum name occurs");
+            let enum_tokens = authored_interface_enum_tokens(
+                source,
+                "api",
+                enum_name,
+                &(name_start..name_start + enum_name.len()),
+            )
+            .expect("scanner binds to the exact enum name range");
+            let enum_fingerprint = declaration_fingerprint_from_token_pairs(
+                SymbolKind::Enum,
+                &enum_tokens.token_pairs,
+            );
+            let case_tokens = &enum_tokens.cases[0];
+            let case_fingerprint = declaration_fingerprint_from_token_pairs(
+                SymbolKind::Variant,
+                &case_tokens.token_pairs,
+            );
+            (enum_fingerprint, case_fingerprint)
+        }
+
+        let original = fingerprints(
+            "package acme:sample@1.0.0; interface api { enum status { ready, stopped } }",
+            "status",
+        );
+        let enum_renamed = fingerprints(
+            "package acme:sample@1.0.0; interface api { enum lifecycle { ready, stopped } }",
+            "lifecycle",
+        );
+        let case_renamed = fingerprints(
+            "package acme:sample@1.0.0; interface api { enum status { prepared, stopped } }",
+            "status",
+        );
+
+        assert_eq!(original.0, enum_renamed.0);
+        assert_eq!(original.1, enum_renamed.1);
+        assert_eq!(original.1, case_renamed.1);
+        assert_ne!(
+            original.0, case_renamed.0,
+            "the enum fingerprint tracks changes to its ordered cases"
+        );
+    }
+
+    #[test]
+    fn enum_def_paths_and_hashes_reject_mismatched_view_identity() {
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:sample#1.0.0")
+            .expect("package interns");
+        let symbols = Interner::new();
+        let enum_path = enum_path(&packages, package, &symbols);
+        let enum_canonical_path = "interface[3:api;0]/type[6:Status;0]/";
+        assert!(view_definition_path_matches_enum(
+            &enum_path,
+            enum_canonical_path,
+            "api",
+            "Status",
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_enum(
+            &enum_path,
+            "interface[3:api;0]/type[5:Wrong;0]/",
+            "api",
+            "Status",
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_enum(
+            &enum_path,
+            enum_canonical_path,
+            "other",
+            "Status",
+            &symbols
+        ));
+
+        let expected_hash =
+            DefPathHash::compute(&enum_path, &packages, &symbols).expect("path hash computes");
+        let interface = WitIndexVec::<WitIfaceIdx, ()>::new()
+            .next_index()
+            .expect("interface index fits");
+        let item = WitIndexVec::<WitItemIdx, ()>::new()
+            .next_index()
+            .expect("item index fits");
+        let enum_definition = WitViewDef {
+            entity: WitViewEntity::Item { interface, item },
+            kind: WitViewDefKind::Enum,
+            path_hash: expected_hash,
+            canonical_path: enum_canonical_path.to_owned(),
+        };
+        assert!(view_definition_matches_entity(
+            &enum_definition,
+            WitViewEntity::Item { interface, item },
+            WitViewDefKind::Enum
+        ));
+        let mut wrong_entity = enum_definition.clone();
+        wrong_entity.entity = WitViewEntity::Interface { interface };
+        assert!(!view_definition_matches_entity(
+            &wrong_entity,
+            WitViewEntity::Item { interface, item },
+            WitViewDefKind::Enum
+        ));
+        let mut wrong_kind = enum_definition.clone();
+        wrong_kind.kind = WitViewDefKind::Variant;
+        assert!(!view_definition_matches_entity(
+            &wrong_kind,
+            WitViewEntity::Item { interface, item },
+            WitViewDefKind::Enum
+        ));
+        assert_eq!(
+            verified_view_path_hash(&enum_path, expected_hash, &packages, &symbols),
+            Some(Fingerprint::new(expected_hash.raw()))
+        );
+        let wrong_hash = DefPathHash::compute(
+            &enum_case_path(&packages, package, &symbols),
+            &packages,
+            &symbols,
+        )
+        .expect("distinct path hash computes");
+        assert_ne!(expected_hash, wrong_hash);
+        assert_eq!(
+            verified_view_path_hash(&enum_path, wrong_hash, &packages, &symbols),
+            None,
+            "a view hash for a different entity is rejected"
+        );
+
+        let case_path = enum_case_path(&packages, package, &symbols);
+        let case_canonical_path = "interface[3:api;0]/type[6:Status;0]/variant[5:Ready;0]/";
+        assert!(view_definition_path_matches_enum_case(
+            &case_path,
+            case_canonical_path,
+            "api",
+            "Status",
+            "Ready",
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_enum_case(
+            &case_path,
+            case_canonical_path,
+            "api",
+            "Status",
+            "NotReady",
+            &symbols
         ));
     }
 }
