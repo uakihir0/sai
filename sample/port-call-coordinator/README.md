@@ -18,7 +18,7 @@ crane's hourly rate, rounded up to a whole minute.
 | Order | Vessel | Result | Berth / crane | Inbound | Service | Outbound or reason |
 |---:|---|---|---|---|---|---|
 | 1 | Aster | Scheduled | Hazmat Pier / 203 | 10:00–10:30 | 10:30–12:18 | 12:18–12:48 |
-| 2 | Brio | Scheduled | North Quay / 201 | 08:00–08:30 | 08:30–10:00 | 10:00–10:30 |
+| 2 | Brio | Scheduled | North Quay / 201 | 08:30–09:00 | 09:00–10:30 | 10:30–11:00 |
 | 3 | Cobalt | Scheduled | Deep Pier / 204 | 12:48–13:18 | 13:18–14:27 | 14:27–14:57 |
 | 4 | Delta | Scheduled | North Quay / 202 | 11:24–11:54 | 11:54–13:18 | 13:18–13:48 |
 | 5 | Ember | Unplaced | — | — | — | ReeferPowerUnavailable |
