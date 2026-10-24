@@ -1,0 +1,272 @@
+use acme:port-call-coordinator/model.{
+    Berth
+    CargoKind
+    Crane
+    HazmatClass
+    PortCall
+    PortScenario
+    TideWindow
+}
+
+pub fn scenario() -> PortScenario {
+    PortScenario(
+        calls: [
+            Some(
+                PortCall(
+                    id: 101,
+                    vessel_id: 5101,
+                    vessel_name: "Aster",
+                    priority: 0,
+                    eta_minute: 480,
+                    latest_departure_minute: 900,
+                    length_m: 280,
+                    draft_m: 11,
+                    cargo_kind: CargoKind.Containers,
+                    cargo_tons: 900,
+                    reefer_plugs_required: 0,
+                    hazmat_class: HazmatClass.Flammable,
+                ),
+            ),
+            Some(
+                PortCall(
+                    id: 102,
+                    vessel_id: 5102,
+                    vessel_name: "Brio",
+                    priority: 0,
+                    eta_minute: 480,
+                    latest_departure_minute: 900,
+                    length_m: 290,
+                    draft_m: 8,
+                    cargo_kind: CargoKind.Containers,
+                    cargo_tons: 900,
+                    reefer_plugs_required: 2,
+                    hazmat_class: HazmatClass.None,
+                ),
+            ),
+            Some(
+                PortCall(
+                    id: 103,
+                    vessel_id: 5103,
+                    vessel_name: "Cobalt",
+                    priority: 1,
+                    eta_minute: 540,
+                    latest_departure_minute: 1020,
+                    length_m: 270,
+                    draft_m: 9,
+                    cargo_kind: CargoKind.Containers,
+                    cargo_tons: 800,
+                    reefer_plugs_required: 0,
+                    hazmat_class: HazmatClass.Oxidizer,
+                ),
+            ),
+            Some(
+                PortCall(
+                    id: 104,
+                    vessel_id: 5104,
+                    vessel_name: "Delta",
+                    priority: 1,
+                    eta_minute: 540,
+                    latest_departure_minute: 930,
+                    length_m: 260,
+                    draft_m: 8,
+                    cargo_kind: CargoKind.Bulk,
+                    cargo_tons: 700,
+                    reefer_plugs_required: 0,
+                    hazmat_class: HazmatClass.None,
+                ),
+            ),
+            Some(
+                PortCall(
+                    id: 105,
+                    vessel_id: 5105,
+                    vessel_name: "Ember",
+                    priority: 2,
+                    eta_minute: 600,
+                    latest_departure_minute: 1080,
+                    length_m: 300,
+                    draft_m: 10,
+                    cargo_kind: CargoKind.Containers,
+                    cargo_tons: 1000,
+                    reefer_plugs_required: 4,
+                    hazmat_class: HazmatClass.None,
+                ),
+            ),
+            Some(
+                PortCall(
+                    id: 106,
+                    vessel_id: 5106,
+                    vessel_name: "Fjord",
+                    priority: 2,
+                    eta_minute: 660,
+                    latest_departure_minute: 1140,
+                    length_m: 250,
+                    draft_m: 13,
+                    cargo_kind: CargoKind.Containers,
+                    cargo_tons: 600,
+                    reefer_plugs_required: 0,
+                    hazmat_class: HazmatClass.None,
+                ),
+            ),
+            Some(
+                PortCall(
+                    id: 107,
+                    vessel_id: 5107,
+                    vessel_name: "Gannet",
+                    priority: 3,
+                    eta_minute: 720,
+                    latest_departure_minute: 1100,
+                    length_m: 310,
+                    draft_m: 8,
+                    cargo_kind: CargoKind.Bulk,
+                    cargo_tons: 500,
+                    reefer_plugs_required: 0,
+                    hazmat_class: HazmatClass.Toxic,
+                ),
+            ),
+            Some(
+                PortCall(
+                    id: 108,
+                    vessel_id: 5108,
+                    vessel_name: "Harbor",
+                    priority: 3,
+                    eta_minute: 780,
+                    latest_departure_minute: 1200,
+                    length_m: 240,
+                    draft_m: 7,
+                    cargo_kind: CargoKind.Liquid,
+                    cargo_tons: 1000,
+                    reefer_plugs_required: 0,
+                    hazmat_class: HazmatClass.None,
+                ),
+            ),
+        ],
+        call_count: 8,
+        berths: [
+            Some(
+                Berth(
+                    id: 11,
+                    name: "North Quay",
+                    maximum_length_m: 300,
+                    maximum_draft_m: 9,
+                    reefer_plugs: 2,
+                    hazmat_permit: HazmatClass.None,
+                    neighbor_berth_id: 12,
+                    open_minute: 480,
+                    close_minute: 1020,
+                ),
+            ),
+            Some(
+                Berth(
+                    id: 12,
+                    name: "Hazmat Pier",
+                    maximum_length_m: 320,
+                    maximum_draft_m: 13,
+                    reefer_plugs: 1,
+                    hazmat_permit: HazmatClass.Flammable,
+                    neighbor_berth_id: 11,
+                    open_minute: 540,
+                    close_minute: 1140,
+                ),
+            ),
+            Some(
+                Berth(
+                    id: 13,
+                    name: "Deep Pier",
+                    maximum_length_m: 280,
+                    maximum_draft_m: 10,
+                    reefer_plugs: 1,
+                    hazmat_permit: HazmatClass.Oxidizer,
+                    neighbor_berth_id: 12,
+                    open_minute: 600,
+                    close_minute: 1200,
+                ),
+            ),
+            Some(
+                Berth(
+                    id: 14,
+                    name: "Outer Berth",
+                    maximum_length_m: 240,
+                    maximum_draft_m: 8,
+                    reefer_plugs: 0,
+                    hazmat_permit: HazmatClass.Toxic,
+                    neighbor_berth_id: 0,
+                    open_minute: 480,
+                    close_minute: 1200,
+                ),
+            ),
+        ],
+        berth_count: 4,
+        cranes: [
+            Some(
+                Crane(
+                    id: 201,
+                    berth_id: 11,
+                    cargo_kind: CargoKind.Containers,
+                    throughput_tons_per_hour: 600,
+                    open_minute: 480,
+                    close_minute: 1020,
+                ),
+            ),
+            Some(
+                Crane(
+                    id: 202,
+                    berth_id: 11,
+                    cargo_kind: CargoKind.Bulk,
+                    throughput_tons_per_hour: 500,
+                    open_minute: 480,
+                    close_minute: 1020,
+                ),
+            ),
+            Some(
+                Crane(
+                    id: 203,
+                    berth_id: 12,
+                    cargo_kind: CargoKind.Containers,
+                    throughput_tons_per_hour: 500,
+                    open_minute: 540,
+                    close_minute: 1140,
+                ),
+            ),
+            Some(
+                Crane(
+                    id: 204,
+                    berth_id: 13,
+                    cargo_kind: CargoKind.Containers,
+                    throughput_tons_per_hour: 700,
+                    open_minute: 600,
+                    close_minute: 1200,
+                ),
+            ),
+            Some(
+                Crane(
+                    id: 205,
+                    berth_id: 13,
+                    cargo_kind: CargoKind.Bulk,
+                    throughput_tons_per_hour: 500,
+                    open_minute: 600,
+                    close_minute: 1200,
+                ),
+            ),
+            Some(
+                Crane(
+                    id: 206,
+                    berth_id: 14,
+                    cargo_kind: CargoKind.Bulk,
+                    throughput_tons_per_hour: 450,
+                    open_minute: 480,
+                    close_minute: 1200,
+                ),
+            ),
+            None,
+            None,
+        ],
+        crane_count: 6,
+        tide_windows: [
+            Some(TideWindow(id: 301, start_minute: 480, end_minute: 600, maximum_draft_m: 9)),
+            Some(TideWindow(id: 302, start_minute: 600, end_minute: 840, maximum_draft_m: 12)),
+            Some(TideWindow(id: 303, start_minute: 840, end_minute: 1200, maximum_draft_m: 10)),
+            None,
+        ],
+        tide_window_count: 3,
+    )
+}

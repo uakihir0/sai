@@ -1,0 +1,208 @@
+use acme:port-call-coordinator/data
+use acme:port-call-coordinator/model.{
+    CargoKind
+    HazmatClass
+    InputIssue
+    PortCall
+    PortPlan
+    PortScenario
+    UnplacedReason
+}
+use acme:port-call-coordinator/planner
+
+pub fn sample_plan() -> PortPlan {
+    planner.plan(data.scenario())
+}
+
+fn channel_pressure_scenario() -> PortScenario {
+    var scenario = data.scenario()
+    scenario.call_count = 2
+    scenario.berth_count = 2
+    scenario.crane_count = 2
+    scenario.tide_window_count = 2
+
+    scenario.calls[0] = Some(
+        PortCall(
+            id: 901,
+            vessel_id: 9901,
+            vessel_name: "First passage",
+            priority: 0,
+            eta_minute: 480,
+            latest_departure_minute: 900,
+            length_m: 200,
+            draft_m: 8,
+            cargo_kind: CargoKind.Containers,
+            cargo_tons: 20000,
+            reefer_plugs_required: 0,
+            hazmat_class: HazmatClass.None,
+        ),
+    )
+    scenario.calls[1] = Some(
+        PortCall(
+            id: 902,
+            vessel_id: 9902,
+            vessel_name: "Tide-limited passage",
+            priority: 1,
+            eta_minute: 577,
+            latest_departure_minute: 640,
+            length_m: 200,
+            draft_m: 8,
+            cargo_kind: CargoKind.Containers,
+            cargo_tons: 1,
+            reefer_plugs_required: 0,
+            hazmat_class: HazmatClass.None,
+        ),
+    )
+
+    var first_crane = scenario.cranes[0].unwrap()
+    first_crane.throughput_tons_per_hour = 18000
+    scenario.cranes[0] = Some(first_crane)
+    scenario.cranes[1] = scenario.cranes[2]
+
+    var first_tide = scenario.tide_windows[0].unwrap()
+    first_tide.end_minute = 577
+    scenario.tide_windows[0] = Some(first_tide)
+    var second_tide = scenario.tide_windows[1].unwrap()
+    second_tide.start_minute = 577
+    second_tide.end_minute = 608
+    scenario.tide_windows[1] = Some(second_tide)
+    scenario
+}
+
+test "the fixed fixture schedules four calls with checked tide and adjacency timing" {
+    let result = sample_plan()
+    assert result.input_valid
+    assert result.decision_count == 8
+    assert result.scheduled_count == 4
+    assert result.decisions[0].unwrap().call_id == 101
+    assert result.decisions[1].unwrap().call_id == 102
+    assert result.decisions[2].unwrap().call_id == 103
+    assert result.decisions[3].unwrap().call_id == 104
+
+    let aster = result.decisions[0].unwrap().assignment.unwrap()
+    assert aster.berth_id == 12
+    assert aster.tide_window_id == 302
+    assert aster.channel_in_start_minute == 600
+    assert aster.service_start_minute == 630
+    assert aster.service_end_minute == 738
+    assert aster.channel_out_end_minute == 768
+
+    let brio = result.decisions[1].unwrap().assignment.unwrap()
+    assert brio.berth_id == 11
+    assert brio.channel_in_start_minute == 510
+    assert brio.service_start_minute == 540
+    assert brio.service_end_minute == 630
+    assert brio.channel_out_end_minute == 660
+
+    let cobalt = result.decisions[2].unwrap().assignment.unwrap()
+    assert cobalt.berth_id == 13
+    assert cobalt.channel_in_start_minute == 768
+    assert cobalt.channel_out_end_minute == 897
+
+    let delta = result.decisions[3].unwrap().assignment.unwrap()
+    assert delta.berth_id == 11
+    assert delta.channel_in_start_minute == 684
+    assert delta.service_start_minute == 714
+    assert delta.service_end_minute == 798
+    assert delta.channel_out_end_minute == 828
+}
+
+test "stable priority ETA and call ID ordering ignores fixture array order" {
+    var shuffled = data.scenario()
+    let first = shuffled.calls[0]
+    shuffled.calls[0] = shuffled.calls[1]
+    shuffled.calls[1] = first
+    let third = shuffled.calls[2]
+    shuffled.calls[2] = shuffled.calls[3]
+    shuffled.calls[3] = third
+    let result = planner.plan(shuffled)
+
+    assert result.decisions[0].unwrap().call_id == 101
+    assert result.decisions[1].unwrap().call_id == 102
+    assert result.decisions[2].unwrap().call_id == 103
+    assert result.decisions[3].unwrap().call_id == 104
+    assert result.decisions[0].unwrap().assignment.unwrap().channel_in_start_minute == 600
+    assert result.decisions[1].unwrap().assignment.unwrap().channel_in_start_minute == 510
+}
+
+test "fixture decisions explain reefer tide permit and crane limits" {
+    let result = sample_plan()
+    let reefer_reason = result.decisions[4].unwrap().unplaced_reason
+    let tide_reason = result.decisions[5].unwrap().unplaced_reason
+    let permit_reason = result.decisions[6].unwrap().unplaced_reason
+    let crane_reason = result.decisions[7].unwrap().unplaced_reason
+    assert reefer_reason == Some(UnplacedReason.ReeferPowerUnavailable)
+    assert tide_reason == Some(UnplacedReason.NoSafeTideWindow)
+    assert permit_reason == Some(UnplacedReason.HazmatPermitUnavailable)
+    assert crane_reason == Some(UnplacedReason.NoCompatibleCrane)
+}
+
+test "a flammable and oxidizer call cannot overlap on adjacent berths" {
+    var scenario = data.scenario()
+    var cobalt = scenario.calls[2].unwrap()
+    cobalt.latest_departure_minute = 890
+    scenario.calls[2] = Some(cobalt)
+    let result = planner.plan(scenario)
+
+    assert result.decisions[2].unwrap().call_id == 103
+    assert result.decisions[2].unwrap().assignment == None
+    assert result.decisions[2].unwrap().unplaced_reason == Some(UnplacedReason.HazmatSeparation)
+}
+
+test "a narrow second tide passage reports the shared channel conflict" {
+    let result = planner.plan(channel_pressure_scenario())
+    assert result.input_valid
+    assert result.scheduled_count == 1
+    assert result.decisions[0].unwrap().call_id == 901
+    assert result.decisions[1].unwrap().call_id == 902
+    assert result.decisions[1].unwrap().assignment == None
+    assert result.decisions[1].unwrap().unplaced_reason == Some(UnplacedReason.ChannelOccupied)
+}
+
+test "duplicate and incomplete inputs fail closed before making decisions" {
+    var duplicate = data.scenario()
+    var repeated_call = duplicate.calls[1].unwrap()
+    repeated_call.id = duplicate.calls[0].unwrap().id
+    duplicate.calls[1] = Some(repeated_call)
+    let duplicate_result = planner.plan(duplicate)
+    assert not duplicate_result.input_valid
+    assert duplicate_result.input_issue == Some(InputIssue.DuplicateCallId)
+    assert duplicate_result.decision_count == 0
+    assert duplicate_result.scheduled_count == 0
+
+    var missing = data.scenario()
+    missing.calls[5] = None
+    let missing_result = planner.plan(missing)
+    assert not missing_result.input_valid
+    assert missing_result.input_issue == Some(InputIssue.MissingCall)
+    assert missing_result.decision_count == 0
+
+    var duplicate_vessel = data.scenario()
+    var repeated_vessel = duplicate_vessel.calls[1].unwrap()
+    repeated_vessel.vessel_id = duplicate_vessel.calls[0].unwrap().vessel_id
+    duplicate_vessel.calls[1] = Some(repeated_vessel)
+    let vessel_result = planner.plan(duplicate_vessel)
+    assert not vessel_result.input_valid
+    assert vessel_result.input_issue == Some(InputIssue.DuplicateVesselId)
+    assert vessel_result.decision_count == 0
+}
+
+test "unknown crane berths and overlapping tides invalidate the full batch" {
+    var unknown_crane = data.scenario()
+    var crane = unknown_crane.cranes[0].unwrap()
+    crane.berth_id = 9999
+    unknown_crane.cranes[0] = Some(crane)
+    let crane_result = planner.plan(unknown_crane)
+    assert not crane_result.input_valid
+    assert crane_result.input_issue == Some(InputIssue.UnknownCraneBerth)
+    assert crane_result.decision_count == 0
+
+    var overlapping_tides = data.scenario()
+    var tide = overlapping_tides.tide_windows[1].unwrap()
+    tide.start_minute = 590
+    overlapping_tides.tide_windows[1] = Some(tide)
+    let tide_result = planner.plan(overlapping_tides)
+    assert not tide_result.input_valid
+    assert tide_result.input_issue == Some(InputIssue.OverlappingTideWindows)
+    assert tide_result.decision_count == 0
+}
