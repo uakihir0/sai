@@ -29128,9 +29128,15 @@ interface api { resource canvas { invalid: static func(items: map<string, u32>);
             "an empty tuple rejected by the parser must not leak enum candidates"
         );
 
-        for source in [
-            &b"interface api {\nenum State { Negative = -1 }\n}\n"[..],
-            &b"interface api {\nenum State { TooLarge = 18446744073709551616 }\n}\n"[..],
+        for (source, variant_name) in [
+            (
+                &b"interface api {\nenum State { Negative = -1 }\n}\n"[..],
+                "Negative",
+            ),
+            (
+                &b"interface api {\nenum State { TooLarge = 18446744073709551616 }\n}\n"[..],
+                "TooLarge",
+            ),
         ] {
             let (_, _, _, collection) =
                 collect_package_inventory_for_target(source, b"", "wasm32-core");
@@ -29149,8 +29155,7 @@ interface api { resource canvas { invalid: static func(items: map<string, u32>);
                     && symbol.kind() == sai_semantic::SymbolKind::Enum
             }));
             assert!(inventory.symbols().iter().any(|symbol| {
-                (symbol.path() == "acme:phase1.api.State.Negative"
-                    || symbol.path() == "acme:phase1.api.State.TooLarge")
+                symbol.path() == format!("acme:phase1.api.State.{variant_name}")
                     && symbol.kind() == sai_semantic::SymbolKind::Variant
             }));
         }
