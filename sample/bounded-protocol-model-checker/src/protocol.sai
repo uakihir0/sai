@@ -1,0 +1,180 @@
+use acme:bounded-protocol-model-checker/model.{
+    Action
+    GrantTiming
+    Owner
+    ProtocolConfig
+    ProtocolState
+}
+
+const ACTION_COUNT: USize = 12
+
+pub fn initial_state() -> ProtocolState {
+    ProtocolState(
+        owner: Owner.Free,
+        request_pending: [false, false],
+        grant_in_flight: [false, false],
+        client_holds_lease: [false, false],
+        release_in_flight: [false, false],
+    )
+}
+
+pub fn action_count() -> USize {
+    ACTION_COUNT
+}
+
+pub fn action_at(index: USize) -> Option<Action> {
+    match index {
+        0 => Some(Action.RequestA)
+        1 => Some(Action.RequestB)
+        2 => Some(Action.SendGrantA)
+        3 => Some(Action.SendGrantB)
+        4 => Some(Action.DeliverGrantA)
+        5 => Some(Action.DeliverGrantB)
+        6 => Some(Action.BeginReleaseA)
+        7 => Some(Action.BeginReleaseB)
+        8 => Some(Action.ProcessReleaseA)
+        9 => Some(Action.ProcessReleaseB)
+        10 => Some(Action.DropReleaseA)
+        11 => Some(Action.DropReleaseB)
+        _ => None
+    }
+}
+
+pub fn next_state(state: ProtocolState, action: Action, config: ProtocolConfig) -> Option<
+    ProtocolState,
+> {
+    var next = state
+
+    match action {
+        Action.RequestA => {
+            if (
+                not state.request_pending[0]
+                and not state.grant_in_flight[0]
+                and not state.client_holds_lease[0]
+            ) {
+                next.request_pending[0] = true
+                return Some(next)
+            }
+        }
+        Action.RequestB => {
+            if (
+                not state.request_pending[1]
+                and not state.grant_in_flight[1]
+                and not state.client_holds_lease[1]
+            ) {
+                next.request_pending[1] = true
+                return Some(next)
+            }
+        }
+        Action.SendGrantA => {
+            if state.request_pending[0] and state.owner == Owner.Free {
+                next.request_pending[0] = false
+                next.grant_in_flight[0] = true
+                if config.grant_timing == GrantTiming.ReserveWhenSending {
+                    next.owner = Owner.ClientA
+                }
+                return Some(next)
+            }
+        }
+        Action.SendGrantB => {
+            if state.request_pending[1] and state.owner == Owner.Free {
+                next.request_pending[1] = false
+                next.grant_in_flight[1] = true
+                if config.grant_timing == GrantTiming.ReserveWhenSending {
+                    next.owner = Owner.ClientB
+                }
+                return Some(next)
+            }
+        }
+        Action.DeliverGrantA => {
+            if state.grant_in_flight[0] {
+                next.grant_in_flight[0] = false
+                next.client_holds_lease[0] = true
+                if (
+                    config.grant_timing == GrantTiming.ReserveWhenReceiving
+                    and state.owner == Owner.Free
+                ) {
+                    next.owner = Owner.ClientA
+                }
+                return Some(next)
+            }
+        }
+        Action.DeliverGrantB => {
+            if state.grant_in_flight[1] {
+                next.grant_in_flight[1] = false
+                next.client_holds_lease[1] = true
+                if (
+                    config.grant_timing == GrantTiming.ReserveWhenReceiving
+                    and state.owner == Owner.Free
+                ) {
+                    next.owner = Owner.ClientB
+                }
+                return Some(next)
+            }
+        }
+        Action.BeginReleaseA => {
+            if state.client_holds_lease[0] and not state.release_in_flight[0] {
+                next.client_holds_lease[0] = false
+                next.release_in_flight[0] = true
+                return Some(next)
+            }
+        }
+        Action.BeginReleaseB => {
+            if state.client_holds_lease[1] and not state.release_in_flight[1] {
+                next.client_holds_lease[1] = false
+                next.release_in_flight[1] = true
+                return Some(next)
+            }
+        }
+        Action.ProcessReleaseA => {
+            if state.release_in_flight[0] {
+                next.release_in_flight[0] = false
+                if state.owner == Owner.ClientA {
+                    next.owner = Owner.Free
+                }
+                return Some(next)
+            }
+        }
+        Action.ProcessReleaseB => {
+            if state.release_in_flight[1] {
+                next.release_in_flight[1] = false
+                if state.owner == Owner.ClientB {
+                    next.owner = Owner.Free
+                }
+                return Some(next)
+            }
+        }
+        Action.DropReleaseA => {
+            if config.allow_release_message_loss and state.release_in_flight[0] {
+                next.release_in_flight[0] = false
+                return Some(next)
+            }
+        }
+        Action.DropReleaseB => {
+            if config.allow_release_message_loss and state.release_in_flight[1] {
+                next.release_in_flight[1] = false
+                return Some(next)
+            }
+        }
+    }
+
+    None
+}
+
+pub fn violates_mutual_exclusion(state: ProtocolState) -> Bool {
+    state.client_holds_lease[0] and state.client_holds_lease[1]
+}
+
+pub fn has_unfinished_work(state: ProtocolState) -> Bool {
+    (
+        state.owner != Owner.Free
+        or state.request_pending[0]
+        or state.request_pending[1]
+        or state.grant_in_flight[0]
+        or state.grant_in_flight[1]
+        or state.client_holds_lease[0]
+        or state.client_holds_lease[1]
+        or state.release_in_flight[0]
+        or state.release_in_flight[1]
+    )
+}

@@ -1,0 +1,16 @@
+use acme:bounded-protocol-model-checker/model.{GrantTiming, ProtocolConfig}
+
+pub fn reliable_server() -> ProtocolConfig {
+    ProtocolConfig(grant_timing: GrantTiming.ReserveWhenSending, allow_release_message_loss: false)
+}
+
+pub fn delayed_reservation_bug() -> ProtocolConfig {
+    ProtocolConfig(
+        grant_timing: GrantTiming.ReserveWhenReceiving,
+        allow_release_message_loss: false,
+    )
+}
+
+pub fn lossy_release_transport() -> ProtocolConfig {
+    ProtocolConfig(grant_timing: GrantTiming.ReserveWhenSending, allow_release_message_loss: true)
+}

@@ -1,0 +1,67 @@
+use acme:bounded-protocol-model-checker/checker
+use acme:bounded-protocol-model-checker/fixtures
+use acme:bounded-protocol-model-checker/model.{
+    Action
+    CheckOutcome
+    CheckReport
+    MAX_SEARCH_CAPACITY
+    ProtocolConfig
+}
+
+pub fn check_protocol(config: ProtocolConfig, state_limit: USize) -> CheckReport {
+    checker.check(config, state_limit)
+}
+
+test "the reliable server exhausts its state graph without deadlock" {
+    let result = checker.check(fixtures.reliable_server(), MAX_SEARCH_CAPACITY)
+    assert result.outcome == CheckOutcome.ProvenSafe
+    assert result.visited_state_count == 20
+    assert result.deadlock_state_count == 0
+    assert result.trace.length == 0
+}
+
+test "delayed reservation returns the shortest deterministic safety witness" {
+    let first = checker.check(fixtures.delayed_reservation_bug(), MAX_SEARCH_CAPACITY)
+    let second = checker.check(fixtures.delayed_reservation_bug(), MAX_SEARCH_CAPACITY)
+
+    assert first.outcome == CheckOutcome.Counterexample
+    assert first.trace.length == 6
+    assert first.trace.actions[0] == Some(Action.RequestA)
+    assert first.trace.actions[1] == Some(Action.RequestB)
+    assert first.trace.actions[2] == Some(Action.SendGrantA)
+    assert first.trace.actions[3] == Some(Action.SendGrantB)
+    assert first.trace.actions[4] == Some(Action.DeliverGrantA)
+    assert first.trace.actions[5] == Some(Action.DeliverGrantB)
+    assert first.trace == second.trace
+}
+
+test "release loss is reported as an unfinished deadlock" {
+    let result = checker.check(fixtures.lossy_release_transport(), MAX_SEARCH_CAPACITY)
+
+    assert result.outcome == CheckOutcome.Deadlock
+    assert result.deadlock_state_count == 2
+    assert result.trace.length == 7
+    assert result.trace.actions[0] == Some(Action.RequestA)
+    assert result.trace.actions[1] == Some(Action.RequestB)
+    assert result.trace.actions[2] == Some(Action.SendGrantA)
+    assert result.trace.actions[3] == Some(Action.DeliverGrantA)
+    assert result.trace.actions[4] == Some(Action.BeginReleaseA)
+    assert result.trace.actions[5] == Some(Action.RequestA)
+    assert result.trace.actions[6] == Some(Action.DropReleaseA)
+}
+
+test "a newly discovered state beyond the limit cannot be reported safe" {
+    let result = checker.check(fixtures.reliable_server(), 1)
+
+    assert result.outcome == CheckOutcome.BoundExceeded
+    assert result.visited_state_count == 1
+    assert result.trace.length == 0
+}
+
+test "invalid state limits are rejected before search" {
+    assert checker.check(fixtures.reliable_server(), 0).outcome == CheckOutcome.InvalidStateLimit
+    assert (
+        checker.check(fixtures.reliable_server(), MAX_SEARCH_CAPACITY + 1).outcome
+        == CheckOutcome.InvalidStateLimit
+    )
+}
