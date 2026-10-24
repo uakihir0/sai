@@ -25244,7 +25244,7 @@ interface api { call: func(); }\n";
             &[(
                 "root.wit",
                 b"package acme:phase1@1.0.0;\n\
-interface local-api { root-call: func(); resource root-resource { ping: func(); } }\n\
+interface local-api { enum local-state { running, stopped } root-call: func(); resource root-resource { ping: func(); } }\n\
 world app { import acme:dep/api; }\n",
             )],
         );
@@ -25256,7 +25256,7 @@ world app { import acme:dep/api; }\n",
             PackageRole::Dependency,
             &[(
                 "root.wit",
-                b"package acme:dep@1.0.0;\ninterface api { dependency-only: func(); resource foreign-resource { ping: func(); } }\n",
+                b"package acme:dep@1.0.0;\ninterface api { enum foreign-state { ready, done } dependency-only: func(); resource foreign-resource { ping: func(); } }\n",
             )],
         );
         database
@@ -25264,7 +25264,7 @@ world app { import acme:dep/api; }\n",
                 dependency,
                 sai_wit::GeneratedText {
                     text: Arc::from(
-                        "package acme:dep@1.0.0;\ninterface api { dependency-only: func(); resource foreign-resource { ping: func(); } }",
+                        "package acme:dep@1.0.0;\ninterface api { enum foreign-state { ready, done } dependency-only: func(); resource foreign-resource { ping: func(); } }",
                     ),
                     complete: true,
                     origins: Arc::from([]),
@@ -25304,6 +25304,20 @@ world app { import acme:dep/api; }\n",
                 .all(|symbol| !symbol.path().starts_with("acme:dep/api.")),
             "dependency closure resources and members must not enter root inventory"
         );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.path() == "acme:phase1/local-api.LocalState"),
+            "the selected root's authored enum is inventoried"
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.path() != "acme:dep/api.ForeignState"),
+            "dependency closure enums must not enter root inventory"
+        );
 
         let selected = MvsPackageVersion::new(
             "acme:phase1",
@@ -25324,6 +25338,174 @@ world app { import acme:dep/api; }\n",
                 .any(|model| model.name.namespace == "acme" && model.name.name == "dep"),
             "dependency closure actually contains the foreign package"
         );
+    }
+
+    #[test]
+    fn wit_enum_inventory_collects_exact_enum_and_case_definitions() {
+        let wit_source = b"package acme:phase1@1.0.0;\n\
+interface api {\n\
+    @since(version = 1.0.0)\n\
+    enum status { ready, not-ready }\n\
+    enum %type { %async, stopped }\n\
+    variant outcome { ready, failed(u32) }\n\
+}\n";
+        let (mut database, package, collection) = collect_single_authored_wit_inventory(wit_source);
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { .. }
+        ));
+
+        let source = std::str::from_utf8(wit_source).expect("fixture WIT is UTF-8");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version parses"),
+        )
+        .expect("root package selection is valid");
+        let unit =
+            WitUnit::dir(package, &database.packages, &selected).expect("root WIT unit is valid");
+        let loaded = database
+            .wit_package(&unit)
+            .expect("root WIT package query succeeds")
+            .package
+            .expect("root WIT package model is available");
+        let root = loaded.root();
+        let (interface_index, interface) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "api")
+            .expect("root interface is present");
+        let view = database
+            .wit_view(&unit)
+            .expect("selected authored WIT view is available");
+        let view_interface = &view.interfaces["api"];
+
+        for (item_index, item) in interface.items.iter_enumerated() {
+            let sai_wit::WitItemKind::Enum(cases) = &item.kind else {
+                continue;
+            };
+            let enum_name =
+                sai_wit::wit_name_to_sai(&item.name, true).expect("enum type name maps to SAI");
+            let enum_name = enum_name.strip_prefix("r#").unwrap_or(&enum_name);
+            let enum_path = format!("acme:phase1/api.{enum_name}");
+            let enum_symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == enum_path)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "enum `{enum_path}` is missing; coverage: {:?}; symbols: {:?}",
+                        inventory.coverage(),
+                        inventory.symbols()
+                    )
+                });
+            assert_eq!(enum_symbol.kind(), sai_semantic::SymbolKind::Enum);
+
+            let enum_definition = view
+                .definition_for_entity(sai_wit::WitViewEntity::Item {
+                    interface: interface_index,
+                    item: item_index,
+                })
+                .expect("enum has the exact view definition");
+            assert_eq!(
+                view_interface.members[enum_name].def, enum_definition,
+                "the selected interface member identifies this enum"
+            );
+            let enum_def_path = view
+                .def_path(enum_definition)
+                .expect("enum DefPath resolves")
+                .expect("enum DefPath exists");
+            let expected_enum_hash = sai_hir::DefPathHash::compute(
+                &enum_def_path,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("enum DefPath hash computes");
+            assert_eq!(
+                enum_symbol.def_path_hash(),
+                Fingerprint::new(expected_enum_hash.raw())
+            );
+            let name_span = item.span.as_ref().expect("enum source name span is mapped");
+            let enum_tokens = sai_wit::authored_interface_enum_tokens(
+                source,
+                &interface.name,
+                &item.name,
+                &name_span.range,
+            )
+            .expect("the exact authored declaration sidecar is available");
+            assert_eq!(
+                enum_symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint_from_token_pairs(
+                    sai_semantic::SymbolKind::Enum,
+                    &enum_tokens.token_pairs
+                )
+            );
+            assert_eq!(enum_tokens.cases.len(), cases.len());
+
+            for (case_index, (case_name, source_case)) in
+                cases.iter().zip(&enum_tokens.cases).enumerate()
+            {
+                let case_name =
+                    sai_wit::wit_name_to_sai(case_name, true).expect("enum case name maps to SAI");
+                let case_name = case_name.strip_prefix("r#").unwrap_or(&case_name);
+                let case_path = format!("{enum_path}.{case_name}");
+                let case_symbol = inventory
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.path() == case_path)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "enum case `{case_path}` is missing; coverage: {:?}; symbols: {:?}",
+                            inventory.coverage(),
+                            inventory.symbols()
+                        )
+                    });
+                assert_eq!(case_symbol.kind(), sai_semantic::SymbolKind::Variant);
+                let case_entity = sai_wit::WitViewEntity::Variant {
+                    interface: interface_index,
+                    item: item_index,
+                    case: u32::try_from(case_index).expect("case index fits"),
+                };
+                let case_definition = view
+                    .definition_for_entity(case_entity)
+                    .expect("case has the exact view definition");
+                let case_def_path = view
+                    .def_path(case_definition)
+                    .expect("case DefPath resolves")
+                    .expect("case DefPath exists");
+                let expected_case_hash = sai_hir::DefPathHash::compute(
+                    &case_def_path,
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("case DefPath hash computes");
+                assert_eq!(
+                    case_symbol.def_path_hash(),
+                    Fingerprint::new(expected_case_hash.raw())
+                );
+                assert_eq!(
+                    case_symbol.fingerprint(),
+                    sai_semantic::declaration_fingerprint_from_token_pairs(
+                        sai_semantic::SymbolKind::Variant,
+                        &source_case.token_pairs
+                    )
+                );
+            }
+        }
+
+        for path in [
+            "acme:phase1/api.Outcome",
+            "acme:phase1/api.Outcome.Ready",
+            "acme:phase1/api.Outcome.Failed",
+        ] {
+            assert!(
+                inventory
+                    .symbols()
+                    .iter()
+                    .all(|symbol| symbol.path() != path),
+                "payload WIT variants are outside this unit-enum slice: {path}"
+            );
+        }
     }
 
     #[test]
