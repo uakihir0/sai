@@ -3094,6 +3094,38 @@ mod tests {
     }
 
     #[test]
+    fn alias_scanner_rejects_use_aliases_and_nested_field_names_as_direct_symbols() {
+        let source = concat!(
+            "interface types { type original = u32; }\n",
+            "interface api {\n",
+            "  use types.{original as imported};\n",
+            "  record container { %type: tuple<u32, u32> }\n",
+            "  type visible = string;\n",
+            "}\n",
+        );
+        let imported_range = source.find("imported").expect("use alias occurs");
+        let imported_range = imported_range..imported_range + "imported".len();
+        assert!(
+            authored_interface_alias_tokens(source, "api", "imported", &imported_range).is_none(),
+            "a use re-export's alias token does not prove a direct type declaration"
+        );
+
+        let field_start = source.find("%type:").expect("nested field occurs");
+        let field_range = field_start..field_start + "%type".len();
+        assert!(
+            authored_interface_alias_tokens(source, "api", "type", &field_range).is_none(),
+            "a type-like record field name does not prove a direct alias"
+        );
+
+        let direct = interface_alias(source, "visible");
+        assert_eq!(&source[direct.name_range.clone()], "visible");
+        assert!(
+            authored_interface_alias_tokens(source, "api", "visible", &direct.name_range).is_some(),
+            "the valid direct sibling remains selectable"
+        );
+    }
+
+    #[test]
     fn direct_record_and_field_ranges_include_attributes_and_mask_own_names() {
         let source = concat!(
             "interface api {\n",
@@ -3505,6 +3537,44 @@ mod tests {
                 "{invalid}"
             );
         }
+    }
+
+    #[test]
+    fn flags_scanner_rejects_case_insensitive_names_that_share_a_sai_spelling() {
+        let source = concat!(
+            "interface api {\n",
+            "  flags permissions { foo-bar, FOO-BAR }\n",
+            "  flags unrelated { read, write }\n",
+            "}\n",
+        );
+        assert_eq!(
+            crate::wit_name_to_sai("foo-bar", true).expect("lowercase WIT name converts"),
+            crate::wit_name_to_sai("FOO-BAR", true).expect("uppercase WIT name converts"),
+            "the case-insensitive WIT duplicates also share one SAI spelling"
+        );
+
+        let declarations = scan_source(source).flags_declarations;
+        assert_eq!(
+            declarations
+                .iter()
+                .map(|declaration| declaration.name.as_str())
+                .collect::<Vec<_>>(),
+            ["unrelated"],
+            "the duplicate declaration contributes no parent or partial flag set"
+        );
+        let duplicate_start = source.find("permissions").expect("parent name occurs");
+        let duplicate_range = duplicate_start..duplicate_start + "permissions".len();
+        assert!(
+            authored_interface_flags_tokens(source, "api", "permissions", &duplicate_range)
+                .is_none(),
+            "the exact source name span cannot select an invalid declaration"
+        );
+        let sibling = &declarations[0];
+        assert!(
+            authored_interface_flags_tokens(source, "api", "unrelated", &sibling.name_range)
+                .is_some(),
+            "the independently verified sibling remains selectable"
+        );
     }
 
     #[test]
