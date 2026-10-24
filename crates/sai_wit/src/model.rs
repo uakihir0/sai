@@ -374,11 +374,12 @@ pub struct WitItem {
     pub kind: WitItemKind,
     pub unsupported: Option<Unsupported>,
     pub span: Option<WitSpan>,
-    /// Exact source range of a directly declared interface function.
+    /// Exact source range of a directly declared interface function or
+    /// resource.
     ///
     /// The parser's item span points at only the declared name token. This
-    /// wider range is retained only when the source scanner can recover a
-    /// function declaration terminator from the same authored file.
+    /// wider range is retained only when the source scanner can recover the
+    /// complete declaration boundary from the same authored file.
     pub declaration_span: Option<WitSpan>,
     /// Stable WIT token kind/text pairs for the exact declaration. The
     /// declared name token is present with empty text.
