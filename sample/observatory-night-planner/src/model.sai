@@ -1,0 +1,83 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Filter {
+    Luminance
+    HAlpha
+    Planetary
+    Infrared
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Disposition {
+    Scheduled
+    TargetNotFound
+    UnsupportedFilter
+    GuidingUnavailable
+    CloudLimitExceeded
+    VisibilityWindowMissed
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Target {
+    pub id: U32
+    pub name: Str
+    pub visible_start_minute: U32
+    pub visible_end_minute: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Telescope {
+    pub name: Str
+    pub supports_luminance: Bool
+    pub supports_h_alpha: Bool
+    pub supports_planetary: Bool
+    pub guiding_unit_available: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type NightConditions {
+    pub dark_start_minute: U32
+    pub dark_end_minute: U32
+    pub cloud_percent: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ObservationRequest {
+    pub id: U32
+    pub target_id: U32
+    // Smaller values represent more urgent observing requests.
+    pub priority: U32
+    pub earliest_start_minute: U32
+    pub latest_end_minute: U32
+    pub exposure_minutes: U32
+    pub filter: Filter
+    pub maximum_cloud_percent: U32
+    pub requires_guiding: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ObservationDecision {
+    pub request_id: U32
+    pub target_name: Str
+    pub filter: Filter
+    pub disposition: Disposition
+    // A missed request carries its proposed interval for auditability.
+    pub start_minute: Option<U32>
+    pub end_minute: Option<U32>
+    pub setup_minutes: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ObservingPlan {
+    pub decisions: Array<Option<ObservationDecision>, 8>
+    pub decision_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type NightReport {
+    pub plan: ObservingPlan
+    pub scheduled_count: USize
+    pub target_missing_count: USize
+    pub equipment_hold_count: USize
+    pub cloud_hold_count: USize
+    pub visibility_miss_count: USize
+}

@@ -1,0 +1,32 @@
+use acme:observatory-night-planner/model.{
+    Disposition
+    Filter
+    NightConditions
+    ObservationRequest
+    Telescope
+}
+
+fn filter_supported(telescope: Telescope, filter: Filter) -> Bool {
+    match filter {
+        Filter.Luminance => telescope.supports_luminance
+        Filter.HAlpha => telescope.supports_h_alpha
+        Filter.Planetary => telescope.supports_planetary
+        Filter.Infrared => false
+    }
+}
+
+pub fn blocking_reason(
+    telescope: Telescope,
+    conditions: NightConditions,
+    request: ObservationRequest,
+) -> Option<Disposition> {
+    if not filter_supported(telescope, request.filter) {
+        Some(Disposition.UnsupportedFilter)
+    } else if request.requires_guiding and not telescope.guiding_unit_available {
+        Some(Disposition.GuidingUnavailable)
+    } else if conditions.cloud_percent > request.maximum_cloud_percent {
+        Some(Disposition.CloudLimitExceeded)
+    } else {
+        None
+    }
+}

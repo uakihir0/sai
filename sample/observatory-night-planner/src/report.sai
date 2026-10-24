@@ -1,0 +1,46 @@
+use acme:observatory-night-planner/model.{Disposition, NightReport, ObservingPlan}
+
+pub fn summarize(plan: ObservingPlan) -> NightReport {
+    var scheduled_count: USize = 0
+    var target_missing_count: USize = 0
+    var equipment_hold_count: USize = 0
+    var cloud_hold_count: USize = 0
+    var visibility_miss_count: USize = 0
+
+    for entry in plan.decisions {
+        match entry {
+            Some(decision) => {
+                match decision.disposition {
+                    Disposition.Scheduled => {
+                        scheduled_count += 1
+                    }
+                    Disposition.TargetNotFound => {
+                        target_missing_count += 1
+                    }
+                    Disposition.UnsupportedFilter => {
+                        equipment_hold_count += 1
+                    }
+                    Disposition.GuidingUnavailable => {
+                        equipment_hold_count += 1
+                    }
+                    Disposition.CloudLimitExceeded => {
+                        cloud_hold_count += 1
+                    }
+                    Disposition.VisibilityWindowMissed => {
+                        visibility_miss_count += 1
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    NightReport(
+        plan: plan,
+        scheduled_count: scheduled_count,
+        target_missing_count: target_missing_count,
+        equipment_hold_count: equipment_hold_count,
+        cloud_hold_count: cloud_hold_count,
+        visibility_miss_count: visibility_miss_count,
+    )
+}

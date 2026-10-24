@@ -1,0 +1,127 @@
+use acme:observatory-night-planner/model.{
+    Filter
+    NightConditions
+    ObservationRequest
+    Target
+    Telescope
+}
+
+pub fn north_dome_telescope() -> Telescope {
+    Telescope(
+        name: "North Dome",
+        supports_luminance: true,
+        supports_h_alpha: true,
+        supports_planetary: true,
+        guiding_unit_available: false,
+    )
+}
+
+pub fn observing_conditions() -> NightConditions {
+    NightConditions(dark_start_minute: 0, dark_end_minute: 210, cloud_percent: 18)
+}
+
+pub fn targets() -> Array<Target, 8> {
+    [
+        Target(id: 1, name: "Comet Vesper-7", visible_start_minute: 0, visible_end_minute: 50),
+        Target(id: 2, name: "Andromeda Galaxy", visible_start_minute: 0, visible_end_minute: 130),
+        Target(id: 3, name: "Rosette Nebula", visible_start_minute: 45, visible_end_minute: 180),
+        Target(id: 4, name: "Jupiter", visible_start_minute: 85, visible_end_minute: 200),
+        Target(id: 5, name: "M13", visible_start_minute: 15, visible_end_minute: 120),
+        Target(id: 6, name: "Pleiades", visible_start_minute: 20, visible_end_minute: 180),
+        Target(id: 7, name: "Crab Nebula", visible_start_minute: 170, visible_end_minute: 210),
+        Target(id: 8, name: "Helix Galaxy", visible_start_minute: 0, visible_end_minute: 200),
+    ]
+}
+
+pub fn requests() -> Array<ObservationRequest, 8> {
+    [
+        ObservationRequest(
+            id: 201,
+            target_id: 1,
+            priority: 1,
+            earliest_start_minute: 0,
+            latest_end_minute: 35,
+            exposure_minutes: 20,
+            filter: Filter.Luminance,
+            maximum_cloud_percent: 30,
+            requires_guiding: false,
+        ),
+        ObservationRequest(
+            id: 206,
+            target_id: 8,
+            priority: 1,
+            earliest_start_minute: 0,
+            latest_end_minute: 180,
+            exposure_minutes: 25,
+            filter: Filter.Infrared,
+            maximum_cloud_percent: 30,
+            requires_guiding: false,
+        ),
+        ObservationRequest(
+            id: 205,
+            target_id: 5,
+            priority: 3,
+            earliest_start_minute: 25,
+            latest_end_minute: 105,
+            exposure_minutes: 30,
+            filter: Filter.Luminance,
+            maximum_cloud_percent: 30,
+            requires_guiding: false,
+        ),
+        ObservationRequest(
+            id: 204,
+            target_id: 4,
+            priority: 2,
+            earliest_start_minute: 90,
+            latest_end_minute: 190,
+            exposure_minutes: 30,
+            filter: Filter.Planetary,
+            maximum_cloud_percent: 25,
+            requires_guiding: false,
+        ),
+        ObservationRequest(
+            id: 202,
+            target_id: 2,
+            priority: 2,
+            earliest_start_minute: 0,
+            latest_end_minute: 120,
+            exposure_minutes: 40,
+            filter: Filter.Luminance,
+            maximum_cloud_percent: 35,
+            requires_guiding: false,
+        ),
+        ObservationRequest(
+            id: 207,
+            target_id: 6,
+            priority: 2,
+            earliest_start_minute: 70,
+            latest_end_minute: 180,
+            exposure_minutes: 25,
+            filter: Filter.Luminance,
+            maximum_cloud_percent: 10,
+            requires_guiding: false,
+        ),
+        ObservationRequest(
+            id: 203,
+            target_id: 3,
+            priority: 2,
+            earliest_start_minute: 45,
+            latest_end_minute: 165,
+            exposure_minutes: 50,
+            filter: Filter.HAlpha,
+            maximum_cloud_percent: 20,
+            requires_guiding: true,
+        ),
+        ObservationRequest(
+            id: 208,
+            target_id: 7,
+            priority: 4,
+            earliest_start_minute: 170,
+            latest_end_minute: 205,
+            exposure_minutes: 25,
+            filter: Filter.HAlpha,
+            maximum_cloud_percent: 25,
+            requires_guiding: false,
+        ),
+    ]
+}

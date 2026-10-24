@@ -76,6 +76,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`backup-restore-readiness-auditor`](backup-restore-readiness-auditor/README.md) | Validate full and incremental backup chains against RPO/RTO, retention, checksum, and offsite requirements; select the newest compliant restore point and report fallbacks. |
 | Advanced | [`canary-release-safety-planner`](canary-release-safety-planner/README.md) | Order dependent service releases across regional canary and general cohorts; apply health gates, halt on failed evidence, and record rollback decisions deterministically. |
 | Advanced | [`port-call-coordinator`](port-call-coordinator/README.md) | Greedily schedule fictional vessel calls against berths, tide windows, cranes, reefer plugs, hazmat separation, and a shared one-way channel; reject malformed input and explain unplaced calls. |
+| Advanced | [`observatory-night-planner`](observatory-night-planner/README.md) | Schedule fictional telescope requests under target visibility, dark-time, filter, guiding, cloud, and setup-time constraints with a deterministic priority policy. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or
