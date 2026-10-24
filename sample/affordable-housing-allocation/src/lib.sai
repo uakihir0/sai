@@ -1,3 +1,5 @@
+use acme:affordable-housing-allocation/allocator
+use acme:affordable-housing-allocation/data
 use acme:affordable-housing-allocation/report
 use sai:core/fmt.{Writer}
 use sai:process
@@ -28,4 +30,29 @@ pub fn main(env: owned process.Env) -> process.ExitCode
 
     out.write_str("usage: affordable-housing-allocation [allocations|waitlist|summary]\n")
     process.ExitCode.failure()
+}
+
+test "the released homes receive four distinct offers in fixture order" {
+    let plan = allocator.build_plan()
+    assert plan.assigned_count == 4
+    assert plan.decisions[0].dwelling_id == 201
+    assert plan.decisions[0].applicant_id == Some(1001)
+    assert plan.decisions[1].dwelling_id == 202
+    assert plan.decisions[1].applicant_id == Some(1002)
+    assert plan.decisions[2].dwelling_id == 203
+    assert plan.decisions[2].applicant_id == Some(1004)
+    assert plan.decisions[3].dwelling_id == 204
+    assert plan.decisions[3].applicant_id == Some(1003)
+    assert plan.assigned_applications[0]
+    assert plan.assigned_applications[1]
+    assert plan.assigned_applications[2]
+    assert plan.assigned_applications[3]
+    assert not plan.assigned_applications[4]
+    assert not plan.assigned_applications[5]
+}
+
+test "waitlist eligibility separates a qualified unselected applicant from no match" {
+    let applicants = data.applicants()
+    assert allocator.has_eligible_dwelling(applicants[4])
+    assert not allocator.has_eligible_dwelling(applicants[5])
 }

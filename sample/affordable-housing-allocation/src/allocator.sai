@@ -13,24 +13,6 @@ pub fn area_preference_rank(applicant: Applicant, dwelling: Dwelling) -> U32 {
     }
 }
 
-fn precedes(
-    candidate: Applicant,
-    candidate_rank: U32,
-    current: Applicant,
-    current_rank: U32,
-) -> Bool {
-    (
-        candidate_rank < current_rank
-        or (
-            candidate_rank == current_rank
-            and (
-                candidate.submitted_day < current.submitted_day
-                or (candidate.submitted_day == current.submitted_day and candidate.id < current.id)
-            )
-        )
-    )
-}
-
 fn choose_applicant(
     applicants: Array<Applicant, 6>,
     already_assigned: Array<Bool, 6>,

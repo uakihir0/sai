@@ -47,7 +47,8 @@ home.
 - `allocator.sai` chooses one unassigned applicant per home using stable
   preference and application-ID tie-breaking.
 - `report.sai` prints offers, waitlist status, and a summary; `lib.sai`
-  dispatches the command.
+  dispatches the command and declares regression assertions for the allocation
+  and waitlist fixture.
 
 The example illustrates multi-module SAI packages, records and enums, fixed
 arrays, nested loops, eligibility policy, deterministic ranking, a
