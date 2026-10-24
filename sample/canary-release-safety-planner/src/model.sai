@@ -1,0 +1,103 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Cohort {
+    Canary
+    General
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum GateIssue {
+    MissingObservation
+    DuplicateObservation
+    InsufficientSamples
+    ErrorRateExceeded
+    LatencyExceeded
+    EarlierWaveFailed
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum GraphIssue {
+    DuplicateServiceId
+    UnknownDependencyEndpoint
+    SelfDependency
+    DuplicateDependency
+    DependencyCycle
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PlanInputIssue {
+    DuplicateRegionId
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum WaveAction {
+    Proceed
+    HoldAndHalt
+    RollbackAndHalt
+    Halted
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Service {
+    pub id: U32
+    pub name: Str
+    pub min_canary_samples: U32
+    pub min_general_samples: U32
+    pub max_error_rate_bps: U32
+    pub max_p95_latency_ms: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Dependency {
+    pub service_id: U32
+    pub prerequisite_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Region {
+    pub id: U32
+    pub name: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type HealthObservation {
+    pub service_id: U32
+    pub region_id: U32
+    pub cohort: Cohort
+    pub sample_count: U32
+    pub error_rate_bps: U32
+    pub p95_latency_ms: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ServiceOrder {
+    pub service_ids: Array<Option<U32>, 4>
+    pub length: USize
+    pub issue: Option<GraphIssue>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type WaveDecision {
+    pub sequence: USize
+    pub service_id: U32
+    pub service_name: Str
+    pub region_id: U32
+    pub region_name: Str
+    pub cohort: Cohort
+    pub action: WaveAction
+    pub issue: Option<GateIssue>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RolloutReport {
+    pub service_order: Array<Option<U32>, 4>
+    pub service_order_length: USize
+    pub waves: Array<Option<WaveDecision>, 16>
+    pub wave_count: USize
+    pub proceeded_count: U32
+    pub held_count: U32
+    pub rollback_count: U32
+    pub halted_count: U32
+    pub halt_sequence: Option<USize>
+    pub input_issue: Option<PlanInputIssue>
+    pub graph_issue: Option<GraphIssue>
+}

@@ -1,0 +1,5 @@
+package acme:canary-release-safety-planner @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Plan staged regional service releases with canary health gates"

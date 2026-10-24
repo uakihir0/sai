@@ -1,0 +1,221 @@
+use acme:canary-release-safety-planner/data
+use acme:canary-release-safety-planner/gates
+use acme:canary-release-safety-planner/lookup
+use acme:canary-release-safety-planner/model.{
+    Cohort
+    Dependency
+    GateIssue
+    GraphIssue
+    HealthObservation
+    PlanInputIssue
+    Region
+    RolloutReport
+    Service
+    WaveAction
+    WaveDecision
+}
+use acme:canary-release-safety-planner/topology
+
+fn is_health_failure(issue: GateIssue) -> Bool {
+    issue == GateIssue.ErrorRateExceeded or issue == GateIssue.LatencyExceeded
+}
+
+fn validate_regions(regions: Array<Region, 2>) -> Option<PlanInputIssue> {
+    for index in 0..regions.len() {
+        for other_index in (index + 1)..regions.len() {
+            if regions[index].id == regions[other_index].id {
+                return Some(PlanInputIssue.DuplicateRegionId)
+            }
+        }
+    }
+    None
+}
+
+pub fn plan(
+    services: Array<Service, 4>,
+    dependencies: Array<Dependency, 4>,
+    regions: Array<Region, 2>,
+    observations: Array<HealthObservation, 16>,
+) -> RolloutReport {
+    var waves = Array<Option<WaveDecision>, 16>.filled(None)
+    var wave_count: USize = 0
+    var proceeded_count: U32 = 0
+    var held_count: U32 = 0
+    var rollback_count: U32 = 0
+    var halted_count: U32 = 0
+    var halt_sequence: Option<USize> = None
+    var halted = false
+
+    let input_issue = validate_regions(regions)
+    if input_issue.is_some() {
+        return RolloutReport(
+            service_order: Array<Option<U32>, 4>.filled(None),
+            service_order_length: 0,
+            waves: waves,
+            wave_count: wave_count,
+            proceeded_count: proceeded_count,
+            held_count: held_count,
+            rollback_count: rollback_count,
+            halted_count: halted_count,
+            halt_sequence: halt_sequence,
+            input_issue: input_issue,
+            graph_issue: None,
+        )
+    }
+
+    let order = topology.order_services(services, dependencies)
+    if order.issue.is_some() {
+        return RolloutReport(
+            service_order: order.service_ids,
+            service_order_length: order.length,
+            waves: waves,
+            wave_count: wave_count,
+            proceeded_count: proceeded_count,
+            held_count: held_count,
+            rollback_count: rollback_count,
+            halted_count: halted_count,
+            halt_sequence: halt_sequence,
+            input_issue: None,
+            graph_issue: order.issue,
+        )
+    }
+
+    for service_position in 0..order.length {
+        match order.service_ids[service_position] {
+            Some(service_id) => {
+                match lookup.service_index(services, service_id) {
+                    Some(service_index) => {
+                        let service = services[service_index]
+                        for cohort in data.cohorts() {
+                            for region in regions {
+                                var action = WaveAction.Halted
+                                var issue = Some(GateIssue.EarlierWaveFailed)
+                                let sequence = wave_count + 1
+
+                                if not halted {
+                                    issue = gates.evaluate(service, region.id, cohort, observations)
+                                    match issue {
+                                        Some(gate_issue) => {
+                                            if is_health_failure(gate_issue) {
+                                                action = WaveAction.RollbackAndHalt
+                                                rollback_count += 1
+                                            } else {
+                                                action = WaveAction.HoldAndHalt
+                                                held_count += 1
+                                            }
+                                            halted = true
+                                            halt_sequence = Some(sequence)
+                                        }
+                                        None => {
+                                            action = WaveAction.Proceed
+                                            proceeded_count += 1
+                                        }
+                                    }
+                                } else {
+                                    halted_count += 1
+                                }
+
+                                waves[wave_count] = Some(
+                                    WaveDecision(
+                                        sequence: sequence,
+                                        service_id: service.id,
+                                        service_name: service.name,
+                                        region_id: region.id,
+                                        region_name: region.name,
+                                        cohort: cohort,
+                                        action: action,
+                                        issue: issue,
+                                    ),
+                                )
+                                wave_count += 1
+                            }
+                        }
+                    }
+                    None => {
+                        return RolloutReport(
+                            service_order: order.service_ids,
+                            service_order_length: order.length,
+                            waves: waves,
+                            wave_count: wave_count,
+                            proceeded_count: proceeded_count,
+                            held_count: held_count,
+                            rollback_count: rollback_count,
+                            halted_count: halted_count,
+                            halt_sequence: halt_sequence,
+                            input_issue: None,
+                            graph_issue: Some(GraphIssue.UnknownDependencyEndpoint),
+                        )
+                    }
+                }
+            }
+            None => {
+                return RolloutReport(
+                    service_order: order.service_ids,
+                    service_order_length: order.length,
+                    waves: waves,
+                    wave_count: wave_count,
+                    proceeded_count: proceeded_count,
+                    held_count: held_count,
+                    rollback_count: rollback_count,
+                    halted_count: halted_count,
+                    halt_sequence: halt_sequence,
+                    input_issue: None,
+                    graph_issue: Some(GraphIssue.DependencyCycle),
+                )
+            }
+        }
+    }
+
+    RolloutReport(
+        service_order: order.service_ids,
+        service_order_length: order.length,
+        waves: waves,
+        wave_count: wave_count,
+        proceeded_count: proceeded_count,
+        held_count: held_count,
+        rollback_count: rollback_count,
+        halted_count: halted_count,
+        halt_sequence: halt_sequence,
+        input_issue: None,
+        graph_issue: order.issue,
+    )
+}
+
+test "fixture orders prerequisites and reports the first failed canary" {
+    let report = plan(data.services(), data.dependencies(), data.regions(), data.observations())
+
+    assert report.service_order_length == 4
+    assert report.service_order[0] == Some(10)
+    assert report.service_order[1] == Some(20)
+    assert report.service_order[2] == Some(30)
+    assert report.service_order[3] == Some(40)
+    assert report.wave_count == 16
+    assert report.proceeded_count == 4
+    assert report.held_count == 0
+    assert report.rollback_count == 1
+    assert report.halted_count == 11
+    assert report.halt_sequence == Some(5)
+    assert report.input_issue == None
+    assert report.graph_issue == None
+    assert report.waves[4].unwrap().action == WaveAction.RollbackAndHalt
+    assert report.waves[4].unwrap().issue == Some(GateIssue.ErrorRateExceeded)
+    assert report.waves[5].unwrap().action == WaveAction.Halted
+    assert report.waves[5].unwrap().issue == Some(GateIssue.EarlierWaveFailed)
+}
+
+test "duplicate region IDs reject the plan before any wave can promote" {
+    var regions = data.regions()
+    regions[1].id = regions[0].id
+    let report = plan(data.services(), data.dependencies(), regions, data.observations())
+
+    assert report.input_issue == Some(PlanInputIssue.DuplicateRegionId)
+    assert report.graph_issue == None
+    assert report.service_order_length == 0
+    assert report.service_order[0] == None
+    assert report.wave_count == 0
+    assert report.proceeded_count == 0
+    assert report.held_count == 0
+    assert report.rollback_count == 0
+    assert report.halted_count == 0
+    assert report.waves[0] == None
+}

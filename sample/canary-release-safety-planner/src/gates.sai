@@ -1,0 +1,37 @@
+use acme:canary-release-safety-planner/lookup
+use acme:canary-release-safety-planner/model.{Cohort, GateIssue, HealthObservation, Service}
+
+pub fn evaluate(
+    service: Service,
+    region_id: U32,
+    cohort: Cohort,
+    observations: Array<HealthObservation, 16>,
+) -> Option<GateIssue> {
+    let count = lookup.observation_count(observations, service.id, region_id, cohort)
+    if count == 0 {
+        return Some(GateIssue.MissingObservation)
+    }
+    if count > 1 {
+        return Some(GateIssue.DuplicateObservation)
+    }
+
+    match lookup.observation_index(observations, service.id, region_id, cohort) {
+        Some(index) => {
+            let observation = observations[index]
+            let minimum_samples = match cohort {
+                Cohort.Canary => service.min_canary_samples
+                Cohort.General => service.min_general_samples
+            }
+            if observation.sample_count < minimum_samples {
+                Some(GateIssue.InsufficientSamples)
+            } else if observation.error_rate_bps > service.max_error_rate_bps {
+                Some(GateIssue.ErrorRateExceeded)
+            } else if observation.p95_latency_ms > service.max_p95_latency_ms {
+                Some(GateIssue.LatencyExceeded)
+            } else {
+                None
+            }
+        }
+        None => Some(GateIssue.MissingObservation)
+    }
+}

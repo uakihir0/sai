@@ -1,0 +1,7 @@
+use acme:canary-release-safety-planner/data
+use acme:canary-release-safety-planner/model.{RolloutReport}
+use acme:canary-release-safety-planner/planner
+
+pub fn fixture_plan() -> RolloutReport {
+    planner.plan(data.services(), data.dependencies(), data.regions(), data.observations())
+}
