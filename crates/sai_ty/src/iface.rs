@@ -96,10 +96,72 @@ enum FlagsRepr {
 /// This value does not allocate flag `DefId`s. Flag names remain constants of
 /// the parent flags type, as specified by spec/13 §13.9.4.
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct FlagsDef {
+pub struct FlagsDef {
     adt: DefId,
     flags: Arc<[(Symbol, Span)]>,
     repr: FlagsRepr,
+}
+
+impl FlagsDef {
+    /// The local type definition described by this validated flags descriptor.
+    pub fn adt(&self) -> DefId {
+        self.adt
+    }
+
+    /// Flag names and source spans in declaration order.
+    pub fn flags(&self) -> &[(Symbol, Span)] {
+        &self.flags
+    }
+
+    /// Whether this descriptor still describes the supplied owner and enum.
+    pub fn matches_enum(&self, adt: DefId, variants: &[Variant<'_>]) -> bool {
+        self.adt == adt
+            && self.flags.len() == variants.len()
+            && variants
+                .iter()
+                .zip(self.flags.iter())
+                .all(|(variant, (flag, span))| {
+                    variant.name.sym == *flag
+                        && variant.name.span == *span
+                        && matches!(variant.shape, VariantShape::Unit)
+                        && !variant.has_explicit_discriminant
+                })
+    }
+}
+
+/// Results of checking one local interface item.
+///
+/// A valid local `@flags enum` retains its validated descriptor here so later
+/// interface lowering uses the same declaration order and source identities.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct InterfaceItemCheck {
+    issues: Vec<InterfaceCheckIssue>,
+    flags_def: Option<FlagsDef>,
+}
+
+impl InterfaceItemCheck {
+    /// Return the issues found while checking this item.
+    pub fn issues(&self) -> &[InterfaceCheckIssue] {
+        &self.issues
+    }
+
+    /// Return the validated flags descriptor, if this item is a valid flags enum.
+    pub fn flags_def(&self) -> Option<&FlagsDef> {
+        self.flags_def.as_ref()
+    }
+
+    /// Split the check result into its diagnostics and validated flags descriptor.
+    pub fn into_parts(self) -> (Vec<InterfaceCheckIssue>, Option<FlagsDef>) {
+        (self.issues, self.flags_def)
+    }
+}
+
+impl std::ops::Deref for InterfaceItemCheck {
+    type Target = [InterfaceCheckIssue];
+
+    fn deref(&self) -> &Self::Target {
+        &self.issues
+    }
 }
 
 impl InterfaceCheckIssue {
@@ -132,11 +194,12 @@ pub fn interface_item_check(
     owner: &HirOwner<'_>,
     flags_marker_accepted: bool,
     symbols: &Interner,
-) -> Result<Vec<InterfaceCheckIssue>, InterfaceCheckError> {
+) -> Result<InterfaceItemCheck, InterfaceCheckError> {
     let OwnerNode::InterfaceItem(item) = owner.node else {
-        return Ok(Vec::new());
+        return Ok(InterfaceItemCheck::default());
     };
     let mut issues = Vec::new();
+    let mut flags_def = None;
     push_name_issue(&mut issues, item.owner_id, item.name, symbols)?;
     match item.kind {
         InterfaceItemKind::Struct { fields, .. } => {
@@ -244,10 +307,11 @@ pub fn interface_item_check(
     }
     if let InterfaceItemKind::Enum { variants, .. } = item.kind
         && flags_marker_accepted
-        && let Err(issue) =
-            build_flags_def(item.owner_id.def_id.to_def_id(), item.owner_id, variants)
     {
-        issues.push(issue);
+        match build_flags_def(item.owner_id.def_id.to_def_id(), item.owner_id, variants) {
+            Ok(definition) => flags_def = definition,
+            Err(issue) => issues.push(issue),
+        }
     }
     if let InterfaceItemKind::Enum { variants, .. } = item.kind {
         for variant in variants {
@@ -292,7 +356,7 @@ pub fn interface_item_check(
             }
         }
     }
-    Ok(issues)
+    Ok(InterfaceItemCheck { issues, flags_def })
 }
 
 pub(super) fn push_name_issue(
@@ -407,8 +471,8 @@ mod tests {
     };
     use sai_hir::types::{Generics, Name, Path, PathRoot, Ty, TyKind};
     use sai_hir::{
-        DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, Mutability,
-        OwnerId, Safety, Span, SpanCtxt, Visibility,
+        DefId, DefIndex, DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId,
+        Mutability, OwnerId, Safety, Span, SpanCtxt, Visibility,
     };
     use sai_intern::{Interner, ItemLocalId, PackageInterner};
     use sai_vfs::{FileId, TextRange, TextSize};
@@ -478,7 +542,7 @@ mod tests {
         kind: InterfaceItemKind<'hir>,
         flags_marker_accepted: bool,
         symbols: &Interner,
-    ) -> Result<Vec<super::InterfaceCheckIssue>, super::InterfaceCheckError> {
+    ) -> Result<super::InterfaceItemCheck, super::InterfaceCheckError> {
         let item = InterfaceItem {
             owner_id: ids.owner,
             interface: ids.owner.def_id,
@@ -538,7 +602,7 @@ mod tests {
         variants: &[Variant<'_>],
         flags_marker_accepted: bool,
         symbols: &Interner,
-    ) -> Vec<super::InterfaceCheckIssue> {
+    ) -> super::InterfaceItemCheck {
         check_item_kind(
             ids,
             Name {
@@ -559,7 +623,7 @@ mod tests {
         role: MemberRole,
         outer_borrow: Option<Mutability>,
         error_type: bool,
-    ) -> Vec<super::InterfaceCheckIssue> {
+    ) -> super::InterfaceItemCheck {
         let (ids, symbols) = test_ids();
         let inner_ty = Ty {
             hir_id: ids.hir,
@@ -662,6 +726,7 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].kind, InterfaceCheckIssueKind::InvalidFlagsEnum);
         assert_eq!(issues[0].span, payload);
+        assert!(issues.flags_def().is_none());
 
         let mut with_discriminant_and_33_variants = (0..33)
             .map(|index| variant(&ids, index, VariantShape::Unit, index == 7, None))
@@ -670,6 +735,7 @@ mod tests {
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].kind, InterfaceCheckIssueKind::InvalidFlagsEnum);
         assert_eq!(issues[0].span, with_discriminant_and_33_variants[7].span);
+        assert!(issues.flags_def().is_none());
 
         with_discriminant_and_33_variants[7].has_explicit_discriminant = false;
         with_discriminant_and_33_variants[7].discriminant = None;
@@ -680,15 +746,14 @@ mod tests {
             issues[0].span,
             with_discriminant_and_33_variants[32].name.span
         );
+        assert!(issues.flags_def().is_none());
     }
 
     #[test]
     fn valid_and_empty_flags_enums_use_the_expected_interface_checks() {
         let (ids, symbols) = test_ids();
         for count in [1, 32] {
-            let variants = (0..count)
-                .map(|index| variant(&ids, index, VariantShape::Unit, false, None))
-                .collect::<Vec<_>>();
+            let variants = flags_variants(&ids, &symbols, count);
             let issues = check_enum(&ids, &variants, true, &symbols);
             assert!(
                 issues
@@ -700,12 +765,25 @@ mod tests {
                     .iter()
                     .all(|issue| issue.kind != InterfaceCheckIssueKind::EmptyType)
             );
+            let flags_def = issues
+                .flags_def()
+                .expect("valid flags checks retain their descriptor");
+            assert_eq!(flags_def.adt(), ids.owner.def_id.to_def_id());
+            assert_eq!(flags_def.flags().len(), count as usize);
+            for (index, (flag, flag_span)) in flags_def.flags().iter().enumerate() {
+                assert_eq!(
+                    symbols.resolve(*flag).expect("flag name resolves").as_ref(),
+                    format!("Flag{index}")
+                );
+                assert_eq!(*flag_span, variants[index].name.span);
+            }
         }
 
         let issues = check_enum(&ids, &[], true, &symbols);
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].kind, InterfaceCheckIssueKind::EmptyType);
         assert_eq!(issues[0].span, span(0, 5));
+        assert!(issues.flags_def().is_none());
 
         let explicit = [variant(&ids, 0, VariantShape::Unit, true, None)];
         let issues = check_enum(&ids, &explicit, false, &symbols);
@@ -814,6 +892,7 @@ mod tests {
                 .expect("nonempty flags declaration builds a definition");
 
             assert_eq!(flags.adt, ids.owner.def_id.to_def_id());
+            assert!(flags.matches_enum(ids.owner.def_id.to_def_id(), &variants));
             assert_eq!(flags.repr, repr);
             assert_eq!(flags.flags.len(), count as usize);
             for (index, (flag, flag_span)) in flags.flags.iter().enumerate() {
@@ -824,6 +903,29 @@ mod tests {
                 assert_eq!(*flag_span, variants[index].name.span);
             }
         }
+    }
+
+    #[test]
+    fn flags_descriptor_rejects_a_different_owner_or_enum_source() {
+        let (ids, symbols) = test_ids();
+        let variants = flags_variants(&ids, &symbols, 2);
+        let flags = build_flags_def(ids.owner.def_id.to_def_id(), ids.owner, &variants)
+            .expect("valid flags declaration")
+            .expect("nonempty flags declaration builds a definition");
+        let foreign_package = PackageInterner::new()
+            .intern("other:flags#1.0")
+            .expect("foreign package interns");
+        let foreign_adt = DefId::from_foreign(foreign_package, DefIndex::default());
+
+        assert!(!flags.matches_enum(foreign_adt, &variants));
+
+        let mut changed_variants = variants.clone();
+        changed_variants[0].name.span = span(100, 102);
+        assert!(!flags.matches_enum(ids.owner.def_id.to_def_id(), &changed_variants));
+
+        let mut payload_variants = variants;
+        payload_variants[0].shape = VariantShape::Tuple(&[]);
+        assert!(!flags.matches_enum(ids.owner.def_id.to_def_id(), &payload_variants));
     }
 
     #[test]

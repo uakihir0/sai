@@ -1093,12 +1093,11 @@ The `info` diagnostics of spec/13 §13.6.2 and §13.6.4 are session-level querie
 
 ### 16.9.1 Validity
 
-`adt_def` of an `enum` with `@flags` applies spec/13 §13.9.4 and spec/15 §15.10. It reports at most one `INVALID_FLAGS_ENUM` per enum, for the first rule that applies, in this order:
+Attribute validation accepts `@flags` only on an interface enum. The attribute target check reports `INVALID_FLAGS_ENUM` when a written marker is outside an interface; such a marker is not passed to `adt_def`. For an accepted marker, `adt_def` applies spec/13 §13.9.4 and spec/15 §15.10 and reports at most one `INVALID_FLAGS_ENUM` per enum, for the first rule that applies, in this order:
 
-1. The enum is not declared inside an interface. Reported at the attribute.
-2. A variant has a payload. Reported at the first such payload.
-3. A variant has an explicit discriminant. Reported at the first such variant. `WIT_EXPLICIT_DISCRIMINANT` is then not reported for the enum (§16.6.1).
-4. The enum has more than 32 variants. Reported at the name of the 33rd variant.
+1. A variant has a payload. Reported at the first such payload.
+2. A variant has an explicit discriminant. Reported at the first such variant. `WIT_EXPLICIT_DISCRIMINANT` is then not reported for the enum (§16.6.1).
+3. The enum has more than 32 variants. Reported at the name of the 33rd variant.
 
 After `INVALID_FLAGS_ENUM`, `adt_def` treats the enum as an ordinary enum (`AdtKind::Enum`), so the later checks of the program see a well-formed type.
 
@@ -1124,13 +1123,15 @@ pub struct FlagsDef {
 
 `flags_def(D)` is `Some` exactly for a type whose `adt_def` is `AdtKind::Flags`. This includes the flags types of views.
 
-**Current implementation boundary (IR-886):** `sai_ty::iface` has a private
-validated `FlagsDef` builder for local interface enums. It retains the flag
+**Current implementation boundary (IR-886, IR-889):** `sai_ty::iface` builds
+an opaque validated `FlagsDef` for local interface enums. It retains the flag
 names and spans in declaration order and selects the smallest representation.
-The existing interface-diagnostic path consumes its invalid result, but does
-not yet store or expose a valid descriptor through `adt_def` or `flags_def`.
-This step leaves Stage 0 feature gates unchanged and does not implement local
-flag constants, type-relative resolution, or generated methods.
+The interface-item check now carries a valid descriptor to the transient WIT
+generator, which uses its ordered names and rejects a descriptor bound to a
+different owner or enum source. The descriptor is not stored or exposed through
+the semantic `adt_def` or `flags_def` queries. Stage 0 feature gates remain
+unchanged; local flag constants, type-relative resolution, and generated
+methods are not implemented.
 
 ### 16.9.3 Constants
 
@@ -1377,7 +1378,7 @@ The suite `tests/impl/wit/` of [15](15-conformance-and-testing.md) §15.12.2 con
 | N-K-16 | `WORLD_EXPORT_UNIMPLEMENTED` is checked per world on its directly written items, on the exports of included external worlds at the include, and on an external export world at the `export world` value. | Each missing implementation is reported once, where it was introduced (P2). |
 | N-K-17 | The hybrid check compares elaborated worlds structurally. It ignores documentation, gates, order and the form of `use`, and reports one sorted diagnostic per differing item. | Only differences that change the component type matter, and the output is deterministic (P8). |
 | N-K-18 | A flags type is an ADT with one hidden unsigned field of 1, 2 or 4 bytes, where bit `i` is flag `i`. Bits `n` and above are ignored by every operation and cleared by every operation that produces a value. | It is identical to the Canonical ABI layout, so no conversion is needed. Values from the boundary need no check (P9). |
-| N-K-19 | `INVALID_FLAGS_ENUM` is reported once, with the precedence outside-interface, payload, discriminant, count, and suppresses `WIT_EXPLICIT_DISCRIMINANT`. An invalid or empty flags enum falls back to an ordinary enum, and zero flags is `WIT_EMPTY_TYPE`. | It resolves the contradiction between spec/15 §15.10 and spec/13 §13.2.2 without cascades (P9). |
+| N-K-19 | A written `@flags` outside an interface is rejected by attribute target validation. For an accepted interface marker, `INVALID_FLAGS_ENUM` is reported once, with payload, discriminant, then count precedence, and suppresses `WIT_EXPLICIT_DISCRIMINANT`. An invalid or empty flags enum falls back to an ordinary enum, and zero flags is `WIT_EMPTY_TYPE`. | Attribute validation owns target eligibility; this precedence resolves the contradiction between spec/15 §15.10 and spec/13 §13.2.2 without cascades (P9). |
 | N-K-20 | Flag constants are written `F.X`. `.X` is `IMPLICIT_MEMBER_NOT_ENUM`. Constants are allowed in consts, and the operators and provided functions are not. | Flags are values, not variants. Constant evaluation stays small (P7). |
 | N-K-21 | The flags operators and provided functions are compiler-provided impls and synthetic inherent items, with the shims `ShimKind::Flags`. | They need no library code, and their semantics are fixed by spec/13 §13.9.4. |
 | N-K-22 | View derives are compiler-provided impls with nested field obligations and `ShimKind::ViewDerive` bodies. Hash is given only to enums and flags, as N-D-35 says. | It reuses the solver for the structural rule; no impl `DefId`s are needed in views. |

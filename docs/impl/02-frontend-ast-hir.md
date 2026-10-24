@@ -2073,7 +2073,9 @@ The following checks need resolved names, types, or the whole package. They are 
 | `@derive` | supertraits implemented | `MISSING_SUPERTRAIT_IMPL` (spec/05) | impl/03 §3.8 |
 | `@derive` | no hand-written impl of the same trait | `OVERLAPPING_IMPLS` (spec/05) | impl/03 §3.8 |
 | `@repr` | `C` on records and unit-only enums; an integer type on unit-only enums; discriminants in range | spec/15; `DISCRIMINANT_OUT_OF_RANGE` (spec/05) | impl/03 §3.6 |
-| `@flags` | declared inside an interface; unit-only enum without explicit discriminants; at most 32 variants | `INVALID_FLAGS_ENUM` (spec/13 §13.9.4); `WIT_EMPTY_TYPE` for no variants (spec/13 §13.2.2) | `adt_def`, [16](16-interfaces-and-wit.md) §16.9.1 |
+| `@flags` on an enum outside an interface | interface-only target | `INVALID_FLAGS_ENUM` (spec/13 §13.9.4) | attribute target validation, spec/15 §15.10 |
+| accepted interface `@flags` enum | unit variants without explicit discriminants; at most 32 variants | `INVALID_FLAGS_ENUM` for the first payload, discriminant, or 33rd variant (spec/13 §13.9.4) | `adt_def`, [16](16-interfaces-and-wit.md) §16.9.1 |
+| empty interface `@flags` enum | at least one variant | `WIT_EMPTY_TYPE` (spec/13 §13.2.2) | `interface_check`, [16](16-interfaces-and-wit.md) §16.6.1 |
 | `@export_name` | unique export names across the package, and not `memory` | `DUPLICATE_EXPORT_NAME` (spec/15 §15.7) | impl/03 §3.3 |
 | `@panic_hook` | signature, root package, at most one | `PANIC_HOOK_SIGNATURE_MISMATCH`, `PANIC_HOOK_OUTSIDE_ROOT`, `DUPLICATE_PANIC_HOOK` (spec/10 §10.6.1) | impl/03 §3.6.9 |
 | `@must_use` | unused results | `UNUSED_MUST_USE` (spec/06 §6.25.2) | impl/03 §3.15 (on typed HIR) |

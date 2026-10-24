@@ -46,7 +46,8 @@ use sai_ty::boundary::{
     IncompatibleReason, Position, boundary_type_with_references,
 };
 use sai_ty::iface::{
-    InterfaceCheckError, InterfaceCheckIssue, InterfaceCheckIssueKind, interface_item_check,
+    FlagsDef, InterfaceCheckError, InterfaceCheckIssue, InterfaceCheckIssueKind,
+    InterfaceItemCheck, interface_item_check,
 };
 use sai_vfs::{FileId, PackageKey, Span, WorkspaceSnapshot};
 use sai_wit::{
@@ -2395,11 +2396,11 @@ fn remember_interface_name_origin(
     }
 }
 
-fn collect_interface_item_issues(
+fn collect_interface_item_check(
     owner: &HirOwner<'_>,
     flags_marker_accepted: bool,
     symbols: &Interner,
-) -> Result<Vec<InterfaceCheckIssue>, InterfaceUsesQueryError> {
+) -> Result<InterfaceItemCheck, InterfaceUsesQueryError> {
     interface_item_check(owner, flags_marker_accepted, symbols)
         .map_err(|error| match error {
             InterfaceCheckError::SymbolLookup(error) => {
@@ -3180,8 +3181,9 @@ fn collect_interface_uses_input(
                 owner_uses_complete = false;
             }
             let flags_marker_accepted = inputs.accepted_flags_attributes.contains(&entry.ast_id);
-            let member_issues =
-                collect_interface_item_issues(&member_hir, flags_marker_accepted, symbols)?;
+            let (member_issues, flags_def) =
+                collect_interface_item_check(&member_hir, flags_marker_accepted, symbols)?
+                    .into_parts();
             let member_has_issues = !member_issues.is_empty();
             if member_has_issues {
                 owner_uses_complete = false;
@@ -3294,6 +3296,7 @@ fn collect_interface_uses_input(
                                 &boundary_conversions,
                                 item_type_references,
                                 flags_marker_accepted,
+                                flags_def.as_ref(),
                                 &inputs.validated_attrs,
                                 prepared.generated_package_version.as_ref(),
                                 symbols,
@@ -3305,6 +3308,7 @@ fn collect_interface_uses_input(
                             &boundary_conversions,
                             item_type_references,
                             flags_marker_accepted,
+                            flags_def.as_ref(),
                             &inputs.validated_attrs,
                             prepared.generated_package_version.as_ref(),
                             symbols,
@@ -3316,6 +3320,7 @@ fn collect_interface_uses_input(
                                 &boundary_conversions,
                                 item_type_references,
                                 flags_marker_accepted,
+                                flags_def.as_ref(),
                                 &inputs.validated_attrs,
                                 prepared.generated_package_version.as_ref(),
                                 symbols,
@@ -3511,7 +3516,8 @@ fn collect_interface_uses_input(
                 if method_has_diagnostics {
                     owner_uses_complete = false;
                 }
-                let method_issues = collect_interface_item_issues(&method_hir, false, symbols)?;
+                let (method_issues, _) =
+                    collect_interface_item_check(&method_hir, false, symbols)?.into_parts();
                 let method_has_issues = !method_issues.is_empty();
                 if method_has_issues {
                     owner_uses_complete = false;
@@ -6581,6 +6587,7 @@ fn generated_interface_type_item(
     conversions: &[sai_ty::boundary::BoundaryTypeConversion],
     references: &HashMap<DefId, WitTypeRef>,
     flags_marker_accepted: bool,
+    flags_def: Option<&FlagsDef>,
     validated_attrs: &BTreeMap<sai_hir::item_tree::ErasedAstId, sai_hir::attrs::ValidatedAttrs>,
     selected: Option<&sai_package::mvs::MvsPackageVersion>,
     symbols: &Interner,
@@ -6588,6 +6595,11 @@ fn generated_interface_type_item(
     let OwnerNode::InterfaceItem(item) = owner.node else {
         return Ok(None);
     };
+    if (flags_marker_accepted && !matches!(item.kind, InterfaceItemKind::Enum { .. }))
+        || (!flags_marker_accepted && flags_def.is_some())
+    {
+        return Ok(None);
+    }
     if item.name.is_error() {
         return Ok(None);
     }
@@ -6754,12 +6766,20 @@ fn generated_interface_type_item(
                 if has_case_docs {
                     return Ok(None);
                 }
-                let case_names = cases.into_iter().map(|case| case.name).collect();
-                if flags_marker_accepted {
-                    WitItemKind::Flags(case_names)
-                } else {
-                    WitItemKind::Enum(case_names)
-                }
+                let enum_case_names = cases.into_iter().map(|case| case.name).collect();
+                let Some(enum_item_kind) = generated_interface_enum_wit_item_kind(
+                    flags_marker_accepted,
+                    flags_def,
+                    item.owner_id,
+                    owner.id,
+                    variants,
+                    enum_case_names,
+                    symbols,
+                )?
+                else {
+                    return Ok(None);
+                };
+                enum_item_kind
             }
         }
         InterfaceItemKind::Resource { .. } => {
@@ -6782,6 +6802,53 @@ fn generated_interface_type_item(
         declaration_span: None,
         declaration_token_pairs: None,
     }))
+}
+
+fn validated_flags_wit_item_kind(
+    flags_def: Option<&FlagsDef>,
+    owner: OwnerId,
+    variants: &[sai_hir::items::Variant<'_>],
+    symbols: &Interner,
+) -> Result<Option<WitItemKind>, InterfaceUsesQueryError> {
+    let Some(flags_def) = flags_def else {
+        return Ok(None);
+    };
+    if !flags_def.matches_enum(owner.def_id.to_def_id(), variants) {
+        return Ok(None);
+    }
+    let mut flags = Vec::with_capacity(flags_def.flags().len());
+    for (flag, _) in flags_def.flags() {
+        let flag_source_name = symbols
+            .resolve(*flag)
+            .map_err(OwnerControlFlowResolutionError::SymbolLookup)
+            .map_err(InterfaceUsesQueryError::Collection)?;
+        let Some(flag_name) = sai_identifier_to_wit_name(&flag_source_name) else {
+            return Ok(None);
+        };
+        flags.push(flag_name);
+    }
+    Ok(Some(WitItemKind::Flags(flags)))
+}
+
+fn generated_interface_enum_wit_item_kind(
+    flags_marker_accepted: bool,
+    flags_def: Option<&FlagsDef>,
+    item_owner: OwnerId,
+    owner: OwnerId,
+    variants: &[sai_hir::items::Variant<'_>],
+    enum_case_names: Vec<String>,
+    symbols: &Interner,
+) -> Result<Option<WitItemKind>, InterfaceUsesQueryError> {
+    if flags_marker_accepted {
+        if item_owner != owner {
+            return Ok(None);
+        }
+        return validated_flags_wit_item_kind(flags_def, owner, variants, symbols);
+    }
+    if flags_def.is_some() {
+        return Ok(None);
+    }
+    Ok(Some(WitItemKind::Enum(enum_case_names)))
 }
 
 fn generated_stability(
@@ -7305,17 +7372,23 @@ mod tests {
     use super::{
         GeneratedWitCandidate, GeneratedWitWorld, InterfaceUsesQueryError, LocalAliasReference,
         WitWorldRef, WorldInterfaceUseGraph, expand_local_alias_interface_references,
-        interface_uses_error_fingerprint, stable_world_interface_uses_fingerprint,
+        generated_interface_enum_wit_item_kind, interface_uses_error_fingerprint,
+        stable_world_interface_uses_fingerprint,
     };
     use crate::OwnerControlFlowResolutionError;
+    use sai_hir::items::{
+        HirOwner, InterfaceItem, InterfaceItemKind, OwnerNode, Variant, VariantShape,
+    };
+    use sai_hir::types::Name;
     use sai_hir::{
-        DefId, DefIndex, DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, IndexVec,
-        LocalDefId,
+        DefId, DefIndex, DefPath, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId,
+        IndexVec, ItemLocalId, LocalDefId, OwnerId, Span, SpanCtxt,
     };
     use sai_intern::{Interner, PackageInterner};
     use sai_package::{mvs::MvsPackageVersion, version::Version};
     use sai_resolve::WorldElaborationInterface;
     use sai_vfs::FileId;
+    use sai_vfs::TextRange;
     use sai_wit::{
         WitFunc, WitIfaceIdx, WitIfaceRef, WitIndexVec, WitInterface, WitItem, WitItemIdx,
         WitItemKind, WitType, WitTypeRef, WitUnit, WitWorld, WitWorldIdx, WitWorldItem,
@@ -7359,6 +7432,48 @@ mod tests {
                 )
                 .expect("test definition path interns")
         }
+
+        fn span(start: u32, end: u32) -> Span {
+            Span {
+                file: FileId::new(1),
+                range: TextRange::new(
+                    sai_diagnostics::TextSize::new(start),
+                    sai_diagnostics::TextSize::new(end),
+                )
+                .expect("test source range is valid"),
+                ctxt: SpanCtxt::Root,
+            }
+        }
+
+        fn hir_id(owner: OwnerId) -> HirId {
+            HirId {
+                owner,
+                local_id: ItemLocalId::default(),
+            }
+        }
+
+        fn flags_variants(&self, owner: OwnerId, names: &[&str]) -> Vec<Variant<'static>> {
+            names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    let start = u32::try_from(index * 10).expect("small test index fits");
+                    Variant {
+                        hir_id: Self::hir_id(owner),
+                        def_id: self.local_definition(name),
+                        name: Name {
+                            sym: self.symbols.intern(name).expect("flag name interns"),
+                            span: Self::span(start, start + name.len() as u32),
+                        },
+                        shape: VariantShape::Unit,
+                        discriminant: None,
+                        has_explicit_discriminant: false,
+                        span: Self::span(start, start + name.len() as u32),
+                        payload_span: None,
+                    }
+                })
+                .collect()
+        }
     }
 
     fn generated_item(name: &str, kind: WitItemKind) -> WitItem {
@@ -7384,6 +7499,190 @@ mod tests {
             items,
             span: None,
         }
+    }
+
+    #[test]
+    fn interface_enum_wit_kind_uses_validated_flags_descriptor_and_fails_closed() {
+        let ids = TestIds::new();
+        let owner = OwnerId {
+            def_id: ids.local_definition("Options"),
+        };
+        let variants = ids.flags_variants(owner, &["Alpha", "Beta"]);
+        let item = InterfaceItem {
+            owner_id: owner,
+            interface: owner.def_id,
+            name: Name {
+                sym: ids.symbols.intern("Options").expect("item name interns"),
+                span: TestIds::span(100, 107),
+            },
+            kind: InterfaceItemKind::Enum {
+                generics: sai_hir::types::Generics {
+                    params: &[],
+                    where_preds: &[],
+                },
+                variants: &variants,
+            },
+            span: TestIds::span(100, 200),
+            generic_params_span: None,
+            where_clause_span: None,
+        };
+        let hir_owner = HirOwner {
+            id: owner,
+            node: OwnerNode::InterfaceItem(&item),
+            body: None,
+            raw_attrs: &[],
+            diagnostics: Vec::new(),
+        };
+        let check = sai_ty::iface::interface_item_check(&hir_owner, true, &ids.symbols)
+            .expect("valid flags declaration checks");
+        assert!(
+            check.issues().is_empty(),
+            "the descriptor is only retained for a valid flags declaration"
+        );
+        let descriptor = check
+            .flags_def()
+            .expect("valid accepted flags declaration retains its descriptor");
+
+        let wit_kind = generated_interface_enum_wit_item_kind(
+            true,
+            Some(descriptor),
+            owner,
+            owner,
+            &variants,
+            vec!["alpha".to_owned(), "beta".to_owned()],
+            &ids.symbols,
+        )
+        .expect("flag symbols resolve")
+        .expect("matching accepted marker and descriptor produce WIT flags");
+        assert_eq!(
+            wit_kind,
+            WitItemKind::Flags(vec!["alpha".to_owned(), "beta".to_owned()])
+        );
+
+        let different_owner = OwnerId {
+            def_id: ids.local_definition("DifferentOptions"),
+        };
+        assert!(
+            generated_interface_enum_wit_item_kind(
+                true,
+                Some(descriptor),
+                different_owner,
+                owner,
+                &variants,
+                vec!["alpha".to_owned(), "beta".to_owned()],
+                &ids.symbols,
+            )
+            .expect("flag symbols resolve")
+            .is_none(),
+            "an accepted marker cannot use a descriptor owned by a different type"
+        );
+
+        assert!(
+            generated_interface_enum_wit_item_kind(
+                true,
+                None,
+                owner,
+                owner,
+                &variants,
+                vec!["alpha".to_owned(), "beta".to_owned()],
+                &ids.symbols,
+            )
+            .expect("missing descriptor needs no symbol lookup")
+            .is_none(),
+            "an accepted marker without a valid descriptor is omitted"
+        );
+
+        let mut changed_variants = variants.clone();
+        changed_variants.swap(0, 1);
+        assert!(
+            generated_interface_enum_wit_item_kind(
+                true,
+                Some(descriptor),
+                owner,
+                owner,
+                &changed_variants,
+                vec!["beta".to_owned(), "alpha".to_owned()],
+                &ids.symbols,
+            )
+            .expect("flag symbols resolve")
+            .is_none(),
+            "a descriptor cannot be emitted for a different declaration order"
+        );
+
+        assert_eq!(
+            generated_interface_enum_wit_item_kind(
+                false,
+                None,
+                owner,
+                owner,
+                &variants,
+                vec!["alpha".to_owned(), "beta".to_owned()],
+                &ids.symbols,
+            )
+            .expect("unmarked enums need no flag symbol lookup"),
+            Some(WitItemKind::Enum(vec![
+                "alpha".to_owned(),
+                "beta".to_owned()
+            ])),
+            "unmarked enums retain ordinary WIT enum generation"
+        );
+        assert!(
+            generated_interface_enum_wit_item_kind(
+                false,
+                Some(descriptor),
+                owner,
+                owner,
+                &variants,
+                vec!["alpha".to_owned(), "beta".to_owned()],
+                &ids.symbols,
+            )
+            .expect("an unexpected descriptor needs no symbol lookup")
+            .is_none(),
+            "an unmarked enum cannot consume a flags descriptor"
+        );
+
+        let empty_variants = [];
+        let empty_item = InterfaceItem {
+            kind: InterfaceItemKind::Enum {
+                generics: sai_hir::types::Generics {
+                    params: &[],
+                    where_preds: &[],
+                },
+                variants: &empty_variants,
+            },
+            ..item
+        };
+        let empty_owner = HirOwner {
+            id: owner,
+            node: OwnerNode::InterfaceItem(&empty_item),
+            body: None,
+            raw_attrs: &[],
+            diagnostics: Vec::new(),
+        };
+        let empty_check = sai_ty::iface::interface_item_check(&empty_owner, true, &ids.symbols)
+            .expect("empty flags declaration checks");
+        assert!(empty_check.flags_def().is_none());
+        assert!(
+            empty_check
+                .issues()
+                .iter()
+                .any(|issue| issue.kind == sai_ty::iface::InterfaceCheckIssueKind::EmptyType),
+            "empty flags declarations retain the ordinary empty-type diagnostic"
+        );
+        assert!(
+            generated_interface_enum_wit_item_kind(
+                true,
+                empty_check.flags_def(),
+                owner,
+                owner,
+                &empty_variants,
+                Vec::new(),
+                &ids.symbols,
+            )
+            .expect("no flag symbols need resolving")
+            .is_none(),
+            "empty flags declarations do not produce a WIT flags item"
+        );
     }
 
     #[test]
