@@ -13,3 +13,4 @@ sai_wit = { path = "../sai_wit" }
 
 [dev-dependencies]
 sai_vfs = { path = "../sai_vfs" }
+sai_syntax = { path = "../sai_syntax" }

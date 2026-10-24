@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use sai_diagnostics::Code;
+use sai_hir::item_tree::{AttrName, RawAttr};
 use sai_hir::items::{HirOwner, InterfaceItemKind, MemberRole, OwnerNode, Variant, VariantShape};
 use sai_hir::types::Name;
 use sai_hir::{DefId, OwnerId, Span, Symbol};
@@ -145,6 +146,118 @@ impl FlagsDef {
 pub struct InterfaceItemCheck {
     issues: Vec<InterfaceCheckIssue>,
     flags_def: Option<FlagsDef>,
+    enum_projection: Option<EnumProjectionCheck>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct EnumProjectionCheck {
+    owner: OwnerId,
+    accepted_flags_marker: bool,
+    valid_raw_flags_marker: bool,
+    variants: Vec<EnumVariantCheck>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EnumFlagsCheck {
+    accepted_marker: bool,
+    valid_raw_marker: bool,
+}
+
+impl EnumFlagsCheck {
+    pub(crate) const fn accepted_marker(self) -> bool {
+        self.accepted_marker
+    }
+
+    pub(crate) const fn valid_raw_marker(self) -> bool {
+        self.valid_raw_marker
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnumVariantShapeCheck {
+    Unit,
+    Tuple(usize),
+    Record(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EnumVariantCheck {
+    def_id: sai_hir::LocalDefId,
+    name: Symbol,
+    name_span: Span,
+    shape: EnumVariantShapeCheck,
+    discriminant: Option<i128>,
+    has_explicit_discriminant: bool,
+    span: Span,
+    payload_span: Option<Span>,
+}
+
+impl EnumProjectionCheck {
+    fn new(
+        owner: OwnerId,
+        variants: &[Variant<'_>],
+        accepted_flags_marker: bool,
+        valid_raw_flags_marker: bool,
+    ) -> Self {
+        Self {
+            owner,
+            accepted_flags_marker,
+            valid_raw_flags_marker,
+            variants: variants
+                .iter()
+                .map(|variant| {
+                    let shape = match variant.shape {
+                        VariantShape::Unit => EnumVariantShapeCheck::Unit,
+                        VariantShape::Tuple(types) => EnumVariantShapeCheck::Tuple(types.len()),
+                        VariantShape::Record(fields) => EnumVariantShapeCheck::Record(fields.len()),
+                    };
+                    EnumVariantCheck {
+                        def_id: variant.def_id,
+                        name: variant.name.sym,
+                        name_span: variant.name.span,
+                        shape,
+                        discriminant: variant.discriminant,
+                        has_explicit_discriminant: variant.has_explicit_discriminant,
+                        span: variant.span,
+                        payload_span: variant.payload_span,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    fn matches(
+        &self,
+        owner: OwnerId,
+        variants: &[Variant<'_>],
+        valid_raw_flags_marker: bool,
+    ) -> bool {
+        self.owner == owner
+            && self.valid_raw_flags_marker == valid_raw_flags_marker
+            && self.variants
+                == variants
+                    .iter()
+                    .map(|variant| {
+                        let shape = match variant.shape {
+                            VariantShape::Unit => EnumVariantShapeCheck::Unit,
+                            VariantShape::Tuple(types) => EnumVariantShapeCheck::Tuple(types.len()),
+                            VariantShape::Record(fields) => {
+                                EnumVariantShapeCheck::Record(fields.len())
+                            }
+                        };
+                        EnumVariantCheck {
+                            def_id: variant.def_id,
+                            name: variant.name.sym,
+                            name_span: variant.name.span,
+                            shape,
+                            discriminant: variant.discriminant,
+                            has_explicit_discriminant: variant.has_explicit_discriminant,
+                            span: variant.span,
+                            payload_span: variant.payload_span,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+    }
 }
 
 impl InterfaceItemCheck {
@@ -156,6 +269,23 @@ impl InterfaceItemCheck {
     /// Return the validated flags descriptor, if this item is a valid flags enum.
     pub fn flags_def(&self) -> Option<&FlagsDef> {
         self.flags_def.as_ref()
+    }
+
+    /// Return whether the same enum declaration was checked with an accepted
+    /// flags marker. `None` means this check does not match the supplied HIR.
+    pub(crate) fn flags_check_for_enum(
+        &self,
+        owner: OwnerId,
+        variants: &[Variant<'_>],
+        valid_raw_flags_marker: bool,
+    ) -> Option<EnumFlagsCheck> {
+        self.enum_projection
+            .as_ref()
+            .filter(|check| check.matches(owner, variants, valid_raw_flags_marker))
+            .map(|check| EnumFlagsCheck {
+                accepted_marker: check.accepted_flags_marker,
+                valid_raw_marker: check.valid_raw_flags_marker,
+            })
     }
 
     /// Split the check result into its diagnostics and validated flags descriptor.
@@ -205,6 +335,15 @@ pub fn interface_item_check(
 ) -> Result<InterfaceItemCheck, InterfaceCheckError> {
     let OwnerNode::InterfaceItem(item) = owner.node else {
         return Ok(InterfaceItemCheck::default());
+    };
+    let enum_projection = match item.kind {
+        InterfaceItemKind::Enum { variants, .. } => Some(EnumProjectionCheck::new(
+            item.owner_id,
+            variants,
+            flags_marker_accepted,
+            raw_flags_marker_is_valid(owner.raw_attrs),
+        )),
+        _ => None,
     };
     let mut issues = Vec::new();
     let mut flags_def = None;
@@ -364,7 +503,21 @@ pub fn interface_item_check(
             }
         }
     }
-    Ok(InterfaceItemCheck { issues, flags_def })
+    Ok(InterfaceItemCheck {
+        issues,
+        flags_def,
+        enum_projection,
+    })
+}
+
+pub(crate) fn raw_flags_marker_is_valid(raw_attrs: &[RawAttr]) -> bool {
+    let mut flags = raw_attrs
+        .iter()
+        .filter(|attribute| attribute.name == AttrName::Flags);
+    matches!(
+        (flags.next(), flags.next()),
+        (Some(attribute), None) if attribute.args.is_none() && !attribute.has_error
+    )
 }
 
 pub(super) fn push_name_issue(

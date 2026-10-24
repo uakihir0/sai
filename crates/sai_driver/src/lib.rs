@@ -133,7 +133,7 @@ use sai_resolve::{ModuleId, ModuleTree, ModuleTreeQueries, ModuleTreeQueryError}
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher, fingerprint};
 use sai_syntax::ast::{self, AstNode, AstToken};
 use sai_syntax::{Parse, ParseQueryError, SyntaxElement, SyntaxNode, SyntaxQueries};
-use sai_ty::adt::LocalFlagsAdtDef;
+use sai_ty::adt::{LocalFlagsAdtDef, LocalInterfaceEnumAdtProjection};
 use sai_vfs::{
     FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex, PackageFileKind,
     PackageFilesSnapshot, PackageKey, PackageKeyError, PackageRelativePath, PackageSourceDirectory,
@@ -2346,6 +2346,7 @@ pub struct Phase1PackageScopesCollection {
     interface_uses: InterfaceUses,
     interface_uses_fingerprint: Fingerprint,
     local_flags_adts: Vec<LocalFlagsAdtDef>,
+    local_interface_enum_projections: Vec<LocalInterfaceEnumAdtProjection>,
     world_interface_uses: WorldInterfaceUseGraph,
     world_interface_uses_fingerprint: Fingerprint,
     interface_check_diagnostics: Vec<Diagnostic>,
@@ -2429,6 +2430,26 @@ impl Phase1PackageScopesCollection {
             .local_flags_adts
             .iter()
             .find(|flags| flags.adt_def().def_id() == owner))
+    }
+
+    /// Look up this snapshot's partial local-interface-enum projection.
+    ///
+    /// Every collected interface enum has an explicit outcome: a unit enum,
+    /// a validated flags enum, or an unsupported reason. `None` only means
+    /// the owner was not a local interface enum in this projection; it does
+    /// not classify arbitrary definitions as non-ADTs.
+    pub fn local_interface_enum_adt_projection(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        owner: DefId,
+    ) -> Result<Option<&LocalInterfaceEnumAdtProjection>, Phase1CollectionError> {
+        if self.snapshot_id != snapshot.id() {
+            return Err(Phase1CollectionError::SnapshotIdentityMismatch);
+        }
+        Ok(self
+            .local_interface_enum_projections
+            .iter()
+            .find(|projection| projection.owner() == owner))
     }
 
     /// Ordered local and external interface-use identities consumed by world
@@ -14118,6 +14139,7 @@ impl RootDatabase {
             interface_check_diagnostics,
             generated_wit_text,
             local_flags_adts,
+            local_interface_enum_projections,
         ) = match interface_uses_result {
             Ok(output) => output,
             Err(error) => {
@@ -14179,6 +14201,7 @@ impl RootDatabase {
             interface_uses,
             interface_uses_fingerprint,
             local_flags_adts,
+            local_interface_enum_projections,
             world_interface_uses,
             world_interface_uses_fingerprint,
             interface_check_diagnostics,
@@ -30587,6 +30610,306 @@ interface api { resource canvas { invalid: static func(items: map<string, u32>);
                 >= 2,
             "payload and explicit-discriminant markers fail flags validation"
         );
+    }
+
+    #[test]
+    fn phase1_local_interface_enum_projection_covers_unit_flags_and_unsupported_forms() {
+        let source = concat!(
+            "interface api {\n",
+            "enum State { Ready, Waiting, Done }\n",
+            "@flags enum Permissions { Read, Write }\n",
+            "@flags enum Empty {}\n",
+            "@flags enum Explicit { Read = 1, Write }\n",
+            "enum Generic<T> { Item }\n",
+            "enum Payload { Item(U32) }\n",
+            "@repr(U8) enum Repr { Ready }\n",
+            "enum Bounds { Minimum = -9223372036854775808, Maximum = 9223372036854775807 }\n",
+            "enum TooWide { Value = 9223372036854775808 }\n",
+            "enum RepeatedDiscriminant { First = 5, Second = 5 }\n",
+            "type Record { value: U32 }\n",
+            "}\n",
+        );
+        let (database, _, snapshot, collection) =
+            collect_package_inventory_with_accepted_flags_for_test(source.as_bytes());
+        let owner_named = |wanted: &str| {
+            collection
+                .scopes()
+                .interfaces
+                .values()
+                .find_map(|scope| {
+                    scope.members.iter().find_map(|(name, binding)| {
+                        (database
+                            .symbols
+                            .resolve(*name)
+                            .is_ok_and(|name| name.as_ref() == wanted))
+                        .then_some(binding.res)
+                    })
+                })
+                .and_then(|res| match res {
+                    sai_resolve::package_scopes::Res::Def(
+                        sai_resolve::package_scopes::DefKind::Enum,
+                        owner,
+                    ) => Some(owner),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("source enum `{wanted}` remains in interface scope"))
+        };
+        let projection_for = |name: &str| {
+            let owner = owner_named(name);
+            let projection = collection
+                .local_interface_enum_adt_projection(&snapshot, owner)
+                .expect("fresh snapshot is accepted")
+                .unwrap_or_else(|| panic!("interface enum `{name}` has a projection outcome"));
+            (owner, projection)
+        };
+
+        let (state_owner, state_projection) = projection_for("State");
+        let LocalInterfaceEnumAdtProjection::Unit(state) = state_projection else {
+            panic!("ordinary unit enum projects as Unit");
+        };
+        let state_adt = state.adt_def();
+        assert_eq!(state_adt.def_id(), state_owner);
+        assert_eq!(state_adt.kind(), sai_ty::adt::AdtKind::Enum);
+        assert_eq!(state_adt.discr_ty(), sai_ty::adt::IntTy::I64);
+        assert_eq!(
+            state_adt
+                .variants()
+                .iter()
+                .map(|variant| (
+                    database
+                        .symbols
+                        .resolve(variant.name())
+                        .unwrap()
+                        .to_string(),
+                    variant.discr(),
+                    variant.fields().len(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                ("Ready".to_owned(), 0, 0),
+                ("Waiting".to_owned(), 1, 0),
+                ("Done".to_owned(), 2, 0),
+            ]
+        );
+        let owner_path = database
+            .resolve_def_path(state_owner)
+            .expect("enum owner path resolves")
+            .expect("enum owner path exists");
+        for variant in state_adt.variants() {
+            assert_eq!(variant.def_id().package, state_owner.package);
+            assert_ne!(variant.def_id(), state_owner);
+            let path = database
+                .resolve_def_path(variant.def_id())
+                .expect("variant path resolves")
+                .expect("variant path exists");
+            assert_eq!(path.package(), owner_path.package());
+            assert_eq!(&path.data()[..owner_path.data().len()], owner_path.data());
+            assert!(matches!(
+                path.data().last(),
+                Some(sai_hir::DisambiguatedDefPathData {
+                    data: sai_hir::DefPathData::Variant(name),
+                    disambiguator: 0,
+                }) if *name == variant.name()
+            ));
+        }
+
+        let (permissions_owner, permissions_projection) = projection_for("Permissions");
+        assert_eq!(
+            permissions_projection,
+            &LocalInterfaceEnumAdtProjection::Flags {
+                owner: permissions_owner
+            }
+        );
+        assert!(
+            collection
+                .local_flags_adt_def(&snapshot, permissions_owner)
+                .expect("fresh snapshot is accepted")
+                .is_some()
+        );
+
+        let (empty_owner, empty_projection) = projection_for("Empty");
+        let LocalInterfaceEnumAdtProjection::Unit(empty) = empty_projection else {
+            panic!("empty flags fallback remains an ordinary empty enum");
+        };
+        assert_eq!(empty.adt_def().def_id(), empty_owner);
+        assert!(empty.adt_def().variants().is_empty());
+        assert!(
+            collection
+                .local_flags_adt_def(&snapshot, empty_owner)
+                .expect("fresh snapshot is accepted")
+                .is_none()
+        );
+
+        let (explicit_owner, explicit_projection) = projection_for("Explicit");
+        let LocalInterfaceEnumAdtProjection::Unit(explicit) = explicit_projection else {
+            panic!("invalid flags fallback remains an ordinary enum");
+        };
+        assert_eq!(
+            explicit
+                .adt_def()
+                .variants()
+                .iter()
+                .map(|variant| variant.discr())
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(
+            collection
+                .local_flags_adt_def(&snapshot, explicit_owner)
+                .expect("fresh snapshot is accepted")
+                .is_none()
+        );
+
+        for (name, expected_reason) in [
+            (
+                "Generic",
+                sai_ty::adt::LocalEnumAdtUnsupportedReason::GenericParameters,
+            ),
+            (
+                "Payload",
+                sai_ty::adt::LocalEnumAdtUnsupportedReason::Payload,
+            ),
+            (
+                "Repr",
+                sai_ty::adt::LocalEnumAdtUnsupportedReason::UnvalidatedRepresentation,
+            ),
+            (
+                "TooWide",
+                sai_ty::adt::LocalEnumAdtUnsupportedReason::DiscriminantOutOfRange,
+            ),
+            (
+                "RepeatedDiscriminant",
+                sai_ty::adt::LocalEnumAdtUnsupportedReason::DuplicateDiscriminant,
+            ),
+        ] {
+            let (owner, projection) = projection_for(name);
+            assert_eq!(
+                projection,
+                &LocalInterfaceEnumAdtProjection::Unsupported {
+                    owner,
+                    reason: expected_reason,
+                },
+                "unsupported enum `{name}` is distinguished from a missing ADT result"
+            );
+        }
+
+        let (_, bounds_projection) = projection_for("Bounds");
+        let LocalInterfaceEnumAdtProjection::Unit(bounds) = bounds_projection else {
+            panic!("I64 boundary discriminants remain representable");
+        };
+        assert_eq!(
+            bounds
+                .adt_def()
+                .variants()
+                .iter()
+                .map(|variant| variant.discr())
+                .collect::<Vec<_>>(),
+            [i64::MIN as i128, i64::MAX as i128]
+        );
+
+        let record_owner = collection
+            .scopes()
+            .interfaces
+            .values()
+            .find_map(|scope| {
+                scope.members.iter().find_map(|(name, binding)| {
+                    (database
+                        .symbols
+                        .resolve(*name)
+                        .is_ok_and(|name| name.as_ref() == "Record"))
+                    .then_some(binding.res)
+                })
+            })
+            .and_then(|res| match res {
+                sai_resolve::package_scopes::Res::Def(
+                    sai_resolve::package_scopes::DefKind::Struct,
+                    owner,
+                ) => Some(owner),
+                _ => None,
+            })
+            .expect("record owner remains in interface scope");
+        assert!(
+            collection
+                .local_interface_enum_adt_projection(&snapshot, record_owner)
+                .expect("fresh snapshot is accepted")
+                .is_none(),
+            "None means no local interface enum projection, not non-ADT"
+        );
+        let stale_snapshot = snapshot_with_version(&snapshot, 88);
+        assert_eq!(
+            collection.local_interface_enum_adt_projection(&stale_snapshot, state_owner),
+            Err(Phase1CollectionError::SnapshotIdentityMismatch)
+        );
+    }
+
+    #[test]
+    fn phase1_does_not_project_unaccepted_valid_raw_flags_as_a_unit_enum() {
+        let source = concat!(
+            "interface api {\n",
+            "@flags enum Gated { Read, Write }\n",
+            "@flags(1) enum InvalidAttribute { Read, Write }\n",
+            "@flags enum Empty {}\n",
+            "@flags enum InvalidFlags { Read = 1, Write }\n",
+            "}\n",
+        );
+        let (database, _, snapshot, collection) =
+            collect_package_inventory_for_target(source.as_bytes(), b"", "wasm32-core");
+        let owner_named = |wanted: &str| {
+            collection
+                .scopes()
+                .interfaces
+                .values()
+                .find_map(|scope| {
+                    scope.members.iter().find_map(|(name, binding)| {
+                        (database
+                            .symbols
+                            .resolve(*name)
+                            .is_ok_and(|name| name.as_ref() == wanted))
+                        .then_some(binding.res)
+                    })
+                })
+                .and_then(|res| match res {
+                    sai_resolve::package_scopes::Res::Def(
+                        sai_resolve::package_scopes::DefKind::Enum,
+                        owner,
+                    ) => Some(owner),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("source enum `{wanted}` remains in interface scope"))
+        };
+        let projection_for = |name: &str| {
+            let owner = owner_named(name);
+            let projection = collection
+                .local_interface_enum_adt_projection(&snapshot, owner)
+                .expect("fresh snapshot is accepted")
+                .unwrap_or_else(|| panic!("interface enum `{name}` has a projection outcome"));
+            (owner, projection)
+        };
+
+        let (gated_owner, gated) = projection_for("Gated");
+        assert_eq!(
+            gated,
+            &LocalInterfaceEnumAdtProjection::Unsupported {
+                owner: gated_owner,
+                reason: sai_ty::adt::LocalEnumAdtUnsupportedReason::InterfaceItemCheckFailed,
+            },
+            "a syntactically valid raw marker cannot be suppressed with a false acceptance token"
+        );
+        assert!(
+            collection
+                .local_flags_adt_def(&snapshot, gated_owner)
+                .expect("fresh snapshot is accepted")
+                .is_none(),
+            "the unaccepted Stage 4 marker does not create a Flags ADT"
+        );
+
+        for name in ["InvalidAttribute", "Empty", "InvalidFlags"] {
+            let (_, projection) = projection_for(name);
+            assert!(
+                matches!(projection, LocalInterfaceEnumAdtProjection::Unit(_)),
+                "invalid or empty `{name}` keeps the ordinary enum fallback"
+            );
+        }
     }
 
     #[test]

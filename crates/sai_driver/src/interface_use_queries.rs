@@ -15,7 +15,7 @@ use sai_diagnostics::{
     Child, ChildKind, Diagnostic, Location, Related, Severity, SourceRef, Value,
 };
 use sai_hir::arena::HirArena;
-use sai_hir::item_tree::ItemTreeKind;
+use sai_hir::item_tree::{AttrName, ItemTreeKind};
 use sai_hir::items::{
     HirOwner, InterfaceItemKind, ItemKind, MemberRole, OwnerNode, VariantShape, WorldItemKind,
 };
@@ -41,7 +41,10 @@ use sai_resolve::{
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher};
 use sai_syntax::SyntaxKind;
 use sai_syntax::ast::{self, AstNode};
-use sai_ty::adt::{LocalFlagsAdtDef, LocalFlagsAdtDefError};
+use sai_ty::adt::{
+    AdtKind, IntTy, LocalEnumAdtUnsupportedReason, LocalFlagsAdtDef, LocalFlagsAdtDefError,
+    LocalInterfaceEnumAdtProjection, LocalUnitEnumAdtDef, LocalUnitEnumAdtDefError,
+};
 use sai_ty::boundary::{
     BoundaryAlias, BoundaryDefinition, BoundaryType, BoundaryTypeContext, BoundaryTypeOutcome,
     IncompatibleReason, Position, boundary_type_with_references,
@@ -148,6 +151,7 @@ pub enum InterfaceUsesQueryError {
     DefPath(DefPathError),
     DefPathInterner(DefPathInternerError),
     FlagsAdt(LocalFlagsAdtDefError),
+    UnitEnumAdt(LocalUnitEnumAdtDefError),
     FlagsAdtPathIdentityMismatch,
     DiagnosticTemplate(String),
     WitUnitIdentity(sai_wit::WitUnitIdentityError),
@@ -183,6 +187,7 @@ struct InterfaceUsesMemo {
     world_graph: WorldInterfaceUseGraph,
     generated_wit_text: Option<GeneratedText>,
     local_flags_adts: Vec<LocalFlagsAdtDef>,
+    local_interface_enum_projections: Vec<LocalInterfaceEnumAdtProjection>,
     diagnostics: Vec<DetachedWorkspaceDiagnostic>,
     interface_check_diagnostics: Vec<DetachedWorkspaceDiagnostic>,
 }
@@ -1411,6 +1416,7 @@ impl PartialEq for InterfaceUsesMemo {
             && self.world_graph == other.world_graph
             && self.generated_wit_text == other.generated_wit_text
             && self.local_flags_adts == other.local_flags_adts
+            && self.local_interface_enum_projections == other.local_interface_enum_projections
             && self.diagnostics == other.diagnostics
             && self.interface_check_diagnostics == other.interface_check_diagnostics
     }
@@ -1498,6 +1504,7 @@ impl InterfaceUsesQueries {
                         interface_check_diagnostics,
                         generated_candidate,
                         local_flags_adts,
+                        local_interface_enum_projections,
                     )| {
                         let graph = interface_uses(input.clone());
                         let generated_wit_text = generated_candidate
@@ -1513,6 +1520,7 @@ impl InterfaceUsesQueries {
                             &interface_check_diagnostics,
                             generated_wit_text.as_ref(),
                             &local_flags_adts,
+                            &local_interface_enum_projections,
                             &prepared,
                             &packages,
                             &symbols,
@@ -1552,6 +1560,7 @@ impl InterfaceUsesQueries {
                                 world_graph,
                                 generated_wit_text,
                                 local_flags_adts,
+                                local_interface_enum_projections,
                                 diagnostics,
                                 interface_check_diagnostics,
                             },
@@ -1589,6 +1598,7 @@ impl InterfaceUsesQueries {
             Vec<Diagnostic>,
             Option<GeneratedText>,
             Vec<LocalFlagsAdtDef>,
+            Vec<LocalInterfaceEnumAdtProjection>,
         ),
         InterfaceUsesQueryError,
     > {
@@ -1620,6 +1630,7 @@ impl InterfaceUsesQueries {
             interface_check_diagnostics,
             memo.generated_wit_text.clone(),
             memo.local_flags_adts.clone(),
+            memo.local_interface_enum_projections.clone(),
         ))
     }
 }
@@ -1732,7 +1743,8 @@ pub(super) fn append_world_function_name_diagnostics(
             | InterfaceUsesQueryError::WitUnitIdentity(_)
             | InterfaceUsesQueryError::WitIndexVec(_)
             | InterfaceUsesQueryError::FlagsAdt(_)
-            | InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch => {
+            | InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch
+            | InterfaceUsesQueryError::UnitEnumAdt(_) => {
                 unreachable!("source-bound world name checks only return collection errors")
             }
         })?;
@@ -2551,6 +2563,7 @@ fn collect_interface_uses_input(
         Vec<Diagnostic>,
         Option<GeneratedWitCandidate>,
         Vec<LocalFlagsAdtDef>,
+        Vec<LocalInterfaceEnumAdtProjection>,
     ),
     InterfaceUsesQueryError,
 > {
@@ -2719,6 +2732,7 @@ fn collect_interface_uses_input(
     let mut local_world_use_completeness = HashMap::<DefId, bool>::new();
     let mut interface_check_diagnostics = Vec::new();
     let mut local_flags_adts = Vec::<LocalFlagsAdtDef>::new();
+    let mut local_interface_enum_projections = Vec::<LocalInterfaceEnumAdtProjection>::new();
     let mut collision_inputs = Vec::with_capacity(descriptors.len());
     let mut poisoned_owners = HashSet::<OwnerId>::new();
     let mut owner_dependencies = HashMap::<OwnerId, HashSet<DefId>>::new();
@@ -3200,9 +3214,9 @@ fn collect_interface_uses_input(
                 owner_uses_complete = false;
             }
             let flags_marker_accepted = inputs.accepted_flags_attributes.contains(&entry.ast_id);
-            let (member_issues, flags_def) =
-                collect_interface_item_check(&member_hir, flags_marker_accepted, symbols)?
-                    .into_parts();
+            let member_interface_check =
+                collect_interface_item_check(&member_hir, flags_marker_accepted, symbols)?;
+            let (member_issues, flags_def) = member_interface_check.clone().into_parts();
             let member_has_issues = !member_issues.is_empty();
             if member_has_issues {
                 owner_uses_complete = false;
@@ -3238,8 +3252,13 @@ fn collect_interface_uses_input(
                     ),
                 ));
             };
+            let mut flags_adt_was_projected = false;
             if !member_has_issues
                 && member_hir.diagnostics.is_empty()
+                && !member_hir
+                    .raw_attrs
+                    .iter()
+                    .any(|attribute| attribute.name == AttrName::Repr)
                 && let (InterfaceItemKind::Enum { variants, .. }, Some(flags_def)) =
                     (item.kind, flags_def.as_ref())
             {
@@ -3255,6 +3274,16 @@ fn collect_interface_uses_input(
                     flags_def.clone(),
                     prepared,
                     packages,
+                    symbols,
+                )?);
+                flags_adt_was_projected = true;
+            }
+            if matches!(item.kind, InterfaceItemKind::Enum { .. }) {
+                local_interface_enum_projections.push(build_local_interface_enum_projection(
+                    &member_hir,
+                    &member_interface_check,
+                    flags_adt_was_projected,
+                    prepared,
                     symbols,
                 )?);
             }
@@ -4394,6 +4423,7 @@ fn collect_interface_uses_input(
         interface_check_diagnostics,
         generated_candidate,
         local_flags_adts,
+        local_interface_enum_projections,
     ))
 }
 
@@ -4660,6 +4690,77 @@ fn build_local_flags_adt_def(
             symbols,
         )
         .map_err(InterfaceUsesQueryError::FlagsAdt)
+}
+
+fn build_local_interface_enum_projection(
+    hir: &HirOwner<'_>,
+    interface_check: &InterfaceItemCheck,
+    flags_adt_was_projected: bool,
+    prepared: &PreparedPhase1PackageScopes,
+    symbols: &Interner,
+) -> Result<LocalInterfaceEnumAdtProjection, InterfaceUsesQueryError> {
+    let owner_id = hir.id.def_id.to_def_id();
+    if flags_adt_was_projected {
+        return Ok(LocalInterfaceEnumAdtProjection::Flags { owner: owner_id });
+    }
+    match LocalUnitEnumAdtDef::from_interface_hir(
+        hir,
+        interface_check,
+        &prepared.def_paths,
+        symbols,
+    ) {
+        Ok(definition) if definition.adt_def().kind() == AdtKind::Enum => {
+            Ok(LocalInterfaceEnumAdtProjection::Unit(definition))
+        }
+        Ok(_) => unreachable!("unit enum constructor always returns AdtKind::Enum"),
+        Err(error) => {
+            let reason = match error {
+                LocalUnitEnumAdtDefError::GenericParameters => {
+                    Some(LocalEnumAdtUnsupportedReason::GenericParameters)
+                }
+                LocalUnitEnumAdtDefError::ExplicitRepresentation => {
+                    Some(LocalEnumAdtUnsupportedReason::UnvalidatedRepresentation)
+                }
+                LocalUnitEnumAdtDefError::InvalidHir | LocalUnitEnumAdtDefError::InvalidSymbol => {
+                    Some(LocalEnumAdtUnsupportedReason::InvalidVariantIdentity)
+                }
+                LocalUnitEnumAdtDefError::Payload => Some(LocalEnumAdtUnsupportedReason::Payload),
+                LocalUnitEnumAdtDefError::ValidFlagsMustUseFlagsAdt => {
+                    Some(LocalEnumAdtUnsupportedReason::InterfaceItemCheckFailed)
+                }
+                LocalUnitEnumAdtDefError::MalformedDiscriminant => {
+                    Some(LocalEnumAdtUnsupportedReason::MalformedDiscriminant)
+                }
+                LocalUnitEnumAdtDefError::DiscriminantOverflow => {
+                    Some(LocalEnumAdtUnsupportedReason::DiscriminantOverflow)
+                }
+                LocalUnitEnumAdtDefError::DiscriminantOutOfRange => {
+                    Some(LocalEnumAdtUnsupportedReason::DiscriminantOutOfRange)
+                }
+                LocalUnitEnumAdtDefError::DuplicateDiscriminant => {
+                    Some(LocalEnumAdtUnsupportedReason::DuplicateDiscriminant)
+                }
+                LocalUnitEnumAdtDefError::NotInterfaceItem
+                | LocalUnitEnumAdtDefError::HirOwnerMismatch
+                | LocalUnitEnumAdtDefError::NotEnum
+                | LocalUnitEnumAdtDefError::OwnerDefinitionPathMismatch
+                | LocalUnitEnumAdtDefError::VariantDefinitionPackageMismatch
+                | LocalUnitEnumAdtDefError::VariantDefinitionPathMismatch
+                | LocalUnitEnumAdtDefError::VariantAliasesOwner
+                | LocalUnitEnumAdtDefError::DuplicateVariantDefinition
+                | LocalUnitEnumAdtDefError::TooManySameNamedVariants
+                | LocalUnitEnumAdtDefError::InterfaceCheckMismatch => None,
+            };
+            if let Some(reason) = reason {
+                Ok(LocalInterfaceEnumAdtProjection::Unsupported {
+                    owner: owner_id,
+                    reason,
+                })
+            } else {
+                Err(InterfaceUsesQueryError::UnitEnumAdt(error))
+            }
+        }
+    }
 }
 
 fn propagate_omitted_interface_owners(
@@ -7150,6 +7251,7 @@ fn stable_interface_uses_fingerprint(
     interface_check_diagnostics: &[Diagnostic],
     generated_wit_text: Option<&GeneratedText>,
     local_flags_adts: &[LocalFlagsAdtDef],
+    local_interface_enum_projections: &[LocalInterfaceEnumAdtProjection],
     prepared: &PreparedPhase1PackageScopes,
     packages: &PackageInterner,
     symbols: &Interner,
@@ -7218,6 +7320,7 @@ fn stable_interface_uses_fingerprint(
         let adt = local_flags.adt_def();
         hasher.write_tag(0xAF);
         match adt.kind() {
+            sai_ty::adt::AdtKind::Enum => hasher.write_tag(0),
             sai_ty::adt::AdtKind::Flags => hasher.write_tag(1),
         }
         hasher.write_len(u64::try_from(adt.variants().len()).unwrap_or(u64::MAX));
@@ -7247,9 +7350,7 @@ fn stable_interface_uses_fingerprint(
             hasher.write_u128(hash.raw());
         }
         match field.ty() {
-            sai_ty::adt::Ty::Int(sai_ty::adt::IntTy::U8) => hasher.write_tag(1),
-            sai_ty::adt::Ty::Int(sai_ty::adt::IntTy::U16) => hasher.write_tag(2),
-            sai_ty::adt::Ty::Int(sai_ty::adt::IntTy::U32) => hasher.write_tag(3),
+            sai_ty::adt::Ty::Int(ty) => hasher.write_u8(int_ty_tag(ty)),
         }
         hasher.write_len(u64::try_from(local_flags.flags_def().flags().len()).unwrap_or(u64::MAX));
         for (flag, span) in local_flags.flags_def().flags() {
@@ -7270,6 +7371,60 @@ fn stable_interface_uses_fingerprint(
             path.stable_hash(&mut hasher);
             package.stable_hash(&mut hasher);
             hash_text_range(&span.range, &mut hasher);
+        }
+    }
+    hasher.write_len(u64::try_from(local_interface_enum_projections.len()).unwrap_or(u64::MAX));
+    for projection in local_interface_enum_projections {
+        let (owner, tag) = match projection {
+            LocalInterfaceEnumAdtProjection::Flags { owner } => (*owner, 1),
+            LocalInterfaceEnumAdtProjection::Unit(definition) => (definition.adt_def().def_id(), 2),
+            LocalInterfaceEnumAdtProjection::Unsupported { owner, .. } => (*owner, 3),
+        };
+        let path = prepared
+            .def_paths
+            .resolve_def_id(owner)
+            .map_err(InterfaceUsesQueryError::DefPathInterner)?
+            .ok_or(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch)?;
+        let hash = DefPathHash::compute(&path, packages, symbols)
+            .map_err(InterfaceUsesQueryError::DefPath)?;
+        hasher.write_tag(0xAE);
+        hasher.write_tag(tag);
+        hasher.write_u128(hash.raw());
+        match projection {
+            LocalInterfaceEnumAdtProjection::Flags { .. } => {}
+            LocalInterfaceEnumAdtProjection::Unsupported { reason, .. } => {
+                hasher.write_u8(local_enum_unsupported_reason_tag(*reason));
+            }
+            LocalInterfaceEnumAdtProjection::Unit(definition) => {
+                let adt = definition.adt_def();
+                hasher.write_tag(match adt.kind() {
+                    AdtKind::Enum => 1,
+                    AdtKind::Flags => 2,
+                });
+                hasher.write_u8(int_ty_tag(adt.discr_ty()));
+                hasher.write_len(u64::try_from(adt.variants().len()).unwrap_or(u64::MAX));
+                for variant in adt.variants() {
+                    let path = prepared
+                        .def_paths
+                        .resolve_def_id(variant.def_id())
+                        .map_err(InterfaceUsesQueryError::DefPathInterner)?
+                        .ok_or(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch)?;
+                    let hash = DefPathHash::compute(&path, packages, symbols)
+                        .map_err(InterfaceUsesQueryError::DefPath)?;
+                    hasher.write_u128(hash.raw());
+                    symbols
+                        .resolve(variant.name())
+                        .map_err(|error| {
+                            InterfaceUsesQueryError::Collection(
+                                OwnerControlFlowResolutionError::SymbolLookup(error),
+                            )
+                        })?
+                        .as_ref()
+                        .stable_hash(&mut hasher);
+                    hasher.write_i128(variant.discr());
+                    hasher.write_len(u64::try_from(variant.fields().len()).unwrap_or(u64::MAX));
+                }
+            }
         }
     }
     hasher.write_len(u64::try_from(graph.diagnostics.len()).unwrap_or(u64::MAX));
@@ -7419,9 +7574,65 @@ fn interface_uses_error_fingerprint(error: &InterfaceUsesQueryError) -> Fingerpr
             hasher.write_tag(9);
             hasher.write_tag(local_flags_adt_error_tag(error));
         }
-        InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch => hasher.write_tag(10),
+        InterfaceUsesQueryError::UnitEnumAdt(error) => {
+            hasher.write_tag(10);
+            hasher.write_tag(local_unit_enum_adt_error_tag(error));
+        }
+        InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch => hasher.write_tag(11),
     }
     hasher.finish()
+}
+
+fn int_ty_tag(ty: IntTy) -> u8 {
+    match ty {
+        IntTy::I8 => 0,
+        IntTy::I16 => 1,
+        IntTy::I32 => 2,
+        IntTy::I64 => 3,
+        IntTy::U8 => 4,
+        IntTy::U16 => 5,
+        IntTy::U32 => 6,
+        IntTy::U64 => 7,
+    }
+}
+
+fn local_enum_unsupported_reason_tag(reason: LocalEnumAdtUnsupportedReason) -> u8 {
+    match reason {
+        LocalEnumAdtUnsupportedReason::GenericParameters => 0,
+        LocalEnumAdtUnsupportedReason::Payload => 1,
+        LocalEnumAdtUnsupportedReason::UnvalidatedRepresentation => 2,
+        LocalEnumAdtUnsupportedReason::MalformedDiscriminant => 3,
+        LocalEnumAdtUnsupportedReason::DiscriminantOverflow => 4,
+        LocalEnumAdtUnsupportedReason::DiscriminantOutOfRange => 5,
+        LocalEnumAdtUnsupportedReason::DuplicateDiscriminant => 6,
+        LocalEnumAdtUnsupportedReason::InvalidVariantIdentity => 7,
+        LocalEnumAdtUnsupportedReason::InterfaceItemCheckFailed => 8,
+    }
+}
+
+fn local_unit_enum_adt_error_tag(error: &LocalUnitEnumAdtDefError) -> u8 {
+    match error {
+        LocalUnitEnumAdtDefError::OwnerDefinitionPathMismatch => 0,
+        LocalUnitEnumAdtDefError::VariantDefinitionPackageMismatch => 1,
+        LocalUnitEnumAdtDefError::VariantDefinitionPathMismatch => 2,
+        LocalUnitEnumAdtDefError::VariantAliasesOwner => 3,
+        LocalUnitEnumAdtDefError::DuplicateVariantDefinition => 4,
+        LocalUnitEnumAdtDefError::TooManySameNamedVariants => 5,
+        LocalUnitEnumAdtDefError::DiscriminantOutOfRange => 6,
+        LocalUnitEnumAdtDefError::DuplicateDiscriminant => 7,
+        LocalUnitEnumAdtDefError::InvalidSymbol => 8,
+        LocalUnitEnumAdtDefError::NotInterfaceItem => 9,
+        LocalUnitEnumAdtDefError::HirOwnerMismatch => 10,
+        LocalUnitEnumAdtDefError::NotEnum => 11,
+        LocalUnitEnumAdtDefError::GenericParameters => 12,
+        LocalUnitEnumAdtDefError::ExplicitRepresentation => 13,
+        LocalUnitEnumAdtDefError::InvalidHir => 14,
+        LocalUnitEnumAdtDefError::Payload => 15,
+        LocalUnitEnumAdtDefError::ValidFlagsMustUseFlagsAdt => 16,
+        LocalUnitEnumAdtDefError::MalformedDiscriminant => 17,
+        LocalUnitEnumAdtDefError::DiscriminantOverflow => 18,
+        LocalUnitEnumAdtDefError::InterfaceCheckMismatch => 19,
+    }
 }
 
 fn local_flags_adt_error_tag(error: &LocalFlagsAdtDefError) -> u8 {

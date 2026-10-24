@@ -3206,6 +3206,7 @@ dependencies = [
  "sai_hir",
  "sai_intern",
  "sai_resolve",
+ "sai_syntax",
  "sai_vfs",
  "sai_wit",
 ]
