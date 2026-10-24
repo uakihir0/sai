@@ -1,0 +1,5 @@
+package acme:bounded-protocol-model-checker @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "A bounded BFS checker for lease-protocol safety and deadlocks"

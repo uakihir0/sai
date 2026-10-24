@@ -1,0 +1,69 @@
+pub const MAX_SEARCH_CAPACITY: USize = 128
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Owner {
+    Free
+    ClientA
+    ClientB
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum GrantTiming {
+    ReserveWhenSending
+    ReserveWhenReceiving
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ProtocolConfig {
+    pub grant_timing: GrantTiming
+    pub allow_release_message_loss: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ProtocolState {
+    pub owner: Owner
+    pub request_pending: Array<Bool, 2>
+    pub grant_in_flight: Array<Bool, 2>
+    pub client_holds_lease: Array<Bool, 2>
+    pub release_in_flight: Array<Bool, 2>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Action {
+    RequestA
+    RequestB
+    SendGrantA
+    SendGrantB
+    DeliverGrantA
+    DeliverGrantB
+    BeginReleaseA
+    BeginReleaseB
+    ProcessReleaseA
+    ProcessReleaseB
+    DropReleaseA
+    DropReleaseB
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CheckOutcome {
+    ProvenSafe
+    Counterexample
+    Deadlock
+    BoundExceeded
+    InvalidStateLimit
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Trace {
+    pub actions: Array<Option<Action>, MAX_SEARCH_CAPACITY>
+    pub length: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CheckReport {
+    pub outcome: CheckOutcome
+    pub trace: Trace
+    pub visited_state_count: USize
+    pub transition_count: USize
+    pub deadlock_state_count: USize
+}

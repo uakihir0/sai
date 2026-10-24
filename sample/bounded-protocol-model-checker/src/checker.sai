@@ -1,0 +1,187 @@
+use acme:bounded-protocol-model-checker/model.{
+    Action
+    CheckOutcome
+    CheckReport
+    MAX_SEARCH_CAPACITY
+    ProtocolConfig
+    ProtocolState
+    Trace
+}
+use acme:bounded-protocol-model-checker/protocol
+
+@derive(Copy, Clone, PartialEq, Eq)
+type SearchNode {
+    state: ProtocolState
+    predecessor: Option<USize>
+    action: Option<Action>
+}
+
+fn empty_trace() -> Trace {
+    Trace(actions: Array<Option<Action>, MAX_SEARCH_CAPACITY>.filled(None), length: 0)
+}
+
+fn report(
+    outcome: CheckOutcome,
+    trace: Trace,
+    visited_state_count: USize,
+    transition_count: USize,
+    deadlock_state_count: USize,
+) -> CheckReport {
+    CheckReport(
+        outcome: outcome,
+        trace: trace,
+        visited_state_count: visited_state_count,
+        transition_count: transition_count,
+        deadlock_state_count: deadlock_state_count,
+    )
+}
+
+fn find_state(
+    nodes: Array<Option<SearchNode>, MAX_SEARCH_CAPACITY>,
+    node_count: USize,
+    state: ProtocolState,
+) -> Option<USize> {
+    for index in 0..node_count {
+        if nodes[index].unwrap().state == state {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn trace_to(
+    nodes: Array<Option<SearchNode>, MAX_SEARCH_CAPACITY>,
+    current_index: USize,
+    final_action: Option<Action>,
+) -> Trace {
+    var reversed = Array<Option<Action>, MAX_SEARCH_CAPACITY>.filled(None)
+    var length: USize = 0
+    var cursor = Some(current_index)
+
+    while cursor != None {
+        match cursor {
+            Some(index) => {
+                let node = nodes[index].unwrap()
+                match node.action {
+                    Some(action) => {
+                        reversed[length] = Some(action)
+                        length += 1
+                    }
+                    None => {}
+                }
+                cursor = node.predecessor
+            }
+            None => break
+        }
+    }
+
+    var actions = Array<Option<Action>, MAX_SEARCH_CAPACITY>.filled(None)
+    for index in 0..length {
+        actions[index] = reversed[length - index - 1]
+    }
+
+    match final_action {
+        Some(action) => {
+            actions[length] = Some(action)
+            length += 1
+        }
+        None => {}
+    }
+    Trace(actions: actions, length: length)
+}
+
+pub fn check(config: ProtocolConfig, state_limit: USize) -> CheckReport {
+    if state_limit == 0 or state_limit > MAX_SEARCH_CAPACITY {
+        return report(CheckOutcome.InvalidStateLimit, empty_trace(), 0, 0, 0)
+    }
+
+    let start = protocol.initial_state()
+    if protocol.violates_mutual_exclusion(start) {
+        return report(CheckOutcome.Counterexample, empty_trace(), 1, 0, 0)
+    }
+
+    var nodes = Array<Option<SearchNode>, MAX_SEARCH_CAPACITY>.filled(None)
+    nodes[0] = Some(SearchNode(state: start, predecessor: None, action: None))
+    var node_count: USize = 1
+    var head: USize = 0
+    var transition_count: USize = 0
+    var deadlock_state_count: USize = 0
+    var first_deadlock: Option<USize> = None
+
+    while head < node_count {
+        let current = nodes[head].unwrap()
+        var has_successor = false
+
+        for action_index in 0..protocol.action_count() {
+            let action = match protocol.action_at(action_index) {
+                Some(value) => value
+                None => continue
+            }
+            match protocol.next_state(current.state, action, config) {
+                Some(next) => {
+                    transition_count += 1
+                    has_successor = true
+
+                    if protocol.violates_mutual_exclusion(next) {
+                        return report(
+                            CheckOutcome.Counterexample,
+                            trace_to(nodes, head, Some(action)),
+                            node_count,
+                            transition_count,
+                            deadlock_state_count,
+                        )
+                    }
+
+                    match find_state(nodes, node_count, next) {
+                        Some(_) => {}
+                        None => {
+                            if node_count >= state_limit {
+                                return report(
+                                    CheckOutcome.BoundExceeded,
+                                    empty_trace(),
+                                    node_count,
+                                    transition_count,
+                                    deadlock_state_count,
+                                )
+                            }
+                            nodes[node_count] = Some(
+                                SearchNode(
+                                    state: next,
+                                    predecessor: Some(head),
+                                    action: Some(action),
+                                ),
+                            )
+                            node_count += 1
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+
+        if not has_successor and protocol.has_unfinished_work(current.state) {
+            deadlock_state_count += 1
+            if first_deadlock == None {
+                first_deadlock = Some(head)
+            }
+        }
+        head += 1
+    }
+
+    match first_deadlock {
+        Some(index) => report(
+            CheckOutcome.Deadlock,
+            trace_to(nodes, index, None),
+            node_count,
+            transition_count,
+            deadlock_state_count,
+        )
+        None => report(
+            CheckOutcome.ProvenSafe,
+            empty_trace(),
+            node_count,
+            transition_count,
+            deadlock_state_count,
+        )
+    }
+}
