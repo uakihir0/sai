@@ -15,7 +15,7 @@ use sai_resolve::package_scopes::{
 };
 use sai_semantic::{
     CurrentSymbol, DeclarationFingerprintError, PackageIndexFileName, PackageSymbolInventory,
-    SymbolKind, declaration_fingerprint,
+    SymbolKind, declaration_fingerprint, declaration_fingerprint_with_appended_token_pair,
 };
 use sai_stable_hash::Fingerprint;
 use sai_syntax::{
@@ -90,7 +90,27 @@ struct ValidatedInterfaceEnum {
     name: String,
     name_token: SyntaxToken,
     generic_children: Vec<ItemTreeEntry>,
+    is_flags: bool,
     variants: Vec<ValidatedInterfaceEnumVariant>,
+}
+
+#[derive(Default)]
+struct InterfaceEnumFlagsShape {
+    has_payload: bool,
+    has_explicit_discriminant: bool,
+    has_duplicate_case_names: bool,
+}
+
+fn interface_enum_is_flags(
+    has_flags_attribute: bool,
+    variant_count: usize,
+    shape: &InterfaceEnumFlagsShape,
+) -> bool {
+    has_flags_attribute
+        && (1..=32).contains(&variant_count)
+        && !shape.has_payload
+        && !shape.has_explicit_discriminant
+        && !shape.has_duplicate_case_names
 }
 
 struct ValidatedInterfaceEnumVariant {
@@ -3323,6 +3343,7 @@ fn validate_interface_enum(
     let mut generic_children = Vec::new();
     let mut variants = Vec::new();
     let mut variant_names = HashSet::<String>::new();
+    let mut flags_shape = InterfaceEnumFlagsShape::default();
     for ((_, ast_child), child) in expected_children.iter().zip(&entry.children) {
         let (expected_kind, expected_ast_id, name_node, child_syntax) = match ast_child {
             EnumChild::Generic(ast::GenericParam::Type(parameter)) => (
@@ -3430,12 +3451,16 @@ fn validate_interface_enum(
                     .discriminant()
                     .is_some_and(|discriminant| discriminant.integer().is_some());
                 if has_explicit_discriminant {
-                    reasons.insert(
-                        "an interface enum variant has an explicit discriminant (WIT_EXPLICIT_DISCRIMINANT)"
-                            .into(),
-                    );
+                    flags_shape.has_explicit_discriminant = true;
+                    if !has_flags_attribute {
+                        reasons.insert(
+                            "an interface enum variant has an explicit discriminant (WIT_EXPLICIT_DISCRIMINANT)"
+                                .into(),
+                        );
+                    }
                 }
                 if !variant_names.insert(child_name.clone()) {
+                    flags_shape.has_duplicate_case_names = true;
                     reasons.insert(format!(
                         "interface enum `{name}` has duplicate variant name `{child_name}`"
                     ));
@@ -3590,6 +3615,8 @@ fn validate_interface_enum(
                         || variant.tuple_shape().is_some()
                         || has_explicit_discriminant)
                 {
+                    flags_shape.has_payload |=
+                        variant.record_shape().is_some() || variant.tuple_shape().is_some();
                     reasons.insert(
                         "an interface @flags enum has a payload or discriminant (INVALID_FLAGS_ENUM)"
                             .into(),
@@ -3621,6 +3648,7 @@ fn validate_interface_enum(
         name,
         name_token,
         generic_children,
+        is_flags: interface_enum_is_flags(has_flags_attribute, variants.len(), &flags_shape),
         variants,
     })
 }
@@ -4123,11 +4151,12 @@ fn collect_interface_enum_symbols(
     };
     let mut variant_def_paths = Vec::with_capacity(enum_declaration.variants.len());
     let mut variant_symbols = Vec::with_capacity(enum_declaration.variants.len());
-    for ((variant, variant_def_id), (_, ordinal)) in enum_declaration
+    for (variant_index, ((variant, variant_def_id), (_, ordinal))) in enum_declaration
         .variants
         .iter()
         .zip(&variant_def_ids)
         .zip(&variant_paths)
+        .enumerate()
     {
         let variant_def_path = match def_paths.resolve(*variant_def_id) {
             Ok(Some(path)) if path.package() == package_id => path,
@@ -4159,12 +4188,18 @@ fn collect_interface_enum_symbols(
                 return;
             }
         };
-        let variant_fingerprint = match declaration_fingerprint(
-            SymbolKind::Variant,
+        let variant_path = format!("{enum_path}.{}", variant.name);
+        if !canonical_paths.insert(variant_path.clone()) {
+            reasons.insert(format!("duplicate canonical symbol path {variant_path}"));
+        }
+        let symbol = match interface_enum_variant_symbol(
+            variant_path,
+            variant_def_path_hash,
             &variant.syntax,
-            Some(&variant.name_token),
+            &variant.name_token,
+            enum_declaration.is_flags.then_some(variant_index),
         ) {
-            Ok(fingerprint) => fingerprint,
+            Ok(symbol) => symbol,
             Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
                 reasons.insert(
                     "an interface enum variant name token is outside its declaration".into(),
@@ -4172,16 +4207,7 @@ fn collect_interface_enum_symbols(
                 return;
             }
         };
-        let variant_path = format!("{enum_path}.{}", variant.name);
-        if !canonical_paths.insert(variant_path.clone()) {
-            reasons.insert(format!("duplicate canonical symbol path {variant_path}"));
-        }
-        variant_symbols.push(CurrentSymbol::new(
-            variant_path,
-            variant_def_path_hash,
-            SymbolKind::Variant,
-            variant_fingerprint,
-        ));
+        variant_symbols.push(symbol);
         variant_def_paths.push(variant_def_path);
     }
     current_symbols.extend(variant_symbols);
@@ -4298,6 +4324,38 @@ fn collect_interface_enum_symbols(
             return;
         }
     }
+}
+
+fn interface_enum_variant_symbol(
+    canonical_path: String,
+    def_path_hash: Fingerprint,
+    syntax: &SyntaxNode,
+    name_token: &SyntaxToken,
+    flags_bit_index: Option<usize>,
+) -> Result<CurrentSymbol, DeclarationFingerprintError> {
+    let (kind, fingerprint) = if let Some(bit_index) = flags_bit_index {
+        let bit_index = bit_index.to_string();
+        (
+            SymbolKind::Const,
+            declaration_fingerprint_with_appended_token_pair(
+                SymbolKind::Const,
+                syntax,
+                Some(name_token),
+                Some(("LocalFlagsBitIndex", &bit_index)),
+            )?,
+        )
+    } else {
+        (
+            SymbolKind::Variant,
+            declaration_fingerprint(SymbolKind::Variant, syntax, Some(name_token))?,
+        )
+    };
+    Ok(CurrentSymbol::new(
+        canonical_path,
+        def_path_hash,
+        kind,
+        fingerprint,
+    ))
 }
 
 fn collect_interface_resource_members(
@@ -7943,13 +8001,43 @@ fn parser_diagnostic_overlaps_syntax(
 
 #[cfg(test)]
 mod tests {
-    use super::trait_children_match_order;
+    use super::{
+        InterfaceEnumFlagsShape, interface_enum_is_flags, interface_enum_variant_symbol,
+        trait_children_match_order,
+    };
     use sai_hir::{
         Visibility,
         item_tree::{ItemTreeEntry, ItemTreeKind},
     };
     use sai_intern::Symbol;
-    use sai_syntax::ast::ErasedAstId;
+    use sai_semantic::SymbolKind;
+    use sai_stable_hash::Fingerprint;
+    use sai_syntax::{SyntaxKind, SyntaxNode, SyntaxToken, ast::ErasedAstId};
+    use sai_vfs::{FileId, SnapshotFile, SourceFile, WorkspaceSnapshot};
+    use std::sync::Arc;
+
+    fn parse_variant(source: &str) -> (SyntaxNode, SyntaxToken) {
+        let file_id = FileId::new(1);
+        let snapshot = WorkspaceSnapshot::new([SnapshotFile::new(
+            Arc::new(SourceFile::new(file_id, source, false).expect("valid source")),
+            "src/lib.sai",
+            Some("acme:sample@1.0.0".to_owned()),
+            None,
+        )])
+        .expect("valid snapshot");
+        let parsed = sai_syntax::parse(&snapshot, file_id).expect("source parses");
+        let declaration = parsed
+            .root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::VARIANT_DECL)
+            .expect("enum variant");
+        let name_token = declaration
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::NAME)
+            .and_then(|name| name.first_token())
+            .expect("variant name token");
+        (declaration, name_token)
+    }
 
     fn child(kind: ItemTreeKind, ast_id: u32) -> ItemTreeEntry {
         ItemTreeEntry {
@@ -7961,6 +8049,115 @@ mod tests {
             raw_attrs: Vec::new(),
             children: Vec::new(),
             header_hash: None,
+        }
+    }
+
+    #[test]
+    fn local_flags_inventory_uses_const_kind_and_bit_sensitive_fingerprints() {
+        let (read, read_name) =
+            parse_variant("interface api { @flags enum Permissions { Read, Write } }\n");
+        let (renamed, renamed_name) =
+            parse_variant("interface api { @flags enum Permissions { Inspect, Write } }\n");
+        let identity_hash = Fingerprint::new(0xA1);
+        let symbol = |path: &str, hash, syntax: &SyntaxNode, name: &SyntaxToken, bit_index| {
+            interface_enum_variant_symbol(path.to_owned(), hash, syntax, name, Some(bit_index))
+                .expect("verified flags variant symbol")
+        };
+        let read = symbol(
+            "acme:sample.api.Permissions.Read",
+            identity_hash,
+            &read,
+            &read_name,
+            0,
+        );
+        let renamed = symbol(
+            "acme:sample.api.Permissions.Inspect",
+            Fingerprint::new(0xA2),
+            &renamed,
+            &renamed_name,
+            0,
+        );
+        assert_eq!(read.kind(), SymbolKind::Const);
+        assert_eq!(read.fingerprint(), renamed.fingerprint());
+        assert_ne!(read.def_path_hash(), renamed.def_path_hash());
+
+        let (read_syntax, read_name) =
+            parse_variant("interface api { @flags enum Permissions { Read, Write } }\n");
+        let reordered = symbol(
+            "acme:sample.api.Permissions.Read",
+            identity_hash,
+            &read_syntax,
+            &read_name,
+            1,
+        );
+        assert_eq!(read.def_path_hash(), reordered.def_path_hash());
+        assert_ne!(read.fingerprint(), reordered.fingerprint());
+
+        let ordinary = interface_enum_variant_symbol(
+            "acme:sample.api.Permissions.Read".to_owned(),
+            identity_hash,
+            &read_syntax,
+            &read_name,
+            None,
+        )
+        .expect("ordinary enum variant symbol");
+        assert_eq!(ordinary.kind(), SymbolKind::Variant);
+    }
+
+    #[test]
+    fn local_flags_inventory_falls_back_for_invalid_shapes() {
+        let valid_shape = InterfaceEnumFlagsShape::default();
+        assert!(interface_enum_is_flags(true, 1, &valid_shape));
+        assert!(interface_enum_is_flags(true, 32, &valid_shape));
+        assert!(!interface_enum_is_flags(true, 0, &valid_shape));
+        assert!(!interface_enum_is_flags(true, 33, &valid_shape));
+        assert!(!interface_enum_is_flags(false, 1, &valid_shape));
+
+        for shape in [
+            InterfaceEnumFlagsShape {
+                has_payload: true,
+                ..InterfaceEnumFlagsShape::default()
+            },
+            InterfaceEnumFlagsShape {
+                has_explicit_discriminant: true,
+                ..InterfaceEnumFlagsShape::default()
+            },
+            InterfaceEnumFlagsShape {
+                has_duplicate_case_names: true,
+                ..InterfaceEnumFlagsShape::default()
+            },
+        ] {
+            assert!(
+                !interface_enum_is_flags(true, 2, &shape),
+                "invalid flags shapes retain ordinary enum variants"
+            );
+        }
+
+        let (syntax, name) = parse_variant("enum Bits { One(U32) }\n");
+        for shape in [
+            InterfaceEnumFlagsShape {
+                has_payload: true,
+                ..InterfaceEnumFlagsShape::default()
+            },
+            InterfaceEnumFlagsShape {
+                has_explicit_discriminant: true,
+                ..InterfaceEnumFlagsShape::default()
+            },
+            InterfaceEnumFlagsShape {
+                has_duplicate_case_names: true,
+                ..InterfaceEnumFlagsShape::default()
+            },
+        ] {
+            let flags_bit_index = interface_enum_is_flags(true, 2, &shape).then_some(0);
+            let symbol = interface_enum_variant_symbol(
+                "acme:sample.api.Bits.One".to_owned(),
+                Fingerprint::new(0xA3),
+                &syntax,
+                &name,
+                flags_bit_index,
+            )
+            .expect("fallback variant symbol");
+            assert_eq!(symbol.kind(), SymbolKind::Variant);
         }
     }
 

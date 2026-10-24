@@ -1156,6 +1156,46 @@ struct OwnedPhase1ModuleInput {
     source_ref: SourceRef,
 }
 
+#[cfg(test)]
+fn accept_flags_for_inventory_tests(filtered: &mut TargetFilterResult) {
+    fn is_flags_stage_rejection(diagnostic: &sai_diagnostics::Diagnostic) -> bool {
+        diagnostic.code == sai_diagnostics::Code::FeatureNotImplemented
+            && matches!(
+                diagnostic.data.get("feature"),
+                Some(sai_diagnostics::Value::String(feature))
+                    if feature == "attribute @flags"
+            )
+    }
+
+    fn visit(
+        entries: &[ItemTreeEntry],
+        validated_attrs: &mut BTreeMap<ast::ErasedAstId, sai_hir::attrs::ValidatedAttrs>,
+    ) {
+        for entry in entries {
+            if entry.kind == ItemTreeKind::Enum
+                && let Some(attribute) = entry
+                    .raw_attrs
+                    .iter()
+                    .find(|attribute| attribute.name == sai_hir::item_tree::AttrName::Flags)
+                && let Some(validated) = validated_attrs.get_mut(&entry.ast_id)
+            {
+                validated.flags = Some(attribute.span);
+                validated
+                    .diagnostics
+                    .retain(|diagnostic| !is_flags_stage_rejection(diagnostic));
+            }
+            visit(&entry.children, validated_attrs);
+        }
+    }
+
+    // Exercise the downstream collector with the same accepted marker Stage 4
+    // validation provides, without raising the global implemented stage.
+    visit(&filtered.item_tree.items, &mut filtered.validated_attrs);
+    filtered
+        .diagnostics
+        .retain(|diagnostic| !is_flags_stage_rejection(diagnostic));
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct DetachedWorkspaceDiagnostic {
     code: sai_diagnostics::Code,
@@ -13764,6 +13804,18 @@ impl RootDatabase {
         foreign_scopes: &[Phase1ForeignPackageScopes],
         wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
     ) -> Result<Phase1PackageScopesCollection, Phase1CollectionError> {
+        #[cfg(test)]
+        let result = self.collect_phase1_package_scopes_with_requirements_inner(
+            module_tree,
+            snapshot,
+            target_cfg,
+            build_context,
+            declared_requirements,
+            foreign_scopes,
+            wit_view_scopes,
+            false,
+        );
+        #[cfg(not(test))]
         let result = self.collect_phase1_package_scopes_with_requirements_inner(
             module_tree,
             snapshot,
@@ -13789,6 +13841,7 @@ impl RootDatabase {
         declared_requirements: Option<Arc<[DeclaredRequirement]>>,
         foreign_scopes: &[Phase1ForeignPackageScopes],
         wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+        #[cfg(test)] accept_flags_for_inventory_test: bool,
     ) -> Result<Phase1PackageScopesCollection, Phase1CollectionError> {
         if module_tree.modules.len() > u32::MAX as usize {
             return Err(Phase1CollectionError::TooManyModules);
@@ -13811,6 +13864,14 @@ impl RootDatabase {
                 snapshot,
                 target_cfg,
             )?;
+            #[cfg(test)]
+            let filtered = {
+                let mut filtered = filtered;
+                if accept_flags_for_inventory_test {
+                    accept_flags_for_inventory_tests(&mut filtered);
+                }
+                filtered
+            };
             let parser_diagnostics = parsed.parser_diagnostics().to_vec();
             owned_inputs.push(OwnedPhase1ModuleInput {
                 filtered,
@@ -24574,6 +24635,28 @@ impl RootDatabase {
 }
 
 #[cfg(test)]
+impl RootDatabase {
+    fn collect_phase1_package_scopes_with_accepted_flags_for_test(
+        &mut self,
+        module_tree: &ModuleTree,
+        snapshot: &WorkspaceSnapshot,
+        target_cfg: &TargetCfg,
+        build_context: Phase1BuildContext,
+    ) -> Result<Phase1PackageScopesCollection, Phase1CollectionError> {
+        self.collect_phase1_package_scopes_with_requirements_inner(
+            module_tree,
+            snapshot,
+            target_cfg,
+            build_context,
+            None,
+            &[],
+            None,
+            true,
+        )
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
@@ -24820,6 +24903,30 @@ mod tests {
                 Phase1BuildContext::default(),
             )
             .expect("Phase 1 collection succeeds");
+        (database, module_tree, snapshot, collection)
+    }
+
+    fn collect_package_inventory_with_accepted_flags_for_test(
+        root_contents: &[u8],
+    ) -> (
+        RootDatabase,
+        ModuleTree,
+        WorkspaceSnapshot,
+        Phase1PackageScopesCollection,
+    ) {
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root_contents, b"");
+        database
+            .set_package_graph(Some(phase1_root_only_graph()))
+            .expect("active source package graph is recorded");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_with_accepted_flags_for_test(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("test collection accepts validated Stage 4 flags");
         (database, module_tree, snapshot, collection)
     }
 
@@ -30119,6 +30226,146 @@ interface api { resource canvas { invalid: static func(items: map<string, u32>);
                         .any(|symbol| symbol.path() == path && symbol.kind() == kind),
                     "{source:?} should retain structurally valid candidate {path}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn module_local_flags_inventory_collects_consts_with_real_variant_identity() {
+        let collect = |source: &[u8]| {
+            let (_, _, _, collection) =
+                collect_package_inventory_with_accepted_flags_for_test(source);
+            collection
+        };
+        let original = collect(b"interface api {\n@flags enum Permissions { Read, Write }\n}\n");
+        let original_inventory = inventory_symbols(&original);
+        let original_read = original_inventory
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.path() == "acme:phase1.api.Permissions.Read")
+            .expect("the accepted flags case is inventoried");
+        assert_eq!(original_read.kind(), sai_semantic::SymbolKind::Const);
+        assert!(original_inventory.symbols().iter().any(|symbol| {
+            symbol.path() == "acme:phase1.api.Permissions.Write"
+                && symbol.kind() == sai_semantic::SymbolKind::Const
+        }));
+        assert!(
+            original_inventory.symbols().iter().all(|symbol| {
+                !(symbol.path() == "acme:phase1.api.Permissions.Read"
+                    && symbol.kind() == sai_semantic::SymbolKind::Variant)
+            }),
+            "accepted flags cases must not also be emitted as variants"
+        );
+        assert!(matches!(
+            original_inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("synthetic associated functions")
+        ));
+
+        let renamed = collect(b"interface api {\n@flags enum Permissions { Inspect, Write }\n}\n");
+        let renamed_inspect = inventory_symbols(&renamed)
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.path() == "acme:phase1.api.Permissions.Inspect")
+            .expect("the renamed flags case is inventoried");
+        assert_ne!(
+            original_read.def_path_hash(),
+            renamed_inspect.def_path_hash()
+        );
+        assert_eq!(original_read.fingerprint(), renamed_inspect.fingerprint());
+
+        let reordered = collect(b"interface api {\n@flags enum Permissions { Write, Read }\n}\n");
+        let reordered_read = inventory_symbols(&reordered)
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.path() == "acme:phase1.api.Permissions.Read")
+            .expect("the reordered flags case is inventoried");
+        assert_eq!(
+            original_read.def_path_hash(),
+            reordered_read.def_path_hash()
+        );
+        assert_ne!(original_read.fingerprint(), reordered_read.fingerprint());
+    }
+
+    #[test]
+    fn module_local_flags_inventory_falls_back_to_enum_candidates_for_invalid_shapes() {
+        let too_many_cases = (0..33)
+            .map(|index| format!("Flag{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let too_many_source =
+            format!("interface api {{\n@flags enum TooMany {{ {too_many_cases} }}\n}}\n");
+        for (source, enum_name, expected_case, expected_reason) in [
+            (
+                &b"interface api {\n@flags enum Empty {}\n}\n"[..],
+                "Empty",
+                None,
+                "WIT_EMPTY_TYPE",
+            ),
+            (
+                &b"interface api {\n@flags enum Payload { Item(U32) }\n}\n"[..],
+                "Payload",
+                Some("Item"),
+                "INVALID_FLAGS_ENUM",
+            ),
+            (
+                &b"interface api {\n@flags enum Discriminant { Read = 1, Write }\n}\n"[..],
+                "Discriminant",
+                Some("Read"),
+                "INVALID_FLAGS_ENUM",
+            ),
+            (
+                too_many_source.as_bytes(),
+                "TooMany",
+                Some("Flag0"),
+                "INVALID_FLAGS_ENUM",
+            ),
+            (
+                &b"interface api {\n@flags enum Duplicate { Same, Same }\n}\n"[..],
+                "Duplicate",
+                Some("Same"),
+                "duplicate variant name",
+            ),
+        ] {
+            let (_, _, _, collection) =
+                collect_package_inventory_with_accepted_flags_for_test(source);
+            let inventory = inventory_symbols(&collection);
+            let enum_path = format!("acme:phase1.api.{enum_name}");
+            assert!(inventory.symbols().iter().any(|symbol| {
+                symbol.path() == enum_path && symbol.kind() == sai_semantic::SymbolKind::Enum
+            }));
+            assert!(
+                matches!(
+                    inventory.coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { reason }
+                        if reason.contains(expected_reason)
+                ),
+                "{source:?}: {:#?}",
+                inventory.coverage()
+            );
+            assert!(
+                inventory.symbols().iter().all(|symbol| {
+                    !(symbol.path().starts_with(&format!("{enum_path}."))
+                        && symbol.kind() == sai_semantic::SymbolKind::Const)
+                }),
+                "{source:?} must not emit a flags constant"
+            );
+            if let Some(case_name) = expected_case {
+                let case_path = format!("{enum_path}.{case_name}");
+                assert!(
+                    inventory.symbols().iter().any(|symbol| {
+                        symbol.path() == case_path
+                            && symbol.kind() == sai_semantic::SymbolKind::Variant
+                    }),
+                    "{source:?} must retain its ordinary enum variant"
+                );
+            }
+            if enum_name == "Discriminant" {
+                assert!(matches!(
+                    inventory.coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { reason }
+                        if !reason.contains("WIT_EXPLICIT_DISCRIMINANT")
+                ));
             }
         }
     }
