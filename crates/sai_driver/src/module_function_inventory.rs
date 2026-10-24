@@ -84,6 +84,38 @@ struct ValidatedInterfaceRecordField {
     name_token: SyntaxToken,
 }
 
+struct ValidatedInterfaceEnum {
+    entry: ItemTreeEntry,
+    declaration: ast::EnumDecl,
+    name: String,
+    name_token: SyntaxToken,
+    generic_children: Vec<ItemTreeEntry>,
+    variants: Vec<ValidatedInterfaceEnumVariant>,
+}
+
+struct ValidatedInterfaceEnumVariant {
+    entry: ItemTreeEntry,
+    name: String,
+    syntax: SyntaxNode,
+    name_token: SyntaxToken,
+    fields: Vec<ValidatedInterfaceEnumField>,
+    tuple_fields: Vec<ValidatedInterfaceEnumTupleField>,
+}
+
+enum ValidatedInterfaceEnumField {
+    Named {
+        entry: ItemTreeEntry,
+        name: String,
+        syntax: SyntaxNode,
+        name_token: SyntaxToken,
+    },
+}
+
+struct ValidatedInterfaceEnumTupleField {
+    index: usize,
+    syntax: SyntaxNode,
+}
+
 /// Collects target-visible module-level functions and their generic
 /// parameters, records and resources with their generic parameters and direct named fields,
 /// enums with their generic parameters, variants and record-variant fields,
@@ -92,8 +124,8 @@ struct ValidatedInterfaceRecordField {
 /// effects, worlds, tests, properties, extern functions, and traits with their
 /// generic parameters, direct associated types and functions, and trait-method
 /// generic parameters. Local interfaces, their direct freestanding functions,
-/// aliases, interface records, resources, and their functions are included;
-/// interface enums and other interface members remain unsupported.
+/// aliases, records, enums and variants, resources, and resource functions are
+/// included; other interface members remain unsupported.
 /// World import/export/include entries are validated as world contents but do
 /// not produce symbols. Every other symbol-bearing declaration makes the result
 /// incomplete until its symbol kind and path are collected as well.
@@ -2327,6 +2359,7 @@ fn collect_interface(
     let mut validated_functions = Vec::<(ItemTreeEntry, ast::FnDecl, String, SyntaxToken)>::new();
     let mut validated_aliases = Vec::<ValidatedInterfaceAlias>::new();
     let mut validated_records = Vec::<ValidatedInterfaceRecord>::new();
+    let mut validated_enums = Vec::<ValidatedInterfaceEnum>::new();
     let mut validated_resources = Vec::<ValidatedInterfaceResource>::new();
     for ((_, member), child) in expected_children.iter().zip(&entry.children) {
         let (member_name, member_syntax, function) = match member {
@@ -2518,6 +2551,63 @@ fn collect_interface(
                     name: child_name,
                     name_token: child_name_token,
                 });
+            } else if let InterfaceChild::Enum(enum_declaration) = member {
+                if child.kind != ItemTreeKind::Enum {
+                    reasons.insert("an interface enum has the wrong ItemTree kind".into());
+                    continue;
+                }
+                let Some(attrs) = input.filtered.validated_attrs.get(&child.ast_id) else {
+                    reasons.insert("an interface enum has no attribute-validation record".into());
+                    continue;
+                };
+                if attrs.target.is_some() {
+                    reasons.insert("an interface enum unexpectedly has a target predicate".into());
+                    continue;
+                }
+                if attrs
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.severity == sai_diagnostics::Severity::Error)
+                {
+                    reasons.insert("an interface enum has an attribute-validation error".into());
+                    continue;
+                }
+                let Some(enum_declaration) = validate_interface_enum(
+                    child,
+                    enum_declaration,
+                    file_id,
+                    input,
+                    symbols,
+                    attrs.flags.is_some(),
+                    reasons,
+                ) else {
+                    continue;
+                };
+                if enum_declaration.declaration.generic_params().is_some()
+                    || enum_declaration.declaration.where_clause().is_some()
+                {
+                    reasons.insert(
+                        "generic interface enums or where clauses are prohibited (GENERIC_INTERFACE_ITEM)"
+                            .into(),
+                    );
+                }
+                if child
+                    .raw_attrs
+                    .iter()
+                    .any(|attribute| attribute.name == sai_hir::item_tree::AttrName::Derive)
+                {
+                    reasons.insert(
+                        "an interface enum has derived impl symbols outside the supported inventory"
+                            .into(),
+                    );
+                }
+                if attrs.flags.is_some() {
+                    reasons.insert(
+                        "an interface flags enum has synthetic associated functions outside the supported inventory"
+                            .into(),
+                    );
+                }
+                validated_enums.push(enum_declaration);
             } else if let InterfaceChild::Resource(resource) = member {
                 if child.kind != ItemTreeKind::Resource {
                     reasons.insert("an interface resource has the wrong ItemTree kind".into());
@@ -2695,6 +2785,24 @@ fn collect_interface(
     for record in validated_records {
         collect_interface_record_symbols(
             &record,
+            entry,
+            descriptor.owner.def_id,
+            &def_path,
+            &canonical_path,
+            package_id,
+            reasons,
+            canonical_paths,
+            current_symbols,
+            def_paths,
+            packages,
+            symbols,
+            input,
+        );
+    }
+
+    for enum_declaration in validated_enums {
+        collect_interface_enum_symbols(
+            &enum_declaration,
             entry,
             descriptor.owner.def_id,
             &def_path,
@@ -3096,6 +3204,427 @@ fn collect_interface(
     }
 }
 
+fn validate_interface_enum(
+    entry: &ItemTreeEntry,
+    declaration: &ast::EnumDecl,
+    file_id: FileId,
+    input: &OwnedPhase1ModuleInput,
+    symbols: &Interner,
+    has_flags_attribute: bool,
+    reasons: &mut HashSet<String>,
+) -> Option<ValidatedInterfaceEnum> {
+    enum EnumChild {
+        Generic(ast::GenericParam),
+        Variant(ast::VariantDecl),
+    }
+
+    if entry.kind != ItemTreeKind::Enum {
+        reasons.insert("an interface enum has the wrong ItemTree kind".into());
+        return None;
+    }
+    if entry.name == Symbol::ERROR {
+        reasons.insert("an interface enum has no valid ItemTree name".into());
+        return None;
+    }
+    let name = match symbols.resolve(entry.name) {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            reasons.insert("an interface enum name cannot be resolved".into());
+            return None;
+        }
+    };
+    if input.ast_ids.ast_id(declaration).map(|id| id.erase()) != Some(entry.ast_id) {
+        reasons.insert("an interface enum AST ID does not match its ItemTree entry".into());
+        return None;
+    }
+    let Some(pointer) = input.ast_ids.pointer(entry.ast_id) else {
+        reasons.insert("an interface enum ItemTree entry has no source pointer".into());
+        return None;
+    };
+    let Some(expected_pointer) = sai_syntax::SyntaxNodePtr::new(file_id, declaration.syntax()).ok()
+    else {
+        reasons.insert("an interface enum AST cannot be bound to its source file".into());
+        return None;
+    };
+    if !pointer.is_same_source_node(&expected_pointer) {
+        reasons.insert("an interface enum pointer identifies a different AST node".into());
+        return None;
+    }
+    let Some(syntax) = pointer.resolve(file_id, &input.root) else {
+        reasons.insert("an interface enum source pointer is stale".into());
+        return None;
+    };
+    if syntax.kind() != declaration.syntax().kind()
+        || syntax.text_range() != declaration.syntax().text_range()
+    {
+        reasons.insert("an interface enum pointer resolves to a different source range".into());
+        return None;
+    }
+    let Some(name_node) = declaration.name() else {
+        reasons.insert("an interface enum AST has no name node".into());
+        return None;
+    };
+    let Some(name_token) = name_node.token() else {
+        reasons.insert("an interface enum AST has no name token".into());
+        return None;
+    };
+    let raw_name = name_token
+        .text()
+        .strip_prefix("r#")
+        .unwrap_or(name_token.text());
+    if sai_syntax::normalize_identifier(raw_name) != name {
+        reasons.insert("the interface enum ItemTree and AST names disagree".into());
+        return None;
+    }
+    if syntax_has_errors(&syntax)
+        || name_token.has_error()
+        || input
+            .parser_diagnostics
+            .iter()
+            .any(|diagnostic| parser_diagnostic_overlaps_syntax(diagnostic, file_id, &syntax))
+    {
+        reasons.insert("an interface enum contains recovery or parser errors".into());
+        return None;
+    }
+    if let Some(where_clause) = declaration.where_clause()
+        && syntax_has_errors(where_clause.syntax())
+    {
+        reasons.insert("an interface enum where clause contains parser errors".into());
+        return None;
+    }
+
+    let mut expected_children = Vec::<(usize, EnumChild)>::new();
+    if let Some(parameters) = declaration.generic_params() {
+        expected_children.extend(parameters.params().map(|parameter| {
+            (
+                parameter.syntax().text_range().start().to_usize(),
+                EnumChild::Generic(parameter),
+            )
+        }));
+    }
+    let Some(variant_list) = declaration.variants() else {
+        reasons.insert("an interface enum has no variant list".into());
+        return None;
+    };
+    expected_children.extend(variant_list.variants().map(|variant| {
+        (
+            variant.syntax().text_range().start().to_usize(),
+            EnumChild::Variant(variant),
+        )
+    }));
+    expected_children.sort_by_key(|(offset, _)| *offset);
+    if entry.children.len() != expected_children.len() {
+        reasons.insert(
+            "an interface enum ItemTree child count does not match its snapshot AST".into(),
+        );
+        return None;
+    }
+
+    let mut generic_children = Vec::new();
+    let mut variants = Vec::new();
+    let mut variant_names = HashSet::<String>::new();
+    for ((_, ast_child), child) in expected_children.iter().zip(&entry.children) {
+        let (expected_kind, expected_ast_id, name_node, child_syntax) = match ast_child {
+            EnumChild::Generic(ast::GenericParam::Type(parameter)) => (
+                ItemTreeKind::TypeParam,
+                input.ast_ids.ast_id(parameter).map(|id| id.erase()),
+                parameter.name(),
+                parameter.syntax().clone(),
+            ),
+            EnumChild::Generic(ast::GenericParam::Const(parameter)) => (
+                ItemTreeKind::ConstParam,
+                input.ast_ids.ast_id(parameter).map(|id| id.erase()),
+                parameter.name(),
+                parameter.syntax().clone(),
+            ),
+            EnumChild::Variant(variant) => (
+                ItemTreeKind::Variant,
+                input.ast_ids.ast_id(variant).map(|id| id.erase()),
+                variant.name(),
+                variant.syntax().clone(),
+            ),
+        };
+        if child.kind != expected_kind || expected_ast_id != Some(child.ast_id) {
+            reasons.insert(
+                "an interface enum ItemTree child kind, ID, or source order does not match its AST"
+                    .into(),
+            );
+            return None;
+        }
+        let Some(child_pointer) = input.ast_ids.pointer(child.ast_id) else {
+            reasons.insert("an interface enum child has no source pointer".into());
+            return None;
+        };
+        let Some(expected_child_pointer) =
+            sai_syntax::SyntaxNodePtr::new(file_id, &child_syntax).ok()
+        else {
+            reasons.insert("an interface enum child cannot be bound to its source file".into());
+            return None;
+        };
+        if !child_pointer.is_same_source_node(&expected_child_pointer) {
+            reasons
+                .insert("an interface enum child pointer identifies a different AST node".into());
+            return None;
+        }
+        let Some(resolved_child) = child_pointer.resolve(file_id, &input.root) else {
+            reasons.insert("an interface enum child source pointer is stale".into());
+            return None;
+        };
+        if resolved_child.kind() != child_syntax.kind()
+            || resolved_child.text_range() != child_syntax.text_range()
+        {
+            reasons.insert("an interface enum child resolves to a different source range".into());
+            return None;
+        }
+        if child.name == Symbol::ERROR {
+            reasons.insert("an interface enum child has no valid ItemTree name".into());
+            return None;
+        }
+        let child_name = match symbols.resolve(child.name) {
+            Ok(name) if !name.is_empty() => name.to_string(),
+            _ => {
+                reasons.insert("an interface enum child name cannot be resolved".into());
+                return None;
+            }
+        };
+        let Some(name_node) = name_node else {
+            reasons.insert("an interface enum child AST has no name node".into());
+            return None;
+        };
+        let Some(child_name_token) = name_node.token() else {
+            reasons.insert("an interface enum child AST has no name token".into());
+            return None;
+        };
+        let raw_child_name = child_name_token
+            .text()
+            .strip_prefix("r#")
+            .unwrap_or(child_name_token.text());
+        if sai_syntax::normalize_identifier(raw_child_name) != child_name {
+            reasons.insert("the interface enum ItemTree and AST child names disagree".into());
+            return None;
+        }
+        if syntax_has_errors(&child_syntax)
+            || child_name_token.has_error()
+            || input.parser_diagnostics.iter().any(|diagnostic| {
+                parser_diagnostic_overlaps_syntax(diagnostic, file_id, &child_syntax)
+            })
+        {
+            reasons.insert("an interface enum child contains recovery or parser errors".into());
+            return None;
+        }
+
+        match ast_child {
+            EnumChild::Generic(_) => {
+                if !child.children.is_empty() {
+                    reasons.insert(
+                        "an interface enum generic parameter has unexpected child entries".into(),
+                    );
+                    return None;
+                }
+                generic_children.push(child.clone());
+            }
+            EnumChild::Variant(variant) => {
+                let mut fields = Vec::new();
+                let mut tuple_fields = Vec::new();
+                let has_explicit_discriminant = variant
+                    .discriminant()
+                    .is_some_and(|discriminant| discriminant.integer().is_some());
+                if has_explicit_discriminant {
+                    reasons.insert(
+                        "an interface enum variant has an explicit discriminant (WIT_EXPLICIT_DISCRIMINANT)"
+                            .into(),
+                    );
+                }
+                if !variant_names.insert(child_name.clone()) {
+                    reasons.insert(format!(
+                        "interface enum `{name}` has duplicate variant name `{child_name}`"
+                    ));
+                }
+
+                if let Some(shape) = variant.record_shape() {
+                    let ast_fields = shape.fields().collect::<Vec<_>>();
+                    if child.children.len() != ast_fields.len() {
+                        reasons.insert(
+                            "an interface enum record payload ItemTree child count does not match its AST"
+                                .into(),
+                        );
+                        return None;
+                    }
+                    let mut field_names = HashSet::<String>::new();
+                    for (field, field_entry) in ast_fields.iter().zip(&child.children) {
+                        let Some(field_ast_id) = input.ast_ids.ast_id(field).map(|id| id.erase())
+                        else {
+                            reasons.insert(
+                                "an interface enum record payload field has no snapshot AST ID"
+                                    .into(),
+                            );
+                            return None;
+                        };
+                        if field_entry.kind != ItemTreeKind::VariantField
+                            || field_entry.ast_id != field_ast_id
+                        {
+                            reasons.insert(
+                                "an interface enum record payload field kind, ID, or order does not match its AST"
+                                    .into(),
+                            );
+                            return None;
+                        }
+                        let Some(field_pointer) = input.ast_ids.pointer(field_entry.ast_id) else {
+                            reasons.insert(
+                                "an interface enum record payload field has no source pointer"
+                                    .into(),
+                            );
+                            return None;
+                        };
+                        let Some(expected_field_pointer) =
+                            sai_syntax::SyntaxNodePtr::new(file_id, field.syntax()).ok()
+                        else {
+                            reasons.insert(
+                                "an interface enum record payload field cannot be bound to its source file"
+                                    .into(),
+                            );
+                            return None;
+                        };
+                        if !field_pointer.is_same_source_node(&expected_field_pointer) {
+                            reasons.insert(
+                                "an interface enum record payload field pointer identifies a different AST node"
+                                    .into(),
+                            );
+                            return None;
+                        }
+                        if !field_entry.children.is_empty() {
+                            reasons.insert(
+                                "an interface enum record payload field has unexpected children"
+                                    .into(),
+                            );
+                            return None;
+                        }
+                        if field_entry.name == Symbol::ERROR {
+                            reasons.insert(
+                                "an interface enum record payload field has no valid name".into(),
+                            );
+                            return None;
+                        }
+                        let field_name = match symbols.resolve(field_entry.name) {
+                            Ok(name) if !name.is_empty() => name.to_string(),
+                            _ => {
+                                reasons.insert(
+                                    "an interface enum record payload field name cannot be resolved"
+                                        .into(),
+                                );
+                                return None;
+                            }
+                        };
+                        let Some(field_name_token) = field.name().and_then(|name| name.token())
+                        else {
+                            reasons.insert(
+                                "an interface enum record payload field AST has no name token"
+                                    .into(),
+                            );
+                            return None;
+                        };
+                        let raw_field_name = field_name_token
+                            .text()
+                            .strip_prefix("r#")
+                            .unwrap_or(field_name_token.text());
+                        if sai_syntax::normalize_identifier(raw_field_name) != field_name {
+                            reasons.insert(
+                                "the interface enum ItemTree and AST field names disagree".into(),
+                            );
+                            return None;
+                        }
+                        if !field_names.insert(field_name.clone()) {
+                            reasons.insert(format!(
+                                "interface enum `{name}` variant `{child_name}` has duplicate field name `{field_name}`"
+                            ));
+                        }
+                        if field.ty().is_none() || syntax_has_errors(field.syntax()) {
+                            reasons.insert(
+                                "an interface enum record payload field has no valid type".into(),
+                            );
+                            return None;
+                        }
+                        fields.push(ValidatedInterfaceEnumField::Named {
+                            entry: field_entry.clone(),
+                            name: field_name,
+                            syntax: field.syntax().clone(),
+                            name_token: field_name_token,
+                        });
+                    }
+                    reasons.insert(
+                        "record-shaped interface enum payloads are incompatible with WIT (WIT_INCOMPATIBLE_TYPE)"
+                            .into(),
+                    );
+                } else if let Some(shape) = variant.tuple_shape() {
+                    if !child.children.is_empty() {
+                        reasons.insert(
+                            "an interface enum tuple payload has unexpected ItemTree child entries"
+                                .into(),
+                        );
+                        return None;
+                    }
+                    for (index, ty) in shape.types().enumerate() {
+                        if syntax_has_errors(ty.syntax()) {
+                            reasons.insert(
+                                "an interface enum tuple payload contains malformed types".into(),
+                            );
+                            return None;
+                        }
+                        tuple_fields.push(ValidatedInterfaceEnumTupleField {
+                            index,
+                            syntax: ty.syntax().clone(),
+                        });
+                    }
+                    if tuple_fields.len() != 1 {
+                        reasons.insert(
+                            "an interface enum case must have exactly one tuple payload (WIT_INCOMPATIBLE_TYPE)"
+                                .into(),
+                        );
+                    }
+                } else if !child.children.is_empty() {
+                    reasons.insert("an interface enum unit variant has unexpected children".into());
+                    return None;
+                }
+                if has_flags_attribute
+                    && (variant.record_shape().is_some()
+                        || variant.tuple_shape().is_some()
+                        || has_explicit_discriminant)
+                {
+                    reasons.insert(
+                        "an interface @flags enum has a payload or discriminant (INVALID_FLAGS_ENUM)"
+                            .into(),
+                    );
+                }
+                variants.push(ValidatedInterfaceEnumVariant {
+                    entry: child.clone(),
+                    name: child_name,
+                    syntax: child_syntax,
+                    name_token: child_name_token,
+                    fields,
+                    tuple_fields,
+                });
+            }
+        }
+    }
+    if variants.is_empty() {
+        reasons.insert("an interface enum has no variants (WIT_EMPTY_TYPE)".into());
+    }
+    if has_flags_attribute && variants.len() > 32 {
+        reasons.insert(
+            "an interface @flags enum has more than 32 variants (INVALID_FLAGS_ENUM)".into(),
+        );
+    }
+
+    Some(ValidatedInterfaceEnum {
+        entry: entry.clone(),
+        declaration: declaration.clone(),
+        name,
+        name_token,
+        generic_children,
+        variants,
+    })
+}
+
 fn validate_interface_record(
     entry: &ItemTreeEntry,
     declaration: &ast::TypeDecl,
@@ -3437,6 +3966,327 @@ fn collect_interface_record_symbols(
             ordinal,
             format!("{record_path}.field[{}]", field.name),
             "interface record field",
+            package_id,
+            reasons,
+            canonical_paths,
+            current_symbols,
+            def_paths,
+            packages,
+            symbols,
+        ) {
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_interface_enum_symbols(
+    enum_declaration: &ValidatedInterfaceEnum,
+    interface: &ItemTreeEntry,
+    interface_owner: LocalDefId,
+    interface_def_path: &sai_hir::DefPath,
+    interface_path: &str,
+    package_id: PackageId,
+    reasons: &mut HashSet<String>,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+    input: &OwnedPhase1ModuleInput,
+) {
+    let Some(component @ DefPathData::TypeNs(_)) =
+        interface_member_path_component(&enum_declaration.entry)
+    else {
+        reasons.insert("an interface enum has no TypeNs DefPath component".into());
+        return;
+    };
+    let disambiguator =
+        match interface_member_path_disambiguator(interface, &enum_declaration.entry) {
+            Ok(disambiguator) => disambiguator,
+            Err(sai_hir::item_tree::InterfaceMemberPathError::ItemTreeMismatch) => {
+                reasons.insert(
+                    "an interface enum has no source-ordered ItemTree disambiguator".into(),
+                );
+                return;
+            }
+            Err(sai_hir::item_tree::InterfaceMemberPathError::TooManyDefinitions) => {
+                reasons.insert("an interface enum TypeNs disambiguator overflowed".into());
+                return;
+            }
+        };
+    let enum_def_id =
+        match def_paths.intern_children(interface_owner, &[(component.clone(), disambiguator)]) {
+            Ok(mut children) if children.len() == 1 => children.remove(0),
+            _ => {
+                reasons.insert("an interface enum DefPath cannot be interned".into());
+                return;
+            }
+        };
+    let enum_def_path = match def_paths.resolve(enum_def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        Ok(Some(_)) => {
+            reasons.insert("an interface enum resolves to another package".into());
+            return;
+        }
+        Ok(None) => {
+            reasons.insert("an interface enum has no canonical DefPath".into());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("an interface enum DefPath cannot be resolved".into());
+            return;
+        }
+    };
+    if enum_def_path.data().len() != interface_def_path.data().len() + 1
+        || enum_def_path.data()[..interface_def_path.data().len()] != *interface_def_path.data()
+        || enum_def_path.data().last().is_none_or(|path_component| {
+            path_component.data != component || path_component.disambiguator != disambiguator
+        })
+    {
+        reasons.insert(
+            "an interface enum DefPath does not match its exact parent, TypeNs name, or source-order disambiguator"
+                .into(),
+        );
+        return;
+    }
+    let enum_def_path_hash = match DefPathHash::compute(&enum_def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert("an interface enum DefPath hash cannot be computed".into());
+            return;
+        }
+    };
+    let enum_fingerprint = match declaration_fingerprint(
+        SymbolKind::Enum,
+        &enum_declaration.declaration.syntax(),
+        Some(&enum_declaration.name_token),
+    ) {
+        Ok(fingerprint) => fingerprint,
+        Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+            reasons.insert("an interface enum name token is outside its declaration".into());
+            return;
+        }
+    };
+    let enum_path = format!("{interface_path}.{}", enum_declaration.name);
+    if !canonical_paths.insert(enum_path.clone()) {
+        reasons.insert(format!("duplicate canonical symbol path {enum_path}"));
+    }
+    current_symbols.push(CurrentSymbol::new(
+        enum_path.clone(),
+        enum_def_path_hash,
+        SymbolKind::Enum,
+        enum_fingerprint,
+    ));
+
+    collect_item_generic_params(
+        &enum_declaration.generic_children,
+        enum_declaration.declaration.generic_params(),
+        &enum_path,
+        enum_def_id,
+        &enum_def_path,
+        input,
+        package_id,
+        "interface enum",
+        canonical_paths,
+        current_symbols,
+        reasons,
+        def_paths,
+        packages,
+        symbols,
+    );
+
+    let mut variant_disambiguators = HashMap::<Symbol, u32>::new();
+    let mut variant_paths = Vec::with_capacity(enum_declaration.variants.len());
+    for variant in &enum_declaration.variants {
+        let disambiguator = variant_disambiguators
+            .entry(variant.entry.name)
+            .or_default();
+        let ordinal = *disambiguator;
+        let Some(next) = ordinal.checked_add(1) else {
+            reasons.insert("interface enum variant DefPath disambiguator overflowed".into());
+            return;
+        };
+        *disambiguator = next;
+        variant_paths.push((variant.entry.name, ordinal));
+    }
+    let variant_def_ids = match def_paths.intern_variants(enum_def_id, &variant_paths) {
+        Ok(def_ids) if def_ids.len() == enum_declaration.variants.len() => def_ids,
+        Ok(_) => {
+            reasons.insert("HIR returned the wrong number of interface enum variants".into());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("interface enum variant DefPaths cannot be interned".into());
+            return;
+        }
+    };
+    let mut variant_def_paths = Vec::with_capacity(enum_declaration.variants.len());
+    let mut variant_symbols = Vec::with_capacity(enum_declaration.variants.len());
+    for ((variant, variant_def_id), (_, ordinal)) in enum_declaration
+        .variants
+        .iter()
+        .zip(&variant_def_ids)
+        .zip(&variant_paths)
+    {
+        let variant_def_path = match def_paths.resolve(*variant_def_id) {
+            Ok(Some(path)) if path.package() == package_id => path,
+            _ => {
+                reasons.insert(
+                    "an interface enum variant has no DefPath in the selected package".into(),
+                );
+                return;
+            }
+        };
+        if variant_def_path.data().len() != enum_def_path.data().len() + 1
+            || variant_def_path.data()[..enum_def_path.data().len()] != *enum_def_path.data()
+            || variant_def_path.data().last().is_none_or(|path_component| {
+                path_component.data != DefPathData::Variant(variant.entry.name)
+                    || path_component.disambiguator != *ordinal
+            })
+        {
+            reasons.insert(
+                "an interface enum variant DefPath does not match its exact parent, name, or source-order disambiguator"
+                    .into(),
+            );
+            return;
+        }
+        let variant_def_path_hash = match DefPathHash::compute(&variant_def_path, packages, symbols)
+        {
+            Ok(hash) => Fingerprint::new(hash.raw()),
+            Err(_) => {
+                reasons.insert("an interface enum variant DefPath hash cannot be computed".into());
+                return;
+            }
+        };
+        let variant_fingerprint = match declaration_fingerprint(
+            SymbolKind::Variant,
+            &variant.syntax,
+            Some(&variant.name_token),
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                reasons.insert(
+                    "an interface enum variant name token is outside its declaration".into(),
+                );
+                return;
+            }
+        };
+        let variant_path = format!("{enum_path}.{}", variant.name);
+        if !canonical_paths.insert(variant_path.clone()) {
+            reasons.insert(format!("duplicate canonical symbol path {variant_path}"));
+        }
+        variant_symbols.push(CurrentSymbol::new(
+            variant_path,
+            variant_def_path_hash,
+            SymbolKind::Variant,
+            variant_fingerprint,
+        ));
+        variant_def_paths.push(variant_def_path);
+    }
+    current_symbols.extend(variant_symbols);
+
+    let mut named_field_paths = Vec::new();
+    let mut named_fields = Vec::new();
+    let mut tuple_field_paths = Vec::new();
+    let mut tuple_fields = Vec::new();
+    for (variant_index, variant) in enum_declaration.variants.iter().enumerate() {
+        let mut field_disambiguators = HashMap::<Symbol, u32>::new();
+        for field in &variant.fields {
+            let ValidatedInterfaceEnumField::Named {
+                entry,
+                name: _,
+                syntax: _,
+                name_token: _,
+            } = field;
+            let disambiguator = field_disambiguators.entry(entry.name).or_default();
+            let ordinal = *disambiguator;
+            let Some(next) = ordinal.checked_add(1) else {
+                reasons.insert(
+                    "interface enum record payload field DefPath disambiguator overflowed".into(),
+                );
+                return;
+            };
+            *disambiguator = next;
+            named_field_paths.push((variant_def_ids[variant_index], entry.name, ordinal));
+            named_fields.push((variant_index, field, ordinal));
+        }
+        for field in &variant.tuple_fields {
+            let field_name = field.index.to_string();
+            let Ok(field_symbol) = symbols.intern(&field_name) else {
+                reasons.insert("an interface enum tuple field index cannot be interned".into());
+                return;
+            };
+            tuple_field_paths.push((variant_def_ids[variant_index], field_symbol, 0));
+            tuple_fields.push((variant_index, field));
+        }
+    }
+
+    let named_field_def_ids = match def_paths.intern_fields_for_parents(&named_field_paths) {
+        Ok(def_ids) if def_ids.len() == named_field_paths.len() => def_ids,
+        Ok(_) => {
+            reasons.insert("HIR returned the wrong number of interface enum record fields".into());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("interface enum record field DefPaths cannot be interned".into());
+            return;
+        }
+    };
+    for ((variant_index, field, ordinal), field_def_id) in
+        named_fields.iter().zip(named_field_def_ids)
+    {
+        let ValidatedInterfaceEnumField::Named {
+            entry,
+            name,
+            syntax,
+            name_token,
+        } = field;
+        if !collect_named_field_symbol(
+            entry,
+            syntax,
+            name_token,
+            field_def_id,
+            &variant_def_paths[*variant_index],
+            *ordinal,
+            format!(
+                "{enum_path}.{}.field[{name}]",
+                enum_declaration.variants[*variant_index].name
+            ),
+            "interface enum record payload field",
+            package_id,
+            reasons,
+            canonical_paths,
+            current_symbols,
+            def_paths,
+            packages,
+            symbols,
+        ) {
+            return;
+        }
+    }
+
+    let tuple_field_def_ids = match def_paths.intern_fields_for_parents(&tuple_field_paths) {
+        Ok(def_ids) if def_ids.len() == tuple_field_paths.len() => def_ids,
+        Ok(_) => {
+            reasons.insert("HIR returned the wrong number of interface enum tuple fields".into());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("interface enum tuple field DefPaths cannot be interned".into());
+            return;
+        }
+    };
+    for ((variant_index, field), field_def_id) in tuple_fields.iter().zip(tuple_field_def_ids) {
+        let field_path = format!(
+            "{enum_path}.{}.field[{}]",
+            enum_declaration.variants[*variant_index].name, field.index
+        );
+        if !collect_tuple_field_symbol(
+            field,
+            field_def_id,
+            &variant_def_paths[*variant_index],
+            &field_path,
             package_id,
             reasons,
             canonical_paths,
@@ -5291,6 +6141,72 @@ fn collect_enum(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_tuple_field_symbol(
+    field: &ValidatedInterfaceEnumTupleField,
+    field_def_id: LocalDefId,
+    parent_def_path: &sai_hir::DefPath,
+    canonical_path: &str,
+    package_id: PackageId,
+    reasons: &mut HashSet<String>,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) -> bool {
+    let field_name = field.index.to_string();
+    let Ok(field_symbol) = symbols.intern(&field_name) else {
+        reasons.insert("an interface enum tuple field index cannot be interned".into());
+        return false;
+    };
+    let field_def_path = match def_paths.resolve(field_def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        _ => {
+            reasons.insert(
+                "an interface enum tuple field has no DefPath in the selected package".into(),
+            );
+            return false;
+        }
+    };
+    let parent_len = parent_def_path.data().len();
+    if field_def_path.data().len() != parent_len + 1
+        || &field_def_path.data()[..parent_len] != parent_def_path.data()
+        || field_def_path.data().last().is_none_or(|component| {
+            component.data != DefPathData::Field(field_symbol) || component.disambiguator != 0
+        })
+    {
+        reasons.insert(
+            "an interface enum tuple field DefPath does not match its exact parent or canonical index"
+                .into(),
+        );
+        return false;
+    }
+    let field_def_path_hash = match DefPathHash::compute(&field_def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert("an interface enum tuple field DefPath hash cannot be computed".into());
+            return false;
+        }
+    };
+    let field_fingerprint = match declaration_fingerprint(SymbolKind::Field, &field.syntax, None) {
+        Ok(fingerprint) => fingerprint,
+        Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+            unreachable!("tuple payload fields have no name token to omit")
+        }
+    };
+    if !canonical_paths.insert(canonical_path.to_owned()) {
+        reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+    }
+    current_symbols.push(CurrentSymbol::new(
+        canonical_path.to_owned(),
+        field_def_path_hash,
+        SymbolKind::Field,
+        field_fingerprint,
+    ));
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
