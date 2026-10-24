@@ -26190,7 +26190,7 @@ world app { import acme:dep/api; }\n",
     }
 
     #[test]
-    fn module_function_inventory_keeps_impl_and_interface_symbols_out_of_trait_slice() {
+    fn module_function_inventory_keeps_impls_out_of_trait_slice_and_collects_interfaces() {
         let source = concat!(
             "type Widget {\n}\n",
             "trait Render {\n",
@@ -26222,7 +26222,7 @@ world app { import acme:dep/api; }\n",
         assert!(matches!(
             inventory.coverage(),
             sai_semantic::InventoryCoverage::Incomplete { reason }
-                if reason.contains("Impl") && reason.contains("Interface")
+                if reason.contains("Impl")
         ));
         for expected_trait_symbol in [
             ("acme:phase1.Widget", sai_semantic::SymbolKind::Record),
@@ -26233,6 +26233,11 @@ world app { import acme:dep/api; }\n",
             ),
             (
                 "acme:phase1.Render.render",
+                sai_semantic::SymbolKind::AssocFn,
+            ),
+            ("acme:phase1.logging", sai_semantic::SymbolKind::Interface),
+            (
+                "acme:phase1.logging.write",
                 sai_semantic::SymbolKind::AssocFn,
             ),
         ] {
@@ -26252,12 +26257,439 @@ world app { import acme:dep/api; }\n",
         }
         assert!(
             inventory.symbols().iter().all(|symbol| {
-                !symbol.path().contains(".impl[")
-                    && !symbol.path().contains(".Widget.helper")
-                    && !symbol.path().contains(".logging")
+                !symbol.path().contains(".impl[") && !symbol.path().contains(".Widget.helper")
             }),
-            "implementation and interface members must not leak into module inventory"
+            "implementation members must not leak into the module inventory"
         );
+    }
+
+    #[test]
+    fn module_interface_inventory_collects_root_nested_and_empty_interfaces() {
+        let (mut database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"interface empty {}\ninterface codec {\nfn encode(value: U32) -> U32\nfn decode(value: U32) -> U32\n}\n",
+            b"interface network {\nfn send()\n}\n",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                ("acme:phase1.empty", sai_semantic::SymbolKind::Interface),
+                ("acme:phase1.codec", sai_semantic::SymbolKind::Interface),
+                (
+                    "acme:phase1.codec.encode",
+                    sai_semantic::SymbolKind::AssocFn
+                ),
+                (
+                    "acme:phase1.codec.decode",
+                    sai_semantic::SymbolKind::AssocFn
+                ),
+                (
+                    "acme:phase1/child.network",
+                    sai_semantic::SymbolKind::Interface
+                ),
+                (
+                    "acme:phase1/child.network.send",
+                    sai_semantic::SymbolKind::AssocFn
+                ),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        for (module_index, interface_name, function_name) in [
+            (0, "codec", Some("encode")),
+            (0, "codec", Some("decode")),
+            (1, "network", Some("send")),
+        ] {
+            let file = module_tree.modules[module_index].file;
+            let parsed =
+                sai_syntax::parse(&snapshot, file).expect("interface source module parses");
+            let interface = parsed
+                .root
+                .descendants()
+                .filter_map(ast::InterfaceDecl::cast)
+                .find(|interface| {
+                    interface
+                        .name()
+                        .and_then(|name| name.token())
+                        .is_some_and(|token| token.text() == interface_name)
+                })
+                .expect("the expected interface declaration exists");
+            let owner = collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .find(|owner| {
+                    owner.kind == TopLevelOwnerKind::Interface
+                        && owner.file == file
+                        && owner.item_id
+                            == database
+                                .ast_id_map(&snapshot, file)
+                                .expect("interface AST ID map exists")
+                                .ast_id(&interface)
+                                .expect("interface AST ID exists")
+                                .erase()
+                })
+                .expect("interface has its exact Phase 1 owner");
+            let interface_path = database
+                .resolve_def_path(owner.owner.def_id.to_def_id())
+                .expect("interface DefId is valid")
+                .expect("interface DefPath exists");
+            assert_eq!(interface_path.package(), module_tree.package);
+            let expected_module_path = if module_index == 0 {
+                &[][..]
+            } else {
+                &["child"][..]
+            };
+            assert_eq!(interface_path.data().len(), expected_module_path.len() + 1);
+            for (component, expected_segment) in
+                interface_path.data().iter().zip(expected_module_path)
+            {
+                assert!(matches!(
+                    &component.data,
+                    DefPathData::Module(segment)
+                        if database.symbols.resolve(*segment).is_ok_and(|name| name.as_ref() == *expected_segment)
+                ));
+                assert_eq!(component.disambiguator, 0);
+            }
+            assert!(matches!(
+                interface_path.data().last(),
+                Some(component)
+                    if component.data == DefPathData::Interface(
+                        database.symbols.intern(interface_name).expect("interface name interns")
+                    )
+                    && component.disambiguator == 0
+            ));
+            let interface_symbol_path = if module_index == 0 {
+                format!("acme:phase1.{interface_name}")
+            } else {
+                format!("acme:phase1/child.{interface_name}")
+            };
+            let interface_symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == interface_symbol_path)
+                .expect("interface has its canonical inventory path");
+            let expected_interface_hash = sai_hir::DefPathHash::compute(
+                &interface_path,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("interface DefPath hash computes");
+            assert_eq!(
+                interface_symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_interface_hash.raw())
+            );
+            let interface_name_token = interface
+                .name()
+                .and_then(|name| name.token())
+                .expect("interface name token exists");
+            assert_eq!(
+                interface_symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint(
+                    sai_semantic::SymbolKind::Interface,
+                    &interface.syntax(),
+                    Some(&interface_name_token),
+                )
+                .expect("interface fingerprint computes")
+            );
+
+            if let Some(function_name) = function_name {
+                let function = interface
+                    .items()
+                    .expect("interface member list exists")
+                    .syntax()
+                    .children()
+                    .filter_map(ast::FnDecl::cast)
+                    .find(|function| {
+                        function
+                            .name()
+                            .and_then(|name| name.token())
+                            .is_some_and(|token| token.text() == function_name)
+                    })
+                    .expect("the direct interface function exists");
+                let function_name_token = function
+                    .name()
+                    .and_then(|name| name.token())
+                    .expect("interface function name token exists");
+                let function_path = format!("{interface_symbol_path}.{function_name}");
+                let function_symbol = inventory
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.path() == function_path)
+                    .expect("interface function has its canonical inventory path");
+                let child_component = DefPathData::ValueNs(
+                    database
+                        .symbols
+                        .intern(function_name)
+                        .expect("function name interns"),
+                );
+                let function_def_id = database
+                    .def_paths
+                    .get(&module_tree.package)
+                    .expect("package DefPath interner exists")
+                    .intern_children(owner.owner.def_id, &[(child_component.clone(), 0)])
+                    .expect("interface function DefPath interns")
+                    .into_iter()
+                    .next()
+                    .expect("interface function DefId exists");
+                let function_path = database
+                    .resolve_def_path(function_def_id.to_def_id())
+                    .expect("interface function DefId is valid")
+                    .expect("interface function DefPath exists");
+                assert_eq!(
+                    &function_path.data()[..interface_path.data().len()],
+                    interface_path.data()
+                );
+                assert!(matches!(
+                    function_path.data().last(),
+                    Some(component)
+                        if component.data == child_component && component.disambiguator == 0
+                ));
+                let expected_function_hash = sai_hir::DefPathHash::compute(
+                    &function_path,
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("interface function DefPath hash computes");
+                assert_eq!(
+                    function_symbol.def_path_hash(),
+                    sai_stable_hash::Fingerprint::new(expected_function_hash.raw())
+                );
+                assert_eq!(
+                    function_symbol.fingerprint(),
+                    sai_semantic::declaration_fingerprint(
+                        sai_semantic::SymbolKind::AssocFn,
+                        &function.syntax(),
+                        Some(&function_name_token),
+                    )
+                    .expect("interface function fingerprint computes")
+                );
+            }
+        }
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.path() == "acme:phase1.empty"),
+            "an empty interface still has one interface symbol"
+        );
+    }
+
+    #[test]
+    fn module_interface_inventory_fingerprints_are_stable_under_name_token_renames() {
+        let (_, _, _, original) = collect_package_inventory_for_target(
+            b"interface codec {\nfn encode(value: U32) -> U32\n}\n",
+            b"",
+            "wasm32-core",
+        );
+        let (_, _, _, renamed_interface) = collect_package_inventory_for_target(
+            b"interface wire {\nfn encode(value: U32) -> U32\n}\n",
+            b"",
+            "wasm32-core",
+        );
+        let (_, _, _, renamed_function) = collect_package_inventory_for_target(
+            b"interface codec {\nfn serialize(value: U32) -> U32\n}\n",
+            b"",
+            "wasm32-core",
+        );
+        let original = inventory_symbols(&original);
+        let renamed_interface = inventory_symbols(&renamed_interface);
+        let renamed_function = inventory_symbols(&renamed_function);
+        let find = |inventory: &sai_semantic::PackageSymbolInventory, path: &str| {
+            inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == path)
+                .expect("the expected interface inventory symbol exists")
+                .fingerprint()
+        };
+        assert_eq!(
+            find(original, "acme:phase1.codec"),
+            find(renamed_interface, "acme:phase1.wire"),
+            "renaming the interface omits only the interface declaration name token"
+        );
+        assert_eq!(
+            find(original, "acme:phase1.codec.encode"),
+            find(renamed_interface, "acme:phase1.wire.encode"),
+            "renaming the interface leaves the function declaration fingerprint stable"
+        );
+        assert_eq!(
+            find(original, "acme:phase1.codec.encode"),
+            find(renamed_function, "acme:phase1.codec.serialize"),
+            "renaming an interface function omits its own name token"
+        );
+        assert_ne!(
+            find(original, "acme:phase1.codec"),
+            find(renamed_function, "acme:phase1.codec"),
+            "the interface fingerprint still tracks its member declaration"
+        );
+    }
+
+    #[test]
+    fn module_interface_inventory_preserves_duplicate_canonical_paths_incomplete() {
+        let (database, module_tree, _, collection) = collect_package_inventory_for_target(
+            b"interface repeated {\nfn read()\nfn read()\n}\ninterface repeated {\nfn read()\n}\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("duplicate canonical symbol path")
+        ));
+        for (path, kind, expected_count) in [
+            (
+                "acme:phase1.repeated",
+                sai_semantic::SymbolKind::Interface,
+                2,
+            ),
+            (
+                "acme:phase1.repeated.read",
+                sai_semantic::SymbolKind::AssocFn,
+                3,
+            ),
+        ] {
+            let symbols = inventory
+                .symbols()
+                .iter()
+                .filter(|symbol| symbol.path() == path && symbol.kind() == kind)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                symbols.len(),
+                expected_count,
+                "candidate symbols for {path}"
+            );
+            assert_eq!(
+                symbols
+                    .iter()
+                    .map(|symbol| symbol.def_path_hash())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                expected_count,
+                "each same-name declaration keeps its distinct DefPath hash"
+            );
+        }
+
+        let interfaces = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|owner| {
+                owner.kind == TopLevelOwnerKind::Interface
+                    && owner.file == module_tree.modules[0].file
+            })
+            .collect::<Vec<_>>();
+        let interface_disambiguators = interfaces
+            .iter()
+            .map(|owner| {
+                database
+                    .resolve_def_path(owner.owner.def_id.to_def_id())
+                    .expect("interface owner DefId is valid")
+                    .expect("interface owner DefPath exists")
+                    .data()
+                    .last()
+                    .expect("interface DefPath has a terminal component")
+                    .disambiguator
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(interface_disambiguators, [0, 1]);
+    }
+
+    #[test]
+    fn module_interface_inventory_keeps_unsupported_members_and_invalid_targets_incomplete() {
+        let (_, _, _, mixed_members) = collect_package_inventory_for_target(
+            b"interface api {\ntype Record { value: U32 }\nenum State { Ready }\ntype Alias = U32\nresource Handle {\nfn close(self: borrow Self)\n}\nfn read()\n}\n",
+            b"",
+            "wasm32-core",
+        );
+        let mixed_members = inventory_symbols(&mixed_members);
+        assert!(matches!(
+            mixed_members.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { .. }
+        ));
+        assert!(mixed_members.symbols().iter().any(|symbol| {
+            symbol.path() == "acme:phase1.api"
+                && symbol.kind() == sai_semantic::SymbolKind::Interface
+        }));
+        assert!(mixed_members.symbols().iter().any(|symbol| {
+            symbol.path() == "acme:phase1.api.read"
+                && symbol.kind() == sai_semantic::SymbolKind::AssocFn
+        }));
+        assert!(
+            mixed_members.symbols().iter().all(|symbol| {
+                !symbol.path().contains("Handle")
+                    && !symbol.path().contains("close")
+                    && !symbol.path().contains("Record")
+                    && !symbol.path().contains("State")
+                    && !symbol.path().contains("Alias")
+            }),
+            "interface resources, methods, records, enums, and aliases remain outside this free-function slice"
+        );
+
+        let cases: [(&str, &[u8]); 10] = [
+            (
+                "generic interface function",
+                b"interface api { fn generic<T>(value: T) }\n",
+            ),
+            (
+                "where clause on interface function",
+                b"interface api { fn bounded<T>() where T: Copy }\n",
+            ),
+            (
+                "async interface function",
+                b"interface api { async fn later() }\n",
+            ),
+            (
+                "unsafe interface function",
+                b"interface api { unsafe fn native() }\n",
+            ),
+            (
+                "interface function body",
+                b"interface api { fn with_body() {} }\n",
+            ),
+            (
+                "malformed interface function",
+                b"interface api { fn broken(value: ) }\n",
+            ),
+            (
+                "invalid target on interface function",
+                b"interface api { @target(host) fn targeted() }\n",
+            ),
+            (
+                "valid target on interface function",
+                b"interface api { @target(\"wasm64-core\") fn targeted() }\n",
+            ),
+            (
+                "unknown target on interface",
+                b"@target(\"wasm32-linux\") interface api {}\n",
+            ),
+            (
+                "disallowed target on interface",
+                b"@target(\"wasm64-core\") interface api {}\n",
+            ),
+        ];
+        for (case_name, source) in cases {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            assert!(
+                matches!(
+                    inventory_symbols(&collection).coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { .. }
+                ),
+                "{case_name} must not yield complete interface coverage"
+            );
+        }
     }
 
     #[test]
@@ -27284,8 +27716,7 @@ world app { import acme:dep/api; }\n",
         let inventory = inventory_symbols(&collection);
         assert!(matches!(
             inventory.coverage(),
-            sai_semantic::InventoryCoverage::Incomplete { reason }
-                if reason.contains("Interface")
+            sai_semantic::InventoryCoverage::Incomplete { .. }
         ));
         assert!(
             inventory
