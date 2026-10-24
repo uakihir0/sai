@@ -10,6 +10,7 @@ pub(super) struct SourceScan {
     pub named_result_function_ranges: Vec<Range<usize>>,
     pub function_declarations: Vec<SourceFunctionDeclaration>,
     pub alias_declarations: Vec<SourceInterfaceAlias>,
+    pub record_declarations: Vec<SourceInterfaceRecord>,
     pub enum_declarations: Vec<SourceInterfaceEnum>,
     pub resource_declarations: Vec<SourceInterfaceResource>,
 }
@@ -71,6 +72,33 @@ pub struct AuthoredInterfaceAliasTokens {
     pub token_pairs: Vec<(String, String)>,
 }
 
+/// Source declaration and direct field boundaries for one authored interface
+/// record.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoredInterfaceRecordTokens {
+    /// Exact UTF-8 byte range from attached attributes through the closing `}`.
+    pub declaration_range: Range<usize>,
+    /// Ordered parser-aligned token pairs for the whole record. The record-name
+    /// token is present with empty text.
+    pub token_pairs: Vec<(String, String)>,
+    /// Named fields in source order, each with its own name-masked fingerprint
+    /// tokens.
+    pub fields: Vec<AuthoredRecordFieldTokens>,
+}
+
+/// Source declaration and name-token boundary for one named WIT record field.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoredRecordFieldTokens {
+    pub name: String,
+    /// Exact byte range of the field-name token.
+    pub name_range: Range<usize>,
+    /// Exact UTF-8 byte range from attached attributes through the field type.
+    pub declaration_range: Range<usize>,
+    /// Ordered parser-aligned token pairs. The field-name token is present
+    /// with empty text.
+    pub token_pairs: Vec<(String, String)>,
+}
+
 /// Source declaration and name-token boundary for one unit enum case.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthoredEnumCaseTokens {
@@ -122,6 +150,24 @@ pub(super) struct SourceInterfaceEnum {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceInterfaceAlias {
     pub interface_name: String,
+    pub name: String,
+    pub name_range: Range<usize>,
+    pub declaration_range: Range<usize>,
+    pub token_pairs: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceInterfaceRecord {
+    pub interface_name: String,
+    pub name: String,
+    pub name_range: Range<usize>,
+    pub declaration_range: Range<usize>,
+    pub token_pairs: Vec<(String, String)>,
+    pub fields: Vec<SourceRecordField>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceRecordField {
     pub name: String,
     pub name_range: Range<usize>,
     pub declaration_range: Range<usize>,
@@ -378,6 +424,7 @@ pub(super) fn scan_source(source: &str) -> SourceScan {
         named_result_function_ranges,
         function_declarations: scan_function_declarations(source, &tokens),
         alias_declarations: scan_interface_aliases(source, &tokens),
+        record_declarations: scan_interface_records(source, &tokens),
         enum_declarations: scan_interface_enums(source, &tokens),
         resource_declarations: scan_interface_resources(source, &tokens),
     }
@@ -409,6 +456,234 @@ pub fn authored_interface_alias_tokens(
     Some(AuthoredInterfaceAliasTokens {
         declaration_range: declaration.declaration_range,
         token_pairs: declaration.token_pairs,
+    })
+}
+
+/// Scans authored WIT source and returns one direct interface record only when
+/// its parsed name-token span identifies exactly one lexical declaration.
+///
+/// Field ranges and token pairs are recovered from the same source bytes; the
+/// caller binds them to the parsed model by ordered field names.
+pub fn authored_interface_record_tokens(
+    source: &str,
+    interface_name: &str,
+    name: &str,
+    name_range: &Range<usize>,
+) -> Option<AuthoredInterfaceRecordTokens> {
+    let mut matches = scan_source(source)
+        .record_declarations
+        .into_iter()
+        .filter(|declaration| {
+            declaration.interface_name == interface_name
+                && declaration.name == name
+                && &declaration.name_range == name_range
+        });
+    let declaration = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(AuthoredInterfaceRecordTokens {
+        declaration_range: declaration.declaration_range,
+        token_pairs: declaration.token_pairs,
+        fields: declaration
+            .fields
+            .into_iter()
+            .map(|field| AuthoredRecordFieldTokens {
+                name: field.name,
+                name_range: field.name_range,
+                declaration_range: field.declaration_range,
+                token_pairs: field.token_pairs,
+            })
+            .collect(),
+    })
+}
+
+fn scan_interface_records(source: &str, tokens: &[Token]) -> Vec<SourceInterfaceRecord> {
+    let mut declarations = Vec::new();
+    for (interface_index, interface_token) in tokens.iter().enumerate() {
+        if !is_identifier(source, interface_token, "interface") {
+            continue;
+        }
+        let Some(interface_name_token) = tokens.get(interface_index + 1) else {
+            continue;
+        };
+        let Some(interface_name) = wit_identifier_text(source, interface_name_token) else {
+            continue;
+        };
+        let open_index = interface_index + 2;
+        if !tokens
+            .get(open_index)
+            .is_some_and(|token| token.kind == TokenKind::Punctuation(b'{'))
+        {
+            continue;
+        }
+        let Some(interface_end) = matching_delimiter(tokens, open_index, b'{', b'}') else {
+            continue;
+        };
+
+        let mut item_index = open_index + 1;
+        while item_index < interface_end {
+            let declaration_index = match skip_attributes(tokens, item_index, interface_end) {
+                Some(index) if index < interface_end => index,
+                _ => break,
+            };
+            if is_identifier(source, &tokens[declaration_index], "record")
+                && let Some((declaration, next_index)) = scan_interface_record(
+                    source,
+                    tokens,
+                    &interface_name,
+                    declaration_index,
+                    interface_end,
+                )
+            {
+                declarations.push(declaration);
+                item_index = next_index;
+                continue;
+            }
+
+            // Skip the full direct item so nested record-like tokens in a
+            // `use` list or another unsupported declaration cannot be
+            // promoted as authored interface records.
+            if tokens[declaration_index].kind == TokenKind::Punctuation(b'{')
+                && let Some(nested_end) = matching_delimiter(tokens, declaration_index, b'{', b'}')
+            {
+                item_index = nested_end + 1;
+            } else if let Some(end_index) =
+                item_end_at_top_level(tokens, declaration_index, interface_end)
+            {
+                item_index = end_index;
+            } else {
+                item_index = declaration_index + 1;
+            }
+        }
+    }
+    declarations
+}
+
+fn scan_interface_record(
+    source: &str,
+    tokens: &[Token],
+    interface_name: &str,
+    record_index: usize,
+    interface_end: usize,
+) -> Option<(SourceInterfaceRecord, usize)> {
+    let name_index = record_index.checked_add(1)?;
+    let name_token = tokens.get(name_index)?;
+    let name = wit_identifier_text(source, name_token)?;
+    let open_index = name_index.checked_add(1)?;
+    if tokens.get(open_index)?.kind != TokenKind::Punctuation(b'{') {
+        return None;
+    }
+    let close_index = matching_delimiter(tokens, open_index, b'{', b'}')?;
+    if close_index >= interface_end {
+        return None;
+    }
+    let declaration_start = attached_attributes_start(tokens, record_index)
+        .map_or(tokens[record_index].range.start, |attribute_index| {
+            tokens[attribute_index].range.start
+        });
+    let declaration_range = declaration_start..tokens[close_index].range.end;
+    let token_pairs = function_token_pairs(source, tokens, &declaration_range, &name_token.range)?;
+    let fields = scan_record_fields(source, tokens, open_index + 1, close_index)?;
+    Some((
+        SourceInterfaceRecord {
+            interface_name: interface_name.to_owned(),
+            name: name.to_owned(),
+            name_range: name_token.range.clone(),
+            declaration_range,
+            token_pairs,
+            fields,
+        },
+        close_index + 1,
+    ))
+}
+
+fn scan_record_fields(
+    source: &str,
+    tokens: &[Token],
+    body_start: usize,
+    body_end: usize,
+) -> Option<Vec<SourceRecordField>> {
+    if body_start == body_end {
+        return Some(Vec::new());
+    }
+
+    let mut fields = Vec::new();
+    let mut segment_start = body_start;
+    let mut delimiter_stack = Vec::new();
+    for index in body_start..body_end {
+        let token = &tokens[index];
+        match token.kind {
+            TokenKind::Invalid => return None,
+            TokenKind::Punctuation(b'(' | b'<' | b'[' | b'{') => {
+                delimiter_stack.push(token.kind);
+            }
+            TokenKind::Punctuation(b')') => {
+                if delimiter_stack.pop() != Some(TokenKind::Punctuation(b'(')) {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b'>') => {
+                if delimiter_stack.pop() != Some(TokenKind::Punctuation(b'<')) {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b']') => {
+                if delimiter_stack.pop() != Some(TokenKind::Punctuation(b'[')) {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b'}') => {
+                if delimiter_stack.pop() != Some(TokenKind::Punctuation(b'{')) {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b',') if delimiter_stack.is_empty() => {
+                if segment_start == index {
+                    return None;
+                }
+                fields.push(scan_record_field(source, tokens, segment_start, index)?);
+                segment_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if !delimiter_stack.is_empty() {
+        return None;
+    }
+    if segment_start < body_end {
+        fields.push(scan_record_field(source, tokens, segment_start, body_end)?);
+    }
+    Some(fields)
+}
+
+fn scan_record_field(
+    source: &str,
+    tokens: &[Token],
+    segment_start: usize,
+    segment_end: usize,
+) -> Option<SourceRecordField> {
+    let name_index = skip_attributes(tokens, segment_start, segment_end)?;
+    if name_index >= segment_end {
+        return None;
+    }
+    let name_token = &tokens[name_index];
+    let name = wit_identifier_text(source, name_token)?;
+    let colon_index = name_index.checked_add(1)?;
+    if tokens.get(colon_index)?.kind != TokenKind::Punctuation(b':')
+        || colon_index.checked_add(1)? >= segment_end
+    {
+        return None;
+    }
+    let declaration_start = attached_attributes_start(tokens, name_index)
+        .map_or(name_token.range.start, |index| tokens[index].range.start);
+    let declaration_range = declaration_start..tokens[segment_end - 1].range.end;
+    let token_pairs = function_token_pairs(source, tokens, &declaration_range, &name_token.range)?;
+    Some(SourceRecordField {
+        name: name.to_owned(),
+        name_range: name_token.range.clone(),
+        declaration_range,
+        token_pairs,
     })
 }
 
@@ -2133,7 +2408,8 @@ fn is_keylike_continue(character: char) -> bool {
 mod tests {
     use super::{
         SourceFunctionDeclaration, SourceInterfaceAlias, SourceInterfaceEnum,
-        SourceInterfaceResource, authored_interface_alias_tokens, authored_interface_enum_tokens,
+        SourceInterfaceRecord, SourceInterfaceResource, authored_interface_alias_tokens,
+        authored_interface_enum_tokens, authored_interface_record_tokens,
         authored_interface_resource_tokens, lex, scan_foreign_references, scan_source,
         stable_wit_token_kind, world_include_docs,
     };
@@ -2168,6 +2444,14 @@ mod tests {
             .into_iter()
             .find(|declaration| declaration.name == name)
             .expect("direct interface alias")
+    }
+
+    fn interface_record(source: &str, name: &str) -> SourceInterfaceRecord {
+        scan_source(source)
+            .record_declarations
+            .into_iter()
+            .find(|declaration| declaration.name == name)
+            .expect("direct interface record")
     }
 
     #[test]
@@ -2252,6 +2536,153 @@ mod tests {
         ] {
             assert!(
                 scan_source(invalid).alias_declarations.is_empty(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_record_and_field_ranges_include_attributes_and_mask_own_names() {
+        let source = concat!(
+            "interface api {\n",
+            "  @since(version = 1.2.3)\n",
+            "  record %type {\n",
+            "    @since(version = 1.2.3)\n",
+            "    %type: tuple<u32, result<string, u32>>,\n",
+            "    amount: option<tuple<u8, u16>>,\n",
+            "  }\n",
+            "  record empty {}\n",
+            "}\n",
+        );
+        let record = interface_record(source, "type");
+        let record_start = source.find("%type").expect("record name occurs");
+        let record_name_range = record_start..record_start + "%type".len();
+        assert_eq!(record.interface_name, "api");
+        assert_eq!(record.name_range, record_name_range);
+        assert_eq!(
+            &source[record.declaration_range.clone()],
+            "@since(version = 1.2.3)\n  record %type {\n    @since(version = 1.2.3)\n    %type: tuple<u32, result<string, u32>>,\n    amount: option<tuple<u8, u16>>,\n  }"
+        );
+        assert_eq!(
+            record
+                .token_pairs
+                .iter()
+                .filter(|(_, text)| text.is_empty())
+                .count(),
+            1,
+            "only the record's own name is masked in its declaration"
+        );
+        assert_eq!(
+            record
+                .fields
+                .iter()
+                .map(|field| field.name.as_str())
+                .collect::<Vec<_>>(),
+            ["type", "amount"]
+        );
+        let field_start = source.find("%type:").expect("escaped field name occurs");
+        assert_eq!(&source[record.fields[0].name_range.clone()], "%type");
+        assert_eq!(
+            &source[record.fields[0].declaration_range.clone()],
+            "@since(version = 1.2.3)\n    %type: tuple<u32, result<string, u32>>"
+        );
+        assert_eq!(
+            record.fields[0].name_range,
+            field_start..field_start + "%type".len()
+        );
+        assert_eq!(
+            record.fields[0]
+                .token_pairs
+                .iter()
+                .filter(|(_, text)| text.is_empty())
+                .count(),
+            1,
+            "the field fingerprint masks exactly its own name"
+        );
+
+        let selected = authored_interface_record_tokens(source, "api", "type", &record_name_range)
+            .expect("the exact parsed record name span selects the declaration");
+        assert_eq!(selected.declaration_range, record.declaration_range);
+        assert_eq!(selected.token_pairs, record.token_pairs);
+        assert_eq!(selected.fields.len(), 2);
+        assert!(
+            authored_interface_record_tokens(source, "api", "type", &(0..0)).is_none(),
+            "a stale or missing parsed name span cannot select a record"
+        );
+        let empty = authored_interface_record_tokens(
+            source,
+            "api",
+            "empty",
+            &(source.find("empty").expect("empty record name occurs")
+                ..source.find("empty").expect("empty record name occurs") + "empty".len()),
+        )
+        .expect("an empty record has an exact declaration boundary");
+        assert!(empty.fields.is_empty());
+    }
+
+    #[test]
+    fn record_and_field_fingerprints_omit_only_their_own_names() {
+        fn record(source: &str, name: &str) -> SourceInterfaceRecord {
+            interface_record(source, name)
+        }
+
+        let original_source = "interface api { record profile { user-id: u32, enabled: bool, } }";
+        let renamed_record_source =
+            "interface api { record account { user-id: u32, enabled: bool, } }";
+        let renamed_field_source =
+            "interface api { record profile { account-id: u32, enabled: bool, } }";
+        let changed_field_type_source =
+            "interface api { record profile { user-id: u64, enabled: bool, } }";
+        let original = record(original_source, "profile");
+        let renamed_record = record(renamed_record_source, "account");
+        let renamed_field = record(renamed_field_source, "profile");
+        let changed_field_type = record(changed_field_type_source, "profile");
+
+        assert_eq!(original.token_pairs, renamed_record.token_pairs);
+        assert_eq!(
+            original.fields[0].token_pairs,
+            renamed_field.fields[0].token_pairs
+        );
+        assert_ne!(original.token_pairs, renamed_field.token_pairs);
+        assert_ne!(
+            original.fields[0].token_pairs,
+            changed_field_type.fields[0].token_pairs
+        );
+        assert_eq!(
+            original.fields[1].token_pairs, renamed_field.fields[1].token_pairs,
+            "an unrelated field rename does not alter a sibling field fingerprint"
+        );
+    }
+
+    #[test]
+    fn record_scanner_excludes_use_members_and_nested_record_like_tokens() {
+        let source = concat!(
+            "interface api {\n",
+            "  use other.{record as imported};\n",
+            "  variant state { ready(record { fake: u32 }) }\n",
+            "  resource store { read: func(); }\n",
+            "  record visible { value: tuple<u32, result<string, u32>>, }\n",
+            "}\n",
+        );
+        assert_eq!(
+            scan_source(source)
+                .record_declarations
+                .iter()
+                .map(|declaration| declaration.name.as_str())
+                .collect::<Vec<_>>(),
+            ["visible"],
+            "only direct interface records are source declarations"
+        );
+
+        for invalid in [
+            "interface api { record missing-type { field: } }",
+            "interface api { record missing-colon { field u32 } }",
+            "interface api { record empty-field { , } }",
+            "interface api { record mismatched { field: tuple<u32, string] } }",
+            "interface api { record unclosed { field: tuple<u32, string } }",
+        ] {
+            assert!(
+                scan_source(invalid).record_declarations.is_empty(),
                 "{invalid}"
             );
         }
