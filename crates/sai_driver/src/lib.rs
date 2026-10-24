@@ -25419,6 +25419,425 @@ mod tests {
     }
 
     #[test]
+    fn module_resource_inventory_collects_nested_resources_and_named_fields() {
+        let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"pub resource File {\n    pub r#match: USize\n    handle: String\n}\nresource Empty {}\n",
+            "pub resource Café {\n    pub valeur: USize\n}\n".as_bytes(),
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<Vec<_>>(),
+            [
+                ("acme:phase1.File", sai_semantic::SymbolKind::Resource),
+                (
+                    "acme:phase1.File.field[match]",
+                    sai_semantic::SymbolKind::Field
+                ),
+                (
+                    "acme:phase1.File.field[handle]",
+                    sai_semantic::SymbolKind::Field
+                ),
+                ("acme:phase1.Empty", sai_semantic::SymbolKind::Resource),
+                ("acme:phase1/child.Café", sai_semantic::SymbolKind::Resource),
+                (
+                    "acme:phase1/child.Café.field[valeur]",
+                    sai_semantic::SymbolKind::Field
+                ),
+            ]
+        );
+
+        let resource_owners = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == TopLevelOwnerKind::Resource)
+            .collect::<Vec<_>>();
+        assert_eq!(resource_owners.len(), 3);
+        let def_paths = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("the selected package has a DefPath interner");
+
+        for (owner, expected_name, module_index, expected_path, field_names) in [
+            (
+                resource_owners[0],
+                "File",
+                0,
+                "acme:phase1.File",
+                vec!["match", "handle"],
+            ),
+            (resource_owners[1], "Empty", 0, "acme:phase1.Empty", vec![]),
+            (
+                resource_owners[2],
+                "Café",
+                1,
+                "acme:phase1/child.Café",
+                vec!["valeur"],
+            ),
+        ] {
+            assert_eq!(owner.file, module_tree.modules[module_index].file);
+            let def_path = database
+                .resolve_def_path(owner.owner.def_id.to_def_id())
+                .expect("resource owner DefId is valid")
+                .expect("resource owner has a DefPath");
+            assert_eq!(def_path.package(), module_tree.package);
+            let expected_modules: &[&str] = if module_index == 0 { &[] } else { &["child"] };
+            assert_eq!(def_path.data().len(), expected_modules.len() + 1);
+            for (component, expected_module) in def_path.data().iter().zip(expected_modules.iter())
+            {
+                assert!(matches!(
+                    &component.data,
+                    DefPathData::Module(segment)
+                        if component.disambiguator == 0
+                            && database.symbols.resolve(*segment).is_ok_and(|name| name.as_ref() == *expected_module)
+                ));
+            }
+            let resource_name = database
+                .symbols
+                .intern(expected_name)
+                .expect("resource name interns");
+            assert!(matches!(
+                def_path.data().last(),
+                Some(component)
+                    if component.data == DefPathData::TypeNs(resource_name)
+                        && component.disambiguator == 0
+            ));
+            let resource_symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == expected_path)
+                .expect("resource declaration has an inventory record");
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&def_path, &database.packages, &database.symbols)
+                    .expect("resource DefPath hash is defined");
+            assert_eq!(
+                resource_symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+
+            let parsed = sai_syntax::parse(&snapshot, owner.file).expect("module parses");
+            let declaration = parsed
+                .root
+                .descendants()
+                .filter_map(ast::ResourceDecl::cast)
+                .find(|resource| {
+                    resource
+                        .name()
+                        .and_then(|name| name.token())
+                        .is_some_and(|token| {
+                            sai_syntax::normalize_identifier(
+                                token.text().strip_prefix("r#").unwrap_or(token.text()),
+                            ) == expected_name
+                        })
+                })
+                .expect("the matching ResourceDecl is in the AST");
+            let name_token = declaration
+                .name()
+                .and_then(|name| name.token())
+                .expect("resource AST has a name token");
+            assert_eq!(
+                resource_symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint(
+                    sai_semantic::SymbolKind::Resource,
+                    &declaration.syntax(),
+                    Some(&name_token),
+                )
+                .expect("resource fingerprint is defined")
+            );
+
+            let ast_fields = declaration
+                .fields()
+                .map(|fields| fields.fields().collect::<Vec<_>>())
+                .unwrap_or_default();
+            assert_eq!(
+                ast_fields
+                    .iter()
+                    .map(|field| {
+                        let token = field
+                            .name()
+                            .and_then(|name| name.token())
+                            .expect("resource field has a name token");
+                        sai_syntax::normalize_identifier(
+                            token.text().strip_prefix("r#").unwrap_or(token.text()),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                field_names
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect::<Vec<_>>()
+            );
+            let mut name_disambiguators = std::collections::HashMap::new();
+            let field_ids = field_names
+                .iter()
+                .map(|name| {
+                    let symbol = database.symbols.intern(name).expect("field name interns");
+                    let disambiguator = name_disambiguators.entry(symbol).or_insert(0_u32);
+                    let current = *disambiguator;
+                    *disambiguator += 1;
+                    (symbol, current)
+                })
+                .collect::<Vec<_>>();
+            let field_def_ids = def_paths
+                .intern_fields(owner.owner.def_id, &field_ids)
+                .expect("resource field DefPaths are interned");
+            for ((field, field_def_id), field_name) in
+                ast_fields.iter().zip(field_def_ids).zip(field_names)
+            {
+                let field_token = field
+                    .name()
+                    .and_then(|name| name.token())
+                    .expect("resource field has a name token");
+                let field_path = format!("{expected_path}.field[{field_name}]");
+                let field_symbol = inventory
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.path() == field_path)
+                    .expect("named resource field has an inventory record");
+                let field_def_path = database
+                    .resolve_def_path(field_def_id.to_def_id())
+                    .expect("field DefId is valid")
+                    .expect("field DefPath is present");
+                let expected_field_hash = sai_hir::DefPathHash::compute(
+                    &field_def_path,
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("resource field DefPath hash is defined");
+                assert_eq!(
+                    field_symbol.def_path_hash(),
+                    sai_stable_hash::Fingerprint::new(expected_field_hash.raw())
+                );
+                assert_eq!(
+                    field_symbol.fingerprint(),
+                    sai_semantic::declaration_fingerprint(
+                        sai_semantic::SymbolKind::Field,
+                        &field.syntax(),
+                        Some(&field_token),
+                    )
+                    .expect("resource field fingerprint is defined")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn module_resource_inventory_preserves_duplicate_def_path_disambiguators() {
+        let (database, module_tree, _, collection) = collect_package_inventory_for_target(
+            b"type Duplicate {}\nresource Duplicate {\n    item: I32\n    item: Bool\n}\nresource Duplicate {\n    other: U32\n}\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("duplicate canonical symbol path")
+        ));
+        let owners = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|owner| {
+                owner.kind == TopLevelOwnerKind::Resource
+                    && owner.file == module_tree.modules[0].file
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(owners.len(), 2);
+        let owner_paths = owners
+            .iter()
+            .map(|owner| {
+                database
+                    .resolve_def_path(owner.owner.def_id.to_def_id())
+                    .expect("resource owner DefId is valid")
+                    .expect("resource owner DefPath exists")
+            })
+            .collect::<Vec<_>>();
+        for (path, expected_disambiguator) in owner_paths.iter().zip([1, 2]) {
+            assert!(matches!(
+                path.data().last(),
+                Some(component)
+                    if component.data == DefPathData::TypeNs(
+                        database.symbols.intern("Duplicate").expect("name interns")
+                    )
+                        && component.disambiguator == expected_disambiguator
+            ));
+        }
+
+        let duplicate_fields = inventory
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.path() == "acme:phase1.Duplicate.field[item]")
+            .collect::<Vec<_>>();
+        assert_eq!(duplicate_fields.len(), 2);
+        assert_ne!(
+            duplicate_fields[0].def_path_hash(),
+            duplicate_fields[1].def_path_hash(),
+            "same-name resource fields retain source-order DefPath disambiguators"
+        );
+    }
+
+    #[test]
+    fn module_resource_inventory_keeps_unsupported_resource_shapes_incomplete() {
+        for source in [
+            &b"resource Generic<T> {}\n"[..],
+            &b"resource Tuple(U32)\n"[..],
+            &b"resource WithMethod { fn close() {} }\n"[..],
+        ] {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            assert!(
+                matches!(
+                    inventory_symbols(&collection).coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { .. }
+                ),
+                "unsupported resource shape must remain incomplete: {}",
+                String::from_utf8_lossy(source)
+            );
+        }
+    }
+
+    #[test]
+    fn module_resource_inventory_tracks_visibility_and_attribute_boundaries() {
+        let fingerprint = |source: &[u8], kind: sai_semantic::SymbolKind, path: &str| {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            inventory_symbols(&collection)
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == path && symbol.kind() == kind)
+                .expect("symbol is present")
+                .fingerprint()
+        };
+        assert_ne!(
+            fingerprint(
+                b"pub resource Item {\n    pub value: U32\n}\n",
+                sai_semantic::SymbolKind::Resource,
+                "acme:phase1.Item",
+            ),
+            fingerprint(
+                b"resource Item {\n    value: U32\n}\n",
+                sai_semantic::SymbolKind::Resource,
+                "acme:phase1.Item",
+            ),
+            "resource visibility participates in its declaration fingerprint"
+        );
+        assert_ne!(
+            fingerprint(
+                b"pub resource Item {\n    pub value: U32\n}\n",
+                sai_semantic::SymbolKind::Field,
+                "acme:phase1.Item.field[value]",
+            ),
+            fingerprint(
+                b"resource Item {\n    value: U32\n}\n",
+                sai_semantic::SymbolKind::Field,
+                "acme:phase1.Item.field[value]",
+            ),
+            "field visibility participates in its declaration fingerprint"
+        );
+
+        let (_, _, _, target_filtered) = collect_package_inventory_for_target(
+            b"@target(\"wasm64-core\")\nresource Only64 {}\n",
+            b"",
+            "wasm32-core",
+        );
+        assert_eq!(
+            inventory_symbols(&target_filtered).coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert!(inventory_symbols(&target_filtered).symbols().is_empty());
+
+        let (_, _, _, invalid_target) = collect_package_inventory_for_target(
+            b"@target(\"wasm32-linux\")\nresource InvalidTarget {}\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(matches!(
+            inventory_symbols(&invalid_target).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("target-selection error")
+        ));
+
+        let (_, _, _, derived) = collect_package_inventory_for_target(
+            b"@derive(Clone)\nresource Derived {}\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(matches!(
+            inventory_symbols(&derived).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("attribute or target-selection error")
+                    || reason.contains("rejected @derive")
+        ));
+
+        let (_, module_tree, snapshot, invalid_field_target) = collect_package_inventory_for_target(
+            b"resource InvalidFieldTarget { @target(\"wasm64-core\")\n    field: U32\n}\n",
+            b"",
+            "wasm32-core",
+        );
+        let parsed = sai_syntax::parse(&snapshot, module_tree.modules[0].file)
+            .expect("resource field target fixture parses");
+        assert!(
+            invalid_field_target
+                .scopes()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget)
+        );
+        assert!(
+            parsed
+                .errors
+                .iter()
+                .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::InvalidAttributeTarget),
+            "field @target validation is surfaced during HIR collection"
+        );
+        assert!(matches!(
+            inventory_symbols(&invalid_field_target).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { .. }
+        ));
+    }
+
+    #[test]
+    fn module_resource_inventory_does_not_register_interface_resources_as_module_resources() {
+        let (_, module_tree, _, collection) = collect_package_inventory_for_target(
+            b"interface storage {\n    resource Handle {\n        fn close(self: borrow Self)\n    }\n}\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("Interface")
+        ));
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.kind() != sai_semantic::SymbolKind::Resource),
+            "nested interface resources do not enter the module-level inventory"
+        );
+        assert!(
+            collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .all(|owner| owner.kind != TopLevelOwnerKind::Resource
+                    || owner.file != module_tree.modules[0].file),
+            "interface resources are represented outside direct top-level owner descriptors"
+        );
+    }
+
+    #[test]
     fn module_test_property_inventory_collects_verified_symbols() {
         let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
             br#"test "say \"hi\"\\path" { assert true }
@@ -26868,7 +27287,6 @@ property "shared"() {}
             &b"type MissingFieldName { : U32 }\n"[..],
             &b"type DuplicateFields { value: U32\n    value: U64 }\n"[..],
             &b"enum Unsupported { Empty(I32) }\n"[..],
-            &b"resource Unsupported { handle: U32 }\n"[..],
             &b"type WithImpl {}\nimpl WithImpl { fn method() {} }\n"[..],
             &b"@derive(Clone)\ntype Derived {}\n"[..],
         ] {
