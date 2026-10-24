@@ -1231,9 +1231,17 @@ impl Parser<'_, '_> {
             self.mod_path()?;
         } else {
             let position = self.position;
-            self.expect_any(&[SyntaxKind::PKG_PATH, SyntaxKind::LIDENT])?;
-            if self.position == position {
+            let expected_was_reported = self.reported_expected_at == Some(position);
+            let present = self.expect_any(&[SyntaxKind::PKG_PATH, SyntaxKind::LIDENT])?;
+            if !present && self.position == position {
                 self.recover_one()?;
+                if self.position == position && expected_was_reported {
+                    // `expect_any` normally adds the zero-width ERROR child
+                    // itself. If another error was already reported at this
+                    // synchronization point, add a child here so the empty
+                    // WORLD_REF remains explicitly marked as recovery.
+                    self.emit_missing_error_node()?;
+                }
             }
         }
         reference.complete(self, SyntaxKind::WORLD_REF)?;

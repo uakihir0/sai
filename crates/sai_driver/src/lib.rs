@@ -27630,6 +27630,271 @@ property "shared"() {}
     }
 
     #[test]
+    fn module_world_inventory_collects_root_and_nested_worlds_without_member_symbols() {
+        let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"world empty {}\nworld app { import clock\n export fn boot() -> U32\n include common.base }\n",
+            b"world nested {}\nworld worker { export storage\n include common.base }\n",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                ("acme:phase1.empty", sai_semantic::SymbolKind::World),
+                ("acme:phase1.app", sai_semantic::SymbolKind::World),
+                ("acme:phase1/child.nested", sai_semantic::SymbolKind::World),
+                ("acme:phase1/child.worker", sai_semantic::SymbolKind::World),
+            ]
+            .into_iter()
+            .collect(),
+            "world members have HIR paths, but do not appear as symbol-index entries"
+        );
+
+        for (file_id, name, path_string) in [
+            (module_tree.modules[0].file, "empty", "acme:phase1.empty"),
+            (module_tree.modules[0].file, "app", "acme:phase1.app"),
+            (
+                module_tree.modules[1].file,
+                "nested",
+                "acme:phase1/child.nested",
+            ),
+            (
+                module_tree.modules[1].file,
+                "worker",
+                "acme:phase1/child.worker",
+            ),
+        ] {
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == path_string)
+                .expect("the world has a canonical inventory path");
+            assert_eq!(symbol.kind(), sai_semantic::SymbolKind::World);
+
+            let owner_path = collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .filter(|owner| owner.file == file_id && owner.kind == TopLevelOwnerKind::World)
+                .filter_map(|owner| {
+                    database
+                        .resolve_def_path(owner.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                })
+                .find(|path| {
+                    matches!(
+                        path.data().last().map(|component| &component.data),
+                        Some(DefPathData::World(world))
+                            if database.symbols.resolve(*world).is_ok_and(|resolved| resolved.as_ref() == name)
+                    )
+                })
+                .expect("the matching Phase 1 world owner has a canonical definition path");
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&owner_path, &database.packages, &database.symbols)
+                    .expect("the matching world owner path hashes");
+            assert_eq!(
+                symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+            assert!(matches!(
+                owner_path.data().last(),
+                Some(component)
+                    if component.data == DefPathData::World(database.symbols.intern(name).unwrap())
+                        && component.disambiguator == 0
+            ));
+
+            let parsed = sai_syntax::parse(&snapshot, file_id).expect("module parses");
+            let declaration = parsed
+                .root
+                .descendants()
+                .filter_map(ast::WorldDecl::cast)
+                .find(|world| {
+                    world
+                        .name()
+                        .and_then(|name| name.token())
+                        .is_some_and(|token| token.text() == name)
+                })
+                .expect("the module contains the expected world declaration");
+            let name_token = declaration
+                .name()
+                .and_then(|name| name.token())
+                .expect("the world has its declared name token");
+            assert_eq!(
+                symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint(
+                    sai_semantic::SymbolKind::World,
+                    declaration.syntax(),
+                    Some(&name_token),
+                )
+                .expect("the world declaration fingerprint is defined")
+            );
+        }
+    }
+
+    #[test]
+    fn module_world_inventory_checks_duplicate_name_disambiguators() {
+        let (database, module_tree, _, collection) = collect_package_inventory_for_target(
+            b"world app {}\nworld app { export storage }\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("duplicate canonical symbol path")
+        ));
+        let mut disambiguators = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|owner| {
+                owner.file == module_tree.modules[0].file && owner.kind == TopLevelOwnerKind::World
+            })
+            .filter_map(|owner| {
+                database
+                    .resolve_def_path(owner.owner.def_id.to_def_id())
+                    .ok()
+                    .flatten()
+            })
+            .filter_map(|path| {
+                path.data()
+                    .last()
+                    .filter(|component| {
+                        component.data
+                            == DefPathData::World(database.symbols.intern("app").unwrap())
+                    })
+                    .map(|component| component.disambiguator)
+            })
+            .collect::<Vec<_>>();
+        disambiguators.sort_unstable();
+        assert_eq!(
+            disambiguators,
+            [0, 1],
+            "same-name worlds use source-order disambiguators in the DefPath"
+        );
+    }
+
+    #[test]
+    fn module_world_fingerprint_ignores_renames_and_tracks_world_contents() {
+        let symbol_for = |source: &[u8]| {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert_eq!(
+                inventory.coverage(),
+                &sai_semantic::InventoryCoverage::Complete
+            );
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind() == sai_semantic::SymbolKind::World)
+                .expect("the fixture world is inventoried");
+            (
+                symbol.path().to_owned(),
+                symbol.def_path_hash(),
+                symbol.fingerprint(),
+            )
+        };
+        let original = symbol_for(b"world original { import clock }\n");
+        let renamed = symbol_for(b"world renamed { import clock }\n");
+        let changed_member = symbol_for(b"world original { import alarm }\n");
+
+        assert_ne!(
+            original.0, renamed.0,
+            "the descriptive canonical path changes with the world name"
+        );
+        assert_ne!(
+            original.1, renamed.1,
+            "the canonical definition path hash changes with the world name"
+        );
+        assert_eq!(
+            original.2, renamed.2,
+            "omitting the declared name token keeps a pure rename fingerprint-stable"
+        );
+        assert_ne!(
+            original.2, changed_member.2,
+            "world contents contribute to the declaration fingerprint"
+        );
+    }
+
+    #[test]
+    fn module_world_inventory_fails_closed_for_malformed_forms_and_target_errors() {
+        let (_, _, _, malformed_collection) = collect_package_inventory_for_target(
+            b"world malformed { import clock\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(
+            matches!(
+                inventory_symbols(&malformed_collection).coverage(),
+                sai_semantic::InventoryCoverage::Incomplete { reason }
+                    if reason.contains("syntax tree contains recovery or parse errors")
+            ),
+            "malformed world declarations must not yield complete coverage"
+        );
+
+        let (_, _, _, malformed_reference_collection) = collect_package_inventory_for_target(
+            b"world malformed { import }\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(
+            matches!(
+                inventory_symbols(&malformed_reference_collection).coverage(),
+                sai_semantic::InventoryCoverage::Incomplete { reason }
+                    if reason.contains("syntax tree contains recovery or parse errors")
+            ),
+            "a missing world reference keeps parser diagnostics and cannot yield complete coverage"
+        );
+
+        let (_, _, _, target_collection) = collect_package_inventory_for_target(
+            b"@target(\"wasm32-core\") world targeted {}\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(
+            target_collection
+                .scopes()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget),
+            "a world-level target attribute stays invalid"
+        );
+        assert!(matches!(
+            inventory_symbols(&target_collection).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("attribute or target-selection error")
+        ));
+
+        let (_, module_tree, snapshot, member_target_collection) =
+            collect_package_inventory_for_target(
+                b"world targeted {\n@target(\"wasm32-core\") import clock\n}\n",
+                b"",
+                "wasm32-core",
+            );
+        let parsed = sai_syntax::parse(&snapshot, module_tree.modules[0].file)
+            .expect("the invalid world-member attribute parses with a diagnostic");
+        assert!(parsed.parser_diagnostics().iter().any(|diagnostic| {
+            diagnostic.code == sai_diagnostics::Code::InvalidAttributeTarget
+        }));
+        assert!(matches!(
+            inventory_symbols(&member_target_collection).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("world declaration has an overlapping parser diagnostic")
+        ));
+    }
+
+    #[test]
     fn module_function_inventory_fails_closed_for_lexer_error_tokens() {
         let (_, _, _, collection) = collect_package_inventory_for_target(
             b"fn malformed() { let 1__2 = 3; }\n",
