@@ -13,6 +13,7 @@ mod module_function_inventory;
 pub mod package_graph;
 mod package_wit_name_queries;
 pub mod symbol_index_store;
+mod wit_function_inventory;
 mod wit_package_queries;
 mod world_elaboration_adapter;
 mod world_resource_containment;
@@ -33,6 +34,7 @@ pub use interface_use_queries::WorldInterfaceUseGraph;
 pub use module_function_inventory::Phase1PackageSymbolInventory;
 use module_function_inventory::collect_module_function_inventory;
 pub use sai_wit::WitPackageDiagnosticTemplate;
+use wit_function_inventory::add_authored_wit_interface_functions;
 pub use wit_package_queries::{
     WitPackageFailure, WitPackageQueryError, WitPackageResult, WitPackageSourceFailure,
     WitViewQueryError,
@@ -14078,6 +14080,13 @@ impl RootDatabase {
             &self.packages,
             &self.symbols,
         );
+        let package_symbol_inventory = add_authored_wit_interface_functions(
+            self,
+            prepared.module_tree.package,
+            &package_key,
+            prepared.generated_package_version.as_ref(),
+            package_symbol_inventory,
+        );
         Ok(Phase1PackageScopesCollection {
             package_key,
             scopes,
@@ -24577,7 +24586,8 @@ mod tests {
     use sai_package::version::Version;
     use sai_package::version_req::VersionReq;
     use sai_vfs::{
-        PackageFileEntry, PackageRelativePath, SnapshotFile, SourceFile, WorkspaceSnapshot,
+        PackageFileEntry, PackageRelativePath, SnapshotFile, SourceFile, WitFilesSnapshot,
+        WorkspaceSnapshot,
     };
 
     struct TestDirectory(std::path::PathBuf);
@@ -24656,6 +24666,14 @@ mod tests {
         let package = database
             .intern_package(PACKAGE_KEY)
             .expect("package identity interns");
+        database
+            .set_package_manifest(
+                package,
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\n"[..]),
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("valid source-only package manifest is tracked");
         let package_key = PackageKey::new(PACKAGE_KEY).expect("package key is valid");
         database
             .set_package_files(
@@ -24726,6 +24744,56 @@ mod tests {
         )
         .expect("workspace snapshot is valid");
         (database, module_tree.as_ref().clone(), snapshot, package)
+    }
+
+    fn install_authored_wit_package(
+        database: &mut RootDatabase,
+        package: PackageId,
+        package_key: &str,
+        manifest: &[u8],
+        role: PackageRole,
+        sources: &[(&str, &[u8])],
+    ) {
+        database
+            .set_package_manifest(package, Arc::from(manifest), role, Durability::Low)
+            .expect("WIT package manifest is tracked");
+        let paths = sources
+            .iter()
+            .map(|(name, _)| {
+                PackageRelativePath::new(format!("wit/{name}")).expect("WIT path is valid")
+            })
+            .collect::<Vec<_>>();
+        database
+            .set_wit_files(
+                PackageKey::new(package_key).expect("WIT package key is valid"),
+                WitFilesSnapshot::listed("wit", paths.clone()).expect("WIT snapshot is valid"),
+                Durability::Low,
+            )
+            .expect("WIT file snapshot is tracked");
+        for ((_, contents), path) in sources.iter().zip(paths) {
+            database
+                .set_file_contents(
+                    FileKey::from_package_path(package_key, path)
+                        .expect("WIT source file key is valid"),
+                    Arc::from(*contents),
+                    Durability::Low,
+                )
+                .expect("WIT source bytes are tracked");
+        }
+    }
+
+    fn phase1_root_graph_at_version(version: &str) -> PackageGraph {
+        PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [graph_node(
+                "acme:phase1#1",
+                "acme:phase1",
+                version,
+                PackageGraphRole::Root,
+                Vec::new(),
+            )],
+        )
+        .expect("version-specific root graph is valid")
     }
 
     fn collect_package_inventory_for_target(
@@ -24861,6 +24929,638 @@ mod tests {
             .expect("the declaration fingerprint is defined");
             assert_eq!(symbol.fingerprint(), expected_fingerprint);
         }
+    }
+
+    #[test]
+    fn wit_function_inventory_uses_exact_version_and_public_interface_path() {
+        let selected_version = "1.0.0-rc.7";
+        let wit_source = b"package acme:phase1@1.0.0-rc.7;\n\
+interface user-api {\n\
+    get-user: func(name: string) -> string;\n\
+}\n";
+        let (mut database, module_tree, snapshot, package) =
+            phase1_fixture(b"fn root_fn() {}\n", b"");
+        database
+            .set_package_graph(Some(phase1_root_graph_at_version(selected_version)))
+            .expect("exact version graph is tracked");
+        install_authored_wit_package(
+            &mut database,
+            package,
+            "acme:phase1#1",
+            b"package acme:phase1 @ 1.0.0-rc.7\nsource \"src\"\nwit \"wit\"\n",
+            PackageRole::Root,
+            &[("root.wit", wit_source)],
+        );
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 and WIT inventory collection succeed");
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.package_node_key(),
+            "package:acme:phase1@1.0.0-rc.7"
+        );
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("interface")
+        ));
+        let function = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.path() == "acme:phase1/user-api.get_user")
+            .expect("the direct WIT function uses the public canonical path");
+        assert_eq!(function.kind(), sai_semantic::SymbolKind::AssocFn);
+
+        let name_start = std::str::from_utf8(wit_source)
+            .expect("fixture WIT is UTF-8")
+            .find("get-user")
+            .expect("WIT function name occurs");
+        let tokens = sai_wit::authored_interface_function_tokens(
+            std::str::from_utf8(wit_source).expect("fixture WIT is UTF-8"),
+            "user-api",
+            "get-user",
+            &(name_start..name_start + "get-user".len()),
+        )
+        .expect("the source scanner finds the exact direct declaration");
+        assert_eq!(
+            function.fingerprint(),
+            sai_semantic::declaration_fingerprint_from_token_pairs(
+                sai_semantic::SymbolKind::AssocFn,
+                &tokens.token_pairs
+            )
+        );
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse(selected_version).expect("full selected version parses"),
+        )
+        .expect("selected package version is valid");
+        let unit = WitUnit::dir(package, &database.packages, &selected)
+            .expect("exact selected WIT unit is valid");
+        let view = database
+            .wit_view(&unit)
+            .expect("exact selected root view is available");
+        let member = view
+            .interfaces
+            .values()
+            .next()
+            .expect("the root WIT interface is present")
+            .members
+            .get("get_user")
+            .expect("the normalized function member is present");
+        let path = view
+            .def_path(member.def)
+            .expect("WIT view path resolves")
+            .expect("WIT view path exists");
+        let hash = sai_hir::DefPathHash::compute(&path, &database.packages, &database.symbols)
+            .expect("WIT view path hashes");
+        assert_eq!(
+            function.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(hash.raw())
+        );
+    }
+
+    #[test]
+    fn wit_function_inventory_collects_declared_hybrid_root_wit() {
+        let (mut database, module_tree, snapshot, package) =
+            phase1_fixture(b"interface api {}\n", b"");
+        database
+            .set_package_graph(Some(phase1_root_graph_at_version("1.0.0")))
+            .expect("exact version graph is tracked");
+        install_authored_wit_package(
+            &mut database,
+            package,
+            "acme:phase1#1",
+            b"package acme:phase1 @ 1.0.0\n\
+              source \"src\"\n\
+              artifact component {}\n\
+              wit \"wit\"\n",
+            PackageRole::Root,
+            &[(
+                "root.wit",
+                b"package acme:phase1@1.0.0;\ninterface api { call: func(); }\n",
+            )],
+        );
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 and hybrid WIT inventory collection succeed");
+        let inventory = inventory_symbols(&collection);
+
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.path() == "acme:phase1/api.call"),
+            "coverage: {:?}; symbols: {:?}",
+            inventory.coverage(),
+            inventory.symbols()
+        );
+    }
+
+    #[test]
+    fn wit_function_inventory_rejects_manifest_prerelease_mismatch() {
+        let selected_version = "1.0.0-rc.7";
+        let wit_source = b"package acme:phase1@1.0.0-rc.7;\n\
+interface api { call: func(); }\n";
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(b"", b"");
+        database
+            .set_package_graph(Some(phase1_root_graph_at_version(selected_version)))
+            .expect("exact version graph is tracked");
+        install_authored_wit_package(
+            &mut database,
+            package,
+            "acme:phase1#1",
+            b"package acme:phase1 @ 1.0.0-rc.6\nsource \"src\"\nwit \"wit\"\n",
+            PackageRole::Root,
+            &[("root.wit", wit_source)],
+        );
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection handles a contract mismatch");
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("full version")
+        ));
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| !symbol.path().starts_with("acme:phase1/api."))
+        );
+    }
+
+    #[test]
+    fn wit_function_inventory_without_wit_preserves_no_version_inventory() {
+        let (mut database, _, _, package) = phase1_fixture(b"", b"");
+        let file = sai_semantic::PackageIndexFileName::new("acme", "phase1", "1")
+            .expect("package index file name is valid");
+        let inventory =
+            sai_semantic::PackageSymbolInventory::complete(file, "package:acme:phase1@1.0.0", []);
+        let package_key = PackageKey::new("acme:phase1#1").expect("exact package key is valid");
+
+        let result = wit_function_inventory::add_authored_wit_interface_functions(
+            &mut database,
+            package,
+            &package_key,
+            None,
+            Phase1PackageSymbolInventory::Available(inventory.clone()),
+        );
+
+        assert_eq!(
+            result,
+            Phase1PackageSymbolInventory::Available(inventory),
+            "a package with no WIT declaration keeps its existing inventory"
+        );
+    }
+
+    #[test]
+    fn wit_function_inventory_without_wit_preserves_hybrid_inventory_without_version() {
+        let (mut database, _, _, package) = phase1_fixture(b"", b"");
+        database
+            .set_package_manifest(
+                package,
+                Arc::from(
+                    &b"package acme:phase1 @ 1.0.0\nsource \"src\"\nartifact component {}\n"[..],
+                ),
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("no-WIT hybrid manifest is tracked");
+        let file = sai_semantic::PackageIndexFileName::new("acme", "phase1", "1")
+            .expect("package index file name is valid");
+        let inventory =
+            sai_semantic::PackageSymbolInventory::complete(file, "package:acme:phase1@1.0.0", []);
+        let package_key = PackageKey::new("acme:phase1#1").expect("exact package key is valid");
+
+        let result = wit_function_inventory::add_authored_wit_interface_functions(
+            &mut database,
+            package,
+            &package_key,
+            None,
+            Phase1PackageSymbolInventory::Available(inventory.clone()),
+        );
+
+        assert_eq!(
+            result,
+            Phase1PackageSymbolInventory::Available(inventory),
+            "a hybrid package without a WIT declaration keeps its existing inventory"
+        );
+    }
+
+    #[test]
+    fn wit_function_inventory_declared_wit_without_version_is_incomplete() {
+        let (mut database, _, _, package) = phase1_fixture(b"", b"");
+        database
+            .set_package_manifest(
+                package,
+                Arc::from(&b"package acme:phase1 @ 1.0.0\nsource \"src\"\nwit \"wit\"\n"[..]),
+                PackageRole::Root,
+                Durability::Low,
+            )
+            .expect("WIT declaration is tracked");
+        let file = sai_semantic::PackageIndexFileName::new("acme", "phase1", "1")
+            .expect("package index file name is valid");
+        let inventory =
+            sai_semantic::PackageSymbolInventory::complete(file, "package:acme:phase1@1.0.0", []);
+        let package_key = PackageKey::new("acme:phase1#1").expect("exact package key is valid");
+
+        let result = wit_function_inventory::add_authored_wit_interface_functions(
+            &mut database,
+            package,
+            &package_key,
+            None,
+            Phase1PackageSymbolInventory::Available(inventory),
+        );
+
+        assert!(matches!(
+            result.inventory().map(sai_semantic::PackageSymbolInventory::coverage),
+            Some(sai_semantic::InventoryCoverage::Incomplete { reason })
+                if reason.contains("no exact selected package version")
+        ));
+    }
+
+    #[test]
+    fn wit_function_inventory_excludes_dependency_closure_symbols() {
+        let (mut database, module_tree, snapshot, root_package) = phase1_fixture(b"", b"");
+        let dependency = database
+            .intern_package("acme:dep#1")
+            .expect("dependency package key interns");
+        database
+            .set_package_graph(Some(phase1_graph("1.0.0", false)))
+            .expect("root and dependency graph is tracked");
+        install_authored_wit_package(
+            &mut database,
+            root_package,
+            "acme:phase1#1",
+            b"package acme:phase1 @ 1.0.0\nsource \"src\"\nwit \"wit\"\n",
+            PackageRole::Root,
+            &[(
+                "root.wit",
+                b"package acme:phase1@1.0.0;\n\
+interface local-api { root-call: func(); }\n\
+world app { import acme:dep/api; }\n",
+            )],
+        );
+        install_authored_wit_package(
+            &mut database,
+            dependency,
+            "acme:dep#1",
+            b"package acme:dep @ 1.0.0\nsource \"src\"\nwit \"wit\"\n",
+            PackageRole::Dependency,
+            &[(
+                "root.wit",
+                b"package acme:dep@1.0.0;\ninterface api { dependency-only: func(); }\n",
+            )],
+        );
+        database
+            .set_generated_wit_text(
+                dependency,
+                sai_wit::GeneratedText {
+                    text: Arc::from(
+                        "package acme:dep@1.0.0;\ninterface api { dependency-only: func(); }",
+                    ),
+                    complete: true,
+                    origins: Arc::from([]),
+                },
+                Durability::Low,
+            )
+            .expect("generated dependency WIT is tracked");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 and root WIT collection succeed");
+        let inventory = inventory_symbols(&collection);
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.path() == "acme:phase1/local-api.root_call"),
+            "coverage: {:?}; symbols: {:?}",
+            inventory.coverage(),
+            inventory.symbols()
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.path() != "acme:dep/api.dependency_only")
+        );
+
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version parses"),
+        )
+        .expect("root package selection is valid");
+        let root_unit = WitUnit::dir(root_package, &database.packages, &selected)
+            .expect("root WIT unit is valid");
+        let loaded = database
+            .wit_package(&root_unit)
+            .expect("root closure query succeeds")
+            .package
+            .expect("root package closure loads");
+        assert!(
+            loaded
+                .dependency_models()
+                .iter()
+                .any(|model| model.name.namespace == "acme" && model.name.name == "dep"),
+            "dependency closure actually contains the foreign package"
+        );
+    }
+
+    #[test]
+    fn wit_function_inventory_does_not_promote_resource_methods_to_interface_functions() {
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(b"", b"");
+        database
+            .set_package_graph(Some(phase1_root_graph_at_version("1.0.0")))
+            .expect("exact version graph is tracked");
+        install_authored_wit_package(
+            &mut database,
+            package,
+            "acme:phase1#1",
+            b"package acme:phase1 @ 1.0.0\nsource \"src\"\nwit \"wit\"\n",
+            PackageRole::Root,
+            &[(
+                "root.wit",
+                b"package acme:phase1@1.0.0;\ninterface api { resource handle { call: func(); } }\n",
+            )],
+        );
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection handles interface resources");
+        let inventory = inventory_symbols(&collection);
+
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { .. }
+        ));
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.path() != "acme:phase1/api.call")
+        );
+    }
+
+    #[test]
+    fn wit_function_inventory_keeps_shadowed_view_functions_incomplete() {
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(b"", b"");
+        database
+            .set_package_graph(Some(phase1_root_graph_at_version("1.0.0")))
+            .expect("exact version graph is tracked");
+        install_authored_wit_package(
+            &mut database,
+            package,
+            "acme:phase1#1",
+            b"package acme:phase1 @ 1.0.0\nsource \"src\"\nwit \"wit\"\n",
+            PackageRole::Root,
+            &[(
+                "root.wit",
+                b"package acme:phase1@1.0.0;\ninterface api { foo-API: func(); foo-api: func(); }\n",
+            )],
+        );
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection handles shadowed WIT members");
+        let inventory = inventory_symbols(&collection);
+
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("shadowed view members")
+                    || reason.contains("absent from the selected view")
+        ));
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .filter(|symbol| symbol.path() == "acme:phase1/api.foo_api")
+                .count()
+                <= 1
+        );
+    }
+
+    #[test]
+    fn wit_function_inventory_maps_explicit_keyword_names_to_sai_spellings() {
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(b"", b"");
+        database
+            .set_package_graph(Some(phase1_root_graph_at_version("1.0.0")))
+            .expect("exact version graph is tracked");
+        install_authored_wit_package(
+            &mut database,
+            package,
+            "acme:phase1#1",
+            b"package acme:phase1 @ 1.0.0\nsource \"src\"\nwit \"wit\"\n",
+            PackageRole::Root,
+            &[(
+                "root.wit",
+                b"package acme:phase1@1.0.0;\ninterface %type { %async: func(); }\n",
+            )],
+        );
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection handles explicit keyword identifiers");
+        let inventory = inventory_symbols(&collection);
+
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.path() == "acme:phase1/type.r#async"),
+            "coverage: {:?}; symbols: {:?}",
+            inventory.coverage(),
+            inventory.symbols()
+        );
+    }
+
+    #[test]
+    fn wit_function_inventory_rejects_wit_snapshot_directory_mismatch() {
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(b"", b"");
+        database
+            .set_package_graph(Some(phase1_root_graph_at_version("1.0.0")))
+            .expect("exact version graph is tracked");
+        install_authored_wit_package(
+            &mut database,
+            package,
+            "acme:phase1#1",
+            b"package acme:phase1 @ 1.0.0\nsource \"src\"\nwit \"wit\"\n",
+            PackageRole::Root,
+            &[(
+                "root.wit",
+                b"package acme:phase1@1.0.0; interface api { call: func(); }",
+            )],
+        );
+        let package_key = PackageKey::new("acme:phase1#1").expect("exact package key is valid");
+        database
+            .set_wit_files(
+                package_key,
+                WitFilesSnapshot::listed(
+                    "other",
+                    [
+                        PackageRelativePath::new("other/root.wit")
+                            .expect("other WIT path is valid"),
+                    ],
+                )
+                .expect("mismatched directory snapshot is structurally valid"),
+                Durability::Low,
+            )
+            .expect("mismatched WIT snapshot is tracked");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection handles WIT snapshot mismatch");
+        let inventory = inventory_symbols(&collection);
+
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("snapshot directory")
+        ));
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.path() != "acme:phase1/api.call")
+        );
+    }
+
+    #[test]
+    fn wit_function_inventory_rejects_contract_identity_mismatch() {
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(b"", b"");
+        database
+            .set_package_graph(Some(phase1_root_graph_at_version("1.0.0")))
+            .expect("exact version graph is tracked");
+        install_authored_wit_package(
+            &mut database,
+            package,
+            "acme:phase1#1",
+            b"package acme:other @ 1.0.0\nsource \"src\"\nwit \"wit\"\n",
+            PackageRole::Root,
+            &[(
+                "root.wit",
+                b"package acme:phase1@1.0.0; interface api { call: func(); }",
+            )],
+        );
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection handles WIT contract mismatch");
+        let inventory = inventory_symbols(&collection);
+
+        assert!(
+            matches!(
+                inventory.coverage(),
+                sai_semantic::InventoryCoverage::Incomplete { reason }
+                    if reason.contains("ManifestPackageMismatch")
+                        || reason.contains("contract identity or full version")
+            ),
+            "coverage: {:?}",
+            inventory.coverage()
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.path() != "acme:phase1/api.call")
+        );
+    }
+
+    #[test]
+    fn wit_function_inventory_keeps_generated_package_views_incomplete() {
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(b"", b"");
+        database
+            .set_package_graph(Some(phase1_root_graph_at_version("1.0.0")))
+            .expect("exact version graph is tracked");
+        install_authored_wit_package(
+            &mut database,
+            package,
+            "acme:phase1#1",
+            b"package acme:phase1 @ 1.0.0\nsource \"src\"\nwit \"wit\"\n",
+            PackageRole::Root,
+            &[(
+                "root.wit",
+                b"package acme:phase1@1.0.0; interface api { call: func(); }",
+            )],
+        );
+        database
+            .publish_phase1_generated_wit_text(
+                package,
+                sai_wit::GeneratedText {
+                    text: Arc::from("package acme:phase1@1.0.0; interface api { call: func(); }"),
+                    complete: true,
+                    origins: Arc::from([]),
+                },
+                Durability::Low,
+            )
+            .expect("generated package snapshot is published");
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection handles generated WIT");
+        let inventory = inventory_symbols(&collection);
+
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("generated WIT package views")
+        ));
     }
 
     #[test]
@@ -56434,13 +57134,13 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 ),
             ],
         );
-        let (_, middle_tree, middle_snapshot_files) = multi_package_fixture(
+        let (middle_package, middle_tree, middle_snapshot_files) = multi_package_fixture(
             &mut database,
             "acme:middle#1",
             "acme:middle@1.0.0",
             &[("lib.sai", b"pub use acme:deep.{api}\n")],
         );
-        let (_, leaf_tree, leaf_snapshot_files) = multi_package_fixture(
+        let (leaf_package, leaf_tree, leaf_snapshot_files) = multi_package_fixture(
             &mut database,
             "acme:leaf#1",
             "acme:leaf@1.0.0",
@@ -56459,7 +57159,7 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
                 ),
             ],
         );
-        let (_, deep_tree, deep_snapshot_files) = multi_package_fixture(
+        let (deep_package, deep_tree, deep_snapshot_files) = multi_package_fixture(
             &mut database,
             "acme:deep#1",
             "acme:deep@1.0.0",
@@ -56526,6 +57226,21 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
         database
             .set_package_graph(Some(graph.clone()))
             .expect("active package graph is installed");
+        for (package, identity, role) in [
+            (root_package, "acme:check", PackageRole::Root),
+            (middle_package, "acme:middle", PackageRole::Dependency),
+            (leaf_package, "acme:leaf", PackageRole::Dependency),
+            (deep_package, "acme:deep", PackageRole::Dependency),
+        ] {
+            database
+                .set_package_manifest(
+                    package,
+                    Arc::from(format!("package {identity} @ 1.0.0\nsource \"src\"\n").into_bytes()),
+                    role,
+                    Durability::Low,
+                )
+                .expect("source dependency manifest is tracked");
+        }
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
         let leaf_collection = database
             .collect_phase1_package_scopes_collection(
@@ -65365,6 +66080,8 @@ interface facade { use middle.{payload}; }"#;
                 deprecated: None,
                 kind: sai_wit::WitItemKind::Resource(Vec::new()),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             })
             .expect("resource item index is available");
@@ -65404,6 +66121,8 @@ interface facade { use middle.{payload}; }"#;
                     is_async: false,
                 }),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             })
             .expect("function item index is available");
