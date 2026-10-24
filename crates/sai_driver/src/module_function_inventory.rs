@@ -44,10 +44,11 @@ impl Phase1PackageSymbolInventory {
 
 /// Collects target-visible module-level functions and their generic
 /// parameters, records with their generic parameters and direct named fields,
+/// enums with their generic parameters, variants and record-variant fields,
 /// plain type aliases and their generic parameters, non-generic refined types,
-/// constants, user effects, tests, and properties. Every other
-/// symbol-bearing declaration makes the result incomplete until its symbol
-/// kind and path are collected as well.
+/// constants, user effects, tests, and properties. Every other symbol-bearing
+/// declaration makes the result incomplete until its symbol kind and path are
+/// collected as well.
 pub(super) fn collect_module_function_inventory(
     package_key: &PackageKey,
     package_version: Option<&MvsPackageVersion>,
@@ -144,6 +145,8 @@ pub(super) fn collect_module_function_inventory(
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), FunctionOwnerDescriptor>::new();
     let mut record_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
+    let mut enum_owners_by_item =
+        HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut const_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut effect_owners_by_item =
@@ -178,6 +181,11 @@ pub(super) fn collect_module_function_inventory(
             TopLevelOwnerKind::Struct => {
                 if record_owners_by_item.insert(key, *descriptor).is_some() {
                     reasons.insert("Phase 1 contains duplicate record owner descriptors".into());
+                }
+            }
+            TopLevelOwnerKind::Enum => {
+                if enum_owners_by_item.insert(key, *descriptor).is_some() {
+                    reasons.insert("Phase 1 contains duplicate enum owner descriptors".into());
                 }
             }
             TopLevelOwnerKind::Alias => {
@@ -229,6 +237,7 @@ pub(super) fn collect_module_function_inventory(
     let mut seen_items = HashSet::new();
     let mut consumed_owners = HashSet::new();
     let mut consumed_record_owners = HashSet::new();
+    let mut consumed_enum_owners = HashSet::new();
     let mut consumed_const_owners = HashSet::new();
     let mut consumed_effect_owners = HashSet::new();
     let mut consumed_alias_owners = HashSet::new();
@@ -259,6 +268,25 @@ pub(super) fn collect_module_function_inventory(
         let mut test_property_names = HashSet::<String>::new();
         for entry in &input.filtered.item_tree.items {
             match entry.kind {
+                ItemTreeKind::Enum => {
+                    collect_enum(
+                        entry,
+                        module.file,
+                        &module_path,
+                        package_version.package(),
+                        input,
+                        prepared.module_tree.package,
+                        &enum_owners_by_item,
+                        &mut seen_items,
+                        &mut consumed_enum_owners,
+                        &mut canonical_paths,
+                        &mut current_symbols,
+                        &mut reasons,
+                        def_paths,
+                        packages,
+                        symbols,
+                    );
+                }
                 ItemTreeKind::Struct => {
                     collect_record(
                         entry,
@@ -409,7 +437,7 @@ pub(super) fn collect_module_function_inventory(
                 // functions are children of ExternBlock and are symbols.
                 _ => {
                     reasons.insert(format!(
-                        "target-filtered declaration {:?} is outside the function-generic-parameter-record-generic-parameter-field-type-alias-generic-parameter-refined-type-constant-effect-test-property inventory",
+                        "target-filtered declaration {:?} is outside the function-generic-parameter-record-generic-parameter-field-enum-generic-parameter-variant-record-variant-field-type-alias-generic-parameter-refined-type-constant-effect-test-property inventory",
                         entry.kind
                     ));
                 }
@@ -426,6 +454,12 @@ pub(super) fn collect_module_function_inventory(
     if consumed_record_owners.len() != record_owners_by_item.len() {
         reasons.insert(
             "the Phase 1 record owner descriptors do not exactly match the filtered ItemTree"
+                .to_owned(),
+        );
+    }
+    if consumed_enum_owners.len() != enum_owners_by_item.len() {
+        reasons.insert(
+            "the Phase 1 enum owner descriptors do not exactly match the filtered ItemTree"
                 .to_owned(),
         );
     }
@@ -470,6 +504,13 @@ pub(super) fn collect_module_function_inventory(
         if !seen_items.contains(&(*file_id, *item_id)) {
             reasons.insert(
                 "a Phase 1 record owner has no target-filtered ItemTree declaration".to_owned(),
+            );
+        }
+    }
+    for ((file_id, item_id), _) in &enum_owners_by_item {
+        if !seen_items.contains(&(*file_id, *item_id)) {
+            reasons.insert(
+                "a Phase 1 enum owner has no target-filtered ItemTree declaration".to_owned(),
             );
         }
     }
@@ -1353,67 +1394,755 @@ fn collect_record(
             return;
         }
     };
-    let mut field_symbols = Vec::with_capacity(validated_fields.len());
     for (
         ((field_entry, _, field_name, field_syntax, field_name_token), field_def_id),
         (_, ordinal),
     ) in validated_fields.iter().zip(field_def_ids).zip(field_paths)
     {
-        let field_def_path = match def_paths.resolve(field_def_id) {
-            Ok(Some(path)) if path.package() == package_id => path,
-            _ => {
-                reasons
-                    .insert("a record field has no definition path in the selected package".into());
-                return;
-            }
+        let field_canonical_path = format!("{canonical_path}.field[{field_name}]");
+        if !collect_named_field_symbol(
+            field_entry,
+            field_syntax,
+            field_name_token,
+            field_def_id,
+            &def_path,
+            ordinal,
+            field_canonical_path,
+            "record field",
+            package_id,
+            reasons,
+            canonical_paths,
+            current_symbols,
+            def_paths,
+            packages,
+            symbols,
+        ) {
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_enum(
+    entry: &ItemTreeEntry,
+    file_id: FileId,
+    module_path: &[String],
+    package_identity: &str,
+    input: &OwnedPhase1ModuleInput,
+    package_id: PackageId,
+    owners_by_item: &HashMap<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>,
+    seen_items: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    consumed_owners: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    reasons: &mut HashSet<String>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) {
+    enum EnumChild {
+        Generic(ast::GenericParam),
+        Variant(ast::VariantDecl),
+    }
+
+    struct EnumVariantField {
+        entry: ItemTreeEntry,
+        name: String,
+        syntax: SyntaxNode,
+        name_token: sai_syntax::SyntaxToken,
+    }
+
+    struct EnumVariant {
+        entry: ItemTreeEntry,
+        name: String,
+        syntax: SyntaxNode,
+        name_token: sai_syntax::SyntaxToken,
+        fields: Vec<EnumVariantField>,
+    }
+
+    let key = (file_id, entry.ast_id);
+    if !seen_items.insert(key) {
+        reasons.insert("the target-filtered ItemTree contains a duplicate enum AST ID".into());
+    }
+    if entry.kind != ItemTreeKind::Enum {
+        reasons.insert("a non-enum ItemTree entry reached the enum collector".into());
+        return;
+    }
+    if entry.name == Symbol::ERROR {
+        reasons.insert("a target-filtered enum has no valid declaration name".into());
+        return;
+    }
+    let name = match symbols.resolve(entry.name) {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            reasons.insert("a target-filtered enum name cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let Some(descriptor) = owners_by_item.get(&key).copied() else {
+        reasons.insert("a target-filtered enum has no matching Phase 1 owner".to_owned());
+        return;
+    };
+    if descriptor.kind != TopLevelOwnerKind::Enum
+        || descriptor.file != file_id
+        || descriptor.item_id != entry.ast_id
+    {
+        reasons.insert("a target-filtered enum has a mismatched Phase 1 owner".to_owned());
+        return;
+    }
+    consumed_owners.insert(key);
+
+    let Some(pointer) = input.ast_ids.pointer(entry.ast_id) else {
+        reasons.insert("a target-filtered enum AST ID has no source pointer".to_owned());
+        return;
+    };
+    let Some(syntax) = pointer.resolve(file_id, &input.root) else {
+        reasons.insert(
+            "a target-filtered enum source pointer cannot resolve in its AST root".to_owned(),
+        );
+        return;
+    };
+    let Some(declaration) = ast::EnumDecl::cast(syntax.clone()) else {
+        reasons
+            .insert("a target-filtered enum source pointer resolves to a non-enum node".to_owned());
+        return;
+    };
+    if input.ast_ids.ast_id(&declaration).map(|id| id.erase()) != Some(entry.ast_id) {
+        reasons.insert("a target-filtered enum AST ID does not match its declaration".into());
+        return;
+    }
+    let Some(name_node) = declaration.name() else {
+        reasons.insert("a target-filtered enum AST has no name node".to_owned());
+        return;
+    };
+    let Some(name_token) = name_node.token() else {
+        reasons.insert("a target-filtered enum AST has no name token".to_owned());
+        return;
+    };
+    let raw_name = name_token
+        .text()
+        .strip_prefix("r#")
+        .unwrap_or(name_token.text());
+    if sai_syntax::normalize_identifier(raw_name) != name {
+        reasons.insert("the ItemTree and enum AST disagree about the declaration name".into());
+        return;
+    }
+    if syntax_has_errors(&syntax) || name_token.has_error() {
+        reasons.insert("a target-filtered enum AST contains recovery or parse errors".into());
+        return;
+    }
+    if input
+        .parser_diagnostics
+        .iter()
+        .any(|diagnostic| parser_diagnostic_overlaps_syntax(diagnostic, file_id, &syntax))
+    {
+        reasons.insert("an enum syntax node has a parser diagnostic".to_owned());
+        return;
+    }
+    if entry
+        .raw_attrs
+        .iter()
+        .any(|attribute| attribute.name == sai_hir::item_tree::AttrName::Derive)
+    {
+        reasons
+            .insert("an enum has derived impl symbols outside the supported inventory".to_owned());
+    }
+
+    // Enum ItemTree children merge declaration generics with variants in
+    // source order. Validate that complete sequence, then validate each
+    // variant's direct record fields against its own AST child list.
+    let mut expected_children = Vec::<(usize, EnumChild)>::new();
+    if let Some(list) = declaration.generic_params() {
+        expected_children.extend(list.params().map(|parameter| {
+            (
+                parameter.syntax().text_range().start().to_usize(),
+                EnumChild::Generic(parameter),
+            )
+        }));
+    }
+    if let Some(variants) = declaration.variants() {
+        expected_children.extend(variants.variants().map(|variant| {
+            (
+                variant.syntax().text_range().start().to_usize(),
+                EnumChild::Variant(variant),
+            )
+        }));
+    }
+    expected_children.sort_by_key(|(offset, _)| *offset);
+    if entry.children.len() != expected_children.len() {
+        reasons.insert("an enum's ItemTree child count does not match its snapshot AST".into());
+        return;
+    }
+
+    let mut generic_children = Vec::<ItemTreeEntry>::new();
+    let mut variants = Vec::<EnumVariant>::new();
+    for ((_, ast_child), child) in expected_children.iter().zip(&entry.children) {
+        let (expected_kind, ast_id, name_node, child_syntax) = match ast_child {
+            EnumChild::Generic(ast::GenericParam::Type(parameter)) => (
+                ItemTreeKind::TypeParam,
+                input.ast_ids.ast_id(parameter).map(|id| id.erase()),
+                parameter.name(),
+                parameter.syntax().clone(),
+            ),
+            EnumChild::Generic(ast::GenericParam::Const(parameter)) => (
+                ItemTreeKind::ConstParam,
+                input.ast_ids.ast_id(parameter).map(|id| id.erase()),
+                parameter.name(),
+                parameter.syntax().clone(),
+            ),
+            EnumChild::Variant(variant) => (
+                ItemTreeKind::Variant,
+                input.ast_ids.ast_id(variant).map(|id| id.erase()),
+                variant.name(),
+                variant.syntax().clone(),
+            ),
         };
-        let parent_len = def_path.data().len();
-        let exact_path = field_def_path.data().len() == parent_len + 1
-            && &field_def_path.data()[..parent_len] == def_path.data()
-            && field_def_path.data().last().is_some_and(|component| {
-                component.data == DefPathData::Field(field_entry.name)
-                    && component.disambiguator == ordinal
-            });
-        if !exact_path {
+        if child.kind != expected_kind {
             reasons.insert(
-                "a record field DefPath disagrees with its parent, name, or sibling order".into(),
+                "an enum's ItemTree child kind or source order does not match its snapshot AST"
+                    .to_owned(),
             );
             return;
         }
-        let field_def_path_hash = match DefPathHash::compute(&field_def_path, packages, symbols) {
-            Ok(hash) => Fingerprint::new(hash.raw()),
-            Err(_) => {
-                reasons.insert("a record field definition path hash cannot be computed".into());
+        if ast_id != Some(child.ast_id) {
+            reasons.insert("an enum ItemTree child ID does not match its snapshot AST".into());
+            return;
+        }
+        let Some(child_pointer) = input.ast_ids.pointer(child.ast_id) else {
+            reasons.insert("an enum ItemTree child ID has no source pointer".into());
+            return;
+        };
+        let Some(expected_child_pointer) =
+            sai_syntax::SyntaxNodePtr::new(file_id, &child_syntax).ok()
+        else {
+            reasons.insert("an enum AST child cannot be bound to its source file".into());
+            return;
+        };
+        if !child_pointer.is_same_source_node(&expected_child_pointer) {
+            reasons.insert(
+                "an enum ItemTree child source pointer identifies a different AST node".into(),
+            );
+            return;
+        }
+        if child.name == Symbol::ERROR {
+            reasons.insert("an enum ItemTree child has no valid name".to_owned());
+            return;
+        }
+        let child_name = match symbols.resolve(child.name) {
+            Ok(name) if !name.is_empty() => name.to_string(),
+            _ => {
+                reasons.insert("an enum ItemTree child name cannot be resolved".to_owned());
                 return;
             }
         };
-        let field_fingerprint = match declaration_fingerprint(
-            SymbolKind::Field,
-            field_syntax,
-            Some(field_name_token),
-        ) {
-            Ok(fingerprint) => fingerprint,
-            Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+        let Some(name_node) = name_node else {
+            reasons.insert("an enum AST child has no name node".to_owned());
+            return;
+        };
+        let Some(child_name_token) = name_node.token() else {
+            reasons.insert("an enum AST child has no name token".to_owned());
+            return;
+        };
+        let raw_child_name = child_name_token
+            .text()
+            .strip_prefix("r#")
+            .unwrap_or(child_name_token.text());
+        if sai_syntax::normalize_identifier(raw_child_name) != child_name {
+            reasons.insert("the enum ItemTree and AST child names disagree".to_owned());
+            return;
+        }
+        if syntax_has_errors(&child_syntax) || child_name_token.has_error() {
+            reasons.insert("an enum AST child contains recovery or parse errors".to_owned());
+            return;
+        }
+        if input
+            .parser_diagnostics
+            .iter()
+            .any(|diagnostic| parser_diagnostic_overlaps_syntax(diagnostic, file_id, &child_syntax))
+        {
+            reasons.insert("an enum child syntax node has a parser diagnostic".to_owned());
+            return;
+        }
+
+        match ast_child {
+            EnumChild::Generic(_) => {
+                if !child.children.is_empty() {
+                    reasons.insert(
+                        "an enum generic parameter has unexpected child declarations".into(),
+                    );
+                    return;
+                }
+                generic_children.push(child.clone());
+            }
+            EnumChild::Variant(variant) => {
+                let mut fields = Vec::new();
+                if let Some(shape) = variant.record_shape() {
+                    let ast_fields = shape.fields().collect::<Vec<_>>();
+                    if child.children.len() != ast_fields.len() {
+                        reasons.insert(
+                            "a record variant's ItemTree field count does not match its snapshot AST"
+                                .to_owned(),
+                        );
+                        return;
+                    }
+                    let mut field_names = HashSet::<String>::new();
+                    for (field, field_entry) in ast_fields.iter().zip(&child.children) {
+                        let Some(field_id) = input.ast_ids.ast_id(field).map(|id| id.erase())
+                        else {
+                            reasons
+                                .insert("a record variant field has no snapshot AST ID".to_owned());
+                            return;
+                        };
+                        if field_entry.kind != ItemTreeKind::VariantField {
+                            reasons.insert(
+                                "a record variant ItemTree field kind or order does not match its snapshot AST"
+                                    .to_owned(),
+                            );
+                            return;
+                        }
+                        if field_entry.ast_id != field_id {
+                            reasons.insert(
+                                "a record variant ItemTree field ID does not match its snapshot AST"
+                                    .to_owned(),
+                            );
+                            return;
+                        }
+                        let Some(field_pointer) = input.ast_ids.pointer(field_entry.ast_id) else {
+                            reasons.insert(
+                                "a record variant field ID has no source pointer".to_owned(),
+                            );
+                            return;
+                        };
+                        let Some(expected_field_pointer) =
+                            sai_syntax::SyntaxNodePtr::new(file_id, field.syntax()).ok()
+                        else {
+                            reasons.insert(
+                                "a record variant field AST cannot be bound to its source file"
+                                    .to_owned(),
+                            );
+                            return;
+                        };
+                        if !field_pointer.is_same_source_node(&expected_field_pointer) {
+                            reasons.insert(
+                                "a record variant field source pointer identifies a different AST node"
+                                    .to_owned(),
+                            );
+                            return;
+                        }
+                        if !field_entry.children.is_empty() {
+                            reasons.insert(
+                                "a record variant field has unexpected nested declarations"
+                                    .to_owned(),
+                            );
+                            return;
+                        }
+                        if field_entry.name == Symbol::ERROR {
+                            reasons.insert(
+                                "a record variant field has no valid ItemTree name".to_owned(),
+                            );
+                            return;
+                        }
+                        let field_name = match symbols.resolve(field_entry.name) {
+                            Ok(name) if !name.is_empty() => name.to_string(),
+                            _ => {
+                                reasons.insert(
+                                    "a record variant field name cannot be resolved".to_owned(),
+                                );
+                                return;
+                            }
+                        };
+                        let Some(field_name_node) = field.name() else {
+                            reasons
+                                .insert("a record variant field AST has no name node".to_owned());
+                            return;
+                        };
+                        let Some(field_name_token) = field_name_node.token() else {
+                            reasons
+                                .insert("a record variant field AST has no name token".to_owned());
+                            return;
+                        };
+                        let raw_field_name = field_name_token
+                            .text()
+                            .strip_prefix("r#")
+                            .unwrap_or(field_name_token.text());
+                        if sai_syntax::normalize_identifier(raw_field_name) != field_name {
+                            reasons.insert(
+                                "the record variant ItemTree and AST field names disagree"
+                                    .to_owned(),
+                            );
+                            return;
+                        }
+                        if !field_names.insert(field_name.clone()) {
+                            reasons.insert(format!(
+                                "enum `{name}` variant `{child_name}` has duplicate field name `{field_name}`"
+                            ));
+                        }
+                        if field.ty().is_none() {
+                            reasons
+                                .insert("a record variant field has no declared type".to_owned());
+                            return;
+                        }
+                        if syntax_has_errors(field.syntax()) || field_name_token.has_error() {
+                            reasons.insert(
+                                "a record variant field AST contains recovery or parse errors"
+                                    .to_owned(),
+                            );
+                            return;
+                        }
+                        fields.push(EnumVariantField {
+                            entry: field_entry.clone(),
+                            name: field_name,
+                            syntax: field.syntax().clone(),
+                            name_token: field_name_token,
+                        });
+                    }
+                } else {
+                    if !child.children.is_empty() {
+                        reasons.insert(
+                            "a unit or tuple enum variant has unexpected ItemTree children".into(),
+                        );
+                        return;
+                    }
+                    if variant.tuple_shape().is_some() {
+                        reasons.insert(
+                            "tuple variant payload symbols are outside the supported enum inventory"
+                                .to_owned(),
+                        );
+                    }
+                }
+                variants.push(EnumVariant {
+                    entry: child.clone(),
+                    name: child_name,
+                    syntax: child_syntax,
+                    name_token: child_name_token,
+                    fields,
+                });
+            }
+        }
+    }
+
+    let canonical_path = format!(
+        "{}{}.{name}",
+        package_identity,
+        module_path
+            .iter()
+            .map(|segment| format!("/{segment}"))
+            .collect::<String>()
+    );
+    if !canonical_paths.insert(canonical_path.clone()) {
+        reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+    }
+
+    let owner_component = DefPathData::TypeNs(entry.name);
+    let Some(item_position) = input
+        .filtered
+        .item_tree
+        .items
+        .iter()
+        .position(|candidate| candidate.ast_id == entry.ast_id)
+    else {
+        reasons.insert("a target-filtered enum is absent from its module ItemTree".to_owned());
+        return;
+    };
+    let owner_disambiguator = input.filtered.item_tree.items[..item_position]
+        .iter()
+        .filter(|candidate| DefPathData::TypeNs(candidate.name) == owner_component)
+        .count();
+    let Ok(owner_disambiguator) = u32::try_from(owner_disambiguator) else {
+        reasons.insert("an enum owner DefPath disambiguator overflowed".to_owned());
+        return;
+    };
+    let def_path = match def_paths.resolve(descriptor.owner.def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        Ok(Some(_)) => {
+            reasons
+                .insert("an enum owner resolves to a definition path from another package".into());
+            return;
+        }
+        Ok(None) => {
+            reasons.insert("an enum owner has no canonical definition path".to_owned());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("an enum owner definition path cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let path_matches_declaration = def_path.data().len() == module_path.len() + 1
+        && def_path
+            .data()
+            .iter()
+            .take(module_path.len())
+            .zip(module_path)
+            .all(|(component, name)| {
+                component.disambiguator == 0
+                    && matches!(&component.data, DefPathData::Module(segment)
+                        if symbols.resolve(*segment).is_ok_and(|resolved| resolved.as_ref() == name))
+            })
+        && def_path.data().last().is_some_and(|component| {
+            component.data == owner_component && component.disambiguator == owner_disambiguator
+        });
+    if !path_matches_declaration {
+        reasons.insert(
+            "the enum DefPath does not match its module, TypeNs name, or disambiguator".into(),
+        );
+        return;
+    }
+    let def_path_hash = match DefPathHash::compute(&def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert("an enum definition path hash cannot be computed".to_owned());
+            return;
+        }
+    };
+    let fingerprint = match declaration_fingerprint(SymbolKind::Enum, &syntax, Some(&name_token)) {
+        Ok(fingerprint) => fingerprint,
+        Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+            reasons.insert("an enum name token is outside its declaration syntax node".into());
+            return;
+        }
+    };
+    current_symbols.push(CurrentSymbol::new(
+        canonical_path.clone(),
+        def_path_hash,
+        SymbolKind::Enum,
+        fingerprint,
+    ));
+
+    collect_item_generic_params(
+        &generic_children,
+        declaration.generic_params(),
+        &canonical_path,
+        descriptor.owner.def_id,
+        &def_path,
+        input,
+        package_id,
+        "enum",
+        canonical_paths,
+        current_symbols,
+        reasons,
+        def_paths,
+        packages,
+        symbols,
+    );
+
+    let mut variant_disambiguators = HashMap::<Symbol, u32>::new();
+    let mut variant_paths = Vec::with_capacity(variants.len());
+    for variant in &variants {
+        let disambiguator = variant_disambiguators
+            .entry(variant.entry.name)
+            .or_default();
+        let ordinal = *disambiguator;
+        let Some(next) = ordinal.checked_add(1) else {
+            reasons.insert("enum variant DefPath disambiguator overflowed".to_owned());
+            return;
+        };
+        *disambiguator = next;
+        variant_paths.push((variant.entry.name, ordinal));
+    }
+    let variant_def_ids = match def_paths.intern_variants(descriptor.owner.def_id, &variant_paths) {
+        Ok(def_ids) if def_ids.len() == variants.len() => def_ids,
+        Ok(_) => {
+            reasons.insert("HIR returned the wrong number of enum variant definitions".into());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("enum variant definitions cannot be interned".to_owned());
+            return;
+        }
+    };
+    let mut variant_symbols = Vec::with_capacity(variants.len());
+    let mut variant_def_paths = Vec::with_capacity(variants.len());
+    for ((variant, def_id), (_, ordinal)) in
+        variants.iter().zip(&variant_def_ids).zip(&variant_paths)
+    {
+        let variant_def_path = match def_paths.resolve(*def_id) {
+            Ok(Some(path)) if path.package() == package_id => path,
+            _ => {
                 reasons.insert(
-                    "a record field name token is outside its declaration syntax node".into(),
+                    "an enum variant has no definition path in the selected package".into(),
                 );
                 return;
             }
         };
-        let field_canonical_path = format!("{canonical_path}.field[{field_name}]");
-        if !canonical_paths.insert(field_canonical_path.clone()) {
+        let parent_len = def_path.data().len();
+        let exact_path = variant_def_path.data().len() == parent_len + 1
+            && &variant_def_path.data()[..parent_len] == def_path.data()
+            && variant_def_path.data().last().is_some_and(|component| {
+                component.data == DefPathData::Variant(variant.entry.name)
+                    && component.disambiguator == *ordinal
+            });
+        if !exact_path {
+            reasons.insert(
+                "an enum variant DefPath disagrees with its parent, name, or sibling order".into(),
+            );
+            return;
+        }
+        let variant_def_path_hash = match DefPathHash::compute(&variant_def_path, packages, symbols)
+        {
+            Ok(hash) => Fingerprint::new(hash.raw()),
+            Err(_) => {
+                reasons.insert("an enum variant definition path hash cannot be computed".into());
+                return;
+            }
+        };
+        let variant_fingerprint = match declaration_fingerprint(
+            SymbolKind::Variant,
+            &variant.syntax,
+            Some(&variant.name_token),
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                reasons.insert(
+                    "an enum variant name token is outside its declaration syntax node".into(),
+                );
+                return;
+            }
+        };
+        let variant_canonical_path = format!("{canonical_path}.{}", variant.name);
+        if !canonical_paths.insert(variant_canonical_path.clone()) {
             reasons.insert(format!(
-                "duplicate canonical symbol path {field_canonical_path}"
+                "duplicate canonical symbol path {variant_canonical_path}"
             ));
         }
-        field_symbols.push(CurrentSymbol::new(
-            field_canonical_path,
-            field_def_path_hash,
-            SymbolKind::Field,
-            field_fingerprint,
+        variant_symbols.push(CurrentSymbol::new(
+            variant_canonical_path,
+            variant_def_path_hash,
+            SymbolKind::Variant,
+            variant_fingerprint,
         ));
+        variant_def_paths.push(variant_def_path);
     }
-    current_symbols.extend(field_symbols);
+    current_symbols.extend(variant_symbols);
+
+    let mut field_disambiguators = Vec::<u32>::new();
+    let mut field_paths = Vec::<(sai_hir::LocalDefId, Symbol, u32)>::new();
+    for (variant_index, variant) in variants.iter().enumerate() {
+        let variant_def_id = variant_def_ids[variant_index];
+        let mut next_disambiguator = HashMap::<Symbol, u32>::new();
+        for field in &variant.fields {
+            let disambiguator = next_disambiguator.entry(field.entry.name).or_default();
+            let ordinal = *disambiguator;
+            let Some(next) = ordinal.checked_add(1) else {
+                reasons.insert("record variant field DefPath disambiguator overflowed".into());
+                return;
+            };
+            *disambiguator = next;
+            field_disambiguators.push(ordinal);
+            field_paths.push((variant_def_id, field.entry.name, ordinal));
+        }
+    }
+    let field_def_ids = match def_paths.intern_fields_for_parents(&field_paths) {
+        Ok(def_ids) if def_ids.len() == field_paths.len() => def_ids,
+        Ok(_) => {
+            reasons.insert("HIR returned the wrong number of record variant fields".into());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("record variant fields cannot be interned".to_owned());
+            return;
+        }
+    };
+    let mut field_def_id_index = 0usize;
+    for (variant, variant_def_path) in variants.iter().zip(&variant_def_paths) {
+        for field in &variant.fields {
+            let field_def_id = field_def_ids[field_def_id_index];
+            let ordinal = field_disambiguators[field_def_id_index];
+            field_def_id_index += 1;
+            let field_canonical_path =
+                format!("{canonical_path}.{}.field[{}]", variant.name, field.name);
+            if !collect_named_field_symbol(
+                &field.entry,
+                &field.syntax,
+                &field.name_token,
+                field_def_id,
+                variant_def_path,
+                ordinal,
+                field_canonical_path,
+                "record variant field",
+                package_id,
+                reasons,
+                canonical_paths,
+                current_symbols,
+                def_paths,
+                packages,
+                symbols,
+            ) {
+                return;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_named_field_symbol(
+    field_entry: &ItemTreeEntry,
+    field_syntax: &SyntaxNode,
+    field_name_token: &sai_syntax::SyntaxToken,
+    field_def_id: LocalDefId,
+    parent_def_path: &sai_hir::DefPath,
+    ordinal: u32,
+    canonical_path: String,
+    field_label: &str,
+    package_id: PackageId,
+    reasons: &mut HashSet<String>,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) -> bool {
+    let field_def_path = match def_paths.resolve(field_def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        _ => {
+            reasons.insert(format!(
+                "a {field_label} has no definition path in the selected package"
+            ));
+            return false;
+        }
+    };
+    let parent_len = parent_def_path.data().len();
+    let exact_path = field_def_path.data().len() == parent_len + 1
+        && &field_def_path.data()[..parent_len] == parent_def_path.data()
+        && field_def_path.data().last().is_some_and(|component| {
+            component.data == DefPathData::Field(field_entry.name)
+                && component.disambiguator == ordinal
+        });
+    if !exact_path {
+        reasons.insert(format!(
+            "a {field_label} DefPath disagrees with its parent, name, or sibling order"
+        ));
+        return false;
+    }
+    let field_def_path_hash = match DefPathHash::compute(&field_def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert(format!(
+                "a {field_label} definition path hash cannot be computed"
+            ));
+            return false;
+        }
+    };
+    let field_fingerprint =
+        match declaration_fingerprint(SymbolKind::Field, field_syntax, Some(field_name_token)) {
+            Ok(fingerprint) => fingerprint,
+            Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                reasons.insert(format!(
+                    "a {field_label} name token is outside its declaration syntax node"
+                ));
+                return false;
+            }
+        };
+    if !canonical_paths.insert(canonical_path.clone()) {
+        reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+    }
+    current_symbols.push(CurrentSymbol::new(
+        canonical_path,
+        field_def_path_hash,
+        SymbolKind::Field,
+        field_fingerprint,
+    ));
+    true
 }
 
 #[allow(clippy::too_many_arguments)]
