@@ -26634,11 +26634,20 @@ world app { import acme:dep/api; }\n",
             symbol.path() == "acme:phase1.api.Handle.close"
                 && symbol.kind() == sai_semantic::SymbolKind::AssocFn
         }));
+        assert!(mixed_members.symbols().iter().any(|symbol| {
+            symbol.path() == "acme:phase1.api.Record"
+                && symbol.kind() == sai_semantic::SymbolKind::Record
+        }));
+        assert!(mixed_members.symbols().iter().any(|symbol| {
+            symbol.path() == "acme:phase1.api.Record.field[value]"
+                && symbol.kind() == sai_semantic::SymbolKind::Field
+        }));
         assert!(
-            mixed_members.symbols().iter().all(|symbol| {
-                !symbol.path().contains("Record") && !symbol.path().contains("State")
-            }),
-            "unsupported interface records and enums stay out of the alias/resource slice"
+            mixed_members
+                .symbols()
+                .iter()
+                .all(|symbol| !symbol.path().contains("State")),
+            "unsupported interface enums stay out of the record/alias/resource slice"
         );
         assert!(
             mixed_members.symbols().iter().any(|symbol| {
@@ -27590,6 +27599,559 @@ world app { import acme:dep/api; }\n",
     }
 
     #[test]
+    fn module_interface_record_inventory_collects_root_nested_fields_and_identity() {
+        let (mut database, module_tree, snapshot, collection) =
+            collect_package_inventory_for_target(
+            b"interface codec {\ntype Message { header: U32\npayload: U64 }\ntype Empty {}\n}\n",
+            b"interface geometry {\ntype Point { x: U32\ny: U32 }\n}\n",
+                "wasm32-core",
+            );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        let actual = inventory
+            .symbols()
+            .iter()
+            .map(|symbol| (symbol.path(), symbol.kind()))
+            .collect::<std::collections::BTreeSet<_>>();
+        for expected in [
+            (
+                "acme:phase1.codec.Message",
+                sai_semantic::SymbolKind::Record,
+            ),
+            (
+                "acme:phase1.codec.Message.field[header]",
+                sai_semantic::SymbolKind::Field,
+            ),
+            (
+                "acme:phase1.codec.Message.field[payload]",
+                sai_semantic::SymbolKind::Field,
+            ),
+            ("acme:phase1.codec.Empty", sai_semantic::SymbolKind::Record),
+            (
+                "acme:phase1/child.geometry",
+                sai_semantic::SymbolKind::Interface,
+            ),
+            (
+                "acme:phase1/child.geometry.Point",
+                sai_semantic::SymbolKind::Record,
+            ),
+            (
+                "acme:phase1/child.geometry.Point.field[x]",
+                sai_semantic::SymbolKind::Field,
+            ),
+            (
+                "acme:phase1/child.geometry.Point.field[y]",
+                sai_semantic::SymbolKind::Field,
+            ),
+        ] {
+            assert!(actual.contains(&expected), "missing symbol {expected:?}");
+        }
+
+        let file = module_tree.modules[0].file;
+        let parsed = sai_syntax::parse(&snapshot, file).expect("record source parses");
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let interface = parsed
+            .root
+            .descendants()
+            .filter_map(ast::InterfaceDecl::cast)
+            .find(|interface| {
+                interface
+                    .name()
+                    .and_then(|name| name.token())
+                    .is_some_and(|token| token.text() == "codec")
+            })
+            .expect("codec interface exists");
+        let record = interface
+            .items()
+            .expect("interface item list exists")
+            .syntax()
+            .children()
+            .filter_map(ast::TypeDecl::cast)
+            .find(|declaration| {
+                declaration
+                    .name()
+                    .and_then(|name| name.token())
+                    .is_some_and(|token| token.text() == "Message")
+            })
+            .expect("Message record exists");
+        let record_name_token = record
+            .name()
+            .and_then(|name| name.token())
+            .expect("record name token exists");
+        let interface_ast_id = database
+            .ast_id_map(&snapshot, file)
+            .expect("current AST ID map exists")
+            .ast_id(&interface)
+            .expect("interface AST ID exists")
+            .erase();
+        let interface_owner = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| {
+                owner.kind == TopLevelOwnerKind::Interface
+                    && owner.file == file
+                    && owner.item_id == interface_ast_id
+            })
+            .expect("interface has its exact Phase 1 owner");
+        let def_paths = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("package DefPath interner exists");
+        let message = database
+            .symbols
+            .intern("Message")
+            .expect("record name interns");
+        let record_def_id = def_paths
+            .intern_children(
+                interface_owner.owner.def_id,
+                &[(DefPathData::TypeNs(message), 0)],
+            )
+            .expect("record DefPath interns")
+            .into_iter()
+            .next()
+            .expect("record DefPath ID exists");
+        let record_def_path = database
+            .resolve_def_path(record_def_id.to_def_id())
+            .expect("record DefId is valid")
+            .expect("record DefPath exists");
+        let record_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.path() == "acme:phase1.codec.Message")
+            .expect("record symbol exists");
+        let expected_record_hash =
+            sai_hir::DefPathHash::compute(&record_def_path, &database.packages, &database.symbols)
+                .expect("record DefPath hash computes");
+        assert_eq!(
+            record_symbol.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(expected_record_hash.raw())
+        );
+        assert_eq!(
+            record_symbol.fingerprint(),
+            sai_semantic::declaration_fingerprint(
+                sai_semantic::SymbolKind::Record,
+                &record.syntax(),
+                Some(&record_name_token),
+            )
+            .expect("record fingerprint uses its actual name token")
+        );
+
+        let fields = record
+            .struct_def()
+            .and_then(|definition| definition.fields())
+            .expect("Message field list exists")
+            .fields()
+            .collect::<Vec<_>>();
+        for (field, name) in fields.iter().zip(["header", "payload"]) {
+            let field_name_token = field
+                .name()
+                .and_then(|name| name.token())
+                .expect("field name token exists");
+            let field_name = database.symbols.intern(name).expect("field name interns");
+            let field_def_id = def_paths
+                .intern_fields(record_def_id, &[(field_name, 0)])
+                .expect("field DefPath interns")
+                .into_iter()
+                .next()
+                .expect("field DefPath ID exists");
+            let field_def_path = database
+                .resolve_def_path(field_def_id.to_def_id())
+                .expect("field DefId is valid")
+                .expect("field DefPath exists");
+            let expected_field_hash = sai_hir::DefPathHash::compute(
+                &field_def_path,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("field DefPath hash computes");
+            let field_symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == format!("acme:phase1.codec.Message.field[{name}]"))
+                .expect("field symbol exists");
+            assert_eq!(
+                field_symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_field_hash.raw())
+            );
+            assert_eq!(
+                field_symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint(
+                    sai_semantic::SymbolKind::Field,
+                    &field.syntax(),
+                    Some(&field_name_token),
+                )
+                .expect("field fingerprint uses its actual name token")
+            );
+        }
+    }
+
+    #[test]
+    fn module_interface_record_inventory_keeps_forbidden_generic_candidates_incomplete() {
+        let (mut database, module_tree, snapshot, collection) =
+            collect_package_inventory_for_target(
+                b"interface api {\ntype Buffer<T, const N: I32> { value: T }\n}\n",
+                b"",
+                "wasm32-core",
+            );
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("GENERIC_INTERFACE_ITEM")
+        ));
+        for (path, kind) in [
+            ("acme:phase1.api.Buffer", sai_semantic::SymbolKind::Record),
+            (
+                "acme:phase1.api.Buffer.generic[T]",
+                sai_semantic::SymbolKind::GenericParam,
+            ),
+            (
+                "acme:phase1.api.Buffer.generic[N]",
+                sai_semantic::SymbolKind::GenericParam,
+            ),
+            (
+                "acme:phase1.api.Buffer.field[value]",
+                sai_semantic::SymbolKind::Field,
+            ),
+        ] {
+            assert!(
+                inventory
+                    .symbols()
+                    .iter()
+                    .any(|symbol| symbol.path() == path && symbol.kind() == kind),
+                "missing structurally valid forbidden candidate {path}"
+            );
+        }
+
+        let file = module_tree.modules[0].file;
+        let parsed = sai_syntax::parse(&snapshot, file).expect("generic record source parses");
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let interface = parsed
+            .root
+            .descendants()
+            .filter_map(ast::InterfaceDecl::cast)
+            .next()
+            .expect("interface exists");
+        let record = interface
+            .items()
+            .expect("interface item list exists")
+            .syntax()
+            .children()
+            .filter_map(ast::TypeDecl::cast)
+            .next()
+            .expect("Buffer record exists");
+        let record_name = database
+            .symbols
+            .intern("Buffer")
+            .expect("record name interns");
+        let interface_ast_id = database
+            .ast_id_map(&snapshot, file)
+            .expect("current AST ID map exists")
+            .ast_id(&interface)
+            .expect("interface AST ID exists")
+            .erase();
+        let interface_owner = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| {
+                owner.kind == TopLevelOwnerKind::Interface
+                    && owner.file == file
+                    && owner.item_id == interface_ast_id
+            })
+            .expect("interface has its exact Phase 1 owner");
+        let def_paths = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("package DefPath interner exists");
+        let record_def_id = def_paths
+            .intern_children(
+                interface_owner.owner.def_id,
+                &[(DefPathData::TypeNs(record_name), 0)],
+            )
+            .expect("record DefPath interns")
+            .into_iter()
+            .next()
+            .expect("record DefPath ID exists");
+        let record_def_path = database
+            .resolve_def_path(record_def_id.to_def_id())
+            .expect("record DefId is valid")
+            .expect("record DefPath exists");
+        let record_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.path() == "acme:phase1.api.Buffer")
+            .expect("record candidate exists");
+        let expected_record_hash =
+            sai_hir::DefPathHash::compute(&record_def_path, &database.packages, &database.symbols)
+                .expect("record DefPath hash computes");
+        assert_eq!(
+            record_symbol.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(expected_record_hash.raw())
+        );
+        let generic_ids = def_paths
+            .intern_generic_params(
+                record_def_id,
+                &[
+                    (
+                        database
+                            .symbols
+                            .intern("T")
+                            .expect("type parameter interns"),
+                        false,
+                        0,
+                    ),
+                    (
+                        database
+                            .symbols
+                            .intern("N")
+                            .expect("const parameter interns"),
+                        true,
+                        0,
+                    ),
+                ],
+            )
+            .expect("generic parameter DefPaths intern");
+        let generic_params = record
+            .generic_params()
+            .expect("generic parameter list exists")
+            .params()
+            .collect::<Vec<_>>();
+        for (((parameter, path), def_id), expected_const) in generic_params
+            .iter()
+            .zip(["T", "N"])
+            .zip(generic_ids)
+            .zip([false, true])
+        {
+            let (name_token, is_const) = match parameter {
+                ast::GenericParam::Type(parameter) => (
+                    parameter
+                        .name()
+                        .and_then(|name| name.token())
+                        .expect("name token exists"),
+                    false,
+                ),
+                ast::GenericParam::Const(parameter) => (
+                    parameter
+                        .name()
+                        .and_then(|name| name.token())
+                        .expect("name token exists"),
+                    true,
+                ),
+            };
+            assert_eq!(is_const, expected_const);
+            let generic_def_path = database
+                .resolve_def_path(def_id.to_def_id())
+                .expect("generic DefId is valid")
+                .expect("generic DefPath exists");
+            let expected_hash = sai_hir::DefPathHash::compute(
+                &generic_def_path,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("generic DefPath hash computes");
+            let path = format!("acme:phase1.api.Buffer.generic[{path}]");
+            let generic_symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == path)
+                .expect("generic parameter candidate exists");
+            assert_eq!(
+                generic_symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+            assert_eq!(
+                generic_symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint(
+                    sai_semantic::SymbolKind::GenericParam,
+                    &parameter.syntax(),
+                    Some(&name_token),
+                )
+                .expect("generic fingerprint uses its actual name token")
+            );
+        }
+    }
+
+    #[test]
+    fn module_interface_record_inventory_uses_shared_type_namespace_source_order() {
+        let cases: [(&str, &[u8], u32); 4] = [
+            (
+                "record then alias and resource",
+                b"interface api {\ntype Shared { value: U32 }\ntype Shared = U32\nresource Shared {}\n}\n",
+                0,
+            ),
+            (
+                "resource then alias and record",
+                b"interface api {\nresource Shared {}\ntype Shared = U32\ntype Shared { value: U32 }\n}\n",
+                2,
+            ),
+            (
+                "alias then resource and record",
+                b"interface api {\ntype Shared = U32\nresource Shared {}\ntype Shared { value: U32 }\n}\n",
+                2,
+            ),
+            (
+                "unsupported enum and alias before record",
+                b"interface api {\nenum Shared { Ready }\ntype Shared = U32\ntype Shared { value: U32 }\n}\n",
+                2,
+            ),
+        ];
+        for (case_name, source, expected_disambiguator) in cases {
+            let (mut database, module_tree, snapshot, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert!(
+                matches!(
+                    inventory.coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { .. }
+                ),
+                "{case_name} contains unsupported or duplicate TypeNs members"
+            );
+            let record_symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| {
+                    symbol.path() == "acme:phase1.api.Shared"
+                        && symbol.kind() == sai_semantic::SymbolKind::Record
+                })
+                .unwrap_or_else(|| panic!("{case_name} retains the record candidate"));
+            let file = module_tree.modules[0].file;
+            let parsed = sai_syntax::parse(&snapshot, file).expect("collision source parses");
+            assert!(
+                parsed.errors.is_empty(),
+                "parse errors: {:?}",
+                parsed.errors
+            );
+            let interface = parsed
+                .root
+                .descendants()
+                .filter_map(ast::InterfaceDecl::cast)
+                .next()
+                .expect("interface exists");
+            let interface_ast_id = database
+                .ast_id_map(&snapshot, file)
+                .expect("current AST ID map exists")
+                .ast_id(&interface)
+                .expect("interface AST ID exists")
+                .erase();
+            let interface_owner = collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .find(|owner| {
+                    owner.kind == TopLevelOwnerKind::Interface
+                        && owner.file == file
+                        && owner.item_id == interface_ast_id
+                })
+                .expect("interface has its exact Phase 1 owner");
+            let shared = database.symbols.intern("Shared").expect("name interns");
+            let def_id = database
+                .def_paths
+                .get(&module_tree.package)
+                .expect("package DefPath interner exists")
+                .intern_children(
+                    interface_owner.owner.def_id,
+                    &[(DefPathData::TypeNs(shared), expected_disambiguator)],
+                )
+                .expect("record DefPath interns")
+                .into_iter()
+                .next()
+                .expect("record DefPath ID exists");
+            let def_path = database
+                .resolve_def_path(def_id.to_def_id())
+                .expect("record DefId is valid")
+                .expect("record DefPath exists");
+            assert!(matches!(
+                def_path.data().last(),
+                Some(component)
+                    if component.data == DefPathData::TypeNs(shared)
+                        && component.disambiguator == expected_disambiguator
+            ));
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&def_path, &database.packages, &database.symbols)
+                    .expect("record DefPath hash computes");
+            assert_eq!(
+                record_symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw()),
+                "{case_name} counts every TypeNs sibling before the record"
+            );
+            if case_name == "unsupported enum and alias before record" {
+                assert!(
+                    inventory.symbols().iter().all(|symbol| {
+                        symbol.path() != "acme:phase1.api.Shared"
+                            || symbol.kind() != sai_semantic::SymbolKind::Enum
+                    }),
+                    "unsupported enum siblings affect ordinals without leaking candidates"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn module_interface_record_inventory_fails_closed_for_malformed_and_invalid_shapes() {
+        let cases: [(&str, &[u8], &str); 5] = [
+            (
+                "malformed record field",
+                b"interface api {\ntype Broken { value: }\n}\n",
+                "Broken",
+            ),
+            (
+                "record with an invalid attribute",
+                b"interface api {\n@deprecated(1) type Invalid { value: U32 }\n}\n",
+                "Invalid",
+            ),
+            (
+                "record with an invalid target predicate",
+                b"interface api {\n@target(\"wasm64-core\") type Filtered { value: U32 }\n}\n",
+                "Filtered",
+            ),
+            (
+                "unsupported enum remains outside the record inventory",
+                b"interface api {\nenum State { Ready }\n}\n",
+                "State",
+            ),
+            (
+                "refined alias remains outside the record inventory",
+                b"interface api {\ntype Positive = U32 where self > 0\n}\n",
+                "Positive",
+            ),
+        ];
+        for (case_name, source, unsupported_name) in cases {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert!(
+                matches!(
+                    inventory.coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { .. }
+                ),
+                "{case_name} must not yield complete interface-record coverage"
+            );
+            assert!(
+                inventory.symbols().iter().all(|symbol| {
+                    symbol.path() != format!("acme:phase1.api.{unsupported_name}")
+                        && !symbol
+                            .path()
+                            .starts_with(&format!("acme:phase1.api.{unsupported_name}."))
+                }),
+                "{case_name} must not leak a malformed or unsupported member candidate"
+            );
+        }
+    }
+
+    #[test]
     fn module_interface_alias_inventory_keeps_plain_root_and_nested_aliases_complete() {
         let (_, _, _, collection) = collect_package_inventory_for_target(
             b"interface codec {\ntype Word = U64\n}\n",
@@ -27626,12 +28188,7 @@ world app { import acme:dep/api; }\n",
 
     #[test]
     fn module_interface_alias_inventory_fails_closed_for_unsupported_and_invalid_forms() {
-        let cases: [(&str, &[u8], &str); 6] = [
-            (
-                "interface record remains unsupported",
-                b"interface api {\ntype Record { value: U32 }\n}\n",
-                "Record",
-            ),
+        let cases: [(&str, &[u8], &str); 5] = [
             (
                 "interface enum remains unsupported",
                 b"interface api {\nenum State { Ready }\n}\n",
