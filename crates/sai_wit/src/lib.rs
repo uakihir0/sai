@@ -24,11 +24,12 @@ pub use loader::*;
 pub use model::*;
 pub use printer::*;
 pub use source_scan::{
-    AuthoredEnumCaseTokens, AuthoredInterfaceAliasTokens, AuthoredInterfaceEnumTokens,
-    AuthoredInterfaceFunctionTokens, AuthoredInterfaceRecordTokens,
-    AuthoredInterfaceResourceTokens, AuthoredInterfaceVariantTokens, AuthoredRecordFieldTokens,
-    AuthoredResourceMemberTokens, AuthoredVariantCaseTokens, authored_interface_alias_tokens,
-    authored_interface_enum_tokens, authored_interface_function_tokens,
+    AuthoredEnumCaseTokens, AuthoredFlagTokens, AuthoredInterfaceAliasTokens,
+    AuthoredInterfaceEnumTokens, AuthoredInterfaceFlagsTokens, AuthoredInterfaceFunctionTokens,
+    AuthoredInterfaceRecordTokens, AuthoredInterfaceResourceTokens, AuthoredInterfaceVariantTokens,
+    AuthoredRecordFieldTokens, AuthoredResourceMemberTokens, AuthoredVariantCaseTokens,
+    authored_interface_alias_tokens, authored_interface_enum_tokens,
+    authored_interface_flags_tokens, authored_interface_function_tokens,
     authored_interface_record_tokens, authored_interface_resource_tokens,
     authored_interface_variant_tokens,
 };

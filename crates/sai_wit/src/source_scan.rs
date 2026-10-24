@@ -12,6 +12,7 @@ pub(super) struct SourceScan {
     pub alias_declarations: Vec<SourceInterfaceAlias>,
     pub record_declarations: Vec<SourceInterfaceRecord>,
     pub enum_declarations: Vec<SourceInterfaceEnum>,
+    pub flags_declarations: Vec<SourceInterfaceFlags>,
     pub variant_declarations: Vec<SourceInterfaceVariant>,
     pub resource_declarations: Vec<SourceInterfaceResource>,
 }
@@ -60,6 +61,32 @@ pub struct AuthoredInterfaceEnumTokens {
     pub token_pairs: Vec<(String, String)>,
     /// Unit cases in source order.
     pub cases: Vec<AuthoredEnumCaseTokens>,
+}
+
+/// Source declaration and direct flag boundaries for one authored interface
+/// flags type. Individual flag boundaries validate parent ownership and order;
+/// they do not represent independent source symbols.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoredInterfaceFlagsTokens {
+    /// Exact UTF-8 byte range from attached attributes through the closing `}`.
+    pub declaration_range: Range<usize>,
+    /// Ordered parser-aligned token pairs for the whole flags type. The flags
+    /// type name token is present with empty text; flag names remain visible.
+    pub token_pairs: Vec<(String, String)>,
+    /// Direct flag names in source order.
+    pub flags: Vec<AuthoredFlagTokens>,
+}
+
+/// Source boundary and name-masked tokens for one flag within its parent type.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoredFlagTokens {
+    pub name: String,
+    /// Exact byte range of the flag-name token.
+    pub name_range: Range<usize>,
+    /// Exact UTF-8 byte range from attached attributes through the flag name.
+    pub declaration_range: Range<usize>,
+    /// Ordered parser-aligned token pairs. This flag's name token is masked.
+    pub token_pairs: Vec<(String, String)>,
 }
 
 /// Source declaration and direct case boundaries for one authored interface
@@ -177,6 +204,16 @@ pub(super) struct SourceInterfaceEnum {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceInterfaceFlags {
+    pub interface_name: String,
+    pub name: String,
+    pub name_range: Range<usize>,
+    pub declaration_range: Range<usize>,
+    pub token_pairs: Vec<(String, String)>,
+    pub flags: Vec<SourceFlag>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceInterfaceVariant {
     pub interface_name: String,
     pub name: String,
@@ -215,6 +252,14 @@ pub(super) struct SourceRecordField {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceEnumCase {
+    pub name: String,
+    pub name_range: Range<usize>,
+    pub declaration_range: Range<usize>,
+    pub token_pairs: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceFlag {
     pub name: String,
     pub name_range: Range<usize>,
     pub declaration_range: Range<usize>,
@@ -474,6 +519,7 @@ pub(super) fn scan_source(source: &str) -> SourceScan {
         alias_declarations: scan_interface_aliases(source, &tokens),
         record_declarations: scan_interface_records(source, &tokens),
         enum_declarations: scan_interface_enums(source, &tokens),
+        flags_declarations: scan_interface_flags(source, &tokens),
         variant_declarations: scan_interface_variants(source, &tokens),
         resource_declarations: scan_interface_resources(source, &tokens),
     }
@@ -1055,6 +1101,46 @@ pub fn authored_interface_enum_tokens(
     })
 }
 
+/// Scans authored WIT source and returns one direct interface flags type only
+/// when its parsed name-token span identifies exactly one lexical declaration.
+///
+/// The parent token sequence retains ordered flag names while masking only the
+/// flags type name. Per-flag ranges validate source/model order; flags are not
+/// returned as independent source symbols.
+pub fn authored_interface_flags_tokens(
+    source: &str,
+    interface_name: &str,
+    name: &str,
+    name_range: &Range<usize>,
+) -> Option<AuthoredInterfaceFlagsTokens> {
+    let mut matches = scan_source(source)
+        .flags_declarations
+        .into_iter()
+        .filter(|declaration| {
+            declaration.interface_name == interface_name
+                && declaration.name == name
+                && &declaration.name_range == name_range
+        });
+    let declaration = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(AuthoredInterfaceFlagsTokens {
+        declaration_range: declaration.declaration_range,
+        token_pairs: declaration.token_pairs,
+        flags: declaration
+            .flags
+            .into_iter()
+            .map(|flag| AuthoredFlagTokens {
+                name: flag.name,
+                name_range: flag.name_range,
+                declaration_range: flag.declaration_range,
+                token_pairs: flag.token_pairs,
+            })
+            .collect(),
+    })
+}
+
 /// Scans authored WIT source and returns one direct interface variant only
 /// when its parsed name-token span identifies exactly one lexical declaration.
 ///
@@ -1156,6 +1242,117 @@ fn scan_interface_enums(source: &str, tokens: &[Token]) -> Vec<SourceInterfaceEn
         }
     }
     declarations
+}
+
+fn scan_interface_flags(source: &str, tokens: &[Token]) -> Vec<SourceInterfaceFlags> {
+    let mut declarations = Vec::new();
+    for (interface_index, interface_token) in tokens.iter().enumerate() {
+        if !is_identifier(source, interface_token, "interface") {
+            continue;
+        }
+        let Some(interface_name_token) = tokens.get(interface_index + 1) else {
+            continue;
+        };
+        let Some(interface_name) = wit_identifier_text(source, interface_name_token) else {
+            continue;
+        };
+        let open_index = interface_index + 2;
+        if !tokens
+            .get(open_index)
+            .is_some_and(|token| token.kind == TokenKind::Punctuation(b'{'))
+        {
+            continue;
+        }
+        let Some(interface_end) = matching_delimiter(tokens, open_index, b'{', b'}') else {
+            continue;
+        };
+
+        let mut item_index = open_index + 1;
+        while item_index < interface_end {
+            let declaration_index = match skip_attributes(tokens, item_index, interface_end) {
+                Some(index) if index < interface_end => index,
+                _ => break,
+            };
+            if is_identifier(source, &tokens[declaration_index], "flags")
+                && let Some((declaration, next_index)) = scan_interface_flags_type(
+                    source,
+                    tokens,
+                    interface_name,
+                    declaration_index,
+                    interface_end,
+                )
+            {
+                declarations.push(declaration);
+                item_index = next_index;
+                continue;
+            }
+
+            // Skip complete direct items, including use lists and nested
+            // declaration bodies, so nested `flags` tokens are not promoted.
+            if tokens[declaration_index].kind == TokenKind::Punctuation(b'{')
+                && let Some(nested_end) = matching_delimiter(tokens, declaration_index, b'{', b'}')
+            {
+                item_index = nested_end + 1;
+            } else if let Some(end_index) =
+                item_end_at_top_level(tokens, declaration_index, interface_end)
+            {
+                item_index = end_index;
+            } else {
+                item_index = declaration_index + 1;
+            }
+        }
+    }
+    declarations
+}
+
+fn scan_interface_flags_type(
+    source: &str,
+    tokens: &[Token],
+    interface_name: &str,
+    flags_index: usize,
+    interface_end: usize,
+) -> Option<(SourceInterfaceFlags, usize)> {
+    let name_index = flags_index.checked_add(1)?;
+    let name_token = tokens.get(name_index)?;
+    let name = wit_identifier_text(source, name_token)?;
+    let open_index = name_index.checked_add(1)?;
+    if tokens.get(open_index)?.kind != TokenKind::Punctuation(b'{') {
+        return None;
+    }
+    let close_index = matching_delimiter(tokens, open_index, b'{', b'}')?;
+    if close_index >= interface_end {
+        return None;
+    }
+    let declaration_start = attached_attributes_start(tokens, flags_index)
+        .map_or(tokens[flags_index].range.start, |index| {
+            tokens[index].range.start
+        });
+    let declaration_range = declaration_start..tokens[close_index].range.end;
+    let token_pairs = function_token_pairs(source, tokens, &declaration_range, &name_token.range)?;
+    let flags = scan_enum_cases(source, tokens, open_index + 1, close_index)?
+        .into_iter()
+        .map(|flag| SourceFlag {
+            name: flag.name,
+            name_range: flag.name_range,
+            declaration_range: flag.declaration_range,
+            token_pairs: flag.token_pairs,
+        })
+        .collect::<Vec<_>>();
+    let mut names = HashSet::new();
+    if flags.iter().any(|flag| !names.insert(flag.name.as_str())) {
+        return None;
+    }
+    Some((
+        SourceInterfaceFlags {
+            interface_name: interface_name.to_owned(),
+            name: name.to_owned(),
+            name_range: name_token.range.clone(),
+            declaration_range,
+            token_pairs,
+            flags,
+        },
+        close_index + 1,
+    ))
 }
 
 fn scan_interface_variants(source: &str, tokens: &[Token]) -> Vec<SourceInterfaceVariant> {
@@ -2739,12 +2936,12 @@ fn is_keylike_continue(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceFunctionDeclaration, SourceInterfaceAlias, SourceInterfaceEnum,
+        SourceFunctionDeclaration, SourceInterfaceAlias, SourceInterfaceEnum, SourceInterfaceFlags,
         SourceInterfaceRecord, SourceInterfaceResource, SourceInterfaceVariant,
         authored_interface_alias_tokens, authored_interface_enum_tokens,
-        authored_interface_record_tokens, authored_interface_resource_tokens,
-        authored_interface_variant_tokens, lex, scan_foreign_references, scan_source,
-        stable_wit_token_kind, world_include_docs,
+        authored_interface_flags_tokens, authored_interface_record_tokens,
+        authored_interface_resource_tokens, authored_interface_variant_tokens, lex,
+        scan_foreign_references, scan_source, stable_wit_token_kind, world_include_docs,
     };
 
     fn function(source: &str, name: &str) -> SourceFunctionDeclaration {
@@ -2769,6 +2966,14 @@ mod tests {
             .into_iter()
             .find(|declaration| declaration.name == name)
             .expect("direct interface enum")
+    }
+
+    fn interface_flags(source: &str, name: &str) -> SourceInterfaceFlags {
+        scan_source(source)
+            .flags_declarations
+            .into_iter()
+            .find(|declaration| declaration.name == name)
+            .expect("direct interface flags type")
     }
 
     fn interface_variant(source: &str, name: &str) -> SourceInterfaceVariant {
@@ -3132,6 +3337,164 @@ mod tests {
         ] {
             assert!(
                 scan_source(invalid).enum_declarations.is_empty(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_flags_ranges_preserve_order_and_mask_only_the_parent_name() {
+        let source = concat!(
+            "interface api {\n",
+            "  @since(version = 1.2.3)\n",
+            "  flags %permissions {\n",
+            "    @deprecated(version = 2.0.0)\n",
+            "    read-only,\n",
+            "    write,\n",
+            "    %type,\n",
+            "  }\n",
+            "}\n",
+        );
+        let declaration = interface_flags(source, "permissions");
+        let name_start = source.find("%permissions").expect("flags type name occurs");
+        let name_range = name_start..name_start + "%permissions".len();
+        assert_eq!(declaration.interface_name, "api");
+        assert_eq!(declaration.name_range, name_range);
+        assert_eq!(
+            &source[declaration.declaration_range.clone()],
+            "@since(version = 1.2.3)\n  flags %permissions {\n    @deprecated(version = 2.0.0)\n    read-only,\n    write,\n    %type,\n  }"
+        );
+        assert_eq!(
+            declaration
+                .flags
+                .iter()
+                .map(|flag| flag.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read-only", "write", "type"]
+        );
+        assert_eq!(
+            declaration
+                .token_pairs
+                .iter()
+                .filter(|(_, text)| text.is_empty())
+                .count(),
+            1,
+            "only the parent type name is masked in the whole declaration"
+        );
+        assert!(
+            declaration
+                .token_pairs
+                .iter()
+                .any(|(_, text)| text == "read-only")
+                && declaration
+                    .token_pairs
+                    .iter()
+                    .any(|(_, text)| text == "%type"),
+            "flag names remain visible in the parent fingerprint"
+        );
+        assert_eq!(
+            declaration.flags[0].token_pairs[0].1, "@",
+            "flag attributes are part of the flag's source span"
+        );
+        assert_eq!(
+            declaration.flags[0]
+                .token_pairs
+                .iter()
+                .filter(|(_, text)| text.is_empty())
+                .count(),
+            1,
+            "each boundary can mask its own flag name for source identity checks"
+        );
+
+        let selected = authored_interface_flags_tokens(source, "api", "permissions", &name_range)
+            .expect("the exact parsed parent-name span selects these flags");
+        assert_eq!(selected.declaration_range, declaration.declaration_range);
+        assert_eq!(selected.token_pairs, declaration.token_pairs);
+        assert_eq!(selected.flags.len(), 3);
+        assert!(
+            authored_interface_flags_tokens(source, "other", "permissions", &name_range).is_none(),
+            "another interface cannot claim the direct declaration"
+        );
+        assert!(
+            authored_interface_flags_tokens(source, "api", "permissions", &(0..0)).is_none(),
+            "an absent parser name span cannot select a flags type"
+        );
+    }
+
+    #[test]
+    fn flags_parent_fingerprint_keeps_ordered_flag_names() {
+        fn parent(source: &str, name: &str) -> Vec<(String, String)> {
+            interface_flags(source, name).token_pairs
+        }
+
+        let original = parent("interface api { flags access { read, write } }", "access");
+        let renamed = parent(
+            "interface api { flags permission-set { read, write } }",
+            "permission-set",
+        );
+        let reordered = parent("interface api { flags access { write, read } }", "access");
+        let changed = parent("interface api { flags access { read, execute } }", "access");
+        assert_eq!(
+            original, renamed,
+            "the flags type's own name is the only masked name"
+        );
+        assert_ne!(
+            original, reordered,
+            "flag declaration order affects the parent fingerprint"
+        );
+        assert_ne!(
+            original, changed,
+            "changing a flag name affects the parent fingerprint"
+        );
+    }
+
+    #[test]
+    fn flags_scanner_excludes_use_members_and_nested_keyword_occurrences() {
+        let source = concat!(
+            "interface types { flags imported { remote } }\n",
+            "interface api {\n",
+            "  use types.{imported as flags};\n",
+            "  record holder { value: tuple<flags, u32> }\n",
+            "  variant outcome { nested(flags) }\n",
+            "  resource store { read: func(); }\n",
+            "  @since(version = 1.0.0) flags direct { visible, }\n",
+            "}\n",
+        );
+        assert_eq!(
+            scan_source(source)
+                .flags_declarations
+                .iter()
+                .map(|declaration| (
+                    declaration.interface_name.as_str(),
+                    declaration.name.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [("types", "imported"), ("api", "direct")],
+            "only direct flags declarations are inventoried"
+        );
+        let declaration = interface_flags(source, "direct");
+        assert_eq!(declaration.flags.len(), 1);
+        assert!(
+            authored_interface_flags_tokens(source, "api", "imported", &declaration.name_range)
+                .is_none(),
+            "a flag type from another interface cannot be selected through a use alias"
+        );
+    }
+
+    #[test]
+    fn flags_scanner_rejects_empty_payload_and_malformed_declarations() {
+        for invalid in [
+            "interface api { flags empty {} }",
+            "interface api { flags payload { read(u32), write } }",
+            "interface api { flags missing-comma { read write } }",
+            "interface api { flags repeated { read, , write } }",
+            "interface api { flags duplicate { read, read } }",
+            "interface api { flags malformed-attribute { @since(version = 1.0.0 read } }",
+            "interface api { flags mismatched { read, write] }",
+            "interface api { flags unfinished { read, write",
+        ] {
+            assert!(
+                scan_source(invalid).flags_declarations.is_empty(),
                 "{invalid}"
             );
         }
