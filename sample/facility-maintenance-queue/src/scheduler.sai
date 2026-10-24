@@ -59,7 +59,8 @@ pub fn plan() -> Plan {
     let orders = data.work_orders()
     let technicians = data.technicians()
     var stock = data.stock()
-    var available_at: Array<U32, 3> = [420, 420, 480]
+    var available_at: Array<U32, 3> =
+        [technicians[0].shift_start, technicians[1].shift_start, technicians[2].shift_start]
     var assignments: Array<Option<Assignment>, 6> = [None, None, None, None, None, None]
     var assignment_count: USize = 0
     var scheduled_count: U32 = 0
