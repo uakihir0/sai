@@ -24,8 +24,9 @@ pub use loader::*;
 pub use model::*;
 pub use printer::*;
 pub use source_scan::{
-    AuthoredEnumCaseTokens, AuthoredInterfaceEnumTokens, AuthoredInterfaceFunctionTokens,
-    AuthoredInterfaceResourceTokens, AuthoredResourceMemberTokens, authored_interface_enum_tokens,
+    AuthoredEnumCaseTokens, AuthoredInterfaceAliasTokens, AuthoredInterfaceEnumTokens,
+    AuthoredInterfaceFunctionTokens, AuthoredInterfaceResourceTokens, AuthoredResourceMemberTokens,
+    authored_interface_alias_tokens, authored_interface_enum_tokens,
     authored_interface_function_tokens, authored_interface_resource_tokens,
 };
 pub use view::*;

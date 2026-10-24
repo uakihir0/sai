@@ -9,6 +9,7 @@ pub(super) struct SourceScan {
     pub nested_package_ranges: Vec<Range<usize>>,
     pub named_result_function_ranges: Vec<Range<usize>>,
     pub function_declarations: Vec<SourceFunctionDeclaration>,
+    pub alias_declarations: Vec<SourceInterfaceAlias>,
     pub enum_declarations: Vec<SourceInterfaceEnum>,
     pub resource_declarations: Vec<SourceInterfaceResource>,
 }
@@ -59,6 +60,17 @@ pub struct AuthoredInterfaceEnumTokens {
     pub cases: Vec<AuthoredEnumCaseTokens>,
 }
 
+/// Source declaration and name-token boundary for one direct interface type
+/// alias.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoredInterfaceAliasTokens {
+    /// Exact UTF-8 byte range from attached attributes through the semicolon.
+    pub declaration_range: Range<usize>,
+    /// Ordered parser-aligned token pairs. The alias name token is present
+    /// with empty text.
+    pub token_pairs: Vec<(String, String)>,
+}
+
 /// Source declaration and name-token boundary for one unit enum case.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AuthoredEnumCaseTokens {
@@ -105,6 +117,15 @@ pub(super) struct SourceInterfaceEnum {
     pub declaration_range: Range<usize>,
     pub token_pairs: Vec<(String, String)>,
     pub cases: Vec<SourceEnumCase>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceInterfaceAlias {
+    pub interface_name: String,
+    pub name: String,
+    pub name_range: Range<usize>,
+    pub declaration_range: Range<usize>,
+    pub token_pairs: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -356,9 +377,174 @@ pub(super) fn scan_source(source: &str) -> SourceScan {
         nested_package_ranges,
         named_result_function_ranges,
         function_declarations: scan_function_declarations(source, &tokens),
+        alias_declarations: scan_interface_aliases(source, &tokens),
         enum_declarations: scan_interface_enums(source, &tokens),
         resource_declarations: scan_interface_resources(source, &tokens),
     }
+}
+
+/// Scans authored WIT source and returns one direct interface type alias only
+/// when its parsed name-token span identifies exactly one lexical declaration.
+///
+/// `use` declarations are intentionally not aliases: their re-exported names
+/// have the canonical path of their defining declaration.
+pub fn authored_interface_alias_tokens(
+    source: &str,
+    interface_name: &str,
+    name: &str,
+    name_range: &Range<usize>,
+) -> Option<AuthoredInterfaceAliasTokens> {
+    let mut matches = scan_source(source)
+        .alias_declarations
+        .into_iter()
+        .filter(|declaration| {
+            declaration.interface_name == interface_name
+                && declaration.name == name
+                && &declaration.name_range == name_range
+        });
+    let declaration = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(AuthoredInterfaceAliasTokens {
+        declaration_range: declaration.declaration_range,
+        token_pairs: declaration.token_pairs,
+    })
+}
+
+fn scan_interface_aliases(source: &str, tokens: &[Token]) -> Vec<SourceInterfaceAlias> {
+    let mut declarations = Vec::new();
+    for (interface_index, interface_token) in tokens.iter().enumerate() {
+        if !is_identifier(source, interface_token, "interface") {
+            continue;
+        }
+        let Some(interface_name_token) = tokens.get(interface_index + 1) else {
+            continue;
+        };
+        let Some(interface_name) = wit_identifier_text(source, interface_name_token) else {
+            continue;
+        };
+        let open_index = interface_index + 2;
+        if !tokens
+            .get(open_index)
+            .is_some_and(|token| token.kind == TokenKind::Punctuation(b'{'))
+        {
+            continue;
+        }
+        let Some(interface_end) = matching_delimiter(tokens, open_index, b'{', b'}') else {
+            continue;
+        };
+
+        let mut item_index = open_index + 1;
+        while item_index < interface_end {
+            let declaration_index = match skip_attributes(tokens, item_index, interface_end) {
+                Some(index) if index < interface_end => index,
+                _ => break,
+            };
+            if is_identifier(source, &tokens[declaration_index], "type")
+                && let Some((declaration, next_index)) = scan_interface_alias(
+                    source,
+                    tokens,
+                    interface_name,
+                    declaration_index,
+                    interface_end,
+                )
+            {
+                declarations.push(declaration);
+                item_index = next_index;
+                continue;
+            }
+
+            // Skip the current direct item, including nested `use` lists and
+            // record/variant/resource bodies. A type alias-like token inside
+            // an unsupported item must never be promoted as a direct alias.
+            if tokens[declaration_index].kind == TokenKind::Punctuation(b'{')
+                && let Some(nested_end) = matching_delimiter(tokens, declaration_index, b'{', b'}')
+            {
+                item_index = nested_end + 1;
+            } else if let Some(end_index) =
+                item_end_at_top_level(tokens, declaration_index, interface_end)
+            {
+                item_index = end_index;
+            } else {
+                item_index = declaration_index + 1;
+            }
+        }
+    }
+    declarations
+}
+
+fn scan_interface_alias(
+    source: &str,
+    tokens: &[Token],
+    interface_name: &str,
+    type_index: usize,
+    interface_end: usize,
+) -> Option<(SourceInterfaceAlias, usize)> {
+    let name_index = type_index.checked_add(1)?;
+    let name_token = tokens.get(name_index)?;
+    let name = wit_identifier_text(source, name_token)?;
+    let equals_index = name_index.checked_add(1)?;
+    if tokens.get(equals_index)?.kind != TokenKind::Punctuation(b'=') {
+        return None;
+    }
+
+    let mut delimiter_stack = Vec::new();
+    let mut index = equals_index + 1;
+    let semicolon_index = loop {
+        let token = tokens.get(index)?;
+        if index >= interface_end {
+            return None;
+        }
+        match token.kind {
+            TokenKind::Invalid => return None,
+            TokenKind::Punctuation(b'(' | b'<' | b'[' | b'{') => {
+                delimiter_stack.push(token.kind);
+            }
+            TokenKind::Punctuation(b')') => {
+                if delimiter_stack.pop() != Some(TokenKind::Punctuation(b'(')) {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b'>') => {
+                if delimiter_stack.pop() != Some(TokenKind::Punctuation(b'<')) {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b']') => {
+                if delimiter_stack.pop() != Some(TokenKind::Punctuation(b'[')) {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b'}') => {
+                if delimiter_stack.pop() != Some(TokenKind::Punctuation(b'{')) {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b';') if delimiter_stack.is_empty() => break index,
+            _ => {}
+        }
+        index = index.checked_add(1)?;
+    };
+    if semicolon_index == equals_index + 1 {
+        return None;
+    }
+    let declaration_start = attached_attributes_start(tokens, type_index)
+        .map_or(tokens[type_index].range.start, |attribute_index| {
+            tokens[attribute_index].range.start
+        });
+    let declaration_range = declaration_start..tokens[semicolon_index].range.end;
+    let token_pairs = function_token_pairs(source, tokens, &declaration_range, &name_token.range)?;
+    Some((
+        SourceInterfaceAlias {
+            interface_name: interface_name.to_owned(),
+            name: name.to_owned(),
+            name_range: name_token.range.clone(),
+            declaration_range,
+            token_pairs,
+        },
+        semicolon_index + 1,
+    ))
 }
 
 fn scan_function_declarations(source: &str, tokens: &[Token]) -> Vec<SourceFunctionDeclaration> {
@@ -1946,9 +2132,10 @@ fn is_keylike_continue(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceFunctionDeclaration, SourceInterfaceEnum, SourceInterfaceResource,
-        authored_interface_enum_tokens, authored_interface_resource_tokens, lex,
-        scan_foreign_references, scan_source, stable_wit_token_kind, world_include_docs,
+        SourceFunctionDeclaration, SourceInterfaceAlias, SourceInterfaceEnum,
+        SourceInterfaceResource, authored_interface_alias_tokens, authored_interface_enum_tokens,
+        authored_interface_resource_tokens, lex, scan_foreign_references, scan_source,
+        stable_wit_token_kind, world_include_docs,
     };
 
     fn function(source: &str, name: &str) -> SourceFunctionDeclaration {
@@ -1973,6 +2160,101 @@ mod tests {
             .into_iter()
             .find(|declaration| declaration.name == name)
             .expect("direct interface enum")
+    }
+
+    fn interface_alias(source: &str, name: &str) -> SourceInterfaceAlias {
+        scan_source(source)
+            .alias_declarations
+            .into_iter()
+            .find(|declaration| declaration.name == name)
+            .expect("direct interface alias")
+    }
+
+    #[test]
+    fn direct_alias_ranges_include_attributes_and_mask_only_the_name() {
+        let source = concat!(
+            "interface api {\n",
+            "  @since(version = 1.2.3)\n",
+            "  type %type = tuple<u32, result<string, u32>>;\n",
+            "}\n",
+        );
+        let declaration = interface_alias(source, "type");
+        let name_start = source.find("%type").expect("escaped alias name occurs");
+        let name_range = name_start..name_start + "%type".len();
+        assert_eq!(declaration.interface_name, "api");
+        assert_eq!(declaration.name_range, name_range);
+        assert_eq!(
+            &source[declaration.declaration_range.clone()],
+            "@since(version = 1.2.3)\n  type %type = tuple<u32, result<string, u32>>;"
+        );
+        assert_eq!(
+            declaration
+                .token_pairs
+                .iter()
+                .filter(|(_, text)| text.is_empty())
+                .count(),
+            1
+        );
+        assert_eq!(
+            declaration
+                .token_pairs
+                .iter()
+                .find(|(_, text)| text.is_empty())
+                .expect("the alias name token is masked"),
+            &("ExplicitId".into(), String::new())
+        );
+
+        let selected = authored_interface_alias_tokens(source, "api", "type", &name_range)
+            .expect("the exact parser name span selects this direct alias");
+        assert_eq!(selected.declaration_range, declaration.declaration_range);
+        assert_eq!(selected.token_pairs, declaration.token_pairs);
+        assert!(
+            authored_interface_alias_tokens(source, "api", "type", &(0..0)).is_none(),
+            "an absent parser name span cannot identify an alias"
+        );
+    }
+
+    #[test]
+    fn alias_fingerprints_ignore_only_own_name_and_scanner_excludes_non_aliases() {
+        fn token_pairs(source: &str, name: &str) -> Vec<(String, String)> {
+            interface_alias(source, name).token_pairs
+        }
+
+        let original = token_pairs("interface api { type count = u32; }", "count");
+        let renamed = token_pairs("interface api {\n  type size = u32;\n}", "size");
+        let changed_target = token_pairs("interface api { type count = u64; }", "count");
+        assert_eq!(original, renamed);
+        assert_ne!(original, changed_target);
+
+        let source = concat!(
+            "interface api {\n",
+            "  use other.{%type as imported};\n",
+            "  record container { value: tuple<u32, u32> }\n",
+            "  enum state { type, ready }\n",
+            "  type visible = option<tuple<u32, string>>;\n",
+            "}\n",
+        );
+        assert_eq!(
+            scan_source(source)
+                .alias_declarations
+                .iter()
+                .map(|declaration| declaration.name.as_str())
+                .collect::<Vec<_>>(),
+            ["visible"],
+            "use members and nested type-like tokens are not direct aliases"
+        );
+
+        for invalid in [
+            "interface api { type empty = ; }",
+            "interface api { type unclosed = tuple<u32, string; }",
+            "interface api { type mismatched = tuple<u32, string] ; }",
+            "interface api { type missing-semicolon = u32 }",
+        ] {
+            assert!(
+                scan_source(invalid).alias_declarations.is_empty(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

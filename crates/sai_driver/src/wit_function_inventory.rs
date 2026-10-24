@@ -12,8 +12,8 @@ use sai_vfs::{FileContents, FileKey, PackageKey, PackageRelativePath, WitFilesSn
 use sai_wit::{
     WitContract, WitIfaceIdx, WitItem, WitItemIdx, WitItemKind, WitMemberKind, WitPackage,
     WitPackageKind, WitType, WitUnit, WitUnitKind, WitView, WitViewDefKind, WitViewEntity,
-    authored_interface_enum_tokens, authored_interface_function_tokens,
-    authored_interface_resource_tokens, wit_name_to_sai,
+    authored_interface_alias_tokens, authored_interface_enum_tokens,
+    authored_interface_function_tokens, authored_interface_resource_tokens, wit_name_to_sai,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str;
@@ -535,6 +535,22 @@ fn collect_root_interface_symbols(
                     reasons,
                     current_symbols,
                 ),
+                WitItemKind::Alias(_) => collect_root_interface_alias(
+                    view,
+                    view_interface,
+                    interface_index,
+                    item_index,
+                    item,
+                    &interface.name,
+                    &selected_identity,
+                    &expected_interface_name,
+                    source_files,
+                    packages,
+                    symbols_interner,
+                    &mut emitted_paths,
+                    reasons,
+                    current_symbols,
+                ),
                 _ => {
                     reasons.insert(format!(
                         "WIT interface item `{}`.{} is outside this inventory slice",
@@ -543,6 +559,220 @@ fn collect_root_interface_symbols(
                 }
             }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_root_interface_alias(
+    view: &WitView,
+    view_interface: &sai_wit::ViewInterface,
+    interface_index: WitIfaceIdx,
+    item_index: WitItemIdx,
+    item: &WitItem,
+    interface_name: &str,
+    selected_identity: &str,
+    expected_interface_name: &str,
+    source_files: &BTreeMap<String, Arc<str>>,
+    packages: &sai_intern::PackageInterner,
+    symbols_interner: &sai_intern::Interner,
+    emitted_paths: &mut HashSet<String>,
+    reasons: &mut BTreeSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+) {
+    let WitItemKind::Alias(target) = &item.kind else {
+        reasons.insert(format!(
+            "WIT item `{interface_name}.{}` is not a direct type alias",
+            item.name
+        ));
+        return;
+    };
+    if item.unsupported.is_some() || function_uses_unsupported_type_in_alias(target) {
+        reasons.insert(format!(
+            "WIT alias `{interface_name}.{}` uses an unsupported declaration or target type",
+            item.name
+        ));
+        return;
+    }
+
+    let Some(source_alias) = alias_source_identity(item, interface_name, source_files) else {
+        reasons.insert(format!(
+            "WIT alias `{interface_name}.{}` has no exact validated declaration and name span",
+            item.name
+        ));
+        return;
+    };
+    let alias_sai_name = match wit_name_to_sai(&item.name, true) {
+        Ok(name) => name,
+        Err(_) => {
+            reasons.insert(format!(
+                "WIT alias `{interface_name}.{}` has no supported SAI type spelling",
+                item.name
+            ));
+            return;
+        }
+    };
+    let alias_view_name = alias_sai_name.strip_prefix("r#").unwrap_or(&alias_sai_name);
+    let Some(view_member) = view_interface.members.get(alias_view_name) else {
+        reasons.insert(format!(
+            "WIT alias `{interface_name}.{}` is absent from the selected view",
+            item.name
+        ));
+        return;
+    };
+    if view_member.item != item_index
+        || view_member.kind != WitViewDefKind::Alias
+        || view_member.unsupported.is_some()
+    {
+        reasons.insert(format!(
+            "WIT alias `{interface_name}.{}` does not match its selected view item",
+            item.name
+        ));
+        return;
+    }
+
+    let alias_entity = WitViewEntity::Item {
+        interface: interface_index,
+        item: item_index,
+    };
+    let Some(alias_def) = view.definition_for_entity(alias_entity) else {
+        reasons.insert(format!(
+            "WIT alias `{interface_name}.{}` has no selected view definition",
+            item.name
+        ));
+        return;
+    };
+    if view_member.def != alias_def {
+        reasons.insert(format!(
+            "WIT alias `{interface_name}.{}` view member does not identify its model item",
+            item.name
+        ));
+        return;
+    }
+    let Some(alias_definition) = view.definition(alias_def) else {
+        reasons.insert(format!(
+            "WIT alias `{interface_name}.{}` has no current selected view definition",
+            item.name
+        ));
+        return;
+    };
+    if !view_definition_matches_entity(alias_definition, alias_entity, WitViewDefKind::Alias) {
+        reasons.insert(format!(
+            "WIT alias `{interface_name}.{}` view definition does not identify its model item",
+            item.name
+        ));
+        return;
+    }
+    let alias_path = match view.def_path(alias_def) {
+        Ok(Some(path)) => path,
+        _ => {
+            reasons.insert(format!(
+                "WIT alias `{interface_name}.{}` has no canonical definition path",
+                item.name
+            ));
+            return;
+        }
+    };
+    if !alias_path_matches_selected_package(&alias_path, view.package) {
+        reasons.insert(format!(
+            "WIT alias `{interface_name}.{}` definition path belongs to a different package",
+            item.name
+        ));
+        return;
+    }
+    if !view_definition_path_matches_alias(
+        &alias_path,
+        &alias_definition.canonical_path,
+        expected_interface_name,
+        alias_view_name,
+        symbols_interner,
+    ) {
+        reasons.insert(format!(
+            "WIT alias `{interface_name}.{}` does not match its canonical view definition path",
+            item.name
+        ));
+        return;
+    }
+    let Some(alias_hash) = verified_view_path_hash(
+        &alias_path,
+        alias_definition.path_hash,
+        packages,
+        symbols_interner,
+    ) else {
+        reasons.insert(format!(
+            "WIT alias `{interface_name}.{}` definition path hash is inconsistent",
+            item.name
+        ));
+        return;
+    };
+
+    let canonical_alias_path = format!("{selected_identity}/{interface_name}.{alias_view_name}");
+    if !emitted_paths.insert(canonical_alias_path.clone()) {
+        reasons.insert(format!(
+            "WIT alias canonical path `{canonical_alias_path}` is duplicated"
+        ));
+        return;
+    }
+    current_symbols.push(CurrentSymbol::new(
+        canonical_alias_path,
+        alias_hash,
+        SymbolKind::Alias,
+        declaration_fingerprint_from_token_pairs(SymbolKind::Alias, &source_alias.token_pairs),
+    ));
+}
+
+fn alias_source_identity(
+    item: &WitItem,
+    interface_name: &str,
+    source_files: &BTreeMap<String, Arc<str>>,
+) -> Option<sai_wit::AuthoredInterfaceAliasTokens> {
+    let name_span = item.span.as_ref()?;
+    let source = source_files.get(&name_span.path)?;
+    let name_text = source.get(name_span.range.clone())?;
+    if normalized_wit_name(name_text) != Some(item.name.as_str()) {
+        return None;
+    }
+    let scanned =
+        authored_interface_alias_tokens(source, interface_name, &item.name, &name_span.range)?;
+    if scanned.declaration_range.start > name_span.range.start
+        || name_span.range.end > scanned.declaration_range.end
+        || scanned.declaration_range.is_empty()
+        || source
+            .get(scanned.declaration_range.clone())
+            .is_none_or(|declaration| !declaration.ends_with(';'))
+        || scanned
+            .token_pairs
+            .last()
+            .map(|(kind, text)| (kind.as_str(), text.as_str()))
+            != Some(("Semicolon", ";"))
+        || scanned
+            .token_pairs
+            .iter()
+            .filter(|(kind, text)| {
+                text.is_empty() && matches!(kind.as_str(), "Id" | "ExplicitId" | "StringLiteral")
+            })
+            .count()
+            != 1
+    {
+        return None;
+    }
+    Some(scanned)
+}
+
+fn function_uses_unsupported_type_in_alias(ty: &WitType) -> bool {
+    match ty {
+        WitType::Unsupported(_) | WitType::Future(_) | WitType::Stream(_) => true,
+        WitType::List(inner) | WitType::Option(inner) => {
+            function_uses_unsupported_type_in_alias(inner)
+        }
+        WitType::Result { ok, err } => {
+            ok.as_ref()
+                .is_some_and(|ty| function_uses_unsupported_type_in_alias(ty))
+                || err
+                    .as_ref()
+                    .is_some_and(|ty| function_uses_unsupported_type_in_alias(ty))
+        }
+        WitType::Tuple(elements) => elements.iter().any(function_uses_unsupported_type_in_alias),
+        _ => false,
     }
 }
 
@@ -1355,6 +1585,51 @@ fn view_definition_path_matches_enum(
     definition_canonical_path == expected_canonical_path
 }
 
+fn view_definition_path_matches_alias(
+    path: &sai_hir::DefPath,
+    definition_canonical_path: &str,
+    expected_interface: &str,
+    expected_alias: &str,
+    symbols_interner: &sai_intern::Interner,
+) -> bool {
+    let [interface_component, alias_component] = path.data() else {
+        return false;
+    };
+    let (DefPathData::Interface(interface_symbol), DefPathData::TypeNs(alias_symbol)) =
+        (&interface_component.data, &alias_component.data)
+    else {
+        return false;
+    };
+    if interface_component.disambiguator != 0
+        || alias_component.disambiguator != 0
+        || !symbols_interner
+            .resolve(*interface_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_interface)
+        || !symbols_interner
+            .resolve(*alias_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_alias)
+    {
+        return false;
+    }
+    let expected_canonical_path = format!(
+        "interface[{}:{};{}]/type[{}:{};{}]/",
+        expected_interface.len(),
+        expected_interface,
+        interface_component.disambiguator,
+        expected_alias.len(),
+        expected_alias,
+        alias_component.disambiguator,
+    );
+    definition_canonical_path == expected_canonical_path
+}
+
+fn alias_path_matches_selected_package(
+    path: &sai_hir::DefPath,
+    selected_package: sai_intern::PackageId,
+) -> bool {
+    path.package() == selected_package
+}
+
 fn view_definition_matches_entity(
     definition: &sai_wit::WitViewDef,
     expected_entity: WitViewEntity,
@@ -1622,9 +1897,11 @@ fn incomplete_inventory(
 #[cfg(test)]
 mod tests {
     use super::{
-        ValidatedFunctionSource, function_source_identity, resource_members_match_source,
-        resource_source_identity, verified_view_path_hash, view_definition_matches_entity,
-        view_definition_path_matches_enum, view_definition_path_matches_enum_case,
+        ValidatedFunctionSource, alias_path_matches_selected_package, alias_source_identity,
+        function_source_identity, resource_members_match_source, resource_source_identity,
+        verified_view_path_hash, view_definition_matches_entity,
+        view_definition_path_matches_alias, view_definition_path_matches_enum,
+        view_definition_path_matches_enum_case,
     };
     use sai_hir::{DefPath, DefPathData, DefPathHash, DisambiguatedDefPathData};
     use sai_intern::{Interner, PackageInterner};
@@ -1632,9 +1909,9 @@ mod tests {
     use sai_stable_hash::Fingerprint;
     use sai_wit::{
         WitFunc, WitIfaceIdx, WitIndexVec, WitItem, WitItemIdx, WitItemKind, WitMember,
-        WitMemberKind, WitSpan, WitViewDef, WitViewDefKind, WitViewEntity,
-        authored_interface_enum_tokens, authored_interface_function_tokens,
-        authored_interface_resource_tokens,
+        WitMemberKind, WitSpan, WitType, WitViewDef, WitViewDefKind, WitViewEntity,
+        authored_interface_alias_tokens, authored_interface_enum_tokens,
+        authored_interface_function_tokens, authored_interface_resource_tokens,
     };
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -1667,6 +1944,27 @@ mod tests {
                 range: tokens.declaration_range,
             }),
             declaration_token_pairs: Some(tokens.token_pairs),
+        }
+    }
+
+    fn alias_item(source: &str, name: &str) -> WitItem {
+        let name_start = source.find(name).expect("alias name occurs");
+        let name_range = name_start..name_start + name.len();
+        let _tokens = authored_interface_alias_tokens(source, "api", name, &name_range)
+            .expect("direct alias tokens are found");
+        WitItem {
+            name: name.to_owned(),
+            docs: None,
+            since: None,
+            deprecated: None,
+            kind: WitItemKind::Alias(WitType::U32),
+            unsupported: None,
+            span: Some(WitSpan {
+                path: "root.wit".to_owned(),
+                range: name_range,
+            }),
+            declaration_span: None,
+            declaration_token_pairs: None,
         }
     }
 
@@ -1703,6 +2001,28 @@ mod tests {
                 },
                 DisambiguatedDefPathData {
                     data: DefPathData::TypeNs(path_symbol(symbols, "Status")),
+                    disambiguator: 0,
+                },
+            ],
+        )
+    }
+
+    fn alias_path(
+        packages: &PackageInterner,
+        package: sai_intern::PackageId,
+        symbols: &Interner,
+    ) -> DefPath {
+        def_path(
+            packages,
+            package,
+            symbols,
+            vec![
+                DisambiguatedDefPathData {
+                    data: DefPathData::Interface(path_symbol(symbols, "api")),
+                    disambiguator: 0,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::TypeNs(path_symbol(symbols, "Count")),
                     disambiguator: 0,
                 },
             ],
@@ -1856,6 +2176,36 @@ mod tests {
     }
 
     #[test]
+    fn alias_source_identity_requires_exact_name_span_and_snapshot_bytes() {
+        let source = "interface api { type count = u32; }\n";
+        let item = alias_item(source, "count");
+        let sources = source_map(source);
+        assert!(alias_source_identity(&item, "api", &sources).is_some());
+
+        let mut invalid_name = item.clone();
+        invalid_name.span.as_mut().expect("alias span").range.end += 1;
+        assert!(alias_source_identity(&invalid_name, "api", &sources).is_none());
+
+        let mut invalid_interface = item.clone();
+        assert!(
+            alias_source_identity(&invalid_interface, "other", &sources).is_none(),
+            "the scanner must identify the exact source interface"
+        );
+        invalid_interface.name = "changed".to_owned();
+        assert!(alias_source_identity(&invalid_interface, "api", &sources).is_none());
+
+        let edited_source = source.replace("count", "amount");
+        assert!(
+            alias_source_identity(&item, "api", &source_map(&edited_source)).is_none(),
+            "the name span cannot validate against changed snapshot bytes"
+        );
+
+        let mut missing_span = item;
+        missing_span.span = None;
+        assert!(alias_source_identity(&missing_span, "api", &sources).is_none());
+    }
+
+    #[test]
     fn resource_member_sidecars_must_match_parsed_names_kinds_order_and_spans() {
         let source = "interface api { resource store { read: func(); } }\n";
         let item = resource_item(source);
@@ -1951,6 +2301,111 @@ mod tests {
         assert_ne!(
             original.0, case_renamed.0,
             "the enum fingerprint tracks changes to its ordered cases"
+        );
+    }
+
+    #[test]
+    fn alias_def_paths_and_hashes_reject_mismatched_view_identity() {
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:sample#1.0.0")
+            .expect("package interns");
+        let symbols = Interner::new();
+        let path = alias_path(&packages, package, &symbols);
+        let canonical_path = "interface[3:api;0]/type[5:Count;0]/";
+        assert!(view_definition_path_matches_alias(
+            &path,
+            canonical_path,
+            "api",
+            "Count",
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_alias(
+            &path,
+            "interface[3:api;0]/type[6:Wrong;0]/",
+            "api",
+            "Count",
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_alias(
+            &path,
+            canonical_path,
+            "other",
+            "Count",
+            &symbols
+        ));
+        let wrong_kind = def_path(
+            &packages,
+            package,
+            &symbols,
+            vec![
+                DisambiguatedDefPathData {
+                    data: DefPathData::Interface(path_symbol(&symbols, "api")),
+                    disambiguator: 0,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::ValueNs(path_symbol(&symbols, "Count")),
+                    disambiguator: 0,
+                },
+            ],
+        );
+        assert!(!view_definition_path_matches_alias(
+            &wrong_kind,
+            canonical_path,
+            "api",
+            "Count",
+            &symbols
+        ));
+        let wrong_disambiguator = def_path(
+            &packages,
+            package,
+            &symbols,
+            vec![
+                DisambiguatedDefPathData {
+                    data: DefPathData::Interface(path_symbol(&symbols, "api")),
+                    disambiguator: 0,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::TypeNs(path_symbol(&symbols, "Count")),
+                    disambiguator: 1,
+                },
+            ],
+        );
+        assert!(!view_definition_path_matches_alias(
+            &wrong_disambiguator,
+            canonical_path,
+            "api",
+            "Count",
+            &symbols
+        ));
+
+        let expected_hash =
+            DefPathHash::compute(&path, &packages, &symbols).expect("path hash computes");
+        assert_eq!(
+            verified_view_path_hash(&path, expected_hash, &packages, &symbols),
+            Some(Fingerprint::new(expected_hash.raw()))
+        );
+        let other_package = packages
+            .intern("acme:other#1.0.0")
+            .expect("other package interns");
+        let foreign_path = alias_path(&packages, other_package, &symbols);
+        let foreign_hash = DefPathHash::compute(&foreign_path, &packages, &symbols)
+            .expect("foreign path hash computes");
+        assert!(
+            verified_view_path_hash(&foreign_path, foreign_hash, &packages, &symbols).is_some(),
+            "a correctly recomputed foreign package hash is internally valid"
+        );
+        assert!(!alias_path_matches_selected_package(&foreign_path, package));
+        assert!(alias_path_matches_selected_package(&path, package));
+        assert_eq!(
+            verified_view_path_hash(
+                &path,
+                DefPathHash::compute(&wrong_disambiguator, &packages, &symbols)
+                    .expect("mismatched path hash computes"),
+                &packages,
+                &symbols
+            ),
+            None
         );
     }
 
