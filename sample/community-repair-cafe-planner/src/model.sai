@@ -1,0 +1,101 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Skill {
+    Bicycle
+    Sewing
+    Woodwork
+    SmallAppliance
+    GlassRepair
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum IntakeSafety {
+    Cleared
+    InspectionRequired
+    StopUseAndRefer
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PartKind {
+    BrakeCable
+    ZipperSlider
+    ScooterWheel
+    ElectricalPlug
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RepairRequest {
+    pub id: U32
+    pub item: Str
+    pub repair: Str
+    pub skill: Skill
+    // Lower values are considered first.
+    pub priority: U32
+    pub safety: IntakeSafety
+    pub earliest_window: USize
+    pub latest_window: USize
+    pub service_minutes: U32
+    pub required_part: Option<PartKind>
+    pub part_quantity: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Volunteer {
+    pub id: U32
+    pub name: Str
+    pub skills: Array<Option<Skill>, 3>
+    pub available_windows: Array<Bool, 3>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AppointmentWindow {
+    pub name: Str
+    pub start_minute: U32
+    pub end_minute: U32
+    pub bench_count: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PartStock {
+    pub kind: PartKind
+    pub name: Str
+    pub quantity: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum HoldReason {
+    IntakeSafetyInspectionRequired
+    StopUseAndRefer
+    NoQualifiedVolunteer
+    SharedPartUnavailable
+    NoAppointmentSlot
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Booking {
+    pub volunteer_index: USize
+    pub window_index: USize
+    pub service_minutes: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Decision {
+    Scheduled(Booking)
+    Held(HoldReason)
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Assignment {
+    pub request_id: U32
+    pub decision: Decision
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RepairPlan {
+    pub assignments: Array<Option<Assignment>, 10>
+    pub service_order: Array<USize, 10>
+    pub assignment_count: USize
+    pub scheduled_count: U32
+    pub held_count: U32
+    pub window_appointments: Array<U32, 3>
+    pub remaining_parts: Array<PartStock, 4>
+}

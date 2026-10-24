@@ -1,0 +1,225 @@
+use acme:community-repair-cafe-planner/data
+use acme:community-repair-cafe-planner/model.{
+    AppointmentWindow
+    Assignment
+    Booking
+    Decision
+    HoldReason
+    IntakeSafety
+    PartKind
+    PartStock
+    RepairPlan
+    RepairRequest
+    Skill
+    Volunteer
+}
+
+fn precedes(left: RepairRequest, right: RepairRequest) -> Bool {
+    left.priority < right.priority or (left.priority == right.priority and left.id < right.id)
+}
+
+fn next_request_index(requests: Array<RepairRequest, 10>, processed: Array<Bool, 10>) -> Option<
+    USize,
+> {
+    var selected: Option<USize> = None
+    for index in 0..requests.len() {
+        if not processed[index] {
+            match selected {
+                Some(current_index) => {
+                    if precedes(requests[index], requests[current_index]) {
+                        selected = Some(index)
+                    }
+                }
+                None => {
+                    selected = Some(index)
+                }
+            }
+        }
+    }
+    selected
+}
+
+fn volunteer_has_skill(volunteer: Volunteer, required: Skill) -> Bool {
+    for skill in volunteer.skills {
+        if skill == Some(required) {
+            return true
+        }
+    }
+    false
+}
+
+fn any_qualified_volunteer(volunteers: Array<Volunteer, 4>, required: Skill) -> Bool {
+    for volunteer in volunteers {
+        if volunteer_has_skill(volunteer, required) {
+            return true
+        }
+    }
+    false
+}
+
+fn part_index(parts: Array<PartStock, 4>, required: PartKind) -> Option<USize> {
+    for index in 0..parts.len() {
+        if parts[index].kind == required {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn part_available(parts: Array<PartStock, 4>, request: RepairRequest) -> Bool {
+    match request.required_part {
+        Some(required) => {
+            match part_index(parts, required) {
+                Some(index) => parts[index].quantity >= request.part_quantity
+                None => false
+            }
+        }
+        None => true
+    }
+}
+
+fn reserve_part(parts: borrow mut Array<PartStock, 4>, request: RepairRequest) {
+    match request.required_part {
+        Some(required) => {
+            match part_index(parts, required) {
+                Some(index) => {
+                    parts[index].quantity -= request.part_quantity
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+}
+
+fn find_booking(
+    request: RepairRequest,
+    volunteers: Array<Volunteer, 4>,
+    windows: Array<AppointmentWindow, 3>,
+    window_appointments: Array<U32, 3>,
+    volunteer_booked: Array<Bool, 12>,
+) -> Option<Booking> {
+    for window_index in 0..windows.len() {
+        let window = windows[window_index]
+        if (
+            window_index >= request.earliest_window
+            and window_index <= request.latest_window
+            and window_appointments[window_index] < window.bench_count
+            and request.service_minutes <= window.end_minute - window.start_minute
+        ) {
+            for volunteer_index in 0..volunteers.len() {
+                let volunteer = volunteers[volunteer_index]
+                let booked_index = volunteer_index * windows.len() + window_index
+                if (
+                    volunteer_has_skill(volunteer, request.skill)
+                    and volunteer.available_windows[window_index]
+                    and not volunteer_booked[booked_index]
+                ) {
+                    return Some(
+                        Booking(
+                            volunteer_index: volunteer_index,
+                            window_index: window_index,
+                            service_minutes: request.service_minutes,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+    None
+}
+
+fn hold(request_id: U32, reason: HoldReason) -> Assignment {
+    Assignment(request_id: request_id, decision: Decision.Held(reason))
+}
+
+pub fn plan() -> RepairPlan {
+    let requests = data.requests()
+    let volunteers = data.volunteers()
+    let windows = data.windows()
+    var parts = data.parts()
+    var processed: Array<Bool, 10> =
+        [false, false, false, false, false, false, false, false, false, false]
+    var assignments: Array<Option<Assignment>, 10> =
+        [None, None, None, None, None, None, None, None, None, None]
+    var service_order: Array<USize, 10> = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    var volunteer_booked: Array<Bool, 12> =
+        [false, false, false, false, false, false, false, false, false, false, false, false]
+    var window_appointments: Array<U32, 3> = [0, 0, 0]
+    var assignment_count: USize = 0
+    var scheduled_count: U32 = 0
+    var held_count: U32 = 0
+
+    while assignment_count < requests.len() {
+        match next_request_index(requests, processed) {
+            Some(request_index) => {
+                let request = requests[request_index]
+                processed[request_index] = true
+                service_order[assignment_count] = request_index
+
+                let assignment = match request.safety {
+                    IntakeSafety.InspectionRequired => {
+                        hold(request.id, HoldReason.IntakeSafetyInspectionRequired)
+                    }
+                    IntakeSafety.StopUseAndRefer => {
+                        hold(request.id, HoldReason.StopUseAndRefer)
+                    }
+                    IntakeSafety.Cleared => {
+                        if not any_qualified_volunteer(volunteers, request.skill) {
+                            hold(request.id, HoldReason.NoQualifiedVolunteer)
+                        } else if not part_available(parts, request) {
+                            hold(request.id, HoldReason.SharedPartUnavailable)
+                        } else {
+                            match find_booking(
+                                request,
+                                volunteers,
+                                windows,
+                                window_appointments,
+                                volunteer_booked,
+                            ) {
+                                Some(booking) => {
+                                    let booked_index = (
+                                        booking.volunteer_index * windows.len()
+                                        + booking.window_index
+                                    )
+                                    volunteer_booked[booked_index] = true
+                                    window_appointments[booking.window_index] += 1
+                                    reserve_part(borrow mut parts, request)
+                                    Assignment(
+                                        request_id: request.id,
+                                        decision: Decision.Scheduled(booking),
+                                    )
+                                }
+                                None => hold(request.id, HoldReason.NoAppointmentSlot)
+                            }
+                        }
+                    }
+                }
+
+                assignments[assignment_count] = Some(assignment)
+                assignment_count += 1
+                match assignment.decision {
+                    Decision.Scheduled(_) => {
+                        scheduled_count += 1
+                    }
+                    Decision.Held(_) => {
+                        held_count += 1
+                    }
+                }
+            }
+            None => {
+                assignment_count = requests.len()
+            }
+        }
+    }
+
+    RepairPlan(
+        assignments: assignments,
+        service_order: service_order,
+        assignment_count: assignment_count,
+        scheduled_count: scheduled_count,
+        held_count: held_count,
+        window_appointments: window_appointments,
+        remaining_parts: parts,
+    )
+}
