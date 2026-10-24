@@ -23,6 +23,7 @@ pub use generated::*;
 pub use loader::*;
 pub use model::*;
 pub use printer::*;
+pub use source_scan::{AuthoredInterfaceFunctionTokens, authored_interface_function_tokens};
 pub use view::*;
 pub use wasi::*;
 pub use wasi_loader::*;
@@ -569,6 +570,8 @@ fn parse_source_texts(
                 location: None,
             })?;
         let scan = source_scan::scan_source(&parser_source);
+        let source_function_declarations =
+            source_scan::scan_source(&source.text).function_declarations;
         let parser_offset = u32::try_from(parser_size).expect("source size was bounded to u32");
         parser_size = parser_size
             .checked_add(scan.parser_text.len())
@@ -587,6 +590,7 @@ fn parse_source_texts(
                 .iter()
                 .map(|offset| rewritten_to_original[*offset])
                 .collect(),
+            function_declarations: source_function_declarations,
         };
         if package_name_location.is_none() {
             package_name_location = scan
@@ -935,6 +939,7 @@ struct WitSourceMapping {
     offset: u32,
     parser_len: usize,
     parser_to_source: Vec<usize>,
+    function_declarations: Vec<source_scan::SourceFunctionDeclaration>,
 }
 
 fn map_parse_error(sources: &[WitSourceMapping], error: ParseError) -> WitParseError {

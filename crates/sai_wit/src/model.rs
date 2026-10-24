@@ -374,6 +374,15 @@ pub struct WitItem {
     pub kind: WitItemKind,
     pub unsupported: Option<Unsupported>,
     pub span: Option<WitSpan>,
+    /// Exact source range of a directly declared interface function.
+    ///
+    /// The parser's item span points at only the declared name token. This
+    /// wider range is retained only when the source scanner can recover a
+    /// function declaration terminator from the same authored file.
+    pub declaration_span: Option<WitSpan>,
+    /// Stable WIT token kind/text pairs for the exact declaration. The
+    /// declared name token is present with empty text.
+    pub declaration_token_pairs: Option<Vec<(String, String)>>,
 }
 
 /// The declaration represented by a WIT interface item.
@@ -718,6 +727,8 @@ mod tests {
                 deprecated: None,
                 kind: WitItemKind::Enum(Vec::new()),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             })
             .collect::<Vec<_>>();

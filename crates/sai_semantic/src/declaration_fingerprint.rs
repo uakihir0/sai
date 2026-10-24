@@ -31,13 +31,9 @@ pub fn declaration_fingerprint(
     declaration: &SyntaxNode,
     name_token: Option<&SyntaxToken>,
 ) -> Result<Fingerprint, DeclarationFingerprintError> {
-    let mut hasher = StableHasher::new();
-    let kind_name = kind.to_string();
-    hasher.write_raw_bytes(kind_name.as_bytes());
-    hasher.write_tag(0);
-
     let mut stack = vec![SyntaxElement::Node(declaration.clone())];
     let mut matched_name_token = false;
+    let mut token_pairs = Vec::new();
 
     while let Some(element) = stack.pop() {
         match element {
@@ -61,9 +57,8 @@ pub fn declaration_fingerprint(
                 // Renaming one is an index compatibility change, guarded by the
                 // golden fingerprint test below.
                 let token_kind = format!("{:?}", token.kind());
-                write_length_prefixed(&mut hasher, token_kind.as_bytes());
                 let text = if is_name_token { "" } else { token.text() };
-                write_length_prefixed(&mut hasher, text.as_bytes());
+                token_pairs.push((token_kind, text.to_owned()));
             }
         }
     }
@@ -72,7 +67,26 @@ pub fn declaration_fingerprint(
         return Err(DeclarationFingerprintError::NameTokenNotInDeclaration);
     }
 
-    Ok(hasher.finish())
+    Ok(declaration_fingerprint_from_token_pairs(kind, &token_pairs))
+}
+
+/// Computes the persistent symbol fingerprint from an ordered token sequence.
+///
+/// This keeps the token-pair encoding shared by source languages whose parser
+/// token kinds do not use [`SyntaxKind`].
+pub fn declaration_fingerprint_from_token_pairs(
+    kind: SymbolKind,
+    token_pairs: &[(String, String)],
+) -> Fingerprint {
+    let mut hasher = StableHasher::new();
+    let kind_name = kind.to_string();
+    hasher.write_raw_bytes(kind_name.as_bytes());
+    hasher.write_tag(0);
+    for (token_kind, text) in token_pairs {
+        write_length_prefixed(&mut hasher, token_kind.as_bytes());
+        write_length_prefixed(&mut hasher, text.as_bytes());
+    }
+    hasher.finish()
 }
 
 fn write_length_prefixed(hasher: &mut StableHasher, bytes: &[u8]) {

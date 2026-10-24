@@ -938,6 +938,8 @@ mod tests {
                 deprecated: None,
                 kind: WitItemKind::Alias(sai_wit::WitType::U32),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             })
             .expect("the retained alias appends");
@@ -949,6 +951,8 @@ mod tests {
                 deprecated: None,
                 kind: WitItemKind::Alias(sai_wit::WitType::U64),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             })
             .expect("the later retained alias appends");

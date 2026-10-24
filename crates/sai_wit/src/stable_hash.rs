@@ -100,6 +100,18 @@ impl StableHash for WitItem {
         self.kind.stable_hash(hasher);
         self.unsupported.stable_hash(hasher);
         self.span.stable_hash(hasher);
+        self.declaration_span.stable_hash(hasher);
+        match &self.declaration_token_pairs {
+            Some(token_pairs) => {
+                hasher.write_tag(0x01);
+                hasher.write_len(u64::try_from(token_pairs.len()).unwrap_or(u64::MAX));
+                for (kind, text) in token_pairs {
+                    kind.stable_hash(hasher);
+                    text.stable_hash(hasher);
+                }
+            }
+            None => hasher.write_tag(0x00),
+        }
     }
 }
 

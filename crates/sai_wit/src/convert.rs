@@ -580,6 +580,8 @@ fn model_package(
                 deprecated,
                 kind,
                 unsupported,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span,
             });
         }
@@ -625,6 +627,13 @@ fn model_package(
                     &unsupported_types,
                     named_result_function_spans,
                 )?;
+                let source_declaration = source_function_declaration(
+                    function.span,
+                    wit_interface_name,
+                    &function.name,
+                    &unit,
+                    source_mappings,
+                );
                 free_functions.push(WitItem {
                     name: function.name.clone(),
                     docs: docs(&function.docs.contents),
@@ -633,6 +642,8 @@ fn model_package(
                     kind: WitItemKind::Func(func),
                     unsupported,
                     span: source_span(function.span, &unit, source_mappings),
+                    declaration_span: source_declaration.as_ref().map(|(span, _)| span.clone()),
+                    declaration_token_pairs: source_declaration.map(|(_, token_pairs)| token_pairs),
                 });
             }
         }
@@ -1942,6 +1953,36 @@ fn source_span(
             path: source.path.clone(),
             range: source.parser_to_source[parser_start]..source.parser_to_source[parser_end],
         })
+    })
+}
+
+fn source_function_declaration(
+    span: Span,
+    interface_name: &str,
+    name: &str,
+    unit: &WitUnit,
+    source_mappings: &[(u32, crate::WitSourceMapping)],
+) -> Option<(WitSpan, Vec<(String, String)>)> {
+    let name_span = source_span(span, unit, source_mappings)?;
+    source_mappings.iter().find_map(|(_, source)| {
+        source
+            .function_declarations
+            .iter()
+            .find(|declaration| {
+                declaration.interface_name == interface_name
+                    && declaration.name == name
+                    && declaration.name_range == name_span.range
+                    && source.path == name_span.path
+            })
+            .map(|declaration| {
+                (
+                    WitSpan {
+                        path: source.path.clone(),
+                        range: declaration.declaration_range.clone(),
+                    },
+                    declaration.token_pairs.clone(),
+                )
+            })
     })
 }
 
