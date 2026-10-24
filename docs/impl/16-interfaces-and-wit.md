@@ -1123,15 +1123,20 @@ pub struct FlagsDef {
 
 `flags_def(D)` is `Some` exactly for a type whose `adt_def` is `AdtKind::Flags`. This includes the flags types of views.
 
-**Current implementation boundary (IR-886, IR-889):** `sai_ty::iface` builds
-an opaque validated `FlagsDef` for local interface enums. It retains the flag
-names and spans in declaration order and selects the smallest representation.
-The interface-item check now carries a valid descriptor to the transient WIT
-generator, which uses its ordered names and rejects a descriptor bound to a
-different owner or enum source. The descriptor is not stored or exposed through
-the semantic `adt_def` or `flags_def` queries. Stage 0 feature gates remain
-unchanged; local flag constants, type-relative resolution, and generated
-methods are not implemented.
+**Current implementation boundary (IR-886, IR-889, IR-891):** `sai_ty::iface`
+builds an opaque validated `FlagsDef` for local interface enums. It retains the
+flag names and spans in declaration order and selects the smallest
+representation. The interface-item check carries a valid descriptor to the
+transient WIT generator and to a flags-only `LocalFlagsAdtDef` projection.
+That projection has the specified single variant and hidden `bits` field, uses
+real child DefIds from the local package DefPath interner, and is available
+through the current package `interface_uses` result only when queried with its
+creating workspace snapshot. It does not implement the general
+`adt_def(DefId)` or `flags_def(DefId)` contracts above: imported WIT flags,
+other local ADT kinds, and general ADT semantic type queries are not covered.
+Invalid or empty local flags declarations remain ordinary enum inputs and have
+no flags projection. Stage 0 feature gates remain unchanged; local flag
+constant resolution and generated methods are not implemented.
 
 ### 16.9.3 Constants
 

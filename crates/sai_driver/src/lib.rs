@@ -133,6 +133,7 @@ use sai_resolve::{ModuleId, ModuleTree, ModuleTreeQueries, ModuleTreeQueryError}
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher, fingerprint};
 use sai_syntax::ast::{self, AstNode, AstToken};
 use sai_syntax::{Parse, ParseQueryError, SyntaxElement, SyntaxNode, SyntaxQueries};
+use sai_ty::adt::LocalFlagsAdtDef;
 use sai_vfs::{
     FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex, PackageFileKind,
     PackageFilesSnapshot, PackageKey, PackageKeyError, PackageRelativePath, PackageSourceDirectory,
@@ -1931,6 +1932,7 @@ pub enum Phase1CollectionError {
     PackageScopes(PackageScopesError),
     PackageWitNamesQuery(PackageWitNamesQueryError),
     InterfaceUsesQuery(InterfaceUsesQueryError),
+    SnapshotIdentityMismatch,
     UseTargetDiagnostics(UseTargetDiagnosticsError),
     DefPathInterner(DefPathInternerError),
     MissingSnapshotFile(FileId),
@@ -2343,6 +2345,7 @@ pub struct Phase1PackageScopesCollection {
     package_wit_names_fingerprint: Fingerprint,
     interface_uses: InterfaceUses,
     interface_uses_fingerprint: Fingerprint,
+    local_flags_adts: Vec<LocalFlagsAdtDef>,
     world_interface_uses: WorldInterfaceUseGraph,
     world_interface_uses_fingerprint: Fingerprint,
     interface_check_diagnostics: Vec<Diagnostic>,
@@ -2408,6 +2411,24 @@ impl Phase1PackageScopesCollection {
     /// definition paths, never the session-local order of the graph maps.
     pub const fn interface_uses_fingerprint(&self) -> Fingerprint {
         self.interface_uses_fingerprint
+    }
+
+    /// Look up a validated local flags ADT owned by this exact source
+    /// snapshot. `None` means this partial flags-only projection has no
+    /// accepted local flags declaration for `owner`; it does not classify
+    /// arbitrary definitions as non-ADTs.
+    pub fn local_flags_adt_def(
+        &self,
+        snapshot: &WorkspaceSnapshot,
+        owner: DefId,
+    ) -> Result<Option<&LocalFlagsAdtDef>, Phase1CollectionError> {
+        if self.snapshot_id != snapshot.id() {
+            return Err(Phase1CollectionError::SnapshotIdentityMismatch);
+        }
+        Ok(self
+            .local_flags_adts
+            .iter()
+            .find(|flags| flags.adt_def().def_id() == owner))
     }
 
     /// Ordered local and external interface-use identities consumed by world
@@ -14096,6 +14117,7 @@ impl RootDatabase {
             world_interface_uses_fingerprint,
             interface_check_diagnostics,
             generated_wit_text,
+            local_flags_adts,
         ) = match interface_uses_result {
             Ok(output) => output,
             Err(error) => {
@@ -14156,6 +14178,7 @@ impl RootDatabase {
             package_wit_names_fingerprint,
             interface_uses,
             interface_uses_fingerprint,
+            local_flags_adts,
             world_interface_uses,
             world_interface_uses_fingerprint,
             interface_check_diagnostics,
@@ -30238,6 +30261,12 @@ interface api { resource canvas { invalid: static func(items: map<string, u32>);
             collection
         };
         let original = collect(b"interface api {\n@flags enum Permissions { Read, Write }\n}\n");
+        let relocated = collect(b"// shift the flag declarations' source spans\ninterface api {\n@flags enum Permissions { Read, Write }\n}\n");
+        assert_ne!(
+            original.interface_uses_fingerprint(),
+            relocated.interface_uses_fingerprint(),
+            "the public fingerprint covers source spans exposed by FlagsDef"
+        );
         let original_inventory = inventory_symbols(&original);
         let original_read = original_inventory
             .symbols()
@@ -30368,6 +30397,196 @@ interface api { resource canvas { invalid: static func(items: map<string, u32>);
                 ));
             }
         }
+    }
+
+    #[test]
+    fn phase1_collection_exposes_flags_only_adt_with_owned_synthetic_def_paths() {
+        let source = b"interface api {\n@flags enum Permissions { Read, Write }\n}\n";
+        let (mut database, module_tree, snapshot, collection) =
+            collect_package_inventory_with_accepted_flags_for_test(source);
+        let permissions = database
+            .symbols
+            .intern("Permissions")
+            .expect("flags item name interns");
+        let owner = collection
+            .scopes()
+            .interfaces
+            .values()
+            .find_map(|scope| {
+                scope
+                    .members
+                    .get(&permissions)
+                    .and_then(|binding| match binding.res {
+                        sai_resolve::package_scopes::Res::Def(
+                            sai_resolve::package_scopes::DefKind::Enum,
+                            owner,
+                        ) => Some(owner),
+                        _ => None,
+                    })
+            })
+            .expect("the flags declaration keeps its enum source owner");
+        let flags = collection
+            .local_flags_adt_def(&snapshot, owner)
+            .expect("the accessor accepts its creating snapshot")
+            .expect("the valid local flags declaration has an ADT projection");
+        let adt = flags.adt_def();
+        assert_eq!(adt.def_id(), owner);
+        assert_eq!(adt.kind(), sai_ty::adt::AdtKind::Flags);
+        assert_eq!(adt.variants().len(), 1);
+
+        let variant = &adt.variants()[0];
+        assert_eq!(variant.name(), database.symbols.intern("$flags").unwrap());
+        assert_eq!(variant.discr(), 0);
+        assert_eq!(variant.fields().len(), 1);
+        let field = &variant.fields()[0];
+        assert_eq!(field.name(), database.symbols.intern("$bits").unwrap());
+        assert_eq!(field.visibility(), Visibility::Private);
+        assert_eq!(field.ty(), sai_ty::adt::Ty::Int(sai_ty::adt::IntTy::U8));
+
+        let owner_path = database
+            .resolve_def_path(owner)
+            .expect("flags owner path resolves")
+            .expect("flags owner path exists");
+        let variant_path = database
+            .resolve_def_path(variant.def_id())
+            .expect("synthetic variant path resolves")
+            .expect("synthetic variant path exists");
+        let field_path = database
+            .resolve_def_path(field.def_id())
+            .expect("synthetic field path resolves")
+            .expect("synthetic field path exists");
+        assert_eq!(variant.def_id().package, owner.package);
+        assert_eq!(field.def_id().package, owner.package);
+        assert_ne!(variant.def_id(), owner);
+        assert_ne!(field.def_id(), owner);
+        assert_ne!(variant.def_id(), field.def_id());
+        assert_eq!(variant_path.package(), owner.package);
+        assert_eq!(field_path.package(), owner.package);
+        assert_eq!(
+            &variant_path.data()[..owner_path.data().len()],
+            owner_path.data()
+        );
+        assert!(matches!(
+            variant_path.data().last(),
+            Some(sai_hir::DisambiguatedDefPathData {
+                data: sai_hir::DefPathData::Variant(name),
+                disambiguator: 0,
+            }) if database.symbols.resolve(*name).is_ok_and(|name| name.as_ref() == "$flags")
+        ));
+        assert_eq!(
+            &field_path.data()[..variant_path.data().len()],
+            variant_path.data()
+        );
+        assert!(matches!(
+            field_path.data().last(),
+            Some(sai_hir::DisambiguatedDefPathData {
+                data: sai_hir::DefPathData::Field(name),
+                disambiguator: 0,
+            }) if database.symbols.resolve(*name).is_ok_and(|name| name.as_ref() == "$bits")
+        ));
+        assert_eq!(
+            flags
+                .flags_def()
+                .flags()
+                .iter()
+                .map(|(name, _)| database.symbols.resolve(*name).unwrap().to_string())
+                .collect::<Vec<_>>(),
+            ["Read", "Write"]
+        );
+
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let repeated = database
+            .collect_phase1_package_scopes_with_accepted_flags_for_test(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("repeat collection succeeds");
+        assert_eq!(
+            repeated
+                .local_flags_adt_def(&snapshot, owner)
+                .expect("repeat collection remains snapshot-bound"),
+            Some(flags),
+            "the source interner retains the same real child identities"
+        );
+        assert_eq!(
+            repeated.interface_uses_fingerprint(),
+            collection.interface_uses_fingerprint(),
+            "the tracked package projection has a stable semantic fingerprint"
+        );
+    }
+
+    #[test]
+    fn phase1_flags_adt_projection_rejects_stale_snapshots_and_keeps_fallback_enums() {
+        let source = concat!(
+            "interface api {\n",
+            "@flags enum Good { Read, Write }\n",
+            "@flags enum Empty {}\n",
+            "@flags enum Payload { Item(U32) }\n",
+            "@flags enum Explicit { Read = 1, Write }\n",
+            "}\n",
+        );
+        let (database, _, snapshot, collection) =
+            collect_package_inventory_with_accepted_flags_for_test(source.as_bytes());
+        let owner_named = |wanted: &str| {
+            collection
+                .scopes()
+                .interfaces
+                .values()
+                .find_map(|scope| {
+                    scope.members.iter().find_map(|(name, binding)| {
+                        (database
+                            .symbols
+                            .resolve(*name)
+                            .is_ok_and(|name| name.as_ref() == wanted))
+                        .then_some(binding.res)
+                    })
+                })
+                .and_then(|res| match res {
+                    sai_resolve::package_scopes::Res::Def(
+                        sai_resolve::package_scopes::DefKind::Enum,
+                        owner,
+                    ) => Some(owner),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("source enum `{wanted}` remains in interface scope"))
+        };
+        let good = owner_named("Good");
+        let good_flags = collection
+            .local_flags_adt_def(&snapshot, good)
+            .expect("fresh snapshot is accepted")
+            .expect("valid flags declaration is represented");
+        assert_eq!(good_flags.adt_def().kind(), sai_ty::adt::AdtKind::Flags);
+        for name in ["Empty", "Payload", "Explicit"] {
+            let enum_owner = owner_named(name);
+            assert!(
+                collection
+                    .local_flags_adt_def(&snapshot, enum_owner)
+                    .expect("fresh snapshot is accepted")
+                    .is_none(),
+                "invalid or empty `{name}` remains outside the flags-only projection"
+            );
+        }
+        let stale_snapshot = snapshot_with_version(&snapshot, 77);
+        assert_eq!(
+            collection.local_flags_adt_def(&stale_snapshot, good),
+            Err(Phase1CollectionError::SnapshotIdentityMismatch)
+        );
+        let diagnostics = collection.interface_check_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| { diagnostic.code == sai_diagnostics::Code::WitEmptyType })
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| { diagnostic.code == sai_diagnostics::Code::InvalidFlagsEnum })
+                .count()
+                >= 2,
+            "payload and explicit-discriminant markers fail flags validation"
+        );
     }
 
     #[test]

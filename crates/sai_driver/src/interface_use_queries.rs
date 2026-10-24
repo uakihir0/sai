@@ -22,8 +22,8 @@ use sai_hir::items::{
 use sai_hir::lower::HirLoweringContext;
 use sai_hir::types::{GenericArg, Name, Ty, TyKind};
 use sai_hir::{
-    DefId, DefPathData, DefPathError, DefPathHash, DefPathInterner, DefPathInternerError, HirId,
-    LocalDefId, OwnerId, Symbol, Visibility,
+    DefId, DefPath, DefPathData, DefPathError, DefPathHash, DefPathInterner, DefPathInternerError,
+    DisambiguatedDefPathData, HirId, LocalDefId, OwnerId, Symbol, Visibility,
 };
 use sai_intern::{Interner, PackageId, PackageInterner};
 use sai_package::version::Version;
@@ -41,6 +41,7 @@ use sai_resolve::{
 use sai_stable_hash::{Fingerprint, StableHash, StableHasher};
 use sai_syntax::SyntaxKind;
 use sai_syntax::ast::{self, AstNode};
+use sai_ty::adt::{LocalFlagsAdtDef, LocalFlagsAdtDefError};
 use sai_ty::boundary::{
     BoundaryAlias, BoundaryDefinition, BoundaryType, BoundaryTypeContext, BoundaryTypeOutcome,
     IncompatibleReason, Position, boundary_type_with_references,
@@ -146,6 +147,8 @@ pub enum InterfaceUsesQueryError {
     PackageWitNames(PackageWitNamesQueryError),
     DefPath(DefPathError),
     DefPathInterner(DefPathInternerError),
+    FlagsAdt(LocalFlagsAdtDefError),
+    FlagsAdtPathIdentityMismatch,
     DiagnosticTemplate(String),
     WitUnitIdentity(sai_wit::WitUnitIdentityError),
     WitIndexVec(sai_wit::WitIndexVecError),
@@ -179,6 +182,7 @@ struct InterfaceUsesMemo {
     graph: InterfaceUses,
     world_graph: WorldInterfaceUseGraph,
     generated_wit_text: Option<GeneratedText>,
+    local_flags_adts: Vec<LocalFlagsAdtDef>,
     diagnostics: Vec<DetachedWorkspaceDiagnostic>,
     interface_check_diagnostics: Vec<DetachedWorkspaceDiagnostic>,
 }
@@ -1406,6 +1410,7 @@ impl PartialEq for InterfaceUsesMemo {
             && self.graph.cyclic == other.graph.cyclic
             && self.world_graph == other.world_graph
             && self.generated_wit_text == other.generated_wit_text
+            && self.local_flags_adts == other.local_flags_adts
             && self.diagnostics == other.diagnostics
             && self.interface_check_diagnostics == other.interface_check_diagnostics
     }
@@ -1487,7 +1492,13 @@ impl InterfaceUsesQueries {
                     &symbols,
                 )
                 .and_then(
-                    |(input, world_graph, interface_check_diagnostics, generated_candidate)| {
+                    |(
+                        input,
+                        world_graph,
+                        interface_check_diagnostics,
+                        generated_candidate,
+                        local_flags_adts,
+                    )| {
                         let graph = interface_uses(input.clone());
                         let generated_wit_text = generated_candidate
                             .map(|candidate| {
@@ -1501,6 +1512,7 @@ impl InterfaceUsesQueries {
                             &world_graph,
                             &interface_check_diagnostics,
                             generated_wit_text.as_ref(),
+                            &local_flags_adts,
                             &prepared,
                             &packages,
                             &symbols,
@@ -1539,6 +1551,7 @@ impl InterfaceUsesQueries {
                                 graph,
                                 world_graph,
                                 generated_wit_text,
+                                local_flags_adts,
                                 diagnostics,
                                 interface_check_diagnostics,
                             },
@@ -1575,6 +1588,7 @@ impl InterfaceUsesQueries {
             Fingerprint,
             Vec<Diagnostic>,
             Option<GeneratedText>,
+            Vec<LocalFlagsAdtDef>,
         ),
         InterfaceUsesQueryError,
     > {
@@ -1605,6 +1619,7 @@ impl InterfaceUsesQueries {
             world_interface_uses_fingerprint,
             interface_check_diagnostics,
             memo.generated_wit_text.clone(),
+            memo.local_flags_adts.clone(),
         ))
     }
 }
@@ -1715,7 +1730,9 @@ pub(super) fn append_world_function_name_diagnostics(
             | InterfaceUsesQueryError::DiagnosticTemplate(_)
             | InterfaceUsesQueryError::PackageWitNames(_)
             | InterfaceUsesQueryError::WitUnitIdentity(_)
-            | InterfaceUsesQueryError::WitIndexVec(_) => {
+            | InterfaceUsesQueryError::WitIndexVec(_)
+            | InterfaceUsesQueryError::FlagsAdt(_)
+            | InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch => {
                 unreachable!("source-bound world name checks only return collection errors")
             }
         })?;
@@ -2533,6 +2550,7 @@ fn collect_interface_uses_input(
         WorldInterfaceUseGraph,
         Vec<Diagnostic>,
         Option<GeneratedWitCandidate>,
+        Vec<LocalFlagsAdtDef>,
     ),
     InterfaceUsesQueryError,
 > {
@@ -2700,6 +2718,7 @@ fn collect_interface_uses_input(
     let mut world_interface_uses = Vec::<InterfaceUse>::new();
     let mut local_world_use_completeness = HashMap::<DefId, bool>::new();
     let mut interface_check_diagnostics = Vec::new();
+    let mut local_flags_adts = Vec::<LocalFlagsAdtDef>::new();
     let mut collision_inputs = Vec::with_capacity(descriptors.len());
     let mut poisoned_owners = HashSet::<OwnerId>::new();
     let mut owner_dependencies = HashMap::<OwnerId, HashSet<DefId>>::new();
@@ -3219,6 +3238,26 @@ fn collect_interface_uses_input(
                     ),
                 ));
             };
+            if !member_has_issues
+                && member_hir.diagnostics.is_empty()
+                && let (InterfaceItemKind::Enum { variants, .. }, Some(flags_def)) =
+                    (item.kind, flags_def.as_ref())
+            {
+                if !flags_def.matches_enum(member_owner.def_id.to_def_id(), variants)
+                    || local_flags_adts.iter().any(|existing: &LocalFlagsAdtDef| {
+                        existing.adt_def().def_id() == member_owner.def_id.to_def_id()
+                    })
+                {
+                    return Err(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch);
+                }
+                local_flags_adts.push(build_local_flags_adt_def(
+                    member_owner.def_id,
+                    flags_def.clone(),
+                    prepared,
+                    packages,
+                    symbols,
+                )?);
+            }
             if let Some(definition) = wit_name_definition(item.name, member_owner, symbols)? {
                 interface_item_names.push(definition);
             }
@@ -4354,6 +4393,7 @@ fn collect_interface_uses_input(
         world_graph,
         interface_check_diagnostics,
         generated_candidate,
+        local_flags_adts,
     ))
 }
 
@@ -4508,6 +4548,118 @@ fn append_generation_eligible_interface_name_collisions(
         )?;
     }
     Ok(())
+}
+
+fn build_local_flags_adt_def(
+    owner: LocalDefId,
+    flags: FlagsDef,
+    prepared: &PreparedPhase1PackageScopes,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) -> Result<LocalFlagsAdtDef, InterfaceUsesQueryError> {
+    if flags.adt() != owner.to_def_id() {
+        return Err(InterfaceUsesQueryError::FlagsAdt(
+            LocalFlagsAdtDefError::OwnerMismatch,
+        ));
+    }
+    if !(1..=32).contains(&flags.flags().len()) {
+        return Err(InterfaceUsesQueryError::FlagsAdt(
+            LocalFlagsAdtDefError::InvalidFlagsCount,
+        ));
+    }
+    if owner.package() != prepared.module_tree.package
+        || owner.package() != prepared.def_paths.package()
+    {
+        return Err(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch);
+    }
+    let owner_path = prepared
+        .def_paths
+        .resolve(owner)
+        .map_err(InterfaceUsesQueryError::DefPathInterner)?
+        .ok_or(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch)?;
+    if owner_path.package() != owner.package()
+        || !matches!(
+            owner_path.data().last(),
+            Some(DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(_),
+                ..
+            })
+        )
+    {
+        return Err(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch);
+    }
+
+    // These names are deliberately outside the source identifier grammar.
+    // The synthetic nodes still receive real, unique LocalDefIds from the
+    // source package's append-only DefPathInterner.
+    let variant_name = symbols
+        .intern("$flags")
+        .map_err(|_| InterfaceUsesQueryError::FlagsAdt(LocalFlagsAdtDefError::InvalidSymbol))?;
+    let bits_name = symbols
+        .intern("$bits")
+        .map_err(|_| InterfaceUsesQueryError::FlagsAdt(LocalFlagsAdtDefError::InvalidSymbol))?;
+    let variants = prepared
+        .def_paths
+        .intern_variants(owner, &[(variant_name, 0)])
+        .map_err(InterfaceUsesQueryError::DefPathInterner)?;
+    let [variant] = variants.as_slice() else {
+        return Err(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch);
+    };
+    let variant = *variant;
+    let fields = prepared
+        .def_paths
+        .intern_fields_for_parents(&[(variant, bits_name, 0)])
+        .map_err(InterfaceUsesQueryError::DefPathInterner)?;
+    let [field] = fields.as_slice() else {
+        return Err(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch);
+    };
+    let field = *field;
+
+    let mut expected_variant_data = owner_path.data().to_vec();
+    expected_variant_data.push(DisambiguatedDefPathData {
+        data: DefPathData::Variant(variant_name),
+        disambiguator: 0,
+    });
+    let expected_variant_path =
+        DefPath::new(owner.package(), expected_variant_data, packages, symbols)
+            .map_err(InterfaceUsesQueryError::DefPath)?;
+    let actual_variant_path = prepared
+        .def_paths
+        .resolve(variant)
+        .map_err(InterfaceUsesQueryError::DefPathInterner)?
+        .ok_or(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch)?;
+    let mut expected_field_data = expected_variant_path.data().to_vec();
+    expected_field_data.push(DisambiguatedDefPathData {
+        data: DefPathData::Field(bits_name),
+        disambiguator: 0,
+    });
+    let expected_field_path = DefPath::new(owner.package(), expected_field_data, packages, symbols)
+        .map_err(InterfaceUsesQueryError::DefPath)?;
+    let actual_field_path = prepared
+        .def_paths
+        .resolve(field)
+        .map_err(InterfaceUsesQueryError::DefPathInterner)?
+        .ok_or(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch)?;
+    if actual_variant_path != expected_variant_path
+        || actual_field_path != expected_field_path
+        || variant == owner
+        || field == owner
+        || variant == field
+    {
+        return Err(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch);
+    }
+
+    flags
+        .into_local_adt_def(
+            owner,
+            variant,
+            field,
+            variant_name,
+            bits_name,
+            &prepared.def_paths,
+            symbols,
+        )
+        .map_err(InterfaceUsesQueryError::FlagsAdt)
 }
 
 fn propagate_omitted_interface_owners(
@@ -6997,6 +7149,7 @@ fn stable_interface_uses_fingerprint(
     world_graph: &WorldInterfaceUseGraph,
     interface_check_diagnostics: &[Diagnostic],
     generated_wit_text: Option<&GeneratedText>,
+    local_flags_adts: &[LocalFlagsAdtDef],
     prepared: &PreparedPhase1PackageScopes,
     packages: &PackageInterner,
     symbols: &Interner,
@@ -7059,6 +7212,65 @@ fn stable_interface_uses_fingerprint(
             generated.stable_hash(&mut hasher);
         }
         None => hasher.write_tag(0),
+    }
+    hasher.write_len(u64::try_from(local_flags_adts.len()).unwrap_or(u64::MAX));
+    for local_flags in local_flags_adts {
+        let adt = local_flags.adt_def();
+        hasher.write_tag(0xAF);
+        match adt.kind() {
+            sai_ty::adt::AdtKind::Flags => hasher.write_tag(1),
+        }
+        hasher.write_len(u64::try_from(adt.variants().len()).unwrap_or(u64::MAX));
+        let variant = adt
+            .variants()
+            .first()
+            .ok_or(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch)?;
+        hasher.write_i128(variant.discr());
+        hasher.write_len(u64::try_from(variant.fields().len()).unwrap_or(u64::MAX));
+        let field = variant
+            .fields()
+            .first()
+            .ok_or(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch)?;
+        match field.visibility() {
+            Visibility::Private => hasher.write_tag(0),
+            Visibility::Pub => hasher.write_tag(1),
+            Visibility::Export => hasher.write_tag(2),
+        }
+        for definition in [adt.def_id(), variant.def_id(), field.def_id()] {
+            let path = prepared
+                .def_paths
+                .resolve_def_id(definition)
+                .map_err(InterfaceUsesQueryError::DefPathInterner)?
+                .ok_or(InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch)?;
+            let hash = DefPathHash::compute(&path, packages, symbols)
+                .map_err(InterfaceUsesQueryError::DefPath)?;
+            hasher.write_u128(hash.raw());
+        }
+        match field.ty() {
+            sai_ty::adt::Ty::Int(sai_ty::adt::IntTy::U8) => hasher.write_tag(1),
+            sai_ty::adt::Ty::Int(sai_ty::adt::IntTy::U16) => hasher.write_tag(2),
+            sai_ty::adt::Ty::Int(sai_ty::adt::IntTy::U32) => hasher.write_tag(3),
+        }
+        hasher.write_len(u64::try_from(local_flags.flags_def().flags().len()).unwrap_or(u64::MAX));
+        for (flag, span) in local_flags.flags_def().flags() {
+            symbols
+                .resolve(*flag)
+                .map_err(|error| {
+                    InterfaceUsesQueryError::Collection(
+                        OwnerControlFlowResolutionError::SymbolLookup(error),
+                    )
+                })?
+                .as_ref()
+                .stable_hash(&mut hasher);
+            let (path, package) = sources.get(&span.file).ok_or_else(|| {
+                InterfaceUsesQueryError::Collection(
+                    OwnerControlFlowResolutionError::MissingSnapshotFile(span.file),
+                )
+            })?;
+            path.stable_hash(&mut hasher);
+            package.stable_hash(&mut hasher);
+            hash_text_range(&span.range, &mut hasher);
+        }
     }
     hasher.write_len(u64::try_from(graph.diagnostics.len()).unwrap_or(u64::MAX));
     for diagnostic in &graph.diagnostics {
@@ -7155,8 +7367,12 @@ fn hash_optional_location(
 }
 
 fn hash_range(span: &Span, hasher: &mut StableHasher) {
-    hasher.write_len(u64::try_from(span.range.start().to_usize()).unwrap_or(u64::MAX));
-    hasher.write_len(u64::try_from(span.range.end().to_usize()).unwrap_or(u64::MAX));
+    hash_text_range(&span.range, hasher);
+}
+
+fn hash_text_range(range: &sai_vfs::TextRange, hasher: &mut StableHasher) {
+    hasher.write_len(u64::try_from(range.start().to_usize()).unwrap_or(u64::MAX));
+    hasher.write_len(u64::try_from(range.end().to_usize()).unwrap_or(u64::MAX));
 }
 
 fn interface_uses_error_fingerprint(error: &InterfaceUsesQueryError) -> Fingerprint {
@@ -7199,8 +7415,27 @@ fn interface_uses_error_fingerprint(error: &InterfaceUsesQueryError) -> Fingerpr
             hasher.write_tag(8);
             format!("{error:?}").stable_hash(&mut hasher);
         }
+        InterfaceUsesQueryError::FlagsAdt(error) => {
+            hasher.write_tag(9);
+            hasher.write_tag(local_flags_adt_error_tag(error));
+        }
+        InterfaceUsesQueryError::FlagsAdtPathIdentityMismatch => hasher.write_tag(10),
     }
     hasher.finish()
+}
+
+fn local_flags_adt_error_tag(error: &LocalFlagsAdtDefError) -> u8 {
+    match error {
+        LocalFlagsAdtDefError::OwnerMismatch => 0,
+        LocalFlagsAdtDefError::InvalidFlagsCount => 1,
+        LocalFlagsAdtDefError::ChildDefinitionPackageMismatch => 2,
+        LocalFlagsAdtDefError::ChildDefinitionAliasesParent => 3,
+        LocalFlagsAdtDefError::ChildDefinitionsAliasEachOther => 4,
+        LocalFlagsAdtDefError::InvalidSymbol => 5,
+        LocalFlagsAdtDefError::OwnerDefinitionPathMismatch => 6,
+        LocalFlagsAdtDefError::ChildDefinitionPathMismatch => 7,
+        LocalFlagsAdtDefError::InvalidSyntheticNames => 8,
+    }
 }
 
 fn owner_resolution_error_tag(error: &OwnerControlFlowResolutionError) -> u8 {
