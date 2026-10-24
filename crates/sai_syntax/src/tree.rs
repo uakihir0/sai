@@ -482,7 +482,7 @@ pub fn build_green_tree(
                     .children
                     .iter()
                     .all(|child| child.text_len().raw() == 0)
-                    && !empty_node_allowed(frame.kind, is_root)
+                    && !empty_node_allowed(&frame, is_root)
                 {
                     return Err(TreeBuildError::EmptyNode(frame.kind));
                 }
@@ -595,8 +595,14 @@ pub fn build_green_tree(
     Ok(TreeBuildOutput { root, errors })
 }
 
-fn empty_node_allowed(kind: SyntaxKind, is_root: bool) -> bool {
-    kind == SyntaxKind::ERROR || (kind == SyntaxKind::SOURCE_FILE && is_root)
+fn empty_node_allowed(frame: &NodeFrame, is_root: bool) -> bool {
+    let empty_error_child = frame.children.len() == 1
+        && frame.children[0]
+            .as_node()
+            .is_some_and(|node| node.kind() == SyntaxKind::ERROR && node.text_len().raw() == 0);
+    frame.kind == SyntaxKind::ERROR
+        || (frame.kind == SyntaxKind::WORLD_REF && empty_error_child)
+        || (frame.kind == SyntaxKind::SOURCE_FILE && is_root)
 }
 
 fn node_delimiters(kind: SyntaxKind) -> Option<(SyntaxKind, SyntaxKind)> {
@@ -1199,7 +1205,11 @@ mod tests {
     fn empty_nodes_are_restricted_to_the_documented_recovery_and_list_kinds() {
         let source = "";
         let lexed = lex_text(source);
-        for kind in [SyntaxKind::FN_DECL, SyntaxKind::ARG_LIST] {
+        for kind in [
+            SyntaxKind::FN_DECL,
+            SyntaxKind::ARG_LIST,
+            SyntaxKind::WORLD_REF,
+        ] {
             let events = vec![
                 Event::Start {
                     kind: SyntaxKind::SOURCE_FILE,
@@ -1223,6 +1233,36 @@ mod tests {
                 Err(TreeBuildError::EmptyNode(kind))
             );
         }
+    }
+
+    #[test]
+    fn empty_world_refs_require_an_empty_error_recovery_child() {
+        let source = "";
+        let lexed = lex_text(source);
+        let events = vec![
+            Event::Start {
+                kind: SyntaxKind::SOURCE_FILE,
+                forward_parent: None,
+            },
+            Event::Start {
+                kind: SyntaxKind::WORLD_REF,
+                forward_parent: None,
+            },
+            Event::Start {
+                kind: SyntaxKind::ERROR,
+                forward_parent: None,
+            },
+            Event::Finish,
+            Event::Finish,
+            Event::Token {
+                kind: SyntaxKind::EOF,
+                n_raw: 1,
+            },
+            Event::Finish,
+        ];
+        let mut cache = NodeCache::new();
+
+        assert!(build_green_tree(source, &lexed.tokens, &lexed.trivia, events, &mut cache).is_ok());
     }
 
     #[test]

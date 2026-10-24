@@ -2357,6 +2357,39 @@ mod tests {
     }
 
     #[test]
+    fn missing_world_reference_preserves_the_world_close() {
+        let source = "world malformed { import }\n";
+        let output = parse_file(source);
+        let root = crate::SyntaxNode::new_root(output.root);
+
+        assert_eq!(output.errors.len(), 1, "{:?}", output.errors);
+        assert_eq!(output.errors[0].code, Code::ExpectedToken);
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WORLD_DECL)
+                .count(),
+            1
+        );
+        assert_eq!(
+            root.descendants()
+                .filter(|node| node.kind() == SyntaxKind::WORLD_IMPORT)
+                .count(),
+            1
+        );
+        let reference = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::WORLD_REF)
+            .expect("the import keeps its reference node");
+        assert!(reference.first_token().is_none());
+        let world = root
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::WORLD_DECL)
+            .expect("world declaration");
+        assert_eq!(world.last_token().unwrap().kind(), SyntaxKind::R_BRACE);
+        assert_eq!(root.green().text_len().to_usize(), source.len());
+    }
+
+    #[test]
     fn missing_world_close_preserves_a_following_constant() {
         let source = "world client {\nimport wasi:io/streams\nconst READY: Bool = true\n";
         let output = parse_file(source);
