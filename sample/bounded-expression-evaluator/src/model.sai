@@ -1,0 +1,67 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum TokenKind {
+    Number
+    Plus
+    Minus
+    Multiply
+    Divide
+    LeftParen
+    RightParen
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Token {
+    pub kind: TokenKind
+    pub value: U32
+    pub offset: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TokenStream {
+    pub items: Array<Option<Token>, 32>
+    pub len: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum EvalErrorKind {
+    EmptyExpression
+    MalformedTokenStream
+    UnexpectedToken
+    MissingOperand
+    UnmatchedLeftParen
+    UnmatchedRightParen
+    TooManyTokens
+    StackLimit
+    ArithmeticRangeError
+    DivisionByZero
+    NoResult
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ErrorPositionKind {
+    SourceByteOffset
+    TokenIndex
+    Unavailable
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type EvalError {
+    pub kind: EvalErrorKind
+    pub position_kind: ErrorPositionKind
+    pub position: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Evaluation {
+    pub value: U32
+    pub operations: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type EvalState {
+    pub values: Array<Option<U32>, 32>
+    pub value_count: USize
+    pub operators: Array<Option<Token>, 32>
+    pub operator_count: USize
+    pub operations: USize
+}

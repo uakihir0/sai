@@ -1,0 +1,74 @@
+use acme:bounded-expression-evaluator/evaluator
+use acme:bounded-expression-evaluator/fixtures
+use acme:bounded-expression-evaluator/model.{
+    ErrorPositionKind
+    EvalErrorKind
+    Token
+    TokenKind
+    TokenStream
+}
+
+test "parentheses and precedence produce eleven" {
+    match evaluator.evaluate_tokens(fixtures.nested_precedence()) {
+        Ok(result) => {
+            assert (result.value == 11)
+            assert (result.operations == 3)
+        }
+        Err(_) => {
+            assert (false)
+        }
+    }
+}
+
+test "subtraction is left associative" {
+    match evaluator.evaluate_tokens(fixtures.left_associative_subtraction()) {
+        Ok(result) => {
+            assert (result.value == 3)
+        }
+        Err(_) => {
+            assert (false)
+        }
+    }
+}
+
+test "division by zero reports the operator location" {
+    match evaluator.evaluate_tokens(fixtures.division_by_zero()) {
+        Ok(_) => {
+            assert (false)
+        }
+        Err(problem) => {
+            assert (problem.kind == EvalErrorKind.DivisionByZero)
+            assert (problem.position_kind == ErrorPositionKind.SourceByteOffset)
+            assert (problem.position == 2)
+        }
+    }
+}
+
+test "addition overflow is reported without wrapping" {
+    match evaluator.evaluate_tokens(fixtures.addition_overflow()) {
+        Ok(_) => {
+            assert (false)
+        }
+        Err(problem) => {
+            assert (problem.kind == EvalErrorKind.ArithmeticRangeError)
+            assert (problem.position_kind == ErrorPositionKind.SourceByteOffset)
+            assert (problem.position == 11)
+        }
+    }
+}
+
+test "a missing token slot reports its token index" {
+    var items = Array<Option<Token>, 32>.filled(None)
+    items[0] = Some(Token(kind: TokenKind.Number, value: 1, offset: 0))
+    let malformed = TokenStream(items: items, len: 2)
+    match evaluator.evaluate_tokens(malformed) {
+        Ok(_) => {
+            assert (false)
+        }
+        Err(problem) => {
+            assert (problem.kind == EvalErrorKind.MalformedTokenStream)
+            assert (problem.position_kind == ErrorPositionKind.TokenIndex)
+            assert (problem.position == 1)
+        }
+    }
+}

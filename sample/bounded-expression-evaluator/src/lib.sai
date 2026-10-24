@@ -1,0 +1,11 @@
+use acme:bounded-expression-evaluator/evaluator
+use acme:bounded-expression-evaluator/fixtures
+use acme:bounded-expression-evaluator/model.{EvalError, Evaluation, TokenStream}
+
+pub fn evaluate_example() -> Result<Evaluation, EvalError> {
+    evaluator.evaluate_tokens(fixtures.nested_precedence())
+}
+
+pub fn evaluate(tokens: TokenStream) -> Result<Evaluation, EvalError> {
+    evaluator.evaluate_tokens(tokens)
+}
