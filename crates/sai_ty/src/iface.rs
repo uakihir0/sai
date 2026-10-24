@@ -85,7 +85,7 @@ pub struct InterfaceCheckIssue {
 
 /// Storage width selected for a validated local WIT flags declaration.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum FlagsRepr {
+enum FlagsRepr {
     U8,
     U16,
     U32,
@@ -96,10 +96,10 @@ pub enum FlagsRepr {
 /// This value does not allocate flag `DefId`s. Flag names remain constants of
 /// the parent flags type, as specified by spec/13 §13.9.4.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FlagsDef {
-    pub adt: DefId,
-    pub flags: Arc<[(Symbol, Span)]>,
-    pub repr: FlagsRepr,
+struct FlagsDef {
+    adt: DefId,
+    flags: Arc<[(Symbol, Span)]>,
+    repr: FlagsRepr,
 }
 
 impl InterfaceCheckIssue {
