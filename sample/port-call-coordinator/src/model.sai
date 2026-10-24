@@ -1,0 +1,143 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CargoKind {
+    Containers
+    Bulk
+    Liquid
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum HazmatClass {
+    None
+    Flammable
+    Oxidizer
+    Toxic
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum UnplacedReason {
+    NoCompatibleBerth
+    HazmatPermitUnavailable
+    ReeferPowerUnavailable
+    NoCompatibleCrane
+    NoSafeTideWindow
+    HazmatSeparation
+    ChannelOccupied
+    BerthOrCraneBusy
+    NoFeasibleOperatingWindow
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum InputIssue {
+    TooManyCalls
+    TooManyBerths
+    TooManyCranes
+    TooManyTideWindows
+    MissingCall
+    MissingBerth
+    MissingCrane
+    MissingTideWindow
+    InvalidCall
+    InvalidBerth
+    InvalidCrane
+    InvalidTideWindow
+    DuplicateCallId
+    DuplicateVesselId
+    DuplicateBerthId
+    DuplicateCraneId
+    DuplicateTideWindowId
+    UnknownCraneBerth
+    UnknownBerthNeighbor
+    InvalidTideOrdering
+    OverlappingTideWindows
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PortCall {
+    pub id: U32
+    pub vessel_id: U32
+    pub vessel_name: Str
+    pub priority: U32
+    pub eta_minute: U32
+    pub latest_departure_minute: U32
+    pub length_m: U32
+    pub draft_m: U32
+    pub cargo_kind: CargoKind
+    pub cargo_tons: U32
+    pub reefer_plugs_required: USize
+    pub hazmat_class: HazmatClass
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Berth {
+    pub id: U32
+    pub name: Str
+    pub maximum_length_m: U32
+    pub maximum_draft_m: U32
+    pub reefer_plugs: USize
+    pub hazmat_permit: HazmatClass
+    pub neighbor_berth_id: U32
+    pub open_minute: U32
+    pub close_minute: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Crane {
+    pub id: U32
+    pub berth_id: U32
+    pub cargo_kind: CargoKind
+    pub throughput_tons_per_hour: U32
+    pub open_minute: U32
+    pub close_minute: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TideWindow {
+    pub id: U32
+    pub start_minute: U32
+    pub end_minute: U32
+    pub maximum_draft_m: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PortScenario {
+    pub calls: Array<Option<PortCall>, 8>
+    pub call_count: USize
+    pub berths: Array<Option<Berth>, 4>
+    pub berth_count: USize
+    pub cranes: Array<Option<Crane>, 8>
+    pub crane_count: USize
+    pub tide_windows: Array<Option<TideWindow>, 4>
+    pub tide_window_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CallAssignment {
+    pub call_id: U32
+    pub berth_id: U32
+    pub crane_id: U32
+    pub tide_window_id: U32
+    pub channel_in_start_minute: U32
+    pub channel_in_end_minute: U32
+    pub service_start_minute: U32
+    pub service_end_minute: U32
+    pub channel_out_start_minute: U32
+    pub channel_out_end_minute: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CallDecision {
+    pub call_id: U32
+    pub vessel_id: U32
+    pub vessel_name: Str
+    pub assignment: Option<CallAssignment>
+    pub unplaced_reason: Option<UnplacedReason>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PortPlan {
+    pub decisions: Array<Option<CallDecision>, 8>
+    pub decision_count: USize
+    pub scheduled_count: USize
+    pub input_valid: Bool
+    pub input_issue: Option<InputIssue>
+}
