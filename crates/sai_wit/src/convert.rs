@@ -569,6 +569,19 @@ fn model_package(
                     &unsupported_types,
                 )?
             };
+            let source_declaration = if owner_interface == *interface_id
+                && matches!(definition.kind, TypeDefKind::Resource)
+            {
+                source_interface_resource_declaration(
+                    definition.span,
+                    wit_interface_name,
+                    name,
+                    &unit,
+                    source_mappings,
+                )
+            } else {
+                None
+            };
             let item_index = item_index(items.len())?;
             if matches!(kind, WitItemKind::Resource(_)) {
                 resource_items.insert(*type_id, item_index);
@@ -580,8 +593,8 @@ fn model_package(
                 deprecated,
                 kind,
                 unsupported,
-                declaration_span: None,
-                declaration_token_pairs: None,
+                declaration_span: source_declaration.as_ref().map(|(span, _)| span.clone()),
+                declaration_token_pairs: source_declaration.map(|(_, token_pairs)| token_pairs),
                 span,
             });
         }
@@ -1986,6 +1999,40 @@ fn source_function_declaration(
     })
 }
 
+fn source_interface_resource_declaration(
+    span: Span,
+    interface_name: &str,
+    name: &str,
+    unit: &WitUnit,
+    source_mappings: &[(u32, crate::WitSourceMapping)],
+) -> Option<(WitSpan, Vec<(String, String)>)> {
+    let name_span = source_span(span, unit, source_mappings)?;
+    let mut matches = source_mappings
+        .iter()
+        .filter(|(_, source)| source.path == name_span.path)
+        .flat_map(|(_, source)| {
+            source
+                .resource_declarations
+                .iter()
+                .filter(|declaration| {
+                    declaration.interface_name == interface_name
+                        && declaration.name == name
+                        && declaration.name_range == name_span.range
+                })
+                .map(|declaration| {
+                    (
+                        WitSpan {
+                            path: source.path.clone(),
+                            range: declaration.declaration_range.clone(),
+                        },
+                        declaration.token_pairs.clone(),
+                    )
+                })
+        });
+    let declaration = matches.next()?;
+    matches.next().is_none().then_some(declaration)
+}
+
 fn first_unsupported(
     earlier: Option<Unsupported>,
     later: Option<Unsupported>,
@@ -3060,6 +3107,90 @@ world app {
                 result: None,
                 is_async: false
             })
+        );
+    }
+
+    #[test]
+    fn authored_resource_and_member_provenance_maps_exact_direct_source_declarations() {
+        let source = concat!(
+            "package acme:graphics@1.2.3;\n",
+            "interface drawing {\n",
+            "  @since(version = 1.0.0)\n",
+            "  resource canvas {\n",
+            "    @since(version = 1.0.0)\n",
+            "    @deprecated(version = 2.0.0)\n",
+            "    constructor(seed: tuple<u32, string>);\n",
+            "    paint: func(color: result<tuple<u32, string>, option<list<u8>>>);\n",
+            "    make: static func() -> canvas;\n",
+            "  }\n",
+            "}\n",
+        );
+        let parsed = parse_source_files(dir_unit(), [WitSourceFile::new("resources.wit", source)])
+            .expect("valid WIT parses");
+        let mut context = WitResolveContext::default();
+        let mut resolve = Resolve::default();
+        let package = context
+            .push_package(&mut resolve, parsed)
+            .expect("self-contained package resolves");
+        let item = &package.interfaces[WitIfaceIdx::from_raw(0)].items[WitItemIdx::from_raw(0)];
+        assert_eq!(item.name, "canvas");
+        let item_span = item.span.as_ref().expect("resource name span is mapped");
+        assert_eq!(item_span.path, "resources.wit");
+        assert_eq!(&source[item_span.range.clone()], "canvas");
+        let declaration_span = item
+            .declaration_span
+            .as_ref()
+            .expect("resource declaration span is scanner-proven");
+        assert_eq!(
+            &source[declaration_span.range.clone()],
+            "@since(version = 1.0.0)\n  resource canvas {\n    @since(version = 1.0.0)\n    @deprecated(version = 2.0.0)\n    constructor(seed: tuple<u32, string>);\n    paint: func(color: result<tuple<u32, string>, option<list<u8>>>);\n    make: static func() -> canvas;\n  }"
+        );
+        let WitItemKind::Resource(members) = &item.kind else {
+            panic!("resource members expected");
+        };
+        let source_members = crate::authored_interface_resource_tokens(
+            source,
+            "drawing",
+            "canvas",
+            &item_span.range,
+        )
+        .expect("resource scanner matches the parsed resource name span");
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| (member.name.as_str(), member.kind))
+                .collect::<Vec<_>>(),
+            source_members
+                .members
+                .iter()
+                .map(|member| (member.name.as_str(), member.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            members
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            ["constructor", "paint", "make"]
+        );
+        for source_member in &source_members.members {
+            assert_eq!(
+                &source[source_member.name_range.clone()],
+                source_member.name
+            );
+            assert!(source[source_member.declaration_range.clone()].ends_with(';'));
+            assert_eq!(
+                source_member
+                    .token_pairs
+                    .iter()
+                    .filter(|(_, text)| text.is_empty())
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            &source[source_members.members[0].declaration_range.clone()],
+            "@since(version = 1.0.0)\n    @deprecated(version = 2.0.0)\n    constructor(seed: tuple<u32, string>);"
         );
     }
 

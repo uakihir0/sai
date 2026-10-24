@@ -23,7 +23,10 @@ pub use generated::*;
 pub use loader::*;
 pub use model::*;
 pub use printer::*;
-pub use source_scan::{AuthoredInterfaceFunctionTokens, authored_interface_function_tokens};
+pub use source_scan::{
+    AuthoredInterfaceFunctionTokens, AuthoredInterfaceResourceTokens, AuthoredResourceMemberTokens,
+    authored_interface_function_tokens, authored_interface_resource_tokens,
+};
 pub use view::*;
 pub use wasi::*;
 pub use wasi_loader::*;
@@ -570,8 +573,7 @@ fn parse_source_texts(
                 location: None,
             })?;
         let scan = source_scan::scan_source(&parser_source);
-        let source_function_declarations =
-            source_scan::scan_source(&source.text).function_declarations;
+        let source_declarations = source_scan::scan_source(&source.text);
         let parser_offset = u32::try_from(parser_size).expect("source size was bounded to u32");
         parser_size = parser_size
             .checked_add(scan.parser_text.len())
@@ -590,7 +592,8 @@ fn parse_source_texts(
                 .iter()
                 .map(|offset| rewritten_to_original[*offset])
                 .collect(),
-            function_declarations: source_function_declarations,
+            function_declarations: source_declarations.function_declarations,
+            resource_declarations: source_declarations.resource_declarations,
         };
         if package_name_location.is_none() {
             package_name_location = scan
@@ -940,6 +943,7 @@ struct WitSourceMapping {
     parser_len: usize,
     parser_to_source: Vec<usize>,
     function_declarations: Vec<source_scan::SourceFunctionDeclaration>,
+    resource_declarations: Vec<source_scan::SourceInterfaceResource>,
 }
 
 fn map_parse_error(sources: &[WitSourceMapping], error: ParseError) -> WitParseError {

@@ -9,6 +9,7 @@ pub(super) struct SourceScan {
     pub nested_package_ranges: Vec<Range<usize>>,
     pub named_result_function_ranges: Vec<Range<usize>>,
     pub function_declarations: Vec<SourceFunctionDeclaration>,
+    pub resource_declarations: Vec<SourceInterfaceResource>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -28,6 +29,53 @@ pub struct AuthoredInterfaceFunctionTokens {
     pub declaration_range: Range<usize>,
     /// Ordered parser-aligned token kind/text pairs. The function-name token
     /// has empty text while retaining its token kind.
+    pub token_pairs: Vec<(String, String)>,
+}
+
+/// Source declaration and direct member boundaries for one authored
+/// interface resource.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoredInterfaceResourceTokens {
+    /// Exact UTF-8 byte range from attached attributes through `;` or `}`.
+    pub declaration_range: Range<usize>,
+    /// Ordered parser-aligned token kind/text pairs. The resource-name token
+    /// is present with empty text while retaining its token kind.
+    pub token_pairs: Vec<(String, String)>,
+    /// Direct resource functions in source order.
+    pub members: Vec<AuthoredResourceMemberTokens>,
+}
+
+/// Source declaration and name-token boundary for one direct resource
+/// constructor, method, or static function.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoredResourceMemberTokens {
+    pub name: String,
+    pub kind: crate::WitMemberKind,
+    /// Exact byte range of the constructor keyword or function name.
+    pub name_range: Range<usize>,
+    /// Exact UTF-8 byte range from attached attributes through `;`.
+    pub declaration_range: Range<usize>,
+    /// Ordered parser-aligned token kind/text pairs. The member-name token
+    /// is present with empty text while retaining its token kind.
+    pub token_pairs: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceInterfaceResource {
+    pub interface_name: String,
+    pub name: String,
+    pub name_range: Range<usize>,
+    pub declaration_range: Range<usize>,
+    pub token_pairs: Vec<(String, String)>,
+    pub members: Vec<SourceResourceMember>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceResourceMember {
+    pub name: String,
+    pub kind: crate::WitMemberKind,
+    pub name_range: Range<usize>,
+    pub declaration_range: Range<usize>,
     pub token_pairs: Vec<(String, String)>,
 }
 
@@ -263,6 +311,7 @@ pub(super) fn scan_source(source: &str) -> SourceScan {
         nested_package_ranges,
         named_result_function_ranges,
         function_declarations: scan_function_declarations(source, &tokens),
+        resource_declarations: scan_interface_resources(source, &tokens),
     }
 }
 
@@ -368,6 +417,246 @@ pub fn authored_interface_function_tokens(
         declaration_range: declaration.declaration_range,
         token_pairs: declaration.token_pairs,
     })
+}
+
+/// Scans authored WIT source and returns one direct interface resource only
+/// when its parsed name-token span identifies exactly one lexical declaration.
+///
+/// Resource members are retained only when every direct member in the
+/// resource body has a complete, bounded function declaration. The returned
+/// source ranges are recovered from `source` itself.
+pub fn authored_interface_resource_tokens(
+    source: &str,
+    interface_name: &str,
+    name: &str,
+    name_range: &Range<usize>,
+) -> Option<AuthoredInterfaceResourceTokens> {
+    let mut matches = scan_source(source)
+        .resource_declarations
+        .into_iter()
+        .filter(|declaration| {
+            declaration.interface_name == interface_name
+                && declaration.name == name
+                && &declaration.name_range == name_range
+        });
+    let declaration = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(AuthoredInterfaceResourceTokens {
+        declaration_range: declaration.declaration_range,
+        token_pairs: declaration.token_pairs,
+        members: declaration
+            .members
+            .into_iter()
+            .map(|member| AuthoredResourceMemberTokens {
+                name: member.name,
+                kind: member.kind,
+                name_range: member.name_range,
+                declaration_range: member.declaration_range,
+                token_pairs: member.token_pairs,
+            })
+            .collect(),
+    })
+}
+
+fn scan_interface_resources(source: &str, tokens: &[Token]) -> Vec<SourceInterfaceResource> {
+    let mut declarations = Vec::new();
+    for (interface_index, interface_token) in tokens.iter().enumerate() {
+        if !is_identifier(source, interface_token, "interface") {
+            continue;
+        }
+        let Some(interface_name_token) = tokens.get(interface_index + 1) else {
+            continue;
+        };
+        let Some(interface_name) = wit_identifier_text(source, interface_name_token) else {
+            continue;
+        };
+        let open_index = interface_index + 2;
+        if !tokens
+            .get(open_index)
+            .is_some_and(|token| token.kind == TokenKind::Punctuation(b'{'))
+        {
+            continue;
+        }
+        let Some(close_index) = matching_delimiter(tokens, open_index, b'{', b'}') else {
+            continue;
+        };
+
+        let mut item_index = open_index + 1;
+        while item_index < close_index {
+            if is_identifier(source, &tokens[item_index], "resource") {
+                if let Some((declaration, next_index)) =
+                    scan_interface_resource(source, tokens, interface_name, item_index, close_index)
+                {
+                    declarations.push(declaration);
+                    item_index = next_index;
+                    continue;
+                }
+            }
+
+            // Skip nested declarations such as record/variant bodies. A
+            // resource nested below one of them is not an interface item.
+            if tokens[item_index].kind == TokenKind::Punctuation(b'{')
+                && let Some(nested_end) = matching_delimiter(tokens, item_index, b'{', b'}')
+            {
+                item_index = nested_end + 1;
+            } else {
+                item_index += 1;
+            }
+        }
+    }
+    declarations
+}
+
+fn scan_interface_resource(
+    source: &str,
+    tokens: &[Token],
+    interface_name: &str,
+    resource_index: usize,
+    interface_end: usize,
+) -> Option<(SourceInterfaceResource, usize)> {
+    let name_index = resource_index.checked_add(1)?;
+    let name_token = tokens.get(name_index)?;
+    let name = wit_identifier_text(source, name_token)?;
+    let after_name = name_index.checked_add(1)?;
+    let declaration_start = attached_attributes_start(tokens, resource_index)
+        .map_or(tokens[resource_index].range.start, |index| {
+            tokens[index].range.start
+        });
+
+    let (declaration_end, next_index, members) = match tokens.get(after_name)?.kind {
+        TokenKind::Punctuation(b';') => {
+            let end_token = &tokens[after_name];
+            (end_token.range.end, after_name + 1, Vec::new())
+        }
+        TokenKind::Punctuation(b'{') => {
+            let body_end = matching_delimiter(tokens, after_name, b'{', b'}')?;
+            if body_end >= interface_end {
+                return None;
+            }
+            let members = scan_resource_members(source, tokens, after_name + 1, body_end)?;
+            (tokens[body_end].range.end, body_end + 1, members)
+        }
+        _ => return None,
+    };
+    let declaration_range = declaration_start..declaration_end;
+    let token_pairs = function_token_pairs(source, tokens, &declaration_range, &name_token.range)?;
+    Some((
+        SourceInterfaceResource {
+            interface_name: interface_name.to_owned(),
+            name: name.to_owned(),
+            name_range: name_token.range.clone(),
+            declaration_range,
+            token_pairs,
+            members,
+        },
+        next_index,
+    ))
+}
+
+fn scan_resource_members(
+    source: &str,
+    tokens: &[Token],
+    mut item_index: usize,
+    body_end: usize,
+) -> Option<Vec<SourceResourceMember>> {
+    let mut members = Vec::new();
+    while item_index < body_end {
+        let name_index = skip_attributes(tokens, item_index, body_end)?;
+        if name_index >= body_end {
+            return None;
+        }
+        let name_token = tokens.get(name_index)?;
+        let name = if is_identifier(source, name_token, "constructor") {
+            "constructor"
+        } else {
+            wit_identifier_text(source, name_token)?
+        };
+        let (kind, end) = if name == "constructor"
+            && tokens
+                .get(name_index + 1)
+                .is_some_and(|token| token.kind == TokenKind::Punctuation(b'('))
+        {
+            (
+                crate::WitMemberKind::Constructor,
+                resource_function_declaration_end(tokens, name_index + 1, body_end)?,
+            )
+        } else {
+            let colon_index = name_index.checked_add(1)?;
+            if tokens.get(colon_index)?.kind != TokenKind::Punctuation(b':') {
+                return None;
+            }
+            let mut function_index = colon_index + 1;
+            let is_static = tokens
+                .get(function_index)
+                .is_some_and(|token| is_identifier(source, token, "static"));
+            if is_static {
+                function_index += 1;
+            }
+            if tokens
+                .get(function_index)
+                .is_some_and(|token| is_identifier(source, token, "async"))
+            {
+                function_index += 1;
+            }
+            if !tokens
+                .get(function_index)
+                .is_some_and(|token| is_identifier(source, token, "func"))
+            {
+                return None;
+            }
+            let end = resource_function_declaration_end(tokens, function_index + 1, body_end)?;
+            (
+                if is_static {
+                    crate::WitMemberKind::Static
+                } else {
+                    crate::WitMemberKind::Method
+                },
+                end,
+            )
+        };
+        let start = attached_attributes_start(tokens, name_index)
+            .map_or(name_token.range.start, |index| tokens[index].range.start);
+        let declaration_range = start..end;
+        let token_pairs =
+            function_token_pairs(source, tokens, &declaration_range, &name_token.range)?;
+        members.push(SourceResourceMember {
+            name: name.to_owned(),
+            kind,
+            name_range: name_token.range.clone(),
+            declaration_range,
+            token_pairs,
+        });
+        item_index = tokens.partition_point(|token| token.range.end <= end);
+    }
+    Some(members)
+}
+
+fn skip_attributes(tokens: &[Token], mut index: usize, limit: usize) -> Option<usize> {
+    while index < limit {
+        if tokens[index].kind != TokenKind::Punctuation(b'@') {
+            break;
+        }
+        index = index.checked_add(1)?;
+        if !matches!(
+            tokens.get(index)?.kind,
+            TokenKind::Identifier | TokenKind::ExplicitIdentifier
+        ) {
+            return None;
+        }
+        index += 1;
+        if tokens
+            .get(index)
+            .is_some_and(|token| token.kind == TokenKind::Punctuation(b'('))
+        {
+            index = matching_delimiter(tokens, index, b'(', b')')?.checked_add(1)?;
+        }
+        if index > limit {
+            return None;
+        }
+    }
+    Some(index)
 }
 
 fn function_token_pairs(
@@ -511,6 +800,38 @@ fn function_declaration_end(tokens: &[Token], start: usize, limit: usize) -> Opt
                 depth[3] = depth[3].checked_sub(1)?;
             }
             TokenKind::Punctuation(b';') if depth.iter().all(|level| *level == 0) => {
+                return Some(token.range.end);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn resource_function_declaration_end(
+    tokens: &[Token],
+    start: usize,
+    limit: usize,
+) -> Option<usize> {
+    let mut delimiters = Vec::new();
+    for token in tokens.iter().take(limit).skip(start) {
+        match token.kind {
+            TokenKind::Punctuation(open @ (b'(' | b'[' | b'{' | b'<')) => {
+                delimiters.push(open);
+            }
+            TokenKind::Punctuation(close @ (b')' | b']' | b'}' | b'>')) => {
+                let expected_open = match close {
+                    b')' => b'(',
+                    b']' => b'[',
+                    b'}' => b'{',
+                    b'>' => b'<',
+                    _ => unreachable!(),
+                };
+                if delimiters.pop()? != expected_open {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b';') if delimiters.is_empty() => {
                 return Some(token.range.end);
             }
             _ => {}
@@ -1357,8 +1678,8 @@ fn is_keylike_continue(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceFunctionDeclaration, lex, scan_foreign_references, scan_source,
-        stable_wit_token_kind, world_include_docs,
+        SourceFunctionDeclaration, SourceInterfaceResource, authored_interface_resource_tokens,
+        lex, scan_foreign_references, scan_source, stable_wit_token_kind, world_include_docs,
     };
 
     fn function(source: &str, name: &str) -> SourceFunctionDeclaration {
@@ -1367,6 +1688,157 @@ mod tests {
             .into_iter()
             .find(|declaration| declaration.name == name)
             .expect("direct interface function")
+    }
+
+    fn resource(source: &str, name: &str) -> SourceInterfaceResource {
+        scan_source(source)
+            .resource_declarations
+            .into_iter()
+            .find(|declaration| declaration.name == name)
+            .expect("direct interface resource")
+    }
+
+    #[test]
+    fn direct_resource_and_member_ranges_include_attributes_and_exact_terminators() {
+        let source = concat!(
+            "interface api {\n",
+            "  /// resource docs are deliberately outside the declaration range\n",
+            "  @since(version = 1.2.3)\n",
+            "  resource handle {\n",
+            "    @deprecated(version = 2.0.0)\n",
+            "    constructor(seed: result<tuple<u32, string>, option<list<u8>>>);\n",
+            "    // internal trivia is part of the exact byte range, but not tokens\n",
+            "    paint: async func(color: u32);\n",
+            "    create: static async func() -> handle;\n",
+            "  }\n",
+            "  resource empty;\n",
+            "}\n",
+        );
+        let declaration = resource(source, "handle");
+        assert_eq!(
+            &source[declaration.declaration_range.clone()],
+            "@since(version = 1.2.3)\n  resource handle {\n    @deprecated(version = 2.0.0)\n    constructor(seed: result<tuple<u32, string>, option<list<u8>>>);\n    // internal trivia is part of the exact byte range, but not tokens\n    paint: async func(color: u32);\n    create: static async func() -> handle;\n  }"
+        );
+        assert_eq!(declaration.interface_name, "api");
+        assert_eq!(
+            declaration
+                .members
+                .iter()
+                .map(|member| member.name.as_str())
+                .collect::<Vec<_>>(),
+            ["constructor", "paint", "create"]
+        );
+        assert_eq!(
+            declaration
+                .members
+                .iter()
+                .map(|member| member.kind)
+                .collect::<Vec<_>>(),
+            [
+                crate::WitMemberKind::Constructor,
+                crate::WitMemberKind::Method,
+                crate::WitMemberKind::Static,
+            ]
+        );
+        assert_eq!(
+            &source[declaration.members[0].declaration_range.clone()],
+            "@deprecated(version = 2.0.0)\n    constructor(seed: result<tuple<u32, string>, option<list<u8>>>);"
+        );
+        assert_eq!(
+            &source[declaration.members[1].declaration_range.clone()],
+            "paint: async func(color: u32);"
+        );
+        assert_eq!(
+            &source[declaration.members[2].declaration_range.clone()],
+            "create: static async func() -> handle;"
+        );
+        assert_eq!(
+            declaration.members[0]
+                .token_pairs
+                .iter()
+                .filter(|(_, text)| text.is_empty())
+                .count(),
+            1
+        );
+        let empty = resource(source, "empty");
+        assert_eq!(&source[empty.declaration_range.clone()], "resource empty;");
+        assert!(empty.members.is_empty());
+    }
+
+    #[test]
+    fn resource_fingerprints_ignore_comments_and_trivia_but_keep_nested_signature_tokens() {
+        let first = resource(
+            "interface api { resource store { /// docs\n read: func(value: result<tuple<u32, string>, option<list<u8>>>); } }",
+            "store",
+        );
+        let changed_trivia = resource(
+            "interface api {\n resource   store {\n /* changed comment */ read : func ( value : result < tuple < u32 , string > , option < list < u8 > > > ) ;\n }\n}",
+            "store",
+        );
+        assert_eq!(first.token_pairs, changed_trivia.token_pairs);
+        assert_eq!(
+            first.members[0].token_pairs,
+            changed_trivia.members[0].token_pairs
+        );
+        assert_eq!(
+            first.members[0]
+                .token_pairs
+                .iter()
+                .filter(|(_, text)| text.is_empty())
+                .count(),
+            1
+        );
+        let signature_changed = resource(
+            "interface api { resource store { read: func(value: result<tuple<u64, string>, option<list<u8>>>); } }",
+            "store",
+        );
+        assert_ne!(
+            first.members[0].token_pairs,
+            signature_changed.members[0].token_pairs
+        );
+    }
+
+    #[test]
+    fn exact_resource_name_span_disambiguates_siblings_and_rejects_missing_spans() {
+        let source = "interface api { resource first { read: func(); } resource second { read: static func(); } }";
+        let declarations = scan_source(source).resource_declarations;
+        assert_eq!(declarations.len(), 2);
+        assert_eq!(
+            &source[declarations[0].declaration_range.clone()],
+            "resource first { read: func(); }"
+        );
+        assert_eq!(
+            &source[declarations[1].declaration_range.clone()],
+            "resource second { read: static func(); }"
+        );
+        let second = authored_interface_resource_tokens(
+            source,
+            "api",
+            "second",
+            &declarations[1].name_range,
+        )
+        .expect("exact parser name span selects sibling");
+        assert_eq!(second.members[0].kind, crate::WitMemberKind::Static);
+        assert!(authored_interface_resource_tokens(source, "api", "second", &(0..0)).is_none());
+        let wrong_range = declarations[1].name_range.start..declarations[1].name_range.end - 1;
+        assert!(
+            authored_interface_resource_tokens(source, "api", "second", &wrong_range).is_none()
+        );
+    }
+
+    #[test]
+    fn malformed_or_unsupported_resource_members_do_not_produce_partial_provenance() {
+        for source in [
+            "interface api { resource store { read: func(value: tuple<u32, string); } }",
+            "interface api { resource store { read: func(value: [u32)); } }",
+            "interface api { resource store { unsupported: record { field: u32 } } }",
+            "interface api { resource store { read: func(); ",
+        ] {
+            assert!(
+                scan_source(source).resource_declarations.is_empty(),
+                "{source}"
+            );
+        }
     }
 
     #[test]
