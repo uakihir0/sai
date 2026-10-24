@@ -1,0 +1,54 @@
+use acme:accessible-audio-release-auditor/audit
+use acme:accessible-audio-release-auditor/fixtures
+use acme:accessible-audio-release-auditor/model.{AuditReport, FindingCode, ReleaseDecision}
+use acme:accessible-audio-release-auditor/report
+use sai:alloc/string.{String}
+
+pub fn sample_audit() -> AuditReport {
+    audit.audit(fixtures.sample_package())
+}
+
+pub fn sample_report() -> String
+    effects { alloc }
+{
+    report.render(sample_audit())
+}
+
+test "the package has complete metadata and required aligned audio parts" {
+    let result = sample_audit()
+    assert result.metadata_complete
+    assert result.required_track_count == 6
+    assert result.expected_track_count == 6
+    assert result.track_boundaries_aligned
+}
+
+test "transcript and audio-description captions cover the timed release" {
+    let result = sample_audit()
+    assert result.transcript.found
+    assert result.transcript.cue_count == 6
+    assert result.transcript.coverage_complete
+    assert result.transcript.largest_gap_ms == 0
+    assert result.captions.found
+    assert result.captions.cue_count == 6
+    assert result.captions.coverage_complete
+    assert result.captions.largest_gap_ms == 0
+}
+
+test "a narration hole above policy is recorded without failing sync tolerance" {
+    let result = sample_audit()
+    assert result.track_boundaries_aligned
+    assert result.narration_gap_count == 1
+    assert result.findings[0].unwrap().code == FindingCode.TrackGap
+    assert result.findings[0].unwrap().observed_ms == 200
+    assert result.findings[0].unwrap().expected_ms == 100
+}
+
+test "pending and stale-version approvals hold the package" {
+    let result = sample_audit()
+    assert result.approved_current_signoff_count == 1
+    assert result.required_signoff_count == 3
+    assert result.findings[1].unwrap().code == FindingCode.ApprovalPending
+    assert result.findings[2].unwrap().code == FindingCode.ApprovalVersionMismatch
+    assert result.decision == ReleaseDecision.HoldForCorrection
+    assert result.finding_count == 3
+}

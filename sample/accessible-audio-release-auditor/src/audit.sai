@@ -1,0 +1,863 @@
+use acme:accessible-audio-release-auditor/model.{
+    AccessibilityApproval
+    ApprovalRole
+    ApprovalStatus
+    AudioAsset
+    AuditReport
+    Chapter
+    Finding
+    FindingCode
+    ReleaseDecision
+    ReleasePackage
+    TextAsset
+    TextCoverageSummary
+    TextCue
+    TextKind
+    TrackKind
+}
+use acme:accessible-audio-release-auditor/policy
+
+fn append_finding(
+    report: AuditReport,
+    code: FindingCode,
+    subject: Str,
+    message: Str,
+    observed_ms: U32,
+    expected_ms: U32,
+    observed_version: Str,
+) -> AuditReport {
+    var updated = report
+    if updated.finding_count < updated.findings.len() {
+        updated.findings[updated.finding_count] = Some(
+            Finding(
+                code: code,
+                subject: subject,
+                message: message,
+                observed_ms: observed_ms,
+                expected_ms: expected_ms,
+                observed_version: observed_version,
+            ),
+        )
+        updated.finding_count += 1
+    }
+    updated
+}
+
+fn absolute_difference(left: U32, right: U32) -> U32 {
+    if left >= right {
+        left - right
+    } else {
+        right - left
+    }
+}
+
+fn chapter_for_number(package: ReleasePackage, number: U32) -> Option<Chapter> {
+    for chapter in package.chapters {
+        if chapter.number == number {
+            return Some(chapter)
+        }
+    }
+    None
+}
+
+fn track_count(package: ReleasePackage, kind: TrackKind, chapter_number: U32) -> USize {
+    var count: USize = 0
+    for slot in package.audio_assets {
+        match slot {
+            Some(asset) => {
+                if asset.kind == kind and asset.chapter_number == chapter_number {
+                    count += 1
+                }
+            }
+            None => {}
+        }
+    }
+    count
+}
+
+fn first_track(package: ReleasePackage, kind: TrackKind, chapter_number: U32) -> Option<
+    AudioAsset,
+> {
+    for slot in package.audio_assets {
+        match slot {
+            Some(asset) => {
+                if asset.kind == kind and asset.chapter_number == chapter_number {
+                    return Some(asset)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+fn track_label(kind: TrackKind, chapter_number: U32) -> Str {
+    match kind {
+        TrackKind.Narration => {
+            match chapter_number {
+                1 => "Narration, chapter 1"
+                2 => "Narration, chapter 2"
+                3 => "Narration, chapter 3"
+                _ => "Narration, unknown chapter"
+            }
+        }
+        TrackKind.AudioDescription => {
+            match chapter_number {
+                1 => "Audio description, chapter 1"
+                2 => "Audio description, chapter 2"
+                3 => "Audio description, chapter 3"
+                _ => "Audio description, unknown chapter"
+            }
+        }
+    }
+}
+
+fn role_label(role: ApprovalRole) -> Str {
+    match role {
+        ApprovalRole.Editorial => "Editorial"
+        ApprovalRole.Accessibility => "Accessibility"
+        ApprovalRole.AudioPost => "Audio post"
+    }
+}
+
+fn count_approvals(package: ReleasePackage, role: ApprovalRole) -> USize {
+    var count: USize = 0
+    for slot in package.approvals {
+        match slot {
+            Some(approval) => {
+                if approval.role == role {
+                    count += 1
+                }
+            }
+            None => {}
+        }
+    }
+    count
+}
+
+fn first_approval(package: ReleasePackage, role: ApprovalRole) -> Option<AccessibilityApproval> {
+    for slot in package.approvals {
+        match slot {
+            Some(approval) => {
+                if approval.role == role {
+                    return Some(approval)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+fn expected_source_track(kind: TextKind) -> TrackKind {
+    match kind {
+        TextKind.Transcript => TrackKind.Narration
+        TextKind.Captions => TrackKind.AudioDescription
+    }
+}
+
+fn text_kind_label(kind: TextKind) -> Str {
+    match kind {
+        TextKind.Transcript => "Transcript"
+        TextKind.Captions => "Audio-description captions"
+    }
+}
+
+fn last_chapter_end(package: ReleasePackage) -> U32 {
+    var end_ms: U32 = 0
+    for chapter in package.chapters {
+        end_ms = chapter.end_ms
+    }
+    end_ms
+}
+
+fn check_metadata(package: ReleasePackage, report: AuditReport) -> AuditReport {
+    var updated = report
+    let metadata = package.metadata
+
+    if metadata.catalog_id == "" {
+        updated.metadata_complete = false
+        updated = append_finding(
+            updated,
+            FindingCode.MissingMetadata,
+            "Catalog ID",
+            "required catalog metadata is blank",
+            0,
+            0,
+            "",
+        )
+    }
+    if metadata.title == "" {
+        updated.metadata_complete = false
+        updated = append_finding(
+            updated,
+            FindingCode.MissingMetadata,
+            "Title",
+            "required title metadata is blank",
+            0,
+            0,
+            "",
+        )
+    }
+    if metadata.narrator_credit == "" {
+        updated.metadata_complete = false
+        updated = append_finding(
+            updated,
+            FindingCode.MissingMetadata,
+            "Narrator credit",
+            "required narrator credit is blank",
+            0,
+            0,
+            "",
+        )
+    }
+    if metadata.locale == "" {
+        updated.metadata_complete = false
+        updated = append_finding(
+            updated,
+            FindingCode.MissingMetadata,
+            "Locale",
+            "required locale metadata is blank",
+            0,
+            0,
+            "",
+        )
+    }
+    if metadata.package_version == "" {
+        updated.metadata_complete = false
+        updated = append_finding(
+            updated,
+            FindingCode.MissingMetadata,
+            "Package version",
+            "required version metadata is blank",
+            0,
+            0,
+            "",
+        )
+    }
+    if metadata.content_advisory == "" {
+        updated.metadata_complete = false
+        updated = append_finding(
+            updated,
+            FindingCode.MissingMetadata,
+            "Content advisory",
+            "required content advisory is blank",
+            0,
+            0,
+            "",
+        )
+    }
+    if not metadata.rights_cleared {
+        updated.metadata_complete = false
+        updated = append_finding(
+            updated,
+            FindingCode.RightsNotCleared,
+            "Rights",
+            "distribution rights are not marked cleared",
+            0,
+            0,
+            "",
+        )
+    }
+    updated
+}
+
+fn check_required_tracks(package: ReleasePackage, report: AuditReport) -> AuditReport {
+    var updated = report
+    let required_kinds = policy.required_track_kinds()
+
+    for chapter in package.chapters {
+        for kind in required_kinds {
+            let count = track_count(package, kind, chapter.number)
+            if count == 0 {
+                updated = append_finding(
+                    updated,
+                    FindingCode.MissingRequiredTrack,
+                    track_label(kind, chapter.number),
+                    "required chapter audio part is missing",
+                    0,
+                    0,
+                    "",
+                )
+            } else {
+                updated.required_track_count += 1
+            }
+            if count > 1 {
+                updated = append_finding(
+                    updated,
+                    FindingCode.DuplicateRequiredTrack,
+                    track_label(kind, chapter.number),
+                    "more than one audio part matches this chapter and track kind",
+                    0,
+                    0,
+                    "",
+                )
+            }
+        }
+    }
+    updated
+}
+
+fn check_audio_asset(
+    package: ReleasePackage,
+    asset: AudioAsset,
+    report: AuditReport,
+) -> AuditReport {
+    var updated = report
+    if asset.locale != package.metadata.locale {
+        updated = append_finding(
+            updated,
+            FindingCode.TrackLanguageMismatch,
+            asset.id,
+            "audio locale differs from the release locale",
+            0,
+            0,
+            "",
+        )
+    }
+    if asset.version != package.metadata.package_version {
+        updated = append_finding(
+            updated,
+            FindingCode.TrackVersionMismatch,
+            asset.id,
+            "audio asset version differs from the package version",
+            0,
+            0,
+            asset.version,
+        )
+    }
+    if asset.end_ms <= asset.start_ms {
+        updated.track_boundaries_aligned = false
+        updated = append_finding(
+            updated,
+            FindingCode.TrackInvalidInterval,
+            asset.id,
+            "audio time range must end after it starts",
+            asset.end_ms,
+            asset.start_ms,
+            "",
+        )
+    }
+
+    match chapter_for_number(package, asset.chapter_number) {
+        Some(chapter) => {
+            let start_delta = absolute_difference(asset.start_ms, chapter.start_ms)
+            let end_delta = absolute_difference(asset.end_ms, chapter.end_ms)
+            if start_delta > policy.sync_tolerance_ms() {
+                updated.track_boundaries_aligned = false
+                updated = append_finding(
+                    updated,
+                    FindingCode.TrackBoundaryMisaligned,
+                    asset.id,
+                    "audio start is outside the chapter sync tolerance",
+                    start_delta,
+                    policy.sync_tolerance_ms(),
+                    "",
+                )
+            }
+            if end_delta > policy.sync_tolerance_ms() {
+                updated.track_boundaries_aligned = false
+                updated = append_finding(
+                    updated,
+                    FindingCode.TrackBoundaryMisaligned,
+                    asset.id,
+                    "audio end is outside the chapter sync tolerance",
+                    end_delta,
+                    policy.sync_tolerance_ms(),
+                    "",
+                )
+            }
+        }
+        None => {
+            updated = append_finding(
+                updated,
+                FindingCode.UnknownChapter,
+                asset.id,
+                "audio asset references a chapter that is not in the release manifest",
+                0,
+                0,
+                "",
+            )
+        }
+    }
+    updated
+}
+
+fn check_audio_assets(package: ReleasePackage, report: AuditReport) -> AuditReport {
+    var updated = report
+    for slot in package.audio_assets {
+        match slot {
+            Some(asset) => {
+                updated = check_audio_asset(package, asset, updated)
+            }
+            None => {}
+        }
+    }
+    updated
+}
+
+fn check_track_continuity(
+    package: ReleasePackage,
+    kind: TrackKind,
+    report: AuditReport,
+) -> AuditReport {
+    var updated = report
+    var previous_end_ms: U32 = 0
+    var previous_found = false
+
+    for chapter in package.chapters {
+        match first_track(package, kind, chapter.number) {
+            Some(asset) => {
+                if previous_found {
+                    if asset.start_ms > previous_end_ms {
+                        let gap_ms = asset.start_ms - previous_end_ms
+                        if gap_ms > policy.maximum_audio_gap_ms() {
+                            updated = append_finding(
+                                updated,
+                                FindingCode.TrackGap,
+                                track_label(kind, chapter.number),
+                                "uncovered audio gap before this chapter exceeds policy",
+                                gap_ms,
+                                policy.maximum_audio_gap_ms(),
+                                "",
+                            )
+                            if kind == TrackKind.Narration {
+                                updated.narration_gap_count += 1
+                            }
+                        }
+                    } else if asset.start_ms < previous_end_ms {
+                        let overlap_ms = previous_end_ms - asset.start_ms
+                        updated = append_finding(
+                            updated,
+                            FindingCode.TrackOverlap,
+                            track_label(kind, chapter.number),
+                            "audio parts overlap at this chapter boundary",
+                            overlap_ms,
+                            0,
+                            "",
+                        )
+                    }
+                }
+                previous_end_ms = asset.end_ms
+                previous_found = true
+            }
+            None => {}
+        }
+    }
+    updated
+}
+
+fn check_cross_track_alignment(package: ReleasePackage, report: AuditReport) -> AuditReport {
+    var updated = report
+    for chapter in package.chapters {
+        match (
+            first_track(package, TrackKind.Narration, chapter.number),
+            first_track(package, TrackKind.AudioDescription, chapter.number),
+        ) {
+            (Some(narration), Some(description)) => {
+                let start_delta = absolute_difference(narration.start_ms, description.start_ms)
+                let end_delta = absolute_difference(narration.end_ms, description.end_ms)
+                if start_delta > policy.sync_tolerance_ms() {
+                    updated.track_boundaries_aligned = false
+                    updated = append_finding(
+                        updated,
+                        FindingCode.CrossTrackMisaligned,
+                        track_label(TrackKind.Narration, chapter.number),
+                        "narration and audio-description starts exceed their sync tolerance",
+                        start_delta,
+                        policy.sync_tolerance_ms(),
+                        "",
+                    )
+                }
+                if end_delta > policy.sync_tolerance_ms() {
+                    updated.track_boundaries_aligned = false
+                    updated = append_finding(
+                        updated,
+                        FindingCode.CrossTrackMisaligned,
+                        track_label(TrackKind.Narration, chapter.number),
+                        "narration and audio-description ends exceed their sync tolerance",
+                        end_delta,
+                        policy.sync_tolerance_ms(),
+                        "",
+                    )
+                }
+            }
+            _ => {}
+        }
+    }
+    updated
+}
+
+fn blank_text_asset() -> TextAsset {
+    TextAsset(
+        id: "",
+        kind: TextKind.Transcript,
+        source_track: TrackKind.Narration,
+        locale: "",
+        version: "",
+        cues: Array<Option<TextCue>, 6>.filled(None),
+        cue_count: 0,
+    )
+}
+
+fn check_text_asset(
+    package: ReleasePackage,
+    asset: TextAsset,
+    expected_source: TrackKind,
+    report: AuditReport,
+) -> AuditReport {
+    var updated = report
+    var summary =
+        TextCoverageSummary(found: true, cue_count: 0, coverage_complete: false, largest_gap_ms: 0)
+    var content_valid = true
+    var coverage_complete = true
+    var gap_exceeded = false
+    var overlap_found = false
+    var previous_end_ms: U32 = 0
+    var first_start_ms: U32 = 0
+    var last_end_ms: U32 = 0
+    var has_previous = false
+
+    if asset.source_track != expected_source {
+        updated = append_finding(
+            updated,
+            FindingCode.TextSourceMismatch,
+            asset.id,
+            "text deliverable is linked to the wrong audio track kind",
+            0,
+            0,
+            "",
+        )
+        content_valid = false
+    }
+    if asset.locale != package.metadata.locale {
+        updated = append_finding(
+            updated,
+            FindingCode.TextLanguageMismatch,
+            asset.id,
+            "text locale differs from the release locale",
+            0,
+            0,
+            "",
+        )
+        content_valid = false
+    }
+    if asset.version != package.metadata.package_version {
+        updated = append_finding(
+            updated,
+            FindingCode.TextVersionMismatch,
+            asset.id,
+            "text deliverable version differs from the package version",
+            0,
+            0,
+            asset.version,
+        )
+        content_valid = false
+    }
+    let cue_count_invalid =
+        (asset.cue_count != policy.expected_text_cue_count() or asset.cue_count > asset.cues.len())
+    if cue_count_invalid {
+        updated = append_finding(
+            updated,
+            FindingCode.TextCueCountInvalid,
+            asset.id,
+            "text deliverable must contain six timed sections in this fixture",
+            0,
+            0,
+            "",
+        )
+        content_valid = false
+        coverage_complete = false
+    }
+
+    if asset.cue_count <= asset.cues.len() {
+        for index in 0..asset.cue_count {
+            match asset.cues[index] {
+                Some(cue) => {
+                    summary.cue_count += 1
+                    if not has_previous {
+                        first_start_ms = cue.start_ms
+                    } else if cue.start_ms > previous_end_ms {
+                        let gap_ms = cue.start_ms - previous_end_ms
+                        if gap_ms > summary.largest_gap_ms {
+                            summary.largest_gap_ms = gap_ms
+                        }
+                        if gap_ms > policy.maximum_text_gap_ms() {
+                            gap_exceeded = true
+                        }
+                    } else if cue.start_ms < previous_end_ms {
+                        overlap_found = true
+                    }
+
+                    if cue.end_ms <= cue.start_ms or cue.text == "" {
+                        content_valid = false
+                    }
+                    previous_end_ms = cue.end_ms
+                    last_end_ms = cue.end_ms
+                    has_previous = true
+                }
+                None => {
+                    content_valid = false
+                    coverage_complete = false
+                }
+            }
+        }
+    }
+
+    let endpoints_incomplete =
+        (summary.cue_count == 0 or first_start_ms != 0 or last_end_ms != last_chapter_end(package))
+    if endpoints_incomplete {
+        coverage_complete = false
+    }
+    if not content_valid {
+        updated = append_finding(
+            updated,
+            FindingCode.TextCueInvalid,
+            asset.id,
+            "a timed text section is blank, missing, or has an invalid time range",
+            0,
+            0,
+            "",
+        )
+    }
+    if gap_exceeded {
+        updated = append_finding(
+            updated,
+            FindingCode.TextGapExceeded,
+            asset.id,
+            "uncovered text interval exceeds the caption and transcript gap limit",
+            summary.largest_gap_ms,
+            policy.maximum_text_gap_ms(),
+            "",
+        )
+        coverage_complete = false
+    }
+    if overlap_found {
+        updated = append_finding(
+            updated,
+            FindingCode.TextOverlap,
+            asset.id,
+            "timed text sections overlap or are out of order",
+            0,
+            0,
+            "",
+        )
+        coverage_complete = false
+    }
+    if not coverage_complete {
+        updated = append_finding(
+            updated,
+            FindingCode.TextCoverageIncomplete,
+            asset.id,
+            "timed text does not cover the complete release interval",
+            last_end_ms,
+            last_chapter_end(package),
+            "",
+        )
+    }
+    summary.coverage_complete = coverage_complete and content_valid
+
+    if asset.kind == TextKind.Transcript {
+        updated.transcript = summary
+    } else {
+        updated.captions = summary
+    }
+    updated
+}
+
+fn check_text_kind(package: ReleasePackage, kind: TextKind, report: AuditReport) -> AuditReport {
+    var updated = report
+    var found_count: USize = 0
+    var first_found = false
+    var selected = blank_text_asset()
+
+    for slot in package.text_assets {
+        match slot {
+            Some(asset) => {
+                if asset.kind == kind {
+                    found_count += 1
+                    if not first_found {
+                        selected = asset
+                        first_found = true
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+
+    if found_count == 0 {
+        updated = append_finding(
+            updated,
+            FindingCode.MissingTextAsset,
+            text_kind_label(kind),
+            "required accessibility text deliverable is missing",
+            0,
+            0,
+            "",
+        )
+        if kind == TextKind.Transcript {
+            updated.transcript = TextCoverageSummary(
+                found: false,
+                cue_count: 0,
+                coverage_complete: false,
+                largest_gap_ms: 0,
+            )
+        } else {
+            updated.captions = TextCoverageSummary(
+                found: false,
+                cue_count: 0,
+                coverage_complete: false,
+                largest_gap_ms: 0,
+            )
+        }
+    } else {
+        if found_count > 1 {
+            updated = append_finding(
+                updated,
+                FindingCode.DuplicateTextAsset,
+                text_kind_label(kind),
+                "more than one deliverable has this text kind",
+                0,
+                0,
+                "",
+            )
+        }
+        updated = check_text_asset(package, selected, expected_source_track(kind), updated)
+    }
+    updated
+}
+
+fn check_approval_role(
+    package: ReleasePackage,
+    role: ApprovalRole,
+    report: AuditReport,
+) -> AuditReport {
+    var updated = report
+    let count = count_approvals(package, role)
+    if count == 0 {
+        return append_finding(
+            updated,
+            FindingCode.MissingApproval,
+            role_label(role),
+            "required release sign-off is missing",
+            0,
+            0,
+            "",
+        )
+    }
+    if count > 1 {
+        updated = append_finding(
+            updated,
+            FindingCode.DuplicateApproval,
+            role_label(role),
+            "more than one sign-off is recorded for this review role",
+            0,
+            0,
+            "",
+        )
+    }
+
+    match first_approval(package, role) {
+        Some(approval) => {
+            if approval.version != package.metadata.package_version {
+                updated = append_finding(
+                    updated,
+                    FindingCode.ApprovalVersionMismatch,
+                    role_label(role),
+                    "sign-off does not cover the current package version",
+                    0,
+                    0,
+                    approval.version,
+                )
+            }
+            match approval.status {
+                ApprovalStatus.Approved => {
+                    if approval.version == package.metadata.package_version {
+                        updated.approved_current_signoff_count += 1
+                    }
+                }
+                ApprovalStatus.Pending => {
+                    updated = append_finding(
+                        updated,
+                        FindingCode.ApprovalPending,
+                        role_label(role),
+                        "required release sign-off is still pending",
+                        0,
+                        0,
+                        "",
+                    )
+                }
+                ApprovalStatus.Rejected => {
+                    updated = append_finding(
+                        updated,
+                        FindingCode.ApprovalRejected,
+                        role_label(role),
+                        "reviewer rejected this release version",
+                        0,
+                        0,
+                        "",
+                    )
+                }
+            }
+        }
+        None => {}
+    }
+    updated
+}
+
+fn check_approvals(package: ReleasePackage, report: AuditReport) -> AuditReport {
+    var updated = report
+    let roles = [ApprovalRole.Editorial, ApprovalRole.Accessibility, ApprovalRole.AudioPost]
+    updated.required_signoff_count = roles.len()
+    for role in roles {
+        updated = check_approval_role(package, role, updated)
+    }
+    updated
+}
+
+pub fn audit(package: ReleasePackage) -> AuditReport {
+    var report = AuditReport(
+        catalog_id: package.metadata.catalog_id,
+        title: package.metadata.title,
+        locale: package.metadata.locale,
+        package_version: package.metadata.package_version,
+        decision: ReleaseDecision.ReadyForDistribution,
+        metadata_complete: true,
+        required_track_count: 0,
+        expected_track_count: package.chapters.len() * policy.required_track_kinds().len(),
+        track_boundaries_aligned: true,
+        narration_gap_count: 0,
+        transcript: TextCoverageSummary(
+            found: false,
+            cue_count: 0,
+            coverage_complete: false,
+            largest_gap_ms: 0,
+        ),
+        captions: TextCoverageSummary(
+            found: false,
+            cue_count: 0,
+            coverage_complete: false,
+            largest_gap_ms: 0,
+        ),
+        approved_current_signoff_count: 0,
+        required_signoff_count: 0,
+        findings: Array<Option<Finding>, 128>.filled(None),
+        finding_count: 0,
+    )
+
+    report = check_metadata(package, report)
+    report = check_required_tracks(package, report)
+    report = check_audio_assets(package, report)
+    report = check_track_continuity(package, TrackKind.Narration, report)
+    report = check_track_continuity(package, TrackKind.AudioDescription, report)
+    report = check_cross_track_alignment(package, report)
+    report = check_text_kind(package, TextKind.Transcript, report)
+    report = check_text_kind(package, TextKind.Captions, report)
+    report = check_approvals(package, report)
+
+    if report.finding_count > 0 {
+        report.decision = ReleaseDecision.HoldForCorrection
+    }
+    report
+}
