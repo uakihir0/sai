@@ -1888,8 +1888,8 @@ fn collect_root_interface_flags(
 
     // A flag is a named constant, not a VariantDef or a view enum case. The
     // view has no DefId for these constants, so extend the verified parent path
-    // with a ValueNs component whose disambiguator is its semantic bit index.
-    // That derived path makes a reorder change the stable identity.
+    // with a name-based ValueNs component. The fingerprint below records the
+    // semantic bit index without changing the name-based path identity.
     if flags.len() > 32 {
         return;
     }
@@ -1912,13 +1912,6 @@ fn collect_root_interface_flags(
             ));
             continue;
         }
-        let Ok(bit_disambiguator) = u32::try_from(bit_index) else {
-            reasons.insert(format!(
-                "WIT flag `{interface_name}.{}`.`{}` has an unrepresentable bit index",
-                item.name, source_flag.name
-            ));
-            continue;
-        };
         let Ok(flag_symbol) = symbols_interner.intern(flag_view_name) else {
             reasons.insert(format!(
                 "WIT flag `{interface_name}.{}`.`{}` cannot be interned",
@@ -1929,7 +1922,7 @@ fn collect_root_interface_flags(
         let mut flag_path_data = flags_path.data().to_vec();
         flag_path_data.push(DisambiguatedDefPathData {
             data: DefPathData::ValueNs(flag_symbol),
-            disambiguator: bit_disambiguator,
+            disambiguator: 0,
         });
         let flag_path = match DefPath::new(
             flags_path.package(),

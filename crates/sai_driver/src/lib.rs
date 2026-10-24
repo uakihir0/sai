@@ -25877,7 +25877,7 @@ interface api {
                 .expect("converted flag name interns");
             flag_def_path_data.push(sai_hir::DisambiguatedDefPathData {
                 data: sai_hir::DefPathData::ValueNs(flag_name_symbol),
-                disambiguator: u32::try_from(bit_index).expect("flag index fits"),
+                disambiguator: 0,
             });
             let flag_def_path = sai_hir::DefPath::new(
                 view.package,
@@ -25892,8 +25892,8 @@ interface api {
                     .data()
                     .last()
                     .map(|component| component.disambiguator),
-                Some(u32::try_from(bit_index).expect("flag index fits")),
-                "the path identity records the flag's semantic bit index"
+                Some(0),
+                "a unique flag name uses the standard zero disambiguator"
             );
             let expected_flag_hash = sai_hir::DefPathHash::compute(
                 &flag_def_path,
@@ -25981,7 +25981,7 @@ interface api {
     }
 
     #[test]
-    fn wit_flags_constant_identity_and_fingerprint_track_bit_order() {
+    fn wit_flags_constant_path_identity_is_stable_while_fingerprint_tracks_bit_order() {
         let inventory_for = |flags: &str| {
             let source = format!(
                 "package acme:phase1@1.0.0; interface api {{ flags permissions {{ {flags} }} }}"
@@ -25998,10 +25998,10 @@ interface api {
         let read_after = inventory_for("write, read");
         assert_eq!(read_before.kind(), sai_semantic::SymbolKind::Const);
         assert_eq!(read_after.kind(), sai_semantic::SymbolKind::Const);
-        assert_ne!(
+        assert_eq!(
             read_before.def_path_hash(),
             read_after.def_path_hash(),
-            "the derived identity changes when a flag moves to another bit"
+            "a named flag's path identity is stable when its bit position changes"
         );
         assert_ne!(
             read_before.fingerprint(),
