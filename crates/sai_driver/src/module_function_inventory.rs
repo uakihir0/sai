@@ -48,10 +48,12 @@ impl Phase1PackageSymbolInventory {
 /// enums with their generic parameters, variants and record-variant fields,
 /// non-refined distinct types and their generic parameters, plain type aliases
 /// and their generic parameters, non-generic refined types, constants, user
-/// effects, worlds, tests, properties, and extern functions. World
-/// import/export/include entries are validated as world contents but do not
-/// produce symbols. Every other symbol-bearing declaration makes the result
-/// incomplete until its symbol kind and path are collected as well.
+/// effects, worlds, tests, properties, extern functions, and traits with their
+/// generic parameters, direct associated types and functions, and trait-method
+/// generic parameters. World import/export/include entries are validated as
+/// world contents but do not produce symbols. Every other symbol-bearing
+/// declaration makes the result incomplete until its symbol kind and path are
+/// collected as well.
 pub(super) fn collect_module_function_inventory(
     package_key: &PackageKey,
     package_version: Option<&MvsPackageVersion>,
@@ -148,6 +150,8 @@ pub(super) fn collect_module_function_inventory(
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), FunctionOwnerDescriptor>::new();
     let mut record_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
+    let mut trait_owners_by_item =
+        HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut resource_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut enum_owners_by_item =
@@ -194,6 +198,11 @@ pub(super) fn collect_module_function_inventory(
             TopLevelOwnerKind::Struct => {
                 if record_owners_by_item.insert(key, *descriptor).is_some() {
                     reasons.insert("Phase 1 contains duplicate record owner descriptors".into());
+                }
+            }
+            TopLevelOwnerKind::Trait => {
+                if trait_owners_by_item.insert(key, *descriptor).is_some() {
+                    reasons.insert("Phase 1 contains duplicate trait owner descriptors".into());
                 }
             }
             TopLevelOwnerKind::Resource => {
@@ -290,6 +299,7 @@ pub(super) fn collect_module_function_inventory(
     let mut seen_items = HashSet::new();
     let mut consumed_owners = HashSet::new();
     let mut consumed_record_owners = HashSet::new();
+    let mut consumed_trait_owners = HashSet::new();
     let mut consumed_resource_owners = HashSet::new();
     let mut consumed_enum_owners = HashSet::new();
     let mut consumed_distinct_owners = HashSet::new();
@@ -376,6 +386,25 @@ pub(super) fn collect_module_function_inventory(
                         &record_owners_by_item,
                         &mut seen_items,
                         &mut consumed_record_owners,
+                        &mut canonical_paths,
+                        &mut current_symbols,
+                        &mut reasons,
+                        def_paths,
+                        packages,
+                        symbols,
+                    );
+                }
+                ItemTreeKind::Trait => {
+                    collect_trait(
+                        entry,
+                        module.file,
+                        &module_path,
+                        package_version.package(),
+                        input,
+                        prepared.module_tree.package,
+                        &trait_owners_by_item,
+                        &mut seen_items,
+                        &mut consumed_trait_owners,
                         &mut canonical_paths,
                         &mut current_symbols,
                         &mut reasons,
@@ -581,7 +610,7 @@ pub(super) fn collect_module_function_inventory(
                 // functions are children of ExternBlock and are symbols.
                 _ => {
                     reasons.insert(format!(
-                        "target-filtered declaration {:?} is outside the function-generic-parameter-record-generic-parameter-field-resource-field-enum-generic-parameter-variant-record-variant-field-distinct-type-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect-world-test-property-extern-function inventory",
+                        "target-filtered declaration {:?} is outside the supported package symbol inventory",
                         entry.kind
                     ));
                 }
@@ -598,6 +627,12 @@ pub(super) fn collect_module_function_inventory(
     if consumed_record_owners.len() != record_owners_by_item.len() {
         reasons.insert(
             "the Phase 1 record owner descriptors do not exactly match the filtered ItemTree"
+                .to_owned(),
+        );
+    }
+    if consumed_trait_owners.len() != trait_owners_by_item.len() {
+        reasons.insert(
+            "the Phase 1 trait owner descriptors do not exactly match the filtered ItemTree"
                 .to_owned(),
         );
     }
@@ -678,6 +713,13 @@ pub(super) fn collect_module_function_inventory(
         if !seen_items.contains(&(*file_id, *item_id)) {
             reasons.insert(
                 "a Phase 1 record owner has no target-filtered ItemTree declaration".to_owned(),
+            );
+        }
+    }
+    for ((file_id, item_id), _) in &trait_owners_by_item {
+        if !seen_items.contains(&(*file_id, *item_id)) {
+            reasons.insert(
+                "a Phase 1 trait owner has no target-filtered ItemTree declaration".to_owned(),
             );
         }
     }
@@ -1483,6 +1525,523 @@ fn canonical_test_string(name: &str) -> String {
     }
     canonical.push('"');
     canonical
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_trait(
+    entry: &ItemTreeEntry,
+    file_id: FileId,
+    module_path: &[String],
+    package_identity: &str,
+    input: &OwnedPhase1ModuleInput,
+    package_id: PackageId,
+    owners_by_item: &HashMap<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>,
+    seen_items: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    consumed_owners: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    reasons: &mut HashSet<String>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) {
+    #[derive(Clone)]
+    enum TraitChild {
+        Generic(ast::GenericParam),
+        AssociatedType(ast::AssocTypeDecl),
+        Method(ast::FnDecl),
+    }
+
+    let key = (file_id, entry.ast_id);
+    if !seen_items.insert(key) {
+        reasons.insert("the target-filtered ItemTree contains a duplicate trait AST ID".into());
+    }
+    if entry.kind != ItemTreeKind::Trait {
+        reasons.insert("a non-trait ItemTree entry reached the trait collector".to_owned());
+        return;
+    }
+    if entry.name == Symbol::ERROR {
+        reasons.insert("a target-filtered trait has no valid declaration name".to_owned());
+        return;
+    }
+    let name = match symbols.resolve(entry.name) {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            reasons.insert("a target-filtered trait name cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let Some(descriptor) = owners_by_item.get(&key).copied() else {
+        reasons.insert("a target-filtered trait has no matching Phase 1 owner".to_owned());
+        return;
+    };
+    if descriptor.kind != TopLevelOwnerKind::Trait
+        || descriptor.file != file_id
+        || descriptor.item_id != entry.ast_id
+    {
+        reasons.insert("a trait owner descriptor has the wrong source identity or kind".into());
+        return;
+    }
+    consumed_owners.insert(key);
+
+    let Some(pointer) = input.ast_ids.pointer(entry.ast_id) else {
+        reasons.insert("a target-filtered trait AST ID has no source pointer".to_owned());
+        return;
+    };
+    let Some(syntax) = pointer.resolve(file_id, &input.root) else {
+        reasons.insert("a target-filtered trait source pointer is stale".to_owned());
+        return;
+    };
+    let Some(declaration) = ast::TraitDecl::cast(syntax.clone()) else {
+        reasons.insert("a trait source pointer resolves to a non-trait node".to_owned());
+        return;
+    };
+    if input.ast_ids.ast_id(&declaration).map(|id| id.erase()) != Some(entry.ast_id) {
+        reasons.insert("a trait AST ID does not match its current declaration".into());
+        return;
+    }
+    let Some(name_token) = declaration.name().and_then(|name| name.token()) else {
+        reasons.insert("a target-filtered trait AST has no name token".to_owned());
+        return;
+    };
+    let raw_name = name_token
+        .text()
+        .strip_prefix("r#")
+        .unwrap_or(name_token.text());
+    if sai_syntax::normalize_identifier(raw_name) != name {
+        reasons.insert("the ItemTree and trait AST disagree about the declaration name".into());
+        return;
+    }
+    if syntax_has_errors(&syntax)
+        || name_token.has_error()
+        || input
+            .parser_diagnostics
+            .iter()
+            .any(|diagnostic| parser_diagnostic_overlaps_syntax(diagnostic, file_id, &syntax))
+    {
+        reasons.insert("a target-filtered trait AST contains recovery or parser errors".into());
+        return;
+    }
+
+    let Some(item_list) = declaration.items() else {
+        reasons.insert("a trait has no associated-item list".to_owned());
+        return;
+    };
+    let mut expected_children = Vec::<(usize, TraitChild)>::new();
+    if let Some(generic_params) = declaration.generic_params() {
+        expected_children.extend(generic_params.params().map(|parameter| {
+            (
+                parameter.syntax().text_range().start().to_usize(),
+                TraitChild::Generic(parameter),
+            )
+        }));
+    }
+    for child in item_list.syntax().children() {
+        if let Some(associated_type) = ast::AssocTypeDecl::cast(child.clone()) {
+            expected_children.push((
+                child.text_range().start().to_usize(),
+                TraitChild::AssociatedType(associated_type),
+            ));
+        } else if let Some(method) = ast::FnDecl::cast(child.clone()) {
+            expected_children.push((
+                child.text_range().start().to_usize(),
+                TraitChild::Method(method),
+            ));
+        } else {
+            reasons.insert(
+                "a trait contains an unsupported or unrecognized associated-item form".into(),
+            );
+            return;
+        }
+    }
+    expected_children.sort_by_key(|(offset, _)| *offset);
+    if entry.children.len() != expected_children.len() {
+        reasons.insert("a trait's ItemTree child count does not match its snapshot AST".into());
+        return;
+    }
+    let expected_child_identities = expected_children
+        .iter()
+        .map(|(_, ast_child)| {
+            Some(match ast_child {
+                TraitChild::Generic(ast::GenericParam::Type(parameter)) => (
+                    ItemTreeKind::TypeParam,
+                    input.ast_ids.ast_id(parameter).map(|id| id.erase())?,
+                ),
+                TraitChild::Generic(ast::GenericParam::Const(parameter)) => (
+                    ItemTreeKind::ConstParam,
+                    input.ast_ids.ast_id(parameter).map(|id| id.erase())?,
+                ),
+                TraitChild::AssociatedType(associated_type) => (
+                    ItemTreeKind::AssocType,
+                    input.ast_ids.ast_id(associated_type).map(|id| id.erase())?,
+                ),
+                TraitChild::Method(method) => (
+                    ItemTreeKind::AssocFn,
+                    input.ast_ids.ast_id(method).map(|id| id.erase())?,
+                ),
+            })
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(expected_child_identities) = expected_child_identities else {
+        reasons.insert("a trait AST child has no current-snapshot AST ID".to_owned());
+        return;
+    };
+    if !trait_children_match_order(&expected_child_identities, &entry.children) {
+        reasons.insert(
+            "a trait's ItemTree child kind or source order does not match its snapshot AST"
+                .to_owned(),
+        );
+        return;
+    }
+
+    let mut generic_children = Vec::new();
+    let mut associated = Vec::<(
+        ItemTreeEntry,
+        Symbol,
+        String,
+        SyntaxNode,
+        sai_syntax::SyntaxToken,
+        bool,
+    )>::new();
+    let mut member_names = HashSet::<String>::new();
+    for ((_, ast_child), child) in expected_children.iter().zip(&entry.children) {
+        let (name_node, child_syntax, is_method) = match ast_child {
+            TraitChild::Generic(ast::GenericParam::Type(parameter)) => {
+                (parameter.name(), parameter.syntax().clone(), false)
+            }
+            TraitChild::Generic(ast::GenericParam::Const(parameter)) => {
+                (parameter.name(), parameter.syntax().clone(), false)
+            }
+            TraitChild::AssociatedType(associated_type) => (
+                associated_type.name(),
+                associated_type.syntax().clone(),
+                false,
+            ),
+            TraitChild::Method(method) => (method.name(), method.syntax().clone(), true),
+        };
+        if input.ast_ids.pointer(child.ast_id).is_none() {
+            reasons.insert("a trait ItemTree child ID does not match its snapshot AST".into());
+            return;
+        }
+        if child.name == Symbol::ERROR {
+            reasons.insert("a trait child has no valid ItemTree name".to_owned());
+            return;
+        }
+        let child_name = match symbols.resolve(child.name) {
+            Ok(name) if !name.is_empty() => name.to_string(),
+            _ => {
+                reasons.insert("a trait child name cannot be resolved".to_owned());
+                return;
+            }
+        };
+        let Some(name_node) = name_node else {
+            reasons.insert("a trait child AST has no name node".to_owned());
+            return;
+        };
+        let Some(child_name_token) = name_node.token() else {
+            reasons.insert("a trait child AST has no name token".to_owned());
+            return;
+        };
+        let raw_child_name = child_name_token
+            .text()
+            .strip_prefix("r#")
+            .unwrap_or(child_name_token.text());
+        if sai_syntax::normalize_identifier(raw_child_name) != child_name {
+            reasons.insert("the trait ItemTree and AST child names disagree".into());
+            return;
+        }
+        if syntax_has_errors(&child_syntax)
+            || child_name_token.has_error()
+            || input.parser_diagnostics.iter().any(|diagnostic| {
+                parser_diagnostic_overlaps_syntax(diagnostic, file_id, &child_syntax)
+            })
+        {
+            reasons.insert("a trait child AST contains recovery or parser errors".into());
+            return;
+        }
+        match ast_child {
+            TraitChild::Generic(_) => {
+                if !child.children.is_empty() {
+                    reasons.insert(
+                        "a trait generic parameter has unexpected child declarations".into(),
+                    );
+                    return;
+                }
+                generic_children.push(child.clone());
+            }
+            TraitChild::AssociatedType(_) => {
+                if !child.children.is_empty() {
+                    reasons.insert(
+                        "a trait associated type has unsupported nested declarations".into(),
+                    );
+                    return;
+                }
+                if !member_names.insert(child_name.clone()) {
+                    reasons.insert(format!(
+                        "trait `{name}` has duplicate associated item name `{child_name}`"
+                    ));
+                }
+                associated.push((
+                    child.clone(),
+                    child.name,
+                    child_name,
+                    child_syntax,
+                    child_name_token,
+                    false,
+                ));
+            }
+            TraitChild::Method(_) => {
+                if !member_names.insert(child_name.clone()) {
+                    reasons.insert(format!(
+                        "trait `{name}` has duplicate associated item name `{child_name}`"
+                    ));
+                }
+                associated.push((
+                    child.clone(),
+                    child.name,
+                    child_name,
+                    child_syntax,
+                    child_name_token,
+                    is_method,
+                ));
+            }
+        }
+    }
+    let canonical_path = format!(
+        "{}{}.{name}",
+        package_identity,
+        module_path
+            .iter()
+            .map(|segment| format!("/{segment}"))
+            .collect::<String>()
+    );
+    if !canonical_paths.insert(canonical_path.clone()) {
+        reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+    }
+
+    let owner_component = DefPathData::TypeNs(entry.name);
+    let Some(item_position) = input
+        .filtered
+        .item_tree
+        .items
+        .iter()
+        .position(|candidate| candidate.ast_id == entry.ast_id)
+    else {
+        reasons.insert("a target-filtered trait is absent from its module ItemTree".to_owned());
+        return;
+    };
+    let owner_disambiguator = input.filtered.item_tree.items[..item_position]
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.kind,
+                ItemTreeKind::Struct
+                    | ItemTreeKind::Alias
+                    | ItemTreeKind::Refined
+                    | ItemTreeKind::Enum
+                    | ItemTreeKind::Distinct
+                    | ItemTreeKind::Resource
+                    | ItemTreeKind::Trait
+            ) && candidate.name == entry.name
+        })
+        .count();
+    let Ok(owner_disambiguator) = u32::try_from(owner_disambiguator) else {
+        reasons.insert("a trait owner DefPath disambiguator overflowed".to_owned());
+        return;
+    };
+    let def_path = match def_paths.resolve(descriptor.owner.def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        Ok(Some(_)) => {
+            reasons
+                .insert("a trait owner resolves to a definition path from another package".into());
+            return;
+        }
+        Ok(None) => {
+            reasons.insert("a trait owner has no canonical definition path".to_owned());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("a trait owner definition path cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let path_matches_declaration = def_path.data().len() == module_path.len() + 1
+        && def_path
+            .data()
+            .iter()
+            .take(module_path.len())
+            .zip(module_path)
+            .all(|(component, module_name)| {
+                component.disambiguator == 0
+                    && matches!(&component.data, DefPathData::Module(segment)
+                        if symbols.resolve(*segment).is_ok_and(|resolved| resolved.as_ref() == module_name))
+            })
+        && def_path.data().last().is_some_and(|component| {
+            component.data == owner_component && component.disambiguator == owner_disambiguator
+        });
+    if !path_matches_declaration {
+        reasons.insert(
+            "the trait DefPath does not match its module, TypeNs name, or disambiguator".into(),
+        );
+        return;
+    }
+    let def_path_hash = match DefPathHash::compute(&def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert("a trait definition path hash cannot be computed".to_owned());
+            return;
+        }
+    };
+    let fingerprint = match declaration_fingerprint(SymbolKind::Trait, &syntax, Some(&name_token)) {
+        Ok(fingerprint) => fingerprint,
+        Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+            reasons.insert("a trait name token is outside its declaration syntax node".into());
+            return;
+        }
+    };
+    current_symbols.push(CurrentSymbol::new(
+        canonical_path.clone(),
+        def_path_hash,
+        SymbolKind::Trait,
+        fingerprint,
+    ));
+    collect_item_generic_params(
+        &generic_children,
+        declaration.generic_params(),
+        &canonical_path,
+        descriptor.owner.def_id,
+        &def_path,
+        input,
+        package_id,
+        "trait",
+        canonical_paths,
+        current_symbols,
+        reasons,
+        def_paths,
+        packages,
+        symbols,
+    );
+
+    let mut next_disambiguator = HashMap::<DefPathData, u32>::new();
+    let mut associated_paths = Vec::with_capacity(associated.len());
+    let mut expected_components = Vec::with_capacity(associated.len());
+    for (item, item_name, _, _, _, _) in &associated {
+        let component = match item.kind {
+            ItemTreeKind::AssocType => DefPathData::AssocType(*item_name),
+            ItemTreeKind::AssocFn => DefPathData::AssocFn(*item_name),
+            _ => {
+                reasons.insert("a trait has an unsupported associated-item kind".into());
+                return;
+            }
+        };
+        let disambiguator = next_disambiguator.entry(component.clone()).or_default();
+        let ordinal = *disambiguator;
+        let Some(next) = ordinal.checked_add(1) else {
+            reasons.insert("trait associated-item DefPath disambiguator overflowed".to_owned());
+            return;
+        };
+        *disambiguator = next;
+        associated_paths.push((component.clone(), ordinal));
+        expected_components.push((component, ordinal));
+    }
+    let associated_def_ids =
+        match def_paths.intern_assoc_items(descriptor.owner.def_id, &associated_paths) {
+            Ok(def_ids) if def_ids.len() == associated.len() => def_ids,
+            Ok(_) => {
+                reasons.insert(
+                    "HIR returned the wrong number of trait associated-item definitions".into(),
+                );
+                return;
+            }
+            Err(_) => {
+                reasons.insert("trait associated-item definitions cannot be interned".into());
+                return;
+            }
+        };
+    for (
+        ((item, _, item_name, item_syntax, item_name_token, is_method), def_id),
+        (component, ordinal),
+    ) in associated
+        .iter()
+        .zip(associated_def_ids)
+        .zip(expected_components)
+    {
+        let item_path = match def_paths.resolve(def_id) {
+            Ok(Some(path)) if path.package() == package_id => path,
+            _ => {
+                reasons.insert(
+                    "a trait associated item has no definition path in the selected package".into(),
+                );
+                return;
+            }
+        };
+        let exact_path = item_path.data().len() == def_path.data().len() + 1
+            && &item_path.data()[..def_path.data().len()] == def_path.data()
+            && item_path.data().last().is_some_and(|path_component| {
+                path_component.data == component && path_component.disambiguator == ordinal
+            });
+        if !exact_path {
+            reasons.insert(
+                "a trait associated-item DefPath disagrees with ItemTree source order".into(),
+            );
+            return;
+        }
+        let item_def_path_hash = match DefPathHash::compute(&item_path, packages, symbols) {
+            Ok(hash) => Fingerprint::new(hash.raw()),
+            Err(_) => {
+                reasons.insert("a trait associated-item DefPath hash cannot be computed".into());
+                return;
+            }
+        };
+        let symbol_kind = if *is_method {
+            SymbolKind::AssocFn
+        } else {
+            SymbolKind::AssocType
+        };
+        let item_fingerprint =
+            match declaration_fingerprint(symbol_kind, item_syntax, Some(item_name_token)) {
+                Ok(fingerprint) => fingerprint,
+                Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                    reasons
+                        .insert("a trait associated-item name is outside its syntax node".into());
+                    return;
+                }
+            };
+        let item_canonical_path = format!("{canonical_path}.{item_name}");
+        if !canonical_paths.insert(item_canonical_path.clone()) {
+            reasons.insert(format!(
+                "duplicate canonical symbol path {item_canonical_path}"
+            ));
+        }
+        current_symbols.push(CurrentSymbol::new(
+            item_canonical_path.clone(),
+            item_def_path_hash,
+            symbol_kind,
+            item_fingerprint,
+        ));
+        if *is_method {
+            let Some(method) = ast::FnDecl::cast(item_syntax.clone()) else {
+                reasons.insert("a trait method ItemTree entry resolves to a non-function".into());
+                return;
+            };
+            collect_item_generic_params(
+                &item.children,
+                method.generic_params(),
+                &item_canonical_path,
+                def_id,
+                &item_path,
+                input,
+                package_id,
+                "trait method",
+                canonical_paths,
+                current_symbols,
+                reasons,
+                def_paths,
+                packages,
+                symbols,
+            );
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4704,6 +5263,17 @@ fn collect_item_generic_params(
     current_symbols.extend(generic_symbols);
 }
 
+fn trait_children_match_order(
+    expected: &[(ItemTreeKind, sai_syntax::ast::ErasedAstId)],
+    actual: &[ItemTreeEntry],
+) -> bool {
+    expected.len() == actual.len()
+        && expected
+            .iter()
+            .zip(actual)
+            .all(|((kind, ast_id), entry)| *kind == entry.kind && *ast_id == entry.ast_id)
+}
+
 fn syntax_has_errors(root: &SyntaxNode) -> bool {
     let mut stack = vec![SyntaxElement::Node(root.clone())];
     while let Some(element) = stack.pop() {
@@ -4735,4 +5305,50 @@ fn parser_diagnostic_overlaps_syntax(
     let diagnostic_range = primary.span.range;
     let syntax_range = syntax.text_range();
     diagnostic_range.start() <= syntax_range.end() && syntax_range.start() <= diagnostic_range.end()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trait_children_match_order;
+    use sai_hir::{
+        Visibility,
+        item_tree::{ItemTreeEntry, ItemTreeKind},
+    };
+    use sai_intern::Symbol;
+    use sai_syntax::ast::ErasedAstId;
+
+    fn child(kind: ItemTreeKind, ast_id: u32) -> ItemTreeEntry {
+        ItemTreeEntry {
+            ast_id: ErasedAstId::new(ast_id),
+            kind,
+            name: Symbol::ERROR,
+            docs: None,
+            vis: Visibility::Private,
+            raw_attrs: Vec::new(),
+            children: Vec::new(),
+            header_hash: None,
+        }
+    }
+
+    #[test]
+    fn trait_child_order_mismatch_is_rejected() {
+        let expected = [
+            (ItemTreeKind::TypeParam, ErasedAstId::new(1)),
+            (ItemTreeKind::AssocType, ErasedAstId::new(2)),
+            (ItemTreeKind::AssocFn, ErasedAstId::new(3)),
+        ];
+        let source_order = [
+            child(ItemTreeKind::TypeParam, 1),
+            child(ItemTreeKind::AssocType, 2),
+            child(ItemTreeKind::AssocFn, 3),
+        ];
+        let reordered = [
+            child(ItemTreeKind::TypeParam, 1),
+            child(ItemTreeKind::AssocFn, 3),
+            child(ItemTreeKind::AssocType, 2),
+        ];
+
+        assert!(trait_children_match_order(&expected, &source_order));
+        assert!(!trait_children_match_order(&expected, &reordered));
+    }
 }

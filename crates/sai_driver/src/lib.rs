@@ -25838,6 +25838,519 @@ world app { import acme:dep/api; }\n",
     }
 
     #[test]
+    fn module_function_inventory_collects_traits_and_nested_generic_parameters() {
+        let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"trait Store<T, const N: I32> {\ntype Item\nfn put<U, const M: I32>(self: borrow Self, item: U)\n}\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<Vec<_>>(),
+            [
+                ("acme:phase1.Store", sai_semantic::SymbolKind::Trait),
+                (
+                    "acme:phase1.Store.generic[T]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.Store.generic[N]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.Store.Item",
+                    sai_semantic::SymbolKind::AssocType
+                ),
+                ("acme:phase1.Store.put", sai_semantic::SymbolKind::AssocFn),
+                (
+                    "acme:phase1.Store.put.generic[U]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.Store.put.generic[M]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+            ]
+        );
+
+        let parsed =
+            sai_syntax::parse(&snapshot, module_tree.modules[0].file).expect("trait module parses");
+        let declaration = parsed
+            .root
+            .descendants()
+            .find_map(ast::TraitDecl::cast)
+            .expect("trait declaration is present");
+        let trait_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.path() == "acme:phase1.Store")
+            .expect("trait symbol exists");
+        let trait_name = declaration
+            .name()
+            .and_then(|name| name.token())
+            .expect("trait name token exists");
+        assert_eq!(
+            trait_symbol.fingerprint(),
+            sai_semantic::declaration_fingerprint(
+                sai_semantic::SymbolKind::Trait,
+                &declaration.syntax(),
+                Some(&trait_name),
+            )
+            .expect("trait declaration fingerprint is defined")
+        );
+
+        let item_list = declaration.items().expect("trait item list exists");
+        let method = item_list
+            .functions()
+            .find(|method| {
+                method
+                    .name()
+                    .and_then(|name| name.token())
+                    .is_some_and(|token| token.text() == "put")
+            })
+            .expect("trait method exists");
+        let method_name = method
+            .name()
+            .and_then(|name| name.token())
+            .expect("method name token exists");
+        let method_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.path() == "acme:phase1.Store.put")
+            .expect("trait method symbol exists");
+        assert_eq!(
+            method_symbol.fingerprint(),
+            sai_semantic::declaration_fingerprint(
+                sai_semantic::SymbolKind::AssocFn,
+                &method.syntax(),
+                Some(&method_name),
+            )
+            .expect("method declaration fingerprint is defined")
+        );
+
+        let method_owner = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| owner.kind == TopLevelOwnerKind::Trait)
+            .expect("trait owner exists");
+        let trait_owner_path = database
+            .resolve_def_path(method_owner.owner.def_id.to_def_id())
+            .expect("trait owner DefId is valid")
+            .expect("trait owner DefPath exists");
+        let def_paths = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("trait package has a DefPath interner");
+        let trait_t = database
+            .symbols
+            .intern("T")
+            .expect("trait type parameter name interns");
+        let trait_n = database
+            .symbols
+            .intern("N")
+            .expect("trait const parameter name interns");
+        let trait_parameter_def_ids = def_paths
+            .intern_generic_params(
+                method_owner.owner.def_id,
+                &[(trait_t, false, 0), (trait_n, true, 0)],
+            )
+            .expect("HIR lowering interns trait generic parameters");
+        for (def_id, expected_path) in trait_parameter_def_ids.into_iter().zip([
+            "acme:phase1.Store.generic[T]",
+            "acme:phase1.Store.generic[N]",
+        ]) {
+            let parameter_path = database
+                .resolve_def_path(def_id.to_def_id())
+                .expect("trait generic parameter DefId is valid")
+                .expect("trait generic parameter DefPath exists");
+            assert_eq!(
+                &parameter_path.data()[..trait_owner_path.data().len()],
+                trait_owner_path.data()
+            );
+            let expected_hash = sai_hir::DefPathHash::compute(
+                &parameter_path,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("trait generic parameter DefPath hashes");
+            assert_eq!(
+                inventory
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.path() == expected_path)
+                    .expect("trait generic parameter symbol exists")
+                    .def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+        }
+        let put = database.symbols.intern("put").expect("method name interns");
+        let method_def_id = def_paths
+            .intern_assoc_items(method_owner.owner.def_id, &[(DefPathData::AssocFn(put), 0)])
+            .expect("HIR lowering interns trait methods")
+            .into_iter()
+            .next()
+            .expect("method DefId exists");
+        let method_path = database
+            .resolve_def_path(method_def_id.to_def_id())
+            .expect("method DefId is valid")
+            .expect("method DefPath exists");
+        assert_eq!(
+            &method_path.data()[..trait_owner_path.data().len()],
+            trait_owner_path.data()
+        );
+        assert!(matches!(
+            method_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::AssocFn(put)
+                    && component.disambiguator == 0
+        ));
+        let expected_parameter_path = def_paths
+            .intern_generic_params(
+                method_def_id,
+                &[
+                    (
+                        database
+                            .symbols
+                            .intern("U")
+                            .expect("type parameter name interns"),
+                        false,
+                        0,
+                    ),
+                    (
+                        database
+                            .symbols
+                            .intern("M")
+                            .expect("const parameter name interns"),
+                        true,
+                        0,
+                    ),
+                ],
+            )
+            .expect("HIR lowering interns trait-method generic parameters");
+        for (def_id, expected_path) in expected_parameter_path.into_iter().zip([
+            "acme:phase1.Store.put.generic[U]",
+            "acme:phase1.Store.put.generic[M]",
+        ]) {
+            let parameter_path = database
+                .resolve_def_path(def_id.to_def_id())
+                .expect("generic parameter DefId is valid")
+                .expect("generic parameter DefPath exists");
+            let expected_parameter_hash = sai_hir::DefPathHash::compute(
+                &parameter_path,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("trait-method generic parameter DefPath hashes");
+            assert_eq!(
+                inventory
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.path() == expected_path)
+                    .expect("trait-method generic parameter symbol exists")
+                    .def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_parameter_hash.raw())
+            );
+        }
+    }
+
+    #[test]
+    fn module_function_inventory_rejects_duplicate_same_name_trait_member_kinds() {
+        let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"trait Duplicate {\ntype Item\ntype Item\nfn item(self: borrow Self)\nfn item(self: borrow Self)\n}\n",
+            b"",
+            "wasm32-core",
+        );
+        let parsed = sai_syntax::parse(&snapshot, module_tree.modules[0].file)
+            .expect("duplicate trait fixture parses");
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let inventory = inventory_symbols(&collection);
+        assert!(
+            matches!(
+                inventory.coverage(),
+                sai_semantic::InventoryCoverage::Incomplete { reason }
+                    if reason.contains("duplicate associated item name")
+            ),
+            "duplicate trait member coverage: {:?}",
+            inventory.coverage()
+        );
+
+        let duplicate_types = inventory
+            .symbols()
+            .iter()
+            .filter(|symbol| {
+                symbol.path() == "acme:phase1.Duplicate.Item"
+                    && symbol.kind() == sai_semantic::SymbolKind::AssocType
+            })
+            .collect::<Vec<_>>();
+        let duplicate_functions = inventory
+            .symbols()
+            .iter()
+            .filter(|symbol| {
+                symbol.path() == "acme:phase1.Duplicate.item"
+                    && symbol.kind() == sai_semantic::SymbolKind::AssocFn
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(duplicate_types.len(), 2);
+        assert_eq!(duplicate_functions.len(), 2);
+        assert_ne!(
+            duplicate_types[0].def_path_hash(),
+            duplicate_types[1].def_path_hash()
+        );
+        assert_ne!(
+            duplicate_functions[0].def_path_hash(),
+            duplicate_functions[1].def_path_hash()
+        );
+
+        let trait_owner = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| owner.kind == TopLevelOwnerKind::Trait)
+            .expect("trait owner exists");
+        let type_name = database
+            .symbols
+            .intern("Item")
+            .expect("associated type name interns");
+        let function_name = database
+            .symbols
+            .intern("item")
+            .expect("associated function name interns");
+        let expected = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("trait package has a DefPath interner")
+            .intern_assoc_items(
+                trait_owner.owner.def_id,
+                &[
+                    (DefPathData::AssocType(type_name), 0),
+                    (DefPathData::AssocType(type_name), 1),
+                    (DefPathData::AssocFn(function_name), 0),
+                    (DefPathData::AssocFn(function_name), 1),
+                ],
+            )
+            .expect("HIR lowering disambiguates duplicate associated items by kind");
+        let expected_hashes = expected
+            .into_iter()
+            .map(|id| {
+                let path = database
+                    .resolve_def_path(id.to_def_id())
+                    .expect("associated item DefId is valid")
+                    .expect("associated item DefPath exists");
+                let hash =
+                    sai_hir::DefPathHash::compute(&path, &database.packages, &database.symbols)
+                        .expect("associated item DefPath hashes");
+                (
+                    path.data()
+                        .last()
+                        .expect("associated item has a final component")
+                        .data
+                        .clone(),
+                    path.data()
+                        .last()
+                        .expect("associated item has a final component")
+                        .disambiguator,
+                    sai_stable_hash::Fingerprint::new(hash.raw()),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (expected_component, expected_disambiguator, expected_hash) in expected_hashes {
+            let expected_kind = if matches!(expected_component, DefPathData::AssocType(_)) {
+                sai_semantic::SymbolKind::AssocType
+            } else {
+                sai_semantic::SymbolKind::AssocFn
+            };
+            assert!(
+                inventory.symbols().iter().any(|symbol| {
+                    symbol.path()
+                        == if expected_kind == sai_semantic::SymbolKind::AssocType {
+                            "acme:phase1.Duplicate.Item"
+                        } else {
+                            "acme:phase1.Duplicate.item"
+                        }
+                        && symbol.kind() == expected_kind
+                        && symbol.def_path_hash() == expected_hash
+                }),
+                "inventory retains {expected_component:?} with source disambiguator {expected_disambiguator}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_function_inventory_keeps_impl_and_interface_symbols_out_of_trait_slice() {
+        let source = concat!(
+            "type Widget {\n}\n",
+            "trait Render {\n",
+            "type Output\n",
+            "fn render(self: borrow Self)\n",
+            "}\n",
+            "impl Render for Widget {\n",
+            "type Output = Str\n",
+            "fn render(self: borrow Self) {}\n",
+            "}\n",
+            "impl Widget {\n",
+            "fn helper(self: borrow Self) {}\n",
+            "}\n",
+            "interface logging {\n",
+            "fn write()\n",
+            "}\n",
+        );
+        let (_, module_tree, snapshot, collection) =
+            collect_package_inventory_for_target(source.as_bytes(), b"", "wasm32-core");
+        let parsed = sai_syntax::parse(&snapshot, module_tree.modules[0].file)
+            .expect("trait and implementation fixture parses");
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("Impl") && reason.contains("Interface")
+        ));
+        for expected_trait_symbol in [
+            ("acme:phase1.Widget", sai_semantic::SymbolKind::Record),
+            ("acme:phase1.Render", sai_semantic::SymbolKind::Trait),
+            (
+                "acme:phase1.Render.Output",
+                sai_semantic::SymbolKind::AssocType,
+            ),
+            (
+                "acme:phase1.Render.render",
+                sai_semantic::SymbolKind::AssocFn,
+            ),
+        ] {
+            assert_eq!(
+                inventory
+                    .symbols()
+                    .iter()
+                    .filter(|symbol| {
+                        (symbol.path(), symbol.kind())
+                            == (expected_trait_symbol.0, expected_trait_symbol.1)
+                    })
+                    .count(),
+                1,
+                "expected one collected symbol for {:?}",
+                expected_trait_symbol
+            );
+        }
+        assert!(
+            inventory.symbols().iter().all(|symbol| {
+                !symbol.path().contains(".impl[")
+                    && !symbol.path().contains(".Widget.helper")
+                    && !symbol.path().contains(".logging")
+            }),
+            "implementation and interface members must not leak into module inventory"
+        );
+    }
+
+    #[test]
+    fn module_function_inventory_filters_traits_before_owner_pairing() {
+        let source = b"@target(\"wasm64-core\")\ntrait Marker<T> {\ntype Value\nfn get<U>(self: borrow Self, value: U)\n}\n";
+        let (_, _, _, wasm32) = collect_package_inventory_for_target(source, b"", "wasm32-core");
+        let wasm32 = inventory_symbols(&wasm32);
+        assert_eq!(
+            wasm32.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert!(wasm32.symbols().is_empty());
+
+        let (_, _, _, wasm64) = collect_package_inventory_for_target(source, b"", "wasm64-core");
+        let wasm64 = inventory_symbols(&wasm64);
+        assert_eq!(
+            wasm64.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            wasm64
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<Vec<_>>(),
+            [
+                ("acme:phase1.Marker", sai_semantic::SymbolKind::Trait),
+                (
+                    "acme:phase1.Marker.generic[T]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.Marker.Value",
+                    sai_semantic::SymbolKind::AssocType
+                ),
+                ("acme:phase1.Marker.get", sai_semantic::SymbolKind::AssocFn),
+                (
+                    "acme:phase1.Marker.get.generic[U]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+            ]
+        );
+
+        let (_, _, _, invalid_target) = collect_package_inventory_for_target(
+            b"@target(\"wasm32-linux\")\ntrait Uncertain {}\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(matches!(
+            inventory_symbols(&invalid_target).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("target-selection error")
+        ));
+    }
+
+    #[test]
+    fn module_function_inventory_fails_closed_for_malformed_and_unsupported_trait_shapes() {
+        let cases: [(&str, &[u8]); 3] = [
+            (
+                "malformed trait generic bound",
+                b"trait Broken<T:> {\ntype Output\n}\n",
+            ),
+            (
+                "malformed associated type bound",
+                b"trait Broken {\ntype Output:\nfn read(self: borrow Self)\n}\n",
+            ),
+            (
+                "unsupported associated constant",
+                b"trait Unsupported {\nconst VALUE: U32 = 1\n}\n",
+            ),
+        ];
+
+        for (case_name, source) in cases {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert!(
+                matches!(
+                    inventory.coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { .. }
+                ),
+                "{case_name} must not be considered a complete trait inventory"
+            );
+            assert!(
+                inventory.symbols().iter().all(|symbol| {
+                    !symbol.path().contains(".Broken") && !symbol.path().contains(".Unsupported")
+                }),
+                "{case_name} must not emit partial trait symbols"
+            );
+        }
+    }
+
+    #[test]
     fn module_function_inventory_filters_generic_parameters_by_target_and_rejects_target_errors() {
         let source = b"@target(\"wasm64-core\")\nfn only64<T>() {}\n";
         let (_, _, _, wasm32) = collect_package_inventory_for_target(source, b"", "wasm32-core");
