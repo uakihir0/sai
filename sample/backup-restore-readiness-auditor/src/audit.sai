@@ -1,0 +1,558 @@
+use acme:backup-restore-readiness-auditor/model.{
+    AuditReport
+    BackupSnapshot
+    CandidateAssessment
+    CatalogEntityKind
+    CatalogIssue
+    Finding
+    ReadinessIssue
+    ReadinessStatus
+    Service
+    SnapshotKind
+}
+use sai:core/num.{U32_MAX}
+
+fn snapshot_index(snapshots: Array<BackupSnapshot, 10>, snapshot_id: U32) -> Result<
+    USize,
+    ReadinessIssue,
+> {
+    var found: Option<USize> = None
+    for index in 0..snapshots.len() {
+        if snapshots[index].id == snapshot_id {
+            match found {
+                Some(_) => return Err(ReadinessIssue.DuplicateSnapshotId)
+                None => {
+                    found = Some(index)
+                }
+            }
+        }
+    }
+    match found { Some(index) => Ok(index), None => Err(ReadinessIssue.MissingParent) }
+}
+
+fn restore_chain_minutes(
+    snapshots: Array<BackupSnapshot, 10>,
+    now: U32,
+    service: Service,
+    candidate: BackupSnapshot,
+) -> Result<U32, ReadinessIssue> {
+    if candidate.captured_minute > now {
+        return Err(ReadinessIssue.FutureCapture)
+    }
+
+    var visited = Array<Option<U32>, 10>.filled(None)
+    var depth: USize = 0
+    var restore_minutes: U32 = 0
+    var cursor: Option<U32> = Some(candidate.id)
+
+    while depth < snapshots.len() {
+        let current_id = match cursor {
+            Some(id) => id
+            None => return Err(ReadinessIssue.MissingFullSnapshot)
+        }
+
+        for seen_index in 0..depth {
+            if visited[seen_index] == Some(current_id) {
+                return Err(ReadinessIssue.ParentCycleOrChainTooDeep)
+            }
+        }
+        visited[depth] = Some(current_id)
+        depth += 1
+
+        let current_index = match snapshot_index(snapshots, current_id) {
+            Ok(index) => index
+            Err(issue) => return Err(issue)
+        }
+        let current = snapshots[current_index]
+        if current.service_id != service.id {
+            return Err(ReadinessIssue.ParentServiceMismatch)
+        }
+        if current.captured_minute > now {
+            return Err(ReadinessIssue.FutureCapture)
+        }
+        if not current.checksum_valid {
+            return Err(ReadinessIssue.ChecksumMismatch)
+        }
+        if current.retained_until_minute < now {
+            return Err(ReadinessIssue.RetentionExpired)
+        }
+        if service.offsite_required and not current.offsite {
+            return Err(ReadinessIssue.OffsiteCopyMissing)
+        }
+        if current.restore_minutes > U32_MAX - restore_minutes {
+            return Err(ReadinessIssue.RestoreTimeOverflow)
+        }
+        restore_minutes += current.restore_minutes
+
+        match current.kind {
+            SnapshotKind.Full => {
+                if current.parent_id != None {
+                    return Err(ReadinessIssue.FullSnapshotHasParent)
+                }
+                return Ok(restore_minutes)
+            }
+            SnapshotKind.Incremental => {
+                let parent_id = match current.parent_id {
+                    Some(id) => id
+                    None => return Err(ReadinessIssue.MissingFullSnapshot)
+                }
+                let parent_index = match snapshot_index(snapshots, parent_id) {
+                    Ok(index) => index
+                    Err(issue) => return Err(issue)
+                }
+                let parent = snapshots[parent_index]
+                if parent.service_id != service.id {
+                    return Err(ReadinessIssue.ParentServiceMismatch)
+                }
+                for seen_index in 0..depth {
+                    if visited[seen_index] == Some(parent_id) {
+                        return Err(ReadinessIssue.ParentCycleOrChainTooDeep)
+                    }
+                }
+                if parent.captured_minute >= current.captured_minute {
+                    return Err(ReadinessIssue.ParentNotOlder)
+                }
+                cursor = Some(parent_id)
+            }
+        }
+    }
+
+    Err(ReadinessIssue.ParentCycleOrChainTooDeep)
+}
+
+fn assess_candidate(
+    snapshots: Array<BackupSnapshot, 10>,
+    now: U32,
+    service: Service,
+    candidate: BackupSnapshot,
+) -> CandidateAssessment {
+    if candidate.captured_minute > now {
+        return CandidateAssessment(
+            issue: Some(ReadinessIssue.FutureCapture),
+            age_minutes: None,
+            restore_minutes: None,
+        )
+    }
+
+    let age_minutes = now - candidate.captured_minute
+    match restore_chain_minutes(snapshots, now, service, candidate) {
+        Ok(restore_minutes) => {
+            let issue = if age_minutes > service.rpo_minutes {
+                Some(ReadinessIssue.RpoExceeded)
+            } else if restore_minutes > service.rto_minutes {
+                Some(ReadinessIssue.RtoExceeded)
+            } else {
+                None
+            }
+            CandidateAssessment(
+                issue: issue,
+                age_minutes: Some(age_minutes),
+                restore_minutes: Some(restore_minutes),
+            )
+        }
+        Err(issue) => CandidateAssessment(
+            issue: Some(issue),
+            age_minutes: Some(age_minutes),
+            restore_minutes: None,
+        )
+    }
+}
+
+fn preferred(candidate: BackupSnapshot, current: BackupSnapshot) -> Bool {
+    (
+        candidate.captured_minute > current.captured_minute
+        or (candidate.captured_minute == current.captured_minute and candidate.id < current.id)
+    )
+}
+
+fn newer_rejection_summary(
+    snapshots: Array<BackupSnapshot, 10>,
+    now: U32,
+    service: Service,
+    selected: BackupSnapshot,
+) -> (U32, Option<ReadinessIssue>) {
+    var count: U32 = 0
+    var newest_rejected: Option<BackupSnapshot> = None
+    var newest_issue: Option<ReadinessIssue> = None
+
+    for index in 0..snapshots.len() {
+        let candidate = snapshots[index]
+        if candidate.service_id == service.id and preferred(candidate, selected) {
+            let assessment = assess_candidate(snapshots, now, service, candidate)
+            match assessment.issue {
+                Some(issue) => {
+                    count += 1
+                    let is_newest = match newest_rejected {
+                        Some(current) => preferred(candidate, current)
+                        None => true
+                    }
+                    if is_newest {
+                        newest_rejected = Some(candidate)
+                        newest_issue = Some(issue)
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    (count, newest_issue)
+}
+
+fn service_finding(snapshots: Array<BackupSnapshot, 10>, now: U32, service: Service) -> Finding {
+    var selected: Option<BackupSnapshot> = None
+    var selected_assessment: Option<CandidateAssessment> = None
+    var newest_candidate: Option<BackupSnapshot> = None
+    var newest_issue: Option<ReadinessIssue> = None
+    var candidate_count: USize = 0
+
+    for index in 0..snapshots.len() {
+        let candidate = snapshots[index]
+        if candidate.service_id == service.id {
+            candidate_count += 1
+            let assessment = assess_candidate(snapshots, now, service, candidate)
+            let is_newest = match newest_candidate {
+                Some(current) => preferred(candidate, current)
+                None => true
+            }
+            if is_newest {
+                newest_candidate = Some(candidate)
+                newest_issue = assessment.issue
+            }
+
+            if assessment.issue == None {
+                let is_better = match selected {
+                    Some(current) => preferred(candidate, current)
+                    None => true
+                }
+                if is_better {
+                    selected = Some(candidate)
+                    selected_assessment = Some(assessment)
+                }
+            }
+        }
+    }
+
+    match selected {
+        Some(snapshot) => {
+            let (skipped_newer_count, latest_issue) =
+                newer_rejection_summary(snapshots, now, service, snapshot)
+            let status = if skipped_newer_count > 0 {
+                ReadinessStatus.ReadyWithFallback
+            } else {
+                ReadinessStatus.Ready
+            }
+            let assessment = match selected_assessment {
+                Some(value) => value
+                None => CandidateAssessment(issue: None, age_minutes: None, restore_minutes: None)
+            }
+            Finding(
+                service_id: service.id,
+                service_name: service.name,
+                status: status,
+                selected_snapshot_id: Some(snapshot.id),
+                age_minutes: assessment.age_minutes,
+                restore_minutes: assessment.restore_minutes,
+                skipped_newer_count: skipped_newer_count,
+                latest_issue: latest_issue,
+            )
+        }
+        None => {
+            let issue = if candidate_count == 0 {
+                Some(ReadinessIssue.NoSnapshots)
+            } else {
+                newest_issue
+            }
+            Finding(
+                service_id: service.id,
+                service_name: service.name,
+                status: ReadinessStatus.NotReady,
+                selected_snapshot_id: None,
+                age_minutes: None,
+                restore_minutes: None,
+                skipped_newer_count: 0,
+                latest_issue: issue,
+            )
+        }
+    }
+}
+
+fn service_id_is_duplicated(services: Array<Service, 7>, service_id: U32) -> Bool {
+    var matches: USize = 0
+    for index in 0..services.len() {
+        if services[index].id == service_id {
+            matches += 1
+        }
+    }
+    matches > 1
+}
+
+fn snapshot_id_is_duplicated(snapshots: Array<BackupSnapshot, 10>, snapshot_id: U32) -> Bool {
+    var matches: USize = 0
+    for index in 0..snapshots.len() {
+        if snapshots[index].id == snapshot_id {
+            matches += 1
+        }
+    }
+    matches > 1
+}
+
+fn service_id_exists(services: Array<Service, 7>, service_id: U32) -> Bool {
+    for index in 0..services.len() {
+        if services[index].id == service_id {
+            return true
+        }
+    }
+    false
+}
+
+fn catalog_issues(services: Array<Service, 7>, snapshots: Array<BackupSnapshot, 10>) -> (
+    Array<Option<CatalogIssue>, 27>,
+    USize,
+) {
+    var issues = Array<Option<CatalogIssue>, 27>.filled(None)
+    var issue_count: USize = 0
+
+    for index in 0..services.len() {
+        let service = services[index]
+        if service_id_is_duplicated(services, service.id) {
+            issues[issue_count] = Some(
+                CatalogIssue(
+                    entity_kind: CatalogEntityKind.Service,
+                    entity_id: service.id,
+                    issue: ReadinessIssue.DuplicateServiceId,
+                ),
+            )
+            issue_count += 1
+        }
+    }
+
+    for index in 0..snapshots.len() {
+        let snapshot = snapshots[index]
+        if not service_id_exists(services, snapshot.service_id) {
+            issues[issue_count] = Some(
+                CatalogIssue(
+                    entity_kind: CatalogEntityKind.Snapshot,
+                    entity_id: snapshot.id,
+                    issue: ReadinessIssue.UnknownServiceId,
+                ),
+            )
+            issue_count += 1
+        }
+        if snapshot_id_is_duplicated(snapshots, snapshot.id) {
+            issues[issue_count] = Some(
+                CatalogIssue(
+                    entity_kind: CatalogEntityKind.Snapshot,
+                    entity_id: snapshot.id,
+                    issue: ReadinessIssue.DuplicateSnapshotId,
+                ),
+            )
+            issue_count += 1
+        }
+    }
+    (issues, issue_count)
+}
+
+fn invalid_service_finding(service: Service, issue: ReadinessIssue) -> Finding {
+    Finding(
+        service_id: service.id,
+        service_name: service.name,
+        status: ReadinessStatus.NotReady,
+        selected_snapshot_id: None,
+        age_minutes: None,
+        restore_minutes: None,
+        skipped_newer_count: 0,
+        latest_issue: Some(issue),
+    )
+}
+
+pub fn audit_all(
+    services: Array<Service, 7>,
+    snapshots: Array<BackupSnapshot, 10>,
+    now: U32,
+) -> AuditReport {
+    var findings = Array<Option<Finding>, 7>.filled(None)
+    let (catalog_issue_entries, catalog_issue_count) = catalog_issues(services, snapshots)
+    var ready_count: U32 = 0
+    var fallback_count: U32 = 0
+    var not_ready_count: U32 = 0
+
+    for index in 0..services.len() {
+        let service = services[index]
+        let finding = if service_id_is_duplicated(services, service.id) {
+            invalid_service_finding(service, ReadinessIssue.DuplicateServiceId)
+        } else {
+            service_finding(snapshots, now, service)
+        }
+        findings[index] = Some(finding)
+        match finding.status {
+            ReadinessStatus.Ready => {
+                ready_count += 1
+            }
+            ReadinessStatus.ReadyWithFallback => {
+                fallback_count += 1
+            }
+            ReadinessStatus.NotReady => {
+                not_ready_count += 1
+            }
+        }
+    }
+
+    AuditReport(
+        findings: findings,
+        finding_count: services.len(),
+        catalog_issues: catalog_issue_entries,
+        catalog_issue_count: catalog_issue_count,
+        ready_count: ready_count,
+        fallback_count: fallback_count,
+        not_ready_count: not_ready_count,
+    )
+}
+
+test "the latest compliant restore point wins and a newer corrupt delta is reported" {
+    let finding = service_finding(data.snapshots(), data.now_minute(), data.services()[0])
+    assert finding.status == ReadinessStatus.ReadyWithFallback
+    assert finding.selected_snapshot_id == Some(1002)
+    assert finding.age_minutes == Some(50)
+    assert finding.restore_minutes == Some(25)
+    assert finding.skipped_newer_count == 1
+    assert finding.latest_issue == Some(ReadinessIssue.ChecksumMismatch)
+}
+
+test "RPO and RTO limits are inclusive" {
+    let finding = service_finding(data.snapshots(), data.now_minute(), data.services()[0])
+    assert finding.status == ReadinessStatus.ReadyWithFallback
+    assert finding.age_minutes == Some(data.services()[0].rpo_minutes)
+    assert finding.restore_minutes == Some(data.services()[0].rto_minutes)
+}
+
+test "the newest valid candidate reports the failed recovery objective" {
+    let report = audit_all(data.services(), data.snapshots(), data.now_minute())
+    assert report.findings[1].unwrap().latest_issue == Some(ReadinessIssue.RpoExceeded)
+    assert report.findings[2].unwrap().latest_issue == Some(ReadinessIssue.RtoExceeded)
+}
+
+test "every snapshot in a required offsite chain must be offsite" {
+    let finding = service_finding(data.snapshots(), data.now_minute(), data.services()[3])
+    assert finding.status == ReadinessStatus.NotReady
+    assert finding.latest_issue == Some(ReadinessIssue.OffsiteCopyMissing)
+}
+
+test "missing parents, expired backups, and absent catalogs stay visible" {
+    let report = audit_all(data.services(), data.snapshots(), data.now_minute())
+    assert report.findings[4].unwrap().latest_issue == Some(ReadinessIssue.MissingParent)
+    assert report.findings[5].unwrap().latest_issue == Some(ReadinessIssue.NoSnapshots)
+    assert report.findings[6].unwrap().latest_issue == Some(ReadinessIssue.RetentionExpired)
+}
+
+test "report counts distinguish ordinary readiness, fallback, and failure" {
+    let report = audit_all(data.services(), data.snapshots(), data.now_minute())
+    assert report.finding_count == 7
+    assert report.ready_count == 0
+    assert report.fallback_count == 1
+    assert report.not_ready_count == 6
+    assert report.catalog_issue_count == 0
+}
+
+test "duplicate service IDs are reported and every matching service fails closed" {
+    var services = data.services()
+    services[1].id = services[0].id
+    var snapshots = data.snapshots()
+    snapshots[3].service_id = services[0].id
+    let report = audit_all(services, snapshots, data.now_minute())
+    assert report.catalog_issue_count == 2
+    assert report.findings[0].unwrap().latest_issue == Some(ReadinessIssue.DuplicateServiceId)
+    assert report.findings[1].unwrap().latest_issue == Some(ReadinessIssue.DuplicateServiceId)
+}
+
+test "orphan snapshots and duplicate snapshot IDs are visible at catalog level" {
+    var orphaned = data.snapshots()
+    orphaned[9].service_id = 999
+    let orphan_report = audit_all(data.services(), orphaned, data.now_minute())
+    assert orphan_report.catalog_issue_count == 1
+    assert orphan_report.catalog_issues[0].unwrap().entity_kind == CatalogEntityKind.Snapshot
+    assert orphan_report.catalog_issues[0].unwrap().entity_id == 7001
+    assert orphan_report.catalog_issues[0].unwrap().issue == ReadinessIssue.UnknownServiceId
+
+    var duplicated = data.snapshots()
+    duplicated[9].id = duplicated[0].id
+    let duplicate_report = audit_all(data.services(), duplicated, data.now_minute())
+    assert duplicate_report.catalog_issue_count == 2
+    assert duplicate_report.catalog_issues[0].unwrap().issue == ReadinessIssue.DuplicateSnapshotId
+    assert duplicate_report.catalog_issues[1].unwrap().issue == ReadinessIssue.DuplicateSnapshotId
+}
+
+test "candidate ordering uses the lower snapshot ID for equal capture times" {
+    let left = BackupSnapshot(
+        id: 120,
+        service_id: 11,
+        captured_minute: 900,
+        kind: SnapshotKind.Full,
+        parent_id: None,
+        restore_minutes: 1,
+        checksum_valid: true,
+        retained_until_minute: 1200,
+        offsite: true,
+    )
+    let right = BackupSnapshot(
+        id: 121,
+        service_id: 11,
+        captured_minute: 900,
+        kind: SnapshotKind.Full,
+        parent_id: None,
+        restore_minutes: 1,
+        checksum_valid: true,
+        retained_until_minute: 1200,
+        offsite: true,
+    )
+    assert preferred(left, right)
+    assert not preferred(right, left)
+}
+
+test "a parent cycle fails closed before its timestamp-order error" {
+    var snapshots = data.snapshots()
+    snapshots[0].kind = SnapshotKind.Incremental
+    snapshots[0].parent_id = Some(1002)
+    assert (
+        restore_chain_minutes(snapshots, data.now_minute(), data.services()[0], snapshots[1])
+        == Err(ReadinessIssue.ParentCycleOrChainTooDeep)
+    )
+}
+
+test "duplicate IDs cannot select an ambiguous parent" {
+    var snapshots = data.snapshots()
+    snapshots[9].id = 1001
+    assert (
+        restore_chain_minutes(snapshots, data.now_minute(), data.services()[0], snapshots[0])
+        == Err(ReadinessIssue.DuplicateSnapshotId)
+    )
+}
+
+test "incremental snapshots cannot cross service boundaries or lose their full root" {
+    var cross_service = data.snapshots()
+    cross_service[5].parent_id = Some(1001)
+    assert (
+        restore_chain_minutes(
+            cross_service,
+            data.now_minute(),
+            data.services()[2],
+            cross_service[5],
+        )
+        == Err(ReadinessIssue.ParentServiceMismatch)
+    )
+
+    var missing_root = data.snapshots()
+    missing_root[1].parent_id = None
+    assert (
+        restore_chain_minutes(missing_root, data.now_minute(), data.services()[0], missing_root[1])
+        == Err(ReadinessIssue.MissingFullSnapshot)
+    )
+}
+
+test "restore duration accumulation refuses unsigned overflow" {
+    var snapshots = data.snapshots()
+    snapshots[0].restore_minutes = U32_MAX
+    assert (
+        restore_chain_minutes(snapshots, data.now_minute(), data.services()[0], snapshots[1])
+        == Err(ReadinessIssue.RestoreTimeOverflow)
+    )
+}
