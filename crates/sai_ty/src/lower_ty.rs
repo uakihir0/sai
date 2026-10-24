@@ -33,6 +33,7 @@ pub enum UnsupportedTy {
     TestOnlyPath,
     ErrorPath,
     RegionIndexOverflow,
+    FieldRegionWithoutParameter,
     ContextAfterFailure,
 }
 
@@ -56,11 +57,13 @@ pub struct LowerTyContext<'a> {
 enum RegionMode {
     Signature,
     Body,
+    Field { has_implicit_region_parameter: bool },
 }
 
 impl<'a> LowerTyContext<'a> {
     /// Create a signature context. Borrow regions receive owner-local indices
     /// starting at zero and are numbered in pre-order across successful calls.
+    /// Use [`for_field`](Self::for_field) for declaration field types.
     pub fn for_signature(
         interner: &'a TyInterner,
         owner: OwnerId,
@@ -71,6 +74,31 @@ impl<'a> LowerTyContext<'a> {
             owner,
             paths,
             region_mode: RegionMode::Signature,
+            next_region_index: 0,
+            failed: false,
+        }
+    }
+
+    /// Create a declaration-field context.
+    ///
+    /// When `has_implicit_region_parameter` is true, every borrow in every
+    /// field type of the declaration receives `Sig { item: owner, index: 0 }`,
+    /// as required for the declaration's single implicit region parameter.
+    /// Otherwise any borrow is unsupported; fields without borrows still
+    /// lower normally.
+    pub fn for_field(
+        interner: &'a TyInterner,
+        owner: OwnerId,
+        paths: &'a HashMap<HirId, PathRes>,
+        has_implicit_region_parameter: bool,
+    ) -> Self {
+        Self {
+            interner,
+            owner,
+            paths,
+            region_mode: RegionMode::Field {
+                has_implicit_region_parameter,
+            },
             next_region_index: 0,
             failed: false,
         }
@@ -95,6 +123,15 @@ impl<'a> LowerTyContext<'a> {
     fn region(&mut self) -> Result<Region, UnsupportedTy> {
         match self.region_mode {
             RegionMode::Body => Ok(Region::Erased),
+            RegionMode::Field {
+                has_implicit_region_parameter: true,
+            } => Ok(Region::Sig(SigRegion {
+                item: self.owner.def_id.to_def_id(),
+                index: 0,
+            })),
+            RegionMode::Field {
+                has_implicit_region_parameter: false,
+            } => Err(UnsupportedTy::FieldRegionWithoutParameter),
             RegionMode::Signature => {
                 let index = self.next_region_index;
                 self.next_region_index = index
@@ -463,6 +500,81 @@ mod tests {
         assert_eq!(
             tuple_semantic.kind(),
             &TyKind::Tuple(Arc::from([boolean_semantic.clone(), boolean_semantic]))
+        );
+    }
+
+    #[test]
+    fn field_borrows_share_the_declaration_implicit_region() {
+        let (owner, symbols) = owner();
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let (boolean, paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            180,
+            "Bool",
+            None,
+            Res::PrimTy(PrimTy::Bool),
+        );
+        let nested_borrow = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 190),
+            kind: HirTyKind::Borrow(
+                Mutability::Mut,
+                arena.alloc_ty(HirTy {
+                    hir_id: hir_id(owner, 191),
+                    kind: HirTyKind::Borrow(Mutability::Not, boolean),
+                    span: span(),
+                }),
+            ),
+            span: span(),
+        });
+        let second_borrow = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 192),
+            kind: HirTyKind::Borrow(Mutability::Not, boolean),
+            span: span(),
+        });
+        let children = arena.alloc_tys(&[*nested_borrow, *second_borrow]);
+        let field_tuple = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 193),
+            kind: HirTyKind::Tuple(children),
+            span: span(),
+        });
+
+        let mut context = LowerTyContext::for_field(&interner, owner, &paths, true);
+        let semantic = lower_ty(&mut context, field_tuple).unwrap();
+        let TyKind::Tuple(elements) = semantic.kind() else {
+            panic!("field tuple lowers as a tuple");
+        };
+        assert!(matches!(
+            elements[0].kind(),
+            TyKind::Ref(
+                Region::Sig(SigRegion { item, index: 0 }),
+                inner,
+                Mutability::Mut
+            ) if *item == owner.def_id.to_def_id()
+                && matches!(
+                    inner.kind(),
+                    TyKind::Ref(
+                        Region::Sig(SigRegion { item, index: 0 }),
+                        _,
+                        Mutability::Not
+                    ) if *item == owner.def_id.to_def_id()
+                )
+        ));
+        assert!(matches!(
+            elements[1].kind(),
+            TyKind::Ref(
+                Region::Sig(SigRegion { item, index: 0 }),
+                _,
+                Mutability::Not
+            ) if *item == owner.def_id.to_def_id()
+        ));
+
+        let mut context = LowerTyContext::for_field(&interner, owner, &paths, false);
+        assert_eq!(
+            lower_ty(&mut context, second_borrow),
+            Err(UnsupportedTy::FieldRegionWithoutParameter)
         );
     }
 
