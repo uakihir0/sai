@@ -25595,7 +25595,7 @@ interface api {
             .iter()
             .find(|symbol| symbol.path() == variant_path)
             .expect("direct WIT variant is inventoried");
-        assert_eq!(variant_symbol.kind(), sai_semantic::SymbolKind::Variant);
+        assert_eq!(variant_symbol.kind(), sai_semantic::SymbolKind::Enum);
         assert_eq!(
             variant_symbol.def_path_hash(),
             Fingerprint::new(expected_hash.raw())
@@ -25612,7 +25612,7 @@ interface api {
         assert_eq!(
             variant_symbol.fingerprint(),
             sai_semantic::declaration_fingerprint_from_token_pairs(
-                sai_semantic::SymbolKind::Variant,
+                sai_semantic::SymbolKind::Enum,
                 &variant_tokens.token_pairs
             )
         );

@@ -1871,8 +1871,8 @@ fn collect_root_interface_variant(
     current_symbols.push(CurrentSymbol::new(
         canonical_variant_path.clone(),
         variant_hash,
-        SymbolKind::Variant,
-        declaration_fingerprint_from_token_pairs(SymbolKind::Variant, &source_variant.token_pairs),
+        SymbolKind::Enum,
+        declaration_fingerprint_from_token_pairs(SymbolKind::Enum, &source_variant.token_pairs),
     ));
 
     for (case_index, (case, source_case)) in cases.iter().zip(&source_variant.cases).enumerate() {
