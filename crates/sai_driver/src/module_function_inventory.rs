@@ -61,6 +61,13 @@ struct ValidatedInterfaceResourceMember {
     name_token: SyntaxToken,
 }
 
+struct ValidatedInterfaceAlias {
+    entry: ItemTreeEntry,
+    declaration: ast::TypeDecl,
+    name: String,
+    name_token: SyntaxToken,
+}
+
 /// Collects target-visible module-level functions and their generic
 /// parameters, records and resources with their generic parameters and direct named fields,
 /// enums with their generic parameters, variants and record-variant fields,
@@ -69,11 +76,11 @@ struct ValidatedInterfaceResourceMember {
 /// effects, worlds, tests, properties, extern functions, and traits with their
 /// generic parameters, direct associated types and functions, and trait-method
 /// generic parameters. Local interfaces, their direct freestanding functions,
-/// interface resources, and resource functions are included; other interface
-/// members remain unsupported. World import/export/include entries are validated as
-/// world contents but do not produce symbols. Every other symbol-bearing
-/// declaration makes the result incomplete until its symbol kind and path are
-/// collected as well.
+/// aliases, interface resources, and resource functions are included;
+/// interface records, enums, and other interface members remain unsupported.
+/// World import/export/include entries are validated as world contents but do
+/// not produce symbols. Every other symbol-bearing declaration makes the result
+/// incomplete until its symbol kind and path are collected as well.
 pub(super) fn collect_module_function_inventory(
     package_key: &PackageKey,
     package_version: Option<&MvsPackageVersion>,
@@ -2302,6 +2309,7 @@ fn collect_interface(
     }
 
     let mut validated_functions = Vec::<(ItemTreeEntry, ast::FnDecl, String, SyntaxToken)>::new();
+    let mut validated_aliases = Vec::<ValidatedInterfaceAlias>::new();
     let mut validated_resources = Vec::<ValidatedInterfaceResource>::new();
     for ((_, member), child) in expected_children.iter().zip(&entry.children) {
         let (member_name, member_syntax, function) = match member {
@@ -2378,7 +2386,62 @@ fn collect_interface(
         }
 
         let Some(function) = function else {
-            if let InterfaceChild::Resource(resource) = member {
+            if let InterfaceChild::Type(type_declaration) = member {
+                let Some(alias_definition) = type_declaration.alias_def() else {
+                    reasons.insert(
+                        "interface records and non-alias type declarations remain outside the supported symbol slice"
+                            .into(),
+                    );
+                    continue;
+                };
+                if alias_definition.refinement().is_some() {
+                    reasons.insert(
+                        "refined interface type aliases remain outside the supported symbol slice"
+                            .into(),
+                    );
+                    continue;
+                }
+                if child.kind != ItemTreeKind::Alias {
+                    reasons.insert("an interface type alias has the wrong ItemTree kind".into());
+                    continue;
+                }
+                if alias_definition.ty().is_none() {
+                    reasons.insert("an interface type alias has no target type".into());
+                    continue;
+                }
+                let Some(attrs) = input.filtered.validated_attrs.get(&child.ast_id) else {
+                    reasons.insert(
+                        "an interface type alias has no attribute-validation record".into(),
+                    );
+                    continue;
+                };
+                if attrs.target.is_some() {
+                    reasons.insert(
+                        "an interface type alias unexpectedly has a target predicate".into(),
+                    );
+                }
+                if attrs
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.severity == sai_diagnostics::Severity::Error)
+                {
+                    reasons
+                        .insert("an interface type alias has an attribute validation error".into());
+                    continue;
+                }
+                if type_declaration.generic_params().is_some() {
+                    reasons.insert(
+                        "generic interface type aliases are prohibited (GENERIC_INTERFACE_ITEM)"
+                            .into(),
+                    );
+                }
+                validated_aliases.push(ValidatedInterfaceAlias {
+                    entry: child.clone(),
+                    declaration: type_declaration.clone(),
+                    name: child_name,
+                    name_token: child_name_token,
+                });
+            } else if let InterfaceChild::Resource(resource) = member {
                 if child.kind != ItemTreeKind::Resource {
                     reasons.insert("an interface resource has the wrong ItemTree kind".into());
                     return;
@@ -2551,6 +2614,112 @@ fn collect_interface(
         SymbolKind::Interface,
         fingerprint,
     ));
+
+    for alias in validated_aliases {
+        let Some(component @ DefPathData::TypeNs(_)) =
+            interface_member_path_component(&alias.entry)
+        else {
+            reasons.insert("an interface type alias has no TypeNs DefPath component".into());
+            continue;
+        };
+        let disambiguator = match interface_member_path_disambiguator(entry, &alias.entry) {
+            Ok(disambiguator) => disambiguator,
+            Err(sai_hir::item_tree::InterfaceMemberPathError::ItemTreeMismatch) => {
+                reasons.insert(
+                    "an interface type alias has no source-ordered ItemTree disambiguator".into(),
+                );
+                continue;
+            }
+            Err(sai_hir::item_tree::InterfaceMemberPathError::TooManyDefinitions) => {
+                reasons.insert("an interface type-alias DefPath disambiguator overflowed".into());
+                continue;
+            }
+        };
+        let expected_alias_def_id = match def_paths.intern_children(
+            descriptor.owner.def_id,
+            &[(component.clone(), disambiguator)],
+        ) {
+            Ok(mut children) if children.len() == 1 => children.remove(0),
+            _ => {
+                reasons.insert("an interface type-alias DefPath cannot be interned".into());
+                continue;
+            }
+        };
+        let alias_def_path = match def_paths.resolve(expected_alias_def_id) {
+            Ok(Some(path)) if path.package() == package_id => path,
+            Ok(Some(_)) => {
+                reasons.insert("an interface type alias resolves to another package".into());
+                continue;
+            }
+            Ok(None) => {
+                reasons.insert("an interface type alias has no canonical DefPath".into());
+                continue;
+            }
+            Err(_) => {
+                reasons.insert("an interface type-alias DefPath cannot be resolved".into());
+                continue;
+            }
+        };
+        if alias_def_path.data().len() != def_path.data().len() + 1
+            || alias_def_path.data()[..def_path.data().len()] != *def_path.data()
+            || alias_def_path.data().last().is_none_or(|path_component| {
+                path_component.data != component || path_component.disambiguator != disambiguator
+            })
+        {
+            reasons.insert(
+                "an interface type-alias DefPath does not match its interface parent, TypeNs name, or source-order disambiguator"
+                    .into(),
+            );
+            continue;
+        }
+        let alias_def_path_hash = match DefPathHash::compute(&alias_def_path, packages, symbols) {
+            Ok(hash) => Fingerprint::new(hash.raw()),
+            Err(_) => {
+                reasons.insert("an interface type-alias DefPath hash cannot be computed".into());
+                continue;
+            }
+        };
+        let alias_fingerprint = match declaration_fingerprint(
+            SymbolKind::Alias,
+            &alias.declaration.syntax(),
+            Some(&alias.name_token),
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                reasons
+                    .insert("an interface type-alias name token is outside its declaration".into());
+                continue;
+            }
+        };
+        let alias_canonical_path = format!("{canonical_path}.{}", alias.name);
+        if !canonical_paths.insert(alias_canonical_path.clone()) {
+            reasons.insert(format!(
+                "duplicate canonical symbol path {alias_canonical_path}"
+            ));
+        }
+        current_symbols.push(CurrentSymbol::new(
+            alias_canonical_path.clone(),
+            alias_def_path_hash,
+            SymbolKind::Alias,
+            alias_fingerprint,
+        ));
+        collect_item_generic_params(
+            &alias.entry.children,
+            alias.declaration.generic_params(),
+            &alias_canonical_path,
+            expected_alias_def_id,
+            &alias_def_path,
+            input,
+            package_id,
+            "interface type alias",
+            canonical_paths,
+            current_symbols,
+            reasons,
+            def_paths,
+            packages,
+            symbols,
+        );
+    }
 
     for resource in validated_resources {
         let Some(component @ DefPathData::TypeNs(_)) =
