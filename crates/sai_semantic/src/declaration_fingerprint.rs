@@ -31,6 +31,22 @@ pub fn declaration_fingerprint(
     declaration: &SyntaxNode,
     name_token: Option<&SyntaxToken>,
 ) -> Result<Fingerprint, DeclarationFingerprintError> {
+    declaration_fingerprint_with_appended_token_pair(kind, declaration, name_token, None)
+}
+
+/// Computes a declaration fingerprint with one stable synthetic token pair at
+/// the end of its source token sequence.
+///
+/// This is for symbol forms whose fingerprint includes additional semantic
+/// identity, such as a flags constant's bit index. The caller owns the pair's
+/// stable spelling and must use a token kind that cannot collide with source
+/// syntax token kinds.
+pub fn declaration_fingerprint_with_appended_token_pair(
+    kind: SymbolKind,
+    declaration: &SyntaxNode,
+    name_token: Option<&SyntaxToken>,
+    appended_token_pair: Option<(&str, &str)>,
+) -> Result<Fingerprint, DeclarationFingerprintError> {
     let mut stack = vec![SyntaxElement::Node(declaration.clone())];
     let mut matched_name_token = false;
     let mut token_pairs = Vec::new();
@@ -67,6 +83,10 @@ pub fn declaration_fingerprint(
         return Err(DeclarationFingerprintError::NameTokenNotInDeclaration);
     }
 
+    if let Some((token_kind, text)) = appended_token_pair {
+        token_pairs.push((token_kind.to_owned(), text.to_owned()));
+    }
+
     Ok(declaration_fingerprint_from_token_pairs(kind, &token_pairs))
 }
 
@@ -96,7 +116,10 @@ fn write_length_prefixed(hasher: &mut StableHasher, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeclarationFingerprintError, declaration_fingerprint};
+    use super::{
+        DeclarationFingerprintError, declaration_fingerprint,
+        declaration_fingerprint_with_appended_token_pair,
+    };
     use crate::SymbolKind;
     use sai_syntax::{SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, parse};
     use sai_vfs::{FileId, SnapshotFile, SourceFile, WorkspaceSnapshot};
@@ -262,6 +285,43 @@ mod tests {
             original_fingerprint,
             declaration_fingerprint(SymbolKind::AssocFn, &original, Some(&original_name))
                 .expect("associated function fingerprint")
+        );
+    }
+
+    #[test]
+    fn appended_token_pair_is_name_stable_and_value_sensitive() {
+        let parse_variant = |source: &str| {
+            let root = parse_root(source);
+            let declaration = root
+                .descendants()
+                .find(|node| node.kind() == SyntaxKind::VARIANT_DECL)
+                .expect("enum variant declaration");
+            let name_token = declaration
+                .descendants()
+                .find(|node| node.kind() == SyntaxKind::NAME)
+                .and_then(|name| name.first_token())
+                .expect("variant name token");
+            (declaration, name_token)
+        };
+        let (read, read_name) = parse_variant("enum Flags { Read }\n");
+        let (renamed, renamed_name) = parse_variant("enum Flags { Inspect }\n");
+
+        let fingerprint = |declaration: &SyntaxNode, name: &SyntaxToken, bit_index: &str| {
+            declaration_fingerprint_with_appended_token_pair(
+                SymbolKind::Const,
+                declaration,
+                Some(name),
+                Some(("LocalFlagsBitIndex", bit_index)),
+            )
+            .expect("flags constant fingerprint")
+        };
+        assert_eq!(
+            fingerprint(&read, &read_name, "0"),
+            fingerprint(&renamed, &renamed_name, "0")
+        );
+        assert_ne!(
+            fingerprint(&read, &read_name, "0"),
+            fingerprint(&read, &read_name, "1")
         );
     }
 

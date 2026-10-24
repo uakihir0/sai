@@ -1,0 +1,154 @@
+use acme:observatory-night-planner/catalog
+use acme:observatory-night-planner/data
+use acme:observatory-night-planner/model.{
+    Disposition
+    Filter
+    ObservationDecision
+    ObservationRequest
+    ObservingPlan
+}
+use acme:observatory-night-planner/policy
+
+fn precedes(left: ObservationRequest, right: ObservationRequest) -> Bool {
+    left.priority < right.priority or (left.priority == right.priority and left.id < right.id)
+}
+
+fn later(left: U32, right: U32) -> U32 {
+    if left > right {
+        left
+    } else {
+        right
+    }
+}
+
+fn earlier(left: U32, right: U32) -> U32 {
+    if left < right {
+        left
+    } else {
+        right
+    }
+}
+
+fn setup_minutes(previous_filter: Option<Filter>, next_filter: Filter) -> U32 {
+    match previous_filter {
+        None => 0
+        Some(current_filter) => {
+            if current_filter == next_filter {
+                6
+            } else {
+                12
+            }
+        }
+    }
+}
+
+fn decision(
+    request: ObservationRequest,
+    target_name: Str,
+    disposition: Disposition,
+    start_minute: Option<U32>,
+    end_minute: Option<U32>,
+    setup: Option<U32>,
+) -> ObservationDecision {
+    ObservationDecision(
+        request_id: request.id,
+        target_name: target_name,
+        filter: request.filter,
+        disposition: disposition,
+        start_minute: start_minute,
+        end_minute: end_minute,
+        setup_minutes: setup,
+    )
+}
+
+pub fn build_plan() -> ObservingPlan {
+    let telescope = data.north_dome_telescope()
+    let conditions = data.observing_conditions()
+    var ordered = data.requests()
+    for index in 1..8 {
+        let candidate = ordered[index]
+        var cursor = index
+        while cursor > 0 {
+            if precedes(candidate, ordered[cursor - 1]) {
+                ordered[cursor] = ordered[cursor - 1]
+                cursor -= 1
+            } else {
+                break
+            }
+        }
+        ordered[cursor] = candidate
+    }
+
+    var decisions: Array<Option<ObservationDecision>, 8> =
+        [None, None, None, None, None, None, None, None]
+    var telescope_cursor = conditions.dark_start_minute
+    var previous_filter: Option<Filter> = None
+
+    for index in 0..8 {
+        let request = ordered[index]
+        match catalog.target_by_id(request.target_id) {
+            None => {
+                decisions[index] = Some(
+                    decision(
+                        request,
+                        "Unknown target",
+                        Disposition.TargetNotFound,
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+            }
+            Some(target) => {
+                match policy.blocking_reason(telescope, conditions, request) {
+                    Some(disposition) => {
+                        decisions[index] =
+                            Some(decision(request, target.name, disposition, None, None, None))
+                    }
+                    None => {
+                        let opening_minute = later(
+                            later(request.earliest_start_minute, target.visible_start_minute),
+                            conditions.dark_start_minute,
+                        )
+                        let closing_minute = earlier(
+                            earlier(request.latest_end_minute, target.visible_end_minute),
+                            conditions.dark_end_minute,
+                        )
+                        let setup = setup_minutes(previous_filter, request.filter)
+                        let earliest_available_minute = telescope_cursor + setup
+                        let start_minute = later(opening_minute, earliest_available_minute)
+                        let end_minute = start_minute + request.exposure_minutes
+
+                        if end_minute <= closing_minute {
+                            decisions[index] = Some(
+                                decision(
+                                    request,
+                                    target.name,
+                                    Disposition.Scheduled,
+                                    Some(start_minute),
+                                    Some(end_minute),
+                                    Some(setup),
+                                ),
+                            )
+                            telescope_cursor = end_minute
+                            previous_filter = Some(request.filter)
+                        } else {
+                            decisions[index] = Some(
+                                decision(
+                                    request,
+                                    target.name,
+                                    Disposition.VisibilityWindowMissed,
+                                    Some(start_minute),
+                                    Some(end_minute),
+                                    Some(setup),
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ObservingPlan(decisions: decisions, decision_count: 8)
+}

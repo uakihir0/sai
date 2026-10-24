@@ -1,0 +1,11 @@
+use acme:observatory-night-planner/data
+use acme:observatory-night-planner/model.{Target}
+
+pub fn target_by_id(target_id: U32) -> Option<Target> {
+    for target in data.targets() {
+        if target.id == target_id {
+            return Some(target)
+        }
+    }
+    None
+}

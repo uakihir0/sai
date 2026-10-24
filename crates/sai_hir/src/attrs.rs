@@ -2942,6 +2942,11 @@ mod tests {
                 .any(|diagnostic| diagnostic.code == Code::ConflictingAttributes)
         );
 
+        let (accepted_flags, _) =
+            validate_source_at_stage("@flags\nenum Bits { One }\n", target, 4);
+        assert!(accepted_flags.flags.is_some());
+        assert!(accepted_flags.diagnostics.is_empty());
+
         let (stage_zero, _) = validate_source_at_stage("@flags\nenum Bits { One }\n", target, 0);
         assert_eq!(stage_zero.flags, None);
         assert!(

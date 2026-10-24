@@ -10,6 +10,7 @@ mod symbol_index;
 
 pub use declaration_fingerprint::{
     DeclarationFingerprintError, declaration_fingerprint, declaration_fingerprint_from_token_pairs,
+    declaration_fingerprint_with_appended_token_pair,
 };
 pub use index_journal::{
     FileState, IndexJournalCodecError, IndexJournalOrigin, IndexJournalState,

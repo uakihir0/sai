@@ -1,0 +1,51 @@
+use acme:observatory-night-planner/model.{Disposition, NightReport}
+use acme:observatory-night-planner/planner
+use acme:observatory-night-planner/report
+
+pub fn north_dome_report() -> NightReport {
+    report.summarize(planner.build_plan())
+}
+
+test "requests are planned in stable priority and ID order" {
+    let result = north_dome_report()
+    assert result.plan.decision_count == 8
+    assert result.plan.decisions[0].unwrap().request_id == 201
+    assert result.plan.decisions[1].unwrap().request_id == 206
+    assert result.plan.decisions[2].unwrap().request_id == 202
+    assert result.plan.decisions[3].unwrap().request_id == 203
+    assert result.plan.decisions[4].unwrap().request_id == 204
+}
+
+test "same-filter and filter-change setup intervals reserve real telescope time" {
+    let result = north_dome_report()
+    assert result.plan.decisions[0].unwrap().start_minute == Some(0)
+    assert result.plan.decisions[0].unwrap().end_minute == Some(20)
+    assert result.plan.decisions[2].unwrap().setup_minutes == Some(6)
+    assert result.plan.decisions[2].unwrap().start_minute == Some(26)
+    assert result.plan.decisions[2].unwrap().end_minute == Some(66)
+    assert result.plan.decisions[4].unwrap().setup_minutes == Some(12)
+    assert result.plan.decisions[4].unwrap().start_minute == Some(90)
+    assert result.plan.decisions[4].unwrap().end_minute == Some(120)
+}
+
+test "equipment and cloud holds do not advance the telescope clock" {
+    let result = north_dome_report()
+    assert result.plan.decisions[1].unwrap().disposition == Disposition.UnsupportedFilter
+    assert result.plan.decisions[3].unwrap().disposition == Disposition.GuidingUnavailable
+    assert result.plan.decisions[5].unwrap().disposition == Disposition.CloudLimitExceeded
+    assert result.plan.decisions[7].unwrap().disposition == Disposition.Scheduled
+    assert result.plan.decisions[7].unwrap().start_minute == Some(170)
+    assert result.equipment_hold_count == 2
+    assert result.cloud_hold_count == 1
+}
+
+test "an exposure that no longer fits its target window is not scheduled" {
+    let result = north_dome_report()
+    assert result.plan.decisions[6].unwrap().request_id == 205
+    assert result.plan.decisions[6].unwrap().disposition == Disposition.VisibilityWindowMissed
+    assert result.plan.decisions[6].unwrap().start_minute == Some(132)
+    assert result.plan.decisions[6].unwrap().end_minute == Some(162)
+    assert result.plan.decisions[6].unwrap().setup_minutes == Some(12)
+    assert result.scheduled_count == 4
+    assert result.visibility_miss_count == 1
+}
