@@ -99,7 +99,7 @@ struct ValidatedInterfaceEnumVariant {
     syntax: SyntaxNode,
     name_token: SyntaxToken,
     fields: Vec<ValidatedInterfaceEnumField>,
-    tuple_fields: Vec<ValidatedInterfaceEnumTupleField>,
+    tuple_fields: Vec<ValidatedEnumTupleField>,
 }
 
 enum ValidatedInterfaceEnumField {
@@ -111,7 +111,7 @@ enum ValidatedInterfaceEnumField {
     },
 }
 
-struct ValidatedInterfaceEnumTupleField {
+struct ValidatedEnumTupleField {
     index: usize,
     syntax: SyntaxNode,
 }
@@ -3570,7 +3570,7 @@ fn validate_interface_enum(
                             );
                             return None;
                         }
-                        tuple_fields.push(ValidatedInterfaceEnumTupleField {
+                        tuple_fields.push(ValidatedEnumTupleField {
                             index,
                             syntax: ty.syntax().clone(),
                         });
@@ -5527,6 +5527,7 @@ fn collect_enum(
         syntax: SyntaxNode,
         name_token: sai_syntax::SyntaxToken,
         fields: Vec<EnumVariantField>,
+        tuple_fields: Vec<ValidatedEnumTupleField>,
     }
 
     let key = (file_id, entry.ast_id);
@@ -5745,6 +5746,7 @@ fn collect_enum(
             }
             EnumChild::Variant(variant) => {
                 let mut fields = Vec::new();
+                let mut tuple_fields = Vec::new();
                 if let Some(shape) = variant.record_shape() {
                     let ast_fields = shape.fields().collect::<Vec<_>>();
                     if child.children.len() != ast_fields.len() {
@@ -5865,19 +5867,28 @@ fn collect_enum(
                             name_token: field_name_token,
                         });
                     }
-                } else {
+                } else if let Some(shape) = variant.tuple_shape() {
                     if !child.children.is_empty() {
-                        reasons.insert(
-                            "a unit or tuple enum variant has unexpected ItemTree children".into(),
-                        );
+                        reasons
+                            .insert("a tuple enum variant has unexpected ItemTree children".into());
                         return;
                     }
-                    if variant.tuple_shape().is_some() {
-                        reasons.insert(
-                            "tuple variant payload symbols are outside the supported enum inventory"
-                                .to_owned(),
-                        );
+                    for (index, ty) in shape.types().enumerate() {
+                        if syntax_has_errors(ty.syntax()) {
+                            reasons.insert(
+                                "an enum tuple variant payload type has recovery or parse errors"
+                                    .into(),
+                            );
+                            return;
+                        }
+                        tuple_fields.push(ValidatedEnumTupleField {
+                            index,
+                            syntax: ty.syntax().clone(),
+                        });
                     }
+                } else if !child.children.is_empty() {
+                    reasons.insert("a unit enum variant has unexpected ItemTree children".into());
+                    return;
                 }
                 variants.push(EnumVariant {
                     entry: child.clone(),
@@ -5885,6 +5896,7 @@ fn collect_enum(
                     syntax: child_syntax,
                     name_token: child_name_token,
                     fields,
+                    tuple_fields,
                 });
             }
         }
@@ -6141,11 +6153,58 @@ fn collect_enum(
             }
         }
     }
+
+    let mut tuple_field_paths = Vec::<(sai_hir::LocalDefId, Symbol, u32)>::new();
+    let mut tuple_fields = Vec::<(usize, &ValidatedEnumTupleField)>::new();
+    for (variant_index, variant) in variants.iter().enumerate() {
+        let variant_def_id = variant_def_ids[variant_index];
+        for field in &variant.tuple_fields {
+            let field_name = field.index.to_string();
+            let Ok(field_symbol) = symbols.intern(&field_name) else {
+                reasons.insert("an enum tuple field index cannot be interned".into());
+                return;
+            };
+            tuple_field_paths.push((variant_def_id, field_symbol, 0));
+            tuple_fields.push((variant_index, field));
+        }
+    }
+    let tuple_field_def_ids = match def_paths.intern_fields_for_parents(&tuple_field_paths) {
+        Ok(def_ids) if def_ids.len() == tuple_field_paths.len() => def_ids,
+        Ok(_) => {
+            reasons.insert("HIR returned the wrong number of enum tuple fields".into());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("enum tuple field DefPaths cannot be interned".to_owned());
+            return;
+        }
+    };
+    for ((variant_index, field), field_def_id) in tuple_fields.iter().zip(tuple_field_def_ids) {
+        let field_canonical_path = format!(
+            "{canonical_path}.{}.field[{}]",
+            variants[*variant_index].name, field.index
+        );
+        if !collect_tuple_field_symbol(
+            field,
+            field_def_id,
+            &variant_def_paths[*variant_index],
+            &field_canonical_path,
+            package_id,
+            reasons,
+            canonical_paths,
+            current_symbols,
+            def_paths,
+            packages,
+            symbols,
+        ) {
+            return;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn collect_tuple_field_symbol(
-    field: &ValidatedInterfaceEnumTupleField,
+    field: &ValidatedEnumTupleField,
     field_def_id: LocalDefId,
     parent_def_path: &sai_hir::DefPath,
     canonical_path: &str,
@@ -6159,15 +6218,13 @@ fn collect_tuple_field_symbol(
 ) -> bool {
     let field_name = field.index.to_string();
     let Ok(field_symbol) = symbols.intern(&field_name) else {
-        reasons.insert("an interface enum tuple field index cannot be interned".into());
+        reasons.insert("an enum tuple field index cannot be interned".into());
         return false;
     };
     let field_def_path = match def_paths.resolve(field_def_id) {
         Ok(Some(path)) if path.package() == package_id => path,
         _ => {
-            reasons.insert(
-                "an interface enum tuple field has no DefPath in the selected package".into(),
-            );
+            reasons.insert("an enum tuple field has no DefPath in the selected package".into());
             return false;
         }
     };
@@ -6179,15 +6236,14 @@ fn collect_tuple_field_symbol(
         })
     {
         reasons.insert(
-            "an interface enum tuple field DefPath does not match its exact parent or canonical index"
-                .into(),
+            "an enum tuple field DefPath does not match its exact parent or canonical index".into(),
         );
         return false;
     }
     let field_def_path_hash = match DefPathHash::compute(&field_def_path, packages, symbols) {
         Ok(hash) => Fingerprint::new(hash.raw()),
         Err(_) => {
-            reasons.insert("an interface enum tuple field DefPath hash cannot be computed".into());
+            reasons.insert("an enum tuple field DefPath hash cannot be computed".into());
             return false;
         }
     };
