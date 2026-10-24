@@ -1746,6 +1746,8 @@ pub struct FieldDef { pub def_id: DefId, pub name: Symbol, pub vis: Visibility, 
 - `REFINED_BASE_IS_REFINED` and `RESOURCE_WITH_BORROW` (Stage 4) are reported here, on the base or the field type.
 - **Interfaces and WIT** (Stage 4). An enum with `@flags` is checked by [16](16-interfaces-and-wit.md) §16.9.1 (`INVALID_FLAGS_ENUM`). A valid one has `AdtKind::Flags` with one variant and one hidden field ([16](16-interfaces-and-wit.md) §16.9.2). The `AdtDef`s of the types of SAI views are built from the WIT model ([16](16-interfaces-and-wit.md) §16.4.3). `IS_HANDLE` marks view resources and the resources of local interfaces.
 
+**Implemented subset (IR-891):** The driver can currently look up a snapshot-bound `LocalFlagsAdtDef` for an accepted, valid local `@flags enum`. This is a flags-only projection carried by the package `interface_uses` query result; it is not the complete `adt_def(DefId)` query described above. A missing result means only that this projection contains no accepted local flags declaration. Other local ADTs and WIT-view types are not classified by this API.
+
 ### 3.6.5 `trait_def`
 
 `trait_def(def) -> Arc<TraitDef>` lists the supertraits (lowered, with `Self := Param(0)`), the associated types with their bounds, the methods and associated functions with their receiver forms and whether they have a default, `unsafe` and sealed markers (spec/16), and the lang-item role. `DUPLICATE_TRAIT_ITEM` is reported here. For the function traits it synthesizes the internal methods of N-E-26 (§3.3.6).

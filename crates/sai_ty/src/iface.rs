@@ -113,6 +113,14 @@ impl FlagsDef {
         &self.flags
     }
 
+    pub(crate) const fn repr_int_ty(&self) -> crate::adt::IntTy {
+        match self.repr {
+            FlagsRepr::U8 => crate::adt::IntTy::U8,
+            FlagsRepr::U16 => crate::adt::IntTy::U16,
+            FlagsRepr::U32 => crate::adt::IntTy::U32,
+        }
+    }
+
     /// Whether this descriptor still describes the supplied owner and enum.
     pub fn matches_enum(&self, adt: DefId, variants: &[Variant<'_>]) -> bool {
         self.adt == adt
@@ -486,6 +494,8 @@ mod tests {
         owner: OwnerId,
         hir: HirId,
         symbol: sai_hir::Symbol,
+        paths: DefPathInterner,
+        packages: PackageInterner,
     }
 
     fn test_ids() -> (TestIds, Interner) {
@@ -515,6 +525,8 @@ mod tests {
                     local_id: ItemLocalId::default(),
                 },
                 symbol,
+                paths,
+                packages,
             },
             symbols,
         )
@@ -903,6 +915,351 @@ mod tests {
                 assert_eq!(*flag_span, variants[index].name.span);
             }
         }
+    }
+
+    #[test]
+    fn flags_descriptor_builds_one_hidden_storage_variant_for_each_repr_boundary() {
+        let (ids, symbols) = test_ids();
+        let variant_name = symbols.intern("$flags").expect("synthetic variant interns");
+        let bits_name = symbols.intern("$bits").expect("hidden field interns");
+
+        for (count, repr) in [
+            (1, crate::adt::IntTy::U8),
+            (8, crate::adt::IntTy::U8),
+            (9, crate::adt::IntTy::U16),
+            (16, crate::adt::IntTy::U16),
+            (17, crate::adt::IntTy::U32),
+            (32, crate::adt::IntTy::U32),
+        ] {
+            let variants = flags_variants(&ids, &symbols, count);
+            let flags = build_flags_def(ids.owner.def_id.to_def_id(), ids.owner, &variants)
+                .expect("valid flags declaration")
+                .expect("nonempty flags declaration builds a definition");
+            let variant_id = ids
+                .paths
+                .intern_variants(ids.owner.def_id, &[(variant_name, 0)])
+                .expect("synthetic variant path interns")[0];
+            let field_id = ids
+                .paths
+                .intern_fields_for_parents(&[(variant_id, bits_name, 0)])
+                .expect("hidden field path interns")[0];
+
+            let local = flags
+                .into_local_adt_def(
+                    ids.owner.def_id,
+                    variant_id,
+                    field_id,
+                    variant_name,
+                    bits_name,
+                    &ids.paths,
+                    &symbols,
+                )
+                .expect("validated flags descriptor lowers");
+            let adt = local.adt_def();
+            assert_eq!(adt.def_id(), ids.owner.def_id.to_def_id());
+            assert_eq!(adt.kind(), crate::adt::AdtKind::Flags);
+            assert_eq!(adt.variants().len(), 1);
+            let variant = &adt.variants()[0];
+            assert_eq!(variant.def_id(), variant_id.to_def_id());
+            assert_eq!(variant.name(), variant_name);
+            assert_eq!(variant.discr(), 0);
+            assert_eq!(variant.fields().len(), 1);
+            let field = &variant.fields()[0];
+            assert_eq!(field.def_id(), field_id.to_def_id());
+            assert_eq!(field.name(), bits_name);
+            assert_eq!(field.visibility(), Visibility::Private);
+            assert_eq!(field.ty(), crate::adt::Ty::Int(repr));
+            assert_eq!(local.flags_def().flags().len(), count as usize);
+            assert_eq!(
+                local
+                    .flags_def()
+                    .flags()
+                    .iter()
+                    .map(|(name, _)| symbols.resolve(*name).expect("flag name resolves"))
+                    .collect::<Vec<_>>(),
+                (0..count)
+                    .map(|index| symbols
+                        .intern(&format!("Flag{index}"))
+                        .expect("flag symbol interns"))
+                    .map(|symbol| symbols.resolve(symbol).expect("flag name resolves"))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn flags_adt_constructor_rejects_wrong_owner_and_aliased_child_ids() {
+        let (ids, symbols) = test_ids();
+        let variants = flags_variants(&ids, &symbols, 2);
+        let flags = build_flags_def(ids.owner.def_id.to_def_id(), ids.owner, &variants)
+            .expect("valid flags declaration")
+            .expect("nonempty flags declaration builds a definition");
+        let variant_name = symbols.intern("$flags").expect("synthetic variant interns");
+        let bits_name = symbols.intern("$bits").expect("hidden field interns");
+        let variant_id = ids
+            .paths
+            .intern_variants(ids.owner.def_id, &[(variant_name, 0)])
+            .expect("synthetic variant path interns")[0];
+        let field_id = ids
+            .paths
+            .intern_fields_for_parents(&[(variant_id, bits_name, 0)])
+            .expect("hidden field path interns")[0];
+
+        assert_eq!(
+            flags.clone().into_local_adt_def(
+                variant_id,
+                variant_id,
+                field_id,
+                variant_name,
+                bits_name,
+                &ids.paths,
+                &symbols
+            ),
+            Err(crate::adt::LocalFlagsAdtDefError::OwnerMismatch)
+        );
+        assert_eq!(
+            flags.into_local_adt_def(
+                ids.owner.def_id,
+                variant_id,
+                variant_id,
+                variant_name,
+                bits_name,
+                &ids.paths,
+                &symbols
+            ),
+            Err(crate::adt::LocalFlagsAdtDefError::ChildDefinitionsAliasEachOther)
+        );
+    }
+
+    #[test]
+    fn flags_adt_constructor_rejects_unrelated_or_foreign_interner_paths() {
+        let (ids, symbols) = test_ids();
+        let variants = flags_variants(&ids, &symbols, 2);
+        let flags = build_flags_def(ids.owner.def_id.to_def_id(), ids.owner, &variants)
+            .expect("valid flags declaration")
+            .expect("nonempty flags declaration builds a definition");
+        let variant_name = symbols.intern("$flags").expect("synthetic variant interns");
+        let bits_name = symbols.intern("$bits").expect("hidden field interns");
+
+        let unrelated = symbols.intern("Unrelated").expect("unrelated name interns");
+        let unrelated_path = DefPath::new(
+            ids.paths.package(),
+            vec![DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(unrelated),
+                disambiguator: 0,
+            }],
+            &ids.packages,
+            &symbols,
+        )
+        .expect("unrelated owner path builds");
+        let unrelated_owner = ids
+            .paths
+            .intern(unrelated_path)
+            .expect("unrelated owner interns");
+        let unrelated_variant = ids
+            .paths
+            .intern_variants(unrelated_owner, &[(variant_name, 0)])
+            .expect("unrelated variant interns")[0];
+        let unrelated_field = ids
+            .paths
+            .intern_fields_for_parents(&[(unrelated_variant, bits_name, 0)])
+            .expect("unrelated field interns")[0];
+        assert_eq!(
+            flags.clone().into_local_adt_def(
+                ids.owner.def_id,
+                unrelated_variant,
+                unrelated_field,
+                variant_name,
+                bits_name,
+                &ids.paths,
+                &symbols,
+            ),
+            Err(crate::adt::LocalFlagsAdtDefError::ChildDefinitionPathMismatch)
+        );
+
+        let same_package_paths = DefPathInterner::new(ids.paths.package(), &ids.packages, &symbols)
+            .expect("second same-package interner builds");
+        let local_variant = ids
+            .paths
+            .intern_variants(ids.owner.def_id, &[(variant_name, 0)])
+            .expect("local variant interns")[0];
+        let local_field = ids
+            .paths
+            .intern_fields_for_parents(&[(local_variant, bits_name, 0)])
+            .expect("local field interns")[0];
+        assert_eq!(
+            flags.clone().into_local_adt_def(
+                ids.owner.def_id,
+                local_variant,
+                local_field,
+                variant_name,
+                bits_name,
+                &same_package_paths,
+                &symbols,
+            ),
+            Err(crate::adt::LocalFlagsAdtDefError::OwnerDefinitionPathMismatch)
+        );
+        let nonzero_variant = ids
+            .paths
+            .intern_variants(ids.owner.def_id, &[(variant_name, 1)])
+            .expect("nonzero variant disambiguator interns")[0];
+        let nonzero_variant_field = ids
+            .paths
+            .intern_fields_for_parents(&[(nonzero_variant, bits_name, 0)])
+            .expect("field beneath nonzero variant interns")[0];
+        assert_eq!(
+            flags.clone().into_local_adt_def(
+                ids.owner.def_id,
+                nonzero_variant,
+                nonzero_variant_field,
+                variant_name,
+                bits_name,
+                &ids.paths,
+                &symbols,
+            ),
+            Err(crate::adt::LocalFlagsAdtDefError::ChildDefinitionPathMismatch)
+        );
+        let nonzero_field = ids
+            .paths
+            .intern_fields_for_parents(&[(local_variant, bits_name, 1)])
+            .expect("nonzero field disambiguator interns")[0];
+        assert_eq!(
+            flags.clone().into_local_adt_def(
+                ids.owner.def_id,
+                local_variant,
+                nonzero_field,
+                variant_name,
+                bits_name,
+                &ids.paths,
+                &symbols,
+            ),
+            Err(crate::adt::LocalFlagsAdtDefError::ChildDefinitionPathMismatch)
+        );
+        let same_package_owner_path = ids
+            .paths
+            .resolve(ids.owner.def_id)
+            .expect("original owner resolves")
+            .expect("original owner is interned");
+        let same_package_owner = same_package_paths
+            .intern(same_package_owner_path)
+            .expect("same-package owner interns separately");
+        let same_package_variant = same_package_paths
+            .intern_variants(same_package_owner, &[(variant_name, 0)])
+            .expect("same-package variant interns")[0];
+        let same_package_field = same_package_paths
+            .intern_fields_for_parents(&[(same_package_variant, bits_name, 0)])
+            .expect("same-package field interns")[0];
+        assert_eq!(
+            flags.clone().into_local_adt_def(
+                ids.owner.def_id,
+                same_package_variant,
+                same_package_field,
+                variant_name,
+                bits_name,
+                &ids.paths,
+                &symbols,
+            ),
+            Err(crate::adt::LocalFlagsAdtDefError::ChildDefinitionPathMismatch)
+        );
+
+        let other_package = ids
+            .packages
+            .intern("acme:other-flags#1.0")
+            .expect("other package interns");
+        let other_paths = DefPathInterner::new(other_package, &ids.packages, &symbols)
+            .expect("other-package interner builds");
+        assert_eq!(
+            flags.clone().into_local_adt_def(
+                ids.owner.def_id,
+                local_variant,
+                local_field,
+                variant_name,
+                bits_name,
+                &other_paths,
+                &symbols,
+            ),
+            Err(crate::adt::LocalFlagsAdtDefError::OwnerDefinitionPathMismatch)
+        );
+        let other_name = symbols.intern("OtherFlags").expect("other name interns");
+        let other_owner_path = DefPath::new(
+            other_package,
+            vec![DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(other_name),
+                disambiguator: 0,
+            }],
+            &ids.packages,
+            &symbols,
+        )
+        .expect("other owner path builds");
+        let other_owner = other_paths
+            .intern(other_owner_path)
+            .expect("other owner interns");
+        let other_variant = other_paths
+            .intern_variants(other_owner, &[(variant_name, 0)])
+            .expect("other variant interns")[0];
+        let other_field = other_paths
+            .intern_fields_for_parents(&[(other_variant, bits_name, 0)])
+            .expect("other field interns")[0];
+        assert_eq!(
+            flags.into_local_adt_def(
+                ids.owner.def_id,
+                other_variant,
+                other_field,
+                variant_name,
+                bits_name,
+                &ids.paths,
+                &symbols,
+            ),
+            Err(crate::adt::LocalFlagsAdtDefError::ChildDefinitionPackageMismatch)
+        );
+    }
+
+    #[test]
+    fn flags_adt_constructor_rejects_non_reserved_synthetic_names() {
+        let (ids, symbols) = test_ids();
+        let variants = flags_variants(&ids, &symbols, 2);
+        let flags = build_flags_def(ids.owner.def_id.to_def_id(), ids.owner, &variants)
+            .expect("valid flags declaration")
+            .expect("nonempty flags declaration builds a definition");
+        let variant_name = symbols.intern("$flags").expect("synthetic variant interns");
+        let bits_name = symbols.intern("$bits").expect("hidden field interns");
+        let variant_id = ids
+            .paths
+            .intern_variants(ids.owner.def_id, &[(variant_name, 0)])
+            .expect("synthetic variant path interns")[0];
+        let field_id = ids
+            .paths
+            .intern_fields_for_parents(&[(variant_id, bits_name, 0)])
+            .expect("hidden field path interns")[0];
+        let visible_name = symbols.intern("bits").expect("visible name interns");
+        let visible_variant_name = symbols
+            .intern("flags")
+            .expect("visible variant name interns");
+
+        assert_eq!(
+            flags.clone().into_local_adt_def(
+                ids.owner.def_id,
+                variant_id,
+                field_id,
+                variant_name,
+                visible_name,
+                &ids.paths,
+                &symbols,
+            ),
+            Err(crate::adt::LocalFlagsAdtDefError::InvalidSyntheticNames)
+        );
+        assert_eq!(
+            flags.into_local_adt_def(
+                ids.owner.def_id,
+                variant_id,
+                field_id,
+                visible_variant_name,
+                bits_name,
+                &ids.paths,
+                &symbols,
+            ),
+            Err(crate::adt::LocalFlagsAdtDefError::InvalidSyntheticNames)
+        );
     }
 
     #[test]
