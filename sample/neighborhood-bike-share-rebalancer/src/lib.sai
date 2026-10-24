@@ -1,0 +1,37 @@
+use acme:neighborhood-bike-share-rebalancer/data
+use acme:neighborhood-bike-share-rebalancer/model.{RebalancePlan}
+use acme:neighborhood-bike-share-rebalancer/planner
+
+pub fn sample_plan() -> RebalancePlan {
+    planner.plan()
+}
+
+test "higher-priority stations receive the deterministic donor surplus first" {
+    let plan = sample_plan()
+    assert plan.trip_count == 3
+    assert plan.bikes_moved == 8
+    assert plan.priority_station_count == 4
+    assert plan.met_station_count == 3
+    assert plan.unmet_bikes == 2
+
+    let first = plan.trips[0].unwrap()
+    assert first.donor_index == 2
+    assert first.recipient_index == 0
+    assert first.standard_bikes == 3
+
+    let second = plan.trips[1].unwrap()
+    assert second.donor_index == 2
+    assert second.recipient_index == 1
+    assert second.standard_bikes == 2
+}
+
+test "the final station projection never fills reserved accessible docks" {
+    let plan = sample_plan()
+    let stations = data.stations()
+    for index in 0..stations.len() {
+        let regular_capacity =
+            stations[index].dock_capacity - stations[index].accessible_dock_capacity
+        assert plan.projected_standard_bikes[index] <= regular_capacity
+    }
+    assert plan.projected_standard_bikes[5] == 3
+}

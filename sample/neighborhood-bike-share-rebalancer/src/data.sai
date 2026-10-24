@@ -1,0 +1,71 @@
+use acme:neighborhood-bike-share-rebalancer/model.{Station}
+
+pub fn van_payload_bikes() -> U32 {
+    3
+}
+
+// Station IDs, rather than fixture position, define stable donor order.
+pub fn stations() -> Array<Station, 6> {
+    [
+        Station(
+            id: 11,
+            name: "Market Square",
+            priority: 0,
+            standard_bikes: 2,
+            target_standard_bikes: 5,
+            accessible_bikes: 1,
+            dock_capacity: 9,
+            accessible_dock_capacity: 2,
+        ),
+        Station(
+            id: 12,
+            name: "River Library",
+            priority: 1,
+            standard_bikes: 4,
+            target_standard_bikes: 6,
+            accessible_bikes: 2,
+            dock_capacity: 11,
+            accessible_dock_capacity: 3,
+        ),
+        Station(
+            id: 13,
+            name: "Depot",
+            priority: 9,
+            standard_bikes: 8,
+            target_standard_bikes: 3,
+            accessible_bikes: 1,
+            dock_capacity: 12,
+            accessible_dock_capacity: 2,
+        ),
+        Station(
+            id: 14,
+            name: "East School",
+            priority: 1,
+            standard_bikes: 1,
+            target_standard_bikes: 4,
+            accessible_bikes: 0,
+            dock_capacity: 8,
+            accessible_dock_capacity: 1,
+        ),
+        Station(
+            id: 15,
+            name: "Hill Clinic",
+            priority: 9,
+            standard_bikes: 7,
+            target_standard_bikes: 4,
+            accessible_bikes: 2,
+            dock_capacity: 9,
+            accessible_dock_capacity: 2,
+        ),
+        Station(
+            id: 16,
+            name: "North Market",
+            priority: 2,
+            standard_bikes: 3,
+            target_standard_bikes: 5,
+            accessible_bikes: 2,
+            dock_capacity: 7,
+            accessible_dock_capacity: 2,
+        ),
+    ]
+}

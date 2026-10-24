@@ -1,0 +1,6 @@
+package acme:neighborhood-bike-share-rebalancer @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+allow { alloc }
+description "Plan small neighborhood bike-share rebalancing trips with accessible docks reserved"
