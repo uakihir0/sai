@@ -1,0 +1,628 @@
+use acme:port-call-coordinator/model.{
+    Berth
+    CallAssignment
+    CallDecision
+    Crane
+    HazmatClass
+    InputIssue
+    PlacementResult
+    PortCall
+    PortPlan
+    PortScenario
+    TideWindow
+    UnplacedReason
+}
+
+fn overlaps(left_start: U32, left_end: U32, right_start: U32, right_end: U32) -> Bool {
+    left_start < right_end and right_start < left_end
+}
+
+fn maximum(left: U32, right: U32) -> U32 {
+    if left > right {
+        left
+    } else {
+        right
+    }
+}
+
+fn berth_exists(scenario: PortScenario, berth_id: U32) -> Bool {
+    for index in 0..scenario.berth_count {
+        if scenario.berths[index].unwrap().id == berth_id {
+            return true
+        }
+    }
+    false
+}
+
+fn neighbor_is_symmetric(scenario: PortScenario, berth: Berth) -> Bool {
+    if berth.neighbor_berth_id == 0 {
+        return true
+    }
+    for index in 0..scenario.berth_count {
+        let neighbor = scenario.berths[index].unwrap()
+        if neighbor.id == berth.neighbor_berth_id {
+            return neighbor.neighbor_berth_id == berth.id
+        }
+    }
+    false
+}
+
+fn validate_input(scenario: PortScenario) -> Option<InputIssue> {
+    if scenario.call_count > 8 {
+        return Some(InputIssue.TooManyCalls)
+    }
+    if scenario.berth_count > 4 {
+        return Some(InputIssue.TooManyBerths)
+    }
+    if scenario.crane_count > 8 {
+        return Some(InputIssue.TooManyCranes)
+    }
+    if scenario.tide_window_count > 4 {
+        return Some(InputIssue.TooManyTideWindows)
+    }
+
+    for index in 0..scenario.call_count {
+        if scenario.calls[index] == None {
+            return Some(InputIssue.MissingCall)
+        }
+    }
+    for index in 0..scenario.berth_count {
+        if scenario.berths[index] == None {
+            return Some(InputIssue.MissingBerth)
+        }
+    }
+    for index in 0..scenario.crane_count {
+        if scenario.cranes[index] == None {
+            return Some(InputIssue.MissingCrane)
+        }
+    }
+    for index in 0..scenario.tide_window_count {
+        if scenario.tide_windows[index] == None {
+            return Some(InputIssue.MissingTideWindow)
+        }
+    }
+
+    for index in 0..scenario.call_count {
+        let call = scenario.calls[index].unwrap()
+        if (
+            call.id == 0
+            or call.vessel_id == 0
+            or call.eta_minute >= call.latest_departure_minute
+            or call.latest_departure_minute > 1440
+            or call.length_m == 0
+            or call.draft_m == 0
+            or call.cargo_tons == 0
+            or call.cargo_tons > 20000
+            or call.reefer_plugs_required > 10
+        ) {
+            return Some(InputIssue.InvalidCall)
+        }
+        for other_index in index + 1..scenario.call_count {
+            let other = scenario.calls[other_index].unwrap()
+            if call.id == other.id {
+                return Some(InputIssue.DuplicateCallId)
+            }
+            if call.vessel_id == other.vessel_id {
+                return Some(InputIssue.DuplicateVesselId)
+            }
+        }
+    }
+
+    for index in 0..scenario.berth_count {
+        let berth = scenario.berths[index].unwrap()
+        if (
+            berth.id == 0
+            or berth.maximum_length_m == 0
+            or berth.maximum_draft_m == 0
+            or berth.open_minute >= berth.close_minute
+            or berth.close_minute > 1440
+            or berth.reefer_plugs > 10
+            or berth.neighbor_berth_id == berth.id
+        ) {
+            return Some(InputIssue.InvalidBerth)
+        }
+        if not neighbor_is_symmetric(scenario, berth) {
+            if not berth_exists(scenario, berth.neighbor_berth_id) {
+                return Some(InputIssue.UnknownBerthNeighbor)
+            }
+            return Some(InputIssue.AsymmetricBerthNeighbor)
+        }
+        for other_index in index + 1..scenario.berth_count {
+            if berth.id == scenario.berths[other_index].unwrap().id {
+                return Some(InputIssue.DuplicateBerthId)
+            }
+        }
+    }
+
+    for index in 0..scenario.crane_count {
+        let crane = scenario.cranes[index].unwrap()
+        if (
+            crane.id == 0
+            or crane.throughput_tons_per_hour == 0
+            or crane.throughput_tons_per_hour > 20000
+            or crane.open_minute >= crane.close_minute
+            or crane.close_minute > 1440
+        ) {
+            return Some(InputIssue.InvalidCrane)
+        }
+        if not berth_exists(scenario, crane.berth_id) {
+            return Some(InputIssue.UnknownCraneBerth)
+        }
+        for other_index in index + 1..scenario.crane_count {
+            if crane.id == scenario.cranes[other_index].unwrap().id {
+                return Some(InputIssue.DuplicateCraneId)
+            }
+        }
+    }
+
+    for index in 0..scenario.tide_window_count {
+        let tide = scenario.tide_windows[index].unwrap()
+        if (
+            tide.id == 0
+            or tide.start_minute >= tide.end_minute
+            or tide.end_minute > 1440
+            or tide.maximum_draft_m == 0
+        ) {
+            return Some(InputIssue.InvalidTideWindow)
+        }
+        for other_index in index + 1..scenario.tide_window_count {
+            let other = scenario.tide_windows[other_index].unwrap()
+            if tide.id == other.id {
+                return Some(InputIssue.DuplicateTideWindowId)
+            }
+            if overlaps(tide.start_minute, tide.end_minute, other.start_minute, other.end_minute) {
+                return Some(InputIssue.OverlappingTideWindows)
+            }
+        }
+    }
+
+    None
+}
+
+fn geometric_berth(call: PortCall, berth: Berth) -> Bool {
+    call.length_m <= berth.maximum_length_m and call.draft_m <= berth.maximum_draft_m
+}
+
+fn permitted_berth(call: PortCall, berth: Berth) -> Bool {
+    call.hazmat_class == HazmatClass.None or berth.hazmat_permit == call.hazmat_class
+}
+
+fn reefer_berth(call: PortCall, berth: Berth) -> Bool {
+    call.reefer_plugs_required <= berth.reefer_plugs
+}
+
+fn matching_crane(call: PortCall, berth: Berth, crane: Crane) -> Bool {
+    crane.berth_id == berth.id and crane.cargo_kind == call.cargo_kind
+}
+
+fn has_static_candidate(scenario: PortScenario, call: PortCall) -> Bool {
+    for berth_index in 0..scenario.berth_count {
+        let berth = scenario.berths[berth_index].unwrap()
+        if (
+            geometric_berth(call, berth)
+            and permitted_berth(call, berth)
+            and reefer_berth(call, berth)
+        ) {
+            for crane_index in 0..scenario.crane_count {
+                if matching_crane(call, berth, scenario.cranes[crane_index].unwrap()) {
+                    return true
+                }
+            }
+        }
+    }
+    false
+}
+
+fn static_failure(scenario: PortScenario, call: PortCall) -> UnplacedReason {
+    var saw_geometry = false
+    var saw_permit = false
+    var saw_reefer = false
+    for berth_index in 0..scenario.berth_count {
+        let berth = scenario.berths[berth_index].unwrap()
+        if geometric_berth(call, berth) {
+            saw_geometry = true
+            if permitted_berth(call, berth) {
+                saw_permit = true
+                if reefer_berth(call, berth) {
+                    saw_reefer = true
+                }
+            }
+        }
+    }
+    if not saw_geometry {
+        return UnplacedReason.NoCompatibleBerth
+    }
+    if not saw_permit {
+        return UnplacedReason.HazmatPermitUnavailable
+    }
+    if not saw_reefer {
+        return UnplacedReason.ReeferPowerUnavailable
+    }
+    UnplacedReason.NoCompatibleCrane
+}
+
+fn tide_supports_entry(tide: TideWindow, call: PortCall, entry: U32) -> Bool {
+    (
+        call.draft_m <= tide.maximum_draft_m
+        and tide.start_minute <= entry
+        and entry + 30 <= tide.end_minute
+    )
+}
+
+fn has_safe_tide(scenario: PortScenario, call: PortCall) -> Bool {
+    for tide_index in 0..scenario.tide_window_count {
+        let tide = scenario.tide_windows[tide_index].unwrap()
+        let earliest = maximum(call.eta_minute, tide.start_minute)
+        if (
+            call.draft_m <= tide.maximum_draft_m
+            and earliest + 30 <= tide.end_minute
+            and earliest + 30 <= call.latest_departure_minute
+        ) {
+            return true
+        }
+    }
+    false
+}
+
+fn hazmat_conflict(left: HazmatClass, right: HazmatClass) -> Bool {
+    (
+        (
+            left == HazmatClass.Flammable
+            and (right == HazmatClass.Oxidizer or right == HazmatClass.Toxic)
+        )
+        or (
+            right == HazmatClass.Flammable
+            and (left == HazmatClass.Oxidizer or left == HazmatClass.Toxic)
+        )
+    )
+}
+
+fn berth_or_crane_busy(
+    berth: Berth,
+    crane: Crane,
+    arrival: U32,
+    departure: U32,
+    service_start: U32,
+    service_end: U32,
+    decisions: Array<Option<CallDecision>, 8>,
+    previous_count: USize,
+) -> Bool {
+    for index in 0..previous_count {
+        let decision = decisions[index].unwrap()
+        match decision.assignment {
+            Some(existing) => {
+                if (
+                    existing.berth_id == berth.id
+                    and overlaps(
+                        arrival,
+                        departure,
+                        existing.channel_in_start_minute,
+                        existing.channel_out_end_minute,
+                    )
+                ) {
+                    return true
+                }
+                if (
+                    existing.crane_id == crane.id
+                    and overlaps(
+                        service_start,
+                        service_end,
+                        existing.service_start_minute,
+                        existing.service_end_minute,
+                    )
+                ) {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+fn adjacent_hazmat_busy(
+    call: PortCall,
+    berth: Berth,
+    arrival: U32,
+    departure: U32,
+    decisions: Array<Option<CallDecision>, 8>,
+    previous_count: USize,
+) -> Bool {
+    if call.hazmat_class == HazmatClass.None {
+        return false
+    }
+    for index in 0..previous_count {
+        let decision = decisions[index].unwrap()
+        match decision.assignment {
+            Some(existing) => {
+                if (
+                    (
+                        existing.berth_id == berth.neighbor_berth_id
+                        or existing.neighbor_berth_id == berth.id
+                    )
+                    and hazmat_conflict(call.hazmat_class, existing.hazmat_class)
+                    and overlaps(
+                        arrival,
+                        departure,
+                        existing.channel_in_start_minute,
+                        existing.channel_out_end_minute,
+                    )
+                ) {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+fn channel_busy(
+    inbound_start: U32,
+    inbound_end: U32,
+    outbound_start: U32,
+    outbound_end: U32,
+    decisions: Array<Option<CallDecision>, 8>,
+    previous_count: USize,
+) -> Bool {
+    for index in 0..previous_count {
+        let decision = decisions[index].unwrap()
+        match decision.assignment {
+            Some(existing) => {
+                if (
+                    overlaps(
+                        inbound_start,
+                        inbound_end,
+                        existing.channel_in_start_minute,
+                        existing.channel_in_end_minute,
+                    )
+                    or overlaps(
+                        inbound_start,
+                        inbound_end,
+                        existing.channel_out_start_minute,
+                        existing.channel_out_end_minute,
+                    )
+                    or overlaps(
+                        outbound_start,
+                        outbound_end,
+                        existing.channel_in_start_minute,
+                        existing.channel_in_end_minute,
+                    )
+                    or overlaps(
+                        outbound_start,
+                        outbound_end,
+                        existing.channel_out_start_minute,
+                        existing.channel_out_end_minute,
+                    )
+                ) {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+fn precedes(left: PortCall, right: PortCall) -> Bool {
+    if left.priority != right.priority {
+        return left.priority < right.priority
+    }
+    if left.eta_minute != right.eta_minute {
+        return left.eta_minute < right.eta_minute
+    }
+    left.id < right.id
+}
+
+fn try_place(
+    scenario: PortScenario,
+    call: PortCall,
+    decisions: Array<Option<CallDecision>, 8>,
+    previous_count: USize,
+) -> PlacementResult {
+    if not has_static_candidate(scenario, call) {
+        return PlacementResult(assignment: None, reason: Some(static_failure(scenario, call)))
+    }
+    if not has_safe_tide(scenario, call) {
+        return PlacementResult(assignment: None, reason: Some(UnplacedReason.NoSafeTideWindow))
+    }
+
+    var saw_hazmat_block = false
+    var saw_channel_block = false
+    var saw_resource_block = false
+
+    for channel_entry in call.eta_minute..call.latest_departure_minute {
+        var best: Option<CallAssignment> = None
+        for berth_index in 0..scenario.berth_count {
+            let berth = scenario.berths[berth_index].unwrap()
+            if not (
+                geometric_berth(call, berth)
+                and permitted_berth(call, berth)
+                and reefer_berth(call, berth)
+            ) {
+                continue
+            }
+            for crane_index in 0..scenario.crane_count {
+                let crane = scenario.cranes[crane_index].unwrap()
+                if not matching_crane(call, berth, crane) {
+                    continue
+                }
+
+                let inbound_end = channel_entry + 30
+                let service_start =
+                    maximum(inbound_end, maximum(berth.open_minute, crane.open_minute))
+                let service_minutes = (
+                    (call.cargo_tons * 60 + crane.throughput_tons_per_hour - 1)
+                    / crane.throughput_tons_per_hour
+                )
+                let service_end = service_start + service_minutes
+                let outbound_end = service_end + 30
+
+                if (
+                    channel_entry < berth.open_minute
+                    or inbound_end > berth.close_minute
+                    or service_end > berth.close_minute
+                    or outbound_end > berth.close_minute
+                    or service_end > crane.close_minute
+                    or outbound_end > call.latest_departure_minute
+                ) {
+                    continue
+                }
+
+                for tide_index in 0..scenario.tide_window_count {
+                    let tide = scenario.tide_windows[tide_index].unwrap()
+                    if not tide_supports_entry(tide, call, channel_entry) {
+                        continue
+                    }
+                    if adjacent_hazmat_busy(
+                        call,
+                        berth,
+                        channel_entry,
+                        outbound_end,
+                        decisions,
+                        previous_count,
+                    ) {
+                        saw_hazmat_block = true
+                        continue
+                    }
+
+                    if berth_or_crane_busy(
+                        berth,
+                        crane,
+                        channel_entry,
+                        outbound_end,
+                        service_start,
+                        service_end,
+                        decisions,
+                        previous_count,
+                    ) {
+                        saw_resource_block = true
+                        continue
+                    }
+
+                    if channel_busy(
+                        channel_entry,
+                        inbound_end,
+                        service_end,
+                        outbound_end,
+                        decisions,
+                        previous_count,
+                    ) {
+                        saw_channel_block = true
+                        continue
+                    }
+
+                    let candidate = CallAssignment(
+                        call_id: call.id,
+                        berth_id: berth.id,
+                        neighbor_berth_id: berth.neighbor_berth_id,
+                        crane_id: crane.id,
+                        tide_window_id: tide.id,
+                        channel_in_start_minute: channel_entry,
+                        channel_in_end_minute: inbound_end,
+                        hazmat_class: call.hazmat_class,
+                        service_start_minute: service_start,
+                        service_end_minute: service_end,
+                        channel_out_start_minute: service_end,
+                        channel_out_end_minute: outbound_end,
+                    )
+
+                    match best {
+                        None => {
+                            best = Some(candidate)
+                        }
+                        Some(current) => {
+                            if (
+                                candidate.berth_id < current.berth_id
+                                or (
+                                    candidate.berth_id == current.berth_id
+                                    and candidate.crane_id < current.crane_id
+                                )
+                            ) {
+                                best = Some(candidate)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        match best {
+            Some(assignment) => {
+                return PlacementResult(assignment: Some(assignment), reason: None)
+            }
+            None => {}
+        }
+    }
+
+    if saw_hazmat_block {
+        return PlacementResult(assignment: None, reason: Some(UnplacedReason.HazmatSeparation))
+    }
+    if saw_channel_block {
+        return PlacementResult(assignment: None, reason: Some(UnplacedReason.ChannelOccupied))
+    }
+    if saw_resource_block {
+        return PlacementResult(assignment: None, reason: Some(UnplacedReason.BerthOrCraneBusy))
+    }
+    PlacementResult(assignment: None, reason: Some(UnplacedReason.NoFeasibleOperatingWindow))
+}
+
+fn empty_plan(issue: InputIssue) -> PortPlan {
+    PortPlan(
+        decisions: [None, None, None, None, None, None, None, None],
+        decision_count: 0,
+        scheduled_count: 0,
+        input_valid: false,
+        input_issue: Some(issue),
+    )
+}
+
+pub fn plan(scenario: PortScenario) -> PortPlan {
+    match validate_input(scenario) {
+        Some(issue) => {
+            return empty_plan(issue)
+        }
+        None => {}
+    }
+
+    var ordered = scenario.calls
+    for index in 1..scenario.call_count {
+        let candidate = ordered[index].unwrap()
+        var cursor = index
+        while cursor > 0 {
+            if precedes(candidate, ordered[cursor - 1].unwrap()) {
+                ordered[cursor] = ordered[cursor - 1]
+                cursor -= 1
+            } else {
+                break
+            }
+        }
+        ordered[cursor] = Some(candidate)
+    }
+
+    var decisions: Array<Option<CallDecision>, 8> = [None, None, None, None, None, None, None, None]
+    var scheduled_count: USize = 0
+    for index in 0..scenario.call_count {
+        let call = ordered[index].unwrap()
+        let placement = try_place(scenario, call, decisions, index)
+        decisions[index] = Some(
+            CallDecision(
+                call_id: call.id,
+                vessel_id: call.vessel_id,
+                vessel_name: call.vessel_name,
+                assignment: placement.assignment,
+                unplaced_reason: placement.reason,
+            ),
+        )
+        if placement.assignment != None {
+            scheduled_count += 1
+        }
+    }
+
+    PortPlan(
+        decisions: decisions,
+        decision_count: scenario.call_count,
+        scheduled_count: scheduled_count,
+        input_valid: true,
+        input_issue: None,
+    )
+}

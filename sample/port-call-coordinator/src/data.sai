@@ -160,7 +160,7 @@ pub fn scenario() -> PortScenario {
                     id: 12,
                     name: "Hazmat Pier",
                     maximum_length_m: 320,
-                    maximum_draft_m: 12,
+                    maximum_draft_m: 13,
                     reefer_plugs: 1,
                     hazmat_permit: HazmatClass.Flammable,
                     neighbor_berth_id: 11,

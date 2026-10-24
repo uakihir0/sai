@@ -47,7 +47,7 @@ pub enum InputIssue {
     DuplicateTideWindowId
     UnknownCraneBerth
     UnknownBerthNeighbor
-    InvalidTideOrdering
+    AsymmetricBerthNeighbor
     OverlappingTideWindows
 }
 
@@ -114,14 +114,22 @@ pub type PortScenario {
 pub type CallAssignment {
     pub call_id: U32
     pub berth_id: U32
+    pub neighbor_berth_id: U32
     pub crane_id: U32
     pub tide_window_id: U32
     pub channel_in_start_minute: U32
     pub channel_in_end_minute: U32
+    pub hazmat_class: HazmatClass
     pub service_start_minute: U32
     pub service_end_minute: U32
     pub channel_out_start_minute: U32
     pub channel_out_end_minute: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PlacementResult {
+    pub assignment: Option<CallAssignment>
+    pub reason: Option<UnplacedReason>
 }
 
 @derive(Copy, Clone, PartialEq, Eq)
