@@ -26636,11 +26636,16 @@ world app { import acme:dep/api; }\n",
         }));
         assert!(
             mixed_members.symbols().iter().all(|symbol| {
-                !symbol.path().contains("Record")
-                    && !symbol.path().contains("State")
-                    && !symbol.path().contains("Alias")
+                !symbol.path().contains("Record") && !symbol.path().contains("State")
             }),
-            "unsupported interface records, enums, and aliases stay out of the resource slice"
+            "unsupported interface records and enums stay out of the alias/resource slice"
+        );
+        assert!(
+            mixed_members.symbols().iter().any(|symbol| {
+                symbol.path() == "acme:phase1.api.Alias"
+                    && symbol.kind() == sai_semantic::SymbolKind::Alias
+            }),
+            "direct interface aliases are inventoried"
         );
         assert_eq!(
             mixed_members
@@ -27019,15 +27024,17 @@ world app { import acme:dep/api; }\n",
         let inventory = inventory_symbols(&collection);
         assert!(matches!(
             inventory.coverage(),
-            sai_semantic::InventoryCoverage::Incomplete { .. }
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("duplicate canonical symbol path")
         ));
-        assert!(
-            inventory.symbols().iter().all(|symbol| {
-                symbol.path() != "acme:phase1.api.Handle"
-                    || symbol.kind() == sai_semantic::SymbolKind::Resource
-            }),
-            "the unsupported alias does not leak into the resource inventory"
-        );
+        let alias_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| {
+                symbol.path() == "acme:phase1.api.Handle"
+                    && symbol.kind() == sai_semantic::SymbolKind::Alias
+            })
+            .expect("alias survives beside the same-named resource");
         let resource_symbol = inventory
             .symbols()
             .iter()
@@ -27035,7 +27042,7 @@ world app { import acme:dep/api; }\n",
                 symbol.path() == "acme:phase1.api.Handle"
                     && symbol.kind() == sai_semantic::SymbolKind::Resource
             })
-            .expect("resource survives beside an unsupported same-named alias");
+            .expect("resource survives beside the same-named alias");
 
         let file = module_tree.modules[0].file;
         let parsed = sai_syntax::parse(&snapshot, file)
@@ -27127,11 +27134,144 @@ world app { import acme:dep/api; }\n",
         );
         let alias_hash =
             sai_hir::DefPathHash::compute(&alias_path, &database.packages, &database.symbols)
-                .expect("unsupported alias DefPath hash computes");
+                .expect("alias DefPath hash computes");
         assert_ne!(
             resource_symbol.def_path_hash(),
             sai_stable_hash::Fingerprint::new(alias_hash.raw()),
             "same-named interface TypeNs items have distinct DefPath hashes"
+        );
+        assert_eq!(
+            alias_symbol.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(alias_hash.raw())
+        );
+    }
+
+    #[test]
+    fn module_interface_alias_after_resource_uses_second_type_namespace_disambiguator() {
+        let (mut database, module_tree, snapshot, collection) =
+            collect_package_inventory_for_target(
+                b"interface api {\nresource Handle {}\ntype Handle = U32\n}\n",
+                b"",
+                "wasm32-core",
+            );
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("duplicate canonical symbol path")
+        ));
+        let alias_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| {
+                symbol.path() == "acme:phase1.api.Handle"
+                    && symbol.kind() == sai_semantic::SymbolKind::Alias
+            })
+            .expect("alias remains visible as an incomplete candidate");
+        let resource_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| {
+                symbol.path() == "acme:phase1.api.Handle"
+                    && symbol.kind() == sai_semantic::SymbolKind::Resource
+            })
+            .expect("resource remains visible as an incomplete candidate");
+
+        let file = module_tree.modules[0].file;
+        let parsed =
+            sai_syntax::parse(&snapshot, file).expect("same-named resource and alias parse");
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let interface = parsed
+            .root
+            .descendants()
+            .filter_map(ast::InterfaceDecl::cast)
+            .find(|interface| {
+                interface
+                    .name()
+                    .and_then(|name| name.token())
+                    .is_some_and(|token| token.text() == "api")
+            })
+            .expect("api interface exists");
+        let interface_ast_id = database
+            .ast_id_map(&snapshot, file)
+            .expect("current snapshot AST ID map exists")
+            .ast_id(&interface)
+            .expect("interface AST ID exists")
+            .erase();
+        let interface_owner = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| {
+                owner.kind == TopLevelOwnerKind::Interface
+                    && owner.file == file
+                    && owner.item_id == interface_ast_id
+            })
+            .expect("interface owner matches the exact AST declaration");
+        let def_path_interner = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("package DefPath interner exists");
+        let name = database.symbols.intern("Handle").expect("name interns");
+        let resource_def_id = def_path_interner
+            .intern_children(
+                interface_owner.owner.def_id,
+                &[(DefPathData::TypeNs(name), 0)],
+            )
+            .expect("first TypeNs path interns")
+            .into_iter()
+            .next()
+            .expect("resource DefPath ID exists");
+        let alias_def_id = def_path_interner
+            .intern_children(
+                interface_owner.owner.def_id,
+                &[(DefPathData::TypeNs(name), 1)],
+            )
+            .expect("second TypeNs path interns")
+            .into_iter()
+            .next()
+            .expect("alias DefPath ID exists");
+        let resource_path = database
+            .resolve_def_path(resource_def_id.to_def_id())
+            .expect("resource DefId resolves")
+            .expect("resource DefPath exists");
+        let alias_path = database
+            .resolve_def_path(alias_def_id.to_def_id())
+            .expect("alias DefId resolves")
+            .expect("alias DefPath exists");
+        assert!(matches!(
+            resource_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::TypeNs(name)
+                    && component.disambiguator == 0
+        ));
+        assert!(matches!(
+            alias_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::TypeNs(name)
+                    && component.disambiguator == 1
+        ));
+        let expected_resource_hash =
+            sai_hir::DefPathHash::compute(&resource_path, &database.packages, &database.symbols)
+                .expect("resource DefPath hash computes");
+        let expected_alias_hash =
+            sai_hir::DefPathHash::compute(&alias_path, &database.packages, &database.symbols)
+                .expect("alias DefPath hash computes");
+        assert_eq!(
+            resource_symbol.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(expected_resource_hash.raw())
+        );
+        assert_eq!(
+            alias_symbol.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(expected_alias_hash.raw())
+        );
+        assert_ne!(
+            resource_symbol.def_path_hash(),
+            alias_symbol.def_path_hash()
         );
     }
 
@@ -27201,6 +27341,303 @@ world app { import acme:dep/api; }\n",
                         && !symbol.path().contains(".Handle.Assoc")
                 }),
                 "{case_name} must not leak unsupported nested members"
+            );
+        }
+    }
+
+    #[test]
+    fn module_interface_alias_inventory_collects_root_nested_aliases_and_generics() {
+        let (mut database, module_tree, snapshot, collection) =
+            collect_package_inventory_for_target(
+                b"interface codec {\ntype Word = U64\ntype Identity<T, const N: I32> = T\n}\n",
+                b"interface identity {\ntype Key = U32\n}\n",
+                "wasm32-core",
+            );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        let actual = inventory
+            .symbols()
+            .iter()
+            .map(|symbol| (symbol.path(), symbol.kind()))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            actual,
+            [
+                ("acme:phase1.codec", sai_semantic::SymbolKind::Interface),
+                ("acme:phase1.codec.Word", sai_semantic::SymbolKind::Alias),
+                (
+                    "acme:phase1.codec.Identity",
+                    sai_semantic::SymbolKind::Alias
+                ),
+                (
+                    "acme:phase1.codec.Identity.generic[T]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1.codec.Identity.generic[N]",
+                    sai_semantic::SymbolKind::GenericParam
+                ),
+                (
+                    "acme:phase1/child.identity",
+                    sai_semantic::SymbolKind::Interface
+                ),
+                (
+                    "acme:phase1/child.identity.Key",
+                    sai_semantic::SymbolKind::Alias
+                ),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        let root_file = module_tree.modules[0].file;
+        let parsed = sai_syntax::parse(&snapshot, root_file).expect("alias source parses");
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let interface = parsed
+            .root
+            .descendants()
+            .filter_map(ast::InterfaceDecl::cast)
+            .find(|interface| {
+                interface
+                    .name()
+                    .and_then(|name| name.token())
+                    .is_some_and(|token| token.text() == "codec")
+            })
+            .expect("codec interface exists");
+        let alias = interface
+            .items()
+            .expect("interface item list exists")
+            .syntax()
+            .children()
+            .filter_map(ast::TypeDecl::cast)
+            .find(|declaration| {
+                declaration
+                    .name()
+                    .and_then(|name| name.token())
+                    .is_some_and(|token| token.text() == "Identity")
+            })
+            .expect("Identity alias exists");
+        let alias_name_token = alias
+            .name()
+            .and_then(|name| name.token())
+            .expect("alias name token exists");
+        let identity_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| {
+                symbol.path() == "acme:phase1.codec.Identity"
+                    && symbol.kind() == sai_semantic::SymbolKind::Alias
+            })
+            .expect("Identity alias symbol exists");
+        assert_eq!(
+            identity_symbol.fingerprint(),
+            sai_semantic::declaration_fingerprint(
+                sai_semantic::SymbolKind::Alias,
+                &alias.syntax(),
+                Some(&alias_name_token),
+            )
+            .expect("interface alias fingerprint computes from its actual name token")
+        );
+
+        let interface_ast_id = database
+            .ast_id_map(&snapshot, root_file)
+            .expect("current snapshot AST ID map exists")
+            .ast_id(&interface)
+            .expect("interface AST ID exists")
+            .erase();
+        let interface_owner = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| {
+                owner.kind == TopLevelOwnerKind::Interface
+                    && owner.file == root_file
+                    && owner.item_id == interface_ast_id
+            })
+            .expect("interface owner matches the exact source declaration");
+        let def_path_interner = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("package DefPath interner exists");
+        let alias_name_symbol = database
+            .symbols
+            .intern("Identity")
+            .expect("alias name interns");
+        let alias_def_id = def_path_interner
+            .intern_children(
+                interface_owner.owner.def_id,
+                &[(DefPathData::TypeNs(alias_name_symbol), 0)],
+            )
+            .expect("interface alias DefPath interns")
+            .into_iter()
+            .next()
+            .expect("interface alias DefPath ID exists");
+        let interface_path = database
+            .resolve_def_path(interface_owner.owner.def_id.to_def_id())
+            .expect("interface owner DefId is valid")
+            .expect("interface owner DefPath exists");
+        let alias_path = database
+            .resolve_def_path(alias_def_id.to_def_id())
+            .expect("interface alias DefId is valid")
+            .expect("interface alias DefPath exists");
+        assert_eq!(
+            &alias_path.data()[..interface_path.data().len()],
+            interface_path.data()
+        );
+        assert!(matches!(
+            alias_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::TypeNs(alias_name_symbol)
+                    && component.disambiguator == 0
+        ));
+        let expected_alias_hash =
+            sai_hir::DefPathHash::compute(&alias_path, &database.packages, &database.symbols)
+                .expect("interface alias DefPath hash computes");
+        assert_eq!(
+            identity_symbol.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(expected_alias_hash.raw())
+        );
+
+        let generic_name = database.symbols.intern("T").expect("generic name interns");
+        let const_generic_name = database
+            .symbols
+            .intern("N")
+            .expect("const generic name interns");
+        let generic_def_id = def_path_interner
+            .intern_generic_params(
+                alias_def_id,
+                &[(generic_name, false, 0), (const_generic_name, true, 0)],
+            )
+            .expect("interface alias generic DefPath interns")
+            .into_iter()
+            .next()
+            .expect("interface alias generic DefPath ID exists");
+        let generic_path = database
+            .resolve_def_path(generic_def_id.to_def_id())
+            .expect("generic DefId is valid")
+            .expect("generic DefPath exists");
+        assert_eq!(
+            &generic_path.data()[..alias_path.data().len()],
+            alias_path.data()
+        );
+        assert!(matches!(
+            generic_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::TypeParam(generic_name)
+                    && component.disambiguator == 0
+        ));
+        let expected_generic_hash =
+            sai_hir::DefPathHash::compute(&generic_path, &database.packages, &database.symbols)
+                .expect("generic DefPath hash computes");
+        let generic_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| {
+                symbol.path() == "acme:phase1.codec.Identity.generic[T]"
+                    && symbol.kind() == sai_semantic::SymbolKind::GenericParam
+            })
+            .expect("interface alias generic symbol exists");
+        assert_eq!(
+            generic_symbol.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(expected_generic_hash.raw())
+        );
+        let const_generic_def_id = def_path_interner
+            .intern_generic_params(alias_def_id, &[(const_generic_name, true, 0)])
+            .expect("interface alias const generic DefPath interns")
+            .into_iter()
+            .next()
+            .expect("interface alias const generic DefPath ID exists");
+        let const_generic_path = database
+            .resolve_def_path(const_generic_def_id.to_def_id())
+            .expect("const generic DefId is valid")
+            .expect("const generic DefPath exists");
+        assert_eq!(
+            &const_generic_path.data()[..alias_path.data().len()],
+            alias_path.data()
+        );
+        assert!(matches!(
+            const_generic_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::ConstParam(const_generic_name)
+                    && component.disambiguator == 0
+        ));
+        let expected_const_generic_hash = sai_hir::DefPathHash::compute(
+            &const_generic_path,
+            &database.packages,
+            &database.symbols,
+        )
+        .expect("const generic DefPath hash computes");
+        let const_generic_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| {
+                symbol.path() == "acme:phase1.codec.Identity.generic[N]"
+                    && symbol.kind() == sai_semantic::SymbolKind::GenericParam
+            })
+            .expect("interface alias const generic symbol exists");
+        assert_eq!(
+            const_generic_symbol.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(expected_const_generic_hash.raw())
+        );
+    }
+
+    #[test]
+    fn module_interface_alias_inventory_fails_closed_for_unsupported_and_invalid_forms() {
+        let cases: [(&str, &[u8], &str); 6] = [
+            (
+                "interface record remains unsupported",
+                b"interface api {\ntype Record { value: U32 }\n}\n",
+                "Record",
+            ),
+            (
+                "interface enum remains unsupported",
+                b"interface api {\nenum State { Ready }\n}\n",
+                "State",
+            ),
+            (
+                "interface refined alias remains unsupported",
+                b"interface api {\ntype Positive = U32 where self > 0\n}\n",
+                "Positive",
+            ),
+            (
+                "malformed interface alias target",
+                b"interface api {\ntype Broken =\n}\n",
+                "Broken",
+            ),
+            (
+                "invalid interface alias attribute",
+                b"interface api {\n@deprecated(1) type Invalid = U32\n}\n",
+                "Invalid",
+            ),
+            (
+                "interface alias target predicate is an invalid member attribute",
+                b"interface api {\n@target(\"wasm64-core\") type Filtered = U32\n}\n",
+                "Filtered",
+            ),
+        ];
+        for (case_name, source, unsupported_name) in cases {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert!(
+                matches!(
+                    inventory.coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { .. }
+                ),
+                "{case_name} must not yield complete interface-alias coverage"
+            );
+            assert!(
+                inventory.symbols().iter().all(|symbol| {
+                    symbol.path() != format!("acme:phase1.api.{unsupported_name}")
+                }),
+                "{case_name} must not leak an unsupported alias candidate"
             );
         }
     }
