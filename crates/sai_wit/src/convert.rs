@@ -3195,6 +3195,107 @@ world app {
     }
 
     #[test]
+    fn authored_type_and_enum_provenance_binds_multifile_escaped_names_to_root_sources() {
+        let alpha = concat!(
+            "package acme:graphics@1.2.3;\n",
+            "interface alpha { type %type = u32; enum %enum { %type, ready } }\n",
+        );
+        let bravo = concat!(
+            "package acme:graphics@1.2.3;\n",
+            "interface bravo { type %type = string; enum %enum { %type, done } }\n",
+        );
+        let parsed = parse_source_files(
+            dir_unit(),
+            [
+                WitSourceFile::new("z-bravo.wit", bravo),
+                WitSourceFile::new("a-alpha.wit", alpha),
+            ],
+        )
+        .expect("both authored root files parse");
+        let mut context = WitResolveContext::default();
+        let mut resolve = Resolve::default();
+        let package = context
+            .push_package(&mut resolve, parsed)
+            .expect("the multi-file root package resolves");
+        let sources = HashMap::from([("a-alpha.wit", alpha), ("z-bravo.wit", bravo)]);
+        let mut local_name_ranges = Vec::new();
+
+        for (interface_name, expected_path) in [("alpha", "a-alpha.wit"), ("bravo", "z-bravo.wit")]
+        {
+            let interface = package
+                .interfaces
+                .iter()
+                .find(|interface| interface.name == interface_name)
+                .expect("root interface is retained");
+            let item = interface
+                .items
+                .iter()
+                .find(|item| item.name == "type")
+                .expect("escaped alias name is normalized in the model");
+            assert!(matches!(&item.kind, WitItemKind::Alias(_)));
+            let name_span = item.span.as_ref().expect("alias name span is mapped");
+            assert_eq!(name_span.path, expected_path);
+            let source = sources[name_span.path.as_str()];
+            assert_eq!(&source[name_span.range.clone()], "%type");
+            local_name_ranges.push(name_span.range.clone());
+
+            let tokens = crate::authored_interface_alias_tokens(
+                source,
+                interface_name,
+                &item.name,
+                &name_span.range,
+            )
+            .expect("the source selected by the parser span proves the direct alias");
+            assert_eq!(
+                &source[tokens.declaration_range],
+                if interface_name == "alpha" {
+                    "type %type = u32;"
+                } else {
+                    "type %type = string;"
+                }
+            );
+
+            let enum_item = interface
+                .items
+                .iter()
+                .find(|item| item.name == "enum")
+                .expect("escaped enum name is normalized in the model");
+            assert!(matches!(&enum_item.kind, WitItemKind::Enum(_)));
+            let enum_span = enum_item.span.as_ref().expect("enum name span is mapped");
+            assert_eq!(enum_span.path, expected_path);
+            assert_eq!(&source[enum_span.range.clone()], "%enum");
+            let enum_tokens = crate::authored_interface_enum_tokens(
+                source,
+                interface_name,
+                &enum_item.name,
+                &enum_span.range,
+            )
+            .expect("the selected source proves the direct escaped enum");
+            assert_eq!(
+                enum_tokens
+                    .cases
+                    .iter()
+                    .map(|case| case.name.as_str())
+                    .collect::<Vec<_>>(),
+                if interface_name == "alpha" {
+                    ["type", "ready"]
+                } else {
+                    ["type", "done"]
+                }
+            );
+            assert_eq!(
+                &source[enum_tokens.cases[0].name_range.clone()],
+                "%type",
+                "the scanner preserves the escaped case's exact source range"
+            );
+        }
+        assert_eq!(
+            local_name_ranges[0], local_name_ranges[1],
+            "both escaped aliases use the same local byte range, so file identity is decisive"
+        );
+    }
+
+    #[test]
     fn preserves_authored_world_include_docs_in_printing_round_trip_and_hash() {
         let unit = dir_unit();
         let source = "\
