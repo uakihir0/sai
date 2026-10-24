@@ -25722,6 +25722,370 @@ interface api {
     }
 
     #[test]
+    fn wit_flags_inventory_collects_parent_and_flag_constants_but_omits_builtins() {
+        let wit_source = br#"package acme:phase1@1.0.0;
+interface types {
+    flags foreign { remote }
+}
+interface api {
+    use types.{foreign as imported};
+    type unsupported = map<string, u32>;
+    flags empty {}
+    @since(version = 1.0.0)
+    flags permissions { read-only, %type, write, }
+}"#;
+        let (mut database, package, collection) = collect_single_authored_wit_inventory(wit_source);
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { .. }
+        ));
+        let source = std::str::from_utf8(wit_source).expect("fixture WIT is UTF-8");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version parses"),
+        )
+        .expect("root package selection is valid");
+        let unit =
+            WitUnit::dir(package, &database.packages, &selected).expect("root WIT unit is valid");
+        let loaded = database
+            .wit_package(&unit)
+            .expect("root WIT package query succeeds")
+            .package
+            .expect("root WIT package model is available");
+        let root = loaded.root();
+        let (interface_index, interface) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "api")
+            .expect("root API interface is present");
+        let (item_index, item, flags) = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(item_index, item)| match &item.kind {
+                sai_wit::WitItemKind::Flags(flags) if item.name == "permissions" => {
+                    Some((item_index, item, flags))
+                }
+                _ => None,
+            })
+            .expect("direct authored flags type is in the selected package model");
+        assert_eq!(flags, &["read-only", "type", "write"]);
+
+        let view = database
+            .wit_view(&unit)
+            .expect("selected authored WIT view is available");
+        let view_interface = &view.interfaces["api"];
+        let member = view_interface
+            .members
+            .get("Permissions")
+            .expect("flags parent is represented as an enum view member");
+        assert_eq!(member.item, item_index);
+        assert_eq!(member.kind, sai_wit::WitViewDefKind::Enum);
+        assert_eq!(member.unsupported, item.unsupported);
+        let entity = sai_wit::WitViewEntity::Item {
+            interface: interface_index,
+            item: item_index,
+        };
+        let definition = view
+            .definition_for_entity(entity)
+            .expect("flags parent has the exact selected view entity");
+        assert_eq!(member.def, definition);
+        let view_definition = view.definition(definition).expect("view definition exists");
+        assert_eq!(view_definition.entity, entity);
+        assert_eq!(view_definition.kind, sai_wit::WitViewDefKind::Enum);
+        let def_path = view
+            .def_path(definition)
+            .expect("flags DefPath resolves")
+            .expect("flags DefPath exists");
+        assert_eq!(def_path.package(), view.package);
+        assert!(matches!(
+            def_path.data(),
+            [
+                sai_hir::DisambiguatedDefPathData {
+                    data: sai_hir::DefPathData::Interface(interface_name),
+                    disambiguator: 0,
+                },
+                sai_hir::DisambiguatedDefPathData {
+                    data: sai_hir::DefPathData::TypeNs(flags_name),
+                    disambiguator: 0,
+                },
+            ] if database.symbols.resolve(*interface_name).is_ok_and(|name| name.as_ref() == "api")
+                && database.symbols.resolve(*flags_name).is_ok_and(|name| name.as_ref() == "Permissions")
+        ));
+        assert_eq!(
+            view_definition.canonical_path,
+            "interface[3:api;0]/type[11:Permissions;0]/"
+        );
+        let expected_hash =
+            sai_hir::DefPathHash::compute(&def_path, &database.packages, &database.symbols)
+                .expect("flags DefPath hash computes");
+        let flags_path = "acme:phase1/api.Permissions";
+        let flags_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.path() == flags_path)
+            .expect("direct WIT flags parent is inventoried");
+        assert_eq!(flags_symbol.kind(), sai_semantic::SymbolKind::Enum);
+        assert_eq!(
+            flags_symbol.def_path_hash(),
+            Fingerprint::new(expected_hash.raw())
+        );
+        let name_span = item.span.as_ref().expect("flags name span is mapped");
+        let flags_tokens = sai_wit::authored_interface_flags_tokens(
+            source,
+            &interface.name,
+            &item.name,
+            &name_span.range,
+        )
+        .expect("scanner binds the parsed flags name span to source");
+        assert_eq!(
+            flags_tokens
+                .flags
+                .iter()
+                .map(|flag| flag.name.as_str())
+                .collect::<Vec<_>>(),
+            ["read-only", "type", "write"]
+        );
+        assert_eq!(
+            flags_symbol.fingerprint(),
+            sai_semantic::declaration_fingerprint_from_token_pairs(
+                sai_semantic::SymbolKind::Enum,
+                &flags_tokens.token_pairs
+            )
+        );
+        let expected_flags = ["ReadOnly", "Type", "Write"];
+        for (bit_index, source_flag) in flags_tokens.flags.iter().enumerate() {
+            let flag_spelling = sai_wit::wit_name_to_sai(&source_flag.name, true)
+                .expect("WIT flag name converts to SAI");
+            let flag_name = flag_spelling
+                .strip_prefix("r#")
+                .unwrap_or(&flag_spelling)
+                .to_owned();
+            assert_eq!(flag_name, expected_flags[bit_index]);
+            let canonical_flag_path = format!("{flags_path}.{flag_name}");
+            let flag_symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == canonical_flag_path)
+                .unwrap_or_else(|| panic!("flag constant `{canonical_flag_path}` is inventoried"));
+            assert_eq!(flag_symbol.kind(), sai_semantic::SymbolKind::Const);
+
+            let mut flag_def_path_data = def_path.data().to_vec();
+            let flag_name_symbol = database
+                .symbols
+                .intern(&flag_name)
+                .expect("converted flag name interns");
+            flag_def_path_data.push(sai_hir::DisambiguatedDefPathData {
+                data: sai_hir::DefPathData::ValueNs(flag_name_symbol),
+                disambiguator: 0,
+            });
+            let flag_def_path = sai_hir::DefPath::new(
+                view.package,
+                flag_def_path_data,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("derived flag constant path is valid");
+            assert_eq!(flag_def_path.package(), view.package);
+            assert_eq!(
+                flag_def_path
+                    .data()
+                    .last()
+                    .map(|component| component.disambiguator),
+                Some(0),
+                "a unique flag name uses the standard zero disambiguator"
+            );
+            let expected_flag_hash = sai_hir::DefPathHash::compute(
+                &flag_def_path,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("derived flag constant path hashes");
+            assert_eq!(
+                flag_symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_flag_hash.raw())
+            );
+
+            let mut flag_tokens = source_flag.token_pairs.clone();
+            flag_tokens.push(("WitFlagsBitIndex".to_owned(), bit_index.to_string()));
+            assert_eq!(
+                flag_symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint_from_token_pairs(
+                    sai_semantic::SymbolKind::Const,
+                    &flag_tokens
+                )
+            );
+        }
+        let flag_child_paths = inventory
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.path().starts_with(&format!("{flags_path}.")))
+            .map(|symbol| symbol.path().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            flag_child_paths,
+            [
+                "acme:phase1/api.Permissions.ReadOnly".to_owned(),
+                "acme:phase1/api.Permissions.Type".to_owned(),
+                "acme:phase1/api.Permissions.Write".to_owned(),
+            ]
+            .into_iter()
+            .collect(),
+            "only the three directly authored flag constants are children"
+        );
+        for builtin in ["empty", "all", "contains", "is_empty"] {
+            let builtin_path = format!("{flags_path}.{builtin}");
+            assert!(
+                inventory
+                    .symbols()
+                    .iter()
+                    .all(|symbol| symbol.path() != builtin_path),
+                "synthetic flag method `{builtin}` is not a source symbol"
+            );
+        }
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.path() == "acme:phase1/types.Foreign"),
+            "the definition in another root interface retains its direct path"
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.path() != "acme:phase1/api.Imported"),
+            "a use alias does not create a second source symbol"
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.path() != "acme:phase1/api.Unsupported"),
+            "an unsupported sibling does not create a type symbol"
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.path() != "acme:phase1/api.Empty"),
+            "an empty flags declaration has no verified source symbol"
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| !symbol.path().starts_with("acme:phase1/api.Empty.")),
+            "an empty flags declaration has no flag constants"
+        );
+    }
+
+    #[test]
+    fn wit_flags_constant_path_identity_is_stable_while_fingerprint_tracks_bit_order() {
+        let inventory_for = |flags: &str| {
+            let source = format!(
+                "package acme:phase1@1.0.0; interface api {{ flags permissions {{ {flags} }} }}"
+            );
+            let (_, _, collection) = collect_single_authored_wit_inventory(source.as_bytes());
+            inventory_symbols(&collection)
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == "acme:phase1/api.Permissions.Read")
+                .expect("Read constant is inventoried")
+                .clone()
+        };
+        let read_before = inventory_for("read, write");
+        let read_after = inventory_for("write, read");
+        assert_eq!(read_before.kind(), sai_semantic::SymbolKind::Const);
+        assert_eq!(read_after.kind(), sai_semantic::SymbolKind::Const);
+        assert_eq!(
+            read_before.def_path_hash(),
+            read_after.def_path_hash(),
+            "a named flag's path identity is stable when its bit position changes"
+        );
+        assert_ne!(
+            read_before.fingerprint(),
+            read_after.fingerprint(),
+            "the constant fingerprint records bit-order semantics"
+        );
+    }
+
+    #[test]
+    fn wit_flags_over_limit_keep_the_source_parent_but_invalidate_coverage() {
+        let flags = (0..33)
+            .map(|index| format!("flag-a{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let wit_source = format!(
+            "package acme:phase1@1.0.0; interface api {{ flags permissions {{ {flags} }} }}"
+        );
+        let (_database, _package, collection) =
+            collect_single_authored_wit_inventory(wit_source.as_bytes());
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("exceeds the 32-flag limit")
+        ));
+        let flags_path = "acme:phase1/api.Permissions";
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == flags_path)
+                .map(|symbol| symbol.kind()),
+            Some(sai_semantic::SymbolKind::Enum),
+            "the source-verified parent remains available despite invalid flag count"
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .filter(|symbol| {
+                    symbol.kind() == sai_semantic::SymbolKind::Const
+                        && symbol.path().starts_with(&format!("{flags_path}."))
+                })
+                .count()
+                == 0,
+            "an invalid over-limit flags declaration has no constant candidates"
+        );
+    }
+
+    #[test]
+    fn wit_flags_case_insensitive_constant_collision_rejects_the_whole_declaration() {
+        let wit_source = br#"package acme:phase1@1.0.0;
+interface api {
+    flags permissions { foo-bar, FOO-BAR }
+    flags unrelated { keep }
+}"#;
+        assert_eq!(
+            sai_wit::wit_name_to_sai("foo-bar", true).expect("lowercase spelling converts"),
+            sai_wit::wit_name_to_sai("FOO-BAR", true).expect("uppercase spelling converts"),
+            "case-insensitive WIT duplicates would collide at one canonical SAI name"
+        );
+        let (_database, _package, collection) = collect_single_authored_wit_inventory(wit_source);
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { .. }
+        ));
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| !symbol.path().starts_with("acme:phase1/api.Permissions")),
+            "an invalid declaration contributes neither its parent nor partial constants"
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.path() == "acme:phase1/api.Unrelated.Keep"),
+            "a separately validated sibling declaration remains inventoried"
+        );
+    }
+
+    #[test]
     fn wit_alias_inventory_collects_direct_aliases_but_not_used_reexports() {
         let wit_source = br#"package acme:phase1@1.0.0;
 interface types { type payload = u32; }
