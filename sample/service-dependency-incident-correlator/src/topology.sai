@@ -50,7 +50,9 @@ pub fn downstream_alert_count(snapshot: Snapshot, provider_id: U32) -> U32 {
         let service = snapshot.services[index]
         if reached[index] and service.id != provider_id {
             match signals.service_signal(snapshot, service.id) {
-                Some(_) => count += 1,
+                Some(_) => {
+                    count += 1
+                }
                 None => {}
             }
         }

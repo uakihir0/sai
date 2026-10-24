@@ -1,18 +1,17 @@
 use acme:service-dependency-incident-correlator/model.{Deployment, ServiceSignal, Snapshot}
 
-pub fn recent_deployment_id(
-    snapshot: Snapshot,
-    service_id: U32,
-    first_alert_minute: U32,
-) -> Option<U32> {
+pub fn recent_deployment_id(snapshot: Snapshot, service_id: U32, first_alert_minute: U32) -> Option<
+    U32,
+> {
     var selected: Option<Deployment> = None
     for index in 0..snapshot.deployment_count {
         match snapshot.deployments[index] {
             Some(deployment) => {
-                if deployment.service_id == service_id
+                if (
+                    deployment.service_id == service_id
                     and deployment.minute < first_alert_minute
                     and first_alert_minute - deployment.minute <= 10
-                {
+                ) {
                     match selected {
                         Some(existing) => {
                             if deployment.minute > existing.minute {
@@ -28,10 +27,7 @@ pub fn recent_deployment_id(
             None => {}
         }
     }
-    match selected {
-        Some(deployment) => Some(deployment.id),
-        None => None,
-    }
+    match selected { Some(deployment) => Some(deployment.id), None => None }
 }
 
 pub fn total_score(
@@ -39,9 +35,6 @@ pub fn total_score(
     downstream_alert_count: U32,
     deployment_id: Option<U32>,
 ) -> U32 {
-    let deployment_bonus = match deployment_id {
-        Some(_) => 25,
-        None => 0,
-    }
+    let deployment_bonus = match deployment_id { Some(_) => 25, None => 0 }
     signal.peak_score + downstream_alert_count * 10 + deployment_bonus
 }

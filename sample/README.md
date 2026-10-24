@@ -67,6 +67,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`service-dependency-incident-correlator`](service-dependency-incident-correlator/README.md) | Rank service incident investigation leads by alert severity, transitive dependency impact, alert onset, and nearby deployments. |
 | Advanced | [`transit-fare-cap-auditor`](transit-fare-cap-auditor/README.md) | Recalculate a bounded tap ledger with transfer windows and daily caps; hold malformed sequences and expose unmatched charges. |
 | Advanced | [`regional-storm-coordination`](regional-storm-coordination/README.md) | Coordinate road clearance, shelter power, accessible evacuation, medical transport, water delivery, and radio relay work across prerequisite and unit-capacity constraints. |
+| Advanced | [`backup-restore-readiness-auditor`](backup-restore-readiness-auditor/README.md) | Validate full and incremental backup chains against RPO/RTO, retention, checksum, and offsite requirements; select the newest compliant restore point and report fallbacks. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or

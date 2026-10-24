@@ -1,0 +1,138 @@
+use acme:backup-restore-readiness-auditor/model.{BackupSnapshot, Service, SnapshotKind}
+
+pub fn now_minute() -> U32 {
+    1000
+}
+
+pub fn services() -> Array<Service, 7> {
+    [
+        Service(id: 11, name: "Payments", rpo_minutes: 50, rto_minutes: 25, offsite_required: true),
+        Service(id: 22, name: "Catalog", rpo_minutes: 30, rto_minutes: 20, offsite_required: false),
+        Service(id: 33, name: "Orders", rpo_minutes: 60, rto_minutes: 15, offsite_required: false),
+        Service(id: 44, name: "Archive", rpo_minutes: 90, rto_minutes: 30, offsite_required: true),
+        Service(id: 55, name: "Search", rpo_minutes: 60, rto_minutes: 30, offsite_required: true),
+        Service(id: 66, name: "Ledger", rpo_minutes: 120, rto_minutes: 40, offsite_required: false),
+        Service(
+            id: 77,
+            name: "Billing",
+            rpo_minutes: 120,
+            rto_minutes: 60,
+            offsite_required: false,
+        ),
+    ]
+}
+
+pub fn snapshots() -> Array<BackupSnapshot, 10> {
+    [
+        BackupSnapshot(
+            id: 1001,
+            service_id: 11,
+            captured_minute: 900,
+            kind: SnapshotKind.Full,
+            parent_id: None,
+            restore_minutes: 20,
+            checksum_valid: true,
+            retained_until_minute: 1200,
+            offsite: true,
+        ),
+        BackupSnapshot(
+            id: 1002,
+            service_id: 11,
+            captured_minute: 950,
+            kind: SnapshotKind.Incremental,
+            parent_id: Some(1001),
+            restore_minutes: 5,
+            checksum_valid: true,
+            retained_until_minute: 1200,
+            offsite: true,
+        ),
+        BackupSnapshot(
+            id: 1003,
+            service_id: 11,
+            captured_minute: 980,
+            kind: SnapshotKind.Incremental,
+            parent_id: Some(1002),
+            restore_minutes: 5,
+            checksum_valid: false,
+            retained_until_minute: 1200,
+            offsite: true,
+        ),
+        BackupSnapshot(
+            id: 2001,
+            service_id: 22,
+            captured_minute: 955,
+            kind: SnapshotKind.Full,
+            parent_id: None,
+            restore_minutes: 10,
+            checksum_valid: true,
+            retained_until_minute: 1200,
+            offsite: false,
+        ),
+        BackupSnapshot(
+            id: 3001,
+            service_id: 33,
+            captured_minute: 990,
+            kind: SnapshotKind.Full,
+            parent_id: None,
+            restore_minutes: 18,
+            checksum_valid: true,
+            retained_until_minute: 1200,
+            offsite: false,
+        ),
+        BackupSnapshot(
+            id: 3002,
+            service_id: 33,
+            captured_minute: 995,
+            kind: SnapshotKind.Incremental,
+            parent_id: Some(3001),
+            restore_minutes: 6,
+            checksum_valid: true,
+            retained_until_minute: 1200,
+            offsite: false,
+        ),
+        BackupSnapshot(
+            id: 4001,
+            service_id: 44,
+            captured_minute: 990,
+            kind: SnapshotKind.Full,
+            parent_id: None,
+            restore_minutes: 10,
+            checksum_valid: true,
+            retained_until_minute: 1200,
+            offsite: false,
+        ),
+        BackupSnapshot(
+            id: 4002,
+            service_id: 44,
+            captured_minute: 995,
+            kind: SnapshotKind.Incremental,
+            parent_id: Some(4001),
+            restore_minutes: 5,
+            checksum_valid: true,
+            retained_until_minute: 1200,
+            offsite: true,
+        ),
+        BackupSnapshot(
+            id: 5001,
+            service_id: 55,
+            captured_minute: 990,
+            kind: SnapshotKind.Incremental,
+            parent_id: Some(5999),
+            restore_minutes: 5,
+            checksum_valid: true,
+            retained_until_minute: 1200,
+            offsite: true,
+        ),
+        BackupSnapshot(
+            id: 7001,
+            service_id: 77,
+            captured_minute: 980,
+            kind: SnapshotKind.Full,
+            parent_id: None,
+            restore_minutes: 15,
+            checksum_valid: true,
+            retained_until_minute: 999,
+            offsite: false,
+        ),
+    ]
+}

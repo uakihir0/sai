@@ -1,10 +1,10 @@
 use acme:service-dependency-incident-correlator/model.{
-    Dependency,
-    Deployment,
-    MetricSample,
-    Service,
-    Snapshot,
-    Tier,
+    Dependency
+    Deployment
+    MetricSample
+    Service
+    Snapshot
+    Tier
 }
 
 pub fn incident_window() -> Snapshot {
@@ -34,54 +34,40 @@ pub fn incident_window() -> Snapshot {
         ],
         dependency_count: 9,
         samples: [
-            Some(MetricSample(
-                service_id: 601,
-                minute: 10,
-                p95_latency_ms: 1250,
-                errors_per_1000: 75,
-            )),
-            Some(MetricSample(
-                service_id: 601,
-                minute: 12,
-                p95_latency_ms: 1150,
-                errors_per_1000: 90,
-            )),
-            Some(MetricSample(
-                service_id: 401,
-                minute: 13,
-                p95_latency_ms: 920,
-                errors_per_1000: 35,
-            )),
-            Some(MetricSample(
-                service_id: 501,
-                minute: 14,
-                p95_latency_ms: 710,
-                errors_per_1000: 52,
-            )),
-            Some(MetricSample(
-                service_id: 701,
-                minute: 14,
-                p95_latency_ms: 450,
-                errors_per_1000: 72,
-            )),
-            Some(MetricSample(
-                service_id: 201,
-                minute: 15,
-                p95_latency_ms: 820,
-                errors_per_1000: 40,
-            )),
-            Some(MetricSample(
-                service_id: 301,
-                minute: 15,
-                p95_latency_ms: 480,
-                errors_per_1000: 30,
-            )),
-            Some(MetricSample(
-                service_id: 101,
-                minute: 16,
-                p95_latency_ms: 610,
-                errors_per_1000: 50,
-            )),
+            Some(
+                MetricSample(
+                    service_id: 601,
+                    minute: 10,
+                    p95_latency_ms: 1250,
+                    errors_per_1000: 75,
+                ),
+            ),
+            Some(
+                MetricSample(
+                    service_id: 601,
+                    minute: 12,
+                    p95_latency_ms: 1150,
+                    errors_per_1000: 90,
+                ),
+            ),
+            Some(
+                MetricSample(service_id: 401, minute: 13, p95_latency_ms: 920, errors_per_1000: 35),
+            ),
+            Some(
+                MetricSample(service_id: 501, minute: 14, p95_latency_ms: 710, errors_per_1000: 52),
+            ),
+            Some(
+                MetricSample(service_id: 701, minute: 14, p95_latency_ms: 450, errors_per_1000: 72),
+            ),
+            Some(
+                MetricSample(service_id: 201, minute: 15, p95_latency_ms: 820, errors_per_1000: 40),
+            ),
+            Some(
+                MetricSample(service_id: 301, minute: 15, p95_latency_ms: 480, errors_per_1000: 30),
+            ),
+            Some(
+                MetricSample(service_id: 101, minute: 16, p95_latency_ms: 610, errors_per_1000: 50),
+            ),
             None,
             None,
             None,

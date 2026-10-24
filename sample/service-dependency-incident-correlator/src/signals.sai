@@ -1,8 +1,4 @@
-use acme:service-dependency-incident-correlator/model.{
-    MetricSample,
-    ServiceSignal,
-    Snapshot,
-}
+use acme:service-dependency-incident-correlator/model.{MetricSample, ServiceSignal, Snapshot}
 
 fn latency_points(p95_latency_ms: U32) -> U32 {
     if p95_latency_ms >= 1000 {
@@ -65,12 +61,14 @@ pub fn service_signal(snapshot: Snapshot, service_id: U32) -> Option<ServiceSign
     }
 
     match first_alert_minute {
-        Some(minute) => Some(ServiceSignal(
-            service_id: service_id,
-            first_alert_minute: minute,
-            peak_score: peak_score,
-            alerting_sample_count: alerting_sample_count,
-        )),
-        None => None,
+        Some(minute) => Some(
+            ServiceSignal(
+                service_id: service_id,
+                first_alert_minute: minute,
+                peak_score: peak_score,
+                alerting_sample_count: alerting_sample_count,
+            ),
+        )
+        None => None
     }
 }

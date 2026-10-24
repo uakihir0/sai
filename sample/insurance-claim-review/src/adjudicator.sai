@@ -19,8 +19,7 @@ fn precedes(left: Claim, right: Claim) -> Bool {
 
 fn initial_review_reason(policy_record: Policy, claim: Claim) -> Option<ReviewReason> {
     if (
-        claim.loss_day < policy_record.term_start_day
-        or claim.loss_day > policy_record.term_end_day
+        claim.loss_day < policy_record.term_start_day or claim.loss_day > policy_record.term_end_day
     ) {
         return Some(ReviewReason.LossOutsidePolicyTerm)
     }
@@ -80,7 +79,8 @@ pub fn review(batch: ClaimBatch) -> ClaimReport {
         aggregate_remaining[index] = policy.initial_aggregate_remaining(policy_record)
     }
 
-    var decisions: Array<Option<ClaimDecision>, 8> = [None, None, None, None, None, None, None, None]
+    var decisions: Array<Option<ClaimDecision>, 8> =
+        [None, None, None, None, None, None, None, None]
     var paid_count: U32 = 0
     var capped_count: U32 = 0
     var denied_count: U32 = 0
@@ -114,11 +114,11 @@ pub fn review(batch: ClaimBatch) -> ClaimReport {
                         if earlier_paid_event(decisions, index, claim.policy_id, claim.event_id) {
                             reason = Some(ReviewReason.DuplicatePaidEvent)
                         } else {
-                            let coverage_limit = policy.coverage_limit(policy_record, claim.coverage)
-                            let covered_damage = if claim.estimated_damage_dollars < coverage_limit {
-                                claim.estimated_damage_dollars
-                            } else {
-                                coverage_limit
+                            let coverage_limit =
+                                policy.coverage_limit(policy_record, claim.coverage)
+                            var covered_damage = coverage_limit
+                            if claim.estimated_damage_dollars < coverage_limit {
+                                covered_damage = claim.estimated_damage_dollars
                             }
                             let calculated_pre_aggregate_payment_dollars = if (
                                 covered_damage > policy_record.deductible_dollars
@@ -127,16 +127,16 @@ pub fn review(batch: ClaimBatch) -> ClaimReport {
                             } else {
                                 0
                             }
-                            pre_aggregate_payment_dollars = Some(
-                                calculated_pre_aggregate_payment_dollars
-                            )
+                            pre_aggregate_payment_dollars =
+                                Some(calculated_pre_aggregate_payment_dollars)
                             if calculated_pre_aggregate_payment_dollars == 0 {
                                 reason = Some(ReviewReason.BelowDeductible)
                             } else if aggregate_remaining[policy_index] == 0 {
                                 reason = Some(ReviewReason.AggregateExhausted)
                             } else {
                                 payable_dollars = if (
-                                    calculated_pre_aggregate_payment_dollars < aggregate_remaining[policy_index]
+                                    calculated_pre_aggregate_payment_dollars
+                                    < aggregate_remaining[policy_index]
                                 ) {
                                     calculated_pre_aggregate_payment_dollars
                                 } else {
@@ -157,16 +157,18 @@ pub fn review(batch: ClaimBatch) -> ClaimReport {
             }
         }
 
-        decisions[index] = Some(ClaimDecision(
-            claim_id: claim.id,
-            policy_id: claim.policy_id,
-            event_id: claim.event_id,
-            outcome: outcome,
-            reason: reason,
-            pre_aggregate_payment_dollars: pre_aggregate_payment_dollars,
-            payable_dollars: payable_dollars,
-            remaining_aggregate_dollars: remaining_after,
-        ))
+        decisions[index] = Some(
+            ClaimDecision(
+                claim_id: claim.id,
+                policy_id: claim.policy_id,
+                event_id: claim.event_id,
+                outcome: outcome,
+                reason: reason,
+                pre_aggregate_payment_dollars: pre_aggregate_payment_dollars,
+                payable_dollars: payable_dollars,
+                remaining_aggregate_dollars: remaining_after,
+            ),
+        )
         total_payable_dollars += payable_dollars
         match outcome {
             ClaimOutcome.Paid => {
@@ -187,10 +189,12 @@ pub fn review(batch: ClaimBatch) -> ClaimReport {
     var policy_balances: Array<Option<PolicyBalance>, 2> = [None, None]
     for index in 0..batch.policy_count {
         let policy_record = batch.policies[index].unwrap()
-        policy_balances[index] = Some(PolicyBalance(
-            policy_id: policy_record.id,
-            remaining_aggregate_dollars: aggregate_remaining[index],
-        ))
+        policy_balances[index] = Some(
+            PolicyBalance(
+                policy_id: policy_record.id,
+                remaining_aggregate_dollars: aggregate_remaining[index],
+            ),
+        )
     }
 
     ClaimReport(

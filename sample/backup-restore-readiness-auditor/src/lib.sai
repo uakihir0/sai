@@ -1,0 +1,7 @@
+use acme:backup-restore-readiness-auditor/audit
+use acme:backup-restore-readiness-auditor/data
+use acme:backup-restore-readiness-auditor/model.{AuditReport}
+
+pub fn audit_fixture() -> AuditReport {
+    audit.audit_all(data.services(), data.snapshots(), data.now_minute())
+}
