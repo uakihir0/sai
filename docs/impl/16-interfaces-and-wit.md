@@ -1123,13 +1123,15 @@ pub struct FlagsDef {
 
 `flags_def(D)` is `Some` exactly for a type whose `adt_def` is `AdtKind::Flags`. This includes the flags types of views.
 
-**Current implementation boundary (IR-886):** `sai_ty::iface` has a private
-validated `FlagsDef` builder for local interface enums. It retains the flag
+**Current implementation boundary (IR-886, IR-889):** `sai_ty::iface` builds
+an opaque validated `FlagsDef` for local interface enums. It retains the flag
 names and spans in declaration order and selects the smallest representation.
-The existing interface-diagnostic path consumes its invalid result, but does
-not yet store or expose a valid descriptor through `adt_def` or `flags_def`.
-This step leaves Stage 0 feature gates unchanged and does not implement local
-flag constants, type-relative resolution, or generated methods.
+The interface-item check now carries a valid descriptor to the transient WIT
+generator, which uses its ordered names and rejects a descriptor bound to a
+different owner or enum source. The descriptor is not stored or exposed through
+the semantic `adt_def` or `flags_def` queries. Stage 0 feature gates remain
+unchanged; local flag constants, type-relative resolution, and generated
+methods are not implemented.
 
 ### 16.9.3 Constants
 
