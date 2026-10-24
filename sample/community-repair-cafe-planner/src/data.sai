@@ -1,0 +1,190 @@
+use acme:community-repair-cafe-planner/model.{
+    AppointmentWindow
+    IntakeSafety
+    PartKind
+    PartStock
+    RepairRequest
+    Skill
+    Volunteer
+}
+
+pub fn requests() -> Array<RepairRequest, 10> {
+    [
+        RepairRequest(
+            id: 7005,
+            item: "Child scooter",
+            repair: "replace rear wheel",
+            skill: Skill.Bicycle,
+            priority: 1,
+            safety: IntakeSafety.Cleared,
+            earliest_window: 0,
+            latest_window: 2,
+            service_minutes: 45,
+            required_part: Some(PartKind.ScooterWheel),
+            part_quantity: 1,
+        ),
+        RepairRequest(
+            id: 7002,
+            item: "Smoke-marked toaster",
+            repair: "intake safety inspection",
+            skill: Skill.SmallAppliance,
+            priority: 0,
+            safety: IntakeSafety.InspectionRequired,
+            earliest_window: 0,
+            latest_window: 2,
+            service_minutes: 45,
+            required_part: Some(PartKind.ElectricalPlug),
+            part_quantity: 1,
+        ),
+        RepairRequest(
+            id: 7010,
+            item: "Swollen e-bike battery",
+            repair: "stop use and refer for qualified review",
+            skill: Skill.Bicycle,
+            priority: 0,
+            safety: IntakeSafety.StopUseAndRefer,
+            earliest_window: 0,
+            latest_window: 2,
+            service_minutes: 0,
+            required_part: None,
+            part_quantity: 0,
+        ),
+        RepairRequest(
+            id: 7008,
+            item: "Rain umbrella",
+            repair: "stitch a torn seam",
+            skill: Skill.Sewing,
+            priority: 2,
+            safety: IntakeSafety.Cleared,
+            earliest_window: 1,
+            latest_window: 2,
+            service_minutes: 35,
+            required_part: None,
+            part_quantity: 0,
+        ),
+        RepairRequest(
+            id: 7003,
+            item: "Denim jacket",
+            repair: "replace zipper slider",
+            skill: Skill.Sewing,
+            priority: 1,
+            safety: IntakeSafety.Cleared,
+            earliest_window: 0,
+            latest_window: 2,
+            service_minutes: 40,
+            required_part: Some(PartKind.ZipperSlider),
+            part_quantity: 1,
+        ),
+        RepairRequest(
+            id: 7001,
+            item: "Commuter bicycle",
+            repair: "replace worn brake cable",
+            skill: Skill.Bicycle,
+            priority: 0,
+            safety: IntakeSafety.Cleared,
+            earliest_window: 0,
+            latest_window: 1,
+            service_minutes: 50,
+            required_part: Some(PartKind.BrakeCable),
+            part_quantity: 1,
+        ),
+        RepairRequest(
+            id: 7009,
+            item: "Cracked glass jar",
+            repair: "replace cracked glass",
+            skill: Skill.GlassRepair,
+            priority: 2,
+            safety: IntakeSafety.Cleared,
+            earliest_window: 0,
+            latest_window: 2,
+            service_minutes: 30,
+            required_part: None,
+            part_quantity: 0,
+        ),
+        RepairRequest(
+            id: 7004,
+            item: "Table lamp",
+            repair: "replace a loose switch",
+            skill: Skill.SmallAppliance,
+            priority: 1,
+            safety: IntakeSafety.Cleared,
+            earliest_window: 0,
+            latest_window: 0,
+            service_minutes: 45,
+            required_part: None,
+            part_quantity: 0,
+        ),
+        RepairRequest(
+            id: 7006,
+            item: "Wooden stool",
+            repair: "glue and clamp a loose rung",
+            skill: Skill.Woodwork,
+            priority: 1,
+            safety: IntakeSafety.Cleared,
+            earliest_window: 2,
+            latest_window: 2,
+            service_minutes: 50,
+            required_part: None,
+            part_quantity: 0,
+        ),
+        RepairRequest(
+            id: 7007,
+            item: "Second jacket",
+            repair: "replace zipper slider",
+            skill: Skill.Sewing,
+            priority: 1,
+            safety: IntakeSafety.Cleared,
+            earliest_window: 1,
+            latest_window: 2,
+            service_minutes: 35,
+            required_part: Some(PartKind.ZipperSlider),
+            part_quantity: 1,
+        ),
+    ]
+}
+
+pub fn volunteers() -> Array<Volunteer, 4> {
+    [
+        Volunteer(
+            id: 101,
+            name: "Bea",
+            skills: [Some(Skill.Bicycle), Some(Skill.Sewing), None],
+            available_windows: [true, true, false],
+        ),
+        Volunteer(
+            id: 102,
+            name: "Dev",
+            skills: [Some(Skill.SmallAppliance), None, None],
+            available_windows: [true, false, true],
+        ),
+        Volunteer(
+            id: 103,
+            name: "Noor",
+            skills: [Some(Skill.Bicycle), Some(Skill.Woodwork), None],
+            available_windows: [false, true, true],
+        ),
+        Volunteer(
+            id: 104,
+            name: "Eli",
+            skills: [Some(Skill.Sewing), Some(Skill.SmallAppliance), None],
+            available_windows: [true, true, true],
+        ),
+    ]
+}
+
+pub fn windows() -> Array<AppointmentWindow, 3> {
+    [
+        AppointmentWindow(name: "09:00-10:00", start_minute: 540, end_minute: 600, bench_count: 2),
+        AppointmentWindow(name: "10:15-11:15", start_minute: 615, end_minute: 675, bench_count: 2),
+        AppointmentWindow(name: "11:30-12:30", start_minute: 690, end_minute: 750, bench_count: 1),
+    ]
+}
+
+pub fn parts() -> Array<PartStock, 4> {
+    [
+        PartStock(kind: PartKind.BrakeCable, name: "brake cables", quantity: 1),
+        PartStock(kind: PartKind.ZipperSlider, name: "zipper sliders", quantity: 1),
+        PartStock(kind: PartKind.ScooterWheel, name: "scooter wheels", quantity: 1),
+        PartStock(kind: PartKind.ElectricalPlug, name: "plugs", quantity: 1),
+    ]
+}

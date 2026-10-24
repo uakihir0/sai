@@ -29,6 +29,7 @@ source repository before a package resolver can fetch them.
 | Intermediate | [`marsh-survey-review`](marsh-survey-review/README.md) | Classify fixed field observations by correction, conservation review, confidence, and transect totals. |
 | Intermediate | [`corpus-search-ranker`](corpus-search-ranker/README.md) | Rank a fixed text corpus with whitespace-token matching, weighted title scores, and stable tie-breaking. |
 | Intermediate | [`facility-maintenance-queue`](facility-maintenance-queue/README.md) | Schedule a fixed facilities backlog across qualified technicians, shift windows, due times, and a shared parts cupboard. |
+| Intermediate | [`neighborhood-bike-share-rebalancer`](neighborhood-bike-share-rebalancer/README.md) | Plan direct bike-share rebalancing trips by station need and donor inventory while preserving docks reserved for adaptive cycles. |
 | Advanced | [`event-planner`](event-planner/README.md) | Apply session capacity and waitlists, then detect conflicts between confirmed sessions. |
 | Advanced | [`university-enrollment-planner`](university-enrollment-planner/README.md) | Enforce year, program, prerequisite, credit, and timetable rules while ranking eligible section waitlists. |
 | Advanced | [`turn-based-duel`](turn-based-duel/README.md) | Simulate stateful turns with combat rules, mutable state, and a deterministic opponent strategy. |
@@ -38,6 +39,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`court-calendar-planner`](court-calendar-planner/README.md) | Schedule fixed hearings around deadlines, judges, courtrooms, parties, witnesses, and session capacity; report unscheduled cases. |
 | Advanced | [`community-food-bank`](community-food-bank/README.md) | Allocate expiring pantry stock across household requests with dietary eligibility and priority rules. |
 | Advanced | [`community-irrigation-rotation`](community-irrigation-rotation/README.md) | Plan drought-restricted garden watering across zone windows, field and canal losses, priority order, flow caps, and a weekly allotment. |
+| Advanced | [`community-repair-cafe-planner`](community-repair-cafe-planner/README.md) | Schedule community repair-cafe intake across safety holds, volunteer skills, appointment windows, workbench limits, and scarce shared parts. |
 | Advanced | [`construction-permit-review`](construction-permit-review/README.md) | Screen fictional building permits for evidence gaps and independent zoning, accessibility, and environmental review triggers. |
 | Advanced | [`warehouse-fulfillment`](warehouse-fulfillment/README.md) | Reserve date-eligible inventory for prioritized orders, then choose a warehouse and route under cold-chain, delivery-deadline, and lane-capacity constraints. |
 | Advanced | [`rail-shuttle-dispatch`](rail-shuttle-dispatch/README.md) | Assign a fixed replacement-bus fleet to disrupted transit services under corridor, passenger-capacity, and wheelchair-space constraints; report unresolved requests deterministically. |

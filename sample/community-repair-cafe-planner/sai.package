@@ -1,0 +1,6 @@
+package acme:community-repair-cafe-planner @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+allow { alloc }
+description "Plan safe community repair-cafe appointments against volunteer skills, benches, and parts"

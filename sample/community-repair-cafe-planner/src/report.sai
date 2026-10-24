@@ -1,0 +1,70 @@
+use acme:community-repair-cafe-planner/data
+use acme:community-repair-cafe-planner/model.{Decision, HoldReason, RepairPlan}
+use acme:community-repair-cafe-planner/planner
+use sai:alloc/string.{String}
+use sai:core/fmt.{Writer}
+
+fn hold_text(reason: HoldReason) -> Str {
+    match reason {
+        HoldReason.IntakeSafetyInspectionRequired => "intake safety inspection required"
+        HoldReason.StopUseAndRefer => "stop use and refer for qualified review"
+        HoldReason.NoQualifiedVolunteer => "no volunteer has the required skill"
+        HoldReason.SharedPartUnavailable => "required shared part is unavailable"
+        HoldReason.NoAppointmentSlot => "no appointment slot fits"
+    }
+}
+
+fn write_assignment(out: borrow mut String, plan: RepairPlan, rank: USize) {
+    let request_index = plan.service_order[rank]
+    let request = data.requests()[request_index]
+    out.write_str(f"#{request.id} {request.item}: ".as_str())
+    match plan.assignments[rank] {
+        Some(assignment) => {
+            match assignment.decision {
+                Decision.Scheduled(booking) => {
+                    let volunteer = data.volunteers()[booking.volunteer_index]
+                    let window = data.windows()[booking.window_index]
+                    out.write_str(
+                        f"{volunteer.name} / {window.name} ({booking.service_minutes} min)\n".as_str(),
+                    )
+                }
+                Decision.Held(reason) => {
+                    out.write_str(f"held — {hold_text(reason)}\n".as_str())
+                }
+            }
+        }
+        None => {
+            out.write_str("missing assignment record\n")
+        }
+    }
+}
+
+pub fn plan_report() -> String
+    effects { alloc }
+{
+    let plan = planner.plan()
+    var out = String.new()
+    out.write_str("Community Repair Café — Saturday intake\n")
+    out.write_str("Service order: priority, then request ID\n")
+
+    for rank in 0..plan.assignment_count {
+        write_assignment(borrow mut out, plan, rank)
+    }
+
+    out.write_str(
+        f"\nScheduled: {plan.scheduled_count} / {plan.assignment_count}; held for review or a later session: {plan.held_count}\n".as_str(),
+    )
+    out.write_str(
+        f"Bench appointments: {plan.window_appointments[0]}/{data.windows()[0].bench_count}, {plan.window_appointments[1]}/{data.windows()[1].bench_count}, {plan.window_appointments[2]}/{data.windows()[2].bench_count}\n".as_str(),
+    )
+    out.write_str("Parts remaining: ")
+    for index in 0..plan.remaining_parts.len() {
+        let part = plan.remaining_parts[index]
+        if index > 0 {
+            out.write_str(", ")
+        }
+        out.write_str(f"{part.name} {part.quantity}".as_str())
+    }
+    out.write_str("\n")
+    out
+}

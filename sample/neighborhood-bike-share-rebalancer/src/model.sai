@@ -1,0 +1,31 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Station {
+    pub id: U32
+    pub name: Str
+    // Lower values are served first when a station is below target.
+    pub priority: U32
+    pub standard_bikes: U32
+    pub target_standard_bikes: U32
+    pub accessible_bikes: U32
+    pub dock_capacity: U32
+    // These docks are unavailable to standard bicycles.
+    pub accessible_dock_capacity: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Trip {
+    pub donor_index: USize
+    pub recipient_index: USize
+    pub standard_bikes: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RebalancePlan {
+    pub trips: Array<Option<Trip>, 8>
+    pub trip_count: USize
+    pub projected_standard_bikes: Array<U32, 6>
+    pub priority_station_count: USize
+    pub met_station_count: USize
+    pub bikes_moved: U32
+    pub unmet_bikes: U32
+}

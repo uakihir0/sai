@@ -1,0 +1,159 @@
+use acme:neighborhood-bike-share-rebalancer/data
+use acme:neighborhood-bike-share-rebalancer/model.{RebalancePlan, Station, Trip}
+
+fn next_recipient(
+    stations: Array<Station, 6>,
+    projected: Array<U32, 6>,
+    considered: Array<Bool, 6>,
+) -> Option<USize> {
+    var selected: Option<USize> = None
+
+    for index in 0..stations.len() {
+        let station = stations[index]
+        if not considered[index] and projected[index] < station.target_standard_bikes {
+            match selected {
+                Some(current_index) => {
+                    let current = stations[current_index]
+                    if (
+                        station.priority < current.priority
+                        or (station.priority == current.priority and station.id < current.id)
+                    ) {
+                        selected = Some(index)
+                    }
+                }
+                None => {
+                    selected = Some(index)
+                }
+            }
+        }
+    }
+    selected
+}
+
+fn next_donor(
+    stations: Array<Station, 6>,
+    projected: Array<U32, 6>,
+    recipient_index: USize,
+) -> Option<USize> {
+    var selected: Option<USize> = None
+
+    for index in 0..stations.len() {
+        let station = stations[index]
+        if index != recipient_index and projected[index] > station.target_standard_bikes {
+            match selected {
+                Some(current_index) => {
+                    if station.id < stations[current_index].id {
+                        selected = Some(index)
+                    }
+                }
+                None => {
+                    selected = Some(index)
+                }
+            }
+        }
+    }
+    selected
+}
+
+fn regular_dock_capacity(station: Station) -> U32 {
+    station.dock_capacity - station.accessible_dock_capacity
+}
+
+fn minimum(left: U32, right: U32) -> U32 {
+    if left < right {
+        left
+    } else {
+        right
+    }
+}
+
+pub fn plan() -> RebalancePlan {
+    let stations = data.stations()
+    var projected: Array<U32, 6> = [0, 0, 0, 0, 0, 0]
+    var considered: Array<Bool, 6> = [false, false, false, false, false, false]
+    var trips: Array<Option<Trip>, 8> = [None, None, None, None, None, None, None, None]
+    var trip_count: USize = 0
+    var priority_station_count: USize = 0
+    var met_station_count: USize = 0
+    var bikes_moved: U32 = 0
+    var unmet_bikes: U32 = 0
+
+    for index in 0..stations.len() {
+        projected[index] = stations[index].standard_bikes
+        if stations[index].standard_bikes < stations[index].target_standard_bikes {
+            priority_station_count += 1
+        }
+    }
+
+    var considered_count: USize = 0
+    while considered_count < stations.len() {
+        match next_recipient(stations, projected, considered) {
+            Some(recipient_index) => {
+                considered[recipient_index] = true
+                considered_count += 1
+                let recipient = stations[recipient_index]
+                var can_continue = true
+
+                while (
+                    projected[recipient_index] < recipient.target_standard_bikes
+                    and trip_count < trips.len()
+                    and can_continue
+                ) {
+                    match next_donor(stations, projected, recipient_index) {
+                        Some(donor_index) => {
+                            let donor = stations[donor_index]
+                            let need = recipient.target_standard_bikes - projected[recipient_index]
+                            let surplus = projected[donor_index] - donor.target_standard_bikes
+                            let open_regular_docks =
+                                regular_dock_capacity(recipient) - projected[recipient_index]
+                            var moved = minimum(need, surplus)
+                            moved = minimum(moved, data.van_payload_bikes())
+                            moved = minimum(moved, open_regular_docks)
+
+                            if moved == 0 {
+                                can_continue = false
+                            } else {
+                                trips[trip_count] = Some(
+                                    Trip(
+                                        donor_index: donor_index,
+                                        recipient_index: recipient_index,
+                                        standard_bikes: moved,
+                                    ),
+                                )
+                                trip_count += 1
+                                projected[donor_index] -= moved
+                                projected[recipient_index] += moved
+                                bikes_moved += moved
+                            }
+                        }
+                        None => {
+                            can_continue = false
+                        }
+                    }
+                }
+                if projected[recipient_index] >= recipient.target_standard_bikes {
+                    met_station_count += 1
+                }
+            }
+            None => {
+                considered_count = stations.len()
+            }
+        }
+    }
+
+    for index in 0..stations.len() {
+        if projected[index] < stations[index].target_standard_bikes {
+            unmet_bikes += stations[index].target_standard_bikes - projected[index]
+        }
+    }
+
+    RebalancePlan(
+        trips: trips,
+        trip_count: trip_count,
+        projected_standard_bikes: projected,
+        priority_station_count: priority_station_count,
+        met_station_count: met_station_count,
+        bikes_moved: bikes_moved,
+        unmet_bikes: unmet_bikes,
+    )
+}

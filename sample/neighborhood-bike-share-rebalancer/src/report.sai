@@ -1,0 +1,57 @@
+use acme:neighborhood-bike-share-rebalancer/data
+use acme:neighborhood-bike-share-rebalancer/model.{RebalancePlan, Station, Trip}
+use acme:neighborhood-bike-share-rebalancer/planner
+use sai:alloc/string.{String}
+use sai:core/fmt.{Writer}
+
+fn write_trip(out: borrow mut String, sequence: USize, trip: Trip, stations: Array<Station, 6>) {
+    let donor = stations[trip.donor_index]
+    let recipient = stations[trip.recipient_index]
+    out.write_str(
+        f"{sequence}. {donor.name} (#{donor.id}) -> {recipient.name} (#{recipient.id}): {trip.standard_bikes} bicycles\n".as_str(),
+    )
+}
+
+fn write_station_projection(
+    out: borrow mut String,
+    plan: RebalancePlan,
+    index: USize,
+    stations: Array<Station, 6>,
+) {
+    let station = stations[index]
+    let regular_capacity = station.dock_capacity - station.accessible_dock_capacity
+    out.write_str(
+        f"{station.name}: {plan.projected_standard_bikes[index]} / {station.target_standard_bikes} target; adaptive bikes in accessible docks {station.accessible_bikes} / {station.accessible_dock_capacity}; regular slots {plan.projected_standard_bikes[index]} / {regular_capacity}\n".as_str(),
+    )
+}
+
+pub fn plan_report() -> String
+    effects { alloc }
+{
+    let stations = data.stations()
+    let plan = planner.plan()
+    var out = String.new()
+    out.write_str("Neighborhood bike-share rebalancing plan\n")
+    out.write_str("Stop order: destination priority, destination ID; donor station ID\n")
+    out.write_str(
+        f"Van payload: {data.van_payload_bikes()} standard bicycles per direct trip\n\n".as_str(),
+    )
+
+    for index in 0..plan.trip_count {
+        match plan.trips[index] {
+            Some(trip) => write_trip(borrow mut out, index + 1, trip, stations)
+            None => {}
+        }
+    }
+
+    out.write_str("\nProjected station inventory (standard bicycles; accessible docks reserved)\n")
+    for index in 0..stations.len() {
+        write_station_projection(borrow mut out, plan, index, stations)
+    }
+    out.write_str(f"\nTrips: {plan.trip_count}; bicycles moved: {plan.bikes_moved}\n".as_str())
+    out.write_str(
+        f"Priority stations brought to target: {plan.met_station_count} / {plan.priority_station_count}\n".as_str(),
+    )
+    out.write_str(f"Unfilled standard-bike demand: {plan.unmet_bikes}\n")
+    out
+}

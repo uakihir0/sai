@@ -1,0 +1,83 @@
+use acme:community-repair-cafe-planner/model.{Decision, HoldReason, RepairPlan}
+use acme:community-repair-cafe-planner/planner
+use acme:community-repair-cafe-planner/report
+use sai:alloc/string.{String}
+
+pub fn sample_plan() -> RepairPlan {
+    planner.plan()
+}
+
+pub fn sample_report() -> String
+    effects { alloc }
+{
+    report.plan_report()
+}
+
+test "safety and stock holds do not reserve a bench or parts" {
+    let plan = sample_plan()
+    assert plan.assignment_count == 10
+    assert plan.scheduled_count == 5
+    assert plan.held_count == 5
+    assert plan.window_appointments[0] == 2
+    assert plan.window_appointments[1] == 2
+    assert plan.window_appointments[2] == 1
+    assert plan.remaining_parts[0].quantity == 0
+    assert plan.remaining_parts[1].quantity == 0
+    assert plan.remaining_parts[2].quantity == 0
+    assert plan.remaining_parts[3].quantity == 1
+
+    match plan.assignments[1].unwrap().decision {
+        Decision.Held(HoldReason.IntakeSafetyInspectionRequired) => {}
+        _ => {
+            assert false
+        }
+    }
+    match plan.assignments[2].unwrap().decision {
+        Decision.Held(HoldReason.StopUseAndRefer) => {}
+        _ => {
+            assert false
+        }
+    }
+    match plan.assignments[6].unwrap().decision {
+        Decision.Held(HoldReason.SharedPartUnavailable) => {}
+        _ => {
+            assert false
+        }
+    }
+    match plan.assignments[3].unwrap().decision {
+        Decision.Held(HoldReason.NoAppointmentSlot) => {}
+        _ => {
+            assert false
+        }
+    }
+    match plan.assignments[8].unwrap().decision {
+        Decision.Held(HoldReason.NoQualifiedVolunteer) => {}
+        _ => {
+            assert false
+        }
+    }
+}
+
+test "the plan uses stable volunteer and window selection" {
+    let plan = sample_plan()
+    assert plan.assignments[0].unwrap().request_id == 7001
+    match plan.assignments[0].unwrap().decision {
+        Decision.Scheduled(booking) => {
+            assert booking.volunteer_index == 0
+            assert booking.window_index == 0
+        }
+        _ => {
+            assert false
+        }
+    }
+    assert plan.assignments[4].unwrap().request_id == 7005
+    match plan.assignments[4].unwrap().decision {
+        Decision.Scheduled(booking) => {
+            assert booking.volunteer_index == 0
+            assert booking.window_index == 1
+        }
+        _ => {
+            assert false
+        }
+    }
+}
