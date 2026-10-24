@@ -26626,15 +26626,30 @@ world app { import acme:dep/api; }\n",
             symbol.path() == "acme:phase1.api.read"
                 && symbol.kind() == sai_semantic::SymbolKind::AssocFn
         }));
+        assert!(mixed_members.symbols().iter().any(|symbol| {
+            symbol.path() == "acme:phase1.api.Handle"
+                && symbol.kind() == sai_semantic::SymbolKind::Resource
+        }));
+        assert!(mixed_members.symbols().iter().any(|symbol| {
+            symbol.path() == "acme:phase1.api.Handle.close"
+                && symbol.kind() == sai_semantic::SymbolKind::AssocFn
+        }));
         assert!(
             mixed_members.symbols().iter().all(|symbol| {
-                !symbol.path().contains("Handle")
-                    && !symbol.path().contains("close")
-                    && !symbol.path().contains("Record")
+                !symbol.path().contains("Record")
                     && !symbol.path().contains("State")
                     && !symbol.path().contains("Alias")
             }),
-            "interface resources, methods, records, enums, and aliases remain outside this free-function slice"
+            "unsupported interface records, enums, and aliases stay out of the resource slice"
+        );
+        assert_eq!(
+            mixed_members
+                .symbols()
+                .iter()
+                .filter(|symbol| symbol.path() == "acme:phase1.api.close")
+                .count(),
+            0,
+            "a resource method is not emitted as a direct interface function"
         );
 
         let cases: [(&str, &[u8]); 10] = [
@@ -26688,6 +26703,504 @@ world app { import acme:dep/api; }\n",
                     sai_semantic::InventoryCoverage::Incomplete { .. }
                 ),
                 "{case_name} must not yield complete interface coverage"
+            );
+        }
+    }
+
+    #[test]
+    fn module_interface_resource_inventory_collects_resources_members_and_identity() {
+        let (mut database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"interface codec {\nfn before()\nfn close()\nresource Handle {\nfn new(id: U32) -> Self\nfn parse(value: U32) -> Self\nfn close(self: borrow Self)\n}\nfn after()\nresource Empty {}\nresource Bare\n}\n",
+            b"interface socket {\nresource Stream {\nfn send(self: borrow Self, value: U8)\n}\n}\n",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        let actual = inventory
+            .symbols()
+            .iter()
+            .map(|symbol| (symbol.path(), symbol.kind()))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            actual,
+            [
+                ("acme:phase1.codec", sai_semantic::SymbolKind::Interface),
+                (
+                    "acme:phase1.codec.before",
+                    sai_semantic::SymbolKind::AssocFn
+                ),
+                ("acme:phase1.codec.close", sai_semantic::SymbolKind::AssocFn),
+                ("acme:phase1.codec.after", sai_semantic::SymbolKind::AssocFn),
+                (
+                    "acme:phase1.codec.Handle",
+                    sai_semantic::SymbolKind::Resource
+                ),
+                (
+                    "acme:phase1.codec.Handle.new",
+                    sai_semantic::SymbolKind::AssocFn
+                ),
+                (
+                    "acme:phase1.codec.Handle.parse",
+                    sai_semantic::SymbolKind::AssocFn
+                ),
+                (
+                    "acme:phase1.codec.Handle.close",
+                    sai_semantic::SymbolKind::AssocFn
+                ),
+                (
+                    "acme:phase1.codec.Empty",
+                    sai_semantic::SymbolKind::Resource
+                ),
+                ("acme:phase1.codec.Bare", sai_semantic::SymbolKind::Resource),
+                (
+                    "acme:phase1/child.socket",
+                    sai_semantic::SymbolKind::Interface
+                ),
+                (
+                    "acme:phase1/child.socket.Stream",
+                    sai_semantic::SymbolKind::Resource
+                ),
+                (
+                    "acme:phase1/child.socket.Stream.send",
+                    sai_semantic::SymbolKind::AssocFn
+                ),
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .filter(|symbol| symbol.path() == "acme:phase1.codec.close")
+                .count(),
+            1,
+            "a resource method must not leak into the interface's direct function path"
+        );
+
+        let file = module_tree.modules[0].file;
+        let parsed = sai_syntax::parse(&snapshot, file).expect("resource source parses");
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let interface = parsed
+            .root
+            .descendants()
+            .filter_map(ast::InterfaceDecl::cast)
+            .find(|interface| {
+                interface
+                    .name()
+                    .and_then(|name| name.token())
+                    .is_some_and(|token| token.text() == "codec")
+            })
+            .expect("codec interface exists");
+        let interface_ast_id = database
+            .ast_id_map(&snapshot, file)
+            .expect("AST ID map exists")
+            .ast_id(&interface)
+            .expect("interface AST ID exists")
+            .erase();
+        let interface_owner = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| {
+                owner.kind == TopLevelOwnerKind::Interface
+                    && owner.file == file
+                    && owner.item_id == interface_ast_id
+            })
+            .expect("interface has its exact Phase 1 owner");
+        let resource = interface
+            .items()
+            .expect("interface item list exists")
+            .syntax()
+            .children()
+            .filter_map(ast::IfaceResource::cast)
+            .find(|resource| {
+                resource
+                    .name()
+                    .and_then(|name| name.token())
+                    .is_some_and(|token| token.text() == "Handle")
+            })
+            .expect("Handle resource exists");
+        let handle_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.path() == "acme:phase1.codec.Handle")
+            .expect("resource symbol exists");
+        let handle_name_token = resource
+            .name()
+            .and_then(|name| name.token())
+            .expect("resource name token exists");
+        assert_eq!(
+            handle_symbol.fingerprint(),
+            sai_semantic::declaration_fingerprint(
+                sai_semantic::SymbolKind::Resource,
+                &resource.syntax(),
+                Some(&handle_name_token),
+            )
+            .expect("resource fingerprint computes")
+        );
+
+        let def_path_interner = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("package DefPath interner exists");
+        let resource_name = database
+            .symbols
+            .intern("Handle")
+            .expect("resource name interns");
+        let resource_def_id = def_path_interner
+            .intern_children(
+                interface_owner.owner.def_id,
+                &[(DefPathData::TypeNs(resource_name), 0)],
+            )
+            .expect("resource DefPath interns")
+            .into_iter()
+            .next()
+            .expect("resource DefPath ID exists");
+        let resource_path = database
+            .resolve_def_path(resource_def_id.to_def_id())
+            .expect("resource DefId is valid")
+            .expect("resource DefPath exists");
+        let interface_path = database
+            .resolve_def_path(interface_owner.owner.def_id.to_def_id())
+            .expect("interface DefId is valid")
+            .expect("interface DefPath exists");
+        assert_eq!(
+            &resource_path.data()[..interface_path.data().len()],
+            interface_path.data()
+        );
+        assert!(matches!(
+            resource_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::TypeNs(resource_name)
+                    && component.disambiguator == 0
+        ));
+        let expected_resource_hash =
+            sai_hir::DefPathHash::compute(&resource_path, &database.packages, &database.symbols)
+                .expect("resource DefPath hash computes");
+        assert_eq!(
+            handle_symbol.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(expected_resource_hash.raw())
+        );
+
+        for member_name in ["new", "parse", "close"] {
+            let function = resource
+                .items()
+                .expect("resource member list exists")
+                .syntax()
+                .children()
+                .filter_map(ast::FnDecl::cast)
+                .find(|function| {
+                    function
+                        .name()
+                        .and_then(|name| name.token())
+                        .is_some_and(|token| token.text() == member_name)
+                })
+                .expect("resource function exists");
+            let function_name_token = function
+                .name()
+                .and_then(|name| name.token())
+                .expect("resource function name token exists");
+            let canonical_path = format!("acme:phase1.codec.Handle.{member_name}");
+            let function_symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == canonical_path)
+                .expect("resource function symbol exists");
+            assert_eq!(
+                function_symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint(
+                    sai_semantic::SymbolKind::AssocFn,
+                    &function.syntax(),
+                    Some(&function_name_token),
+                )
+                .expect("resource function fingerprint computes")
+            );
+
+            let member_name_symbol = database
+                .symbols
+                .intern(member_name)
+                .expect("resource member name interns");
+            let member_def_id = def_path_interner
+                .intern_children(
+                    resource_def_id,
+                    &[(DefPathData::AssocFn(member_name_symbol), 0)],
+                )
+                .expect("resource function DefPath interns")
+                .into_iter()
+                .next()
+                .expect("resource function DefPath ID exists");
+            let member_path = database
+                .resolve_def_path(member_def_id.to_def_id())
+                .expect("resource function DefId is valid")
+                .expect("resource function DefPath exists");
+            assert_eq!(
+                &member_path.data()[..resource_path.data().len()],
+                resource_path.data()
+            );
+            assert!(matches!(
+                member_path.data().last(),
+                Some(component)
+                    if component.data == DefPathData::AssocFn(member_name_symbol)
+                        && component.disambiguator == 0
+            ));
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&member_path, &database.packages, &database.symbols)
+                    .expect("resource function DefPath hash computes");
+            assert_eq!(
+                function_symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+        }
+    }
+
+    #[test]
+    fn module_interface_resource_inventory_disambiguates_duplicate_paths() {
+        let (_, _, _, collection) = collect_package_inventory_for_target(
+            b"interface api {\nresource Handle {\nfn close(self: borrow Self)\nfn close(self: borrow Self)\n}\nresource Handle {\nfn close(self: borrow Self)\n}\n}\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("duplicate canonical symbol path")
+        ));
+        for (path, kind, expected_count) in [
+            (
+                "acme:phase1.api.Handle",
+                sai_semantic::SymbolKind::Resource,
+                2,
+            ),
+            (
+                "acme:phase1.api.Handle.close",
+                sai_semantic::SymbolKind::AssocFn,
+                3,
+            ),
+        ] {
+            let symbols = inventory
+                .symbols()
+                .iter()
+                .filter(|symbol| symbol.path() == path && symbol.kind() == kind)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                symbols.len(),
+                expected_count,
+                "candidate symbols for {path}"
+            );
+            assert_eq!(
+                symbols
+                    .iter()
+                    .map(|symbol| symbol.def_path_hash())
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                expected_count,
+                "duplicate canonical candidates have distinct DefPath hashes"
+            );
+        }
+    }
+
+    #[test]
+    fn module_interface_resource_inventory_shares_type_namespace_disambiguators() {
+        let (mut database, module_tree, snapshot, collection) =
+            collect_package_inventory_for_target(
+                b"interface api {\ntype Handle = U32\nresource Handle {}\n}\n",
+                b"",
+                "wasm32-core",
+            );
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { .. }
+        ));
+        assert!(
+            inventory.symbols().iter().all(|symbol| {
+                symbol.path() != "acme:phase1.api.Handle"
+                    || symbol.kind() == sai_semantic::SymbolKind::Resource
+            }),
+            "the unsupported alias does not leak into the resource inventory"
+        );
+        let resource_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| {
+                symbol.path() == "acme:phase1.api.Handle"
+                    && symbol.kind() == sai_semantic::SymbolKind::Resource
+            })
+            .expect("resource survives beside an unsupported same-named alias");
+
+        let file = module_tree.modules[0].file;
+        let parsed = sai_syntax::parse(&snapshot, file)
+            .expect("same-named alias and resource source parses");
+        assert!(
+            parsed.errors.is_empty(),
+            "parse errors: {:?}",
+            parsed.errors
+        );
+        let interface = parsed
+            .root
+            .descendants()
+            .filter_map(ast::InterfaceDecl::cast)
+            .find(|interface| {
+                interface
+                    .name()
+                    .and_then(|name| name.token())
+                    .is_some_and(|token| token.text() == "api")
+            })
+            .expect("api interface exists");
+        let interface_ast_id = database
+            .ast_id_map(&snapshot, file)
+            .expect("AST ID map exists")
+            .ast_id(&interface)
+            .expect("interface AST ID exists")
+            .erase();
+        let interface_owner = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| {
+                owner.kind == TopLevelOwnerKind::Interface
+                    && owner.file == file
+                    && owner.item_id == interface_ast_id
+            })
+            .expect("interface has its exact Phase 1 owner");
+        let def_path_interner = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("package DefPath interner exists");
+        let resource_name = database
+            .symbols
+            .intern("Handle")
+            .expect("resource name interns");
+        let alias_def_id = def_path_interner
+            .intern_children(
+                interface_owner.owner.def_id,
+                &[(DefPathData::TypeNs(resource_name), 0)],
+            )
+            .expect("first same-named TypeNs DefPath interns")
+            .into_iter()
+            .next()
+            .expect("first TypeNs DefPath ID exists");
+        let resource_def_id = def_path_interner
+            .intern_children(
+                interface_owner.owner.def_id,
+                &[(DefPathData::TypeNs(resource_name), 1)],
+            )
+            .expect("second same-named TypeNs DefPath interns")
+            .into_iter()
+            .next()
+            .expect("second TypeNs DefPath ID exists");
+        let alias_path = database
+            .resolve_def_path(alias_def_id.to_def_id())
+            .expect("alias DefId is valid")
+            .expect("alias DefPath exists");
+        let resource_path = database
+            .resolve_def_path(resource_def_id.to_def_id())
+            .expect("resource DefId is valid")
+            .expect("resource DefPath exists");
+        assert!(matches!(
+            alias_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::TypeNs(resource_name)
+                    && component.disambiguator == 0
+        ));
+        assert!(matches!(
+            resource_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::TypeNs(resource_name)
+                    && component.disambiguator == 1
+        ));
+        let expected_resource_hash =
+            sai_hir::DefPathHash::compute(&resource_path, &database.packages, &database.symbols)
+                .expect("resource DefPath hash computes");
+        assert_eq!(
+            resource_symbol.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(expected_resource_hash.raw())
+        );
+        let alias_hash =
+            sai_hir::DefPathHash::compute(&alias_path, &database.packages, &database.symbols)
+                .expect("unsupported alias DefPath hash computes");
+        assert_ne!(
+            resource_symbol.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(alias_hash.raw()),
+            "same-named interface TypeNs items have distinct DefPath hashes"
+        );
+    }
+
+    #[test]
+    fn module_interface_resource_inventory_leaves_boundary_type_checks_to_interface_check() {
+        let (_, _, _, collection) = collect_package_inventory_for_target(
+            b"interface api {\nresource Handle {\nfn count(self: Self) -> USize\n}\n}\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert!(
+            inventory.symbols().iter().any(|symbol| {
+                symbol.path() == "acme:phase1.api.Handle.count"
+                    && symbol.kind() == sai_semantic::SymbolKind::AssocFn
+            }),
+            "a structurally identified declaration stays inventoried for interface_check"
+        );
+    }
+
+    #[test]
+    fn module_interface_resource_inventory_fails_closed_without_leaking_unsupported_members() {
+        let cases: [(&str, &[u8]); 6] = [
+            (
+                "valid resource target predicate is not applied to nested members",
+                b"interface api {\n@target(\"wasm64-core\") resource Handle {\nfn read(self: borrow Self)\n}\n}\n",
+            ),
+            (
+                "invalid resource target predicate",
+                b"interface api {\n@target(wasm32-linux) resource Handle {}\n}\n",
+            ),
+            (
+                "valid resource function target predicate is not applied",
+                b"interface api {\nresource Handle {\n@target(\"wasm64-core\") fn read(self: borrow Self)\n}\n}\n",
+            ),
+            (
+                "invalid resource function attribute",
+                b"interface api {\nresource Handle {\n@deprecated(1) fn read(self: borrow Self)\n}\n}\n",
+            ),
+            (
+                "malformed resource function",
+                b"interface api {\nresource Handle {\nfn read(self: borrow Self\n}\n}\n",
+            ),
+            (
+                "unsupported nested associated type",
+                b"interface api {\nresource Handle {\ntype Output = U32\nfn read(self: borrow Self)\n}\n}\n",
+            ),
+        ];
+        for (case_name, source) in cases {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert!(
+                matches!(
+                    inventory.coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { .. }
+                ),
+                "{case_name} must not yield complete interface-resource coverage"
+            );
+            assert!(
+                inventory.symbols().iter().all(|symbol| {
+                    !symbol.path().contains(".Handle.Output")
+                        && !symbol.path().contains(".Handle.Assoc")
+                }),
+                "{case_name} must not leak unsupported nested members"
             );
         }
     }
@@ -27714,16 +28227,23 @@ world app { import acme:dep/api; }\n",
             "wasm32-core",
         );
         let inventory = inventory_symbols(&collection);
-        assert!(matches!(
+        assert_eq!(
             inventory.coverage(),
-            sai_semantic::InventoryCoverage::Incomplete { .. }
-        ));
+            &sai_semantic::InventoryCoverage::Complete
+        );
         assert!(
-            inventory
-                .symbols()
-                .iter()
-                .all(|symbol| symbol.kind() != sai_semantic::SymbolKind::Resource),
-            "nested interface resources do not enter the module-level inventory"
+            inventory.symbols().iter().any(|symbol| {
+                symbol.path() == "acme:phase1.storage.Handle"
+                    && symbol.kind() == sai_semantic::SymbolKind::Resource
+            }),
+            "nested interface resources have their interface member path"
+        );
+        assert!(
+            inventory.symbols().iter().any(|symbol| {
+                symbol.path() == "acme:phase1.storage.Handle.close"
+                    && symbol.kind() == sai_semantic::SymbolKind::AssocFn
+            }),
+            "resource methods have their resource child path"
         );
         assert!(
             collection

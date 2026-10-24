@@ -46,6 +46,21 @@ impl Phase1PackageSymbolInventory {
     }
 }
 
+struct ValidatedInterfaceResource {
+    entry: ItemTreeEntry,
+    declaration: ast::IfaceResource,
+    name: String,
+    name_token: SyntaxToken,
+    members: Vec<ValidatedInterfaceResourceMember>,
+}
+
+struct ValidatedInterfaceResourceMember {
+    entry: ItemTreeEntry,
+    function: ast::FnDecl,
+    name: String,
+    name_token: SyntaxToken,
+}
+
 /// Collects target-visible module-level functions and their generic
 /// parameters, records and resources with their generic parameters and direct named fields,
 /// enums with their generic parameters, variants and record-variant fields,
@@ -53,9 +68,9 @@ impl Phase1PackageSymbolInventory {
 /// and their generic parameters, non-generic refined types, constants, user
 /// effects, worlds, tests, properties, extern functions, and traits with their
 /// generic parameters, direct associated types and functions, and trait-method
-/// generic parameters. Local interfaces and their direct freestanding
-/// functions are included; interface resources and other interface members
-/// remain unsupported. World import/export/include entries are validated as
+/// generic parameters. Local interfaces, their direct freestanding functions,
+/// interface resources, and resource functions are included; other interface
+/// members remain unsupported. World import/export/include entries are validated as
 /// world contents but do not produce symbols. Every other symbol-bearing
 /// declaration makes the result incomplete until its symbol kind and path are
 /// collected as well.
@@ -2287,6 +2302,7 @@ fn collect_interface(
     }
 
     let mut validated_functions = Vec::<(ItemTreeEntry, ast::FnDecl, String, SyntaxToken)>::new();
+    let mut validated_resources = Vec::<ValidatedInterfaceResource>::new();
     for ((_, member), child) in expected_children.iter().zip(&entry.children) {
         let (member_name, member_syntax, function) = match member {
             InterfaceChild::Type(declaration) => {
@@ -2362,10 +2378,36 @@ fn collect_interface(
         }
 
         let Some(function) = function else {
-            reasons.insert(
-                "interface resource, record, alias, enum, and other type members remain outside the supported symbol slice"
-                    .into(),
-            );
+            if let InterfaceChild::Resource(resource) = member {
+                if child.kind != ItemTreeKind::Resource {
+                    reasons.insert("an interface resource has the wrong ItemTree kind".into());
+                    return;
+                }
+                let Some(attrs) = input.filtered.validated_attrs.get(&child.ast_id) else {
+                    reasons
+                        .insert("an interface resource has no attribute-validation record".into());
+                    return;
+                };
+                if attrs.target.is_some() {
+                    reasons
+                        .insert("an interface resource unexpectedly has a target predicate".into());
+                }
+                let members = collect_interface_resource_members(
+                    child, resource, file_id, input, symbols, reasons,
+                );
+                validated_resources.push(ValidatedInterfaceResource {
+                    entry: child.clone(),
+                    declaration: resource.clone(),
+                    name: child_name,
+                    name_token: child_name_token,
+                    members,
+                });
+            } else {
+                reasons.insert(
+                    "interface records, aliases, enums, and other type members remain outside the supported symbol slice"
+                        .into(),
+                );
+            }
             continue;
         };
         if child.kind != ItemTreeKind::InterfaceFn {
@@ -2510,6 +2552,194 @@ fn collect_interface(
         fingerprint,
     ));
 
+    for resource in validated_resources {
+        let Some(component @ DefPathData::TypeNs(_)) =
+            interface_member_path_component(&resource.entry)
+        else {
+            reasons.insert("an interface resource has no TypeNs DefPath component".into());
+            continue;
+        };
+        let disambiguator = match interface_member_path_disambiguator(entry, &resource.entry) {
+            Ok(disambiguator) => disambiguator,
+            Err(sai_hir::item_tree::InterfaceMemberPathError::ItemTreeMismatch) => {
+                reasons.insert(
+                    "an interface resource has no source-ordered ItemTree disambiguator".into(),
+                );
+                continue;
+            }
+            Err(sai_hir::item_tree::InterfaceMemberPathError::TooManyDefinitions) => {
+                reasons.insert("an interface resource DefPath disambiguator overflowed".into());
+                continue;
+            }
+        };
+        let resource_def_id = match def_paths.intern_children(
+            descriptor.owner.def_id,
+            &[(component.clone(), disambiguator)],
+        ) {
+            Ok(mut children) if children.len() == 1 => children.remove(0),
+            _ => {
+                reasons.insert("an interface resource DefPath cannot be interned".into());
+                continue;
+            }
+        };
+        let resource_def_path = match def_paths.resolve(resource_def_id) {
+            Ok(Some(path)) if path.package() == package_id => path,
+            Ok(Some(_)) => {
+                reasons.insert("an interface resource resolves to another package".into());
+                continue;
+            }
+            Ok(None) => {
+                reasons.insert("an interface resource has no canonical DefPath".into());
+                continue;
+            }
+            Err(_) => {
+                reasons.insert("an interface resource DefPath cannot be resolved".into());
+                continue;
+            }
+        };
+        if resource_def_path.data().len() != def_path.data().len() + 1
+            || resource_def_path.data()[..def_path.data().len()] != *def_path.data()
+            || resource_def_path
+                .data()
+                .last()
+                .is_none_or(|path_component| {
+                    path_component.data != component
+                        || path_component.disambiguator != disambiguator
+                })
+        {
+            reasons.insert(
+                "an interface resource DefPath does not match its parent, TypeNs name, or source-order disambiguator"
+                    .into(),
+            );
+            continue;
+        }
+        let resource_def_path_hash =
+            match DefPathHash::compute(&resource_def_path, packages, symbols) {
+                Ok(hash) => Fingerprint::new(hash.raw()),
+                Err(_) => {
+                    reasons.insert("an interface resource DefPath hash cannot be computed".into());
+                    continue;
+                }
+            };
+        let resource_fingerprint = match declaration_fingerprint(
+            SymbolKind::Resource,
+            resource.declaration.syntax(),
+            Some(&resource.name_token),
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                reasons
+                    .insert("an interface resource name token is outside its declaration".into());
+                continue;
+            }
+        };
+        let resource_canonical_path = format!("{canonical_path}.{}", resource.name);
+        if !canonical_paths.insert(resource_canonical_path.clone()) {
+            reasons.insert(format!(
+                "duplicate canonical symbol path {resource_canonical_path}"
+            ));
+        }
+        current_symbols.push(CurrentSymbol::new(
+            resource_canonical_path.clone(),
+            resource_def_path_hash,
+            SymbolKind::Resource,
+            resource_fingerprint,
+        ));
+
+        for member in resource.members {
+            let component = DefPathData::AssocFn(member.entry.name);
+            let Some(member_disambiguator) =
+                interface_resource_member_path_disambiguator(&resource.entry, &member.entry)
+            else {
+                reasons.insert(
+                    "an interface resource function has no source-ordered ItemTree disambiguator"
+                        .into(),
+                );
+                continue;
+            };
+            let member_def_id = match def_paths.intern_children(
+                resource_def_id,
+                &[(component.clone(), member_disambiguator)],
+            ) {
+                Ok(mut children) if children.len() == 1 => children.remove(0),
+                _ => {
+                    reasons
+                        .insert("an interface resource function DefPath cannot be interned".into());
+                    continue;
+                }
+            };
+            let member_def_path = match def_paths.resolve(member_def_id) {
+                Ok(Some(path)) if path.package() == package_id => path,
+                Ok(Some(_)) => {
+                    reasons.insert(
+                        "an interface resource function resolves to another package".into(),
+                    );
+                    continue;
+                }
+                Ok(None) => {
+                    reasons
+                        .insert("an interface resource function has no canonical DefPath".into());
+                    continue;
+                }
+                Err(_) => {
+                    reasons
+                        .insert("an interface resource function DefPath cannot be resolved".into());
+                    continue;
+                }
+            };
+            if member_def_path.data().len() != resource_def_path.data().len() + 1
+                || member_def_path.data()[..resource_def_path.data().len()]
+                    != *resource_def_path.data()
+                || member_def_path.data().last().is_none_or(|path_component| {
+                    path_component.data != component
+                        || path_component.disambiguator != member_disambiguator
+                })
+            {
+                reasons.insert(
+                    "an interface resource function DefPath does not match its parent, AssocFn name, or source-order disambiguator"
+                        .into(),
+                );
+                continue;
+            }
+            let member_def_path_hash =
+                match DefPathHash::compute(&member_def_path, packages, symbols) {
+                    Ok(hash) => Fingerprint::new(hash.raw()),
+                    Err(_) => {
+                        reasons.insert(
+                            "an interface resource function DefPath hash cannot be computed".into(),
+                        );
+                        continue;
+                    }
+                };
+            let member_fingerprint = match declaration_fingerprint(
+                SymbolKind::AssocFn,
+                member.function.syntax(),
+                Some(&member.name_token),
+            ) {
+                Ok(fingerprint) => fingerprint,
+                Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                    reasons.insert(
+                        "an interface resource function name token is outside its declaration"
+                            .into(),
+                    );
+                    continue;
+                }
+            };
+            let member_canonical_path = format!("{resource_canonical_path}.{}", member.name);
+            if !canonical_paths.insert(member_canonical_path.clone()) {
+                reasons.insert(format!(
+                    "duplicate canonical symbol path {member_canonical_path}"
+                ));
+            }
+            current_symbols.push(CurrentSymbol::new(
+                member_canonical_path,
+                member_def_path_hash,
+                SymbolKind::AssocFn,
+                member_fingerprint,
+            ));
+        }
+    }
+
     for (child, function, child_name, child_name_token) in validated_functions {
         let component = match interface_member_path_component(&child) {
             Some(component @ DefPathData::ValueNs(_)) => component,
@@ -2600,6 +2830,262 @@ fn collect_interface(
             child_fingerprint,
         ));
     }
+}
+
+fn collect_interface_resource_members(
+    resource_entry: &ItemTreeEntry,
+    declaration: &ast::IfaceResource,
+    file_id: FileId,
+    input: &OwnedPhase1ModuleInput,
+    symbols: &Interner,
+    reasons: &mut HashSet<String>,
+) -> Vec<ValidatedInterfaceResourceMember> {
+    if resource_entry.kind != ItemTreeKind::Resource {
+        reasons.insert("an interface resource has the wrong ItemTree kind".into());
+        return Vec::new();
+    }
+    let Some(item_list) = declaration.items() else {
+        if !resource_entry.children.is_empty() {
+            reasons.insert(
+                "an interface resource without a member list has unexpected ItemTree children"
+                    .into(),
+            );
+        }
+        return Vec::new();
+    };
+
+    let mut expected = Vec::<(
+        usize,
+        ItemTreeKind,
+        sai_hir::item_tree::ErasedAstId,
+        Option<ast::FnDecl>,
+    )>::new();
+    for child in item_list.syntax().children() {
+        if let Some(function) = ast::FnDecl::cast(child.clone()) {
+            let Some(ast_id) = input.ast_ids.ast_id(&function).map(|id| id.erase()) else {
+                reasons
+                    .insert("an interface resource function has no current-snapshot AST ID".into());
+                return Vec::new();
+            };
+            expected.push((
+                child.text_range().start().to_usize(),
+                ItemTreeKind::AssocFn,
+                ast_id,
+                Some(function),
+            ));
+        } else if let Some(associated_type) = ast::AssocTypeDecl::cast(child.clone()) {
+            let Some(ast_id) = input.ast_ids.ast_id(&associated_type).map(|id| id.erase()) else {
+                reasons.insert(
+                    "an unsupported interface resource associated type has no current-snapshot AST ID"
+                        .into(),
+                );
+                return Vec::new();
+            };
+            expected.push((
+                child.text_range().start().to_usize(),
+                ItemTreeKind::AssocType,
+                ast_id,
+                None,
+            ));
+            reasons.insert(
+                "associated types inside interface resources remain outside the supported symbol slice"
+                    .into(),
+            );
+        } else if let Some(associated_type) = ast::AssocTypeDef::cast(child.clone()) {
+            let Some(ast_id) = input.ast_ids.ast_id(&associated_type).map(|id| id.erase()) else {
+                reasons.insert(
+                    "an unsupported interface resource associated type definition has no current-snapshot AST ID"
+                        .into(),
+                );
+                return Vec::new();
+            };
+            expected.push((
+                child.text_range().start().to_usize(),
+                ItemTreeKind::AssocType,
+                ast_id,
+                None,
+            ));
+            reasons.insert(
+                "associated types inside interface resources remain outside the supported symbol slice"
+                    .into(),
+            );
+        } else {
+            reasons.insert(
+                "an interface resource contains an unsupported or unrecognized direct member form"
+                    .into(),
+            );
+        }
+    }
+    expected.sort_by_key(|(offset, _, _, _)| *offset);
+    let expected_identities = expected
+        .iter()
+        .map(|(_, kind, ast_id, _)| (*kind, *ast_id))
+        .collect::<Vec<_>>();
+    if !trait_children_match_order(&expected_identities, &resource_entry.children) {
+        reasons.insert(
+            "an interface resource's ItemTree member kind or source order does not match its snapshot AST"
+                .into(),
+        );
+        return Vec::new();
+    }
+
+    let mut validated = Vec::new();
+    for ((_, kind, ast_id, function), member_entry) in
+        expected.into_iter().zip(&resource_entry.children)
+    {
+        let Some(function) = function else {
+            debug_assert_eq!(kind, ItemTreeKind::AssocType);
+            continue;
+        };
+        if kind != ItemTreeKind::AssocFn || member_entry.kind != ItemTreeKind::AssocFn {
+            reasons
+                .insert("an interface resource function has the wrong ItemTree member kind".into());
+            return Vec::new();
+        }
+        if member_entry.ast_id != ast_id {
+            reasons.insert(
+                "an interface resource function ItemTree ID does not match its current AST".into(),
+            );
+            return Vec::new();
+        }
+        let Some(pointer) = input.ast_ids.pointer(member_entry.ast_id) else {
+            reasons.insert("an interface resource function has no current source pointer".into());
+            return Vec::new();
+        };
+        let Some(expected_pointer) =
+            sai_syntax::SyntaxNodePtr::new(file_id, function.syntax()).ok()
+        else {
+            reasons
+                .insert("an interface resource function cannot be bound to its source file".into());
+            return Vec::new();
+        };
+        if !pointer.is_same_source_node(&expected_pointer) {
+            reasons.insert(
+                "an interface resource function pointer identifies a different AST node".into(),
+            );
+            return Vec::new();
+        }
+        let Some(member_syntax) = pointer.resolve(file_id, &input.root) else {
+            reasons.insert("an interface resource function pointer is stale".into());
+            return Vec::new();
+        };
+        if member_syntax.kind() != function.syntax().kind()
+            || member_syntax.text_range() != function.syntax().text_range()
+        {
+            reasons.insert(
+                "an interface resource function pointer resolves to a different source range"
+                    .into(),
+            );
+            return Vec::new();
+        }
+        if syntax_has_errors(&member_syntax)
+            || input.parser_diagnostics.iter().any(|diagnostic| {
+                parser_diagnostic_overlaps_syntax(diagnostic, file_id, &member_syntax)
+            })
+        {
+            reasons
+                .insert("an interface resource function contains parser recovery or errors".into());
+            continue;
+        }
+        if !member_entry.children.is_empty() || function.generic_params().is_some() {
+            reasons.insert(
+                "generic parameters on interface resource functions remain outside the supported symbol slice"
+                    .into(),
+            );
+        }
+        if function.unsafe_token().is_some()
+            || function.async_token().is_some()
+            || function.body().is_some()
+            || function.syntax().children().any(|child| {
+                ast::WhereClause::cast(child.clone()).is_some()
+                    || ast::BorrowsClause::cast(child.clone()).is_some()
+                    || ast::EffectsClause::cast(child.clone()).is_some()
+                    || ast::RequiresClause::cast(child.clone()).is_some()
+                    || ast::EnsuresClause::cast(child).is_some()
+            })
+        {
+            reasons.insert(
+                "an interface resource function has an unsupported async, unsafe, clause, or body form"
+                    .into(),
+            );
+        }
+        if let Some(params) = function.params() {
+            let self_positions = params
+                .syntax()
+                .children()
+                .enumerate()
+                .filter_map(|(position, child)| ast::SelfParam::cast(child).map(|_| position))
+                .collect::<Vec<_>>();
+            if self_positions.len() > 1
+                || self_positions
+                    .first()
+                    .is_some_and(|position| *position != 0)
+            {
+                reasons.insert(
+                    "an interface resource function has an invalid self parameter position".into(),
+                );
+            }
+        }
+        if member_entry.vis != sai_hir::Visibility::Private || function.visibility().is_some() {
+            reasons.insert(
+                "an interface resource function has unsupported individual visibility".into(),
+            );
+        }
+        let Some(attrs) = input.filtered.validated_attrs.get(&member_entry.ast_id) else {
+            reasons
+                .insert("an interface resource function has no attribute-validation record".into());
+            return Vec::new();
+        };
+        if attrs.target.is_some() {
+            reasons.insert(
+                "an interface resource function unexpectedly has a target predicate".into(),
+            );
+        }
+        let Some(name_token) = function.name().and_then(|name| name.token()) else {
+            reasons.insert("an interface resource function has no name token".into());
+            return Vec::new();
+        };
+        if name_token.has_error() {
+            reasons.insert("an interface resource function name token is malformed".into());
+            continue;
+        }
+        let raw_name = name_token
+            .text()
+            .strip_prefix("r#")
+            .unwrap_or(name_token.text());
+        let name = sai_syntax::normalize_identifier(raw_name);
+        let resolved_member_name = symbols.resolve(member_entry.name);
+        if member_entry.name == Symbol::ERROR
+            || !resolved_member_name.is_ok_and(|resolved| resolved.as_ref() == name.as_str())
+        {
+            reasons.insert("the interface resource ItemTree and AST member names disagree".into());
+            return Vec::new();
+        }
+        validated.push(ValidatedInterfaceResourceMember {
+            entry: member_entry.clone(),
+            function,
+            name,
+            name_token,
+        });
+    }
+    validated
+}
+
+fn interface_resource_member_path_disambiguator(
+    resource: &ItemTreeEntry,
+    member: &ItemTreeEntry,
+) -> Option<u32> {
+    let mut disambiguator = 0u32;
+    for candidate in &resource.children {
+        if candidate.kind != ItemTreeKind::AssocFn || candidate.name != member.name {
+            continue;
+        }
+        if candidate.ast_id == member.ast_id {
+            return Some(disambiguator);
+        }
+        disambiguator = disambiguator.checked_add(1)?;
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
