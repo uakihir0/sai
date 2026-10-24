@@ -25,8 +25,9 @@ The `Canary` cohort precedes `General`.
 
 The report's expected summary is service order `[10, 20, 30, 40]`, four
 proceeded waves, zero evidence holds, one rollback, eleven halted waves, and
-`halt_sequence = Some(5)`. Catalog's failed canary is rolled back to the
-previous version and the remaining plan does not start. The Catalog canary's
+`halt_sequence = Some(5)`. Catalog's failed canary receives a recorded
+`RollbackAndHalt` decision; the report does not execute a rollback or identify
+the deployed version. The remaining plan does not start. The Catalog canary's
 latency and sample count pass; its error rate is the first failed gate.
 
 The planner treats absent, duplicate, or undersampled metrics as
@@ -38,7 +39,7 @@ gate precedence is sample count, error rate, then p95 latency.
 ## Module map
 
 - `model.sai` defines service dependencies, regions, cohorts, health evidence,
-  ordered decisions, and graph/gate findings.
+  ordered decisions, and plan-input, graph, and gate findings.
 - `data.sai` supplies four services, four dependency edges, two regions, and
   sixteen fictional observations.
 - `lookup.sai` finds services and counts or locates observations.
@@ -47,7 +48,10 @@ gate precedence is sample count, error rate, then p95 latency.
 - `gates.sai` checks evidence sufficiency, error rate, and p95 latency in a
   fixed, documented order.
 - `planner.sai` expands each service into regional canary and general waves,
-  halts at the first finding, and records rollback/hold and not-started waves.
+  rejects duplicate region IDs before planning, halts at the first finding,
+  and records rollback/hold and not-started waves. It also contains
+  source-level tests for fixture order/counts, the first gate failure, and
+  duplicate-region fail-closed behavior.
 - `lib.sai` exposes `fixture_plan()` as the pure fixture entry point.
 
 ## Inspect and check
@@ -58,7 +62,9 @@ above and trace the rules in `src/topology.sai`, `src/gates.sai`, and
 to verify canonical formatting. `sai check` and `sai test` do not currently
 type-check or execute this project: the compiler stops at its unimplemented
 Stage 0 check gate and Stage 3 test gate, respectively. The expected results
-are hand-checked from the fixture and are not compiler output.
+are hand-checked from the fixture and are not compiler output. The embedded
+source-level tests are present for future execution, but cannot run until the
+Stage 3 test implementation is available.
 
 This is a pure `wasm32-core` library: it performs no network requests, deploys
 nothing, and stores no release state. The source uses fixed-size arrays for
@@ -73,15 +79,19 @@ four services, four dependencies, two regions, and sixteen waves/observations.
 - The planner considers metric inputs complete snapshots. It does not model
   observation timestamps, rolling windows, confidence intervals, traffic
   weighting, metric-source availability, or stale data.
-- One unhealthy observation triggers an immediate rollback of that wave and a
-  global halt. Teams should confirm whether rollback should be scoped to one
-  region, one cohort, or the whole deployment and whether automated rollback
-  is permitted.
+- One unhealthy observation produces an immediate rollback decision for that
+  wave and a global halt. Teams should confirm whether rollback should be
+  scoped to one region, one cohort, or the whole deployment and whether
+  automated rollback is permitted.
 - Dependencies are required to finish all regions and cohorts before a
   dependent service starts. Some systems may safely release dependent services
   alongside one another or use region-local dependency readiness.
 - Service ID is the stable tie-break for independent dependencies; region and
   cohort orders come from their fixture arrays. Production plans should use an
   explicitly reviewed ordering policy.
+- Region IDs must be unique. Duplicate IDs could otherwise match the same
+  observation in more than one regional wave, so the planner rejects the
+  entire plan with a distinct input finding and emits no service order or
+  rollout waves. This fail-closed rule is a deliberate integrity choice.
 - The report records an attempted rollback decision but cannot verify that a
   deployment controller executed it or that the previous version is healthy.
