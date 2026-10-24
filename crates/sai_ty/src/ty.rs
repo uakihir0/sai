@@ -122,6 +122,7 @@ impl TyInterner {
 
     /// Intern a semantic type, returning the canonical handle for its shape.
     pub fn intern(&self, kind: TyKind) -> Ty {
+        let kind = self.canonicalize_children(kind);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         kind.hash(&mut hasher);
         let shard_index = (hasher.finish() as usize) % TY_INTERNER_SHARDS;
@@ -135,6 +136,22 @@ impl TyInterner {
         let ty = Ty(Arc::new(kind.clone()));
         types.insert(kind, ty.clone());
         ty
+    }
+
+    fn canonicalize_children(&self, kind: TyKind) -> TyKind {
+        match kind {
+            TyKind::Tuple(elements) => TyKind::Tuple(
+                elements
+                    .iter()
+                    .map(|element| self.intern(element.kind().clone()))
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
+            TyKind::Ref(region, inner, mutability) => {
+                TyKind::Ref(region, self.intern(inner.kind().clone()), mutability)
+            }
+            kind => kind,
+        }
     }
 
     /// Intern a tuple in declaration order. An empty tuple is the unit type.
@@ -221,5 +238,18 @@ mod tests {
 
         assert!(values.iter().all(|value| value.ptr_eq(&values[0])));
         assert_eq!(interner.len(), 1);
+    }
+
+    #[test]
+    fn interning_canonicalizes_children_from_another_interner() {
+        let interner = TyInterner::new();
+        let other = TyInterner::new();
+        let local_child = interner.intern(TyKind::Bool);
+        let foreign_child = other.intern(TyKind::Bool);
+        let local_parent = interner.tuple(Arc::from([local_child]));
+        let foreign_parent = interner.intern(TyKind::Tuple(Arc::from([foreign_child])));
+
+        assert!(local_parent.ptr_eq(&foreign_parent));
+        assert_eq!(interner.len(), 2);
     }
 }
