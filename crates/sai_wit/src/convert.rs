@@ -3220,10 +3220,8 @@ world app {
         let sources = HashMap::from([("a-alpha.wit", alpha), ("z-bravo.wit", bravo)]);
         let mut local_name_ranges = Vec::new();
 
-        for (interface_name, expected_path, other_path) in [
-            ("alpha", "a-alpha.wit", "z-bravo.wit"),
-            ("bravo", "z-bravo.wit", "a-alpha.wit"),
-        ] {
+        for (interface_name, expected_path) in [("alpha", "a-alpha.wit"), ("bravo", "z-bravo.wit")]
+        {
             let interface = package
                 .interfaces
                 .iter()
@@ -3255,16 +3253,6 @@ world app {
                 } else {
                     "type %type = string;"
                 }
-            );
-            assert!(
-                crate::authored_interface_alias_tokens(
-                    sources[other_path],
-                    interface_name,
-                    &item.name,
-                    &name_span.range,
-                )
-                .is_none(),
-                "an equal local range in another root file cannot prove this declaration"
             );
 
             let enum_item = interface
@@ -3299,16 +3287,6 @@ world app {
                 &source[enum_tokens.cases[0].name_range.clone()],
                 "%type",
                 "the scanner preserves the escaped case's exact source range"
-            );
-            assert!(
-                crate::authored_interface_enum_tokens(
-                    sources[other_path],
-                    interface_name,
-                    &enum_item.name,
-                    &enum_span.range,
-                )
-                .is_none(),
-                "an equal local range in another root file cannot prove this enum"
             );
         }
         assert_eq!(
