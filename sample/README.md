@@ -28,6 +28,7 @@ source repository before a package resolver can fetch them.
 | Intermediate | [`library-loan-policy`](library-loan-policy/README.md) | Enforce checkout, hold, and renewal rules with records, enums, and `Result`. |
 | Intermediate | [`marsh-survey-review`](marsh-survey-review/README.md) | Classify fixed field observations by correction, conservation review, confidence, and transect totals. |
 | Intermediate | [`corpus-search-ranker`](corpus-search-ranker/README.md) | Rank a fixed text corpus with whitespace-token matching, weighted title scores, and stable tie-breaking. |
+| Intermediate | [`facility-maintenance-queue`](facility-maintenance-queue/README.md) | Schedule a fixed facilities backlog across qualified technicians, shift windows, due times, and a shared parts cupboard. |
 | Advanced | [`event-planner`](event-planner/README.md) | Apply session capacity and waitlists, then detect conflicts between confirmed sessions. |
 | Advanced | [`university-enrollment-planner`](university-enrollment-planner/README.md) | Enforce year, program, prerequisite, credit, and timetable rules while ranking eligible section waitlists. |
 | Advanced | [`turn-based-duel`](turn-based-duel/README.md) | Simulate stateful turns with combat rules, mutable state, and a deterministic opponent strategy. |
@@ -63,6 +64,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`digital-evidence-custody-auditor`](digital-evidence-custody-auditor/README.md) | Audit a custody event stream for actor permissions, seal and storage transitions, timestamp regressions, and final disposition. |
 | Advanced | [`service-dependency-incident-correlator`](service-dependency-incident-correlator/README.md) | Rank service incident investigation leads by alert severity, transitive dependency impact, alert onset, and nearby deployments. |
 | Advanced | [`transit-fare-cap-auditor`](transit-fare-cap-auditor/README.md) | Recalculate a bounded tap ledger with transfer windows and daily caps; hold malformed sequences and expose unmatched charges. |
+| Advanced | [`regional-storm-coordination`](regional-storm-coordination/README.md) | Coordinate road clearance, shelter power, accessible evacuation, medical transport, water delivery, and radio relay work across prerequisite and unit-capacity constraints. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or

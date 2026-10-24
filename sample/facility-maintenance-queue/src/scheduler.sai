@@ -1,0 +1,149 @@
+use acme:facility-maintenance-queue/data
+use acme:facility-maintenance-queue/model.{
+    Assignment
+    HoldReason
+    Plan
+    Skill
+    StockItem
+    Technician
+    WorkOrder
+    WorkStatus
+}
+use sai:core/num.{U32_MAX}
+
+fn has_skill(technician: Technician, skill: Skill) -> Bool {
+    for slot in technician.skills {
+        if slot == Some(skill) {
+            return true
+        }
+    }
+    false
+}
+
+fn stock_index(stock: Array<StockItem, 5>, part_name: Str) -> Option<USize> {
+    for index in 0..5 {
+        if stock[index].name == part_name {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn parts_available(stock: Array<StockItem, 5>, order: WorkOrder) -> Bool {
+    match order.part_name {
+        Some(part_name) => {
+            match stock_index(stock, part_name) {
+                Some(index) => stock[index].quantity >= order.part_quantity
+                None => false
+            }
+        }
+        None => true
+    }
+}
+
+fn reserve_parts(stock: borrow mut Array<StockItem, 5>, order: WorkOrder) {
+    match order.part_name {
+        Some(part_name) => {
+            match stock_index(stock, part_name) {
+                Some(index) => {
+                    stock[index].quantity -= order.part_quantity
+                }
+                None => {}
+            }
+        }
+        None => {}
+    }
+}
+
+pub fn plan() -> Plan {
+    let orders = data.work_orders()
+    let technicians = data.technicians()
+    var stock = data.stock()
+    var available_at: Array<U32, 3> = [420, 420, 480]
+    var assignments: Array<Option<Assignment>, 6> = [None, None, None, None, None, None]
+    var assignment_count: USize = 0
+    var scheduled_count: U32 = 0
+    var held_count: U32 = 0
+
+    for order in orders {
+        var best_technician: Option<USize> = None
+        var best_finish = U32_MAX
+        var saw_qualified_technician = false
+        var saw_spare_parts = false
+        for index in 0..3 {
+            let technician = technicians[index]
+            if has_skill(technician, order.skill) {
+                saw_qualified_technician = true
+                if parts_available(stock, order) {
+                    saw_spare_parts = true
+                    let start = if available_at[index] > technician.shift_start {
+                        available_at[index]
+                    } else {
+                        technician.shift_start
+                    }
+                    let finish = start + order.duration_minutes
+                    if finish <= technician.shift_end and finish <= order.due_minute {
+                        if finish < best_finish {
+                            best_technician = Some(index)
+                            best_finish = finish
+                        }
+                    }
+                }
+            }
+        }
+
+        match best_technician {
+            Some(index) => {
+                let technician = technicians[index]
+                let start = if available_at[index] > technician.shift_start {
+                    available_at[index]
+                } else {
+                    technician.shift_start
+                }
+                assignments[assignment_count] = Some(
+                    Assignment(
+                        work_order_id: order.id,
+                        status: WorkStatus.Scheduled,
+                        technician_name: Some(technician.name),
+                        start_minute: Some(start),
+                        finish_minute: Some(best_finish),
+                        hold_reason: None,
+                    ),
+                )
+                assignment_count += 1
+                scheduled_count += 1
+                available_at[index] = best_finish
+                reserve_parts(borrow mut stock, order)
+            }
+            None => {
+                let reason = if not saw_qualified_technician {
+                    HoldReason.NoQualifiedTechnician
+                } else if not saw_spare_parts {
+                    HoldReason.SparePartsUnavailable
+                } else {
+                    HoldReason.ShiftOrDueWindow
+                }
+                assignments[assignment_count] = Some(
+                    Assignment(
+                        work_order_id: order.id,
+                        status: WorkStatus.Held,
+                        technician_name: None,
+                        start_minute: None,
+                        finish_minute: None,
+                        hold_reason: Some(reason),
+                    ),
+                )
+                assignment_count += 1
+                held_count += 1
+            }
+        }
+    }
+
+    Plan(
+        assignments: assignments,
+        assignment_count: assignment_count,
+        scheduled_count: scheduled_count,
+        held_count: held_count,
+        remaining_stock: stock,
+    )
+}

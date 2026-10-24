@@ -1,0 +1,85 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Priority {
+    Critical
+    High
+    Standard
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Capability {
+    Roads
+    Electrical
+    AccessibleTransport
+    MedicalTransport
+    WaterDelivery
+    Communications
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Outcome {
+    Dispatched
+    Held
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum HoldReason {
+    NoQualifiedUnit
+    LoadExceedsUnitCapacity
+    RouteUnavailable
+    MissedDeadlineOrShift
+    PrerequisiteNotMet
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Mission {
+    pub id: U32
+    pub label: Str
+    pub priority: Priority
+    pub capability: Capability
+    pub origin_zone: U32
+    pub destination_zone: U32
+    pub load_units: U32
+    pub earliest_minute: U32
+    pub due_minute: U32
+    pub service_minutes: U32
+    pub depends_on: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ResponseUnit {
+    pub id: U32
+    pub name: Str
+    pub capability: Capability
+    pub home_zone: U32
+    pub capacity_units: U32
+    pub shift_end: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Lane {
+    pub from_zone: U32
+    pub to_zone: U32
+    pub travel_minutes: U32
+    pub open_at_start: Bool
+    pub cleared_by_mission: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Assignment {
+    pub mission_id: U32
+    pub outcome: Outcome
+    pub unit_index: Option<USize>
+    pub unit_name: Option<Str>
+    pub depart_minute: Option<U32>
+    pub finish_minute: Option<U32>
+    pub travel_minutes: Option<U32>
+    pub hold_reason: Option<HoldReason>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CoordinationPlan {
+    pub assignments: Array<Option<Assignment>, 6>
+    pub reviewed_count: U32
+    pub dispatched_count: U32
+    pub held_count: U32
+}

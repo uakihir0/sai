@@ -1,0 +1,91 @@
+use acme:facility-maintenance-queue/data
+use acme:facility-maintenance-queue/model.{Assignment, HoldReason, Plan, WorkOrder}
+use acme:facility-maintenance-queue/scheduler
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn urgency_name(order: WorkOrder) -> Str {
+    match order.urgency {
+        .Emergency => "emergency"
+        .Scheduled => "scheduled"
+        .Routine => "routine"
+    }
+}
+
+fn hold_name(reason: HoldReason) -> Str {
+    match reason {
+        .NoQualifiedTechnician => "no qualified technician"
+        .SparePartsUnavailable => "spare parts unavailable"
+        .ShiftOrDueWindow => "no technician can finish within shift and due time"
+    }
+}
+
+pub fn print_plan(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let orders = data.work_orders()
+    let plan = scheduler.plan()
+    out.write_str("Community facilities maintenance queue\n")
+    out.write_str("Priority order: emergency, scheduled, routine; fixture order breaks ties\n")
+    for index in 0..plan.assignment_count {
+        match plan.assignments[index] {
+            Some(assignment) => {
+                match find_order(orders, assignment.work_order_id) {
+                    Some(order) => print_assignment(borrow mut out, order, assignment)
+                    None => {}
+                }
+            }
+            None => {}
+        }
+    }
+    out.write_str(f"Scheduled: {plan.scheduled_count}; held: {plan.held_count}\n".as_str())
+}
+
+fn find_order(orders: Array<WorkOrder, 6>, order_id: U32) -> Option<WorkOrder> {
+    for order in orders {
+        if order.id == order_id {
+            return Some(order)
+        }
+    }
+    None
+}
+
+fn print_assignment(out: borrow mut Stdout, order: WorkOrder, assignment: Assignment)
+    effects { stdio.write, alloc }
+{
+    match assignment.status {
+        .Scheduled => {
+            match (assignment.technician_name, assignment.start_minute, assignment.finish_minute) {
+                (Some(name), Some(start), Some(finish)) => {
+                    out.write_str(
+                        f"#{order.id} [{urgency_name(order)}] {order.asset}: {order.summary}\n  {name}, {start}–{finish} minutes after midnight\n".as_str(),
+                    )
+                }
+                _ => {}
+            }
+        }
+        .Held => {
+            match assignment.hold_reason {
+                Some(reason) => {
+                    out.write_str(
+                        f"#{order.id} [{urgency_name(order)}] {order.asset}: held — {hold_name(reason)}\n".as_str(),
+                    )
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+pub fn print_summary(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let plan = scheduler.plan()
+    out.write_str("Maintenance queue summary\n")
+    out.write_str(f"{plan.assignment_count} work orders reviewed\n".as_str())
+    out.write_str(f"{plan.scheduled_count} scheduled; {plan.held_count} held for review\n".as_str())
+    out.write_str("Remaining cupboard stock:\n")
+    for item in plan.remaining_stock {
+        out.write_str(f"  {item.name}: {item.quantity}\n".as_str())
+    }
+}

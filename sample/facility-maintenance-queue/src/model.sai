@@ -1,0 +1,76 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Skill {
+    Electrical
+    Plumbing
+    Mechanical
+    Roofing
+    Carpentry
+    Hvac
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Urgency {
+    Emergency
+    Scheduled
+    Routine
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum WorkStatus {
+    Scheduled
+    Held
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum HoldReason {
+    NoQualifiedTechnician
+    SparePartsUnavailable
+    ShiftOrDueWindow
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type WorkOrder {
+    pub id: U32
+    pub asset: Str
+    pub summary: Str
+    pub urgency: Urgency
+    pub skill: Skill
+    pub duration_minutes: U32
+    pub due_minute: U32
+    pub part_name: Option<Str>
+    pub part_quantity: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Technician {
+    pub id: U32
+    pub name: Str
+    pub skills: Array<Option<Skill>, 3>
+    pub shift_start: U32
+    pub shift_end: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type StockItem {
+    pub name: Str
+    pub quantity: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Assignment {
+    pub work_order_id: U32
+    pub status: WorkStatus
+    pub technician_name: Option<Str>
+    pub start_minute: Option<U32>
+    pub finish_minute: Option<U32>
+    pub hold_reason: Option<HoldReason>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Plan {
+    pub assignments: Array<Option<Assignment>, 6>
+    pub assignment_count: USize
+    pub scheduled_count: U32
+    pub held_count: U32
+    pub remaining_stock: Array<StockItem, 5>
+}

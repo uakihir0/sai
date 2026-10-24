@@ -1,0 +1,33 @@
+use acme:regional-storm-coordination/data
+use acme:regional-storm-coordination/model.{Assignment, CoordinationPlan, Outcome}
+
+pub fn find_assignment(plan: CoordinationPlan, mission_id: U32) -> Option<Assignment> {
+    for index in 0..6 {
+        match plan.assignments[index] {
+            Some(assignment) => {
+                if assignment.mission_id == mission_id {
+                    return Some(assignment)
+                }
+            }
+            None => {}
+        }
+    }
+    None
+}
+
+pub fn review_complete(plan: CoordinationPlan) -> Bool {
+    if plan.reviewed_count != 6 {
+        return false
+    }
+    for mission in data.missions() {
+        match find_assignment(plan, mission.id) { Some(_) => {}, None => return false }
+    }
+    true
+}
+
+pub fn dispatched_mission(plan: CoordinationPlan, mission_id: U32) -> Bool {
+    match find_assignment(plan, mission_id) {
+        Some(assignment) => assignment.outcome == Outcome.Dispatched
+        None => false
+    }
+}

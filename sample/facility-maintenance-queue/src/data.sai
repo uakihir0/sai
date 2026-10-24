@@ -1,0 +1,108 @@
+use acme:facility-maintenance-queue/model.{Skill, StockItem, Technician, Urgency, WorkOrder}
+
+pub fn work_orders() -> Array<WorkOrder, 6> {
+    [
+        WorkOrder(
+            id: 3101,
+            asset: "Civic Center generator",
+            summary: "Replace failed transfer-switch breaker",
+            urgency: Urgency.Emergency,
+            skill: Skill.Electrical,
+            duration_minutes: 60,
+            due_minute: 510,
+            part_name: Some("breaker"),
+            part_quantity: 1,
+        ),
+        WorkOrder(
+            id: 3102,
+            asset: "Northside water pump",
+            summary: "Repair leaking feed valve",
+            urgency: Urgency.Emergency,
+            skill: Skill.Plumbing,
+            duration_minutes: 90,
+            due_minute: 540,
+            part_name: Some("feed valve"),
+            part_quantity: 1,
+        ),
+        WorkOrder(
+            id: 3103,
+            asset: "Library access lift",
+            summary: "Complete safety inspection",
+            urgency: Urgency.Scheduled,
+            skill: Skill.Mechanical,
+            duration_minutes: 45,
+            due_minute: 600,
+            part_name: Some("drive belt"),
+            part_quantity: 1,
+        ),
+        WorkOrder(
+            id: 3104,
+            asset: "East Annex roof",
+            summary: "Patch a leak above the records room",
+            urgency: Urgency.Scheduled,
+            skill: Skill.Roofing,
+            duration_minutes: 90,
+            due_minute: 660,
+            part_name: Some("roof patch roll"),
+            part_quantity: 1,
+        ),
+        WorkOrder(
+            id: 3105,
+            asset: "Room 12",
+            summary: "Replace a sticking door latch",
+            urgency: Urgency.Routine,
+            skill: Skill.Carpentry,
+            duration_minutes: 30,
+            due_minute: 720,
+            part_name: None,
+            part_quantity: 0,
+        ),
+        WorkOrder(
+            id: 3106,
+            asset: "Civic Center chiller",
+            summary: "Replace both return-air filters",
+            urgency: Urgency.Routine,
+            skill: Skill.Hvac,
+            duration_minutes: 40,
+            due_minute: 750,
+            part_name: Some("chiller filter"),
+            part_quantity: 2,
+        ),
+    ]
+}
+
+pub fn technicians() -> Array<Technician, 3> {
+    [
+        Technician(
+            id: 41,
+            name: "Ren Sato",
+            skills: [Some(Skill.Electrical), Some(Skill.Hvac), None],
+            shift_start: 420,
+            shift_end: 720,
+        ),
+        Technician(
+            id: 42,
+            name: "Sol Okafor",
+            skills: [Some(Skill.Plumbing), Some(Skill.Mechanical), None],
+            shift_start: 420,
+            shift_end: 660,
+        ),
+        Technician(
+            id: 43,
+            name: "Amara Chen",
+            skills: [Some(Skill.Roofing), Some(Skill.Carpentry), None],
+            shift_start: 480,
+            shift_end: 720,
+        ),
+    ]
+}
+
+pub fn stock() -> Array<StockItem, 5> {
+    [
+        StockItem(name: "breaker", quantity: 1),
+        StockItem(name: "feed valve", quantity: 1),
+        StockItem(name: "drive belt", quantity: 1),
+        StockItem(name: "roof patch roll", quantity: 1),
+        StockItem(name: "chiller filter", quantity: 1),
+    ]
+}
