@@ -68,6 +68,22 @@ struct ValidatedInterfaceAlias {
     name_token: SyntaxToken,
 }
 
+struct ValidatedInterfaceRecord {
+    entry: ItemTreeEntry,
+    declaration: ast::TypeDecl,
+    name: String,
+    name_token: SyntaxToken,
+    generic_children: Vec<ItemTreeEntry>,
+    fields: Vec<ValidatedInterfaceRecordField>,
+}
+
+struct ValidatedInterfaceRecordField {
+    entry: ItemTreeEntry,
+    name: String,
+    syntax: SyntaxNode,
+    name_token: SyntaxToken,
+}
+
 /// Collects target-visible module-level functions and their generic
 /// parameters, records and resources with their generic parameters and direct named fields,
 /// enums with their generic parameters, variants and record-variant fields,
@@ -76,8 +92,8 @@ struct ValidatedInterfaceAlias {
 /// effects, worlds, tests, properties, extern functions, and traits with their
 /// generic parameters, direct associated types and functions, and trait-method
 /// generic parameters. Local interfaces, their direct freestanding functions,
-/// aliases, interface resources, and resource functions are included;
-/// interface records, enums, and other interface members remain unsupported.
+/// aliases, interface records, resources, and their functions are included;
+/// interface enums and other interface members remain unsupported.
 /// World import/export/include entries are validated as world contents but do
 /// not produce symbols. Every other symbol-bearing declaration makes the result
 /// incomplete until its symbol kind and path are collected as well.
@@ -2310,6 +2326,7 @@ fn collect_interface(
 
     let mut validated_functions = Vec::<(ItemTreeEntry, ast::FnDecl, String, SyntaxToken)>::new();
     let mut validated_aliases = Vec::<ValidatedInterfaceAlias>::new();
+    let mut validated_records = Vec::<ValidatedInterfaceRecord>::new();
     let mut validated_resources = Vec::<ValidatedInterfaceResource>::new();
     for ((_, member), child) in expected_children.iter().zip(&entry.children) {
         let (member_name, member_syntax, function) = match member {
@@ -2387,9 +2404,69 @@ fn collect_interface(
 
         let Some(function) = function else {
             if let InterfaceChild::Type(type_declaration) = member {
+                if type_declaration.struct_def().is_some() {
+                    if child.kind != ItemTreeKind::Struct {
+                        reasons.insert("an interface record has the wrong ItemTree kind".into());
+                        continue;
+                    }
+                    let Some(attrs) = input.filtered.validated_attrs.get(&child.ast_id) else {
+                        reasons.insert(
+                            "an interface record has no attribute-validation record".into(),
+                        );
+                        continue;
+                    };
+                    if attrs.target.is_some() {
+                        reasons.insert(
+                            "an interface record unexpectedly has a target predicate".into(),
+                        );
+                        continue;
+                    }
+                    if attrs
+                        .diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.severity == sai_diagnostics::Severity::Error)
+                    {
+                        reasons
+                            .insert("an interface record has an attribute-validation error".into());
+                        continue;
+                    }
+                    let Some(record) = validate_interface_record(
+                        child,
+                        type_declaration,
+                        file_id,
+                        input,
+                        symbols,
+                        reasons,
+                    ) else {
+                        continue;
+                    };
+                    if record.declaration.generic_params().is_some()
+                        || record
+                            .declaration
+                            .struct_def()
+                            .is_some_and(|definition| definition.where_clause().is_some())
+                    {
+                        reasons.insert(
+                            "generic interface records or where clauses are prohibited (GENERIC_INTERFACE_ITEM)"
+                                .into(),
+                        );
+                    }
+                    if child
+                        .raw_attrs
+                        .iter()
+                        .any(|attribute| attribute.name == sai_hir::item_tree::AttrName::Derive)
+                    {
+                        reasons.insert(
+                            "an interface record has derived impl symbols outside the supported inventory"
+                                .into(),
+                        );
+                    }
+                    validated_records.push(record);
+                    continue;
+                }
                 let Some(alias_definition) = type_declaration.alias_def() else {
                     reasons.insert(
-                        "interface records and non-alias type declarations remain outside the supported symbol slice"
+                        "non-alias interface type declarations remain outside the supported symbol slice"
                             .into(),
                     );
                     continue;
@@ -2467,7 +2544,7 @@ fn collect_interface(
                 });
             } else {
                 reasons.insert(
-                    "interface records, aliases, enums, and other type members remain outside the supported symbol slice"
+                    "interface aliases, enums, and other type members remain outside the supported symbol slice"
                         .into(),
                 );
             }
@@ -2614,6 +2691,24 @@ fn collect_interface(
         SymbolKind::Interface,
         fingerprint,
     ));
+
+    for record in validated_records {
+        collect_interface_record_symbols(
+            &record,
+            entry,
+            descriptor.owner.def_id,
+            &def_path,
+            &canonical_path,
+            package_id,
+            reasons,
+            canonical_paths,
+            current_symbols,
+            def_paths,
+            packages,
+            symbols,
+            input,
+        );
+    }
 
     for alias in validated_aliases {
         let Some(component @ DefPathData::TypeNs(_)) =
@@ -2998,6 +3093,360 @@ fn collect_interface(
             SymbolKind::AssocFn,
             child_fingerprint,
         ));
+    }
+}
+
+fn validate_interface_record(
+    entry: &ItemTreeEntry,
+    declaration: &ast::TypeDecl,
+    file_id: FileId,
+    input: &OwnedPhase1ModuleInput,
+    symbols: &Interner,
+    reasons: &mut HashSet<String>,
+) -> Option<ValidatedInterfaceRecord> {
+    #[derive(Clone)]
+    enum RecordChild {
+        Generic(ast::GenericParam),
+        Field(ast::FieldDecl),
+    }
+
+    let Some(definition) = declaration.struct_def() else {
+        reasons.insert("an interface record has no record definition".into());
+        return None;
+    };
+    let mut expected_children = Vec::<(usize, RecordChild)>::new();
+    if let Some(generic_params) = declaration.generic_params() {
+        expected_children.extend(generic_params.params().map(|parameter| {
+            (
+                parameter.syntax().text_range().start().to_usize(),
+                RecordChild::Generic(parameter),
+            )
+        }));
+    }
+    if let Some(fields) = definition.fields() {
+        expected_children.extend(fields.fields().map(|field| {
+            (
+                field.syntax().text_range().start().to_usize(),
+                RecordChild::Field(field),
+            )
+        }));
+    }
+    expected_children.sort_by_key(|(offset, _)| *offset);
+    if entry.children.len() != expected_children.len() {
+        reasons.insert(
+            "an interface record's ItemTree child count does not match its snapshot AST".into(),
+        );
+        return None;
+    }
+
+    let mut generic_children = Vec::new();
+    let mut fields = Vec::new();
+    for ((_, ast_child), child) in expected_children.iter().zip(&entry.children) {
+        let (expected_kind, expected_ast_id, name_node, child_syntax, field_has_type) =
+            match ast_child {
+                RecordChild::Generic(ast::GenericParam::Type(parameter)) => (
+                    ItemTreeKind::TypeParam,
+                    input.ast_ids.ast_id(parameter).map(|id| id.erase()),
+                    parameter.name(),
+                    parameter.syntax().clone(),
+                    true,
+                ),
+                RecordChild::Generic(ast::GenericParam::Const(parameter)) => (
+                    ItemTreeKind::ConstParam,
+                    input.ast_ids.ast_id(parameter).map(|id| id.erase()),
+                    parameter.name(),
+                    parameter.syntax().clone(),
+                    true,
+                ),
+                RecordChild::Field(field) => (
+                    ItemTreeKind::Field,
+                    input.ast_ids.ast_id(field).map(|id| id.erase()),
+                    field.name(),
+                    field.syntax().clone(),
+                    field.ty().is_some(),
+                ),
+            };
+        if child.kind != expected_kind || expected_ast_id != Some(child.ast_id) {
+            reasons.insert(
+                "an interface record's ItemTree child kind, identity, or source order does not match its snapshot AST"
+                    .into(),
+            );
+            return None;
+        }
+        if !child.children.is_empty() {
+            reasons.insert("an interface record child has unexpected nested declarations".into());
+            return None;
+        }
+        let Some(pointer) = input.ast_ids.pointer(child.ast_id) else {
+            reasons.insert("an interface record child has no current source pointer".into());
+            return None;
+        };
+        let Some(expected_pointer) = sai_syntax::SyntaxNodePtr::new(file_id, &child_syntax).ok()
+        else {
+            reasons.insert("an interface record child cannot be bound to its source file".into());
+            return None;
+        };
+        if !pointer.is_same_source_node(&expected_pointer) {
+            reasons.insert("an interface record ItemTree child points to another AST node".into());
+            return None;
+        }
+        let Some(resolved) = pointer.resolve(file_id, &input.root) else {
+            reasons.insert("an interface record child source pointer is stale".into());
+            return None;
+        };
+        if resolved.kind() != child_syntax.kind()
+            || resolved.text_range() != child_syntax.text_range()
+        {
+            reasons.insert("an interface record child resolves to a different source range".into());
+            return None;
+        }
+        if child.name == Symbol::ERROR {
+            reasons.insert("an interface record child has no valid ItemTree name".into());
+            return None;
+        }
+        let child_name = match symbols.resolve(child.name) {
+            Ok(name) if !name.is_empty() => name.to_string(),
+            _ => {
+                reasons.insert("an interface record child name cannot be resolved".into());
+                return None;
+            }
+        };
+        let Some(name_node) = name_node else {
+            reasons.insert("an interface record child AST has no name node".into());
+            return None;
+        };
+        let Some(name_token) = name_node.token() else {
+            reasons.insert("an interface record child AST has no name token".into());
+            return None;
+        };
+        let raw_name = name_token
+            .text()
+            .strip_prefix("r#")
+            .unwrap_or(name_token.text());
+        if sai_syntax::normalize_identifier(raw_name) != child_name {
+            reasons.insert("an interface record ItemTree and AST child name disagree".into());
+            return None;
+        }
+        if syntax_has_errors(&child_syntax)
+            || name_token.has_error()
+            || input.parser_diagnostics.iter().any(|diagnostic| {
+                parser_diagnostic_overlaps_syntax(diagnostic, file_id, &child_syntax)
+            })
+        {
+            reasons.insert("an interface record child contains parser recovery or errors".into());
+            return None;
+        }
+        let Some(attrs) = input.filtered.validated_attrs.get(&child.ast_id) else {
+            reasons.insert("an interface record child has no attribute-validation record".into());
+            return None;
+        };
+        if attrs.target.is_some()
+            || attrs
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.severity == sai_diagnostics::Severity::Error)
+        {
+            reasons.insert(
+                "an interface record child has a target predicate or invalid attribute".into(),
+            );
+            return None;
+        }
+        if !field_has_type {
+            reasons.insert("an interface record field has no declared type".into());
+            return None;
+        }
+
+        match ast_child {
+            RecordChild::Generic(_) => generic_children.push(child.clone()),
+            RecordChild::Field(field) => fields.push(ValidatedInterfaceRecordField {
+                entry: child.clone(),
+                name: child_name,
+                syntax: field.syntax().clone(),
+                name_token,
+            }),
+        }
+    }
+
+    let Some(name_token) = declaration.name().and_then(|name| name.token()) else {
+        reasons.insert("an interface record declaration has no name token".into());
+        return None;
+    };
+    let name = match symbols.resolve(entry.name) {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            reasons.insert("an interface record name cannot be resolved".into());
+            return None;
+        }
+    };
+    Some(ValidatedInterfaceRecord {
+        entry: entry.clone(),
+        declaration: declaration.clone(),
+        name,
+        name_token,
+        generic_children,
+        fields,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_interface_record_symbols(
+    record: &ValidatedInterfaceRecord,
+    interface: &ItemTreeEntry,
+    interface_owner: LocalDefId,
+    interface_def_path: &sai_hir::DefPath,
+    interface_path: &str,
+    package_id: PackageId,
+    reasons: &mut HashSet<String>,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+    input: &OwnedPhase1ModuleInput,
+) {
+    let Some(component @ DefPathData::TypeNs(_)) = interface_member_path_component(&record.entry)
+    else {
+        reasons.insert("an interface record has no TypeNs DefPath component".into());
+        return;
+    };
+    let disambiguator = match interface_member_path_disambiguator(interface, &record.entry) {
+        Ok(disambiguator) => disambiguator,
+        Err(sai_hir::item_tree::InterfaceMemberPathError::ItemTreeMismatch) => {
+            reasons
+                .insert("an interface record has no source-ordered ItemTree disambiguator".into());
+            return;
+        }
+        Err(sai_hir::item_tree::InterfaceMemberPathError::TooManyDefinitions) => {
+            reasons.insert("an interface record DefPath disambiguator overflowed".into());
+            return;
+        }
+    };
+    let record_def_id =
+        match def_paths.intern_children(interface_owner, &[(component.clone(), disambiguator)]) {
+            Ok(mut children) if children.len() == 1 => children.remove(0),
+            _ => {
+                reasons.insert("an interface record DefPath cannot be interned".into());
+                return;
+            }
+        };
+    let record_def_path = match def_paths.resolve(record_def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        Ok(Some(_)) => {
+            reasons.insert("an interface record resolves to another package".into());
+            return;
+        }
+        Ok(None) => {
+            reasons.insert("an interface record has no canonical DefPath".into());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("an interface record DefPath cannot be resolved".into());
+            return;
+        }
+    };
+    if record_def_path.data().len() != interface_def_path.data().len() + 1
+        || record_def_path.data()[..interface_def_path.data().len()] != *interface_def_path.data()
+        || record_def_path.data().last().is_none_or(|path_component| {
+            path_component.data != component || path_component.disambiguator != disambiguator
+        })
+    {
+        reasons.insert(
+            "an interface record DefPath does not match its exact interface parent, TypeNs name, or source-order disambiguator"
+                .into(),
+        );
+        return;
+    }
+    let record_def_path_hash = match DefPathHash::compute(&record_def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert("an interface record DefPath hash cannot be computed".into());
+            return;
+        }
+    };
+    let record_fingerprint = match declaration_fingerprint(
+        SymbolKind::Record,
+        &record.declaration.syntax(),
+        Some(&record.name_token),
+    ) {
+        Ok(fingerprint) => fingerprint,
+        Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+            reasons.insert("an interface record name token is outside its declaration".into());
+            return;
+        }
+    };
+    let record_path = format!("{interface_path}.{}", record.name);
+    if !canonical_paths.insert(record_path.clone()) {
+        reasons.insert(format!("duplicate canonical symbol path {record_path}"));
+    }
+    current_symbols.push(CurrentSymbol::new(
+        record_path.clone(),
+        record_def_path_hash,
+        SymbolKind::Record,
+        record_fingerprint,
+    ));
+
+    collect_item_generic_params(
+        &record.generic_children,
+        record.declaration.generic_params(),
+        &record_path,
+        record_def_id,
+        &record_def_path,
+        input,
+        package_id,
+        "interface record",
+        canonical_paths,
+        current_symbols,
+        reasons,
+        def_paths,
+        packages,
+        symbols,
+    );
+
+    let mut next_disambiguator = HashMap::<Symbol, u32>::new();
+    let mut field_paths = Vec::with_capacity(record.fields.len());
+    for field in &record.fields {
+        let ordinal = next_disambiguator.entry(field.entry.name).or_default();
+        let current = *ordinal;
+        let Some(next) = current.checked_add(1) else {
+            reasons.insert("interface record field DefPath disambiguator overflowed".into());
+            return;
+        };
+        *ordinal = next;
+        field_paths.push((field.entry.name, current));
+    }
+    let field_def_ids = match def_paths.intern_fields(record_def_id, &field_paths) {
+        Ok(def_ids) if def_ids.len() == record.fields.len() => def_ids,
+        Ok(_) => {
+            reasons.insert("HIR returned the wrong number of interface record fields".into());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("interface record fields cannot be interned".into());
+            return;
+        }
+    };
+    for ((field, field_def_id), (_, ordinal)) in
+        record.fields.iter().zip(field_def_ids).zip(field_paths)
+    {
+        if !collect_named_field_symbol(
+            &field.entry,
+            &field.syntax,
+            &field.name_token,
+            field_def_id,
+            &record_def_path,
+            ordinal,
+            format!("{record_path}.field[{}]", field.name),
+            "interface record field",
+            package_id,
+            reasons,
+            canonical_paths,
+            current_symbols,
+            def_paths,
+            packages,
+            symbols,
+        ) {
+            return;
+        }
     }
 }
 
