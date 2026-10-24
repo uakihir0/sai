@@ -32892,7 +32892,6 @@ property "shared"() {}
             &b"type Malformed<T:> { value: U32 }\n"[..],
             &b"type MissingFieldName { : U32 }\n"[..],
             &b"type DuplicateFields { value: U32\n    value: U64 }\n"[..],
-            &b"enum Unsupported { Empty(I32) }\n"[..],
             &b"type WithImpl {}\nimpl WithImpl { fn method() {} }\n"[..],
             &b"@derive(Clone)\ntype Derived {}\n"[..],
         ] {
@@ -33297,6 +33296,148 @@ property "shared"() {}
     }
 
     #[test]
+    fn module_enum_inventory_collects_tuple_payload_fields_and_exact_def_paths() {
+        let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"enum Packet { Unit, Pair(U8, U32), Named(code: U16) }\n",
+            b"enum Nested { Tuple(U64, U8) }\n",
+            "wasm32-core",
+        );
+        for module in &module_tree.modules {
+            let parsed = sai_syntax::parse(&snapshot, module.file)
+                .expect("the enum fixture has a parse snapshot");
+            assert!(
+                parsed.parser_diagnostics().is_empty(),
+                "the tuple enum fixture must parse cleanly: {:#?}",
+                parsed.parser_diagnostics()
+            );
+        }
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        for path in [
+            "acme:phase1.Packet",
+            "acme:phase1.Packet.Unit",
+            "acme:phase1.Packet.Pair",
+            "acme:phase1.Packet.Pair.field[0]",
+            "acme:phase1.Packet.Pair.field[1]",
+            "acme:phase1.Packet.Named",
+            "acme:phase1.Packet.Named.field[code]",
+            "acme:phase1/child.Nested",
+            "acme:phase1/child.Nested.Tuple",
+            "acme:phase1/child.Nested.Tuple.field[0]",
+            "acme:phase1/child.Nested.Tuple.field[1]",
+        ] {
+            assert!(
+                inventory
+                    .symbols()
+                    .iter()
+                    .any(|symbol| symbol.path() == path),
+                "missing tuple-enum inventory path {path}"
+            );
+        }
+        for path in [
+            "acme:phase1.Packet.Pair.field[0]",
+            "acme:phase1.Packet.Pair.field[1]",
+            "acme:phase1/child.Nested.Tuple.field[0]",
+            "acme:phase1/child.Nested.Tuple.field[1]",
+        ] {
+            assert_eq!(
+                inventory
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.path() == path)
+                    .expect("tuple payload field is inventoried")
+                    .kind(),
+                sai_semantic::SymbolKind::Field
+            );
+        }
+
+        let def_paths = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("the package has a DefPath interner");
+        let packet_owner = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| {
+                owner.kind == TopLevelOwnerKind::Enum
+                    && database
+                        .resolve_def_path(owner.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            matches!(
+                                path.data().last().map(|component| &component.data),
+                                Some(DefPathData::TypeNs(name))
+                                    if database.symbols.resolve(*name).is_ok_and(|name| name.as_ref() == "Packet")
+                            )
+                        })
+            })
+            .expect("the Packet enum owner exists");
+        let packet_path = database
+            .resolve_def_path(packet_owner.owner.def_id.to_def_id())
+            .expect("enum DefId is valid")
+            .expect("enum DefPath exists");
+        let pair = database.symbols.intern("Pair").expect("Pair interns");
+        let pair_id = def_paths
+            .intern_variants(packet_owner.owner.def_id, &[(pair, 0)])
+            .expect("the tuple variant DefPath is interned")[0];
+        let pair_path = database
+            .resolve_def_path(pair_id.to_def_id())
+            .expect("variant DefId is valid")
+            .expect("variant DefPath exists");
+        assert_eq!(
+            &pair_path.data()[..packet_path.data().len()],
+            packet_path.data()
+        );
+        assert!(matches!(
+            pair_path.data().last(),
+            Some(last) if last.data == DefPathData::Variant(pair) && last.disambiguator == 0
+        ));
+        let tuple_fields = [
+            database.symbols.intern("0").expect("field 0 interns"),
+            database.symbols.intern("1").expect("field 1 interns"),
+        ];
+        let tuple_field_ids = def_paths
+            .intern_fields_for_parents(&[
+                (pair_id, tuple_fields[0], 0),
+                (pair_id, tuple_fields[1], 0),
+            ])
+            .expect("tuple field DefPaths are interned");
+        for (index, (field_id, field_name)) in tuple_field_ids.iter().zip(tuple_fields).enumerate()
+        {
+            let field_path = database
+                .resolve_def_path(field_id.to_def_id())
+                .expect("field DefId is valid")
+                .expect("field DefPath exists");
+            assert_eq!(field_path.package(), module_tree.package);
+            assert_eq!(
+                &field_path.data()[..pair_path.data().len()],
+                pair_path.data()
+            );
+            assert!(matches!(
+                field_path.data().last(),
+                Some(last) if last.data == DefPathData::Field(field_name) && last.disambiguator == 0
+            ));
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&field_path, &database.packages, &database.symbols)
+                    .expect("tuple field DefPath hash is computable");
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == format!("acme:phase1.Packet.Pair.field[{index}]"))
+                .expect("tuple field symbol exists");
+            assert_eq!(
+                symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+        }
+    }
+
+    #[test]
     fn module_enum_inventory_fingerprints_ignore_renames_and_track_discriminants_and_payloads() {
         let fingerprint = |source: &[u8], kind: sai_semantic::SymbolKind| {
             let (_, _, _, collection) =
@@ -33356,6 +33497,35 @@ property "shared"() {}
         assert_ne!(variant_payload, variant_payload_changed);
         assert_eq!(field_original, field_renamed);
         assert_ne!(field_original, field_payload_changed);
+
+        let tuple_field_fingerprint = |source: &[u8], index: usize| {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert_eq!(
+                inventory.coverage(),
+                &sai_semantic::InventoryCoverage::Complete
+            );
+            let suffix = format!(".field[{index}]");
+            inventory
+                .symbols()
+                .iter()
+                .find(|symbol| {
+                    symbol.kind() == sai_semantic::SymbolKind::Field
+                        && symbol.path().ends_with(&suffix)
+                })
+                .expect("the tuple payload field is inventoried")
+                .fingerprint()
+        };
+        let tuple_field_0 = tuple_field_fingerprint(b"enum E { Data(I32, U32) }\n", 0);
+        let tuple_field_0_renamed = tuple_field_fingerprint(b"enum E { Changed(I32, U32) }\n", 0);
+        let tuple_field_0_sibling_changed =
+            tuple_field_fingerprint(b"enum E { Data(I32, U16) }\n", 0);
+        let tuple_field_1 = tuple_field_fingerprint(b"enum E { Data(I32, U32) }\n", 1);
+        let tuple_field_1_changed = tuple_field_fingerprint(b"enum E { Data(I32, U16) }\n", 1);
+        assert_eq!(tuple_field_0, tuple_field_0_renamed);
+        assert_eq!(tuple_field_0, tuple_field_0_sibling_changed);
+        assert_ne!(tuple_field_1, tuple_field_1_changed);
     }
 
     #[test]
@@ -33461,8 +33631,35 @@ property "shared"() {}
     }
 
     #[test]
-    fn module_enum_inventory_filters_by_selected_target_and_fails_closed_for_tuple_and_derive() {
-        let source = b"@target(\"wasm64-core\")\nenum Only64<T> { Empty }\n";
+    fn module_enum_inventory_fails_closed_for_malformed_tuple_payloads() {
+        for source in [
+            &b"enum Malformed { Data(, U32) }\n"[..],
+            &b"enum EmptyTuple { Unit() }\n"[..],
+        ] {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert!(
+                matches!(
+                    inventory.coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { .. }
+                ),
+                "{source:?}: {:#?}",
+                inventory.coverage()
+            );
+            assert!(
+                inventory
+                    .symbols()
+                    .iter()
+                    .all(|symbol| !symbol.path().contains(".field[")),
+                "malformed tuple payloads must not emit partial field symbols"
+            );
+        }
+    }
+
+    #[test]
+    fn module_enum_inventory_filters_by_selected_target_and_fails_closed_for_derive() {
+        let source = b"@target(\"wasm64-core\")\nenum Only64<T> { Empty, Pair(T, U32) }\n";
         let (_, _, _, wasm32) = collect_package_inventory_for_target(source, b"", "wasm32-core");
         assert_eq!(
             inventory_symbols(&wasm32).coverage(),
@@ -33484,28 +33681,21 @@ property "shared"() {}
             [
                 "acme:phase1.Only64",
                 "acme:phase1.Only64.generic[T]",
-                "acme:phase1.Only64.Empty"
+                "acme:phase1.Only64.Empty",
+                "acme:phase1.Only64.Pair",
+                "acme:phase1.Only64.Pair.field[0]",
+                "acme:phase1.Only64.Pair.field[1]"
             ]
         );
 
-        for (source, reason) in [
-            (
-                &b"enum Tuple { With(I32) }\n"[..],
-                "tuple variant payload symbols are outside the supported enum inventory",
-            ),
-            (
-                &b"@derive(Clone)\nenum Derived { Empty }\n"[..],
-                "derived impl symbols outside the supported inventory",
-            ),
-        ] {
-            let (_, _, _, collection) =
-                collect_package_inventory_for_target(source, b"", "wasm32-core");
-            assert!(matches!(
-                inventory_symbols(&collection).coverage(),
-                sai_semantic::InventoryCoverage::Incomplete { reason: actual }
-                    if actual.contains(reason)
-            ));
-        }
+        let source = b"@derive(Clone)\nenum Derived { Empty }\n";
+        let (_, _, _, collection) =
+            collect_package_inventory_for_target(source, b"", "wasm32-core");
+        assert!(matches!(
+            inventory_symbols(&collection).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason: actual }
+                if actual.contains("derived impl symbols outside the supported inventory")
+        ));
     }
 
     #[test]
