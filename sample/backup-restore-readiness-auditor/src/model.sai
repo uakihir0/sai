@@ -1,0 +1,98 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum SnapshotKind {
+    Full
+    Incremental
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReadinessStatus {
+    Ready
+    ReadyWithFallback
+    NotReady
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReadinessIssue {
+    NoSnapshots
+    DuplicateSnapshotId
+    DuplicateServiceId
+    UnknownServiceId
+    MissingParent
+    MissingFullSnapshot
+    ParentCycleOrChainTooDeep
+    ParentServiceMismatch
+    ParentNotOlder
+    FullSnapshotHasParent
+    FutureCapture
+    ChecksumMismatch
+    RetentionExpired
+    OffsiteCopyMissing
+    RestoreTimeOverflow
+    RpoExceeded
+    RtoExceeded
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CatalogEntityKind {
+    Service
+    Snapshot
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CatalogIssue {
+    pub entity_kind: CatalogEntityKind
+    pub entity_id: U32
+    pub issue: ReadinessIssue
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Service {
+    pub id: U32
+    pub name: Str
+    pub rpo_minutes: U32
+    pub rto_minutes: U32
+    pub offsite_required: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BackupSnapshot {
+    pub id: U32
+    pub service_id: U32
+    pub captured_minute: U32
+    pub kind: SnapshotKind
+    pub parent_id: Option<U32>
+    pub restore_minutes: U32
+    pub checksum_valid: Bool
+    pub retained_until_minute: U32
+    pub offsite: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CandidateAssessment {
+    pub issue: Option<ReadinessIssue>
+    pub age_minutes: Option<U32>
+    pub restore_minutes: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Finding {
+    pub service_id: U32
+    pub service_name: Str
+    pub status: ReadinessStatus
+    pub selected_snapshot_id: Option<U32>
+    pub age_minutes: Option<U32>
+    pub restore_minutes: Option<U32>
+    pub skipped_newer_count: U32
+    pub latest_issue: Option<ReadinessIssue>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditReport {
+    pub findings: Array<Option<Finding>, 7>
+    pub finding_count: USize
+    pub catalog_issues: Array<Option<CatalogIssue>, 27>
+    pub catalog_issue_count: USize
+    pub ready_count: U32
+    pub fallback_count: U32
+    pub not_ready_count: U32
+}
