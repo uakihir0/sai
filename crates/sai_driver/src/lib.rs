@@ -25722,7 +25722,7 @@ interface api {
     }
 
     #[test]
-    fn wit_flags_inventory_collects_the_parent_and_omits_flag_and_builtin_symbols() {
+    fn wit_flags_inventory_collects_parent_and_flag_constants_but_omits_builtins() {
         let wit_source = br#"package acme:phase1@1.0.0;
 interface types {
     flags foreign { remote }
@@ -25853,13 +25853,96 @@ interface api {
                 &flags_tokens.token_pairs
             )
         );
-        assert!(
-            inventory
+        let expected_flags = ["ReadOnly", "Type", "Write"];
+        for (bit_index, source_flag) in flags_tokens.flags.iter().enumerate() {
+            let flag_spelling = sai_wit::wit_name_to_sai(&source_flag.name, true)
+                .expect("WIT flag name converts to SAI");
+            let flag_name = flag_spelling
+                .strip_prefix("r#")
+                .unwrap_or(&flag_spelling)
+                .to_owned();
+            assert_eq!(flag_name, expected_flags[bit_index]);
+            let canonical_flag_path = format!("{flags_path}.{flag_name}");
+            let flag_symbol = inventory
                 .symbols()
                 .iter()
-                .all(|symbol| !symbol.path().starts_with(&format!("{flags_path}."))),
-            "flag names and the four synthetic flags methods are not source symbols"
+                .find(|symbol| symbol.path() == canonical_flag_path)
+                .unwrap_or_else(|| panic!("flag constant `{canonical_flag_path}` is inventoried"));
+            assert_eq!(flag_symbol.kind(), sai_semantic::SymbolKind::Const);
+
+            let mut flag_def_path_data = def_path.data().to_vec();
+            let flag_name_symbol = database
+                .symbols
+                .intern(&flag_name)
+                .expect("converted flag name interns");
+            flag_def_path_data.push(sai_hir::DisambiguatedDefPathData {
+                data: sai_hir::DefPathData::ValueNs(flag_name_symbol),
+                disambiguator: u32::try_from(bit_index).expect("flag index fits"),
+            });
+            let flag_def_path = sai_hir::DefPath::new(
+                view.package,
+                flag_def_path_data,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("derived flag constant path is valid");
+            assert_eq!(flag_def_path.package(), view.package);
+            assert_eq!(
+                flag_def_path
+                    .data()
+                    .last()
+                    .map(|component| component.disambiguator),
+                Some(u32::try_from(bit_index).expect("flag index fits")),
+                "the path identity records the flag's semantic bit index"
+            );
+            let expected_flag_hash = sai_hir::DefPathHash::compute(
+                &flag_def_path,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("derived flag constant path hashes");
+            assert_eq!(
+                flag_symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_flag_hash.raw())
+            );
+
+            let mut flag_tokens = source_flag.token_pairs.clone();
+            flag_tokens.push(("WitFlagsBitIndex".to_owned(), bit_index.to_string()));
+            assert_eq!(
+                flag_symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint_from_token_pairs(
+                    sai_semantic::SymbolKind::Const,
+                    &flag_tokens
+                )
+            );
+        }
+        let flag_child_paths = inventory
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.path().starts_with(&format!("{flags_path}.")))
+            .map(|symbol| symbol.path().to_owned())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            flag_child_paths,
+            [
+                "acme:phase1/api.Permissions.ReadOnly".to_owned(),
+                "acme:phase1/api.Permissions.Type".to_owned(),
+                "acme:phase1/api.Permissions.Write".to_owned(),
+            ]
+            .into_iter()
+            .collect(),
+            "only the three directly authored flag constants are children"
         );
+        for builtin in ["empty", "all", "contains", "is_empty"] {
+            let builtin_path = format!("{flags_path}.{builtin}");
+            assert!(
+                inventory
+                    .symbols()
+                    .iter()
+                    .all(|symbol| symbol.path() != builtin_path),
+                "synthetic flag method `{builtin}` is not a source symbol"
+            );
+        }
         assert!(
             inventory
                 .symbols()
@@ -25887,6 +25970,43 @@ interface api {
                 .iter()
                 .all(|symbol| symbol.path() != "acme:phase1/api.Empty"),
             "an empty flags declaration has no verified source symbol"
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| !symbol.path().starts_with("acme:phase1/api.Empty.")),
+            "an empty flags declaration has no flag constants"
+        );
+    }
+
+    #[test]
+    fn wit_flags_constant_identity_and_fingerprint_track_bit_order() {
+        let inventory_for = |flags: &str| {
+            let source = format!(
+                "package acme:phase1@1.0.0; interface api {{ flags permissions {{ {flags} }} }}"
+            );
+            let (_, _, collection) = collect_single_authored_wit_inventory(source.as_bytes());
+            inventory_symbols(&collection)
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == "acme:phase1/api.Permissions.Read")
+                .expect("Read constant is inventoried")
+                .clone()
+        };
+        let read_before = inventory_for("read, write");
+        let read_after = inventory_for("write, read");
+        assert_eq!(read_before.kind(), sai_semantic::SymbolKind::Const);
+        assert_eq!(read_after.kind(), sai_semantic::SymbolKind::Const);
+        assert_ne!(
+            read_before.def_path_hash(),
+            read_after.def_path_hash(),
+            "the derived identity changes when a flag moves to another bit"
+        );
+        assert_ne!(
+            read_before.fingerprint(),
+            read_after.fingerprint(),
+            "the constant fingerprint records bit-order semantics"
         );
     }
 
@@ -25921,8 +26041,13 @@ interface api {
             inventory
                 .symbols()
                 .iter()
-                .all(|symbol| !symbol.path().starts_with(&format!("{flags_path}."))),
-            "flag names never become independently inventoried symbols"
+                .filter(|symbol| {
+                    symbol.kind() == sai_semantic::SymbolKind::Const
+                        && symbol.path().starts_with(&format!("{flags_path}."))
+                })
+                .count()
+                == 0,
+            "an invalid over-limit flags declaration has no constant candidates"
         );
     }
 

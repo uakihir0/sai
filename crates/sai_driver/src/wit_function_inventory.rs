@@ -1,7 +1,7 @@
 //! Inventory support for authored WIT interface functions.
 
 use super::{Phase1PackageSymbolInventory, RootDatabase};
-use sai_hir::{DefPathData, DefPathHash, PackageId};
+use sai_hir::{DefPath, DefPathData, DefPathHash, DisambiguatedDefPathData, PackageId};
 use sai_package::mvs::MvsPackageVersion;
 use sai_semantic::{
     CurrentSymbol, InventoryCoverage, PackageSymbolInventory, SymbolKind,
@@ -1879,14 +1879,92 @@ fn collect_root_interface_flags(
         ));
         return;
     }
-    // WIT flags lower to the interface enum view entity but do not declare
-    // independent source symbols for their names or provided methods.
     current_symbols.push(CurrentSymbol::new(
-        canonical_flags_path,
+        canonical_flags_path.clone(),
         flags_hash,
         SymbolKind::Enum,
         declaration_fingerprint_from_token_pairs(SymbolKind::Enum, &source_flags.token_pairs),
     ));
+
+    // A flag is a named constant, not a VariantDef or a view enum case. The
+    // view has no DefId for these constants, so extend the verified parent path
+    // with a ValueNs component whose disambiguator is its semantic bit index.
+    // That derived path makes a reorder change the stable identity.
+    if flags.len() > 32 {
+        return;
+    }
+    for (bit_index, source_flag) in source_flags.flags.iter().enumerate() {
+        let flag_sai_name = match wit_name_to_sai(&source_flag.name, true) {
+            Ok(name) => name,
+            Err(_) => {
+                reasons.insert(format!(
+                    "WIT flag `{interface_name}.{}`.`{}` has no supported SAI constant spelling",
+                    item.name, source_flag.name
+                ));
+                continue;
+            }
+        };
+        let flag_view_name = flag_sai_name.strip_prefix("r#").unwrap_or(&flag_sai_name);
+        let canonical_flag_path = format!("{canonical_flags_path}.{flag_view_name}");
+        if !emitted_paths.insert(canonical_flag_path.clone()) {
+            reasons.insert(format!(
+                "WIT flags constant canonical path `{canonical_flag_path}` is duplicated"
+            ));
+            continue;
+        }
+        let Ok(bit_disambiguator) = u32::try_from(bit_index) else {
+            reasons.insert(format!(
+                "WIT flag `{interface_name}.{}`.`{}` has an unrepresentable bit index",
+                item.name, source_flag.name
+            ));
+            continue;
+        };
+        let Ok(flag_symbol) = symbols_interner.intern(flag_view_name) else {
+            reasons.insert(format!(
+                "WIT flag `{interface_name}.{}`.`{}` cannot be interned",
+                item.name, source_flag.name
+            ));
+            continue;
+        };
+        let mut flag_path_data = flags_path.data().to_vec();
+        flag_path_data.push(DisambiguatedDefPathData {
+            data: DefPathData::ValueNs(flag_symbol),
+            disambiguator: bit_disambiguator,
+        });
+        let flag_path = match DefPath::new(
+            flags_path.package(),
+            flag_path_data,
+            packages,
+            symbols_interner,
+        ) {
+            Ok(path) => path,
+            Err(_) => {
+                reasons.insert(format!(
+                    "WIT flag `{interface_name}.{}`.`{}` has an invalid derived definition path",
+                    item.name, source_flag.name
+                ));
+                continue;
+            }
+        };
+        let flag_hash = match DefPathHash::compute(&flag_path, packages, symbols_interner) {
+            Ok(hash) => Fingerprint::new(hash.raw()),
+            Err(_) => {
+                reasons.insert(format!(
+                    "WIT flag `{interface_name}.{}`.`{}` definition path hash cannot be computed",
+                    item.name, source_flag.name
+                ));
+                continue;
+            }
+        };
+        let mut flag_tokens = source_flag.token_pairs.clone();
+        flag_tokens.push(("WitFlagsBitIndex".to_owned(), bit_index.to_string()));
+        current_symbols.push(CurrentSymbol::new(
+            canonical_flag_path,
+            flag_hash,
+            SymbolKind::Const,
+            declaration_fingerprint_from_token_pairs(SymbolKind::Const, &flag_tokens),
+        ));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
