@@ -10,10 +10,11 @@ use sai_semantic::{
 use sai_stable_hash::Fingerprint;
 use sai_vfs::{FileContents, FileKey, PackageKey, PackageRelativePath, WitFilesSnapshot};
 use sai_wit::{
-    WitContract, WitIfaceIdx, WitItem, WitItemIdx, WitItemKind, WitMemberKind, WitPackage,
-    WitPackageKind, WitType, WitUnit, WitUnitKind, WitView, WitViewDefKind, WitViewEntity,
-    authored_interface_alias_tokens, authored_interface_enum_tokens,
-    authored_interface_function_tokens, authored_interface_resource_tokens, wit_name_to_sai,
+    WitContract, WitField, WitIfaceIdx, WitInterface, WitItem, WitItemIdx, WitItemKind,
+    WitMemberKind, WitPackage, WitPackageKind, WitType, WitUnit, WitUnitKind, WitView,
+    WitViewDefKind, WitViewEntity, authored_interface_alias_tokens, authored_interface_enum_tokens,
+    authored_interface_function_tokens, authored_interface_record_tokens,
+    authored_interface_resource_tokens, wit_name_to_sai,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str;
@@ -519,6 +520,24 @@ fn collect_root_interface_symbols(
                     reasons,
                     current_symbols,
                 ),
+                WitItemKind::Record(fields) => collect_root_interface_record(
+                    view,
+                    view_interface,
+                    interface,
+                    interface_index,
+                    item_index,
+                    item,
+                    fields,
+                    &interface.name,
+                    &selected_identity,
+                    &expected_interface_name,
+                    source_files,
+                    packages,
+                    symbols_interner,
+                    &mut emitted_paths,
+                    reasons,
+                    current_symbols,
+                ),
                 WitItemKind::Enum(_) => collect_root_interface_enum(
                     view,
                     view_interface,
@@ -586,7 +605,7 @@ fn collect_root_interface_alias(
         ));
         return;
     };
-    if item.unsupported.is_some() || function_uses_unsupported_type_in_alias(target) {
+    if item.unsupported.is_some() || wit_type_uses_unsupported_shape(target) {
         reasons.insert(format!(
             "WIT alias `{interface_name}.{}` uses an unsupported declaration or target type",
             item.name
@@ -672,7 +691,7 @@ fn collect_root_interface_alias(
             return;
         }
     };
-    if !alias_path_matches_selected_package(&alias_path, view.package) {
+    if !view_path_matches_selected_package(&alias_path, view.package) {
         reasons.insert(format!(
             "WIT alias `{interface_name}.{}` definition path belongs to a different package",
             item.name
@@ -720,6 +739,367 @@ fn collect_root_interface_alias(
     ));
 }
 
+#[allow(clippy::too_many_arguments)]
+fn collect_root_interface_record(
+    view: &WitView,
+    view_interface: &sai_wit::ViewInterface,
+    interface: &WitInterface,
+    interface_index: WitIfaceIdx,
+    item_index: WitItemIdx,
+    item: &WitItem,
+    fields: &[WitField],
+    interface_name: &str,
+    selected_identity: &str,
+    expected_interface_name: &str,
+    source_files: &BTreeMap<String, Arc<str>>,
+    packages: &sai_intern::PackageInterner,
+    symbols_interner: &sai_intern::Interner,
+    emitted_paths: &mut HashSet<String>,
+    reasons: &mut BTreeSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+) {
+    let unsupported_field = fields
+        .iter()
+        .any(|field| wit_type_uses_unsupported_shape(&field.ty));
+    if item.unsupported.is_some() || unsupported_field {
+        reasons.insert(format!(
+            "WIT record `{interface_name}.{}` uses an unsupported declaration or field type",
+            item.name
+        ));
+        return;
+    }
+    let Some(source_record) = record_source_identity(item, interface_name, fields, source_files)
+    else {
+        reasons.insert(format!(
+            "WIT record `{interface_name}.{}` has no exact validated declaration and field spans",
+            item.name
+        ));
+        return;
+    };
+    let record_sai_name = match wit_name_to_sai(&item.name, true) {
+        Ok(name) => name,
+        Err(_) => {
+            reasons.insert(format!(
+                "WIT record `{interface_name}.{}` has no supported SAI type spelling",
+                item.name
+            ));
+            return;
+        }
+    };
+    let record_view_name = record_sai_name
+        .strip_prefix("r#")
+        .unwrap_or(&record_sai_name);
+    let Some(view_member) = view_interface.members.get(record_view_name) else {
+        reasons.insert(format!(
+            "WIT record `{interface_name}.{}` is absent from the selected view",
+            item.name
+        ));
+        return;
+    };
+    if view_member.item != item_index
+        || view_member.kind != WitViewDefKind::Struct
+        || view_member.unsupported.is_some()
+    {
+        reasons.insert(format!(
+            "WIT record `{interface_name}.{}` does not match its selected view item",
+            item.name
+        ));
+        return;
+    }
+    let record_entity = WitViewEntity::Item {
+        interface: interface_index,
+        item: item_index,
+    };
+    let Some(record_def) = view.definition_for_entity(record_entity) else {
+        reasons.insert(format!(
+            "WIT record `{interface_name}.{}` has no selected view definition",
+            item.name
+        ));
+        return;
+    };
+    if view_member.def != record_def {
+        reasons.insert(format!(
+            "WIT record `{interface_name}.{}` view member does not identify its model item",
+            item.name
+        ));
+        return;
+    }
+    let Some(record_definition) = view.definition(record_def) else {
+        reasons.insert(format!(
+            "WIT record `{interface_name}.{}` has no current selected view definition",
+            item.name
+        ));
+        return;
+    };
+    if !view_definition_matches_entity(record_definition, record_entity, WitViewDefKind::Struct) {
+        reasons.insert(format!(
+            "WIT record `{interface_name}.{}` view definition does not identify its model item",
+            item.name
+        ));
+        return;
+    }
+    let record_path = match view.def_path(record_def) {
+        Ok(Some(path)) => path,
+        _ => {
+            reasons.insert(format!(
+                "WIT record `{interface_name}.{}` has no canonical definition path",
+                item.name
+            ));
+            return;
+        }
+    };
+    let Some(record_disambiguator) =
+        interface_type_item_disambiguator(interface, item_index, record_view_name)
+    else {
+        reasons.insert(format!(
+            "WIT record `{interface_name}.{}` has an invalid type-namespace disambiguator",
+            item.name
+        ));
+        return;
+    };
+    if !view_path_matches_selected_package(&record_path, view.package) {
+        reasons.insert(format!(
+            "WIT record `{interface_name}.{}` definition path belongs to a different package",
+            item.name
+        ));
+        return;
+    }
+    if !view_definition_path_matches_record(
+        &record_path,
+        &record_definition.canonical_path,
+        expected_interface_name,
+        record_view_name,
+        record_disambiguator,
+        symbols_interner,
+    ) {
+        reasons.insert(format!(
+            "WIT record `{interface_name}.{}` does not match its canonical view definition path",
+            item.name
+        ));
+        return;
+    }
+    let Some(record_hash) = verified_view_path_hash(
+        &record_path,
+        record_definition.path_hash,
+        packages,
+        symbols_interner,
+    ) else {
+        reasons.insert(format!(
+            "WIT record `{interface_name}.{}` definition path hash is inconsistent",
+            item.name
+        ));
+        return;
+    };
+
+    let canonical_record_path = format!("{selected_identity}/{interface_name}.{record_view_name}");
+    if !emitted_paths.insert(canonical_record_path.clone()) {
+        reasons.insert(format!(
+            "WIT record canonical path `{canonical_record_path}` is duplicated"
+        ));
+        return;
+    }
+    current_symbols.push(CurrentSymbol::new(
+        canonical_record_path.clone(),
+        record_hash,
+        SymbolKind::Record,
+        declaration_fingerprint_from_token_pairs(SymbolKind::Record, &source_record.token_pairs),
+    ));
+
+    for (field_index, (field, source_field)) in fields.iter().zip(&source_record.fields).enumerate()
+    {
+        let field_sai_name = match wit_name_to_sai(&field.name, false) {
+            Ok(name) => name,
+            Err(_) => {
+                reasons.insert(format!(
+                    "WIT record field `{interface_name}.{}`.{} has no supported SAI spelling",
+                    item.name, field.name
+                ));
+                continue;
+            }
+        };
+        let field_view_name = field_sai_name.strip_prefix("r#").unwrap_or(&field_sai_name);
+        let Ok(field_ordinal) = u32::try_from(field_index) else {
+            reasons.insert(format!(
+                "WIT record `{interface_name}.{}` has too many fields",
+                item.name
+            ));
+            continue;
+        };
+        let Some(field_disambiguator) =
+            record_field_disambiguator(fields, field_index, field_view_name)
+        else {
+            reasons.insert(format!(
+                "WIT record field `{interface_name}.{}`.{} has an invalid disambiguator",
+                item.name, field.name
+            ));
+            continue;
+        };
+        let field_entity = WitViewEntity::Field {
+            interface: interface_index,
+            item: item_index,
+            field: field_ordinal,
+        };
+        let Some(field_def) = view.definition_for_entity(field_entity) else {
+            reasons.insert(format!(
+                "WIT record field `{interface_name}.{}`.{} is missing from the selected view",
+                item.name, field.name
+            ));
+            continue;
+        };
+        let Some(field_definition) = view.definition(field_def) else {
+            reasons.insert(format!(
+                "WIT record field `{interface_name}.{}`.{} has no current selected view definition",
+                item.name, field.name
+            ));
+            continue;
+        };
+        if !view_definition_matches_entity(field_definition, field_entity, WitViewDefKind::Field) {
+            reasons.insert(format!(
+                "WIT record field `{interface_name}.{}`.{} view definition does not identify its model field",
+                item.name, field.name
+            ));
+            continue;
+        }
+        let field_path = match view.def_path(field_def) {
+            Ok(Some(path)) => path,
+            _ => {
+                reasons.insert(format!(
+                    "WIT record field `{interface_name}.{}`.{} has no canonical definition path",
+                    item.name, field.name
+                ));
+                continue;
+            }
+        };
+        if !view_path_matches_selected_package(&field_path, view.package) {
+            reasons.insert(format!(
+                "WIT record field `{interface_name}.{}`.{} definition path belongs to a different package",
+                item.name, field.name
+            ));
+            continue;
+        }
+        if !view_definition_path_matches_record_field(
+            &field_path,
+            &field_definition.canonical_path,
+            &record_path,
+            expected_interface_name,
+            record_view_name,
+            record_disambiguator,
+            field_view_name,
+            field_disambiguator,
+            symbols_interner,
+        ) {
+            reasons.insert(format!(
+                "WIT record field `{interface_name}.{}`.{} does not match its canonical view definition path",
+                item.name, field.name
+            ));
+            continue;
+        }
+        let Some(field_hash) = verified_view_path_hash(
+            &field_path,
+            field_definition.path_hash,
+            packages,
+            symbols_interner,
+        ) else {
+            reasons.insert(format!(
+                "WIT record field `{interface_name}.{}`.{} definition path hash is inconsistent",
+                item.name, field.name
+            ));
+            continue;
+        };
+        let canonical_field_path = format!("{canonical_record_path}.field[{field_view_name}]");
+        if !emitted_paths.insert(canonical_field_path.clone()) {
+            reasons.insert(format!(
+                "WIT record field canonical path `{canonical_field_path}` is duplicated"
+            ));
+            continue;
+        }
+        current_symbols.push(CurrentSymbol::new(
+            canonical_field_path,
+            field_hash,
+            SymbolKind::Field,
+            declaration_fingerprint_from_token_pairs(SymbolKind::Field, &source_field.token_pairs),
+        ));
+    }
+}
+
+fn record_source_identity(
+    item: &WitItem,
+    interface_name: &str,
+    fields: &[WitField],
+    source_files: &BTreeMap<String, Arc<str>>,
+) -> Option<sai_wit::AuthoredInterfaceRecordTokens> {
+    let name_span = item.span.as_ref()?;
+    let source = source_files.get(&name_span.path)?;
+    let name_text = source.get(name_span.range.clone())?;
+    if normalized_wit_name(name_text) != Some(item.name.as_str()) {
+        return None;
+    }
+    let scanned =
+        authored_interface_record_tokens(source, interface_name, &item.name, &name_span.range)?;
+    if scanned.fields.len() != fields.len()
+        || scanned.declaration_range.start > name_span.range.start
+        || name_span.range.end > scanned.declaration_range.end
+        || scanned.declaration_range.is_empty()
+        || source
+            .get(scanned.declaration_range.clone())
+            .is_none_or(|declaration| !declaration.ends_with('}'))
+        || scanned
+            .token_pairs
+            .last()
+            .map(|(kind, text)| (kind.as_str(), text.as_str()))
+            != Some(("RightBrace", "}"))
+        || scanned
+            .token_pairs
+            .iter()
+            .filter(|(kind, text)| {
+                text.is_empty() && matches!(kind.as_str(), "Id" | "ExplicitId" | "StringLiteral")
+            })
+            .count()
+            != 1
+    {
+        return None;
+    }
+    if let (Some(declaration_span), Some(token_pairs)) =
+        (&item.declaration_span, &item.declaration_token_pairs)
+    {
+        if declaration_span.path != name_span.path
+            || declaration_span.range != scanned.declaration_range
+            || token_pairs != &scanned.token_pairs
+        {
+            return None;
+        }
+    } else if item.declaration_span.is_some() || item.declaration_token_pairs.is_some() {
+        return None;
+    }
+
+    let mut previous_end = scanned.declaration_range.start;
+    for (model_field, source_field) in fields.iter().zip(&scanned.fields) {
+        let field_name_text = source.get(source_field.name_range.clone())?;
+        if source_field.name != model_field.name
+            || normalized_wit_name(field_name_text) != Some(model_field.name.as_str())
+            || source_field.declaration_range.start < scanned.declaration_range.start
+            || source_field.declaration_range.end > scanned.declaration_range.end
+            || source_field.declaration_range.start < previous_end
+            || source_field.declaration_range.is_empty()
+            || source_field.name_range.start < source_field.declaration_range.start
+            || source_field.name_range.end > source_field.declaration_range.end
+            || source_field
+                .token_pairs
+                .iter()
+                .filter(|(kind, text)| {
+                    text.is_empty()
+                        && matches!(kind.as_str(), "Id" | "ExplicitId" | "StringLiteral")
+                })
+                .count()
+                != 1
+        {
+            return None;
+        }
+        previous_end = source_field.declaration_range.end;
+    }
+    Some(scanned)
+}
+
 fn alias_source_identity(
     item: &WitItem,
     interface_name: &str,
@@ -758,20 +1138,18 @@ fn alias_source_identity(
     Some(scanned)
 }
 
-fn function_uses_unsupported_type_in_alias(ty: &WitType) -> bool {
+fn wit_type_uses_unsupported_shape(ty: &WitType) -> bool {
     match ty {
         WitType::Unsupported(_) | WitType::Future(_) | WitType::Stream(_) => true,
-        WitType::List(inner) | WitType::Option(inner) => {
-            function_uses_unsupported_type_in_alias(inner)
-        }
+        WitType::List(inner) | WitType::Option(inner) => wit_type_uses_unsupported_shape(inner),
         WitType::Result { ok, err } => {
             ok.as_ref()
-                .is_some_and(|ty| function_uses_unsupported_type_in_alias(ty))
+                .is_some_and(|ty| wit_type_uses_unsupported_shape(ty))
                 || err
                     .as_ref()
-                    .is_some_and(|ty| function_uses_unsupported_type_in_alias(ty))
+                    .is_some_and(|ty| wit_type_uses_unsupported_shape(ty))
         }
-        WitType::Tuple(elements) => elements.iter().any(function_uses_unsupported_type_in_alias),
+        WitType::Tuple(elements) => elements.iter().any(wit_type_uses_unsupported_shape),
         _ => false,
     }
 }
@@ -1623,11 +2001,145 @@ fn view_definition_path_matches_alias(
     definition_canonical_path == expected_canonical_path
 }
 
-fn alias_path_matches_selected_package(
+fn interface_type_item_disambiguator(
+    interface: &WitInterface,
+    item_index: WitItemIdx,
+    expected_name: &str,
+) -> Option<u32> {
+    interface.items.get(item_index)?;
+    let mut count = 0_u32;
+    for (_, item) in interface.items.iter_enumerated().take(item_index.index()) {
+        if matches!(item.kind, WitItemKind::Func(_)) {
+            continue;
+        }
+        let name = wit_name_to_sai(&item.name, true).ok()?;
+        if name.strip_prefix("r#").unwrap_or(&name) == expected_name {
+            count = count.checked_add(1)?;
+        }
+    }
+    Some(count)
+}
+
+fn record_field_disambiguator(
+    fields: &[WitField],
+    field_index: usize,
+    expected_name: &str,
+) -> Option<u32> {
+    fields.get(field_index)?;
+    let mut count = 0_u32;
+    for field in fields.iter().take(field_index) {
+        let name = wit_name_to_sai(&field.name, false).ok()?;
+        if name.strip_prefix("r#").unwrap_or(&name) == expected_name {
+            count = count.checked_add(1)?;
+        }
+    }
+    Some(count)
+}
+
+fn view_path_matches_selected_package(
     path: &sai_hir::DefPath,
     selected_package: sai_intern::PackageId,
 ) -> bool {
     path.package() == selected_package
+}
+
+fn view_definition_path_matches_record(
+    path: &sai_hir::DefPath,
+    definition_canonical_path: &str,
+    expected_interface: &str,
+    expected_record: &str,
+    record_disambiguator: u32,
+    symbols_interner: &sai_intern::Interner,
+) -> bool {
+    let [interface_component, record_component] = path.data() else {
+        return false;
+    };
+    let (DefPathData::Interface(interface_symbol), DefPathData::TypeNs(record_symbol)) =
+        (&interface_component.data, &record_component.data)
+    else {
+        return false;
+    };
+    if interface_component.disambiguator != 0
+        || record_component.disambiguator != record_disambiguator
+        || !symbols_interner
+            .resolve(*interface_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_interface)
+        || !symbols_interner
+            .resolve(*record_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_record)
+    {
+        return false;
+    }
+    let expected_canonical_path = format!(
+        "interface[{}:{};{}]/type[{}:{};{}]/",
+        expected_interface.len(),
+        expected_interface,
+        interface_component.disambiguator,
+        expected_record.len(),
+        expected_record,
+        record_component.disambiguator,
+    );
+    definition_canonical_path == expected_canonical_path
+}
+
+fn view_definition_path_matches_record_field(
+    path: &sai_hir::DefPath,
+    definition_canonical_path: &str,
+    record_path: &sai_hir::DefPath,
+    expected_interface: &str,
+    expected_record: &str,
+    record_disambiguator: u32,
+    expected_field: &str,
+    field_disambiguator: u32,
+    symbols_interner: &sai_intern::Interner,
+) -> bool {
+    let [interface_component, record_component, field_component] = path.data() else {
+        return false;
+    };
+    let [parent_interface_component, parent_record_component] = record_path.data() else {
+        return false;
+    };
+    let (
+        DefPathData::Interface(interface_symbol),
+        DefPathData::TypeNs(record_symbol),
+        DefPathData::Field(field_symbol),
+    ) = (
+        &interface_component.data,
+        &record_component.data,
+        &field_component.data,
+    )
+    else {
+        return false;
+    };
+    if interface_component != parent_interface_component
+        || record_component != parent_record_component
+        || record_component.disambiguator != record_disambiguator
+        || field_component.disambiguator != field_disambiguator
+        || !symbols_interner
+            .resolve(*interface_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_interface)
+        || !symbols_interner
+            .resolve(*record_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_record)
+        || !symbols_interner
+            .resolve(*field_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_field)
+    {
+        return false;
+    }
+    let expected_canonical_path = format!(
+        "interface[{}:{};{}]/type[{}:{};{}]/field[{}:{};{}]/",
+        expected_interface.len(),
+        expected_interface,
+        interface_component.disambiguator,
+        expected_record.len(),
+        expected_record,
+        record_component.disambiguator,
+        expected_field.len(),
+        expected_field,
+        field_component.disambiguator,
+    );
+    definition_canonical_path == expected_canonical_path
 }
 
 fn view_definition_matches_entity(
@@ -1897,21 +2409,24 @@ fn incomplete_inventory(
 #[cfg(test)]
 mod tests {
     use super::{
-        ValidatedFunctionSource, alias_path_matches_selected_package, alias_source_identity,
-        function_source_identity, resource_members_match_source, resource_source_identity,
-        verified_view_path_hash, view_definition_matches_entity,
-        view_definition_path_matches_alias, view_definition_path_matches_enum,
-        view_definition_path_matches_enum_case,
+        ValidatedFunctionSource, alias_source_identity, function_source_identity,
+        interface_type_item_disambiguator, record_field_disambiguator, record_source_identity,
+        resource_members_match_source, resource_source_identity, verified_view_path_hash,
+        view_definition_matches_entity, view_definition_path_matches_alias,
+        view_definition_path_matches_enum, view_definition_path_matches_enum_case,
+        view_definition_path_matches_record, view_definition_path_matches_record_field,
+        view_path_matches_selected_package,
     };
     use sai_hir::{DefPath, DefPathData, DefPathHash, DisambiguatedDefPathData};
     use sai_intern::{Interner, PackageInterner};
     use sai_semantic::{SymbolKind, declaration_fingerprint_from_token_pairs};
     use sai_stable_hash::Fingerprint;
     use sai_wit::{
-        WitFunc, WitIfaceIdx, WitIndexVec, WitItem, WitItemIdx, WitItemKind, WitMember,
-        WitMemberKind, WitSpan, WitType, WitViewDef, WitViewDefKind, WitViewEntity,
-        authored_interface_alias_tokens, authored_interface_enum_tokens,
-        authored_interface_function_tokens, authored_interface_resource_tokens,
+        WitField, WitFunc, WitIfaceIdx, WitIndexVec, WitInterface, WitItem, WitItemIdx,
+        WitItemKind, WitMember, WitMemberKind, WitSpan, WitType, WitViewDef, WitViewDefKind,
+        WitViewEntity, authored_interface_alias_tokens, authored_interface_enum_tokens,
+        authored_interface_function_tokens, authored_interface_record_tokens,
+        authored_interface_resource_tokens,
     };
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -1958,6 +2473,36 @@ mod tests {
             since: None,
             deprecated: None,
             kind: WitItemKind::Alias(WitType::U32),
+            unsupported: None,
+            span: Some(WitSpan {
+                path: "root.wit".to_owned(),
+                range: name_range,
+            }),
+            declaration_span: None,
+            declaration_token_pairs: None,
+        }
+    }
+
+    fn record_item(source: &str, name: &str, field_names: &[&str]) -> WitItem {
+        let name_start = source.find(name).expect("record name occurs");
+        let name_range = name_start..name_start + name.len();
+        let _tokens = authored_interface_record_tokens(source, "api", name, &name_range)
+            .expect("direct record tokens are found");
+        WitItem {
+            name: name.to_owned(),
+            docs: None,
+            since: None,
+            deprecated: None,
+            kind: WitItemKind::Record(
+                field_names
+                    .iter()
+                    .map(|field_name| WitField {
+                        name: (*field_name).to_owned(),
+                        docs: None,
+                        ty: WitType::U32,
+                    })
+                    .collect(),
+            ),
             unsupported: None,
             span: Some(WitSpan {
                 path: "root.wit".to_owned(),
@@ -2050,6 +2595,58 @@ mod tests {
                 DisambiguatedDefPathData {
                     data: DefPathData::Variant(path_symbol(symbols, "Ready")),
                     disambiguator: 0,
+                },
+            ],
+        )
+    }
+
+    fn record_path(
+        packages: &PackageInterner,
+        package: sai_intern::PackageId,
+        symbols: &Interner,
+        record_disambiguator: u32,
+    ) -> DefPath {
+        def_path(
+            packages,
+            package,
+            symbols,
+            vec![
+                DisambiguatedDefPathData {
+                    data: DefPathData::Interface(path_symbol(symbols, "api")),
+                    disambiguator: 0,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::TypeNs(path_symbol(symbols, "Record")),
+                    disambiguator: record_disambiguator,
+                },
+            ],
+        )
+    }
+
+    fn record_field_path(
+        packages: &PackageInterner,
+        package: sai_intern::PackageId,
+        symbols: &Interner,
+        record_disambiguator: u32,
+        field_name: &str,
+        field_disambiguator: u32,
+    ) -> DefPath {
+        def_path(
+            packages,
+            package,
+            symbols,
+            vec![
+                DisambiguatedDefPathData {
+                    data: DefPathData::Interface(path_symbol(symbols, "api")),
+                    disambiguator: 0,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::TypeNs(path_symbol(symbols, "Record")),
+                    disambiguator: record_disambiguator,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::Field(path_symbol(symbols, field_name)),
+                    disambiguator: field_disambiguator,
                 },
             ],
         )
@@ -2203,6 +2800,229 @@ mod tests {
         let mut missing_span = item;
         missing_span.span = None;
         assert!(alias_source_identity(&missing_span, "api", &sources).is_none());
+    }
+
+    #[test]
+    fn record_source_identity_requires_exact_name_span_and_ordered_fields() {
+        let source = "interface api { record point { x: u32, y: string } }\n";
+        let item = record_item(source, "point", &["x", "y"]);
+        let fields = match &item.kind {
+            WitItemKind::Record(fields) => fields.clone(),
+            _ => unreachable!(),
+        };
+        let sources = source_map(source);
+        let scanned =
+            record_source_identity(&item, "api", &fields, &sources).expect("record validates");
+        assert_eq!(scanned.fields.len(), fields.len());
+        assert_eq!(scanned.fields[0].name, "x");
+        assert_eq!(scanned.fields[1].name, "y");
+
+        let mut wrong_span = item.clone();
+        wrong_span.span.as_mut().expect("record span").range.end += 1;
+        assert!(record_source_identity(&wrong_span, "api", &fields, &sources).is_none());
+
+        assert!(record_source_identity(&item, "other", &fields, &sources).is_none());
+        let edited_source = source.replace("point", "vector");
+        assert!(
+            record_source_identity(&item, "api", &fields, &source_map(&edited_source)).is_none(),
+            "the record span cannot validate against changed source bytes"
+        );
+
+        let reordered_fields = vec![fields[1].clone(), fields[0].clone()];
+        assert!(
+            record_source_identity(&item, "api", &reordered_fields, &sources).is_none(),
+            "model fields must match source order"
+        );
+        let wrong_field = vec![
+            fields[0].clone(),
+            WitField {
+                name: "renamed".to_owned(),
+                ..fields[1].clone()
+            },
+        ];
+        assert!(record_source_identity(&item, "api", &wrong_field, &sources).is_none());
+
+        let mut partial_metadata = item.clone();
+        partial_metadata.declaration_span = Some(WitSpan {
+            path: "root.wit".to_owned(),
+            range: scanned.declaration_range,
+        });
+        assert!(
+            record_source_identity(&partial_metadata, "api", &fields, &sources).is_none(),
+            "partial parser declaration metadata is rejected"
+        );
+
+        let mut missing_span = item;
+        missing_span.span = None;
+        assert!(record_source_identity(&missing_span, "api", &fields, &sources).is_none());
+    }
+
+    #[test]
+    fn record_and_field_def_paths_require_exact_components_parent_and_serialization() {
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:sample#1.0.0")
+            .expect("package interns");
+        let symbols = Interner::new();
+        let parent = record_path(&packages, package, &symbols, 1);
+        let field = record_field_path(&packages, package, &symbols, 1, "name", 1);
+        let record_canonical = "interface[3:api;0]/type[6:Record;1]/";
+        let field_canonical = "interface[3:api;0]/type[6:Record;1]/field[4:name;1]/";
+
+        assert!(view_definition_path_matches_record(
+            &parent,
+            record_canonical,
+            "api",
+            "Record",
+            1,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_record(
+            &parent,
+            record_canonical,
+            "api",
+            "Record",
+            0,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_record(
+            &parent,
+            "interface[3:api;0]/type[6:Record;0]/",
+            "api",
+            "Record",
+            1,
+            &symbols
+        ));
+        let foreign_package = packages
+            .intern("other:package#1.0.0")
+            .expect("foreign package interns");
+        let foreign_parent = record_path(&packages, foreign_package, &symbols, 1);
+        let foreign_hash =
+            DefPathHash::compute(&foreign_parent, &packages, &symbols).expect("foreign hash");
+        assert_eq!(
+            verified_view_path_hash(&foreign_parent, foreign_hash, &packages, &symbols),
+            Some(Fingerprint::new(foreign_hash.raw())),
+            "a foreign path can have a valid hash for itself"
+        );
+        assert!(!view_path_matches_selected_package(
+            &foreign_parent,
+            package
+        ));
+
+        assert!(view_definition_path_matches_record_field(
+            &field,
+            field_canonical,
+            &parent,
+            "api",
+            "Record",
+            1,
+            "name",
+            1,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_record_field(
+            &field,
+            field_canonical,
+            &parent,
+            "api",
+            "Record",
+            0,
+            "name",
+            1,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_record_field(
+            &field,
+            "interface[3:api;0]/type[6:Record;1]/field[4:name;0]/",
+            &parent,
+            "api",
+            "Record",
+            1,
+            "name",
+            1,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_record_field(
+            &field,
+            field_canonical,
+            &record_path(&packages, package, &symbols, 0),
+            "api",
+            "Record",
+            1,
+            "name",
+            1,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_record_field(
+            &field,
+            field_canonical,
+            &parent,
+            "api",
+            "WrongRecord",
+            1,
+            "name",
+            1,
+            &symbols
+        ));
+    }
+
+    #[test]
+    fn record_namespace_ordinals_follow_type_and_field_name_order() {
+        let source = "interface api { record point {} }\n";
+        let mut earlier_type = record_item(source, "point", &[]);
+        earlier_type.name = "record".to_owned();
+        let mut function = earlier_type.clone();
+        function.kind = WitItemKind::Func(WitFunc {
+            params: Vec::new(),
+            result: None,
+            is_async: false,
+        });
+        let mut current_type = earlier_type.clone();
+        current_type.span = None;
+        let items = sai_wit::WitIndexVec::<WitItemIdx, _>::try_from_vec(vec![
+            earlier_type,
+            function,
+            current_type,
+        ])
+        .expect("item indices fit");
+        let current_index = items
+            .iter_enumerated()
+            .nth(2)
+            .map(|(index, _)| index)
+            .expect("current type item is present");
+        let interface = WitInterface {
+            name: "api".to_owned(),
+            docs: None,
+            since: None,
+            deprecated: None,
+            items,
+            span: None,
+        };
+        assert_eq!(
+            interface_type_item_disambiguator(&interface, current_index, "Record"),
+            Some(1),
+            "only prior type-namespace names contribute"
+        );
+
+        let fields = vec![
+            WitField {
+                name: "name".to_owned(),
+                docs: None,
+                ty: WitType::String,
+            },
+            WitField {
+                name: "age".to_owned(),
+                docs: None,
+                ty: WitType::U32,
+            },
+            WitField {
+                name: "name".to_owned(),
+                docs: None,
+                ty: WitType::String,
+            },
+        ];
+        assert_eq!(record_field_disambiguator(&fields, 2, "name"), Some(1));
+        assert_eq!(record_field_disambiguator(&fields, 1, "age"), Some(0));
     }
 
     #[test]
@@ -2395,8 +3215,8 @@ mod tests {
             verified_view_path_hash(&foreign_path, foreign_hash, &packages, &symbols).is_some(),
             "a correctly recomputed foreign package hash is internally valid"
         );
-        assert!(!alias_path_matches_selected_package(&foreign_path, package));
-        assert!(alias_path_matches_selected_package(&path, package));
+        assert!(!view_path_matches_selected_package(&foreign_path, package));
+        assert!(view_path_matches_selected_package(&path, package));
         assert_eq!(
             verified_view_path_hash(
                 &path,

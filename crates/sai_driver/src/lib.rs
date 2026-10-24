@@ -25677,6 +25677,233 @@ interface api {
     }
 
     #[test]
+    fn wit_record_inventory_collects_direct_records_and_named_fields() {
+        let wit_source = br#"package acme:phase1@1.0.0;
+interface api {
+    @since(version = 1.0.0)
+    record person {
+        name: string,
+        age: u32,
+        metadata: tuple<u32, result<string, u32>>,
+        %type: string,
+    }
+    record unsupported { payload: map<string, u32> }
+    variant outcome { ready, failed(u32) }
+}"#;
+        let (mut database, package, collection) = collect_single_authored_wit_inventory(wit_source);
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { .. }
+        ));
+
+        let source = std::str::from_utf8(wit_source).expect("fixture WIT is UTF-8");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version parses"),
+        )
+        .expect("root package selection is valid");
+        let unit =
+            WitUnit::dir(package, &database.packages, &selected).expect("root WIT unit is valid");
+        let loaded = database
+            .wit_package(&unit)
+            .expect("root WIT package query succeeds")
+            .package
+            .expect("root WIT package model is available");
+        let root = loaded.root();
+        let (interface_index, interface) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "api")
+            .expect("root interface is present");
+        let view = database
+            .wit_view(&unit)
+            .expect("selected authored WIT view is available");
+        let view_interface = &view.interfaces["api"];
+
+        let records = interface
+            .items
+            .iter_enumerated()
+            .filter_map(|(item_index, item)| match &item.kind {
+                sai_wit::WitItemKind::Record(fields) if item.unsupported.is_none() => {
+                    Some((item_index, item, fields))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records
+                .iter()
+                .map(|(_, item, _)| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["person"],
+            "unsupported records are not treated as supported source declarations"
+        );
+
+        for (item_index, item, fields) in records {
+            let record_name =
+                sai_wit::wit_name_to_sai(&item.name, true).expect("record name maps to SAI");
+            let record_name = record_name.strip_prefix("r#").unwrap_or(&record_name);
+            let record_path = format!("acme:phase1/api.{record_name}");
+            let record_symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == record_path)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "record `{record_path}` is missing; coverage: {:?}; symbols: {:?}",
+                        inventory.coverage(),
+                        inventory.symbols()
+                    )
+                });
+            assert_eq!(record_symbol.kind(), sai_semantic::SymbolKind::Record);
+
+            let member = view_interface
+                .members
+                .get(record_name)
+                .expect("record is represented in the selected view");
+            assert_eq!(member.item, item_index);
+            assert_eq!(member.kind, sai_wit::WitViewDefKind::Struct);
+            let entity = sai_wit::WitViewEntity::Item {
+                interface: interface_index,
+                item: item_index,
+            };
+            let definition = view
+                .definition_for_entity(entity)
+                .expect("record has the exact view entity");
+            assert_eq!(member.def, definition);
+            let view_definition = view.definition(definition).expect("view definition exists");
+            assert_eq!(view_definition.entity, entity);
+            assert_eq!(view_definition.kind, sai_wit::WitViewDefKind::Struct);
+            let def_path = view
+                .def_path(definition)
+                .expect("record DefPath resolves")
+                .expect("record DefPath exists");
+            assert_eq!(def_path.package(), view.package);
+            assert!(matches!(
+                def_path.data(),
+                [
+                    sai_hir::DisambiguatedDefPathData {
+                        data: sai_hir::DefPathData::Interface(interface_name),
+                        disambiguator: 0,
+                    },
+                    sai_hir::DisambiguatedDefPathData {
+                        data: sai_hir::DefPathData::TypeNs(type_name),
+                        disambiguator: 0,
+                    },
+                ] if database.symbols.resolve(*interface_name).is_ok_and(|name| name.as_ref() == "api")
+                    && database.symbols.resolve(*type_name).is_ok_and(|name| name.as_ref() == record_name)
+            ));
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&def_path, &database.packages, &database.symbols)
+                    .expect("record DefPath hash computes");
+            assert_eq!(
+                record_symbol.def_path_hash(),
+                Fingerprint::new(expected_hash.raw())
+            );
+
+            let name_span = item.span.as_ref().expect("record name span is mapped");
+            let record_tokens = sai_wit::authored_interface_record_tokens(
+                source,
+                &interface.name,
+                &item.name,
+                &name_span.range,
+            )
+            .expect("the exact authored record sidecar is available");
+            assert_eq!(record_tokens.fields.len(), fields.len());
+            assert_eq!(
+                record_symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint_from_token_pairs(
+                    sai_semantic::SymbolKind::Record,
+                    &record_tokens.token_pairs
+                )
+            );
+
+            for (field_index, (field, source_field)) in
+                fields.iter().zip(&record_tokens.fields).enumerate()
+            {
+                let field_name =
+                    sai_wit::wit_name_to_sai(&field.name, false).expect("field name maps to SAI");
+                let field_name = field_name.strip_prefix("r#").unwrap_or(&field_name);
+                let field_path = format!("{record_path}.field[{field_name}]");
+                let field_symbol = inventory
+                    .symbols()
+                    .iter()
+                    .find(|symbol| symbol.path() == field_path)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "record field `{field_path}` is missing; coverage: {:?}; symbols: {:?}",
+                            inventory.coverage(),
+                            inventory.symbols()
+                        )
+                    });
+                assert_eq!(field_symbol.kind(), sai_semantic::SymbolKind::Field);
+                let field_entity = sai_wit::WitViewEntity::Field {
+                    interface: interface_index,
+                    item: item_index,
+                    field: u32::try_from(field_index).expect("field index fits"),
+                };
+                let field_definition = view
+                    .definition_for_entity(field_entity)
+                    .expect("field has the exact view entity");
+                let field_view_definition = view
+                    .definition(field_definition)
+                    .expect("field view definition exists");
+                assert_eq!(field_view_definition.entity, field_entity);
+                assert_eq!(field_view_definition.kind, sai_wit::WitViewDefKind::Field);
+                let field_def_path = view
+                    .def_path(field_definition)
+                    .expect("field DefPath resolves")
+                    .expect("field DefPath exists");
+                assert_eq!(field_def_path.package(), view.package);
+                assert_eq!(
+                    field_def_path.data().get(..2),
+                    def_path.data().get(..2),
+                    "field DefPath extends the exact record DefPath"
+                );
+                assert!(matches!(
+                    field_def_path.data().last(),
+                    Some(sai_hir::DisambiguatedDefPathData {
+                        data: sai_hir::DefPathData::Field(name),
+                        ..
+                    }) if database.symbols.resolve(*name).is_ok_and(|name| name.as_ref() == field_name)
+                ));
+                let expected_field_hash = sai_hir::DefPathHash::compute(
+                    &field_def_path,
+                    &database.packages,
+                    &database.symbols,
+                )
+                .expect("field DefPath hash computes");
+                assert_eq!(
+                    field_symbol.def_path_hash(),
+                    Fingerprint::new(expected_field_hash.raw())
+                );
+                assert_eq!(
+                    field_symbol.fingerprint(),
+                    sai_semantic::declaration_fingerprint_from_token_pairs(
+                        sai_semantic::SymbolKind::Field,
+                        &source_field.token_pairs
+                    )
+                );
+            }
+        }
+
+        for path in [
+            "acme:phase1/api.Unsupported",
+            "acme:phase1/api.Unsupported.field[payload]",
+            "acme:phase1/api.Outcome",
+        ] {
+            assert!(
+                inventory
+                    .symbols()
+                    .iter()
+                    .all(|symbol| symbol.path() != path),
+                "unsupported records and out-of-slice variants do not leak symbols: {path}"
+            );
+        }
+    }
+
+    #[test]
     fn wit_function_inventory_does_not_promote_resource_methods_to_interface_functions() {
         let wit_source = b"package acme:phase1@1.0.0;\n\
 interface api {\n\
