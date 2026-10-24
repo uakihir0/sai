@@ -4,8 +4,9 @@ Orbital Conjunction Review ranks a fixed set of fictional satellite conjunction
 alerts, estimates conservative miss distance from the supplied uncertainty,
 and checks whether a proposed maneuver fits the spacecraft's simplified
 propellant and timing constraints. It emits operator-readable recommendations
-in priority order and reserves a spacecraft's propellant budget as earlier
-maneuvers are accepted.
+in priority order and treats feasible recommendations as accepted for
+portfolio budgeting, reserving each spacecraft's propellant budget as they
+are processed.
 
 ## Hand-checked fixture decisions
 
