@@ -1,7 +1,10 @@
 use super::{OwnedPhase1ModuleInput, PreparedPhase1PackageScopes};
 use sai_hir::{
     DefPathData, DefPathHash, DefPathInterner, LocalDefId, PackageId,
-    item_tree::{ItemTreeEntry, ItemTreeKind},
+    item_tree::{
+        ItemTreeEntry, ItemTreeKind, interface_member_path_component,
+        interface_member_path_disambiguator,
+    },
 };
 use sai_intern::{Interner, PackageInterner, Symbol};
 use sai_package::mvs::MvsPackageVersion;
@@ -16,7 +19,7 @@ use sai_semantic::{
 };
 use sai_stable_hash::Fingerprint;
 use sai_syntax::{
-    SyntaxElement, SyntaxKind, SyntaxNode,
+    SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken,
     ast::{self, AstNode, AstToken},
 };
 use sai_vfs::{FileId, PackageKey};
@@ -50,7 +53,9 @@ impl Phase1PackageSymbolInventory {
 /// and their generic parameters, non-generic refined types, constants, user
 /// effects, worlds, tests, properties, extern functions, and traits with their
 /// generic parameters, direct associated types and functions, and trait-method
-/// generic parameters. World import/export/include entries are validated as
+/// generic parameters. Local interfaces and their direct freestanding
+/// functions are included; interface resources and other interface members
+/// remain unsupported. World import/export/include entries are validated as
 /// world contents but do not produce symbols. Every other symbol-bearing
 /// declaration makes the result incomplete until its symbol kind and path are
 /// collected as well.
@@ -152,6 +157,8 @@ pub(super) fn collect_module_function_inventory(
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut trait_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
+    let mut interface_owners_by_item =
+        HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut resource_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut enum_owners_by_item =
@@ -203,6 +210,11 @@ pub(super) fn collect_module_function_inventory(
             TopLevelOwnerKind::Trait => {
                 if trait_owners_by_item.insert(key, *descriptor).is_some() {
                     reasons.insert("Phase 1 contains duplicate trait owner descriptors".into());
+                }
+            }
+            TopLevelOwnerKind::Interface => {
+                if interface_owners_by_item.insert(key, *descriptor).is_some() {
+                    reasons.insert("Phase 1 contains duplicate interface owner descriptors".into());
                 }
             }
             TopLevelOwnerKind::Resource => {
@@ -300,6 +312,7 @@ pub(super) fn collect_module_function_inventory(
     let mut consumed_owners = HashSet::new();
     let mut consumed_record_owners = HashSet::new();
     let mut consumed_trait_owners = HashSet::new();
+    let mut consumed_interface_owners = HashSet::new();
     let mut consumed_resource_owners = HashSet::new();
     let mut consumed_enum_owners = HashSet::new();
     let mut consumed_distinct_owners = HashSet::new();
@@ -405,6 +418,25 @@ pub(super) fn collect_module_function_inventory(
                         &trait_owners_by_item,
                         &mut seen_items,
                         &mut consumed_trait_owners,
+                        &mut canonical_paths,
+                        &mut current_symbols,
+                        &mut reasons,
+                        def_paths,
+                        packages,
+                        symbols,
+                    );
+                }
+                ItemTreeKind::Interface => {
+                    collect_interface(
+                        entry,
+                        module.file,
+                        &module_path,
+                        package_version.package(),
+                        input,
+                        prepared.module_tree.package,
+                        &interface_owners_by_item,
+                        &mut seen_items,
+                        &mut consumed_interface_owners,
                         &mut canonical_paths,
                         &mut current_symbols,
                         &mut reasons,
@@ -636,6 +668,12 @@ pub(super) fn collect_module_function_inventory(
                 .to_owned(),
         );
     }
+    if consumed_interface_owners.len() != interface_owners_by_item.len() {
+        reasons.insert(
+            "the Phase 1 interface owner descriptors do not exactly match the filtered ItemTree"
+                .to_owned(),
+        );
+    }
     if consumed_resource_owners.len() != resource_owners_by_item.len() {
         reasons.insert(
             "the Phase 1 resource owner descriptors do not exactly match the filtered ItemTree"
@@ -720,6 +758,13 @@ pub(super) fn collect_module_function_inventory(
         if !seen_items.contains(&(*file_id, *item_id)) {
             reasons.insert(
                 "a Phase 1 trait owner has no target-filtered ItemTree declaration".to_owned(),
+            );
+        }
+    }
+    for ((file_id, item_id), _) in &interface_owners_by_item {
+        if !seen_items.contains(&(*file_id, *item_id)) {
+            reasons.insert(
+                "a Phase 1 interface owner has no target-filtered ItemTree declaration".to_owned(),
             );
         }
     }
@@ -2041,6 +2086,519 @@ fn collect_trait(
                 symbols,
             );
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_interface(
+    entry: &ItemTreeEntry,
+    file_id: FileId,
+    module_path: &[String],
+    package_identity: &str,
+    input: &OwnedPhase1ModuleInput,
+    package_id: PackageId,
+    owners_by_item: &HashMap<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>,
+    seen_items: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    consumed_owners: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    reasons: &mut HashSet<String>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) {
+    #[derive(Clone)]
+    enum InterfaceChild {
+        Type(ast::TypeDecl),
+        Enum(ast::EnumDecl),
+        Resource(ast::IfaceResource),
+        Function(ast::FnDecl),
+    }
+
+    let key = (file_id, entry.ast_id);
+    if !seen_items.insert(key) {
+        reasons.insert("the target-filtered ItemTree contains a duplicate interface AST ID".into());
+    }
+    if entry.kind != ItemTreeKind::Interface {
+        reasons.insert("a non-interface ItemTree entry reached the interface collector".into());
+        return;
+    }
+    if entry.name == Symbol::ERROR {
+        reasons.insert("a target-filtered interface has no valid declaration name".into());
+        return;
+    }
+    let name = match symbols.resolve(entry.name) {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            reasons.insert("a target-filtered interface name cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let Some(descriptor) = owners_by_item.get(&key).copied() else {
+        reasons.insert("a target-filtered interface has no matching Phase 1 owner".to_owned());
+        return;
+    };
+    if descriptor.kind != TopLevelOwnerKind::Interface
+        || descriptor.file != file_id
+        || descriptor.item_id != entry.ast_id
+    {
+        reasons
+            .insert("an interface owner descriptor has the wrong source identity or kind".into());
+        return;
+    }
+    consumed_owners.insert(key);
+
+    let Some(pointer) = input.ast_ids.pointer(entry.ast_id) else {
+        reasons.insert("a target-filtered interface AST ID has no source pointer".to_owned());
+        return;
+    };
+    let Some(syntax) = pointer.resolve(file_id, &input.root) else {
+        reasons.insert("a target-filtered interface source pointer is stale".to_owned());
+        return;
+    };
+    let Some(declaration) = ast::InterfaceDecl::cast(syntax.clone()) else {
+        reasons.insert("an interface source pointer resolves to a non-interface node".into());
+        return;
+    };
+    if input.ast_ids.ast_id(&declaration).map(|id| id.erase()) != Some(entry.ast_id) {
+        reasons.insert("an interface AST ID does not match its current declaration".into());
+        return;
+    }
+    let Some(expected_pointer) = sai_syntax::SyntaxNodePtr::new(file_id, declaration.syntax()).ok()
+    else {
+        reasons.insert("an interface AST cannot be bound to its source file".to_owned());
+        return;
+    };
+    if !pointer.is_same_source_node(&expected_pointer) {
+        reasons.insert("an interface source pointer identifies a different AST node".into());
+        return;
+    }
+    let Some(name_token) = declaration.name().and_then(|name| name.token()) else {
+        reasons.insert("a target-filtered interface AST has no name token".to_owned());
+        return;
+    };
+    let raw_name = name_token
+        .text()
+        .strip_prefix("r#")
+        .unwrap_or(name_token.text());
+    if sai_syntax::normalize_identifier(raw_name) != name {
+        reasons.insert("the ItemTree and interface AST disagree about the declaration name".into());
+        return;
+    }
+    if syntax_has_errors(&syntax)
+        || name_token.has_error()
+        || input
+            .parser_diagnostics
+            .iter()
+            .any(|diagnostic| parser_diagnostic_overlaps_syntax(diagnostic, file_id, &syntax))
+    {
+        reasons.insert("a target-filtered interface AST contains recovery or parser errors".into());
+        return;
+    }
+    if input.filtered.validated_attrs.get(&entry.ast_id).is_none() {
+        reasons.insert("a target-filtered interface has no attribute-validation record".into());
+        return;
+    }
+    let expected_visibility = declaration
+        .visibility()
+        .map(|visibility| {
+            if visibility.export_token().is_some() {
+                sai_hir::Visibility::Export
+            } else if visibility.pub_token().is_some() {
+                sai_hir::Visibility::Pub
+            } else {
+                sai_hir::Visibility::Private
+            }
+        })
+        .unwrap_or(sai_hir::Visibility::Private);
+    if entry.vis != expected_visibility {
+        reasons.insert("the interface ItemTree visibility does not match its snapshot AST".into());
+        return;
+    }
+
+    let Some(item_list) = declaration.items() else {
+        reasons.insert("an interface has no direct member list".to_owned());
+        return;
+    };
+    let mut expected_children = Vec::<(usize, InterfaceChild)>::new();
+    for child in item_list.syntax().children() {
+        let member = if let Some(declaration) = ast::TypeDecl::cast(child.clone()) {
+            Some(InterfaceChild::Type(declaration))
+        } else if let Some(declaration) = ast::EnumDecl::cast(child.clone()) {
+            Some(InterfaceChild::Enum(declaration))
+        } else if let Some(resource) = ast::IfaceResource::cast(child.clone()) {
+            Some(InterfaceChild::Resource(resource))
+        } else if let Some(function) = ast::FnDecl::cast(child.clone()) {
+            Some(InterfaceChild::Function(function))
+        } else {
+            None
+        };
+        if let Some(member) = member {
+            expected_children.push((child.text_range().start().to_usize(), member));
+        } else {
+            reasons.insert(
+                "an interface contains an unsupported or unrecognized direct member form".into(),
+            );
+        }
+    }
+    expected_children.sort_by_key(|(offset, _)| *offset);
+    let expected_child_identities = expected_children
+        .iter()
+        .map(|(_, member)| {
+            Some(match member {
+                InterfaceChild::Type(declaration) => (
+                    match declaration.struct_def() {
+                        Some(_) => ItemTreeKind::Struct,
+                        None if declaration
+                            .alias_def()
+                            .is_some_and(|definition| definition.refinement().is_some()) =>
+                        {
+                            ItemTreeKind::Refined
+                        }
+                        None => ItemTreeKind::Alias,
+                    },
+                    input.ast_ids.ast_id(declaration).map(|id| id.erase())?,
+                ),
+                InterfaceChild::Enum(declaration) => (
+                    ItemTreeKind::Enum,
+                    input.ast_ids.ast_id(declaration).map(|id| id.erase())?,
+                ),
+                InterfaceChild::Resource(declaration) => (
+                    ItemTreeKind::Resource,
+                    input.ast_ids.ast_id(declaration).map(|id| id.erase())?,
+                ),
+                InterfaceChild::Function(declaration) => (
+                    ItemTreeKind::InterfaceFn,
+                    input.ast_ids.ast_id(declaration).map(|id| id.erase())?,
+                ),
+            })
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(expected_child_identities) = expected_child_identities else {
+        reasons.insert("an interface child has no current-snapshot AST ID".to_owned());
+        return;
+    };
+    if !trait_children_match_order(&expected_child_identities, &entry.children) {
+        reasons.insert(
+            "an interface's ItemTree child kind or source order does not match its snapshot AST"
+                .into(),
+        );
+        return;
+    }
+
+    let mut validated_functions = Vec::<(ItemTreeEntry, ast::FnDecl, String, SyntaxToken)>::new();
+    for ((_, member), child) in expected_children.iter().zip(&entry.children) {
+        let (member_name, member_syntax, function) = match member {
+            InterfaceChild::Type(declaration) => {
+                (declaration.name(), declaration.syntax().clone(), None)
+            }
+            InterfaceChild::Enum(declaration) => {
+                (declaration.name(), declaration.syntax().clone(), None)
+            }
+            InterfaceChild::Resource(declaration) => {
+                (declaration.name(), declaration.syntax().clone(), None)
+            }
+            InterfaceChild::Function(function) => (
+                function.name(),
+                function.syntax().clone(),
+                Some(function.clone()),
+            ),
+        };
+        let Some(child_pointer) = input.ast_ids.pointer(child.ast_id) else {
+            reasons.insert("an interface ItemTree child has no current source pointer".into());
+            return;
+        };
+        let Some(expected_pointer) = sai_syntax::SyntaxNodePtr::new(file_id, &member_syntax).ok()
+        else {
+            reasons.insert("an interface child cannot be bound to its source file".into());
+            return;
+        };
+        if !child_pointer.is_same_source_node(&expected_pointer) {
+            reasons.insert("an interface ItemTree child points to a different AST node".into());
+            return;
+        }
+        let Some(child_syntax) = child_pointer.resolve(file_id, &input.root) else {
+            reasons.insert("an interface ItemTree child source pointer is stale".into());
+            return;
+        };
+        if child_syntax.kind() != member_syntax.kind()
+            || child_syntax.text_range() != member_syntax.text_range()
+        {
+            reasons
+                .insert("an interface ItemTree child resolves to a different source range".into());
+            return;
+        }
+        if child.name == Symbol::ERROR {
+            reasons.insert("an interface direct member has no valid ItemTree name".to_owned());
+            return;
+        }
+        let child_name = match symbols.resolve(child.name) {
+            Ok(name) if !name.is_empty() => name.to_string(),
+            _ => {
+                reasons.insert("an interface direct member name cannot be resolved".into());
+                return;
+            }
+        };
+        let Some(child_name_token) = member_name.and_then(|name| name.token()) else {
+            reasons.insert("an interface direct member AST has no name token".into());
+            return;
+        };
+        let raw_child_name = child_name_token
+            .text()
+            .strip_prefix("r#")
+            .unwrap_or(child_name_token.text());
+        if sai_syntax::normalize_identifier(raw_child_name) != child_name {
+            reasons.insert("the interface ItemTree and AST member names disagree".into());
+            return;
+        }
+        if syntax_has_errors(&member_syntax)
+            || child_name_token.has_error()
+            || input.parser_diagnostics.iter().any(|diagnostic| {
+                parser_diagnostic_overlaps_syntax(diagnostic, file_id, &member_syntax)
+            })
+        {
+            reasons.insert("an interface direct member contains parser recovery or errors".into());
+            return;
+        }
+
+        let Some(function) = function else {
+            reasons.insert(
+                "interface resource, record, alias, enum, and other type members remain outside the supported symbol slice"
+                    .into(),
+            );
+            continue;
+        };
+        if child.kind != ItemTreeKind::InterfaceFn {
+            reasons.insert("an interface function has the wrong ItemTree kind".into());
+            return;
+        }
+        if !child.children.is_empty() {
+            reasons.insert(
+                "an interface function's generic parameters are outside the supported symbol slice"
+                    .into(),
+            );
+        }
+        if function.generic_params().is_some()
+            || function.unsafe_token().is_some()
+            || function.async_token().is_some()
+            || function.body().is_some()
+            || function.params().is_some_and(|parameters| {
+                parameters
+                    .syntax()
+                    .children()
+                    .any(|parameter| ast::SelfParam::cast(parameter).is_some())
+            })
+            || function.syntax().children().any(|child| {
+                ast::WhereClause::cast(child.clone()).is_some()
+                    || ast::BorrowsClause::cast(child.clone()).is_some()
+                    || ast::EffectsClause::cast(child.clone()).is_some()
+                    || ast::RequiresClause::cast(child.clone()).is_some()
+                    || ast::EnsuresClause::cast(child).is_some()
+            })
+        {
+            reasons.insert(
+                "an interface function has an unsupported generic, async, unsafe, self, clause, or body form"
+                    .into(),
+            );
+        }
+        if child.vis != sai_hir::Visibility::Private || function.visibility().is_some() {
+            reasons
+                .insert("an interface function has unsupported individual visibility".to_owned());
+        }
+        let Some(attrs) = input.filtered.validated_attrs.get(&child.ast_id) else {
+            reasons.insert("an interface function has no attribute-validation record".into());
+            return;
+        };
+        if attrs.target.is_some() {
+            reasons.insert("an interface function unexpectedly has a target predicate".into());
+        }
+        validated_functions.push((child.clone(), function, child_name, child_name_token));
+    }
+
+    let interface_component = DefPathData::Interface(entry.name);
+    let Some(item_position) = input
+        .filtered
+        .item_tree
+        .items
+        .iter()
+        .position(|candidate| candidate.ast_id == entry.ast_id)
+    else {
+        reasons.insert("a target-filtered interface is absent from its module ItemTree".into());
+        return;
+    };
+    let owner_disambiguator = input.filtered.item_tree.items[..item_position]
+        .iter()
+        .filter(|candidate| {
+            candidate.kind == ItemTreeKind::Interface && candidate.name == entry.name
+        })
+        .count();
+    let Ok(owner_disambiguator) = u32::try_from(owner_disambiguator) else {
+        reasons.insert("an interface owner DefPath disambiguator overflowed".to_owned());
+        return;
+    };
+    let def_path = match def_paths.resolve(descriptor.owner.def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        Ok(Some(_)) => {
+            reasons.insert(
+                "an interface owner resolves to a definition path from another package".into(),
+            );
+            return;
+        }
+        Ok(None) => {
+            reasons.insert("an interface owner has no canonical definition path".to_owned());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("an interface owner definition path cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let path_matches_declaration = def_path.data().len() == module_path.len() + 1
+        && def_path
+            .data()
+            .iter()
+            .take(module_path.len())
+            .zip(module_path)
+            .all(|(component, module_name)| {
+                component.disambiguator == 0
+                    && matches!(&component.data, DefPathData::Module(segment)
+                        if symbols.resolve(*segment).is_ok_and(|resolved| resolved.as_ref() == module_name))
+            })
+        && def_path.data().last().is_some_and(|component| {
+            component.data == interface_component && component.disambiguator == owner_disambiguator
+        });
+    if !path_matches_declaration {
+        reasons.insert(
+            "the interface DefPath does not match its module, name, or source-order disambiguator"
+                .into(),
+        );
+        return;
+    }
+
+    let canonical_path = format!(
+        "{}{}.{name}",
+        package_identity,
+        module_path
+            .iter()
+            .map(|segment| format!("/{segment}"))
+            .collect::<String>()
+    );
+    if !canonical_paths.insert(canonical_path.clone()) {
+        reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+    }
+    let def_path_hash = match DefPathHash::compute(&def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert("an interface definition path hash cannot be computed".to_owned());
+            return;
+        }
+    };
+    let fingerprint =
+        match declaration_fingerprint(SymbolKind::Interface, &syntax, Some(&name_token)) {
+            Ok(fingerprint) => fingerprint,
+            Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                reasons.insert(
+                    "an interface name token is outside its declaration syntax node".into(),
+                );
+                return;
+            }
+        };
+    current_symbols.push(CurrentSymbol::new(
+        canonical_path.clone(),
+        def_path_hash,
+        SymbolKind::Interface,
+        fingerprint,
+    ));
+
+    for (child, function, child_name, child_name_token) in validated_functions {
+        let component = match interface_member_path_component(&child) {
+            Some(component @ DefPathData::ValueNs(_)) => component,
+            _ => {
+                reasons.insert("an interface function has no ValueNs DefPath component".into());
+                continue;
+            }
+        };
+        let disambiguator = match interface_member_path_disambiguator(entry, &child) {
+            Ok(disambiguator) => disambiguator,
+            Err(sai_hir::item_tree::InterfaceMemberPathError::ItemTreeMismatch) => {
+                reasons.insert(
+                    "an interface function has no source-ordered ItemTree disambiguator".into(),
+                );
+                continue;
+            }
+            Err(sai_hir::item_tree::InterfaceMemberPathError::TooManyDefinitions) => {
+                reasons.insert("an interface function DefPath disambiguator overflowed".into());
+                continue;
+            }
+        };
+        let child_def_id = match def_paths.intern_children(
+            descriptor.owner.def_id,
+            &[(component.clone(), disambiguator)],
+        ) {
+            Ok(mut children) if children.len() == 1 => children.remove(0),
+            _ => {
+                reasons.insert("an interface function DefPath cannot be interned".into());
+                continue;
+            }
+        };
+        let child_def_path = match def_paths.resolve(child_def_id) {
+            Ok(Some(path)) if path.package() == package_id => path,
+            Ok(Some(_)) => {
+                reasons.insert("an interface function resolves to another package".into());
+                continue;
+            }
+            Ok(None) => {
+                reasons.insert("an interface function has no canonical DefPath".into());
+                continue;
+            }
+            Err(_) => {
+                reasons.insert("an interface function DefPath cannot be resolved".into());
+                continue;
+            }
+        };
+        if child_def_path.data().len() != def_path.data().len() + 1
+            || child_def_path.data()[..def_path.data().len()] != *def_path.data()
+            || child_def_path.data().last().is_none_or(|path_component| {
+                path_component.data != component || path_component.disambiguator != disambiguator
+            })
+        {
+            reasons.insert(
+                "an interface function DefPath does not match its parent, ValueNs name, or source-order disambiguator"
+                    .into(),
+            );
+            continue;
+        }
+        let child_def_path_hash = match DefPathHash::compute(&child_def_path, packages, symbols) {
+            Ok(hash) => Fingerprint::new(hash.raw()),
+            Err(_) => {
+                reasons.insert("an interface function DefPath hash cannot be computed".into());
+                continue;
+            }
+        };
+        let child_fingerprint = match declaration_fingerprint(
+            SymbolKind::AssocFn,
+            function.syntax(),
+            Some(&child_name_token),
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                reasons
+                    .insert("an interface function name token is outside its syntax node".into());
+                continue;
+            }
+        };
+        let child_canonical_path = format!("{canonical_path}.{child_name}");
+        if !canonical_paths.insert(child_canonical_path.clone()) {
+            reasons.insert(format!(
+                "duplicate canonical symbol path {child_canonical_path}"
+            ));
+        }
+        current_symbols.push(CurrentSymbol::new(
+            child_canonical_path,
+            child_def_path_hash,
+            SymbolKind::AssocFn,
+            child_fingerprint,
+        ));
     }
 }
 
