@@ -12,6 +12,7 @@ pub(super) struct SourceScan {
     pub alias_declarations: Vec<SourceInterfaceAlias>,
     pub record_declarations: Vec<SourceInterfaceRecord>,
     pub enum_declarations: Vec<SourceInterfaceEnum>,
+    pub variant_declarations: Vec<SourceInterfaceVariant>,
     pub resource_declarations: Vec<SourceInterfaceResource>,
 }
 
@@ -59,6 +60,19 @@ pub struct AuthoredInterfaceEnumTokens {
     pub token_pairs: Vec<(String, String)>,
     /// Unit cases in source order.
     pub cases: Vec<AuthoredEnumCaseTokens>,
+}
+
+/// Source declaration and direct case boundaries for one authored interface
+/// variant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoredInterfaceVariantTokens {
+    /// Exact UTF-8 byte range from attached attributes through the closing `}`.
+    pub declaration_range: Range<usize>,
+    /// Ordered parser-aligned token pairs for the whole variant. The variant
+    /// name token is present with empty text.
+    pub token_pairs: Vec<(String, String)>,
+    /// Cases in source order. Payload syntax remains in each case's tokens.
+    pub cases: Vec<AuthoredVariantCaseTokens>,
 }
 
 /// Source declaration and name-token boundary for one direct interface type
@@ -112,6 +126,21 @@ pub struct AuthoredEnumCaseTokens {
     pub token_pairs: Vec<(String, String)>,
 }
 
+/// Source declaration and name-token boundary for one named WIT variant case.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoredVariantCaseTokens {
+    pub name: String,
+    /// Exact byte range of the case name token.
+    pub name_range: Range<usize>,
+    /// Exact UTF-8 byte range from attached attributes through the case payload.
+    pub declaration_range: Range<usize>,
+    /// Whether this case has one parenthesized payload type.
+    pub has_payload: bool,
+    /// Ordered parser-aligned token pairs. The case name token is present
+    /// with empty text while payload tokens are retained.
+    pub token_pairs: Vec<(String, String)>,
+}
+
 /// Source declaration and name-token boundary for one direct resource
 /// constructor, method, or static function.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,6 +177,16 @@ pub(super) struct SourceInterfaceEnum {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceInterfaceVariant {
+    pub interface_name: String,
+    pub name: String,
+    pub name_range: Range<usize>,
+    pub declaration_range: Range<usize>,
+    pub token_pairs: Vec<(String, String)>,
+    pub cases: Vec<SourceVariantCase>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SourceInterfaceAlias {
     pub interface_name: String,
     pub name: String,
@@ -179,6 +218,15 @@ pub(super) struct SourceEnumCase {
     pub name: String,
     pub name_range: Range<usize>,
     pub declaration_range: Range<usize>,
+    pub token_pairs: Vec<(String, String)>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceVariantCase {
+    pub name: String,
+    pub name_range: Range<usize>,
+    pub declaration_range: Range<usize>,
+    pub has_payload: bool,
     pub token_pairs: Vec<(String, String)>,
 }
 
@@ -426,6 +474,7 @@ pub(super) fn scan_source(source: &str) -> SourceScan {
         alias_declarations: scan_interface_aliases(source, &tokens),
         record_declarations: scan_interface_records(source, &tokens),
         enum_declarations: scan_interface_enums(source, &tokens),
+        variant_declarations: scan_interface_variants(source, &tokens),
         resource_declarations: scan_interface_resources(source, &tokens),
     }
 }
@@ -1006,6 +1055,47 @@ pub fn authored_interface_enum_tokens(
     })
 }
 
+/// Scans authored WIT source and returns one direct interface variant only
+/// when its parsed name-token span identifies exactly one lexical declaration.
+///
+/// Case ranges and token pairs are recovered from `source` itself. A case's
+/// own name is masked, while its complete parenthesized payload remains part
+/// of its fingerprint.
+pub fn authored_interface_variant_tokens(
+    source: &str,
+    interface_name: &str,
+    name: &str,
+    name_range: &Range<usize>,
+) -> Option<AuthoredInterfaceVariantTokens> {
+    let mut matches = scan_source(source)
+        .variant_declarations
+        .into_iter()
+        .filter(|declaration| {
+            declaration.interface_name == interface_name
+                && declaration.name == name
+                && &declaration.name_range == name_range
+        });
+    let declaration = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(AuthoredInterfaceVariantTokens {
+        declaration_range: declaration.declaration_range,
+        token_pairs: declaration.token_pairs,
+        cases: declaration
+            .cases
+            .into_iter()
+            .map(|case| AuthoredVariantCaseTokens {
+                name: case.name,
+                name_range: case.name_range,
+                declaration_range: case.declaration_range,
+                has_payload: case.has_payload,
+                token_pairs: case.token_pairs,
+            })
+            .collect(),
+    })
+}
+
 fn scan_interface_enums(source: &str, tokens: &[Token]) -> Vec<SourceInterfaceEnum> {
     let mut declarations = Vec::new();
     for (interface_index, interface_token) in tokens.iter().enumerate() {
@@ -1068,6 +1158,67 @@ fn scan_interface_enums(source: &str, tokens: &[Token]) -> Vec<SourceInterfaceEn
     declarations
 }
 
+fn scan_interface_variants(source: &str, tokens: &[Token]) -> Vec<SourceInterfaceVariant> {
+    let mut declarations = Vec::new();
+    for (interface_index, interface_token) in tokens.iter().enumerate() {
+        if !is_identifier(source, interface_token, "interface") {
+            continue;
+        }
+        let Some(interface_name_token) = tokens.get(interface_index + 1) else {
+            continue;
+        };
+        let Some(interface_name) = wit_identifier_text(source, interface_name_token) else {
+            continue;
+        };
+        let open_index = interface_index + 2;
+        if !tokens
+            .get(open_index)
+            .is_some_and(|token| token.kind == TokenKind::Punctuation(b'{'))
+        {
+            continue;
+        }
+        let Some(interface_end) = matching_delimiter(tokens, open_index, b'{', b'}') else {
+            continue;
+        };
+
+        let mut item_index = open_index + 1;
+        while item_index < interface_end {
+            let declaration_index = match skip_attributes(tokens, item_index, interface_end) {
+                Some(index) if index < interface_end => index,
+                _ => break,
+            };
+            if is_identifier(source, &tokens[declaration_index], "variant")
+                && let Some((declaration, next_index)) = scan_interface_variant(
+                    source,
+                    tokens,
+                    interface_name,
+                    declaration_index,
+                    interface_end,
+                )
+            {
+                declarations.push(declaration);
+                item_index = next_index;
+                continue;
+            }
+
+            // Skip complete direct items, including use lists and nested
+            // declaration bodies, so nested `variant` tokens are not promoted.
+            if tokens[declaration_index].kind == TokenKind::Punctuation(b'{')
+                && let Some(nested_end) = matching_delimiter(tokens, declaration_index, b'{', b'}')
+            {
+                item_index = nested_end + 1;
+            } else if let Some(end_index) =
+                item_end_at_top_level(tokens, declaration_index, interface_end)
+            {
+                item_index = end_index;
+            } else {
+                item_index = declaration_index + 1;
+            }
+        }
+    }
+    declarations
+}
+
 fn scan_interface_enum(
     source: &str,
     tokens: &[Token],
@@ -1107,6 +1258,187 @@ fn scan_interface_enum(
         },
         close_index + 1,
     ))
+}
+
+fn scan_interface_variant(
+    source: &str,
+    tokens: &[Token],
+    interface_name: &str,
+    variant_index: usize,
+    interface_end: usize,
+) -> Option<(SourceInterfaceVariant, usize)> {
+    let name_index = variant_index.checked_add(1)?;
+    let name_token = tokens.get(name_index)?;
+    let name = wit_identifier_text(source, name_token)?;
+    let open_index = name_index.checked_add(1)?;
+    if tokens.get(open_index)?.kind != TokenKind::Punctuation(b'{') {
+        return None;
+    }
+    let close_index = matching_delimiter(tokens, open_index, b'{', b'}')?;
+    if close_index >= interface_end {
+        return None;
+    }
+    let declaration_start = attached_attributes_start(tokens, variant_index)
+        .map_or(tokens[variant_index].range.start, |index| {
+            tokens[index].range.start
+        });
+    let declaration_range = declaration_start..tokens[close_index].range.end;
+    let token_pairs = function_token_pairs(source, tokens, &declaration_range, &name_token.range)?;
+    let cases = scan_variant_cases(source, tokens, open_index + 1, close_index)?;
+    if cases.is_empty() {
+        return None;
+    }
+    Some((
+        SourceInterfaceVariant {
+            interface_name: interface_name.to_owned(),
+            name: name.to_owned(),
+            name_range: name_token.range.clone(),
+            declaration_range,
+            token_pairs,
+            cases,
+        },
+        close_index + 1,
+    ))
+}
+
+fn scan_variant_cases(
+    source: &str,
+    tokens: &[Token],
+    body_start: usize,
+    body_end: usize,
+) -> Option<Vec<SourceVariantCase>> {
+    if body_start == body_end {
+        return None;
+    }
+    let mut cases = Vec::new();
+    let mut segment_start = body_start;
+    let mut delimiters = Vec::new();
+    for index in body_start..body_end {
+        let token = &tokens[index];
+        if token.kind == TokenKind::Invalid {
+            return None;
+        }
+        match token.kind {
+            TokenKind::Punctuation(open @ (b'(' | b'<' | b'[' | b'{')) => {
+                delimiters.push(open);
+            }
+            TokenKind::Punctuation(b')') => {
+                if delimiters.pop() != Some(b'(') {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b'>') => {
+                if delimiters.pop() != Some(b'<') {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b']') => {
+                if delimiters.pop() != Some(b'[') {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b'}') => {
+                if delimiters.pop() != Some(b'{') {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b',') if delimiters.is_empty() => {
+                if segment_start == index {
+                    return None;
+                }
+                cases.push(variant_case(source, tokens, segment_start, index)?);
+                segment_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if !delimiters.is_empty() {
+        return None;
+    }
+    if segment_start < body_end {
+        cases.push(variant_case(source, tokens, segment_start, body_end)?);
+    } else if cases.is_empty() {
+        return None;
+    }
+    Some(cases)
+}
+
+fn variant_case(
+    source: &str,
+    tokens: &[Token],
+    segment_start: usize,
+    segment_end: usize,
+) -> Option<SourceVariantCase> {
+    let name_index = skip_attributes(tokens, segment_start, segment_end)?;
+    if name_index >= segment_end {
+        return None;
+    }
+    let name_token = tokens.get(name_index)?;
+    let name = wit_identifier_text(source, name_token)?;
+    let (case_end_index, has_payload) = if name_index + 1 == segment_end {
+        (name_index, false)
+    } else {
+        let payload_open = name_index.checked_add(1)?;
+        if tokens.get(payload_open)?.kind != TokenKind::Punctuation(b'(') {
+            return None;
+        }
+        let payload_close = matching_delimiter(tokens, payload_open, b'(', b')')?;
+        if payload_close + 1 != segment_end || payload_close == payload_open + 1 {
+            return None;
+        }
+        validate_balanced_tokens(tokens, payload_open + 1, payload_close)?;
+        (payload_close, true)
+    };
+    let declaration_start = if name_index == segment_start {
+        name_token.range.start
+    } else {
+        tokens[segment_start].range.start
+    };
+    let declaration_range = declaration_start..tokens[case_end_index].range.end;
+    let token_pairs = function_token_pairs(source, tokens, &declaration_range, &name_token.range)?;
+    Some(SourceVariantCase {
+        name: name.to_owned(),
+        name_range: name_token.range.clone(),
+        declaration_range,
+        has_payload,
+        token_pairs,
+    })
+}
+
+fn validate_balanced_tokens(tokens: &[Token], start: usize, end: usize) -> Option<()> {
+    let mut delimiters = Vec::new();
+    for token in tokens.get(start..end)? {
+        if token.kind == TokenKind::Invalid {
+            return None;
+        }
+        match token.kind {
+            TokenKind::Punctuation(open @ (b'(' | b'<' | b'[' | b'{')) => {
+                delimiters.push(open);
+            }
+            TokenKind::Punctuation(b')') => {
+                if delimiters.pop() != Some(b'(') {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b'>') => {
+                if delimiters.pop() != Some(b'<') {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b']') => {
+                if delimiters.pop() != Some(b'[') {
+                    return None;
+                }
+            }
+            TokenKind::Punctuation(b'}') => {
+                if delimiters.pop() != Some(b'{') {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    delimiters.is_empty().then_some(())
 }
 
 fn scan_enum_cases(
@@ -2408,9 +2740,10 @@ fn is_keylike_continue(character: char) -> bool {
 mod tests {
     use super::{
         SourceFunctionDeclaration, SourceInterfaceAlias, SourceInterfaceEnum,
-        SourceInterfaceRecord, SourceInterfaceResource, authored_interface_alias_tokens,
-        authored_interface_enum_tokens, authored_interface_record_tokens,
-        authored_interface_resource_tokens, lex, scan_foreign_references, scan_source,
+        SourceInterfaceRecord, SourceInterfaceResource, SourceInterfaceVariant,
+        authored_interface_alias_tokens, authored_interface_enum_tokens,
+        authored_interface_record_tokens, authored_interface_resource_tokens,
+        authored_interface_variant_tokens, lex, scan_foreign_references, scan_source,
         stable_wit_token_kind, world_include_docs,
     };
 
@@ -2436,6 +2769,14 @@ mod tests {
             .into_iter()
             .find(|declaration| declaration.name == name)
             .expect("direct interface enum")
+    }
+
+    fn interface_variant(source: &str, name: &str) -> SourceInterfaceVariant {
+        scan_source(source)
+            .variant_declarations
+            .into_iter()
+            .find(|declaration| declaration.name == name)
+            .expect("direct interface variant")
     }
 
     fn interface_alias(source: &str, name: &str) -> SourceInterfaceAlias {
@@ -2791,6 +3132,159 @@ mod tests {
         ] {
             assert!(
                 scan_source(invalid).enum_declarations.is_empty(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_variant_and_case_ranges_preserve_payloads_and_mask_only_names() {
+        let source = concat!(
+            "interface api {\n",
+            "  @since(version = 1.2.3)\n",
+            "  variant outcome {\n",
+            "    ready,\n",
+            "    @deprecated(version = 2.0.0)\n",
+            "    failed(result<tuple<u32, string>, option<u64>>),\n",
+            "    %type(string),\n",
+            "  }\n",
+            "}\n",
+        );
+        let declaration = interface_variant(source, "outcome");
+        assert_eq!(declaration.interface_name, "api");
+        assert_eq!(
+            &source[declaration.declaration_range.clone()],
+            "@since(version = 1.2.3)\n  variant outcome {\n    ready,\n    @deprecated(version = 2.0.0)\n    failed(result<tuple<u32, string>, option<u64>>),\n    %type(string),\n  }"
+        );
+        assert_eq!(
+            declaration
+                .cases
+                .iter()
+                .map(|case| (case.name.as_str(), case.has_payload))
+                .collect::<Vec<_>>(),
+            [("ready", false), ("failed", true), ("type", true)]
+        );
+        assert_eq!(
+            &source[declaration.cases[1].declaration_range.clone()],
+            "@deprecated(version = 2.0.0)\n    failed(result<tuple<u32, string>, option<u64>>)"
+        );
+        assert_eq!(
+            declaration.token_pairs[0].1, "@",
+            "variant attributes remain part of the parent fingerprint"
+        );
+        assert_eq!(
+            declaration.cases[0]
+                .token_pairs
+                .iter()
+                .filter(|(_, text)| text.is_empty())
+                .count(),
+            1
+        );
+        assert!(
+            declaration.cases[1]
+                .token_pairs
+                .iter()
+                .any(|(_, text)| text == "result"),
+            "payload syntax remains in the case fingerprint"
+        );
+        assert_eq!(
+            declaration.cases[1].token_pairs[0].1, "@",
+            "case attributes remain in the case fingerprint"
+        );
+
+        let selected =
+            authored_interface_variant_tokens(source, "api", "outcome", &declaration.name_range)
+                .expect("the exact parsed name span selects this variant");
+        assert_eq!(selected.declaration_range, declaration.declaration_range);
+        assert_eq!(selected.token_pairs, declaration.token_pairs);
+        assert_eq!(selected.cases.len(), 3);
+        assert!(
+            authored_interface_variant_tokens(source, "api", "outcome", &(0..0)).is_none(),
+            "an absent parser name span cannot identify a variant"
+        );
+    }
+
+    #[test]
+    fn variant_case_fingerprints_ignore_own_name_trivia_and_sibling_cases() {
+        let first = interface_variant(
+            "interface api { variant outcome { failed(result<u32, string>), ready } }",
+            "outcome",
+        );
+        let renamed = interface_variant(
+            "interface api {\n variant result-state {\n failed ( result < u32 , string > ) ,\n ready,\n extra,\n }\n}",
+            "result-state",
+        );
+        assert_ne!(
+            first.token_pairs, renamed.token_pairs,
+            "the parent fingerprint includes the variant and sibling names"
+        );
+        assert_eq!(
+            first.cases[0].token_pairs, renamed.cases[0].token_pairs,
+            "the case fingerprint masks only its own spelling and excludes trivia/siblings"
+        );
+
+        let changed_payload = interface_variant(
+            "interface api { variant outcome { failed(result<u64, string>), ready } }",
+            "outcome",
+        );
+        assert_ne!(
+            first.cases[0].token_pairs, changed_payload.cases[0].token_pairs,
+            "changing a payload type changes the case fingerprint"
+        );
+        assert_eq!(
+            first.cases[1].token_pairs, changed_payload.cases[1].token_pairs,
+            "another case's payload does not affect this case fingerprint"
+        );
+    }
+
+    #[test]
+    fn variant_scanner_keeps_direct_declarations_and_rejects_malformed_cases() {
+        let source = concat!(
+            "interface types { variant imported { foreign } }\n",
+            "interface api {\n",
+            "  use types.{imported};\n",
+            "  enum state { variant, unit }\n",
+            "  record holder { value: tuple<u32, u64> }\n",
+            "  variant direct { yes, nested(tuple<u32, result<string, u32>>) }\n",
+            "}\n",
+        );
+        let declarations = scan_source(source).variant_declarations;
+        assert_eq!(
+            declarations
+                .iter()
+                .map(|declaration| (
+                    declaration.interface_name.as_str(),
+                    declaration.name.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            [("types", "imported"), ("api", "direct")]
+        );
+        let direct =
+            authored_interface_variant_tokens(source, "api", "direct", &declarations[1].name_range)
+                .expect("the direct declaration is addressable by its exact name span");
+        assert_eq!(direct.cases.len(), 2);
+        assert!(
+            authored_interface_variant_tokens(
+                source,
+                "api",
+                "imported",
+                &declarations[0].name_range,
+            )
+            .is_none(),
+            "a variant from a different interface cannot be selected by a use"
+        );
+
+        for invalid in [
+            "interface api { variant empty {} }",
+            "interface api { variant missing-comma { first second } }",
+            "interface api { variant repeated { first, , second } }",
+            "interface api { variant empty-payload { item() } }",
+            "interface api { variant trailing-token { item(u32) other } }",
+            "interface api { variant mismatched-payload { item(tuple<u32, string]) } }",
+            "interface api { variant unclosed-payload { item(tuple<u32, string) }",
+        ] {
+            assert!(
+                scan_source(invalid).variant_declarations.is_empty(),
                 "{invalid}"
             );
         }
