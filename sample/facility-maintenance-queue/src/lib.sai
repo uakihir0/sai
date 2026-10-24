@@ -1,0 +1,50 @@
+use acme:facility-maintenance-queue/report
+use acme:facility-maintenance-queue/scheduler
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 or args[1].as_str() == "plan" {
+        report.print_plan(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if args[1].as_str() == "summary" {
+        report.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+    out.write_str("usage: facility-maintenance-queue [plan|summary]\n")
+    process.ExitCode.failure()
+}
+
+test "the backlog reserves shared parts and preserves a held filter job" {
+    let plan = scheduler.plan()
+    assert plan.assignment_count == 6
+    assert plan.scheduled_count == 5
+    assert plan.held_count == 1
+    assert plan.remaining_stock[0].quantity == 0
+    assert plan.remaining_stock[4].quantity == 1
+}
+
+test "each emergency repair is assigned before routine work" {
+    let plan = scheduler.plan()
+    match plan.assignments[0] {
+        Some(assignment) => {
+            assert assignment.work_order_id == 3101
+        }
+        None => {
+            assert false
+        }
+    }
+    match plan.assignments[1] {
+        Some(assignment) => {
+            assert assignment.work_order_id == 3102
+        }
+        None => {
+            assert false
+        }
+    }
+}
