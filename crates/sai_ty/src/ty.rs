@@ -103,6 +103,35 @@ pub struct SigRegion {
     pub index: u32,
 }
 
+/// The lowered types of one supported non-generic function signature.
+///
+/// This is intentionally not the complete `fn_sig` model from the
+/// implementation plan: safety, async output, ABI, effects, and borrow
+/// relations remain explicit lowering boundaries until their representations
+/// are implemented.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FnSig {
+    inputs: Arc<[Ty]>,
+    output: Ty,
+}
+
+impl FnSig {
+    pub(crate) fn new(inputs: impl Into<Arc<[Ty]>>, output: Ty) -> Self {
+        Self {
+            inputs: inputs.into(),
+            output,
+        }
+    }
+
+    pub fn inputs(&self) -> &[Ty] {
+        &self.inputs
+    }
+
+    pub fn output(&self) -> &Ty {
+        &self.output
+    }
+}
+
 /// Session-local canonicalization for semantic types.
 ///
 /// Type nodes use `Arc` handles so their children can be owned without

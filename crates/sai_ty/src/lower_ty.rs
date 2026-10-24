@@ -3,9 +3,9 @@
 //! This module deliberately returns an unsupported result instead of
 //! manufacturing semantic error types or guessing at unresolved names.
 
-use crate::ty::{FloatTy, IntTy, Region, SigRegion, Ty, TyInterner, TyKind, UintTy};
-use sai_hir::types::{PathRoot, Ty as HirTy, TyKind as HirTyKind};
-use sai_hir::{HirId, OwnerId};
+use crate::ty::{FloatTy, FnSig, IntTy, Region, SigRegion, Ty, TyInterner, TyKind, UintTy};
+use sai_hir::types::{Generics, PathRoot, Ty as HirTy, TyKind as HirTyKind};
+use sai_hir::{HirId, OwnerId, Safety, body::FnSig as HirFnSig};
 use sai_resolve::package_scopes::{DefKind, PathRes, Res};
 use sai_resolve::prelude::PrimTy;
 use std::collections::HashMap;
@@ -35,6 +35,23 @@ pub enum UnsupportedTy {
     RegionIndexOverflow,
     FieldRegionWithoutParameter,
     ContextAfterFailure,
+}
+
+/// Why a function signature is outside the current non-generic subset.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnsupportedFnSig {
+    ContextAfterFailure,
+    NonFunctionItem,
+    MissingTypePathResolution,
+    GenericParameters,
+    WherePredicates,
+    Unsafe,
+    Async,
+    BorrowClause,
+    Effects,
+    SelfParameter,
+    ParameterType { index: usize, reason: UnsupportedTy },
+    ReturnType(UnsupportedTy),
 }
 
 /// Region policy and type-path inputs for one HIR owner.
@@ -162,6 +179,64 @@ pub fn lower_ty(context: &mut LowerTyContext<'_>, ty: &HirTy<'_>) -> Result<Ty, 
             Err(error)
         }
     }
+}
+
+/// Lower a deliberately narrow function signature while retaining its
+/// parameter and return type information.
+///
+/// Only non-generic, safe, synchronous signatures without effect or borrow
+/// clauses are represented by the current `FnSig`. Every failure invalidates
+/// the context so a partially consumed signature-region sequence cannot be
+/// reused. An omitted return type lowers to unit.
+pub fn lower_fn_sig(
+    context: &mut LowerTyContext<'_>,
+    generics: Generics<'_>,
+    signature: HirFnSig<'_>,
+) -> Result<FnSig, UnsupportedFnSig> {
+    if context.failed {
+        return Err(UnsupportedFnSig::ContextAfterFailure);
+    }
+
+    let unsupported = if !generics.params.is_empty() {
+        Some(UnsupportedFnSig::GenericParameters)
+    } else if !generics.where_preds.is_empty() {
+        Some(UnsupportedFnSig::WherePredicates)
+    } else if signature.safety == Safety::Unsafe {
+        Some(UnsupportedFnSig::Unsafe)
+    } else if signature.is_async {
+        Some(UnsupportedFnSig::Async)
+    } else if signature.borrows.is_some() {
+        Some(UnsupportedFnSig::BorrowClause)
+    } else if signature.effects.is_some() {
+        Some(UnsupportedFnSig::Effects)
+    } else if signature.params.iter().any(|param| param.is_self) {
+        Some(UnsupportedFnSig::SelfParameter)
+    } else {
+        None
+    };
+    if let Some(reason) = unsupported {
+        context.failed = true;
+        return Err(reason);
+    }
+
+    let mut inputs = Vec::with_capacity(signature.params.len());
+    for (index, parameter) in signature.params.iter().enumerate() {
+        match lower_ty(context, parameter.ty) {
+            Ok(ty) => inputs.push(ty),
+            Err(reason) => {
+                return Err(UnsupportedFnSig::ParameterType { index, reason });
+            }
+        }
+    }
+    let output = match signature.ret {
+        Some(return_type) => match lower_ty(context, return_type) {
+            Ok(ty) => ty,
+            Err(reason) => return Err(UnsupportedFnSig::ReturnType(reason)),
+        },
+        None => context.interner.tuple(Vec::new()),
+    };
+
+    Ok(FnSig::new(inputs, output))
 }
 
 fn lower_ty_inner(context: &mut LowerTyContext<'_>, ty: &HirTy<'_>) -> Result<Ty, UnsupportedTy> {
@@ -850,5 +925,282 @@ mod tests {
             lower_ty(&mut context, hir_ty),
             Err(UnsupportedTy::GenericArguments)
         );
+    }
+
+    #[test]
+    fn function_signature_regions_follow_parameter_then_result_order() {
+        let (owner, symbols) = owner();
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let (i32_ty, mut paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            200,
+            "I32",
+            None,
+            Res::PrimTy(PrimTy::I32),
+        );
+        let (bool_ty, bool_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            210,
+            "Bool",
+            None,
+            Res::PrimTy(PrimTy::Bool),
+        );
+        paths.extend(bool_paths);
+        let (i64_ty, i64_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            220,
+            "I64",
+            None,
+            Res::PrimTy(PrimTy::I64),
+        );
+        paths.extend(i64_paths);
+        let (u8_ty, u8_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            230,
+            "U8",
+            None,
+            Res::PrimTy(PrimTy::U8),
+        );
+        paths.extend(u8_paths);
+
+        let first_input = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 250),
+            kind: HirTyKind::Borrow(Mutability::Not, i32_ty),
+            span: span(),
+        });
+        let second_input_borrow = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 260),
+            kind: HirTyKind::Borrow(Mutability::Mut, bool_ty),
+            span: span(),
+        });
+        let second_input_elements = arena.alloc_tys(&[*second_input_borrow, *i64_ty]);
+        let second_input = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 270),
+            kind: HirTyKind::Tuple(second_input_elements),
+            span: span(),
+        });
+        let output = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, 280),
+            kind: HirTyKind::Borrow(Mutability::Not, u8_ty),
+            span: span(),
+        });
+        let params = arena.alloc_fn_params(&[
+            sai_hir::body::FnParam {
+                hir_id: hir_id(owner, 300),
+                name: None,
+                is_self: false,
+                mutable: false,
+                ty: first_input,
+                span: span(),
+            },
+            sai_hir::body::FnParam {
+                hir_id: hir_id(owner, 310),
+                name: None,
+                is_self: false,
+                mutable: false,
+                ty: second_input,
+                span: span(),
+            },
+        ]);
+        let signature = HirFnSig {
+            safety: Safety::Safe,
+            is_async: false,
+            params,
+            ret: Some(output),
+            borrows: None,
+            effects: None,
+            requires: &[],
+            ensures: &[],
+        };
+        let generics = Generics {
+            params: &[],
+            where_preds: &[],
+        };
+
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths);
+        let lowered = lower_fn_sig(&mut context, generics, signature).unwrap();
+        assert!(matches!(
+            lowered.inputs()[0].kind(),
+            TyKind::Ref(Region::Sig(SigRegion { index: 0, .. }), _, Mutability::Not)
+        ));
+        let TyKind::Tuple(second_elements) = lowered.inputs()[1].kind() else {
+            panic!("second input lowers as a tuple");
+        };
+        assert!(matches!(
+            second_elements[0].kind(),
+            TyKind::Ref(Region::Sig(SigRegion { index: 1, .. }), _, Mutability::Mut)
+        ));
+        assert!(matches!(
+            lowered.output().kind(),
+            TyKind::Ref(Region::Sig(SigRegion { index: 2, .. }), _, Mutability::Not)
+        ));
+    }
+
+    #[test]
+    fn function_without_explicit_return_uses_unit_output() {
+        let (owner, _) = owner();
+        let interner = TyInterner::new();
+        let paths = HashMap::new();
+        let signature = HirFnSig {
+            safety: Safety::Safe,
+            is_async: false,
+            params: &[],
+            ret: None,
+            borrows: None,
+            effects: None,
+            requires: &[],
+            ensures: &[],
+        };
+        let generics = Generics {
+            params: &[],
+            where_preds: &[],
+        };
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths);
+
+        let lowered = lower_fn_sig(&mut context, generics, signature).unwrap();
+        assert!(lowered.inputs().is_empty());
+        assert_eq!(lowered.output().kind(), &TyKind::Tuple(Arc::from([])));
+    }
+
+    #[test]
+    fn unsupported_function_signature_metadata_fails_closed() {
+        let (owner, symbols) = owner();
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let (input, paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            320,
+            "I32",
+            None,
+            Res::PrimTy(PrimTy::I32),
+        );
+        let param = arena.alloc_fn_param(sai_hir::body::FnParam {
+            hir_id: hir_id(owner, 330),
+            name: None,
+            is_self: false,
+            mutable: false,
+            ty: input,
+            span: span(),
+        });
+        let params = arena.alloc_fn_params(&[*param]);
+        let generic_param = arena.alloc_generic_param(sai_hir::types::GenericParam {
+            def_id: owner.def_id,
+            name: Name {
+                sym: symbols.intern("T").unwrap(),
+                span: span(),
+            },
+            kind: sai_hir::types::GenericParamKind::Type { bounds: &[] },
+        });
+        let generic_params = arena.alloc_generic_params(&[*generic_param]);
+        let cases = [
+            (
+                Generics {
+                    params: generic_params,
+                    where_preds: &[],
+                },
+                HirFnSig {
+                    safety: Safety::Safe,
+                    is_async: false,
+                    params,
+                    ret: None,
+                    borrows: None,
+                    effects: None,
+                    requires: &[],
+                    ensures: &[],
+                },
+                UnsupportedFnSig::GenericParameters,
+            ),
+            (
+                Generics {
+                    params: &[],
+                    where_preds: &[],
+                },
+                HirFnSig {
+                    safety: Safety::Unsafe,
+                    is_async: false,
+                    params,
+                    ret: None,
+                    borrows: None,
+                    effects: None,
+                    requires: &[],
+                    ensures: &[],
+                },
+                UnsupportedFnSig::Unsafe,
+            ),
+            (
+                Generics {
+                    params: &[],
+                    where_preds: &[],
+                },
+                HirFnSig {
+                    safety: Safety::Safe,
+                    is_async: true,
+                    params,
+                    ret: None,
+                    borrows: None,
+                    effects: None,
+                    requires: &[],
+                    ensures: &[],
+                },
+                UnsupportedFnSig::Async,
+            ),
+            (
+                Generics {
+                    params: &[],
+                    where_preds: &[],
+                },
+                HirFnSig {
+                    safety: Safety::Safe,
+                    is_async: false,
+                    params,
+                    ret: None,
+                    borrows: Some(&[]),
+                    effects: None,
+                    requires: &[],
+                    ensures: &[],
+                },
+                UnsupportedFnSig::BorrowClause,
+            ),
+            (
+                Generics {
+                    params: &[],
+                    where_preds: &[],
+                },
+                HirFnSig {
+                    safety: Safety::Safe,
+                    is_async: false,
+                    params,
+                    ret: None,
+                    borrows: None,
+                    effects: Some(&[]),
+                    requires: &[],
+                    ensures: &[],
+                },
+                UnsupportedFnSig::Effects,
+            ),
+        ];
+
+        for (generics, signature, expected) in cases {
+            let mut context = LowerTyContext::for_signature(&interner, owner, &paths);
+            assert_eq!(
+                lower_fn_sig(&mut context, generics, signature),
+                Err(expected)
+            );
+            assert_eq!(
+                lower_ty(&mut context, input),
+                Err(UnsupportedTy::ContextAfterFailure)
+            );
+        }
     }
 }

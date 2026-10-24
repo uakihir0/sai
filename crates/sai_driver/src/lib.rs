@@ -189,6 +189,8 @@ pub struct RootDatabase {
     packages: Arc<PackageInterner>,
     files: FileInterner,
     symbols: Arc<Interner>,
+    /// Canonical semantic types retained for this compiler session.
+    semantic_types: sai_ty::ty::TyInterner,
     primitive_prelude: Result<Prelude, PrimitivePreludeBuildError>,
     /// Retained for the lifetime of this database so every `DefId` returned
     /// by Phase 1 remains associated with its original package-local paths.
@@ -2498,6 +2500,7 @@ pub struct FunctionOwnerResolution {
     resolution: Result<LabelResolution, FunctionOwnerResolutionError>,
     local_resolution: Result<Option<LocalResolution>, FunctionOwnerResolutionError>,
     body_type_check: Result<FunctionBodyTypeCheck, FunctionOwnerResolutionError>,
+    signature_projection: Result<FunctionSignatureProjection, FunctionOwnerResolutionError>,
     module_resolution: Result<Option<ModuleResolution>, FunctionOwnerResolutionError>,
     type_path_resolution: Result<Option<TypeOwnerPathResolution>, FunctionOwnerResolutionError>,
     module_path_diagnostics: Result<Option<Vec<Diagnostic>>, FunctionOwnerResolutionError>,
@@ -2509,6 +2512,14 @@ pub struct FunctionOwnerResolution {
     /// Diagnostics produced while lowering the owner, kept separate from the
     /// label resolver's diagnostics so the caller can preserve phase order.
     lowering_diagnostics: Vec<Diagnostic>,
+}
+
+/// Supported semantic function signature data or the explicit boundary that
+/// kept the current HIR signature out of the partial projection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FunctionSignatureProjection {
+    Supported(sai_ty::ty::FnSig),
+    Unsupported(sai_ty::lower_ty::UnsupportedFnSig),
 }
 
 impl FunctionOwnerResolution {
@@ -5405,6 +5416,56 @@ impl FunctionOwnerResolutions {
 
     pub fn owners(&self) -> &[FunctionOwnerResolution] {
         &self.owners
+    }
+
+    /// Returns a semantic signature only when these owner results belong to
+    /// the supplied package collection. The collection guard binds the
+    /// projection to the exact workspace snapshot and all package inputs used
+    /// to resolve its source type paths.
+    pub fn signature_projection(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        owner: OwnerId,
+    ) -> Result<Option<&FunctionSignatureProjection>, FunctionOwnerResolutionError> {
+        self.signature_projection_with_scopes(collection, None, None, owner)
+    }
+
+    /// Returns a signature projection after checking every source-member and
+    /// WIT-view closure used to produce it.
+    pub fn signature_projection_with_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+        owner: OwnerId,
+    ) -> Result<Option<&FunctionSignatureProjection>, FunctionOwnerResolutionError> {
+        let matches_member_scopes = match member_scopes {
+            Some(scopes) => self.matches_member_scopes(collection, scopes),
+            None => {
+                self.matches_collection(collection)
+                    && self.member_scope_closure_fingerprint.is_none()
+            }
+        };
+        let matches_wit_view_scopes = match wit_view_scopes {
+            Some(scopes) => self.matches_wit_view_scopes(collection, scopes),
+            None => {
+                self.matches_collection(collection) && self.wit_view_closure_fingerprint.is_none()
+            }
+        };
+        if !self.matches_collection(collection)
+            || !matches_member_scopes
+            || !matches_wit_view_scopes
+        {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        let Some(owner) = self.owners.iter().find(|result| result.owner == owner) else {
+            return Ok(None);
+        };
+        owner
+            .signature_projection
+            .as_ref()
+            .map(Some)
+            .map_err(Clone::clone)
     }
 }
 
@@ -12868,6 +12929,7 @@ impl RootDatabase {
         let resolve = ModuleTreeQueries::new(vfs.clone())?;
         let packages = Arc::new(PackageInterner::new());
         let symbols = Arc::new(Interner::new());
+        let semantic_types = sai_ty::ty::TyInterner::new();
         let primitive_prelude = build_primitive_prelude(&symbols);
         let package_scopes =
             Phase1PackageScopesQueries::new(Arc::clone(&packages), Arc::clone(&symbols))?;
@@ -12926,6 +12988,7 @@ impl RootDatabase {
             packages,
             files: FileInterner::new(),
             symbols,
+            semantic_types,
             primitive_prelude,
             def_paths: HashMap::new(),
             wit_source_def_paths,
@@ -14560,6 +14623,7 @@ impl RootDatabase {
                                 resolution: Err(error.clone()),
                                 local_resolution: Err(error.clone()),
                                 body_type_check: Err(error.clone()),
+                                signature_projection: Err(error.clone()),
                                 module_resolution: Err(error.clone()),
                                 type_path_resolution: Err(error.clone()),
                                 module_path_diagnostics: Err(error.clone()),
@@ -14584,6 +14648,7 @@ impl RootDatabase {
                 let mut lowering_diagnostics = Vec::new();
                 let mut local_resolution = None;
                 let mut body_type_check = None;
+                let mut signature_projection = None;
                 let mut module_resolution = None;
                 let mut type_path_resolution = None;
                 let mut module_path_diagnostics = None;
@@ -14684,6 +14749,43 @@ impl RootDatabase {
                             (_, _, Err(error)) => Err(error),
                         },
                     );
+                    signature_projection = Some(match type_path_resolution.as_ref() {
+                        Some(Ok(Some(path_resolution))) => {
+                            let mut context = sai_ty::lower_ty::LowerTyContext::for_signature(
+                                &self.semantic_types,
+                                descriptor.owner,
+                                path_resolution.paths(),
+                            );
+                            match hir_owner.node {
+                                OwnerNode::Item(item) => match item.kind {
+                                    ItemKind::Fn { sig, generics, .. } => {
+                                        match sai_ty::lower_ty::lower_fn_sig(
+                                            &mut context,
+                                            generics,
+                                            sig,
+                                        ) {
+                                            Ok(signature) => Ok(
+                                                FunctionSignatureProjection::Supported(signature),
+                                            ),
+                                            Err(reason) => {
+                                                Ok(FunctionSignatureProjection::Unsupported(reason))
+                                            }
+                                        }
+                                    }
+                                    _ => Ok(FunctionSignatureProjection::Unsupported(
+                                        sai_ty::lower_ty::UnsupportedFnSig::NonFunctionItem,
+                                    )),
+                                },
+                                _ => Ok(FunctionSignatureProjection::Unsupported(
+                                    sai_ty::lower_ty::UnsupportedFnSig::NonFunctionItem,
+                                )),
+                            }
+                        }
+                        Some(Ok(None)) | None => Ok(FunctionSignatureProjection::Unsupported(
+                            sai_ty::lower_ty::UnsupportedFnSig::MissingTypePathResolution,
+                        )),
+                        Some(Err(error)) => Err(error.clone()),
+                    });
                     module_path_diagnostics = match (member_scopes, type_path_resolution.as_ref()) {
                         (Some(member_scopes), Some(Ok(Some(path_resolution)))) => Some(
                             self.type_owner_module_path_diagnostics(
@@ -14820,6 +14922,13 @@ impl RootDatabase {
                         .clone()
                         .map(|_| FunctionBodyTypeCheck::Unsupported)
                 });
+                let signature_projection = signature_projection.unwrap_or_else(|| {
+                    resolution.clone().map(|_| {
+                        FunctionSignatureProjection::Unsupported(
+                            sai_ty::lower_ty::UnsupportedFnSig::MissingTypePathResolution,
+                        )
+                    })
+                });
                 let module_resolution =
                     module_resolution.unwrap_or_else(|| resolution.clone().map(|_| None));
                 let type_path_resolution =
@@ -14845,6 +14954,7 @@ impl RootDatabase {
                     resolution,
                     local_resolution,
                     body_type_check,
+                    signature_projection,
                     module_resolution,
                     type_path_resolution,
                     module_path_diagnostics,
@@ -35755,6 +35865,80 @@ property "shared"() {}
         assert!(matches!(
             database.resolve_function_owner_labels(&collection, &stale_module_tree, &snapshot),
             Err(FunctionOwnerLabelResolutionError::ModuleTreeMismatch)
+        ));
+    }
+
+    #[test]
+    fn function_owner_signature_projection_is_collection_bound_and_conservative() {
+        let root = concat!(
+            "fn signature(first: I32, pair: (Bool, I64)) -> U8 {}\n",
+            "fn generic<T>(value: T) {}\n",
+        );
+        let child = "";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        assert!(resolved.matches_collection(&collection));
+
+        let supported_owner = collection.scopes.function_owners[0].owner;
+        let supported = resolved
+            .signature_projection(&collection, supported_owner)
+            .expect("the exact collection guards the signature")
+            .expect("the function owner exists");
+        let FunctionSignatureProjection::Supported(signature) = supported else {
+            panic!("a concrete nongeneric signature is supported");
+        };
+        assert_eq!(signature.inputs().len(), 2);
+        assert!(matches!(
+            signature.inputs()[0].kind(),
+            sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I32)
+        ));
+        assert!(matches!(
+            signature.inputs()[1].kind(),
+            sai_ty::ty::TyKind::Tuple(elements)
+                if matches!(elements[0].kind(), sai_ty::ty::TyKind::Bool)
+                    && matches!(
+                        elements[1].kind(),
+                        sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I64)
+                    )
+        ));
+        assert!(matches!(
+            signature.output().kind(),
+            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+        ));
+
+        let generic_owner = collection.scopes.function_owners[1].owner;
+        assert_eq!(
+            resolved.signature_projection(&collection, generic_owner),
+            Ok(Some(&FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::GenericParameters
+            )))
+        );
+
+        let changed_cfg =
+            target_cfg_for_check("wasm64-core").expect("the second target config is valid");
+        let changed_collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &changed_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("same-snapshot collection with a different target succeeds");
+        assert!(matches!(
+            resolved.signature_projection(&changed_collection, supported_owner),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch)
         ));
     }
 
@@ -63061,6 +63245,42 @@ world retained-exports { export preserved: func() -> (first: u32, second: u32); 
             function_results.member_scope_closure_fingerprint(),
             Some(member_scopes.closure_fingerprint())
         );
+        let function_owner = function_results.owners()[0].owner();
+        assert!(
+            function_results
+                .signature_projection(&root_collection, function_owner)
+                .is_err(),
+            "the package-local accessor rejects projections produced with a source closure"
+        );
+        assert!(
+            function_results
+                .signature_projection_with_scopes(
+                    &root_collection,
+                    Some(&member_scopes),
+                    None,
+                    function_owner,
+                )
+                .expect("the matching source closure guards its projection")
+                .is_some()
+        );
+        let mut different_member_scopes = member_scopes.clone();
+        different_member_scopes.closure_fingerprint = fingerprint(&(
+            "different source closure",
+            member_scopes.closure_fingerprint(),
+        ));
+        assert_ne!(
+            different_member_scopes.closure_fingerprint(),
+            member_scopes.closure_fingerprint()
+        );
+        assert!(matches!(
+            function_results.signature_projection_with_scopes(
+                &root_collection,
+                Some(&different_member_scopes),
+                None,
+                function_owner,
+            ),
+            Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+        ));
         assert!(matches!(
             database.resolve_function_owner_analyses_with_member_scopes(
                 &middle_collection,

@@ -1712,6 +1712,8 @@ Predicates are stored unelaborated. Elaboration (spec/05 §5.7.4) is done once p
 
 `fn_sig(def) -> Arc<FnSig>` holds the lowered parameter types (the receiver first), the return type (`()` when omitted, `Never` for `-> Never`), safety, `async`, the `extern` ABI, and the HIR ids of the contract clauses. For an `async fn f(..) -> T`, `fn_sig.output` is the anonymous future type `Future(f, identity args)` and `fn_sig.async_output` is `T` (Stage 5, spec/11 §11.2). `type_of(def)` returns:
 
+**Implemented subset (IR-894):** `FunctionOwnerResolutions::signature_projection(collection, owner)` exposes a partial function projection whose component `Ty` values are interned in the owning database session. Use `signature_projection_with_scopes` when active source-member or WIT-view closures contributed to path resolution; that accessor checks the same closures as well as the exact package collection. Projections cover top-level, non-generic, safe, synchronous functions whose parameter and return types fit §3.6.1's primitive/tuple/reference subset. An omitted return is unit. Lowering runs while the matching HIR arena and path-resolution map are live. Generic or where predicates, unsafe and async signatures, effect or borrow clauses, `self` parameters, and unsupported types return explicit `Unsupported` reasons without diagnostics or changes to source acceptance. This projection is not the complete `fn_sig` query: it does not retain safety, async output, ABI, effects, borrow relations, or contract metadata, and it has no query-stable fingerprint.
+
 | Definition | `type_of` |
 |---|---|
 | function, method, associated function | `FnDef(def, identity args)` |
