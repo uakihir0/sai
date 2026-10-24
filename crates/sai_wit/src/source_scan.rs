@@ -1338,8 +1338,14 @@ fn scan_interface_flags_type(
             token_pairs: flag.token_pairs,
         })
         .collect::<Vec<_>>();
+    // WIT names are unique case-insensitively within a scope. Enforce that
+    // boundary here so an invalid declaration cannot leak a parent or a
+    // partial set of flag constants into source inventory.
     let mut names = HashSet::new();
-    if flags.iter().any(|flag| !names.insert(flag.name.as_str())) {
+    if flags
+        .iter()
+        .any(|flag| !names.insert(flag.name.to_ascii_lowercase()))
+    {
         return None;
     }
     Some((
@@ -3489,6 +3495,7 @@ mod tests {
             "interface api { flags missing-comma { read write } }",
             "interface api { flags repeated { read, , write } }",
             "interface api { flags duplicate { read, read } }",
+            "interface api { flags case-duplicate { foo-bar, FOO-BAR } }",
             "interface api { flags malformed-attribute { @since(version = 1.0.0 read } }",
             "interface api { flags mismatched { read, write] }",
             "interface api { flags unfinished { read, write",

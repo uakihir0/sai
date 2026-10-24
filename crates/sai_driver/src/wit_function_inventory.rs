@@ -1759,6 +1759,35 @@ fn collect_root_interface_flags(
         ));
     }
 
+    // Do not publish a parent or a partial child set if distinct source names
+    // would collapse to one public SAI constant path.
+    let mut canonical_flag_names = HashSet::new();
+    let mut flag_view_names = Vec::with_capacity(source_flags.flags.len());
+    for source_flag in &source_flags.flags {
+        let flag_sai_name = match wit_name_to_sai(&source_flag.name, true) {
+            Ok(name) => name,
+            Err(_) => {
+                reasons.insert(format!(
+                    "WIT flag `{interface_name}.{}`.`{}` has no supported SAI constant spelling",
+                    item.name, source_flag.name
+                ));
+                return;
+            }
+        };
+        let flag_view_name = flag_sai_name
+            .strip_prefix("r#")
+            .unwrap_or(&flag_sai_name)
+            .to_owned();
+        if !canonical_flag_names.insert(flag_view_name.clone()) {
+            reasons.insert(format!(
+                "WIT flags type `{interface_name}.{}` has multiple flag names with the same canonical SAI name `{flag_view_name}`",
+                item.name
+            ));
+            return;
+        }
+        flag_view_names.push(flag_view_name);
+    }
+
     let flags_sai_name = match wit_name_to_sai(&item.name, true) {
         Ok(name) => name,
         Err(_) => {
@@ -1893,18 +1922,9 @@ fn collect_root_interface_flags(
     if flags.len() > 32 {
         return;
     }
-    for (bit_index, source_flag) in source_flags.flags.iter().enumerate() {
-        let flag_sai_name = match wit_name_to_sai(&source_flag.name, true) {
-            Ok(name) => name,
-            Err(_) => {
-                reasons.insert(format!(
-                    "WIT flag `{interface_name}.{}`.`{}` has no supported SAI constant spelling",
-                    item.name, source_flag.name
-                ));
-                continue;
-            }
-        };
-        let flag_view_name = flag_sai_name.strip_prefix("r#").unwrap_or(&flag_sai_name);
+    for (bit_index, (source_flag, flag_view_name)) in
+        source_flags.flags.iter().zip(flag_view_names).enumerate()
+    {
         let canonical_flag_path = format!("{canonical_flags_path}.{flag_view_name}");
         if !emitted_paths.insert(canonical_flag_path.clone()) {
             reasons.insert(format!(
@@ -1912,7 +1932,7 @@ fn collect_root_interface_flags(
             ));
             continue;
         }
-        let Ok(flag_symbol) = symbols_interner.intern(flag_view_name) else {
+        let Ok(flag_symbol) = symbols_interner.intern(&flag_view_name) else {
             reasons.insert(format!(
                 "WIT flag `{interface_name}.{}`.`{}` cannot be interned",
                 item.name, source_flag.name

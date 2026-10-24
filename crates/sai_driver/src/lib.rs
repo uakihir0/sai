@@ -26013,7 +26013,7 @@ interface api {
     #[test]
     fn wit_flags_over_limit_keep_the_source_parent_but_invalidate_coverage() {
         let flags = (0..33)
-            .map(|index| format!("flag-{index}"))
+            .map(|index| format!("flag-a{index}"))
             .collect::<Vec<_>>()
             .join(", ");
         let wit_source = format!(
@@ -26048,6 +26048,40 @@ interface api {
                 .count()
                 == 0,
             "an invalid over-limit flags declaration has no constant candidates"
+        );
+    }
+
+    #[test]
+    fn wit_flags_case_insensitive_constant_collision_rejects_the_whole_declaration() {
+        let wit_source = br#"package acme:phase1@1.0.0;
+interface api {
+    flags permissions { foo-bar, FOO-BAR }
+    flags unrelated { keep }
+}"#;
+        assert_eq!(
+            sai_wit::wit_name_to_sai("foo-bar", true).expect("lowercase spelling converts"),
+            sai_wit::wit_name_to_sai("FOO-BAR", true).expect("uppercase spelling converts"),
+            "case-insensitive WIT duplicates would collide at one canonical SAI name"
+        );
+        let (_database, _package, collection) = collect_single_authored_wit_inventory(wit_source);
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { .. }
+        ));
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| !symbol.path().starts_with("acme:phase1/api.Permissions")),
+            "an invalid declaration contributes neither its parent nor partial constants"
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.path() == "acme:phase1/api.Unrelated.Keep"),
+            "a separately validated sibling declaration remains inventoried"
         );
     }
 
