@@ -8,7 +8,9 @@ mod index_journal;
 mod reconciliation;
 mod symbol_index;
 
-pub use declaration_fingerprint::{DeclarationFingerprintError, declaration_fingerprint};
+pub use declaration_fingerprint::{
+    DeclarationFingerprintError, declaration_fingerprint, declaration_fingerprint_from_token_pairs,
+};
 pub use index_journal::{
     FileState, IndexJournalCodecError, IndexJournalOrigin, IndexJournalState,
     IndexOperationJournal, IndexSnapshot, MAX_OPERATION_JOURNAL_BYTES, PackageFileState,
