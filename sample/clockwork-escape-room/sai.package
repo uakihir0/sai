@@ -1,0 +1,5 @@
+package acme:clockwork-escape-room @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Replay a short clockwork escape-room adventure"

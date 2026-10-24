@@ -21,6 +21,7 @@ source repository before a package resolver can fetch them.
 | Beginner | [`temperature-converter`](temperature-converter/README.md) | Convert Celsius to Fahrenheit with `F32` parameters, locals, and arithmetic. |
 | Beginner | [`mini-task-board`](mini-task-board/README.md) | Split a small task board into modules; use records, enums, command dispatch, and summaries. |
 | Beginner | [`profile-check`](profile-check/README.md) | Parse and validate a key-value profile; return structured errors with `Result`. |
+| Intermediate | [`clockwork-escape-room`](clockwork-escape-room/README.md) | Replay a short, readable museum adventure with guarded state transitions, inventory, and a bounded story log. |
 | Intermediate | [`open-source-license-review`](open-source-license-review/README.md) | Review a fixed component inventory for evidence gaps, conflicts, policy exceptions, and unresolved release findings. |
 | Intermediate | [`reading-log`](reading-log/README.md) | Summarize a fixed book queue with status counts, page totals, and next-book selection. |
 | Intermediate | [`market-checkout`](market-checkout/README.md) | Review orders, aggregate repeated stock requests, and calculate discounts and tax. |
@@ -44,6 +45,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`warehouse-fulfillment`](warehouse-fulfillment/README.md) | Reserve date-eligible inventory for prioritized orders, then choose a warehouse and route under cold-chain, delivery-deadline, and lane-capacity constraints. |
 | Advanced | [`rail-shuttle-dispatch`](rail-shuttle-dispatch/README.md) | Assign a fixed replacement-bus fleet to disrupted transit services under corridor, passenger-capacity, and wheelchair-space constraints; report unresolved requests deterministically. |
 | Advanced | [`weighted-route-finder`](weighted-route-finder/README.md) | Find a minimum-time multi-edge route with Dijkstra's algorithm, stable tie-breaking, and predecessor-based path reconstruction. |
+| Advanced | [`bounded-expression-evaluator`](bounded-expression-evaluator/README.md) | Evaluate pre-tokenized integer expressions with precedence, parentheses, fixed-capacity stacks, source offsets, and checked arithmetic. |
 | Advanced | [`access-policy-review`](access-policy-review/README.md) | Evaluate role, action, and resource rules with deny-overrides, default-deny, and stable decision explanations. |
 | Advanced | [`flood-evacuation-planner`](flood-evacuation-planner/README.md) | Assign whole households to safe shelters under deadlines, closed roads, hazard limits, accessible-space, and medical-support capacity constraints. |
 | Advanced | [`insurance-claim-review`](insurance-claim-review/README.md) | Adjudicate fixed property claims through policy checks, duplicate-event prevention, per-claim deductibles, and policy-wide aggregate limits. |

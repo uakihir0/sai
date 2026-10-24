@@ -1,0 +1,254 @@
+use acme:bounded-expression-evaluator/model.{
+    ErrorPositionKind
+    EvalError
+    EvalErrorKind
+    EvalState
+    Evaluation
+    Token
+    TokenKind
+    TokenStream
+}
+use sai:core/num.{U32_MAX}
+
+fn source_error(kind: EvalErrorKind, offset: USize) -> EvalError {
+    EvalError(kind: kind, position_kind: ErrorPositionKind.SourceByteOffset, position: offset)
+}
+
+fn token_error(kind: EvalErrorKind, index: USize) -> EvalError {
+    EvalError(kind: kind, position_kind: ErrorPositionKind.TokenIndex, position: index)
+}
+
+fn unlocated_error(kind: EvalErrorKind) -> EvalError {
+    EvalError(kind: kind, position_kind: ErrorPositionKind.Unavailable, position: 0)
+}
+
+fn empty_state() -> EvalState {
+    EvalState(
+        values: Array<Option<U32>, 32>.filled(None),
+        value_count: 0,
+        operators: Array<Option<Token>, 32>.filled(None),
+        operator_count: 0,
+        operations: 0,
+    )
+}
+
+fn precedence(kind: TokenKind) -> USize {
+    match kind {
+        TokenKind.Plus => 1
+        TokenKind.Minus => 1
+        TokenKind.Multiply => 2
+        TokenKind.Divide => 2
+        _ => 0
+    }
+}
+
+fn apply_binary(left: U32, right: U32, operator: Token) -> Result<U32, EvalError> {
+    match operator.kind {
+        TokenKind.Plus => {
+            if left > U32_MAX - right {
+                Err(source_error(EvalErrorKind.ArithmeticRangeError, operator.offset))
+            } else {
+                Ok(left + right)
+            }
+        }
+        TokenKind.Minus => {
+            if left < right {
+                Err(source_error(EvalErrorKind.ArithmeticRangeError, operator.offset))
+            } else {
+                Ok(left - right)
+            }
+        }
+        TokenKind.Multiply => {
+            if right == 0 {
+                Ok(0)
+            } else if left > U32_MAX / right {
+                Err(source_error(EvalErrorKind.ArithmeticRangeError, operator.offset))
+            } else {
+                Ok(left * right)
+            }
+        }
+        TokenKind.Divide => {
+            if right == 0 {
+                Err(source_error(EvalErrorKind.DivisionByZero, operator.offset))
+            } else {
+                Ok(left / right)
+            }
+        }
+        _ => Err(source_error(EvalErrorKind.UnexpectedToken, operator.offset))
+    }
+}
+
+fn reduce_once(state: EvalState) -> Result<EvalState, EvalError> {
+    if state.operator_count == 0 {
+        return Err(unlocated_error(EvalErrorKind.NoResult))
+    }
+    if state.value_count < 2 {
+        let offset = match state.operators[state.operator_count - 1] {
+            Some(operator) => operator.offset
+            None => return Err(unlocated_error(EvalErrorKind.MalformedTokenStream))
+        }
+        return Err(source_error(EvalErrorKind.MissingOperand, offset))
+    }
+
+    let operator_index = state.operator_count - 1
+    let operator = match state.operators[operator_index] {
+        Some(operator) => operator
+        None => return Err(unlocated_error(EvalErrorKind.MalformedTokenStream))
+    }
+    if operator.kind == TokenKind.LeftParen {
+        return Err(source_error(EvalErrorKind.UnmatchedLeftParen, operator.offset))
+    }
+
+    let right_index = state.value_count - 1
+    let left_index = state.value_count - 2
+    let right = match state.values[right_index] {
+        Some(value) => value
+        None => return Err(unlocated_error(EvalErrorKind.MalformedTokenStream))
+    }
+    let left = match state.values[left_index] {
+        Some(value) => value
+        None => return Err(unlocated_error(EvalErrorKind.MalformedTokenStream))
+    }
+    let value = match apply_binary(left, right, operator) {
+        Ok(value) => value
+        Err(problem) => return Err(problem)
+    }
+
+    var updated = state
+    updated.values[left_index] = Some(value)
+    updated.values[right_index] = None
+    updated.value_count -= 1
+    updated.operators[operator_index] = None
+    updated.operator_count -= 1
+    updated.operations += 1
+    Ok(updated)
+}
+
+pub fn evaluate_tokens(tokens: TokenStream) -> Result<Evaluation, EvalError> {
+    if tokens.len == 0 {
+        return Err(unlocated_error(EvalErrorKind.EmptyExpression))
+    }
+    if tokens.len > tokens.items.len() {
+        return Err(token_error(EvalErrorKind.TooManyTokens, tokens.items.len()))
+    }
+
+    var state = empty_state()
+    var expecting_operand = true
+
+    for index in 0..tokens.len {
+        let token = match tokens.items[index] {
+            Some(token) => token
+            None => return Err(token_error(EvalErrorKind.MalformedTokenStream, index))
+        }
+
+        match token.kind {
+            TokenKind.Number => {
+                if not expecting_operand {
+                    return Err(source_error(EvalErrorKind.UnexpectedToken, token.offset))
+                }
+                if state.value_count >= state.values.len() {
+                    return Err(source_error(EvalErrorKind.StackLimit, token.offset))
+                }
+                state.values[state.value_count] = Some(token.value)
+                state.value_count += 1
+                expecting_operand = false
+            }
+            TokenKind.LeftParen => {
+                if not expecting_operand {
+                    return Err(source_error(EvalErrorKind.UnexpectedToken, token.offset))
+                }
+                if state.operator_count >= state.operators.len() {
+                    return Err(source_error(EvalErrorKind.StackLimit, token.offset))
+                }
+                state.operators[state.operator_count] = Some(token)
+                state.operator_count += 1
+            }
+            TokenKind.RightParen => {
+                if expecting_operand {
+                    return Err(source_error(EvalErrorKind.MissingOperand, token.offset))
+                }
+                var matched_left = false
+                while state.operator_count > 0 and not matched_left {
+                    let top_index = state.operator_count - 1
+                    let top = match state.operators[top_index] {
+                        Some(operator) => operator
+                        None => {
+                            return Err(unlocated_error(EvalErrorKind.MalformedTokenStream))
+                        }
+                    }
+                    if top.kind == TokenKind.LeftParen {
+                        state.operators[top_index] = None
+                        state.operator_count -= 1
+                        matched_left = true
+                    } else {
+                        state = match reduce_once(state) {
+                            Ok(updated) => updated
+                            Err(problem) => return Err(problem)
+                        }
+                    }
+                }
+                if not matched_left {
+                    return Err(source_error(EvalErrorKind.UnmatchedRightParen, token.offset))
+                }
+                expecting_operand = false
+            }
+            TokenKind.Plus | TokenKind.Minus | TokenKind.Multiply | TokenKind.Divide => {
+                if expecting_operand {
+                    return Err(source_error(EvalErrorKind.MissingOperand, token.offset))
+                }
+                while state.operator_count > 0 {
+                    let top_index = state.operator_count - 1
+                    let top = match state.operators[top_index] {
+                        Some(operator) => operator
+                        None => {
+                            return Err(unlocated_error(EvalErrorKind.MalformedTokenStream))
+                        }
+                    }
+                    if (
+                        top.kind == TokenKind.LeftParen
+                        or precedence(top.kind) < precedence(token.kind)
+                    ) {
+                        break
+                    }
+                    state = match reduce_once(state) {
+                        Ok(updated) => updated
+                        Err(problem) => return Err(problem)
+                    }
+                }
+                if state.operator_count >= state.operators.len() {
+                    return Err(source_error(EvalErrorKind.StackLimit, token.offset))
+                }
+                state.operators[state.operator_count] = Some(token)
+                state.operator_count += 1
+                expecting_operand = true
+            }
+        }
+    }
+
+    if expecting_operand {
+        let offset = match tokens.items[tokens.len - 1] { Some(token) => token.offset, None => 0 }
+        return Err(source_error(EvalErrorKind.MissingOperand, offset))
+    }
+
+    while state.operator_count > 0 {
+        let top = match state.operators[state.operator_count - 1] {
+            Some(operator) => operator
+            None => return Err(unlocated_error(EvalErrorKind.MalformedTokenStream))
+        }
+        if top.kind == TokenKind.LeftParen {
+            return Err(source_error(EvalErrorKind.UnmatchedLeftParen, top.offset))
+        }
+        state = match reduce_once(state) {
+            Ok(updated) => updated
+            Err(problem) => return Err(problem)
+        }
+    }
+
+    if state.value_count != 1 {
+        return Err(unlocated_error(EvalErrorKind.NoResult))
+    }
+    match state.values[0] {
+        Some(value) => Ok(Evaluation(value: value, operations: state.operations))
+        None => Err(unlocated_error(EvalErrorKind.NoResult))
+    }
+}

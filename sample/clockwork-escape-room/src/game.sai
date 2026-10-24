@@ -1,0 +1,165 @@
+use acme:clockwork-escape-room/model.{Action, AdventureState, Ending, Room, Scene, StoryRun}
+
+fn starting_state() -> AdventureState {
+    AdventureState(
+        room: Room.Workshop,
+        has_brass_key: false,
+        has_clockwork_gear: false,
+        gear_fitted: false,
+        lens_aligned: false,
+        escaped: false,
+        rejected_actions: 0,
+        scenes: Array<Option<Scene>, 8>.filled(None),
+        scene_count: 0,
+    )
+}
+
+fn record_scene(state: AdventureState, text: Str) -> AdventureState {
+    var updated = state
+    if updated.scene_count < updated.scenes.len() {
+        updated.scenes[updated.scene_count] = Some(Scene(text: text))
+        updated.scene_count += 1
+    }
+    updated
+}
+
+pub fn step(state: AdventureState, action: Action) -> AdventureState {
+    var updated = state
+    var text: Str = ""
+    var accepted = true
+
+    match (updated.room, action) {
+        (Room.Workshop, Action.Look) => {
+            text =
+                "A brass key rests beside a stopped automaton. A locked door leads to the archive."
+        }
+        (Room.Workshop, Action.TakeBrassKey) => {
+            if updated.has_brass_key {
+                text = "The brass key is already in your pocket."
+            } else {
+                updated.has_brass_key = true
+                text = "You pocket the brass key. The automaton gives a tiny approving nod."
+            }
+        }
+        (Room.Workshop, Action.EnterArchive) => {
+            if updated.has_brass_key {
+                updated.room = Room.Archive
+                text = "The key turns. Dusty shelves and a clockwork gear fill the archive."
+            } else {
+                text = "The archive door is locked. The keyhole is small and brass-lined."
+                accepted = false
+            }
+        }
+        (Room.Archive, Action.Look) => {
+            text = "A loose gear lies beneath a map of the observatory dome."
+        }
+        (Room.Archive, Action.TakeClockworkGear) => {
+            if updated.has_clockwork_gear {
+                text = "You already have the clockwork gear."
+            } else {
+                updated.has_clockwork_gear = true
+                text = "You lift the clockwork gear from the floor. Its teeth still gleam."
+            }
+        }
+        (Room.Archive, Action.FitClockworkGear) => {
+            if updated.has_clockwork_gear {
+                updated.gear_fitted = true
+                updated.room = Room.Observatory
+                text = "The gear catches with a satisfying click, and the observatory dome opens."
+            } else {
+                text = "The empty socket turns freely. Something toothed is missing."
+                accepted = false
+            }
+        }
+        (Room.Observatory, Action.Look) => {
+            text = "A brass telescope points at a narrow shaft of morning light."
+        }
+        (Room.Observatory, Action.AlignLens) => {
+            if updated.gear_fitted {
+                updated.lens_aligned = true
+                text = "You align the lens. Sunlight draws a bright arrow toward the exit."
+            } else {
+                text = "The telescope gears are still. The lens will not hold its position."
+                accepted = false
+            }
+        }
+        (Room.Observatory, Action.Leave) => {
+            if updated.lens_aligned {
+                updated.room = Room.Courtyard
+                updated.escaped = true
+                text = "The exit clicks open. You step into the courtyard as the automaton waves."
+            } else {
+                text = "The exit remains hidden in the dark dome."
+                accepted = false
+            }
+        }
+        (Room.Courtyard, Action.Look) => {
+            text = "Fresh air, birdsong, and the museum garden greet you."
+        }
+        _ => {
+            text = "That action does not help from here."
+            accepted = false
+        }
+    }
+
+    if not accepted {
+        updated.rejected_actions += 1
+    }
+    record_scene(updated, text)
+}
+
+pub fn play_script(actions: Array<Action, 7>) -> StoryRun {
+    var state = starting_state()
+    for index in 0..actions.len() {
+        state = step(state, actions[index])
+    }
+    let ending = if state.escaped {
+        Ending.Escaped
+    } else {
+        Ending.StillInside
+    }
+    StoryRun(state: state, ending: ending)
+}
+
+pub fn play_fixture() -> StoryRun {
+    play_script(
+        [
+            Action.Look,
+            Action.TakeBrassKey,
+            Action.EnterArchive,
+            Action.TakeClockworkGear,
+            Action.FitClockworkGear,
+            Action.AlignLens,
+            Action.Leave,
+        ],
+    )
+}
+
+test "the scripted visitor escapes with a readable story" {
+    let run = play_fixture()
+    assert (run.ending == Ending.Escaped)
+    assert (run.state.room == Room.Courtyard)
+    assert (run.state.scene_count == 7)
+    assert (run.state.rejected_actions == 0)
+    assert (
+        run.state.scenes[1]
+        == Some(Scene(text: "You pocket the brass key. The automaton gives a tiny approving nod."))
+    )
+}
+
+test "a visitor cannot open the archive without the key" {
+    let run = play_script(
+        [
+            Action.EnterArchive,
+            Action.Look,
+            Action.Look,
+            Action.Look,
+            Action.Look,
+            Action.Look,
+            Action.Look,
+        ],
+    )
+    assert (run.ending == Ending.StillInside)
+    assert (run.state.room == Room.Workshop)
+    assert (run.state.rejected_actions == 1)
+}
