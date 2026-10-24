@@ -1,0 +1,231 @@
+use acme:coffee-roastery-production-auditor/model.{
+    BatchBook
+    GreenBeanLot
+    RoastBatch
+    RoastOrder
+    RoastProfile
+    Roaster
+}
+
+pub fn sample_book() -> BatchBook {
+    BatchBook(
+        orders: [
+            Some(
+                RoastOrder(
+                    id: "CAFE-101",
+                    profile: RoastProfile.Espresso,
+                    target_roasted_grams: 1700,
+                    requires_organic: false,
+                ),
+            ),
+            Some(
+                RoastOrder(
+                    id: "COOP-204",
+                    profile: RoastProfile.Light,
+                    target_roasted_grams: 1700,
+                    requires_organic: true,
+                ),
+            ),
+            Some(
+                RoastOrder(
+                    id: "LAB-330",
+                    profile: RoastProfile.Medium,
+                    target_roasted_grams: 850,
+                    requires_organic: true,
+                ),
+            ),
+        ],
+        order_count: 3,
+        bean_lots: [
+            Some(
+                GreenBeanLot(
+                    id: "ETH-07",
+                    origin: "Ethiopia washed",
+                    available_green_grams: 2600,
+                    organic_certified: true,
+                ),
+            ),
+            Some(
+                GreenBeanLot(
+                    id: "BRA-12",
+                    origin: "Brazil natural",
+                    available_green_grams: 3000,
+                    organic_certified: false,
+                ),
+            ),
+            Some(
+                GreenBeanLot(
+                    id: "GUA-03",
+                    origin: "Guatemala washed",
+                    available_green_grams: 1500,
+                    organic_certified: true,
+                ),
+            ),
+        ],
+        bean_lot_count: 3,
+        roasters: [
+            Some(
+                Roaster(
+                    id: "DRUM-12",
+                    maximum_charge_grams: 2200,
+                    supports_light: false,
+                    supports_medium: true,
+                    supports_espresso: true,
+                ),
+            ),
+            Some(
+                Roaster(
+                    id: "SAMPLE-3",
+                    maximum_charge_grams: 1500,
+                    supports_light: true,
+                    supports_medium: true,
+                    supports_espresso: false,
+                ),
+            ),
+        ],
+        roaster_count: 2,
+        batches: [
+            Some(
+                RoastBatch(
+                    id: "RB-100",
+                    order_id: "CAFE-101",
+                    bean_lot_id: "BRA-12",
+                    roaster_id: "DRUM-12",
+                    green_grams: 2000,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-101",
+                    order_id: "COOP-204",
+                    bean_lot_id: "ETH-07",
+                    roaster_id: "SAMPLE-3",
+                    green_grams: 1200,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-102",
+                    order_id: "COOP-204",
+                    bean_lot_id: "ETH-07",
+                    roaster_id: "SAMPLE-3",
+                    green_grams: 800,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-103",
+                    order_id: "LAB-330",
+                    bean_lot_id: "GUA-03",
+                    roaster_id: "SAMPLE-3",
+                    green_grams: 1000,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-104",
+                    order_id: "LAB-330",
+                    bean_lot_id: "GUA-03",
+                    roaster_id: "SAMPLE-3",
+                    green_grams: 500,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-105",
+                    order_id: "CAFE-101",
+                    bean_lot_id: "BRA-12",
+                    roaster_id: "SAMPLE-3",
+                    green_grams: 1000,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-106",
+                    order_id: "COOP-204",
+                    bean_lot_id: "BRA-12",
+                    roaster_id: "SAMPLE-3",
+                    green_grams: 1000,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-107",
+                    order_id: "CAFE-101",
+                    bean_lot_id: "BRA-12",
+                    roaster_id: "DRUM-12",
+                    green_grams: 2500,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-100",
+                    order_id: "CAFE-101",
+                    bean_lot_id: "BRA-12",
+                    roaster_id: "DRUM-12",
+                    green_grams: 1000,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-109",
+                    order_id: "CAFE-999",
+                    bean_lot_id: "BRA-12",
+                    roaster_id: "DRUM-12",
+                    green_grams: 1000,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-110",
+                    order_id: "CAFE-101",
+                    bean_lot_id: "BRA-12",
+                    roaster_id: "DRUM-12",
+                    green_grams: 1000,
+                    roast_loss_percent: 100,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-111",
+                    order_id: "CAFE-101",
+                    bean_lot_id: "BRA-12",
+                    roaster_id: "DRUM-12",
+                    green_grams: 1500,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-112",
+                    order_id: "CAFE-101",
+                    bean_lot_id: "LOT-MISSING",
+                    roaster_id: "DRUM-12",
+                    green_grams: 1000,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-113",
+                    order_id: "CAFE-101",
+                    bean_lot_id: "BRA-12",
+                    roaster_id: "ROASTER-MISSING",
+                    green_grams: 1000,
+                    roast_loss_percent: 15,
+                ),
+            ),
+        ],
+        batch_count: 14,
+    )
+}

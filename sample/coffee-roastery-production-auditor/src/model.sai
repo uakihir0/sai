@@ -1,0 +1,107 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RoastProfile {
+    Light
+    Medium
+    Espresso
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum HoldReason {
+    DuplicateBatchId
+    UnknownOrder
+    UnknownBeanLot
+    UnknownRoaster
+    UnsupportedRoastProfile
+    OrganicCertificationRequired
+    InvalidRoastLoss
+    ChargeAboveRoasterLimit
+    BeanLotQuantityExceeded
+    OrderQuantityExceeded
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RoastOrder {
+    pub id: Str
+    pub profile: RoastProfile
+    pub target_roasted_grams: U32
+    pub requires_organic: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type GreenBeanLot {
+    pub id: Str
+    pub origin: Str
+    pub available_green_grams: U32
+    pub organic_certified: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Roaster {
+    pub id: Str
+    pub maximum_charge_grams: U32
+    pub supports_light: Bool
+    pub supports_medium: Bool
+    pub supports_espresso: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RoastBatch {
+    pub id: Str
+    pub order_id: Str
+    pub bean_lot_id: Str
+    pub roaster_id: Str
+    pub green_grams: U32
+    pub roast_loss_percent: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BatchBook {
+    pub orders: Array<Option<RoastOrder>, 3>
+    pub order_count: USize
+    pub bean_lots: Array<Option<GreenBeanLot>, 3>
+    pub bean_lot_count: USize
+    pub roasters: Array<Option<Roaster>, 2>
+    pub roaster_count: USize
+    pub batches: Array<Option<RoastBatch>, 14>
+    pub batch_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BatchDecision {
+    pub batch_id: Str
+    pub order_id: Str
+    pub bean_lot_id: Str
+    pub roaster_id: Str
+    pub accepted: Bool
+    pub reason: Option<HoldReason>
+    pub green_grams: U32
+    pub roasted_grams: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type OrderSummary {
+    pub order_id: Str
+    pub target_roasted_grams: U32
+    pub planned_roasted_grams: U32
+    pub remaining_roasted_grams: U32
+    pub fulfilled: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BeanLotBalance {
+    pub bean_lot_id: Str
+    pub available_green_grams: U32
+    pub reserved_green_grams: U32
+    pub remaining_green_grams: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ProductionAudit {
+    pub decisions: Array<Option<BatchDecision>, 14>
+    pub order_summaries: Array<Option<OrderSummary>, 3>
+    pub bean_lot_balances: Array<Option<BeanLotBalance>, 3>
+    pub batch_count: USize
+    pub accepted_count: USize
+    pub held_count: USize
+    pub accepted_roasted_grams: U32
+}

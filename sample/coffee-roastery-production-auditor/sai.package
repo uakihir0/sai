@@ -1,0 +1,5 @@
+package acme:coffee-roastery-production-auditor @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Audit fixed coffee roasting batches against orders, green bean lots, and roaster limits"

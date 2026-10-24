@@ -1,0 +1,45 @@
+use acme:coffee-roastery-production-auditor/auditor
+use acme:coffee-roastery-production-auditor/fixtures
+use acme:coffee-roastery-production-auditor/model.{HoldReason, ProductionAudit}
+
+pub fn sample_audit() -> ProductionAudit {
+    auditor.audit(fixtures.sample_book())
+}
+
+test "accept only batches that fit orders, lots, certification, and roasters" {
+    let audit = sample_audit()
+    assert audit.batch_count == 14
+    assert audit.accepted_count == 4
+    assert audit.held_count == 10
+    assert audit.accepted_roasted_grams == 4250
+
+    assert audit.decisions[0].unwrap().accepted
+    assert audit.decisions[0].unwrap().roasted_grams == 1700
+    assert audit.decisions[4].unwrap().reason == Some(HoldReason.OrderQuantityExceeded)
+    assert audit.decisions[5].unwrap().reason == Some(HoldReason.UnsupportedRoastProfile)
+    assert audit.decisions[6].unwrap().reason == Some(HoldReason.OrganicCertificationRequired)
+    assert audit.decisions[7].unwrap().reason == Some(HoldReason.ChargeAboveRoasterLimit)
+    assert audit.decisions[8].unwrap().reason == Some(HoldReason.DuplicateBatchId)
+    assert audit.decisions[9].unwrap().reason == Some(HoldReason.UnknownOrder)
+    assert audit.decisions[10].unwrap().reason == Some(HoldReason.InvalidRoastLoss)
+    assert audit.decisions[11].unwrap().reason == Some(HoldReason.BeanLotQuantityExceeded)
+    assert audit.decisions[12].unwrap().reason == Some(HoldReason.UnknownBeanLot)
+    assert audit.decisions[13].unwrap().reason == Some(HoldReason.UnknownRoaster)
+}
+
+test "orders and bean lots reflect accepted batches only" {
+    let audit = sample_audit()
+    assert audit.order_summaries[0].unwrap().planned_roasted_grams == 1700
+    assert audit.order_summaries[0].unwrap().fulfilled
+    assert audit.order_summaries[1].unwrap().planned_roasted_grams == 1700
+    assert audit.order_summaries[1].unwrap().fulfilled
+    assert audit.order_summaries[2].unwrap().planned_roasted_grams == 850
+    assert audit.order_summaries[2].unwrap().fulfilled
+
+    assert audit.bean_lot_balances[0].unwrap().reserved_green_grams == 2000
+    assert audit.bean_lot_balances[0].unwrap().remaining_green_grams == 600
+    assert audit.bean_lot_balances[1].unwrap().reserved_green_grams == 2000
+    assert audit.bean_lot_balances[1].unwrap().remaining_green_grams == 1000
+    assert audit.bean_lot_balances[2].unwrap().reserved_green_grams == 1000
+    assert audit.bean_lot_balances[2].unwrap().remaining_green_grams == 500
+}
