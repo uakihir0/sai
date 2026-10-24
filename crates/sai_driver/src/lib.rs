@@ -24832,6 +24832,33 @@ mod tests {
             .expect("the selected package graph node makes the inventory available")
     }
 
+    fn collect_single_authored_wit_inventory(
+        wit_source: &[u8],
+    ) -> (RootDatabase, PackageId, Phase1PackageScopesCollection) {
+        let (mut database, module_tree, snapshot, package) = phase1_fixture(b"", b"");
+        database
+            .set_package_graph(Some(phase1_root_graph_at_version("1.0.0")))
+            .expect("exact version graph is tracked");
+        install_authored_wit_package(
+            &mut database,
+            package,
+            "acme:phase1#1",
+            b"package acme:phase1 @ 1.0.0\nsource \"src\"\nwit \"wit\"\n",
+            PackageRole::Root,
+            &[("root.wit", wit_source)],
+        );
+        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+            )
+            .expect("Phase 1 collection succeeds");
+        (database, package, collection)
+    }
+
     #[test]
     fn module_function_inventory_collects_multiple_modules_and_stable_metadata() {
         let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
@@ -25217,7 +25244,7 @@ interface api { call: func(); }\n";
             &[(
                 "root.wit",
                 b"package acme:phase1@1.0.0;\n\
-interface local-api { root-call: func(); }\n\
+interface local-api { root-call: func(); resource root-resource { ping: func(); } }\n\
 world app { import acme:dep/api; }\n",
             )],
         );
@@ -25229,7 +25256,7 @@ world app { import acme:dep/api; }\n",
             PackageRole::Dependency,
             &[(
                 "root.wit",
-                b"package acme:dep@1.0.0;\ninterface api { dependency-only: func(); }\n",
+                b"package acme:dep@1.0.0;\ninterface api { dependency-only: func(); resource foreign-resource { ping: func(); } }\n",
             )],
         );
         database
@@ -25237,7 +25264,7 @@ world app { import acme:dep/api; }\n",
                 dependency,
                 sai_wit::GeneratedText {
                     text: Arc::from(
-                        "package acme:dep@1.0.0;\ninterface api { dependency-only: func(); }",
+                        "package acme:dep@1.0.0;\ninterface api { dependency-only: func(); resource foreign-resource { ping: func(); } }",
                     ),
                     complete: true,
                     origins: Arc::from([]),
@@ -25270,6 +25297,13 @@ world app { import acme:dep/api; }\n",
                 .iter()
                 .all(|symbol| symbol.path() != "acme:dep/api.dependency_only")
         );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| !symbol.path().starts_with("acme:dep/api.")),
+            "dependency closure resources and members must not enter root inventory"
+        );
 
         let selected = MvsPackageVersion::new(
             "acme:phase1",
@@ -25294,41 +25328,323 @@ world app { import acme:dep/api; }\n",
 
     #[test]
     fn wit_function_inventory_does_not_promote_resource_methods_to_interface_functions() {
-        let (mut database, module_tree, snapshot, package) = phase1_fixture(b"", b"");
-        database
-            .set_package_graph(Some(phase1_root_graph_at_version("1.0.0")))
-            .expect("exact version graph is tracked");
-        install_authored_wit_package(
-            &mut database,
-            package,
-            "acme:phase1#1",
-            b"package acme:phase1 @ 1.0.0\nsource \"src\"\nwit \"wit\"\n",
-            PackageRole::Root,
-            &[(
-                "root.wit",
-                b"package acme:phase1@1.0.0;\ninterface api { resource handle { call: func(); } }\n",
-            )],
-        );
-        let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
-        let collection = database
-            .collect_phase1_package_scopes_collection(
-                &module_tree,
-                &snapshot,
-                &target,
-                Phase1BuildContext::default(),
-            )
-            .expect("Phase 1 collection handles interface resources");
+        let wit_source = b"package acme:phase1@1.0.0;\n\
+interface api {\n\
+    resource canvas {\n\
+        constructor(seed: u32);\n\
+        paint: func();\n\
+        create: static func(size: u32) -> canvas;\n\
+    }\n\
+    resource empty;\n\
+    resource shell {}\n\
+}\n";
+        let (mut database, package, collection) = collect_single_authored_wit_inventory(wit_source);
         let inventory = inventory_symbols(&collection);
 
         assert!(matches!(
             inventory.coverage(),
             sai_semantic::InventoryCoverage::Incomplete { .. }
         ));
+        let symbol = |path: &str| {
+            inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == path)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "symbol `{path}` was not inventoried; coverage: {:?}; symbols: {:?}",
+                        inventory.coverage(),
+                        inventory.symbols()
+                    )
+                })
+        };
+        for path in [
+            "acme:phase1/api.Canvas",
+            "acme:phase1/api.Canvas.new",
+            "acme:phase1/api.Canvas.paint",
+            "acme:phase1/api.Canvas.create",
+            "acme:phase1/api.Empty",
+            "acme:phase1/api.Shell",
+        ] {
+            assert!(symbol(path).path() == path);
+        }
+        assert_eq!(
+            symbol("acme:phase1/api.Canvas").kind(),
+            sai_semantic::SymbolKind::Resource
+        );
+        for path in [
+            "acme:phase1/api.Canvas.new",
+            "acme:phase1/api.Canvas.paint",
+            "acme:phase1/api.Canvas.create",
+        ] {
+            assert_eq!(
+                symbol(path).kind(),
+                sai_semantic::SymbolKind::AssocFn,
+                "{path}"
+            );
+        }
+        assert_eq!(
+            symbol("acme:phase1/api.Empty").kind(),
+            sai_semantic::SymbolKind::Resource
+        );
+        assert_eq!(
+            symbol("acme:phase1/api.Shell").kind(),
+            sai_semantic::SymbolKind::Resource
+        );
         assert!(
             inventory
                 .symbols()
                 .iter()
-                .all(|symbol| symbol.path() != "acme:phase1/api.call")
+                .all(|symbol| symbol.path() != "acme:phase1/api.paint"),
+            "resource methods must keep their resource-qualified paths"
+        );
+
+        let source = std::str::from_utf8(wit_source).expect("fixture WIT is UTF-8");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version parses"),
+        )
+        .expect("selected package version is valid");
+        let unit =
+            WitUnit::dir(package, &database.packages, &selected).expect("root WIT unit is valid");
+        let loaded = database
+            .wit_package(&unit)
+            .expect("root WIT package loads")
+            .package
+            .expect("root WIT package model is available");
+        let root = loaded.root();
+        let (interface_index, interface) = root
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("root interface is present");
+        let (item_index, item) = interface
+            .items
+            .iter_enumerated()
+            .next()
+            .expect("first interface item is the resource");
+        let name_span = item.span.as_ref().expect("resource name span is mapped");
+        let sidecar = sai_wit::authored_interface_resource_tokens(
+            source,
+            &interface.name,
+            &item.name,
+            &name_span.range,
+        )
+        .expect("exact resource source sidecar is available");
+        assert_eq!(
+            symbol("acme:phase1/api.Canvas").fingerprint(),
+            sai_semantic::declaration_fingerprint_from_token_pairs(
+                sai_semantic::SymbolKind::Resource,
+                &sidecar.token_pairs
+            )
+        );
+        let view = database
+            .wit_view(&unit)
+            .expect("selected WIT view is available");
+        let view_interface = &view.interfaces["api"];
+        let resource_member = &view_interface.members["Canvas"];
+        let resource_definition = view
+            .definition_for_entity(sai_wit::WitViewEntity::Item {
+                interface: interface_index,
+                item: item_index,
+            })
+            .expect("resource item has the exact view definition");
+        assert_eq!(resource_member.def, resource_definition);
+        let resource_path = view
+            .def_path(resource_definition)
+            .expect("resource view path resolves")
+            .expect("resource view path exists");
+        let expected_resource_hash =
+            sai_hir::DefPathHash::compute(&resource_path, &database.packages, &database.symbols)
+                .expect("resource view path hashes");
+        assert_eq!(
+            symbol("acme:phase1/api.Canvas").def_path_hash(),
+            Fingerprint::new(expected_resource_hash.raw())
+        );
+        for (member_index, (member, source_member)) in match &item.kind {
+            sai_wit::WitItemKind::Resource(members) => members,
+            _ => panic!("resource item model expected"),
+        }
+        .iter()
+        .zip(sidecar.members.iter())
+        .enumerate()
+        {
+            let view_name = if member.kind == sai_wit::WitMemberKind::Constructor {
+                "new".to_owned()
+            } else {
+                sai_wit::wit_name_to_sai(&member.name, false)
+                    .expect("member WIT name maps to SAI")
+                    .trim_start_matches("r#")
+                    .to_owned()
+            };
+            let path = format!("acme:phase1/api.Canvas.{view_name}");
+            assert_eq!(
+                symbol(&path).fingerprint(),
+                sai_semantic::declaration_fingerprint_from_token_pairs(
+                    sai_semantic::SymbolKind::AssocFn,
+                    &source_member.token_pairs
+                ),
+                "{path}"
+            );
+            let member_def = view
+                .definition_for_entity(sai_wit::WitViewEntity::ResourceMember {
+                    interface: interface_index,
+                    item: item_index,
+                    member: u32::try_from(member_index).expect("resource member index fits"),
+                })
+                .expect("resource member has its exact view definition");
+            let member_path = view
+                .def_path(member_def)
+                .expect("resource member view path resolves")
+                .expect("resource member view path exists");
+            let expected_member_hash =
+                sai_hir::DefPathHash::compute(&member_path, &database.packages, &database.symbols)
+                    .expect("resource member view path hashes");
+            assert_eq!(
+                symbol(&path).def_path_hash(),
+                Fingerprint::new(expected_member_hash.raw()),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn wit_resource_inventory_uses_canonical_name_for_escaped_reserved_resource() {
+        let wit_source =
+            b"package acme:phase1@1.0.0;\ninterface api { resource %self { read: func(); } }\n";
+        let (_database, _package, collection) = collect_single_authored_wit_inventory(wit_source);
+        let inventory = inventory_symbols(&collection);
+
+        for (path, kind, hex) in [
+            (
+                "acme:phase1/api.Self",
+                sai_semantic::SymbolKind::Resource,
+                "000001",
+            ),
+            (
+                "acme:phase1/api.Self.read",
+                sai_semantic::SymbolKind::AssocFn,
+                "000002",
+            ),
+        ] {
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == path)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "symbol `{path}` was not inventoried; coverage: {:?}; symbols: {:?}",
+                        inventory.coverage(),
+                        inventory.symbols()
+                    )
+                });
+            assert_eq!(symbol.kind(), kind);
+            assert!(
+                !symbol.path().contains("r#"),
+                "canonical paths use semantic names, not SAI escape spelling"
+            );
+            sai_semantic::SymbolIndexEntry::new(
+                sai_semantic::SymbolHex::parse(hex).expect("symbol hex parses"),
+                symbol.def_path_hash(),
+                symbol.path(),
+                symbol.kind(),
+                symbol.fingerprint(),
+            )
+            .expect("canonical resource and member paths pass index validation");
+        }
+    }
+
+    #[test]
+    fn wit_resource_inventory_maps_constructors_and_leaves_shadowed_new_incomplete() {
+        let wit_source = b"package acme:phase1@1.0.0;\n\
+interface api { resource canvas { new: static func() -> canvas; constructor(); } }\n";
+        let (mut database, package, collection) = collect_single_authored_wit_inventory(wit_source);
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("shadowed")
+        ));
+        let member_symbols = inventory
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.path() == "acme:phase1/api.Canvas.new")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            member_symbols.len(),
+            1,
+            "the constructor must win the SAI `new` name"
+        );
+
+        let source = std::str::from_utf8(wit_source).expect("fixture WIT is UTF-8");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version parses"),
+        )
+        .expect("selected package version is valid");
+        let unit =
+            WitUnit::dir(package, &database.packages, &selected).expect("root WIT unit is valid");
+        let loaded = database
+            .wit_package(&unit)
+            .expect("root WIT package loads")
+            .package
+            .expect("root WIT package model is available");
+        let (_interface_index, interface) = loaded
+            .root()
+            .interfaces
+            .iter_enumerated()
+            .next()
+            .expect("root interface is present");
+        let (_item_index, item) = interface
+            .items
+            .iter_enumerated()
+            .next()
+            .expect("first interface item is the resource");
+        let name_span = item.span.as_ref().expect("resource name span is mapped");
+        let sidecar = sai_wit::authored_interface_resource_tokens(
+            source,
+            &interface.name,
+            &item.name,
+            &name_span.range,
+        )
+        .expect("the exact resource sidecar is available");
+        assert_eq!(sidecar.members.len(), 2);
+        assert_eq!(sidecar.members[0].kind, sai_wit::WitMemberKind::Static);
+        assert_eq!(sidecar.members[1].kind, sai_wit::WitMemberKind::Constructor);
+        assert_eq!(
+            member_symbols[0].fingerprint(),
+            sai_semantic::declaration_fingerprint_from_token_pairs(
+                sai_semantic::SymbolKind::AssocFn,
+                &sidecar.members[1].token_pairs
+            ),
+            "the exposed `new` fingerprint comes from the winning constructor"
+        );
+    }
+
+    #[test]
+    fn wit_resource_inventory_omits_unsupported_members_but_keeps_supported_symbols() {
+        let wit_source = b"package acme:phase1@1.0.0;\n\
+interface api { resource canvas { invalid: static func(items: map<string, u32>); read: func(); } }\n";
+        let (_database, _package, collection) = collect_single_authored_wit_inventory(wit_source);
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("unsupported signature")
+        ));
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.path() == "acme:phase1/api.Canvas.read"),
+            "a supported sibling remains available as a candidate"
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.path() != "acme:phase1/api.Canvas.invalid"),
+            "an unsupported member has no symbol candidate"
         );
     }
 
