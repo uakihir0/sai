@@ -1,0 +1,20 @@
+use acme:affordable-housing-allocation/model.{Applicant, Dwelling}
+
+pub fn household_size(applicant: Applicant) -> U32 {
+    applicant.adults + applicant.children
+}
+
+pub fn is_eligible(applicant: Applicant, dwelling: Dwelling) -> Bool {
+    (
+        household_size(applicant) > 0
+        and household_size(applicant) <= dwelling.maximum_occupants
+        and applicant.monthly_income_cents <= dwelling.maximum_monthly_income_cents
+        and applicant.monthly_income_cents > 0
+        and (
+            U64.from(dwelling.monthly_rent_cents) * 100
+            <= U64.from(applicant.monthly_income_cents) * 30
+        )
+        and (not applicant.needs_step_free or dwelling.step_free_entry)
+        and (not applicant.needs_wide_doorways or dwelling.wide_doorways)
+    )
+}

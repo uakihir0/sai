@@ -1,0 +1,92 @@
+use acme:construction-permit-review/evaluator
+use acme:construction-permit-review/model.{PermitBatch, PermitReport, PermitReview, ReviewStatus}
+
+pub fn review_batch(batch: PermitBatch) -> PermitReport {
+    let placeholder = PermitReview(
+        application_id: 0,
+        name: "",
+        status: ReviewStatus.DataCorrectionRequired,
+        required_evidence_count: 0,
+        missing_evidence_count: 0,
+        requires_site_plan: false,
+        requires_structural_drawings: false,
+        requires_accessibility_plan: false,
+        requires_drainage_plan: false,
+        requires_environmental_note: false,
+        requires_demolition_plan: false,
+        missing_site_plan: false,
+        missing_structural_drawings: false,
+        missing_accessibility_plan: false,
+        missing_drainage_plan: false,
+        missing_environmental_note: false,
+        missing_demolition_plan: false,
+        zoning_review: false,
+        accessibility_review: false,
+        environmental_review: false,
+        data_correction_required: false,
+    )
+    var reviews = Array<PermitReview, 8>.filled(placeholder)
+    var staff_plan_review_count: USize = 0
+    var incomplete_evidence_count: USize = 0
+    var incomplete_and_specialist_count: USize = 0
+    var zoning_review_count: USize = 0
+    var accessibility_review_count: USize = 0
+    var environmental_review_count: USize = 0
+    var multi_discipline_review_count: USize = 0
+    var data_correction_count: USize = 0
+    var follow_up_count: USize = 0
+    var index: USize = 0
+
+    for application in batch.applications {
+        let review = evaluator.review(application)
+        reviews[index] = review
+        match review.status {
+            ReviewStatus.StaffPlanReview => {
+                staff_plan_review_count += 1
+            }
+            ReviewStatus.IncompleteEvidence => {
+                incomplete_evidence_count += 1
+                follow_up_count += 1
+            }
+            ReviewStatus.IncompleteAndSpecialistReview => {
+                incomplete_and_specialist_count += 1
+                follow_up_count += 1
+            }
+            ReviewStatus.ZoningReview => {
+                zoning_review_count += 1
+                follow_up_count += 1
+            }
+            ReviewStatus.AccessibilityReview => {
+                accessibility_review_count += 1
+                follow_up_count += 1
+            }
+            ReviewStatus.EnvironmentalReview => {
+                environmental_review_count += 1
+                follow_up_count += 1
+            }
+            ReviewStatus.MultiDisciplineReview => {
+                multi_discipline_review_count += 1
+                follow_up_count += 1
+            }
+            ReviewStatus.DataCorrectionRequired => {
+                data_correction_count += 1
+                follow_up_count += 1
+            }
+        }
+        index += 1
+    }
+
+    PermitReport(
+        reviews: reviews,
+        application_count: index,
+        staff_plan_review_count: staff_plan_review_count,
+        incomplete_evidence_count: incomplete_evidence_count,
+        incomplete_and_specialist_count: incomplete_and_specialist_count,
+        zoning_review_count: zoning_review_count,
+        accessibility_review_count: accessibility_review_count,
+        environmental_review_count: environmental_review_count,
+        multi_discipline_review_count: multi_discipline_review_count,
+        data_correction_count: data_correction_count,
+        follow_up_count: follow_up_count,
+    )
+}

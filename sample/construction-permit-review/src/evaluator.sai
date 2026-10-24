@@ -1,0 +1,115 @@
+use acme:construction-permit-review/model.{Application, PermitReview, ReviewStatus}
+use acme:construction-permit-review/policy
+
+pub fn review(application: Application) -> PermitReview {
+    let requires_site_plan = true
+    let requires_structural_drawings = policy.requires_structural_drawings(application.permit_type)
+    let requires_accessibility_plan = policy.requires_accessibility_plan(application)
+    let requires_drainage_plan = policy.requires_drainage_plan(application)
+    let requires_environmental_note = policy.requires_environmental_note(application)
+    let requires_demolition_plan = policy.requires_demolition_plan(application.permit_type)
+
+    let missing_site_plan = requires_site_plan and not application.has_site_plan
+    let missing_structural_drawings =
+        (requires_structural_drawings and not application.has_structural_drawings)
+    let missing_accessibility_plan =
+        (requires_accessibility_plan and not application.has_accessibility_plan)
+    let missing_drainage_plan = requires_drainage_plan and not application.has_drainage_plan
+    let missing_environmental_note =
+        (requires_environmental_note and not application.has_environmental_note)
+    let missing_demolition_plan = (requires_demolition_plan and not application.has_demolition_plan)
+
+    var required_evidence_count: USize = 1
+    if requires_structural_drawings {
+        required_evidence_count += 1
+    }
+    if requires_accessibility_plan {
+        required_evidence_count += 1
+    }
+    if requires_drainage_plan {
+        required_evidence_count += 1
+    }
+    if requires_environmental_note {
+        required_evidence_count += 1
+    }
+    if requires_demolition_plan {
+        required_evidence_count += 1
+    }
+
+    var missing_evidence_count: USize = 0
+    if missing_site_plan {
+        missing_evidence_count += 1
+    }
+    if missing_structural_drawings {
+        missing_evidence_count += 1
+    }
+    if missing_accessibility_plan {
+        missing_evidence_count += 1
+    }
+    if missing_drainage_plan {
+        missing_evidence_count += 1
+    }
+    if missing_environmental_note {
+        missing_evidence_count += 1
+    }
+    if missing_demolition_plan {
+        missing_evidence_count += 1
+    }
+
+    let zoning_review = policy.requires_zoning_review(application)
+    let accessibility_review = policy.requires_accessibility_review(application)
+    let environmental_review = policy.requires_environmental_review(application)
+    let data_correction_required = policy.has_invalid_site_metrics(application)
+    var specialist_count: USize = 0
+    if zoning_review {
+        specialist_count += 1
+    }
+    if accessibility_review {
+        specialist_count += 1
+    }
+    if environmental_review {
+        specialist_count += 1
+    }
+
+    let status = if data_correction_required {
+        ReviewStatus.DataCorrectionRequired
+    } else if missing_evidence_count > 0 and specialist_count > 0 {
+        ReviewStatus.IncompleteAndSpecialistReview
+    } else if missing_evidence_count > 0 {
+        ReviewStatus.IncompleteEvidence
+    } else if specialist_count > 1 {
+        ReviewStatus.MultiDisciplineReview
+    } else if zoning_review {
+        ReviewStatus.ZoningReview
+    } else if accessibility_review {
+        ReviewStatus.AccessibilityReview
+    } else if environmental_review {
+        ReviewStatus.EnvironmentalReview
+    } else {
+        ReviewStatus.StaffPlanReview
+    }
+
+    PermitReview(
+        application_id: application.id,
+        name: application.name,
+        status: status,
+        required_evidence_count: required_evidence_count,
+        missing_evidence_count: missing_evidence_count,
+        requires_site_plan: requires_site_plan,
+        requires_structural_drawings: requires_structural_drawings,
+        requires_accessibility_plan: requires_accessibility_plan,
+        requires_drainage_plan: requires_drainage_plan,
+        requires_environmental_note: requires_environmental_note,
+        requires_demolition_plan: requires_demolition_plan,
+        missing_site_plan: missing_site_plan,
+        missing_structural_drawings: missing_structural_drawings,
+        missing_accessibility_plan: missing_accessibility_plan,
+        missing_drainage_plan: missing_drainage_plan,
+        missing_environmental_note: missing_environmental_note,
+        missing_demolition_plan: missing_demolition_plan,
+        zoning_review: zoning_review,
+        accessibility_review: accessibility_review,
+        environmental_review: environmental_review,
+        data_correction_required: data_correction_required,
+    )
+}

@@ -1,0 +1,48 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Area {
+    North
+    Central
+    South
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Applicant {
+    pub id: U32
+    pub name: Str
+    pub adults: U32
+    pub children: U32
+    pub monthly_income_cents: U32
+    pub needs_step_free: Bool
+    pub needs_wide_doorways: Bool
+    pub first_choice: Area
+    pub second_choice: Area
+    // Lower values are older applications and win otherwise equal offers.
+    pub submitted_day: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Dwelling {
+    pub id: U32
+    pub address: Str
+    pub area: Area
+    pub bedrooms: U32
+    pub maximum_occupants: U32
+    pub monthly_rent_cents: U32
+    pub maximum_monthly_income_cents: U32
+    pub step_free_entry: Bool
+    pub wide_doorways: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type UnitDecision {
+    pub dwelling_id: U32
+    pub applicant_id: Option<U32>
+    pub area_preference_rank: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Plan {
+    pub decisions: Array<UnitDecision, 4>
+    pub assigned_applications: Array<Bool, 6>
+    pub assigned_count: USize
+}

@@ -1,0 +1,97 @@
+use acme:affordable-housing-allocation/data
+use acme:affordable-housing-allocation/eligibility
+use acme:affordable-housing-allocation/model.{Applicant, Area, Dwelling, Plan, UnitDecision}
+use sai:core/num.{U32_MAX}
+
+pub fn area_preference_rank(applicant: Applicant, dwelling: Dwelling) -> U32 {
+    if dwelling.area == applicant.first_choice {
+        1
+    } else if dwelling.area == applicant.second_choice {
+        2
+    } else {
+        3
+    }
+}
+
+fn choose_applicant(
+    applicants: Array<Applicant, 6>,
+    already_assigned: Array<Bool, 6>,
+    dwelling: Dwelling,
+) -> Option<USize> {
+    var selected: Option<USize> = None
+    var best_rank: U32 = U32_MAX
+    var best_day: U32 = U32_MAX
+    var best_id: U32 = U32_MAX
+    var index: USize = 0
+
+    for applicant in applicants {
+        if not already_assigned[index] and eligibility.is_eligible(applicant, dwelling) {
+            let rank = area_preference_rank(applicant, dwelling)
+            if (
+                rank < best_rank
+                or (
+                    rank == best_rank
+                    and (
+                        applicant.submitted_day < best_day
+                        or (applicant.submitted_day == best_day and applicant.id < best_id)
+                    )
+                )
+            ) {
+                selected = Some(index)
+                best_rank = rank
+                best_day = applicant.submitted_day
+                best_id = applicant.id
+            }
+        }
+        index += 1
+    }
+    selected
+}
+
+pub fn build_plan() -> Plan {
+    let applicants = data.applicants()
+    let dwellings = data.dwellings()
+    var assigned = Array<Bool, 6>.filled(false)
+    var decisions = Array<UnitDecision, 4>.filled(
+        UnitDecision(dwelling_id: 0, applicant_id: None, area_preference_rank: None),
+    )
+    var assigned_count: USize = 0
+
+    for dwelling_index in 0..4 {
+        let dwelling = dwellings[dwelling_index]
+        match choose_applicant(applicants, assigned, dwelling) {
+            Some(applicant_index) => {
+                let applicant = applicants[applicant_index]
+                assigned[applicant_index] = true
+                assigned_count += 1
+                decisions[dwelling_index] = UnitDecision(
+                    dwelling_id: dwelling.id,
+                    applicant_id: Some(applicant.id),
+                    area_preference_rank: Some(area_preference_rank(applicant, dwelling)),
+                )
+            }
+            None => {
+                decisions[dwelling_index] = UnitDecision(
+                    dwelling_id: dwelling.id,
+                    applicant_id: None,
+                    area_preference_rank: None,
+                )
+            }
+        }
+    }
+
+    Plan(decisions: decisions, assigned_applications: assigned, assigned_count: assigned_count)
+}
+
+pub fn has_eligible_dwelling(applicant: Applicant) -> Bool {
+    for dwelling in data.dwellings() {
+        if eligibility.is_eligible(applicant, dwelling) {
+            return true
+        }
+    }
+    false
+}
+
+pub fn area_name(area: Area) -> Str {
+    match area { .North => "North", .Central => "Central", .South => "South" }
+}
