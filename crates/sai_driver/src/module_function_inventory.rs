@@ -2429,6 +2429,12 @@ fn collect_interface(
                         .insert("an interface type alias has an attribute validation error".into());
                     continue;
                 }
+                if type_declaration.generic_params().is_some() {
+                    reasons.insert(
+                        "generic interface type aliases are prohibited (GENERIC_INTERFACE_ITEM)"
+                            .into(),
+                    );
+                }
                 validated_aliases.push(ValidatedInterfaceAlias {
                     entry: child.clone(),
                     declaration: type_declaration.clone(),

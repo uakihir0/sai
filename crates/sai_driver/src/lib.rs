@@ -27346,7 +27346,7 @@ world app { import acme:dep/api; }\n",
     }
 
     #[test]
-    fn module_interface_alias_inventory_collects_root_nested_aliases_and_generics() {
+    fn module_interface_alias_inventory_keeps_forbidden_generic_candidates_incomplete() {
         let (mut database, module_tree, snapshot, collection) =
             collect_package_inventory_for_target(
                 b"interface codec {\ntype Word = U64\ntype Identity<T, const N: I32> = T\n}\n",
@@ -27354,10 +27354,11 @@ world app { import acme:dep/api; }\n",
                 "wasm32-core",
             );
         let inventory = inventory_symbols(&collection);
-        assert_eq!(
+        assert!(matches!(
             inventory.coverage(),
-            &sai_semantic::InventoryCoverage::Complete
-        );
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("GENERIC_INTERFACE_ITEM")
+        ));
         let actual = inventory
             .symbols()
             .iter()
@@ -27585,6 +27586,41 @@ world app { import acme:dep/api; }\n",
         assert_eq!(
             const_generic_symbol.def_path_hash(),
             sai_stable_hash::Fingerprint::new(expected_const_generic_hash.raw())
+        );
+    }
+
+    #[test]
+    fn module_interface_alias_inventory_keeps_plain_root_and_nested_aliases_complete() {
+        let (_, _, _, collection) = collect_package_inventory_for_target(
+            b"interface codec {\ntype Word = U64\n}\n",
+            b"interface identity {\ntype Key = U32\n}\n",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                ("acme:phase1.codec", sai_semantic::SymbolKind::Interface),
+                ("acme:phase1.codec.Word", sai_semantic::SymbolKind::Alias),
+                (
+                    "acme:phase1/child.identity",
+                    sai_semantic::SymbolKind::Interface
+                ),
+                (
+                    "acme:phase1/child.identity.Key",
+                    sai_semantic::SymbolKind::Alias
+                ),
+            ]
+            .into_iter()
+            .collect()
         );
     }
 
