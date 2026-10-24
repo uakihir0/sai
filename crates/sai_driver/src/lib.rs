@@ -25347,7 +25347,6 @@ interface api {\n\
     @since(version = 1.0.0)\n\
     enum status { ready, not-ready }\n\
     enum %type { %async, stopped }\n\
-    variant outcome { ready, failed(u32) }\n\
 }\n";
         let (mut database, package, collection) = collect_single_authored_wit_inventory(wit_source);
         let inventory = inventory_symbols(&collection);
@@ -25492,20 +25491,234 @@ interface api {\n\
                 );
             }
         }
+    }
 
-        for path in [
-            "acme:phase1/api.Outcome",
-            "acme:phase1/api.Outcome.Ready",
-            "acme:phase1/api.Outcome.Failed",
-        ] {
-            assert!(
-                inventory
-                    .symbols()
-                    .iter()
-                    .all(|symbol| symbol.path() != path),
-                "payload WIT variants are outside this unit-enum slice: {path}"
+    #[test]
+    fn wit_variant_inventory_collects_payload_cases_and_keeps_supported_siblings() {
+        let wit_source = br#"package acme:phase1@1.0.0;
+interface types {
+    variant foreign { remote(u32) }
+}
+interface api {
+    use types.{foreign as imported};
+    @since(version = 1.0.0)
+    variant outcome {
+        ready,
+        failed(result<tuple<u32, string>, option<u64>>),
+        unsupported(map<string, u32>),
+        %type(string),
+    }
+}"#;
+        let (mut database, package, collection) = collect_single_authored_wit_inventory(wit_source);
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("unsupported case payload types")
+        ));
+        let source = std::str::from_utf8(wit_source).expect("fixture WIT is UTF-8");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version parses"),
+        )
+        .expect("root package selection is valid");
+        let unit =
+            WitUnit::dir(package, &database.packages, &selected).expect("root WIT unit is valid");
+        let loaded = database
+            .wit_package(&unit)
+            .expect("root WIT package query succeeds")
+            .package
+            .expect("root WIT package model is available");
+        let root = loaded.root();
+        let (interface_index, interface) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "api")
+            .expect("root interface is present");
+        let (item_index, item, cases) = interface
+            .items
+            .iter_enumerated()
+            .find_map(|(item_index, item)| match &item.kind {
+                sai_wit::WitItemKind::Variant(cases) if item.name == "outcome" => {
+                    Some((item_index, item, cases))
+                }
+                _ => None,
+            })
+            .expect("direct authored variant is in the selected package model");
+        let view = database
+            .wit_view(&unit)
+            .expect("selected authored WIT view is available");
+        let view_interface = &view.interfaces["api"];
+        let member = view_interface
+            .members
+            .get("Outcome")
+            .expect("variant parent is represented as a view enum member");
+        assert_eq!(member.item, item_index);
+        assert_eq!(member.kind, sai_wit::WitViewDefKind::Enum);
+        assert_eq!(member.unsupported, item.unsupported);
+        let entity = sai_wit::WitViewEntity::Item {
+            interface: interface_index,
+            item: item_index,
+        };
+        let definition = view
+            .definition_for_entity(entity)
+            .expect("variant parent has the exact selected view entity");
+        assert_eq!(member.def, definition);
+        let view_definition = view.definition(definition).expect("view definition exists");
+        assert_eq!(view_definition.entity, entity);
+        assert_eq!(view_definition.kind, sai_wit::WitViewDefKind::Enum);
+        let def_path = view
+            .def_path(definition)
+            .expect("variant DefPath resolves")
+            .expect("variant DefPath exists");
+        assert_eq!(def_path.package(), view.package);
+        assert!(matches!(
+            def_path.data(),
+            [
+                sai_hir::DisambiguatedDefPathData {
+                    data: sai_hir::DefPathData::Interface(interface_name),
+                    disambiguator: 0,
+                },
+                sai_hir::DisambiguatedDefPathData {
+                    data: sai_hir::DefPathData::TypeNs(variant_name),
+                    disambiguator: 0,
+                },
+            ] if database.symbols.resolve(*interface_name).is_ok_and(|name| name.as_ref() == "api")
+                && database.symbols.resolve(*variant_name).is_ok_and(|name| name.as_ref() == "Outcome")
+        ));
+        let expected_hash =
+            sai_hir::DefPathHash::compute(&def_path, &database.packages, &database.symbols)
+                .expect("variant DefPath hash computes");
+        let variant_path = "acme:phase1/api.Outcome";
+        let variant_symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.path() == variant_path)
+            .expect("direct WIT variant is inventoried");
+        assert_eq!(variant_symbol.kind(), sai_semantic::SymbolKind::Variant);
+        assert_eq!(
+            variant_symbol.def_path_hash(),
+            Fingerprint::new(expected_hash.raw())
+        );
+        let name_span = item.span.as_ref().expect("variant name span is mapped");
+        let variant_tokens = sai_wit::authored_interface_variant_tokens(
+            source,
+            &interface.name,
+            &item.name,
+            &name_span.range,
+        )
+        .expect("scanner binds the parsed variant name span to source");
+        assert_eq!(variant_tokens.cases.len(), cases.len());
+        assert_eq!(
+            variant_symbol.fingerprint(),
+            sai_semantic::declaration_fingerprint_from_token_pairs(
+                sai_semantic::SymbolKind::Variant,
+                &variant_tokens.token_pairs
+            )
+        );
+
+        for (case_index, (case, source_case)) in cases.iter().zip(&variant_tokens.cases).enumerate()
+        {
+            let case_name =
+                sai_wit::wit_name_to_sai(&case.name, true).expect("case name maps to SAI");
+            let case_name = case_name.strip_prefix("r#").unwrap_or(&case_name);
+            let case_path = format!("{variant_path}.{case_name}");
+            if case
+                .payload
+                .as_ref()
+                .is_some_and(|ty| matches!(ty, sai_wit::WitType::Unsupported(_)))
+            {
+                assert!(
+                    inventory
+                        .symbols()
+                        .iter()
+                        .all(|symbol| symbol.path() != case_path),
+                    "unsupported payload case is excluded: {case_path}"
+                );
+                continue;
+            }
+            let case_symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == case_path)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "supported case `{case_path}` is missing; coverage: {:?}; symbols: {:?}",
+                        inventory.coverage(),
+                        inventory.symbols()
+                    )
+                });
+            assert_eq!(case_symbol.kind(), sai_semantic::SymbolKind::Variant);
+            let case_entity = sai_wit::WitViewEntity::Variant {
+                interface: interface_index,
+                item: item_index,
+                case: u32::try_from(case_index).expect("case ordinal fits"),
+            };
+            let case_definition = view
+                .definition_for_entity(case_entity)
+                .expect("case has the exact selected view entity");
+            let case_view_definition = view
+                .definition(case_definition)
+                .expect("case view definition is current");
+            assert_eq!(case_view_definition.entity, case_entity);
+            assert_eq!(case_view_definition.kind, sai_wit::WitViewDefKind::Variant);
+            let case_def_path = view
+                .def_path(case_definition)
+                .expect("case DefPath resolves")
+                .expect("case DefPath exists");
+            assert_eq!(case_def_path.package(), view.package);
+            assert!(matches!(
+                case_def_path.data(),
+                [
+                    sai_hir::DisambiguatedDefPathData {
+                        data: sai_hir::DefPathData::Interface(interface_name),
+                        disambiguator: 0,
+                    },
+                    sai_hir::DisambiguatedDefPathData {
+                        data: sai_hir::DefPathData::TypeNs(variant_name),
+                        disambiguator: 0,
+                    },
+                    sai_hir::DisambiguatedDefPathData {
+                        data: sai_hir::DefPathData::Variant(case_view_name),
+                        disambiguator: 0,
+                    },
+                ] if database.symbols.resolve(*interface_name).is_ok_and(|name| name.as_ref() == "api")
+                    && database.symbols.resolve(*variant_name).is_ok_and(|name| name.as_ref() == "Outcome")
+                    && database.symbols.resolve(*case_view_name).is_ok_and(|name| name.as_ref() == case_name)
+            ));
+            let expected_hash = sai_hir::DefPathHash::compute(
+                &case_def_path,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("case DefPath hash computes");
+            assert_eq!(
+                case_symbol.def_path_hash(),
+                Fingerprint::new(expected_hash.raw())
+            );
+            assert_eq!(
+                case_symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint_from_token_pairs(
+                    sai_semantic::SymbolKind::Variant,
+                    &source_case.token_pairs
+                )
             );
         }
+
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.path() == "acme:phase1/api.Outcome.Failed"),
+            "supported cases survive their unsupported sibling"
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| !symbol.path().starts_with("acme:phase1/api.Imported")),
+            "use re-exports do not acquire a new direct variant path"
+        );
     }
 
     #[test]
@@ -25688,7 +25901,6 @@ interface api {
         %type: string,
     }
     record unsupported { payload: map<string, u32> }
-    variant outcome { ready, failed(u32) }
 }"#;
         let (mut database, package, collection) = collect_single_authored_wit_inventory(wit_source);
         let inventory = inventory_symbols(&collection);
@@ -25891,14 +26103,13 @@ interface api {
         for path in [
             "acme:phase1/api.Unsupported",
             "acme:phase1/api.Unsupported.field[payload]",
-            "acme:phase1/api.Outcome",
         ] {
             assert!(
                 inventory
                     .symbols()
                     .iter()
                     .all(|symbol| symbol.path() != path),
-                "unsupported records and out-of-slice variants do not leak symbols: {path}"
+                "unsupported records do not leak symbols: {path}"
             );
         }
     }
