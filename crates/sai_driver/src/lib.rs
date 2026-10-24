@@ -25509,6 +25509,174 @@ interface api {\n\
     }
 
     #[test]
+    fn wit_alias_inventory_collects_direct_aliases_but_not_used_reexports() {
+        let wit_source = br#"package acme:phase1@1.0.0;
+interface types { type payload = u32; }
+interface api {
+    @since(version = 1.0.0)
+    type count = u32;
+    type %type = result<u32, string>;
+    type unsupported = map<string, u32>;
+    use types.{payload as imported};
+}"#;
+        let (mut database, package, collection) = collect_single_authored_wit_inventory(wit_source);
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { .. }
+        ));
+        let source = std::str::from_utf8(wit_source).expect("fixture WIT is UTF-8");
+        let selected = MvsPackageVersion::new(
+            "acme:phase1",
+            Version::parse("1.0.0").expect("root version parses"),
+        )
+        .expect("root package selection is valid");
+        let unit =
+            WitUnit::dir(package, &database.packages, &selected).expect("root WIT unit is valid");
+        let loaded = database
+            .wit_package(&unit)
+            .expect("root WIT package query succeeds")
+            .package
+            .expect("root WIT package model is available");
+        let root = loaded.root();
+        let (interface_index, interface) = root
+            .interfaces
+            .iter_enumerated()
+            .find(|(_, interface)| interface.name == "api")
+            .expect("root interface is present");
+        let view = database
+            .wit_view(&unit)
+            .expect("selected authored WIT view is available");
+        let view_interface = &view.interfaces["api"];
+
+        let aliases = interface
+            .items
+            .iter_enumerated()
+            .filter_map(|(item_index, item)| {
+                matches!(item.kind, sai_wit::WitItemKind::Alias(_)).then_some((item_index, item))
+            })
+            .collect::<Vec<_>>();
+        let aliases = aliases
+            .into_iter()
+            .filter(|(_, item)| {
+                item.span.as_ref().is_some_and(|span| {
+                    sai_wit::authored_interface_alias_tokens(
+                        source,
+                        &interface.name,
+                        &item.name,
+                        &span.range,
+                    )
+                    .is_some()
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            aliases
+                .iter()
+                .map(|(_, item)| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["count", "type", "unsupported"],
+            "only direct authored alias declarations are selected"
+        );
+        for (item_index, item) in aliases {
+            if item.name == "unsupported" {
+                continue;
+            }
+            let alias_sai_name =
+                sai_wit::wit_name_to_sai(&item.name, true).expect("alias name maps to SAI");
+            let alias_sai_name = alias_sai_name.strip_prefix("r#").unwrap_or(&alias_sai_name);
+            let canonical_path = format!("acme:phase1/api.{alias_sai_name}");
+            let alias_symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == canonical_path)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "alias `{canonical_path}` is missing; coverage: {:?}; symbols: {:?}",
+                        inventory.coverage(),
+                        inventory.symbols()
+                    )
+                });
+            assert_eq!(alias_symbol.kind(), sai_semantic::SymbolKind::Alias);
+
+            let view_member = view_interface
+                .members
+                .get(alias_sai_name)
+                .expect("direct alias is represented in the selected view");
+            assert_eq!(view_member.item, item_index);
+            assert_eq!(view_member.kind, sai_wit::WitViewDefKind::Alias);
+            let entity = sai_wit::WitViewEntity::Item {
+                interface: interface_index,
+                item: item_index,
+            };
+            let definition = view
+                .definition_for_entity(entity)
+                .expect("direct alias has the exact view entity");
+            assert_eq!(view_member.def, definition);
+            let view_definition = view.definition(definition).expect("view definition exists");
+            assert_eq!(view_definition.entity, entity);
+            assert_eq!(view_definition.kind, sai_wit::WitViewDefKind::Alias);
+
+            let path = view
+                .def_path(definition)
+                .expect("alias DefPath resolves")
+                .expect("alias DefPath exists");
+            assert_eq!(path.package(), view.package);
+            assert!(matches!(
+                path.data(),
+                [
+                    sai_hir::DisambiguatedDefPathData {
+                        data: sai_hir::DefPathData::Interface(interface_name),
+                        disambiguator: 0,
+                    },
+                    sai_hir::DisambiguatedDefPathData {
+                        data: sai_hir::DefPathData::TypeNs(alias_name),
+                        disambiguator: 0,
+                    },
+                ] if database.symbols.resolve(*interface_name).is_ok_and(|name| name.as_ref() == "api")
+                    && database.symbols.resolve(*alias_name).is_ok_and(|name| name.as_ref() == alias_sai_name)
+            ));
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&path, &database.packages, &database.symbols)
+                    .expect("alias DefPath hash computes");
+            assert_eq!(
+                alias_symbol.def_path_hash(),
+                Fingerprint::new(expected_hash.raw())
+            );
+
+            let name_span = item.span.as_ref().expect("alias name span is mapped");
+            let alias_tokens = sai_wit::authored_interface_alias_tokens(
+                source,
+                &interface.name,
+                &item.name,
+                &name_span.range,
+            )
+            .expect("the exact authored alias declaration sidecar is available");
+            assert_eq!(
+                alias_symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint_from_token_pairs(
+                    sai_semantic::SymbolKind::Alias,
+                    &alias_tokens.token_pairs
+                )
+            );
+        }
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.path() != "acme:phase1/api.Imported"),
+            "a `use` re-export has the canonical path of its definition"
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.path() != "acme:phase1/api.Unsupported"),
+            "unsupported alias targets do not leak candidates"
+        );
+    }
+
+    #[test]
     fn wit_function_inventory_does_not_promote_resource_methods_to_interface_functions() {
         let wit_source = b"package acme:phase1@1.0.0;\n\
 interface api {\n\
