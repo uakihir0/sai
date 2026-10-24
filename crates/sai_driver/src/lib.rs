@@ -26090,6 +26090,453 @@ property "shared"() {}
     }
 
     #[test]
+    fn module_distinct_inventory_collects_root_nested_and_mixed_generic_symbols() {
+        let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"distinct UserId = U64\ndistinct Matrix<T, const ROWS: USize, U, const COLS: USize> = Array<T, ROWS>\n",
+            b"distinct ChildKey = U32\n",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<BTreeSet<_>>(),
+            [
+                ("acme:phase1.UserId", sai_semantic::SymbolKind::Distinct),
+                ("acme:phase1.Matrix", sai_semantic::SymbolKind::Distinct),
+                (
+                    "acme:phase1.Matrix.generic[T]",
+                    sai_semantic::SymbolKind::GenericParam,
+                ),
+                (
+                    "acme:phase1.Matrix.generic[ROWS]",
+                    sai_semantic::SymbolKind::GenericParam,
+                ),
+                (
+                    "acme:phase1.Matrix.generic[U]",
+                    sai_semantic::SymbolKind::GenericParam,
+                ),
+                (
+                    "acme:phase1.Matrix.generic[COLS]",
+                    sai_semantic::SymbolKind::GenericParam,
+                ),
+                (
+                    "acme:phase1/child.ChildKey",
+                    sai_semantic::SymbolKind::Distinct,
+                ),
+            ]
+            .into_iter()
+            .collect()
+        );
+
+        for (file_id, name, path) in [
+            (module_tree.modules[0].file, "UserId", "acme:phase1.UserId"),
+            (module_tree.modules[0].file, "Matrix", "acme:phase1.Matrix"),
+            (
+                module_tree.modules[1].file,
+                "ChildKey",
+                "acme:phase1/child.ChildKey",
+            ),
+        ] {
+            let owner = collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .find(|owner| {
+                    owner.file == file_id
+                        && owner.kind == TopLevelOwnerKind::Distinct
+                        && database
+                            .resolve_def_path(owner.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|owner_path| {
+                                matches!(
+                                    owner_path.data().last().map(|component| &component.data),
+                                    Some(DefPathData::TypeNs(symbol))
+                                        if database.symbols.resolve(*symbol).is_ok_and(|resolved| resolved.as_ref() == name)
+                                )
+                            })
+                })
+                .expect("the distinct declaration has its exact top-level owner");
+            let owner_path = database
+                .resolve_def_path(owner.owner.def_id.to_def_id())
+                .expect("distinct owner DefId is valid")
+                .expect("distinct owner DefPath exists");
+            assert_eq!(owner_path.package(), module_tree.package);
+            assert!(
+                owner_path
+                    .data()
+                    .iter()
+                    .all(|component| component.disambiguator == 0),
+                "the unique module path and distinct name use zero disambiguators"
+            );
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&owner_path, &database.packages, &database.symbols)
+                    .expect("the distinct owner DefPath hashes");
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.path() == path)
+                .expect("the distinct has its canonical inventory path");
+            assert_eq!(symbol.kind(), sai_semantic::SymbolKind::Distinct);
+            assert_eq!(
+                symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+
+            let parsed = sai_syntax::parse(&snapshot, file_id).expect("distinct module parses");
+            let declaration = parsed
+                .root
+                .descendants()
+                .filter_map(ast::DistinctDecl::cast)
+                .find(|declaration| {
+                    declaration
+                        .name()
+                        .and_then(|name| name.token())
+                        .is_some_and(|token| token.text() == name)
+                })
+                .expect("the distinct declaration is present in its source file");
+            let name_token = declaration
+                .name()
+                .and_then(|name| name.token())
+                .expect("the distinct declaration has its name token");
+            assert_eq!(
+                symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint(
+                    sai_semantic::SymbolKind::Distinct,
+                    declaration.syntax(),
+                    Some(&name_token),
+                )
+                .expect("the distinct declaration fingerprint is defined")
+            );
+        }
+
+        let owner = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| {
+                owner.file == module_tree.modules[0].file
+                    && owner.kind == TopLevelOwnerKind::Distinct
+                    && database
+                        .resolve_def_path(owner.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            matches!(
+                                path.data().last().map(|component| &component.data),
+                                Some(DefPathData::TypeNs(name))
+                                    if database.symbols.resolve(*name).is_ok_and(|name| name.as_ref() == "Matrix")
+                            )
+                        })
+            })
+            .expect("the generic distinct owner exists");
+        let def_paths = database
+            .def_paths
+            .get(&module_tree.package)
+            .expect("the package DefPath interner exists");
+        let t = database.symbols.intern("T").expect("T interns");
+        let rows = database.symbols.intern("ROWS").expect("ROWS interns");
+        let u = database.symbols.intern("U").expect("U interns");
+        let cols = database.symbols.intern("COLS").expect("COLS interns");
+        let parameter_ids = def_paths
+            .intern_generic_params(
+                owner.owner.def_id,
+                &[
+                    (t, false, 0),
+                    (rows, true, 0),
+                    (u, false, 0),
+                    (cols, true, 0),
+                ],
+            )
+            .expect("mixed type and const parameters have exact HIR paths");
+        let owner_path = database
+            .resolve_def_path(owner.owner.def_id.to_def_id())
+            .expect("generic distinct owner DefId is valid")
+            .expect("generic distinct owner DefPath exists");
+        let expected_components = [
+            DefPathData::TypeParam(t),
+            DefPathData::ConstParam(rows),
+            DefPathData::TypeParam(u),
+            DefPathData::ConstParam(cols),
+        ];
+        let parsed = sai_syntax::parse(&snapshot, module_tree.modules[0].file)
+            .expect("generic distinct module parses");
+        let declaration = parsed
+            .root
+            .descendants()
+            .filter_map(ast::DistinctDecl::cast)
+            .find(|declaration| {
+                declaration
+                    .name()
+                    .and_then(|name| name.token())
+                    .is_some_and(|token| token.text() == "Matrix")
+            })
+            .expect("generic distinct AST exists");
+        let params = declaration
+            .generic_params()
+            .expect("generic parameter list exists")
+            .params()
+            .collect::<Vec<_>>();
+        for (((parameter, def_id), expected_component), parameter_name) in params
+            .iter()
+            .zip(parameter_ids)
+            .zip(expected_components)
+            .zip(["T", "ROWS", "U", "COLS"])
+        {
+            let (name_token, syntax) = match parameter {
+                ast::GenericParam::Type(parameter) => (
+                    parameter.name().and_then(|name| name.token()),
+                    parameter.syntax(),
+                ),
+                ast::GenericParam::Const(parameter) => (
+                    parameter.name().and_then(|name| name.token()),
+                    parameter.syntax(),
+                ),
+            };
+            let name_token = name_token.expect("generic parameter name token exists");
+            assert_eq!(name_token.text(), parameter_name);
+            let param_path = database
+                .resolve_def_path(def_id.to_def_id())
+                .expect("generic DefId is valid")
+                .expect("generic DefPath exists");
+            assert_eq!(param_path.package(), module_tree.package);
+            assert_eq!(
+                &param_path.data()[..owner_path.data().len()],
+                owner_path.data()
+            );
+            assert!(matches!(
+                param_path.data().last(),
+                Some(component)
+                    if component.data == expected_component && component.disambiguator == 0
+            ));
+            let symbol = inventory
+                .symbols()
+                .iter()
+                .find(|symbol| {
+                    symbol.path() == format!("acme:phase1.Matrix.generic[{parameter_name}]")
+                })
+                .expect("the parameter has its canonical inventory path");
+            let expected_hash =
+                sai_hir::DefPathHash::compute(&param_path, &database.packages, &database.symbols)
+                    .expect("generic parameter DefPath hashes");
+            assert_eq!(
+                symbol.def_path_hash(),
+                sai_stable_hash::Fingerprint::new(expected_hash.raw())
+            );
+            assert_eq!(
+                symbol.fingerprint(),
+                sai_semantic::declaration_fingerprint(
+                    sai_semantic::SymbolKind::GenericParam,
+                    syntax,
+                    Some(&name_token),
+                )
+                .expect("generic parameter fingerprint is defined")
+            );
+        }
+    }
+
+    #[test]
+    fn module_distinct_fingerprints_ignore_names_and_track_base_and_generic_changes() {
+        let fingerprint_for = |source: &[u8], kind: sai_semantic::SymbolKind| {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            let inventory = inventory_symbols(&collection);
+            assert_eq!(
+                inventory.coverage(),
+                &sai_semantic::InventoryCoverage::Complete
+            );
+            inventory
+                .symbols()
+                .iter()
+                .find(|symbol| symbol.kind() == kind)
+                .expect("the requested distinct symbol is inventoried")
+                .fingerprint()
+        };
+        let distinct_original = fingerprint_for(
+            b"distinct UserId = U64\n",
+            sai_semantic::SymbolKind::Distinct,
+        );
+        let distinct_renamed = fingerprint_for(
+            b"distinct AccountId = U64\n",
+            sai_semantic::SymbolKind::Distinct,
+        );
+        let distinct_changed_base = fingerprint_for(
+            b"distinct UserId = U32\n",
+            sai_semantic::SymbolKind::Distinct,
+        );
+        let generic_original = fingerprint_for(
+            b"distinct Wrapper<T: Copy> = T\n",
+            sai_semantic::SymbolKind::GenericParam,
+        );
+        let generic_renamed = fingerprint_for(
+            b"distinct Wrapper<U: Copy> = U\n",
+            sai_semantic::SymbolKind::GenericParam,
+        );
+        let generic_changed_bound = fingerprint_for(
+            b"distinct Wrapper<T: Clone> = T\n",
+            sai_semantic::SymbolKind::GenericParam,
+        );
+
+        assert_eq!(
+            distinct_original, distinct_renamed,
+            "renaming a distinct type preserves its fingerprint"
+        );
+        assert_ne!(
+            distinct_original, distinct_changed_base,
+            "changing the distinct base type changes its fingerprint"
+        );
+        assert_eq!(
+            generic_original, generic_renamed,
+            "renaming a generic parameter preserves its fingerprint"
+        );
+        assert_ne!(
+            generic_original, generic_changed_bound,
+            "changing a generic parameter bound changes its fingerprint"
+        );
+    }
+
+    #[test]
+    fn module_distinct_inventory_checks_target_parser_and_derive_coverage() {
+        let source = b"@target(\"wasm64-core\")\ndistinct Only64 = U64\n";
+        let (_, _, _, wasm32) = collect_package_inventory_for_target(source, b"", "wasm32-core");
+        assert_eq!(
+            inventory_symbols(&wasm32).coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert!(inventory_symbols(&wasm32).symbols().is_empty());
+        let (_, _, _, wasm64) = collect_package_inventory_for_target(source, b"", "wasm64-core");
+        assert_eq!(
+            inventory_symbols(&wasm64).coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory_symbols(&wasm64)
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.path())
+                .collect::<Vec<_>>(),
+            ["acme:phase1.Only64"]
+        );
+
+        for (source, expected_reason) in [
+            (
+                &b"@target(\"wasm32-linux\")\ndistinct Uncertain = U64\n"[..],
+                "target-selection error",
+            ),
+            (
+                &b"distinct Malformed<T:> = T\n"[..],
+                "syntax tree contains recovery or parse errors",
+            ),
+            (
+                &b"distinct Invalid<@target(\"wasm64-core\") T> = T\n"[..],
+                "parser diagnostic",
+            ),
+        ] {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            assert!(
+                matches!(
+                    inventory_symbols(&collection).coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { reason }
+                        if reason.contains(expected_reason)
+                ),
+                "unexpected inventory coverage for {source:?}"
+            );
+        }
+
+        let (_, _, _, derived) = collect_package_inventory_for_target(
+            b"@derive(Clone)\ndistinct Derived = U32\n",
+            b"",
+            "wasm32-core",
+        );
+        assert!(matches!(
+            inventory_symbols(&derived).coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("derived impl symbols outside the supported inventory")
+        ));
+        assert!(
+            inventory_symbols(&derived)
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.kind() == sai_semantic::SymbolKind::Distinct),
+            "the declared distinct remains inspectable while derive-generated symbols are uncovered"
+        );
+    }
+
+    #[test]
+    fn module_distinct_inventory_rejects_refined_distincts_and_wrong_type_disambiguators() {
+        for source in [
+            &b"distinct Refined = U32 where self > 0\n"[..],
+            &b"distinct Refined<T> = T where self > 0\n"[..],
+        ] {
+            let (_, _, _, refined) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            assert!(matches!(
+                inventory_symbols(&refined).coverage(),
+                sai_semantic::InventoryCoverage::Incomplete { reason }
+                    if reason.contains("refined distinct type is outside the supported distinct inventory")
+            ));
+            assert!(
+                inventory_symbols(&refined).symbols().iter().all(|symbol| {
+                    symbol.kind() != sai_semantic::SymbolKind::Distinct
+                        && symbol.kind() != sai_semantic::SymbolKind::GenericParam
+                }),
+                "refined distincts contribute neither the parent nor generic-parameter symbols"
+            );
+        }
+
+        let (database, module_tree, _, duplicate) = collect_package_inventory_for_target(
+            b"type SameName = I32\ndistinct SameName = U32\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&duplicate);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { .. }
+        ));
+        let owner = duplicate
+            .scopes()
+            .top_level_owners
+            .iter()
+            .find(|owner| owner.kind == TopLevelOwnerKind::Distinct)
+            .expect("distinct owner exists despite the duplicate name");
+        let owner_path = database
+            .resolve_def_path(owner.owner.def_id.to_def_id())
+            .expect("distinct owner DefId is valid")
+            .expect("distinct owner DefPath exists");
+        assert!(matches!(
+            owner_path.data().last(),
+            Some(component)
+                if matches!(component.data, DefPathData::TypeNs(_))
+                    && component.disambiguator == 1
+        ));
+        let expected_hash =
+            sai_hir::DefPathHash::compute(&owner_path, &database.packages, &database.symbols)
+                .expect("the duplicate distinct owner path hashes");
+        let symbol = inventory
+            .symbols()
+            .iter()
+            .find(|symbol| {
+                symbol.kind() == sai_semantic::SymbolKind::Distinct
+                    && symbol.path() == "acme:phase1.SameName"
+            })
+            .expect("the distinct candidate remains inspectable");
+        assert_eq!(
+            symbol.def_path_hash(),
+            sai_stable_hash::Fingerprint::new(expected_hash.raw())
+        );
+        assert_eq!(owner.file, module_tree.modules[0].file);
+    }
+
+    #[test]
     fn module_record_inventory_collects_root_nested_empty_and_generic_records() {
         let (database, module_tree, _, collection) = collect_package_inventory_for_target(
             b"type Marker {}\ntype Pair<T, const N: I32, U> {\n    left: T\n    right: U\n}\n",
@@ -27071,15 +27518,21 @@ property "shared"() {}
     }
 
     #[test]
-    fn module_function_inventory_fails_closed_for_other_symbol_forms() {
+    fn module_function_inventory_collects_newly_supported_distinct_symbol() {
         let (_, _, _, collection) =
             collect_package_inventory_for_target(b"distinct Marker = U32\n", b"", "wasm32-core");
         let inventory = inventory_symbols(&collection);
-        assert!(matches!(
+        assert_eq!(
             inventory.coverage(),
-            sai_semantic::InventoryCoverage::Incomplete { reason }
-                if reason.contains("outside the")
-        ));
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.path() == "acme:phase1.Marker"
+                    && symbol.kind() == sai_semantic::SymbolKind::Distinct)
+        );
     }
 
     #[test]

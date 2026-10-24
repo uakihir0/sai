@@ -45,10 +45,11 @@ impl Phase1PackageSymbolInventory {
 /// Collects target-visible module-level functions and their generic
 /// parameters, records with their generic parameters and direct named fields,
 /// enums with their generic parameters, variants and record-variant fields,
-/// plain type aliases and their generic parameters, non-generic refined types,
-/// constants, user effects, tests, and properties. Every other symbol-bearing
-/// declaration makes the result incomplete until its symbol kind and path are
-/// collected as well.
+/// non-refined distinct types and their generic parameters, plain type aliases
+/// and their generic parameters, non-generic refined types, constants, user
+/// effects, tests, and properties. Every other symbol-bearing declaration
+/// makes the result incomplete until its symbol kind and path are collected as
+/// well.
 pub(super) fn collect_module_function_inventory(
     package_key: &PackageKey,
     package_version: Option<&MvsPackageVersion>,
@@ -147,6 +148,8 @@ pub(super) fn collect_module_function_inventory(
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut enum_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
+    let mut distinct_owners_by_item =
+        HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut const_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut effect_owners_by_item =
@@ -186,6 +189,13 @@ pub(super) fn collect_module_function_inventory(
             TopLevelOwnerKind::Enum => {
                 if enum_owners_by_item.insert(key, *descriptor).is_some() {
                     reasons.insert("Phase 1 contains duplicate enum owner descriptors".into());
+                }
+            }
+            TopLevelOwnerKind::Distinct => {
+                if distinct_owners_by_item.insert(key, *descriptor).is_some() {
+                    reasons.insert(
+                        "Phase 1 contains duplicate distinct-type owner descriptors".into(),
+                    );
                 }
             }
             TopLevelOwnerKind::Alias => {
@@ -238,6 +248,7 @@ pub(super) fn collect_module_function_inventory(
     let mut consumed_owners = HashSet::new();
     let mut consumed_record_owners = HashSet::new();
     let mut consumed_enum_owners = HashSet::new();
+    let mut consumed_distinct_owners = HashSet::new();
     let mut consumed_const_owners = HashSet::new();
     let mut consumed_effect_owners = HashSet::new();
     let mut consumed_alias_owners = HashSet::new();
@@ -279,6 +290,25 @@ pub(super) fn collect_module_function_inventory(
                         &enum_owners_by_item,
                         &mut seen_items,
                         &mut consumed_enum_owners,
+                        &mut canonical_paths,
+                        &mut current_symbols,
+                        &mut reasons,
+                        def_paths,
+                        packages,
+                        symbols,
+                    );
+                }
+                ItemTreeKind::Distinct => {
+                    collect_distinct(
+                        entry,
+                        module.file,
+                        &module_path,
+                        package_version.package(),
+                        input,
+                        prepared.module_tree.package,
+                        &distinct_owners_by_item,
+                        &mut seen_items,
+                        &mut consumed_distinct_owners,
                         &mut canonical_paths,
                         &mut current_symbols,
                         &mut reasons,
@@ -437,7 +467,7 @@ pub(super) fn collect_module_function_inventory(
                 // functions are children of ExternBlock and are symbols.
                 _ => {
                     reasons.insert(format!(
-                        "target-filtered declaration {:?} is outside the function-generic-parameter-record-generic-parameter-field-enum-generic-parameter-variant-record-variant-field-type-alias-generic-parameter-refined-type-constant-effect-test-property inventory",
+                        "target-filtered declaration {:?} is outside the function-generic-parameter-record-generic-parameter-field-enum-generic-parameter-variant-record-variant-field-distinct-type-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect-test-property inventory",
                         entry.kind
                     ));
                 }
@@ -460,6 +490,12 @@ pub(super) fn collect_module_function_inventory(
     if consumed_enum_owners.len() != enum_owners_by_item.len() {
         reasons.insert(
             "the Phase 1 enum owner descriptors do not exactly match the filtered ItemTree"
+                .to_owned(),
+        );
+    }
+    if consumed_distinct_owners.len() != distinct_owners_by_item.len() {
+        reasons.insert(
+            "the Phase 1 distinct-type owner descriptors do not exactly match the filtered ItemTree"
                 .to_owned(),
         );
     }
@@ -511,6 +547,14 @@ pub(super) fn collect_module_function_inventory(
         if !seen_items.contains(&(*file_id, *item_id)) {
             reasons.insert(
                 "a Phase 1 enum owner has no target-filtered ItemTree declaration".to_owned(),
+            );
+        }
+    }
+    for ((file_id, item_id), _) in &distinct_owners_by_item {
+        if !seen_items.contains(&(*file_id, *item_id)) {
+            reasons.insert(
+                "a Phase 1 distinct-type owner has no target-filtered ItemTree declaration"
+                    .to_owned(),
             );
         }
     }
@@ -2317,6 +2361,306 @@ fn collect_alias(
         input,
         package_id,
         "type alias",
+        canonical_paths,
+        current_symbols,
+        reasons,
+        def_paths,
+        packages,
+        symbols,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_distinct(
+    entry: &ItemTreeEntry,
+    file_id: FileId,
+    module_path: &[String],
+    package_identity: &str,
+    input: &OwnedPhase1ModuleInput,
+    package_id: PackageId,
+    owners_by_item: &HashMap<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>,
+    seen_items: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    consumed_owners: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    reasons: &mut HashSet<String>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) {
+    let key = (file_id, entry.ast_id);
+    if !seen_items.insert(key) {
+        reasons.insert(
+            "the target-filtered ItemTree contains a duplicate distinct-type AST ID".into(),
+        );
+    }
+    if entry.kind != ItemTreeKind::Distinct {
+        reasons.insert("a non-distinct ItemTree entry reached the distinct-type collector".into());
+        return;
+    }
+    if entry.name == Symbol::ERROR {
+        reasons.insert("a target-filtered distinct type has no valid declaration name".to_owned());
+        return;
+    }
+    let name = match symbols.resolve(entry.name) {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            reasons.insert("a target-filtered distinct-type name cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let Some(descriptor) = owners_by_item.get(&key).copied() else {
+        reasons.insert("a target-filtered distinct type has no matching Phase 1 owner".to_owned());
+        return;
+    };
+    if descriptor.kind != TopLevelOwnerKind::Distinct
+        || descriptor.file != file_id
+        || descriptor.item_id != entry.ast_id
+    {
+        reasons.insert("a target-filtered distinct type has a mismatched Phase 1 owner".to_owned());
+        return;
+    }
+    consumed_owners.insert(key);
+
+    let Some(pointer) = input.ast_ids.pointer(entry.ast_id) else {
+        reasons.insert("a target-filtered distinct-type AST ID has no source pointer".to_owned());
+        return;
+    };
+    let Some(syntax) = pointer.resolve(file_id, &input.root) else {
+        reasons.insert(
+            "a target-filtered distinct-type source pointer cannot resolve in its AST root"
+                .to_owned(),
+        );
+        return;
+    };
+    let Some(declaration) = ast::DistinctDecl::cast(syntax.clone()) else {
+        reasons.insert(
+            "a target-filtered distinct-type source pointer resolves to a non-distinct node"
+                .to_owned(),
+        );
+        return;
+    };
+    if input.ast_ids.ast_id(&declaration).map(|id| id.erase()) != Some(entry.ast_id) {
+        reasons.insert(
+            "a target-filtered distinct-type AST ID does not match its declaration".to_owned(),
+        );
+        return;
+    }
+    if declaration.base_type().is_none() {
+        reasons.insert("a target-filtered distinct type has no base type".to_owned());
+        return;
+    }
+    if declaration.refinement().is_some() {
+        reasons.insert(
+            "a refined distinct type is outside the supported distinct inventory".to_owned(),
+        );
+        return;
+    }
+    let Some(name_node) = declaration.name() else {
+        reasons.insert("a target-filtered distinct-type AST has no name node".to_owned());
+        return;
+    };
+    let Some(name_token) = name_node.token() else {
+        reasons.insert("a target-filtered distinct-type AST has no name token".to_owned());
+        return;
+    };
+    let raw_name = name_token
+        .text()
+        .strip_prefix("r#")
+        .unwrap_or(name_token.text());
+    if sai_syntax::normalize_identifier(raw_name) != name {
+        reasons.insert(
+            "the ItemTree and distinct-type AST disagree about the declaration name".into(),
+        );
+        return;
+    }
+    if syntax_has_errors(&syntax) || name_token.has_error() {
+        reasons.insert(
+            "a target-filtered distinct-type AST contains recovery or parse errors".to_owned(),
+        );
+        return;
+    }
+    if input
+        .parser_diagnostics
+        .iter()
+        .any(|diagnostic| parser_diagnostic_overlaps_syntax(diagnostic, file_id, &syntax))
+    {
+        reasons.insert("a distinct-type syntax node has a parser diagnostic".to_owned());
+        return;
+    }
+
+    // The ItemTree keeps direct generic parameters in source order. Resolve
+    // each child back to the same source node before asking the shared generic
+    // collector to validate its kind, name, DefPath and fingerprint.
+    let ast_params = declaration
+        .generic_params()
+        .map(|params| params.params().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if entry.children.len() != ast_params.len() {
+        reasons.insert(
+            "a distinct type's ItemTree generic-parameter count does not match its snapshot AST"
+                .to_owned(),
+        );
+        return;
+    }
+    for (parameter, child) in ast_params.iter().zip(&entry.children) {
+        let (expected_kind, ast_id, parameter_syntax) = match parameter {
+            ast::GenericParam::Type(parameter) => (
+                ItemTreeKind::TypeParam,
+                input.ast_ids.ast_id(parameter).map(|id| id.erase()),
+                parameter.syntax(),
+            ),
+            ast::GenericParam::Const(parameter) => (
+                ItemTreeKind::ConstParam,
+                input.ast_ids.ast_id(parameter).map(|id| id.erase()),
+                parameter.syntax(),
+            ),
+        };
+        let expected_pointer = sai_syntax::SyntaxNodePtr::new(file_id, parameter_syntax).ok();
+        let actual_pointer = input
+            .ast_ids
+            .pointer(child.ast_id)
+            .filter(|pointer| pointer.file() == file_id);
+        if child.kind != expected_kind
+            || ast_id != Some(child.ast_id)
+            || expected_pointer
+                .as_ref()
+                .zip(actual_pointer)
+                .is_none_or(|(expected, actual)| !actual.is_same_source_node(expected))
+        {
+            reasons.insert(
+                "a distinct type's ItemTree generic-parameter kind, order, or source node does not match its snapshot AST"
+                    .to_owned(),
+            );
+            return;
+        }
+    }
+
+    if entry
+        .raw_attrs
+        .iter()
+        .any(|attribute| attribute.name == sai_hir::item_tree::AttrName::Derive)
+    {
+        reasons.insert(
+            "a distinct type has derived impl symbols outside the supported inventory".to_owned(),
+        );
+    }
+
+    let canonical_path = format!(
+        "{}{}.{name}",
+        package_identity,
+        module_path
+            .iter()
+            .map(|segment| format!("/{segment}"))
+            .collect::<String>()
+    );
+    if !canonical_paths.insert(canonical_path.clone()) {
+        reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+    }
+
+    let owner_component = DefPathData::TypeNs(entry.name);
+    let Some(item_position) = input
+        .filtered
+        .item_tree
+        .items
+        .iter()
+        .position(|candidate| candidate.ast_id == entry.ast_id)
+    else {
+        reasons.insert(
+            "a target-filtered distinct type is absent from its module ItemTree".to_owned(),
+        );
+        return;
+    };
+    let owner_disambiguator = input.filtered.item_tree.items[..item_position]
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.kind,
+                ItemTreeKind::Struct
+                    | ItemTreeKind::Alias
+                    | ItemTreeKind::Refined
+                    | ItemTreeKind::Enum
+                    | ItemTreeKind::Distinct
+                    | ItemTreeKind::Resource
+                    | ItemTreeKind::Trait
+            ) && candidate.name == entry.name
+        })
+        .count();
+    let Ok(owner_disambiguator) = u32::try_from(owner_disambiguator) else {
+        reasons.insert("a distinct-type owner DefPath disambiguator overflowed".to_owned());
+        return;
+    };
+    let def_path = match def_paths.resolve(descriptor.owner.def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        Ok(Some(_)) => {
+            reasons.insert(
+                "a distinct-type owner resolves to a definition path from another package"
+                    .to_owned(),
+            );
+            return;
+        }
+        Ok(None) => {
+            reasons.insert("a distinct-type owner has no canonical definition path".to_owned());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("a distinct-type owner definition path cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let path_matches_declaration = def_path.data().len() == module_path.len() + 1
+        && def_path
+            .data()
+            .iter()
+            .take(module_path.len())
+            .zip(module_path)
+            .all(|(component, name)| {
+                component.disambiguator == 0
+                    && matches!(&component.data, DefPathData::Module(segment)
+                        if symbols.resolve(*segment).is_ok_and(|resolved| resolved.as_ref() == name))
+            })
+        && def_path.data().last().is_some_and(|component| {
+            component.data == owner_component && component.disambiguator == owner_disambiguator
+        });
+    if !path_matches_declaration {
+        reasons.insert(
+            "the distinct-type DefPath does not match its module, TypeNs name, or disambiguator"
+                .to_owned(),
+        );
+        return;
+    }
+    let def_path_hash = match DefPathHash::compute(&def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert("a distinct-type definition path hash cannot be computed".to_owned());
+            return;
+        }
+    };
+    let fingerprint =
+        match declaration_fingerprint(SymbolKind::Distinct, &syntax, Some(&name_token)) {
+            Ok(fingerprint) => fingerprint,
+            Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                reasons.insert(
+                    "a distinct-type name token is outside its declaration syntax node".to_owned(),
+                );
+                return;
+            }
+        };
+    current_symbols.push(CurrentSymbol::new(
+        canonical_path.clone(),
+        def_path_hash,
+        SymbolKind::Distinct,
+        fingerprint,
+    ));
+    collect_item_generic_params(
+        &entry.children,
+        declaration.generic_params(),
+        &canonical_path,
+        descriptor.owner.def_id,
+        &def_path,
+        input,
+        package_id,
+        "distinct type",
         canonical_paths,
         current_symbols,
         reasons,
