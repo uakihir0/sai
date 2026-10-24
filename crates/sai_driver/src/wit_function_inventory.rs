@@ -13,8 +13,9 @@ use sai_wit::{
     WitCase, WitContract, WitField, WitIfaceIdx, WitInterface, WitItem, WitItemIdx, WitItemKind,
     WitMemberKind, WitPackage, WitPackageKind, WitType, WitUnit, WitUnitKind, WitView,
     WitViewDefKind, WitViewEntity, authored_interface_alias_tokens, authored_interface_enum_tokens,
-    authored_interface_function_tokens, authored_interface_record_tokens,
-    authored_interface_resource_tokens, authored_interface_variant_tokens, wit_name_to_sai,
+    authored_interface_flags_tokens, authored_interface_function_tokens,
+    authored_interface_record_tokens, authored_interface_resource_tokens,
+    authored_interface_variant_tokens, wit_name_to_sai,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str;
@@ -544,6 +545,24 @@ fn collect_root_interface_symbols(
                     interface_index,
                     item_index,
                     item,
+                    &interface.name,
+                    &selected_identity,
+                    &expected_interface_name,
+                    source_files,
+                    packages,
+                    symbols_interner,
+                    &mut emitted_paths,
+                    reasons,
+                    current_symbols,
+                ),
+                WitItemKind::Flags(flags) => collect_root_interface_flags(
+                    view,
+                    view_interface,
+                    interface,
+                    interface_index,
+                    item_index,
+                    item,
+                    flags,
                     &interface.name,
                     &selected_identity,
                     &expected_interface_name,
@@ -1700,6 +1719,177 @@ fn collect_root_interface_enum(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn collect_root_interface_flags(
+    view: &WitView,
+    view_interface: &sai_wit::ViewInterface,
+    interface: &WitInterface,
+    interface_index: WitIfaceIdx,
+    item_index: WitItemIdx,
+    item: &WitItem,
+    flags: &[String],
+    interface_name: &str,
+    selected_identity: &str,
+    expected_interface_name: &str,
+    source_files: &BTreeMap<String, Arc<str>>,
+    packages: &sai_intern::PackageInterner,
+    symbols_interner: &sai_intern::Interner,
+    emitted_paths: &mut HashSet<String>,
+    reasons: &mut BTreeSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+) {
+    if item.unsupported.is_some() {
+        reasons.insert(format!(
+            "WIT flags type `{interface_name}.{}` uses an unsupported declaration form",
+            item.name
+        ));
+        return;
+    }
+    let Some(source_flags) = flags_source_identity(item, interface_name, flags, source_files)
+    else {
+        reasons.insert(format!(
+            "WIT flags type `{interface_name}.{}` has no exact validated declaration and flag spans",
+            item.name
+        ));
+        return;
+    };
+    if flags.len() > 32 {
+        reasons.insert(format!(
+            "WIT flags type `{interface_name}.{}` exceeds the 32-flag limit",
+            item.name
+        ));
+    }
+
+    let flags_sai_name = match wit_name_to_sai(&item.name, true) {
+        Ok(name) => name,
+        Err(_) => {
+            reasons.insert(format!(
+                "WIT flags type `{interface_name}.{}` has no supported SAI type spelling",
+                item.name
+            ));
+            return;
+        }
+    };
+    let flags_view_name = flags_sai_name.strip_prefix("r#").unwrap_or(&flags_sai_name);
+    let Some(view_member) = view_interface.members.get(flags_view_name) else {
+        reasons.insert(format!(
+            "WIT flags type `{interface_name}.{}` is absent from the selected view",
+            item.name
+        ));
+        return;
+    };
+    if view_member.item != item_index
+        || view_member.kind != WitViewDefKind::Enum
+        || view_member.unsupported != item.unsupported
+    {
+        reasons.insert(format!(
+            "WIT flags type `{interface_name}.{}` does not match its selected view item",
+            item.name
+        ));
+        return;
+    }
+    let flags_entity = WitViewEntity::Item {
+        interface: interface_index,
+        item: item_index,
+    };
+    let Some(flags_def) = view.definition_for_entity(flags_entity) else {
+        reasons.insert(format!(
+            "WIT flags type `{interface_name}.{}` has no selected view definition",
+            item.name
+        ));
+        return;
+    };
+    if view_member.def != flags_def {
+        reasons.insert(format!(
+            "WIT flags type `{interface_name}.{}` view member does not identify its model item",
+            item.name
+        ));
+        return;
+    }
+    let Some(flags_definition) = view.definition(flags_def) else {
+        reasons.insert(format!(
+            "WIT flags type `{interface_name}.{}` has no current selected view definition",
+            item.name
+        ));
+        return;
+    };
+    if !view_definition_matches_entity(flags_definition, flags_entity, WitViewDefKind::Enum) {
+        reasons.insert(format!(
+            "WIT flags type `{interface_name}.{}` view definition does not identify its model item",
+            item.name
+        ));
+        return;
+    }
+    let Some(flags_disambiguator) =
+        interface_type_item_disambiguator(interface, item_index, flags_view_name)
+    else {
+        reasons.insert(format!(
+            "WIT flags type `{interface_name}.{}` has an invalid type-namespace disambiguator",
+            item.name
+        ));
+        return;
+    };
+    let flags_path = match view.def_path(flags_def) {
+        Ok(Some(path)) => path,
+        _ => {
+            reasons.insert(format!(
+                "WIT flags type `{interface_name}.{}` has no canonical definition path",
+                item.name
+            ));
+            return;
+        }
+    };
+    if !view_path_matches_selected_package(&flags_path, view.package) {
+        reasons.insert(format!(
+            "WIT flags type `{interface_name}.{}` definition path belongs to a different view package",
+            item.name
+        ));
+        return;
+    }
+    if !view_definition_path_matches_flags(
+        &flags_path,
+        &flags_definition.canonical_path,
+        expected_interface_name,
+        flags_view_name,
+        flags_disambiguator,
+        symbols_interner,
+    ) {
+        reasons.insert(format!(
+            "WIT flags type `{interface_name}.{}` does not match its canonical view definition path",
+            item.name
+        ));
+        return;
+    }
+    let Some(flags_hash) = verified_view_path_hash(
+        &flags_path,
+        flags_definition.path_hash,
+        packages,
+        symbols_interner,
+    ) else {
+        reasons.insert(format!(
+            "WIT flags type `{interface_name}.{}` definition path hash is inconsistent",
+            item.name
+        ));
+        return;
+    };
+
+    let canonical_flags_path = format!("{selected_identity}/{interface_name}.{flags_view_name}");
+    if !emitted_paths.insert(canonical_flags_path.clone()) {
+        reasons.insert(format!(
+            "WIT flags type canonical path `{canonical_flags_path}` is duplicated"
+        ));
+        return;
+    }
+    // WIT flags lower to the interface enum view entity but do not declare
+    // independent source symbols for their names or provided methods.
+    current_symbols.push(CurrentSymbol::new(
+        canonical_flags_path,
+        flags_hash,
+        SymbolKind::Enum,
+        declaration_fingerprint_from_token_pairs(SymbolKind::Enum, &source_flags.token_pairs),
+    ));
+}
+
+#[allow(clippy::too_many_arguments)]
 fn collect_root_interface_variant(
     view: &WitView,
     view_interface: &sai_wit::ViewInterface,
@@ -2103,6 +2293,74 @@ fn enum_source_identity(
     Some(scanned)
 }
 
+fn flags_source_identity(
+    item: &WitItem,
+    interface_name: &str,
+    flags: &[String],
+    source_files: &BTreeMap<String, Arc<str>>,
+) -> Option<sai_wit::AuthoredInterfaceFlagsTokens> {
+    let name_span = item.span.as_ref()?;
+    let source = source_files.get(&name_span.path)?;
+    let name_text = source.get(name_span.range.clone())?;
+    if normalized_wit_name(name_text) != Some(item.name.as_str()) {
+        return None;
+    }
+    let scanned =
+        authored_interface_flags_tokens(source, interface_name, &item.name, &name_span.range)?;
+    if scanned.flags.len() != flags.len()
+        || scanned.declaration_range.start > name_span.range.start
+        || name_span.range.end > scanned.declaration_range.end
+        || scanned.declaration_range.is_empty()
+        || source
+            .get(scanned.declaration_range.clone())
+            .is_none_or(|declaration| !declaration.ends_with('}'))
+        || scanned
+            .token_pairs
+            .last()
+            .map(|(kind, text)| (kind.as_str(), text.as_str()))
+            != Some(("RightBrace", "}"))
+        || scanned
+            .token_pairs
+            .iter()
+            .filter(|(kind, text)| {
+                text.is_empty() && matches!(kind.as_str(), "Id" | "ExplicitId" | "StringLiteral")
+            })
+            .count()
+            != 1
+    {
+        return None;
+    }
+    let mut previous_end = scanned.declaration_range.start;
+    for (model_flag, source_flag) in flags.iter().zip(&scanned.flags) {
+        let name_text = source.get(source_flag.name_range.clone())?;
+        if source_flag.name != *model_flag
+            || normalized_wit_name(name_text) != Some(model_flag.as_str())
+            || source_flag.declaration_range.start < scanned.declaration_range.start
+            || source_flag.declaration_range.end > scanned.declaration_range.end
+            || source_flag.declaration_range.start < previous_end
+            || source_flag.declaration_range.is_empty()
+            || source_flag.name_range.start < source_flag.declaration_range.start
+            || source_flag.name_range.end > source_flag.declaration_range.end
+            || source
+                .get(source_flag.declaration_range.clone())
+                .is_none_or(|declaration| !declaration.ends_with(name_text))
+            || source_flag
+                .token_pairs
+                .iter()
+                .filter(|(kind, text)| {
+                    text.is_empty()
+                        && matches!(kind.as_str(), "Id" | "ExplicitId" | "StringLiteral")
+                })
+                .count()
+                != 1
+        {
+            return None;
+        }
+        previous_end = source_flag.declaration_range.end;
+    }
+    Some(scanned)
+}
+
 fn variant_source_identity(
     item: &WitItem,
     interface_name: &str,
@@ -2349,6 +2607,45 @@ fn view_definition_path_matches_enum(
         expected_enum.len(),
         expected_enum,
         enum_component.disambiguator,
+    );
+    definition_canonical_path == expected_canonical_path
+}
+
+fn view_definition_path_matches_flags(
+    path: &sai_hir::DefPath,
+    definition_canonical_path: &str,
+    expected_interface: &str,
+    expected_flags: &str,
+    flags_disambiguator: u32,
+    symbols_interner: &sai_intern::Interner,
+) -> bool {
+    let [interface_component, flags_component] = path.data() else {
+        return false;
+    };
+    let (DefPathData::Interface(interface_symbol), DefPathData::TypeNs(flags_symbol)) =
+        (&interface_component.data, &flags_component.data)
+    else {
+        return false;
+    };
+    if interface_component.disambiguator != 0
+        || flags_component.disambiguator != flags_disambiguator
+        || !symbols_interner
+            .resolve(*interface_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_interface)
+        || !symbols_interner
+            .resolve(*flags_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_flags)
+    {
+        return false;
+    }
+    let expected_canonical_path = format!(
+        "interface[{}:{};{}]/type[{}:{};{}]/",
+        expected_interface.len(),
+        expected_interface,
+        interface_component.disambiguator,
+        expected_flags.len(),
+        expected_flags,
+        flags_component.disambiguator,
     );
     definition_canonical_path == expected_canonical_path
 }
@@ -2915,12 +3212,13 @@ fn incomplete_inventory(
 #[cfg(test)]
 mod tests {
     use super::{
-        ValidatedFunctionSource, alias_source_identity, function_source_identity,
-        interface_type_item_disambiguator, record_field_disambiguator, record_source_identity,
-        resource_members_match_source, resource_source_identity, variant_case_disambiguator,
-        variant_source_identity, verified_view_path_hash, view_definition_matches_entity,
-        view_definition_path_matches_alias, view_definition_path_matches_enum,
-        view_definition_path_matches_enum_case, view_definition_path_matches_record,
+        ValidatedFunctionSource, alias_source_identity, flags_source_identity,
+        function_source_identity, interface_type_item_disambiguator, record_field_disambiguator,
+        record_source_identity, resource_members_match_source, resource_source_identity,
+        variant_case_disambiguator, variant_source_identity, verified_view_path_hash,
+        view_definition_matches_entity, view_definition_path_matches_alias,
+        view_definition_path_matches_enum, view_definition_path_matches_enum_case,
+        view_definition_path_matches_flags, view_definition_path_matches_record,
         view_definition_path_matches_record_field, view_definition_path_matches_variant,
         view_definition_path_matches_variant_case, view_path_matches_selected_package,
     };
@@ -2932,8 +3230,9 @@ mod tests {
         WitCase, WitField, WitFunc, WitIfaceIdx, WitIndexVec, WitInterface, WitItem, WitItemIdx,
         WitItemKind, WitMember, WitMemberKind, WitSpan, WitType, WitViewDef, WitViewDefKind,
         WitViewEntity, authored_interface_alias_tokens, authored_interface_enum_tokens,
-        authored_interface_function_tokens, authored_interface_record_tokens,
-        authored_interface_resource_tokens, authored_interface_variant_tokens,
+        authored_interface_flags_tokens, authored_interface_function_tokens,
+        authored_interface_record_tokens, authored_interface_resource_tokens,
+        authored_interface_variant_tokens,
     };
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -3031,6 +3330,27 @@ mod tests {
             since: None,
             deprecated: None,
             kind: WitItemKind::Variant(cases),
+            unsupported: None,
+            span: Some(WitSpan {
+                path: "root.wit".to_owned(),
+                range: name_range,
+            }),
+            declaration_span: None,
+            declaration_token_pairs: None,
+        }
+    }
+
+    fn flags_item(source: &str, name: &str, flags: &[&str]) -> WitItem {
+        let name_start = source.find(name).expect("flags type name occurs");
+        let name_range = name_start..name_start + name.len();
+        let _tokens = authored_interface_flags_tokens(source, "api", name, &name_range)
+            .expect("direct flags tokens are found");
+        WitItem {
+            name: name.to_owned(),
+            docs: None,
+            since: None,
+            deprecated: None,
+            kind: WitItemKind::Flags(flags.iter().map(|flag| (*flag).to_owned()).collect()),
             unsupported: None,
             span: Some(WitSpan {
                 path: "root.wit".to_owned(),
@@ -3486,6 +3806,131 @@ mod tests {
         let mut missing_span = item;
         missing_span.span = None;
         assert!(variant_source_identity(&missing_span, "api", &cases, &sources).is_none());
+    }
+
+    #[test]
+    fn flags_source_identity_requires_exact_parent_span_and_flag_order() {
+        let source = "interface api { flags permissions { read-only, %type } }\n";
+        let flags = ["read-only", "type"];
+        let item = flags_item(source, "permissions", &flags);
+        let sources = source_map(source);
+        let scanned = flags_source_identity(&item, "api", &flags.map(str::to_owned), &sources)
+            .expect("the direct flags parent and its ordered names validate");
+        assert_eq!(
+            scanned
+                .flags
+                .iter()
+                .map(|flag| flag.name.as_str())
+                .collect::<Vec<_>>(),
+            flags
+        );
+        assert_eq!(
+            scanned
+                .token_pairs
+                .iter()
+                .filter(|(_, text)| text.is_empty())
+                .count(),
+            1,
+            "the parent fingerprint masks only the parent name"
+        );
+        assert!(
+            scanned.flags.iter().all(|flag| flag
+                .token_pairs
+                .iter()
+                .filter(|(_, text)| text.is_empty())
+                .count()
+                == 1),
+            "flag spans mask one flag name for order binding without making flag symbols"
+        );
+
+        let mut invalid_span = item.clone();
+        invalid_span.span.as_mut().expect("flags span").range.end += 1;
+        assert!(
+            flags_source_identity(&invalid_span, "api", &flags.map(str::to_owned), &sources)
+                .is_none()
+        );
+        assert!(
+            flags_source_identity(&item, "other", &flags.map(str::to_owned), &sources).is_none()
+        );
+        let reversed = ["type".to_owned(), "read-only".to_owned()];
+        assert!(
+            flags_source_identity(&item, "api", &reversed, &sources).is_none(),
+            "the model flag order must match the selected source snapshot"
+        );
+        let changed_source = source.replace("read-only", "write-only");
+        assert!(
+            flags_source_identity(
+                &item,
+                "api",
+                &flags.map(str::to_owned),
+                &source_map(&changed_source)
+            )
+            .is_none(),
+            "a different direct flag name cannot be bound to the model declaration"
+        );
+        let mut missing_span = item;
+        missing_span.span = None;
+        assert!(
+            flags_source_identity(&missing_span, "api", &flags.map(str::to_owned), &sources)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn flags_type_def_paths_require_the_selected_parent_and_disambiguator() {
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:sample#1.0.0")
+            .expect("package interns");
+        let symbols = Interner::new();
+        let flags_path = def_path(
+            &packages,
+            package,
+            &symbols,
+            vec![
+                DisambiguatedDefPathData {
+                    data: DefPathData::Interface(path_symbol(&symbols, "api")),
+                    disambiguator: 0,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::TypeNs(path_symbol(&symbols, "Permissions")),
+                    disambiguator: 1,
+                },
+            ],
+        );
+        let canonical = "interface[3:api;0]/type[11:Permissions;1]/";
+        assert!(view_definition_path_matches_flags(
+            &flags_path,
+            canonical,
+            "api",
+            "Permissions",
+            1,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_flags(
+            &flags_path,
+            canonical,
+            "api",
+            "Permissions",
+            0,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_flags(
+            &flags_path,
+            canonical,
+            "other",
+            "Permissions",
+            1,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_flags(
+            &flags_path,
+            "interface[3:api;0]/type[11:Permissions;0]/",
+            "api",
+            "Permissions",
+            1,
+            &symbols
+        ));
     }
 
     #[test]
