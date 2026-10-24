@@ -1,0 +1,132 @@
+use acme:affordable-housing-allocation/model.{Applicant, Area, Dwelling}
+
+pub fn program_name() -> Str {
+    "Cedar Grove Affordable Homes"
+}
+
+pub fn applicants() -> Array<Applicant, 6> {
+    [
+        Applicant(
+            id: 1001,
+            name: "Aki Sato",
+            adults: 1,
+            children: 1,
+            monthly_income_cents: 300000,
+            needs_step_free: false,
+            needs_wide_doorways: false,
+            first_choice: Area.North,
+            second_choice: Area.Central,
+            submitted_day: 1,
+        ),
+        Applicant(
+            id: 1002,
+            name: "Bo Tanaka",
+            adults: 2,
+            children: 2,
+            monthly_income_cents: 420000,
+            needs_step_free: true,
+            needs_wide_doorways: true,
+            first_choice: Area.Central,
+            second_choice: Area.North,
+            submitted_day: 2,
+        ),
+        Applicant(
+            id: 1003,
+            name: "Chika Mori",
+            adults: 1,
+            children: 0,
+            monthly_income_cents: 180000,
+            needs_step_free: true,
+            needs_wide_doorways: true,
+            first_choice: Area.South,
+            second_choice: Area.Central,
+            submitted_day: 3,
+        ),
+        Applicant(
+            id: 1004,
+            name: "Darius Okafor",
+            adults: 2,
+            children: 1,
+            monthly_income_cents: 280000,
+            needs_step_free: false,
+            needs_wide_doorways: false,
+            first_choice: Area.Central,
+            second_choice: Area.South,
+            submitted_day: 3,
+        ),
+        Applicant(
+            id: 1005,
+            name: "Emi Watanabe",
+            adults: 1,
+            children: 1,
+            monthly_income_cents: 220000,
+            needs_step_free: false,
+            needs_wide_doorways: false,
+            first_choice: Area.North,
+            second_choice: Area.South,
+            submitted_day: 4,
+        ),
+        Applicant(
+            id: 1006,
+            name: "Farah Ali",
+            adults: 2,
+            children: 3,
+            monthly_income_cents: 500000,
+            needs_step_free: false,
+            needs_wide_doorways: false,
+            first_choice: Area.Central,
+            second_choice: Area.North,
+            submitted_day: 5,
+        ),
+    ]
+}
+
+// Dwellings are processed in this published release order.
+pub fn dwellings() -> Array<Dwelling, 4> {
+    [
+        Dwelling(
+            id: 201,
+            address: "18 Pine Court, Apt 1",
+            area: Area.North,
+            bedrooms: 1,
+            maximum_occupants: 3,
+            monthly_rent_cents: 90000,
+            maximum_monthly_income_cents: 350000,
+            step_free_entry: false,
+            wide_doorways: false,
+        ),
+        Dwelling(
+            id: 202,
+            address: "44 Market Street, Apt 3",
+            area: Area.Central,
+            bedrooms: 2,
+            maximum_occupants: 5,
+            monthly_rent_cents: 120000,
+            maximum_monthly_income_cents: 450000,
+            step_free_entry: true,
+            wide_doorways: true,
+        ),
+        Dwelling(
+            id: 203,
+            address: "7 Orchard Row, Apt 2",
+            area: Area.South,
+            bedrooms: 2,
+            maximum_occupants: 5,
+            monthly_rent_cents: 80000,
+            maximum_monthly_income_cents: 400000,
+            step_free_entry: false,
+            wide_doorways: false,
+        ),
+        Dwelling(
+            id: 204,
+            address: "9 Orchard Row, Apt 0",
+            area: Area.South,
+            bedrooms: 0,
+            maximum_occupants: 2,
+            monthly_rent_cents: 50000,
+            maximum_monthly_income_cents: 270000,
+            step_free_entry: true,
+            wide_doorways: true,
+        ),
+    ]
+}

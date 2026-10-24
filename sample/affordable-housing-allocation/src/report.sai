@@ -1,0 +1,82 @@
+use acme:affordable-housing-allocation/allocator
+use acme:affordable-housing-allocation/data
+use acme:affordable-housing-allocation/eligibility
+use acme:affordable-housing-allocation/model.{Applicant, Dwelling, Plan}
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn dwelling_at(index: USize) -> Dwelling {
+    data.dwellings()[index]
+}
+
+fn applicant_by_id(id: U32) -> Option<Applicant> {
+    for applicant in data.applicants() {
+        if applicant.id == id {
+            return Some(applicant)
+        }
+    }
+    None
+}
+
+pub fn print_assignments(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let plan = allocator.build_plan()
+    out.write_str(f"{data.program_name()} — rental offer plan\n".as_str())
+    out.write_str(
+        "Tie-break: preferred area, earliest application day, then ascending application ID\n",
+    )
+    for index in 0..plan.decisions.len() {
+        let decision = plan.decisions[index]
+        let dwelling = dwelling_at(index)
+        match (decision.applicant_id, decision.area_preference_rank) {
+            (Some(applicant_id), Some(rank)) => {
+                match applicant_by_id(applicant_id) {
+                    Some(applicant) => {
+                        out.write_str(
+                            f"Unit #{dwelling.id} {dwelling.address} ({allocator.area_name(dwelling.area)}, {dwelling.bedrooms} BR, ${dwelling.monthly_rent_cents / 100}/month): #{applicant.id} {applicant.name} — area preference {rank}, household {eligibility.household_size(applicant)}\n".as_str(),
+                        )
+                    }
+                    None => {}
+                }
+            }
+            (None, None) => {
+                out.write_str(f"Unit #{dwelling.id} {dwelling.address}: vacant\n".as_str())
+            }
+            _ => {}
+        }
+    }
+    out.write_str(f"Offers made in this plan: {plan.assigned_count}\n")
+}
+
+pub fn print_waitlist(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let plan = allocator.build_plan()
+    out.write_str("Cedar Grove waitlist after this allocation run\n")
+    for index in 0..data.applicants().len() {
+        let applicant = data.applicants()[index]
+        if not plan.assigned_applications[index] {
+            if allocator.has_eligible_dwelling(applicant) {
+                out.write_str(
+                    f"#{applicant.id} {applicant.name} — qualified for a listed home; no offer after earlier unit decisions\n".as_str(),
+                )
+            } else {
+                out.write_str(
+                    f"#{applicant.id} {applicant.name} — no listed home meets all size, income, rent, and access rules\n".as_str(),
+                )
+            }
+        }
+    }
+}
+
+pub fn print_summary(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let plan: Plan = allocator.build_plan()
+    let applicants = data.applicants()
+    out.write_str(f"{data.program_name()} summary\n")
+    out.write_str(f"Homes offered: {plan.assigned_count} / {plan.decisions.len()}\n".as_str())
+    out.write_str(f"Applicants waitlisted: {applicants.len() - plan.assigned_count}\n".as_str())
+    out.write_str("Gross monthly rent cap: 30%; accessibility needs are hard requirements\n")
+}

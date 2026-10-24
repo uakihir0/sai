@@ -1,0 +1,12 @@
+package acme:affordable-housing-allocation @ 0.1.0
+compiler ^0.1
+source "src"
+
+requires {
+    sai:process @ ^0.1
+        from git "https://github.com/sai-lang/process"
+}
+
+targets { wasm32-wasi }
+allow { alloc, wasi:cli }
+description "A deterministic affordable rental housing allocation example"
