@@ -26,10 +26,11 @@ pub use printer::*;
 pub use source_scan::{
     AuthoredEnumCaseTokens, AuthoredInterfaceAliasTokens, AuthoredInterfaceEnumTokens,
     AuthoredInterfaceFunctionTokens, AuthoredInterfaceRecordTokens,
-    AuthoredInterfaceResourceTokens, AuthoredRecordFieldTokens, AuthoredResourceMemberTokens,
-    authored_interface_alias_tokens, authored_interface_enum_tokens,
-    authored_interface_function_tokens, authored_interface_record_tokens,
-    authored_interface_resource_tokens,
+    AuthoredInterfaceResourceTokens, AuthoredInterfaceVariantTokens, AuthoredRecordFieldTokens,
+    AuthoredResourceMemberTokens, AuthoredVariantCaseTokens, authored_interface_alias_tokens,
+    authored_interface_enum_tokens, authored_interface_function_tokens,
+    authored_interface_record_tokens, authored_interface_resource_tokens,
+    authored_interface_variant_tokens,
 };
 pub use view::*;
 pub use wasi::*;

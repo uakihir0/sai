@@ -10,11 +10,11 @@ use sai_semantic::{
 use sai_stable_hash::Fingerprint;
 use sai_vfs::{FileContents, FileKey, PackageKey, PackageRelativePath, WitFilesSnapshot};
 use sai_wit::{
-    WitContract, WitField, WitIfaceIdx, WitInterface, WitItem, WitItemIdx, WitItemKind,
+    WitCase, WitContract, WitField, WitIfaceIdx, WitInterface, WitItem, WitItemIdx, WitItemKind,
     WitMemberKind, WitPackage, WitPackageKind, WitType, WitUnit, WitUnitKind, WitView,
     WitViewDefKind, WitViewEntity, authored_interface_alias_tokens, authored_interface_enum_tokens,
     authored_interface_function_tokens, authored_interface_record_tokens,
-    authored_interface_resource_tokens, wit_name_to_sai,
+    authored_interface_resource_tokens, authored_interface_variant_tokens, wit_name_to_sai,
 };
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::str;
@@ -544,6 +544,24 @@ fn collect_root_interface_symbols(
                     interface_index,
                     item_index,
                     item,
+                    &interface.name,
+                    &selected_identity,
+                    &expected_interface_name,
+                    source_files,
+                    packages,
+                    symbols_interner,
+                    &mut emitted_paths,
+                    reasons,
+                    current_symbols,
+                ),
+                WitItemKind::Variant(cases) => collect_root_interface_variant(
+                    view,
+                    view_interface,
+                    interface_index,
+                    item_index,
+                    item,
+                    &interface,
+                    cases,
                     &interface.name,
                     &selected_identity,
                     &expected_interface_name,
@@ -1681,6 +1699,305 @@ fn collect_root_interface_enum(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn collect_root_interface_variant(
+    view: &WitView,
+    view_interface: &sai_wit::ViewInterface,
+    interface_index: WitIfaceIdx,
+    item_index: WitItemIdx,
+    item: &WitItem,
+    interface: &WitInterface,
+    cases: &[WitCase],
+    interface_name: &str,
+    selected_identity: &str,
+    expected_interface_name: &str,
+    source_files: &BTreeMap<String, Arc<str>>,
+    packages: &sai_intern::PackageInterner,
+    symbols_interner: &sai_intern::Interner,
+    emitted_paths: &mut HashSet<String>,
+    reasons: &mut BTreeSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+) {
+    let has_unsupported_payload = cases.iter().any(|case| {
+        case.payload
+            .as_ref()
+            .is_some_and(wit_type_uses_unsupported_shape)
+    });
+    if item.unsupported.is_some() != has_unsupported_payload {
+        reasons.insert(format!(
+            "WIT variant `{interface_name}.{}` has inconsistent unsupported payload metadata",
+            item.name
+        ));
+        return;
+    }
+    if has_unsupported_payload {
+        reasons.insert(format!(
+            "WIT variant `{interface_name}.{}` contains unsupported case payload types",
+            item.name
+        ));
+    }
+    let Some(source_variant) = variant_source_identity(item, interface_name, cases, source_files)
+    else {
+        reasons.insert(format!(
+            "WIT variant `{interface_name}.{}` has no exact validated declaration and case spans",
+            item.name
+        ));
+        return;
+    };
+
+    let variant_sai_name = match wit_name_to_sai(&item.name, true) {
+        Ok(name) => name,
+        Err(_) => {
+            reasons.insert(format!(
+                "WIT variant `{interface_name}.{}` has no supported SAI type spelling",
+                item.name
+            ));
+            return;
+        }
+    };
+    let variant_view_name = variant_sai_name
+        .strip_prefix("r#")
+        .unwrap_or(&variant_sai_name);
+    let Some(view_member) = view_interface.members.get(variant_view_name) else {
+        reasons.insert(format!(
+            "WIT variant `{interface_name}.{}` is absent from the selected view",
+            item.name
+        ));
+        return;
+    };
+    if view_member.item != item_index
+        || view_member.kind != WitViewDefKind::Enum
+        || view_member.unsupported != item.unsupported
+    {
+        reasons.insert(format!(
+            "WIT variant `{interface_name}.{}` does not match its selected view item",
+            item.name
+        ));
+        return;
+    }
+    let variant_entity = WitViewEntity::Item {
+        interface: interface_index,
+        item: item_index,
+    };
+    let Some(variant_def) = view.definition_for_entity(variant_entity) else {
+        reasons.insert(format!(
+            "WIT variant `{interface_name}.{}` has no selected view definition",
+            item.name
+        ));
+        return;
+    };
+    if view_member.def != variant_def {
+        reasons.insert(format!(
+            "WIT variant `{interface_name}.{}` view member does not identify its model item",
+            item.name
+        ));
+        return;
+    }
+    let Some(variant_definition) = view.definition(variant_def) else {
+        reasons.insert(format!(
+            "WIT variant `{interface_name}.{}` has no current selected view definition",
+            item.name
+        ));
+        return;
+    };
+    if !view_definition_matches_entity(variant_definition, variant_entity, WitViewDefKind::Enum) {
+        reasons.insert(format!(
+            "WIT variant `{interface_name}.{}` view definition does not identify its model item",
+            item.name
+        ));
+        return;
+    }
+    let variant_path = match view.def_path(variant_def) {
+        Ok(Some(path)) => path,
+        _ => {
+            reasons.insert(format!(
+                "WIT variant `{interface_name}.{}` has no canonical definition path",
+                item.name
+            ));
+            return;
+        }
+    };
+    let Some(variant_disambiguator) =
+        interface_type_item_disambiguator(interface, item_index, variant_view_name)
+    else {
+        reasons.insert(format!(
+            "WIT variant `{interface_name}.{}` has an invalid type-namespace disambiguator",
+            item.name
+        ));
+        return;
+    };
+    if !view_path_matches_selected_package(&variant_path, view.package) {
+        reasons.insert(format!(
+            "WIT variant `{interface_name}.{}` definition path belongs to a different package",
+            item.name
+        ));
+        return;
+    }
+    if !view_definition_path_matches_variant(
+        &variant_path,
+        &variant_definition.canonical_path,
+        expected_interface_name,
+        variant_view_name,
+        variant_disambiguator,
+        symbols_interner,
+    ) {
+        reasons.insert(format!(
+            "WIT variant `{interface_name}.{}` does not match its canonical view definition path",
+            item.name
+        ));
+        return;
+    }
+    let Some(variant_hash) = verified_view_path_hash(
+        &variant_path,
+        variant_definition.path_hash,
+        packages,
+        symbols_interner,
+    ) else {
+        reasons.insert(format!(
+            "WIT variant `{interface_name}.{}` definition path hash is inconsistent",
+            item.name
+        ));
+        return;
+    };
+
+    let canonical_variant_path =
+        format!("{selected_identity}/{interface_name}.{variant_view_name}");
+    if !emitted_paths.insert(canonical_variant_path.clone()) {
+        reasons.insert(format!(
+            "WIT variant canonical path `{canonical_variant_path}` is duplicated"
+        ));
+        return;
+    }
+    current_symbols.push(CurrentSymbol::new(
+        canonical_variant_path.clone(),
+        variant_hash,
+        SymbolKind::Enum,
+        declaration_fingerprint_from_token_pairs(SymbolKind::Enum, &source_variant.token_pairs),
+    ));
+
+    for (case_index, (case, source_case)) in cases.iter().zip(&source_variant.cases).enumerate() {
+        if case
+            .payload
+            .as_ref()
+            .is_some_and(wit_type_uses_unsupported_shape)
+        {
+            continue;
+        }
+        let case_sai_name = match wit_name_to_sai(&case.name, true) {
+            Ok(name) => name,
+            Err(_) => {
+                reasons.insert(format!(
+                    "WIT variant case `{interface_name}.{}`.{} has no supported SAI spelling",
+                    item.name, case.name
+                ));
+                continue;
+            }
+        };
+        let case_view_name = case_sai_name.strip_prefix("r#").unwrap_or(&case_sai_name);
+        let Ok(case_ordinal) = u32::try_from(case_index) else {
+            reasons.insert(format!(
+                "WIT variant `{interface_name}.{}` has too many cases",
+                item.name
+            ));
+            continue;
+        };
+        let Some(case_disambiguator) =
+            variant_case_disambiguator(cases, case_index, case_view_name)
+        else {
+            reasons.insert(format!(
+                "WIT variant case `{interface_name}.{}`.{} has an invalid disambiguator",
+                item.name, case.name
+            ));
+            continue;
+        };
+        let case_entity = WitViewEntity::Variant {
+            interface: interface_index,
+            item: item_index,
+            case: case_ordinal,
+        };
+        let Some(case_def) = view.definition_for_entity(case_entity) else {
+            reasons.insert(format!(
+                "WIT variant case `{interface_name}.{}`.{} is missing from the selected view",
+                item.name, case.name
+            ));
+            continue;
+        };
+        let Some(case_definition) = view.definition(case_def) else {
+            reasons.insert(format!(
+                "WIT variant case `{interface_name}.{}`.{} has no current selected view definition",
+                item.name, case.name
+            ));
+            continue;
+        };
+        if !view_definition_matches_entity(case_definition, case_entity, WitViewDefKind::Variant) {
+            reasons.insert(format!(
+                "WIT variant case `{interface_name}.{}`.{} view definition does not identify its model case",
+                item.name, case.name
+            ));
+            continue;
+        }
+        let case_path = match view.def_path(case_def) {
+            Ok(Some(path)) => path,
+            _ => {
+                reasons.insert(format!(
+                    "WIT variant case `{interface_name}.{}`.{} has no canonical definition path",
+                    item.name, case.name
+                ));
+                continue;
+            }
+        };
+        if !view_path_matches_selected_package(&case_path, view.package) {
+            reasons.insert(format!(
+                "WIT variant case `{interface_name}.{}`.{} definition path belongs to a different package",
+                item.name, case.name
+            ));
+            continue;
+        }
+        if !view_definition_path_matches_variant_case(
+            &case_path,
+            &case_definition.canonical_path,
+            &variant_path,
+            expected_interface_name,
+            variant_view_name,
+            variant_disambiguator,
+            case_view_name,
+            case_disambiguator,
+            symbols_interner,
+        ) {
+            reasons.insert(format!(
+                "WIT variant case `{interface_name}.{}`.{} does not match its canonical view definition path",
+                item.name, case.name
+            ));
+            continue;
+        }
+        let Some(case_hash) = verified_view_path_hash(
+            &case_path,
+            case_definition.path_hash,
+            packages,
+            symbols_interner,
+        ) else {
+            reasons.insert(format!(
+                "WIT variant case `{interface_name}.{}`.{} definition path hash is inconsistent",
+                item.name, case.name
+            ));
+            continue;
+        };
+        let canonical_case_path = format!("{canonical_variant_path}.{case_view_name}");
+        if !emitted_paths.insert(canonical_case_path.clone()) {
+            reasons.insert(format!(
+                "WIT variant case canonical path `{canonical_case_path}` is duplicated"
+            ));
+            continue;
+        }
+        current_symbols.push(CurrentSymbol::new(
+            canonical_case_path,
+            case_hash,
+            SymbolKind::Variant,
+            declaration_fingerprint_from_token_pairs(SymbolKind::Variant, &source_case.token_pairs),
+        ));
+    }
+}
+
 fn resource_source_identity(
     item: &WitItem,
     interface_name: &str,
@@ -1778,6 +2095,79 @@ fn enum_source_identity(
                 })
                 .count()
                 != 1
+        {
+            return None;
+        }
+        previous_end = source_case.declaration_range.end;
+    }
+    Some(scanned)
+}
+
+fn variant_source_identity(
+    item: &WitItem,
+    interface_name: &str,
+    cases: &[WitCase],
+    source_files: &BTreeMap<String, Arc<str>>,
+) -> Option<sai_wit::AuthoredInterfaceVariantTokens> {
+    let name_span = item.span.as_ref()?;
+    let source = source_files.get(&name_span.path)?;
+    let name_text = source.get(name_span.range.clone())?;
+    if normalized_wit_name(name_text) != Some(item.name.as_str()) {
+        return None;
+    }
+    let scanned =
+        authored_interface_variant_tokens(source, interface_name, &item.name, &name_span.range)?;
+    if scanned.cases.len() != cases.len()
+        || scanned.declaration_range.start > name_span.range.start
+        || name_span.range.end > scanned.declaration_range.end
+        || scanned.declaration_range.is_empty()
+        || source
+            .get(scanned.declaration_range.clone())
+            .is_none_or(|declaration| !declaration.ends_with('}'))
+        || scanned
+            .token_pairs
+            .last()
+            .map(|(kind, text)| (kind.as_str(), text.as_str()))
+            != Some(("RightBrace", "}"))
+        || scanned
+            .token_pairs
+            .iter()
+            .filter(|(kind, text)| {
+                text.is_empty() && matches!(kind.as_str(), "Id" | "ExplicitId" | "StringLiteral")
+            })
+            .count()
+            != 1
+    {
+        return None;
+    }
+    let mut previous_end = scanned.declaration_range.start;
+    for (model_case, source_case) in cases.iter().zip(&scanned.cases) {
+        let name_text = source.get(source_case.name_range.clone())?;
+        if source_case.name != model_case.name
+            || normalized_wit_name(name_text) != Some(model_case.name.as_str())
+            || source_case.has_payload != model_case.payload.is_some()
+            || source_case.declaration_range.start < scanned.declaration_range.start
+            || source_case.declaration_range.end > scanned.declaration_range.end
+            || source_case.declaration_range.start < previous_end
+            || source_case.declaration_range.is_empty()
+            || source_case.name_range.start < source_case.declaration_range.start
+            || source_case.name_range.end > source_case.declaration_range.end
+            || source_case
+                .token_pairs
+                .iter()
+                .filter(|(kind, text)| {
+                    text.is_empty()
+                        && matches!(kind.as_str(), "Id" | "ExplicitId" | "StringLiteral")
+                })
+                .count()
+                != 1
+            || source_case
+                .token_pairs
+                .last()
+                .map(|(kind, text)| (kind.as_str(), text.as_str()))
+                .is_none_or(|(kind, text)| {
+                    source_case.has_payload && (kind != "RightParen" || text != ")")
+                })
         {
             return None;
         }
@@ -1963,6 +2353,45 @@ fn view_definition_path_matches_enum(
     definition_canonical_path == expected_canonical_path
 }
 
+fn view_definition_path_matches_variant(
+    path: &sai_hir::DefPath,
+    definition_canonical_path: &str,
+    expected_interface: &str,
+    expected_variant: &str,
+    variant_disambiguator: u32,
+    symbols_interner: &sai_intern::Interner,
+) -> bool {
+    let [interface_component, variant_component] = path.data() else {
+        return false;
+    };
+    let (DefPathData::Interface(interface_symbol), DefPathData::TypeNs(variant_symbol)) =
+        (&interface_component.data, &variant_component.data)
+    else {
+        return false;
+    };
+    if interface_component.disambiguator != 0
+        || variant_component.disambiguator != variant_disambiguator
+        || !symbols_interner
+            .resolve(*interface_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_interface)
+        || !symbols_interner
+            .resolve(*variant_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_variant)
+    {
+        return false;
+    }
+    let expected_canonical_path = format!(
+        "interface[{}:{};{}]/type[{}:{};{}]/",
+        expected_interface.len(),
+        expected_interface,
+        interface_component.disambiguator,
+        expected_variant.len(),
+        expected_variant,
+        variant_component.disambiguator,
+    );
+    definition_canonical_path == expected_canonical_path
+}
+
 fn view_definition_path_matches_alias(
     path: &sai_hir::DefPath,
     definition_canonical_path: &str,
@@ -2013,6 +2442,22 @@ fn interface_type_item_disambiguator(
             continue;
         }
         let name = wit_name_to_sai(&item.name, true).ok()?;
+        if name.strip_prefix("r#").unwrap_or(&name) == expected_name {
+            count = count.checked_add(1)?;
+        }
+    }
+    Some(count)
+}
+
+fn variant_case_disambiguator(
+    cases: &[WitCase],
+    case_index: usize,
+    expected_name: &str,
+) -> Option<u32> {
+    cases.get(case_index)?;
+    let mut count = 0_u32;
+    for case in cases.iter().take(case_index) {
+        let name = wit_name_to_sai(&case.name, true).ok()?;
         if name.strip_prefix("r#").unwrap_or(&name) == expected_name {
             count = count.checked_add(1)?;
         }
@@ -2206,6 +2651,67 @@ fn view_definition_path_matches_enum_case(
         expected_enum.len(),
         expected_enum,
         enum_component.disambiguator,
+        expected_case.len(),
+        expected_case,
+        case_component.disambiguator,
+    );
+    definition_canonical_path == expected_canonical_path
+}
+
+fn view_definition_path_matches_variant_case(
+    path: &sai_hir::DefPath,
+    definition_canonical_path: &str,
+    variant_path: &sai_hir::DefPath,
+    expected_interface: &str,
+    expected_variant: &str,
+    variant_disambiguator: u32,
+    expected_case: &str,
+    case_disambiguator: u32,
+    symbols_interner: &sai_intern::Interner,
+) -> bool {
+    let [interface_component, variant_component, case_component] = path.data() else {
+        return false;
+    };
+    let [parent_interface_component, parent_variant_component] = variant_path.data() else {
+        return false;
+    };
+    let (
+        DefPathData::Interface(interface_symbol),
+        DefPathData::TypeNs(variant_symbol),
+        DefPathData::Variant(case_symbol),
+    ) = (
+        &interface_component.data,
+        &variant_component.data,
+        &case_component.data,
+    )
+    else {
+        return false;
+    };
+    if interface_component != parent_interface_component
+        || variant_component != parent_variant_component
+        || interface_component.disambiguator != 0
+        || variant_component.disambiguator != variant_disambiguator
+        || case_component.disambiguator != case_disambiguator
+        || !symbols_interner
+            .resolve(*interface_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_interface)
+        || !symbols_interner
+            .resolve(*variant_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_variant)
+        || !symbols_interner
+            .resolve(*case_symbol)
+            .is_ok_and(|name| name.as_ref() == expected_case)
+    {
+        return false;
+    }
+    let expected_canonical_path = format!(
+        "interface[{}:{};{}]/type[{}:{};{}]/variant[{}:{};{}]/",
+        expected_interface.len(),
+        expected_interface,
+        interface_component.disambiguator,
+        expected_variant.len(),
+        expected_variant,
+        variant_component.disambiguator,
         expected_case.len(),
         expected_case,
         case_component.disambiguator,
@@ -2411,22 +2917,23 @@ mod tests {
     use super::{
         ValidatedFunctionSource, alias_source_identity, function_source_identity,
         interface_type_item_disambiguator, record_field_disambiguator, record_source_identity,
-        resource_members_match_source, resource_source_identity, verified_view_path_hash,
-        view_definition_matches_entity, view_definition_path_matches_alias,
-        view_definition_path_matches_enum, view_definition_path_matches_enum_case,
-        view_definition_path_matches_record, view_definition_path_matches_record_field,
-        view_path_matches_selected_package,
+        resource_members_match_source, resource_source_identity, variant_case_disambiguator,
+        variant_source_identity, verified_view_path_hash, view_definition_matches_entity,
+        view_definition_path_matches_alias, view_definition_path_matches_enum,
+        view_definition_path_matches_enum_case, view_definition_path_matches_record,
+        view_definition_path_matches_record_field, view_definition_path_matches_variant,
+        view_definition_path_matches_variant_case, view_path_matches_selected_package,
     };
     use sai_hir::{DefPath, DefPathData, DefPathHash, DisambiguatedDefPathData};
     use sai_intern::{Interner, PackageInterner};
     use sai_semantic::{SymbolKind, declaration_fingerprint_from_token_pairs};
     use sai_stable_hash::Fingerprint;
     use sai_wit::{
-        WitField, WitFunc, WitIfaceIdx, WitIndexVec, WitInterface, WitItem, WitItemIdx,
+        WitCase, WitField, WitFunc, WitIfaceIdx, WitIndexVec, WitInterface, WitItem, WitItemIdx,
         WitItemKind, WitMember, WitMemberKind, WitSpan, WitType, WitViewDef, WitViewDefKind,
         WitViewEntity, authored_interface_alias_tokens, authored_interface_enum_tokens,
         authored_interface_function_tokens, authored_interface_record_tokens,
-        authored_interface_resource_tokens,
+        authored_interface_resource_tokens, authored_interface_variant_tokens,
     };
     use std::collections::BTreeMap;
     use std::sync::Arc;
@@ -2503,6 +3010,27 @@ mod tests {
                     })
                     .collect(),
             ),
+            unsupported: None,
+            span: Some(WitSpan {
+                path: "root.wit".to_owned(),
+                range: name_range,
+            }),
+            declaration_span: None,
+            declaration_token_pairs: None,
+        }
+    }
+
+    fn variant_item(source: &str, name: &str, cases: Vec<WitCase>) -> WitItem {
+        let name_start = source.find(name).expect("variant name occurs");
+        let name_range = name_start..name_start + name.len();
+        let _tokens = authored_interface_variant_tokens(source, "api", name, &name_range)
+            .expect("direct variant tokens are found");
+        WitItem {
+            name: name.to_owned(),
+            docs: None,
+            since: None,
+            deprecated: None,
+            kind: WitItemKind::Variant(cases),
             unsupported: None,
             span: Some(WitSpan {
                 path: "root.wit".to_owned(),
@@ -2598,6 +3126,47 @@ mod tests {
                 },
             ],
         )
+    }
+
+    fn variant_path(
+        packages: &PackageInterner,
+        package: sai_intern::PackageId,
+        symbols: &Interner,
+        variant_disambiguator: u32,
+    ) -> DefPath {
+        def_path(
+            packages,
+            package,
+            symbols,
+            vec![
+                DisambiguatedDefPathData {
+                    data: DefPathData::Interface(path_symbol(symbols, "api")),
+                    disambiguator: 0,
+                },
+                DisambiguatedDefPathData {
+                    data: DefPathData::TypeNs(path_symbol(symbols, "Outcome")),
+                    disambiguator: variant_disambiguator,
+                },
+            ],
+        )
+    }
+
+    fn variant_case_path(
+        packages: &PackageInterner,
+        package: sai_intern::PackageId,
+        symbols: &Interner,
+        variant_disambiguator: u32,
+        case_name: &str,
+        case_disambiguator: u32,
+    ) -> DefPath {
+        let mut path = variant_path(packages, package, symbols, variant_disambiguator)
+            .data()
+            .to_vec();
+        path.push(DisambiguatedDefPathData {
+            data: DefPathData::Variant(path_symbol(symbols, case_name)),
+            disambiguator: case_disambiguator,
+        });
+        def_path(packages, package, symbols, path)
     }
 
     fn record_path(
@@ -2855,6 +3424,241 @@ mod tests {
         let mut missing_span = item;
         missing_span.span = None;
         assert!(record_source_identity(&missing_span, "api", &fields, &sources).is_none());
+    }
+
+    #[test]
+    fn variant_source_identity_requires_exact_name_span_order_and_payload_presence() {
+        let source = "interface api { variant outcome { ready, failed(u32) } }\n";
+        let cases = vec![
+            WitCase {
+                name: "ready".to_owned(),
+                docs: None,
+                payload: None,
+            },
+            WitCase {
+                name: "failed".to_owned(),
+                docs: None,
+                payload: Some(WitType::U32),
+            },
+        ];
+        let item = variant_item(source, "outcome", cases.clone());
+        let sources = source_map(source);
+        let scanned =
+            variant_source_identity(&item, "api", &cases, &sources).expect("variant validates");
+        assert_eq!(scanned.cases.len(), cases.len());
+        assert!(!scanned.cases[0].has_payload);
+        assert!(scanned.cases[1].has_payload);
+        assert!(
+            scanned.cases[1]
+                .token_pairs
+                .iter()
+                .any(|(_, text)| text == "u32"),
+            "the case payload is retained in its fingerprint source"
+        );
+
+        let mut invalid_name = item.clone();
+        invalid_name.span.as_mut().expect("variant span").range.end += 1;
+        assert!(variant_source_identity(&invalid_name, "api", &cases, &sources).is_none());
+        assert!(variant_source_identity(&item, "other", &cases, &sources).is_none());
+
+        let reversed = vec![cases[1].clone(), cases[0].clone()];
+        assert!(
+            variant_source_identity(&item, "api", &reversed, &sources).is_none(),
+            "model cases must match exact source order"
+        );
+        let missing_payload = vec![
+            cases[0].clone(),
+            WitCase {
+                payload: None,
+                ..cases[1].clone()
+            },
+        ];
+        assert!(
+            variant_source_identity(&item, "api", &missing_payload, &sources).is_none(),
+            "source and model payload presence must agree"
+        );
+
+        let edited_source = source.replace("failed(u32)", "failed(string)");
+        assert!(
+            variant_source_identity(&item, "api", &cases, &source_map(&edited_source)).is_some(),
+            "the inventory verifies source provenance and payload presence, not type equivalence"
+        );
+        let mut missing_span = item;
+        missing_span.span = None;
+        assert!(variant_source_identity(&missing_span, "api", &cases, &sources).is_none());
+    }
+
+    #[test]
+    fn variant_and_case_def_paths_require_exact_components_parent_and_serialization() {
+        let packages = PackageInterner::new();
+        let package = packages
+            .intern("acme:sample#1.0.0")
+            .expect("package interns");
+        let symbols = Interner::new();
+        let parent = variant_path(&packages, package, &symbols, 1);
+        let case = variant_case_path(&packages, package, &symbols, 1, "Failed", 1);
+        let parent_canonical = "interface[3:api;0]/type[7:Outcome;1]/";
+        let case_canonical = "interface[3:api;0]/type[7:Outcome;1]/variant[6:Failed;1]/";
+
+        assert!(view_definition_path_matches_variant(
+            &parent,
+            parent_canonical,
+            "api",
+            "Outcome",
+            1,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_variant(
+            &parent,
+            "interface[3:api;0]/type[7:Outcome;0]/",
+            "api",
+            "Outcome",
+            1,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_variant(
+            &parent,
+            parent_canonical,
+            "api",
+            "Wrong",
+            1,
+            &symbols
+        ));
+
+        assert!(view_definition_path_matches_variant_case(
+            &case,
+            case_canonical,
+            &parent,
+            "api",
+            "Outcome",
+            1,
+            "Failed",
+            1,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_variant_case(
+            &case,
+            "interface[3:api;0]/type[7:Outcome;1]/variant[6:Failed;0]/",
+            &parent,
+            "api",
+            "Outcome",
+            1,
+            "Failed",
+            1,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_variant_case(
+            &case,
+            case_canonical,
+            &variant_path(&packages, package, &symbols, 0),
+            "api",
+            "Outcome",
+            1,
+            "Failed",
+            1,
+            &symbols
+        ));
+        assert!(!view_definition_path_matches_variant_case(
+            &case,
+            case_canonical,
+            &parent,
+            "api",
+            "Outcome",
+            1,
+            "Wrong",
+            1,
+            &symbols
+        ));
+
+        let expected_hash =
+            DefPathHash::compute(&case, &packages, &symbols).expect("case path hash computes");
+        assert_eq!(
+            verified_view_path_hash(&case, expected_hash, &packages, &symbols),
+            Some(Fingerprint::new(expected_hash.raw()))
+        );
+        let foreign_package = packages
+            .intern("other:sample#1.0.0")
+            .expect("foreign package interns");
+        let foreign_case = variant_case_path(&packages, foreign_package, &symbols, 1, "Failed", 1);
+        let foreign_hash = DefPathHash::compute(&foreign_case, &packages, &symbols)
+            .expect("foreign case path hash computes");
+        assert!(
+            verified_view_path_hash(&foreign_case, foreign_hash, &packages, &symbols).is_some(),
+            "a recomputed hash only proves the foreign path is internally valid"
+        );
+        assert!(!view_path_matches_selected_package(&foreign_case, package));
+        assert!(view_path_matches_selected_package(&case, package));
+    }
+
+    #[test]
+    fn variant_namespace_ordinals_follow_type_and_case_order() {
+        let source = "interface api { variant outcome { ready, failed(u32) } }\n";
+        let cases = vec![
+            WitCase {
+                name: "ready".to_owned(),
+                docs: None,
+                payload: None,
+            },
+            WitCase {
+                name: "failed".to_owned(),
+                docs: None,
+                payload: Some(WitType::U32),
+            },
+        ];
+        let mut earlier_type = variant_item(source, "outcome", Vec::new());
+        earlier_type.name = "same".to_owned();
+        let mut function = earlier_type.clone();
+        function.kind = WitItemKind::Func(WitFunc {
+            params: Vec::new(),
+            result: None,
+            is_async: false,
+        });
+        let mut current_type = variant_item(source, "outcome", cases.clone());
+        current_type.name = "same".to_owned();
+        let items = sai_wit::WitIndexVec::<WitItemIdx, _>::try_from_vec(vec![
+            earlier_type,
+            function,
+            current_type,
+        ])
+        .expect("item indices fit");
+        let current_index = items
+            .iter_enumerated()
+            .last()
+            .expect("current variant item exists")
+            .0;
+        let interface = WitInterface {
+            name: "api".to_owned(),
+            docs: None,
+            since: None,
+            deprecated: None,
+            items,
+            span: None,
+        };
+        assert_eq!(
+            interface_type_item_disambiguator(&interface, current_index, "Same"),
+            Some(1)
+        );
+        assert_eq!(variant_case_disambiguator(&cases, 0, "Ready"), Some(0));
+        assert_eq!(variant_case_disambiguator(&cases, 1, "Failed"), Some(0));
+
+        let repeated_name_cases = vec![
+            WitCase {
+                name: "ready".to_owned(),
+                docs: None,
+                payload: None,
+            },
+            WitCase {
+                name: "ready".to_owned(),
+                docs: None,
+                payload: None,
+            },
+        ];
+        assert_eq!(
+            variant_case_disambiguator(&repeated_name_cases, 1, "Ready"),
+            Some(1),
+            "ordinal calculation remains deterministic even for a malformed duplicate model"
+        );
+        assert_eq!(variant_case_disambiguator(&cases, 2, "Extra"), None);
     }
 
     #[test]
