@@ -77,6 +77,8 @@ source repository before a package resolver can fetch them.
 | Advanced | [`canary-release-safety-planner`](canary-release-safety-planner/README.md) | Order dependent service releases across regional canary and general cohorts; apply health gates, halt on failed evidence, and record rollback decisions deterministically. |
 | Advanced | [`port-call-coordinator`](port-call-coordinator/README.md) | Greedily schedule fictional vessel calls against berths, tide windows, cranes, reefer plugs, hazmat separation, and a shared one-way channel; reject malformed input and explain unplaced calls. |
 | Advanced | [`observatory-night-planner`](observatory-night-planner/README.md) | Schedule fictional telescope requests under target visibility, dark-time, filter, guiding, cloud, and setup-time constraints with a deterministic priority policy. |
+| Advanced | [`orbital-conjunction-review`](orbital-conjunction-review/README.md) | Rank fictional satellite conjunction alerts by uncertainty-adjusted miss distance and review maneuver timing, spacecraft limits, and protected propellant reserves. |
+| Advanced | [`accessible-audio-release-auditor`](accessible-audio-release-auditor/README.md) | Audit a fictional audiobook release for required audio parts, chapter synchronization, timed transcript and description coverage, version consistency, and accessibility approvals. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or

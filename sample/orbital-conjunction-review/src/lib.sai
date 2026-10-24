@@ -1,0 +1,93 @@
+use acme:orbital-conjunction-review/data
+use acme:orbital-conjunction-review/model.{
+    ConjunctionAlert
+    Recommendation
+    ReviewPlan
+    ReviewReason
+    RiskBand
+}
+use acme:orbital-conjunction-review/policy
+use acme:orbital-conjunction-review/report
+use acme:orbital-conjunction-review/review
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    report.print_review(borrow mut out)
+    process.ExitCode.success()
+}
+
+pub fn review_fixture() -> ReviewPlan {
+    review.build_review()
+}
+
+test "conservative clearance subtracts uncertainty without underflow" {
+    let alert = data.alerts()[2]
+    assert policy.conservative_miss_distance(alert) == 400
+
+    let uncertainty_below_miss_distance = data.alerts()[5]
+    assert policy.conservative_miss_distance(uncertainty_below_miss_distance) == 2200
+
+    let uncertainty_at_miss_distance = ConjunctionAlert(
+        id: 901,
+        spacecraft_id: 11,
+        other_object: "TEST-EQUAL-UNCERTAINTY",
+        miss_distance_m: 900,
+        uncertainty_m: 900,
+        confidence_bps: 9000,
+        hours_to_tca: 24,
+    )
+    assert policy.conservative_miss_distance(uncertainty_at_miss_distance) == 0
+
+    let uncertainty_beyond_miss_distance = ConjunctionAlert(
+        id: 902,
+        spacecraft_id: 11,
+        other_object: "TEST-WIDE-UNCERTAINTY",
+        miss_distance_m: 900,
+        uncertainty_m: 1200,
+        confidence_bps: 9000,
+        hours_to_tca: 24,
+    )
+    assert policy.conservative_miss_distance(uncertainty_beyond_miss_distance) == 0
+}
+
+test "priority order is deterministic and fixture order is not reused" {
+    let plan = review_fixture()
+    assert plan.priority_order[0] == 2
+    assert plan.priority_order[1] == 4
+    assert plan.priority_order[2] == 8
+    assert plan.priority_order[3] == 7
+    assert plan.priority_order[4] == 0
+    assert plan.priority_order[8] == 1
+}
+
+test "only feasible critical burns reserve propellant while preserving the reserve" {
+    let plan = review_fixture()
+    assert plan.maneuver_count == 2
+    assert plan.monitor_count == 6
+    assert plan.hold_count == 1
+    assert plan.remaining_propellant_mm_s[1] == 60
+
+    assert plan.assessments[4].recommendation == Recommendation.Maneuver
+    assert plan.assessments[4].projected_propellant_after_burn_mm_s == 140
+    assert plan.assessments[0].recommendation == Recommendation.Maneuver
+    assert plan.assessments[0].projected_propellant_after_burn_mm_s == 60
+}
+
+test "critical alerts blocked by reserve, lead time, or closed window remain monitored" {
+    let plan = review_fixture()
+    assert plan.assessments[2].risk == RiskBand.Critical
+    assert plan.assessments[2].recommendation == Recommendation.Monitor
+    assert plan.assessments[2].reason == ReviewReason.ProtectedPropellantReserve
+    assert plan.assessments[7].reason == ReviewReason.InsufficientLeadTime
+    assert plan.assessments[8].reason == ReviewReason.NoApprovedManeuverWindow
+}
+
+test "uncertain close passes are monitored and distant or late passes are held" {
+    let plan = review_fixture()
+    assert plan.assessments[5].risk == RiskBand.Watch
+    assert plan.assessments[5].recommendation == Recommendation.Monitor
+    assert plan.assessments[1].recommendation == Recommendation.Hold
+}

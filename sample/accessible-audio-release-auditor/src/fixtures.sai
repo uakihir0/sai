@@ -1,0 +1,238 @@
+use acme:accessible-audio-release-auditor/model.{
+    AccessibilityApproval
+    ApprovalRole
+    ApprovalStatus
+    AudioAsset
+    Chapter
+    ReleaseMetadata
+    ReleasePackage
+    TextAsset
+    TextCue
+    TextKind
+    TrackKind
+}
+
+pub fn sample_package() -> ReleasePackage {
+    ReleasePackage(
+        metadata: ReleaseMetadata(
+            catalog_id: "AUD-204",
+            title: "The Last Ferry at Moonrise",
+            narrator_credit: "Narrated by Asha Bell",
+            locale: "en-GB",
+            package_version: "2.4.1",
+            content_advisory: "Mild peril and storm sounds",
+            rights_cleared: true,
+        ),
+        chapters: [
+            Chapter(number: 1, start_ms: 0, end_ms: 30000),
+            Chapter(number: 2, start_ms: 30000, end_ms: 60000),
+            Chapter(number: 3, start_ms: 60000, end_ms: 90000),
+        ],
+        audio_assets: [
+            Some(
+                AudioAsset(
+                    id: "narration-chapter-1.wav",
+                    kind: TrackKind.Narration,
+                    chapter_number: 1,
+                    locale: "en-GB",
+                    version: "2.4.1",
+                    start_ms: 0,
+                    end_ms: 30000,
+                ),
+            ),
+            Some(
+                AudioAsset(
+                    id: "description-chapter-1.wav",
+                    kind: TrackKind.AudioDescription,
+                    chapter_number: 1,
+                    locale: "en-GB",
+                    version: "2.4.1",
+                    start_ms: 0,
+                    end_ms: 30000,
+                ),
+            ),
+            Some(
+                AudioAsset(
+                    id: "narration-chapter-2.wav",
+                    kind: TrackKind.Narration,
+                    chapter_number: 2,
+                    locale: "en-GB",
+                    version: "2.4.1",
+                    start_ms: 30200,
+                    end_ms: 60000,
+                ),
+            ),
+            Some(
+                AudioAsset(
+                    id: "description-chapter-2.wav",
+                    kind: TrackKind.AudioDescription,
+                    chapter_number: 2,
+                    locale: "en-GB",
+                    version: "2.4.1",
+                    start_ms: 30100,
+                    end_ms: 60000,
+                ),
+            ),
+            Some(
+                AudioAsset(
+                    id: "narration-chapter-3.wav",
+                    kind: TrackKind.Narration,
+                    chapter_number: 3,
+                    locale: "en-GB",
+                    version: "2.4.1",
+                    start_ms: 60000,
+                    end_ms: 90000,
+                ),
+            ),
+            Some(
+                AudioAsset(
+                    id: "description-chapter-3.wav",
+                    kind: TrackKind.AudioDescription,
+                    chapter_number: 3,
+                    locale: "en-GB",
+                    version: "2.4.1",
+                    start_ms: 60000,
+                    end_ms: 90000,
+                ),
+            ),
+            None,
+        ],
+        text_assets: [
+            Some(
+                TextAsset(
+                    id: "the-last-ferry-transcript.vtt",
+                    kind: TextKind.Transcript,
+                    source_track: TrackKind.Narration,
+                    locale: "en-GB",
+                    version: "2.4.1",
+                    cues: [
+                        Some(
+                            TextCue(
+                                start_ms: 0,
+                                end_ms: 15000,
+                                text: "The last ferry slipped from the quay as the harbor lamps flickered on through the rain.",
+                            ),
+                        ),
+                        Some(
+                            TextCue(
+                                start_ms: 15000,
+                                end_ms: 30000,
+                                text: "Mara found a brass ticket in her coat, stamped with tomorrow's date and a name she knew.",
+                            ),
+                        ),
+                        Some(
+                            TextCue(
+                                start_ms: 30000,
+                                end_ms: 45000,
+                                text: "Across the water, a lantern moved where no boat could safely cross the storm.",
+                            ),
+                        ),
+                        Some(
+                            TextCue(
+                                start_ms: 45000,
+                                end_ms: 60000,
+                                text: "The keeper said the old bell rang only when someone had been forgotten.",
+                            ),
+                        ),
+                        Some(
+                            TextCue(
+                                start_ms: 60000,
+                                end_ms: 75000,
+                                text: "Mara listened, then heard her brother's whistle rise above the wind and waves.",
+                            ),
+                        ),
+                        Some(
+                            TextCue(
+                                start_ms: 75000,
+                                end_ms: 90000,
+                                text: "She turned the ticket over; beneath the date, a second ferry time had appeared.",
+                            ),
+                        ),
+                    ],
+                    cue_count: 6,
+                ),
+            ),
+            Some(
+                TextAsset(
+                    id: "the-last-ferry-description-captions.vtt",
+                    kind: TextKind.Captions,
+                    source_track: TrackKind.AudioDescription,
+                    locale: "en-GB",
+                    version: "2.4.1",
+                    cues: [
+                        Some(
+                            TextCue(
+                                start_ms: 0,
+                                end_ms: 15000,
+                                text: "[Rain patters on the dock. A ferry horn sounds as harbor lamps glow.]",
+                            ),
+                        ),
+                        Some(
+                            TextCue(
+                                start_ms: 15000,
+                                end_ms: 30000,
+                                text: "[Paper rustles.] Mara: This ticket is dated tomorrow. [Wind rises.]",
+                            ),
+                        ),
+                        Some(
+                            TextCue(
+                                start_ms: 30000,
+                                end_ms: 45000,
+                                text: "[A distant lantern swings across the water. Waves strike the seawall.]",
+                            ),
+                        ),
+                        Some(
+                            TextCue(
+                                start_ms: 45000,
+                                end_ms: 60000,
+                                text: "Keeper: The bell rings for those the harbor has forgotten. [Bell tolls.]",
+                            ),
+                        ),
+                        Some(
+                            TextCue(
+                                start_ms: 60000,
+                                end_ms: 75000,
+                                text: "[A whistle answers from beyond the breakwater. The storm briefly quiets.]",
+                            ),
+                        ),
+                        Some(
+                            TextCue(
+                                start_ms: 75000,
+                                end_ms: 90000,
+                                text: "[Mara turns the ticket. A new time appears as the ferry bell rings again.]",
+                            ),
+                        ),
+                    ],
+                    cue_count: 6,
+                ),
+            ),
+        ],
+        approvals: [
+            Some(
+                AccessibilityApproval(
+                    role: ApprovalRole.Editorial,
+                    status: ApprovalStatus.Approved,
+                    reviewer: "N. Cole",
+                    version: "2.4.1",
+                ),
+            ),
+            Some(
+                AccessibilityApproval(
+                    role: ApprovalRole.Accessibility,
+                    status: ApprovalStatus.Pending,
+                    reviewer: "Access QA",
+                    version: "2.4.1",
+                ),
+            ),
+            Some(
+                AccessibilityApproval(
+                    role: ApprovalRole.AudioPost,
+                    status: ApprovalStatus.Approved,
+                    reviewer: "R. Okafor",
+                    version: "2.4.0",
+                ),
+            ),
+            None,
+        ],
+    )
+}

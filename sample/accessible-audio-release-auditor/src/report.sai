@@ -1,0 +1,111 @@
+use acme:accessible-audio-release-auditor/model.{
+    AuditReport
+    Finding
+    FindingCode
+    ReleaseDecision
+    TextCoverageSummary
+}
+use acme:accessible-audio-release-auditor/policy
+use sai:alloc/string.{String}
+use sai:core/fmt.{Writer}
+
+fn decision_text(decision: ReleaseDecision) -> Str {
+    match decision {
+        ReleaseDecision.ReadyForDistribution => "READY — no blocking findings"
+        ReleaseDecision.HoldForCorrection => "HOLD — resolve the findings before distribution"
+    }
+}
+
+fn status_text(passed: Bool) -> Str {
+    if passed {
+        "PASS"
+    } else {
+        "REVIEW"
+    }
+}
+
+fn write_text_summary(out: borrow mut String, label: Str, summary: TextCoverageSummary)
+    effects { alloc }
+{
+    let passed = summary.found and summary.coverage_complete
+    out.write_str(
+        f"{label} coverage: {status_text(passed)} — {summary.cue_count} timed sections; largest gap {summary.largest_gap_ms} ms (limit {policy.maximum_text_gap_ms()} ms)\n".as_str(),
+    )
+}
+
+fn write_finding(out: borrow mut String, finding: Finding, package_version: Str)
+    effects { alloc }
+{
+    out.write_str(f"- {finding.subject}: {finding.message}".as_str())
+
+    if (
+        finding.code == FindingCode.TrackBoundaryMisaligned
+        or finding.code == FindingCode.TrackGap
+        or finding.code == FindingCode.TrackOverlap
+        or finding.code == FindingCode.CrossTrackMisaligned
+        or finding.code == FindingCode.TextGapExceeded
+        or finding.code == FindingCode.TextOverlap
+        or finding.code == FindingCode.TextCoverageIncomplete
+    ) {
+        out.write_str(
+            f" (observed {finding.observed_ms} ms; tolerance or limit {finding.expected_ms} ms)".as_str(),
+        )
+    }
+    if (
+        finding.code == FindingCode.TrackVersionMismatch
+        or finding.code == FindingCode.TextVersionMismatch
+        or finding.code == FindingCode.ApprovalVersionMismatch
+    ) {
+        out.write_str(
+            f" (recorded version {finding.observed_version}; release version {package_version})".as_str(),
+        )
+    }
+    out.write_str("\n")
+}
+
+pub fn render(report: AuditReport) -> String
+    effects { alloc }
+{
+    var out = String.new()
+    out.write_str("Accessible audio release audit\n")
+    out.write_str(
+        f"Release: {report.title} ({report.catalog_id}) — {report.locale} — version {report.package_version}\n".as_str(),
+    )
+    out.write_str(f"Decision: {decision_text(report.decision)}\n".as_str())
+    out.write_str(
+        f"Metadata: {status_text(report.metadata_complete)} — required catalog, title, narrator, locale, package version, advisory, and rights fields\n".as_str(),
+    )
+    out.write_str(
+        f"Required audio parts: {report.required_track_count}/{report.expected_track_count} present\n".as_str(),
+    )
+    out.write_str(
+        f"Present-part boundary sync: {status_text(report.track_boundaries_aligned)} — {policy.sync_tolerance_ms()} ms tolerance\n".as_str(),
+    )
+    if report.narration_gap_count == 0 {
+        out.write_str(
+            f"Narration gaps: PASS — no gap exceeds {policy.maximum_audio_gap_ms()} ms\n".as_str(),
+        )
+    } else {
+        out.write_str(
+            f"Narration gaps: REVIEW — {report.narration_gap_count} gap(s) exceed {policy.maximum_audio_gap_ms()} ms\n".as_str(),
+        )
+    }
+    write_text_summary(borrow mut out, "Transcript", report.transcript)
+    write_text_summary(borrow mut out, "Audio-description captions", report.captions)
+    out.write_str(
+        f"Current approvals: {report.approved_current_signoff_count}/{report.required_signoff_count} required roles\n\n".as_str(),
+    )
+
+    if report.finding_count == 0 {
+        out.write_str("Findings: none\n")
+    } else {
+        out.write_str(f"Blocking findings ({report.finding_count}):\n".as_str())
+        for index in 0..report.finding_count {
+            match report.findings[index] {
+                Some(finding) => write_finding(borrow mut out, finding, report.package_version)
+                None => {}
+            }
+        }
+    }
+    out
+}

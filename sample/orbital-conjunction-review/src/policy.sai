@@ -1,0 +1,65 @@
+use acme:orbital-conjunction-review/model.{ConjunctionAlert, RiskBand}
+
+pub fn conservative_miss_distance(alert: ConjunctionAlert) -> U32 {
+    if alert.uncertainty_m >= alert.miss_distance_m {
+        0
+    } else {
+        alert.miss_distance_m - alert.uncertainty_m
+    }
+}
+
+pub fn classify(alert: ConjunctionAlert) -> RiskBand {
+    let clearance = conservative_miss_distance(alert)
+    if alert.hours_to_tca > 168 {
+        return RiskBand.Routine
+    }
+    if clearance <= 6000 and alert.confidence_bps < 7000 {
+        return RiskBand.Watch
+    }
+    if clearance <= 2500 and alert.confidence_bps >= 8000 and alert.hours_to_tca <= 72 {
+        return RiskBand.Critical
+    }
+    if clearance <= 6000 and alert.confidence_bps >= 7000 {
+        return RiskBand.Elevated
+    }
+    if clearance <= 6000 {
+        return RiskBand.Watch
+    }
+    RiskBand.Routine
+}
+
+pub fn band_rank(band: RiskBand) -> U32 {
+    match band {
+        RiskBand.Critical => 0
+        RiskBand.Elevated => 1
+        RiskBand.Watch => 2
+        RiskBand.Routine => 3
+    }
+}
+
+pub fn precedes(left: ConjunctionAlert, right: ConjunctionAlert) -> Bool {
+    let left_band = band_rank(classify(left))
+    let right_band = band_rank(classify(right))
+    if left_band < right_band {
+        return true
+    }
+    if left_band > right_band {
+        return false
+    }
+
+    let left_clearance = conservative_miss_distance(left)
+    let right_clearance = conservative_miss_distance(right)
+    if left_clearance < right_clearance {
+        return true
+    }
+    if left_clearance > right_clearance {
+        return false
+    }
+    if left.hours_to_tca < right.hours_to_tca {
+        return true
+    }
+    if left.hours_to_tca > right.hours_to_tca {
+        return false
+    }
+    left.id < right.id
+}

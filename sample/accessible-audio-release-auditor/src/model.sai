@@ -1,0 +1,164 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum TrackKind {
+    Narration
+    AudioDescription
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum TextKind {
+    Transcript
+    Captions
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ApprovalRole {
+    Editorial
+    Accessibility
+    AudioPost
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ApprovalStatus {
+    Approved
+    Pending
+    Rejected
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReleaseDecision {
+    ReadyForDistribution
+    HoldForCorrection
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum FindingCode {
+    MissingMetadata
+    RightsNotCleared
+    MissingRequiredTrack
+    DuplicateRequiredTrack
+    UnknownChapter
+    TrackLanguageMismatch
+    TrackVersionMismatch
+    TrackBoundaryMisaligned
+    TrackInvalidInterval
+    CrossTrackMisaligned
+    TrackGap
+    TrackOverlap
+    MissingTextAsset
+    DuplicateTextAsset
+    TextSourceMismatch
+    TextLanguageMismatch
+    TextVersionMismatch
+    TextCueCountInvalid
+    TextCueInvalid
+    TextGapExceeded
+    TextOverlap
+    TextCoverageIncomplete
+    MissingApproval
+    DuplicateApproval
+    ApprovalPending
+    ApprovalRejected
+    ApprovalVersionMismatch
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ReleaseMetadata {
+    pub catalog_id: Str
+    pub title: Str
+    pub narrator_credit: Str
+    pub locale: Str
+    pub package_version: Str
+    pub content_advisory: Str
+    pub rights_cleared: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Chapter {
+    pub number: U32
+    pub start_ms: U32
+    pub end_ms: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AudioAsset {
+    pub id: Str
+    pub kind: TrackKind
+    pub chapter_number: U32
+    pub locale: Str
+    pub version: Str
+    pub start_ms: U32
+    pub end_ms: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TextCue {
+    pub start_ms: U32
+    pub end_ms: U32
+    pub text: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TextAsset {
+    pub id: Str
+    pub kind: TextKind
+    pub source_track: TrackKind
+    pub locale: Str
+    pub version: Str
+    pub cues: Array<Option<TextCue>, 6>
+    pub cue_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AccessibilityApproval {
+    pub role: ApprovalRole
+    pub status: ApprovalStatus
+    pub reviewer: Str
+    pub version: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ReleasePackage {
+    pub metadata: ReleaseMetadata
+    pub chapters: Array<Chapter, 3>
+    pub audio_assets: Array<Option<AudioAsset>, 7>
+    pub text_assets: Array<Option<TextAsset>, 2>
+    pub approvals: Array<Option<AccessibilityApproval>, 4>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Finding {
+    pub code: FindingCode
+    pub subject: Str
+    pub message: Str
+    pub observed_ms: U32
+    pub expected_ms: U32
+    pub observed_version: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TextCoverageSummary {
+    pub found: Bool
+    pub cue_count: USize
+    pub coverage_complete: Bool
+    pub largest_gap_ms: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditReport {
+    pub catalog_id: Str
+    pub title: Str
+    pub locale: Str
+    pub package_version: Str
+    pub decision: ReleaseDecision
+    pub metadata_complete: Bool
+    pub required_track_count: USize
+    pub expected_track_count: USize
+    pub track_boundaries_aligned: Bool
+    pub narration_gap_count: USize
+    pub transcript: TextCoverageSummary
+    pub captions: TextCoverageSummary
+    pub approved_current_signoff_count: USize
+    pub required_signoff_count: USize
+    pub findings: Array<Option<Finding>, 128>
+    pub finding_count: USize
+}

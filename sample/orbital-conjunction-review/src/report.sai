@@ -1,0 +1,142 @@
+use acme:orbital-conjunction-review/data
+use acme:orbital-conjunction-review/model.{
+    Assessment
+    Recommendation
+    ReviewPlan
+    ReviewReason
+    RiskBand
+    Spacecraft
+}
+use acme:orbital-conjunction-review/review
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn spacecraft_for(spacecraft_id: U32) -> Spacecraft {
+    let vehicles = data.spacecraft()
+    for vehicle in vehicles {
+        if vehicle.id == spacecraft_id {
+            return vehicle
+        }
+    }
+    vehicles[0]
+}
+
+fn spacecraft_name_for(spacecraft_id: U32) -> Str {
+    for vehicle in data.spacecraft() {
+        if vehicle.id == spacecraft_id {
+            return vehicle.name
+        }
+    }
+    "UNKNOWN SPACECRAFT"
+}
+
+fn risk_name(risk: RiskBand) -> Str {
+    match risk {
+        RiskBand.Critical => "CRITICAL"
+        RiskBand.Elevated => "ELEVATED"
+        RiskBand.Watch => "WATCH"
+        RiskBand.Routine => "ROUTINE"
+    }
+}
+
+fn recommendation_name(recommendation: Recommendation) -> Str {
+    match recommendation {
+        Recommendation.Maneuver => "MANEUVER"
+        Recommendation.Monitor => "MONITOR"
+        Recommendation.Hold => "HOLD"
+    }
+}
+
+fn print_reason(
+    out: borrow mut Stdout,
+    assessment: Assessment,
+    alert_index: USize,
+    vehicle: Spacecraft,
+)
+    effects { stdio.write, alloc }
+{
+    let alert = data.alerts()[alert_index]
+    match assessment.reason {
+        ReviewReason.ManeuverRecommended => {
+            out.write_str(
+                f"Recommend an {assessment.proposed_burn_mm_s} mm/s burn for operator approval; {assessment.projected_propellant_after_burn_mm_s} mm/s would remain and the {vehicle.protected_reserve_mm_s} mm/s reserve would be protected. ".as_str(),
+            )
+        }
+        ReviewReason.ProtectedPropellantReserve => {
+            out.write_str(
+                f"Do not queue the {assessment.proposed_burn_mm_s} mm/s burn: it would leave only {assessment.projected_propellant_after_burn_mm_s} mm/s against a {vehicle.protected_reserve_mm_s} mm/s reserve. Escalate for operator review. ".as_str(),
+            )
+        }
+        ReviewReason.NoApprovedManeuverWindow => {
+            out.write_str(
+                "No approved maneuver window is open; keep monitoring and escalate to the flight dynamics operator. ",
+            )
+        }
+        ReviewReason.InsufficientLeadTime => {
+            out.write_str(
+                f"Only {alert.hours_to_tca} h remain, below the {vehicle.minimum_lead_hours} h maneuver lead requirement; request operator review. ".as_str(),
+            )
+        }
+        ReviewReason.BurnExceedsSpacecraftLimit => {
+            out.write_str(
+                f"The {assessment.proposed_burn_mm_s} mm/s proposal exceeds this spacecraft's single-burn limit of {vehicle.maximum_burn_mm_s} mm/s; request operator review. ".as_str(),
+            )
+        }
+        ReviewReason.ElevatedNeedsMonitoring => {
+            out.write_str(
+                "This pass is elevated but below the automatic maneuver band; monitor the next state-vector update. ",
+            )
+        }
+        ReviewReason.TrackNeedsConfirmation => {
+            out.write_str(
+                "The close-pass estimate is not confident enough to maneuver; request better tracking and continue monitoring. ",
+            )
+        }
+        ReviewReason.OutsideReviewHorizon => {
+            out.write_str(
+                "The pass is beyond the 168 h review horizon; hold and refresh the alert when it enters the window. ",
+            )
+        }
+        ReviewReason.OutsideReviewCorridor => {
+            out.write_str(
+                "The uncertainty-adjusted miss remains outside the review corridor; hold unless tracking changes materially. ",
+            )
+        }
+    }
+}
+
+fn print_assessment(out: borrow mut Stdout, plan: ReviewPlan, alert_index: USize)
+    effects { stdio.write, alloc }
+{
+    let alert = data.alerts()[alert_index]
+    let vehicle = spacecraft_for(alert.spacecraft_id)
+    let assessment = plan.assessments[alert_index]
+    out.write_str(
+        f"#{alert.id} {spacecraft_name_for(alert.spacecraft_id)} / {alert.other_object}: {risk_name(assessment.risk)} — {recommendation_name(assessment.recommendation)}. ".as_str(),
+    )
+    print_reason(borrow mut out, assessment, alert_index, vehicle)
+    out.write_str(
+        f"Conservative miss bound {assessment.conservative_miss_m} m; TCA in {alert.hours_to_tca} h; confidence {alert.confidence_bps} bps.\n".as_str(),
+    )
+}
+
+pub fn print_review(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let plan = review.build_review()
+    out.write_str("Orbital conjunction review — fictional operator fixture\n")
+    out.write_str("Priority: risk band, conservative miss bound, TCA, then alert ID\n\n")
+    for rank in 0..plan.priority_order.len() {
+        print_assessment(borrow mut out, plan, plan.priority_order[rank])
+    }
+    out.write_str("\nPortfolio summary\n")
+    out.write_str(
+        f"Risk bands: {plan.critical_count} critical, {plan.elevated_count} elevated, {plan.watch_count} watch, {plan.routine_count} routine.\n".as_str(),
+    )
+    out.write_str(
+        f"Recommendations: {plan.maneuver_count} maneuver, {plan.monitor_count} monitor, {plan.hold_count} hold.\n".as_str(),
+    )
+    out.write_str(
+        f"Remaining propellant budgets: Aster-1 {plan.remaining_propellant_mm_s[0]} mm/s, Lark-4 {plan.remaining_propellant_mm_s[1]} mm/s, Kestrel-9 {plan.remaining_propellant_mm_s[2]} mm/s.\n".as_str(),
+    )
+}

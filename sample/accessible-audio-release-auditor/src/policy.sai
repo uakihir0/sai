@@ -1,0 +1,21 @@
+use acme:accessible-audio-release-auditor/model.{TrackKind}
+
+pub fn sync_tolerance_ms() -> U32 {
+    250
+}
+
+pub fn maximum_audio_gap_ms() -> U32 {
+    100
+}
+
+pub fn maximum_text_gap_ms() -> U32 {
+    2000
+}
+
+pub fn expected_text_cue_count() -> USize {
+    6
+}
+
+pub fn required_track_kinds() -> Array<TrackKind, 2> {
+    [TrackKind.Narration, TrackKind.AudioDescription]
+}
