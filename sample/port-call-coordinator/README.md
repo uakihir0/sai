@@ -64,7 +64,9 @@ non-conflicting hazmat classes.
 - Each crane handles one cargo kind. Service time is
   `ceil(cargo tons × 60 / crane tons per hour)` minutes.
 - The channel is single-lane and one-way: no inbound or outbound passages may
-  overlap any earlier assignment's inbound or outbound passage.
+  overlap any earlier assignment's inbound or outbound passage. Minute
+  intervals are half-open, so a passage may start at the exact minute another
+  passage ends.
 - A berth is occupied from inbound start through outbound end. Its crane is
   occupied only during service. Overlapping assignments cannot reuse an
   occupied berth or crane.
@@ -95,7 +97,8 @@ real operational use:
 
 - Passage times are fixed at 30 minutes in each direction; channel direction
   changes, vessel speed, pilots, tug availability, safety buffers, and
-  channel closures are not modeled.
+  channel closures are not modeled. The half-open interval rule also assumes
+  no extra channel headway or direction-change buffer.
 - Crane rates are treated as exact constant rates. Weather, gang size, setup,
   cargo mix, operating breaks, and service uncertainty are omitted.
 - Berths have one neighbor and one hazmat permit class. The fictional
