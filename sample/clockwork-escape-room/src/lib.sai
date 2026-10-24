@@ -1,0 +1,6 @@
+use acme:clockwork-escape-room/game
+use acme:clockwork-escape-room/model.{StoryRun}
+
+pub fn replay_museum_visit() -> StoryRun {
+    game.play_fixture()
+}

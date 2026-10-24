@@ -1,0 +1,48 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Room {
+    Workshop
+    Archive
+    Observatory
+    Courtyard
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Action {
+    Look
+    TakeBrassKey
+    EnterArchive
+    TakeClockworkGear
+    FitClockworkGear
+    AlignLens
+    Leave
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Ending {
+    Escaped
+    StillInside
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Scene {
+    pub text: Str
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AdventureState {
+    pub room: Room
+    pub has_brass_key: Bool
+    pub has_clockwork_gear: Bool
+    pub gear_fitted: Bool
+    pub lens_aligned: Bool
+    pub escaped: Bool
+    pub rejected_actions: USize
+    pub scenes: Array<Option<Scene>, 8>
+    pub scene_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type StoryRun {
+    pub state: AdventureState
+    pub ending: Ending
+}
