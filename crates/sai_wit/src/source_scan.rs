@@ -9,6 +9,7 @@ pub(super) struct SourceScan {
     pub nested_package_ranges: Vec<Range<usize>>,
     pub named_result_function_ranges: Vec<Range<usize>>,
     pub function_declarations: Vec<SourceFunctionDeclaration>,
+    pub enum_declarations: Vec<SourceInterfaceEnum>,
     pub resource_declarations: Vec<SourceInterfaceResource>,
 }
 
@@ -45,6 +46,32 @@ pub struct AuthoredInterfaceResourceTokens {
     pub members: Vec<AuthoredResourceMemberTokens>,
 }
 
+/// Source declaration and direct case boundaries for one authored interface
+/// enum.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoredInterfaceEnumTokens {
+    /// Exact UTF-8 byte range from attached attributes through the closing `}`.
+    pub declaration_range: Range<usize>,
+    /// Ordered parser-aligned token pairs for the whole enum. The enum name
+    /// token is present with empty text.
+    pub token_pairs: Vec<(String, String)>,
+    /// Unit cases in source order.
+    pub cases: Vec<AuthoredEnumCaseTokens>,
+}
+
+/// Source declaration and name-token boundary for one unit enum case.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoredEnumCaseTokens {
+    pub name: String,
+    /// Exact byte range of the case name token.
+    pub name_range: Range<usize>,
+    /// Exact UTF-8 byte range from attached attributes through the case name.
+    pub declaration_range: Range<usize>,
+    /// Ordered parser-aligned token pairs. The case name token is present
+    /// with empty text.
+    pub token_pairs: Vec<(String, String)>,
+}
+
 /// Source declaration and name-token boundary for one direct resource
 /// constructor, method, or static function.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,6 +95,24 @@ pub(super) struct SourceInterfaceResource {
     pub declaration_range: Range<usize>,
     pub token_pairs: Vec<(String, String)>,
     pub members: Vec<SourceResourceMember>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceInterfaceEnum {
+    pub interface_name: String,
+    pub name: String,
+    pub name_range: Range<usize>,
+    pub declaration_range: Range<usize>,
+    pub token_pairs: Vec<(String, String)>,
+    pub cases: Vec<SourceEnumCase>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceEnumCase {
+    pub name: String,
+    pub name_range: Range<usize>,
+    pub declaration_range: Range<usize>,
+    pub token_pairs: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -311,6 +356,7 @@ pub(super) fn scan_source(source: &str) -> SourceScan {
         nested_package_ranges,
         named_result_function_ranges,
         function_declarations: scan_function_declarations(source, &tokens),
+        enum_declarations: scan_interface_enums(source, &tokens),
         resource_declarations: scan_interface_resources(source, &tokens),
     }
 }
@@ -458,6 +504,228 @@ pub fn authored_interface_resource_tokens(
             })
             .collect(),
     })
+}
+
+/// Scans authored WIT source and returns one direct interface enum only when
+/// its parsed name-token span identifies exactly one lexical declaration.
+///
+/// Case ranges and token pairs are recovered from `source` itself, allowing a
+/// consumer to bind every candidate to the exact tracked file snapshot.
+pub fn authored_interface_enum_tokens(
+    source: &str,
+    interface_name: &str,
+    name: &str,
+    name_range: &Range<usize>,
+) -> Option<AuthoredInterfaceEnumTokens> {
+    let mut matches = scan_source(source)
+        .enum_declarations
+        .into_iter()
+        .filter(|declaration| {
+            declaration.interface_name == interface_name
+                && declaration.name == name
+                && &declaration.name_range == name_range
+        });
+    let declaration = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(AuthoredInterfaceEnumTokens {
+        declaration_range: declaration.declaration_range,
+        token_pairs: declaration.token_pairs,
+        cases: declaration
+            .cases
+            .into_iter()
+            .map(|case| AuthoredEnumCaseTokens {
+                name: case.name,
+                name_range: case.name_range,
+                declaration_range: case.declaration_range,
+                token_pairs: case.token_pairs,
+            })
+            .collect(),
+    })
+}
+
+fn scan_interface_enums(source: &str, tokens: &[Token]) -> Vec<SourceInterfaceEnum> {
+    let mut declarations = Vec::new();
+    for (interface_index, interface_token) in tokens.iter().enumerate() {
+        if !is_identifier(source, interface_token, "interface") {
+            continue;
+        }
+        let Some(interface_name_token) = tokens.get(interface_index + 1) else {
+            continue;
+        };
+        let Some(interface_name) = wit_identifier_text(source, interface_name_token) else {
+            continue;
+        };
+        let open_index = interface_index + 2;
+        if !tokens
+            .get(open_index)
+            .is_some_and(|token| token.kind == TokenKind::Punctuation(b'{'))
+        {
+            continue;
+        }
+        let Some(interface_end) = matching_delimiter(tokens, open_index, b'{', b'}') else {
+            continue;
+        };
+
+        let mut item_index = open_index + 1;
+        while item_index < interface_end {
+            let declaration_index = match skip_attributes(tokens, item_index, interface_end) {
+                Some(index) if index < interface_end => index,
+                _ => break,
+            };
+            if is_identifier(source, &tokens[declaration_index], "enum")
+                && let Some((declaration, next_index)) = scan_interface_enum(
+                    source,
+                    tokens,
+                    interface_name,
+                    declaration_index,
+                    interface_end,
+                )
+            {
+                declarations.push(declaration);
+                item_index = next_index;
+                continue;
+            }
+
+            // Skip the current direct item, including nested record,
+            // variant, resource, and use-list bodies. A keyword under an
+            // unsupported declaration must not be promoted as an enum.
+            if tokens[declaration_index].kind == TokenKind::Punctuation(b'{')
+                && let Some(nested_end) = matching_delimiter(tokens, declaration_index, b'{', b'}')
+            {
+                item_index = nested_end + 1;
+            } else if let Some(end_index) =
+                item_end_at_top_level(tokens, declaration_index, interface_end)
+            {
+                item_index = end_index;
+            } else {
+                item_index = declaration_index + 1;
+            }
+        }
+    }
+    declarations
+}
+
+fn scan_interface_enum(
+    source: &str,
+    tokens: &[Token],
+    interface_name: &str,
+    enum_index: usize,
+    interface_end: usize,
+) -> Option<(SourceInterfaceEnum, usize)> {
+    let name_index = enum_index.checked_add(1)?;
+    let name_token = tokens.get(name_index)?;
+    let name = wit_identifier_text(source, name_token)?;
+    let open_index = name_index.checked_add(1)?;
+    if tokens.get(open_index)?.kind != TokenKind::Punctuation(b'{') {
+        return None;
+    }
+    let close_index = matching_delimiter(tokens, open_index, b'{', b'}')?;
+    if close_index >= interface_end {
+        return None;
+    }
+    let declaration_start = attached_attributes_start(tokens, enum_index)
+        .map_or(tokens[enum_index].range.start, |index| {
+            tokens[index].range.start
+        });
+    let declaration_range = declaration_start..tokens[close_index].range.end;
+    let token_pairs = function_token_pairs(source, tokens, &declaration_range, &name_token.range)?;
+    let cases = scan_enum_cases(source, tokens, open_index + 1, close_index)?;
+    if cases.is_empty() {
+        return None;
+    }
+    Some((
+        SourceInterfaceEnum {
+            interface_name: interface_name.to_owned(),
+            name: name.to_owned(),
+            name_range: name_token.range.clone(),
+            declaration_range,
+            token_pairs,
+            cases,
+        },
+        close_index + 1,
+    ))
+}
+
+fn scan_enum_cases(
+    source: &str,
+    tokens: &[Token],
+    body_start: usize,
+    body_end: usize,
+) -> Option<Vec<SourceEnumCase>> {
+    let mut cases = Vec::new();
+    let mut segment_start = body_start;
+    let mut depth = [0_u32; 3];
+    for index in body_start..body_end {
+        match tokens[index].kind {
+            TokenKind::Punctuation(b'(') => depth[0] = depth[0].saturating_add(1),
+            TokenKind::Punctuation(b')') => depth[0] = depth[0].saturating_sub(1),
+            TokenKind::Punctuation(b'<') => depth[1] = depth[1].saturating_add(1),
+            TokenKind::Punctuation(b'>') => depth[1] = depth[1].saturating_sub(1),
+            TokenKind::Punctuation(b'[') => depth[2] = depth[2].saturating_add(1),
+            TokenKind::Punctuation(b']') => depth[2] = depth[2].saturating_sub(1),
+            TokenKind::Punctuation(b',') if depth.iter().all(|level| *level == 0) => {
+                if segment_start == index {
+                    return None;
+                }
+                cases.push(enum_case(source, tokens, segment_start, index)?);
+                segment_start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if segment_start < body_end {
+        cases.push(enum_case(source, tokens, segment_start, body_end)?);
+    } else if segment_start == body_start || cases.is_empty() {
+        return None;
+    }
+    Some(cases)
+}
+
+fn enum_case(
+    source: &str,
+    tokens: &[Token],
+    segment_start: usize,
+    segment_end: usize,
+) -> Option<SourceEnumCase> {
+    let name_index = skip_attributes(tokens, segment_start, segment_end)?;
+    if name_index.checked_add(1)? != segment_end {
+        return None;
+    }
+    let name_token = tokens.get(name_index)?;
+    let name = wit_identifier_text(source, name_token)?;
+    let declaration_start = if name_index == segment_start {
+        name_token.range.start
+    } else {
+        tokens[segment_start].range.start
+    };
+    let declaration_range = declaration_start..name_token.range.end;
+    let token_pairs = function_token_pairs(source, tokens, &declaration_range, &name_token.range)?;
+    Some(SourceEnumCase {
+        name: name.to_owned(),
+        name_range: name_token.range.clone(),
+        declaration_range,
+        token_pairs,
+    })
+}
+
+fn item_end_at_top_level(tokens: &[Token], start: usize, limit: usize) -> Option<usize> {
+    let mut index = start;
+    while index < limit {
+        match tokens[index].kind {
+            TokenKind::Punctuation(b';') => return Some(index + 1),
+            TokenKind::Punctuation(b'{') => {
+                let end = matching_delimiter(tokens, index, b'{', b'}')?;
+                if end >= limit {
+                    return None;
+                }
+                return Some(end + 1);
+            }
+            _ => index += 1,
+        }
+    }
+    None
 }
 
 fn scan_interface_resources(source: &str, tokens: &[Token]) -> Vec<SourceInterfaceResource> {
@@ -1678,8 +1946,9 @@ fn is_keylike_continue(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        SourceFunctionDeclaration, SourceInterfaceResource, authored_interface_resource_tokens,
-        lex, scan_foreign_references, scan_source, stable_wit_token_kind, world_include_docs,
+        SourceFunctionDeclaration, SourceInterfaceEnum, SourceInterfaceResource,
+        authored_interface_enum_tokens, authored_interface_resource_tokens, lex,
+        scan_foreign_references, scan_source, stable_wit_token_kind, world_include_docs,
     };
 
     fn function(source: &str, name: &str) -> SourceFunctionDeclaration {
@@ -1696,6 +1965,122 @@ mod tests {
             .into_iter()
             .find(|declaration| declaration.name == name)
             .expect("direct interface resource")
+    }
+
+    fn interface_enum(source: &str, name: &str) -> SourceInterfaceEnum {
+        scan_source(source)
+            .enum_declarations
+            .into_iter()
+            .find(|declaration| declaration.name == name)
+            .expect("direct interface enum")
+    }
+
+    #[test]
+    fn direct_enum_and_case_ranges_preserve_order_and_mask_declared_names() {
+        let source = concat!(
+            "interface api {\n",
+            "  @since(version = 1.2.3)\n",
+            "  enum status {\n",
+            "    ready,\n",
+            "    not-ready,\n",
+            "  }\n",
+            "}\n",
+        );
+        let declaration = interface_enum(source, "status");
+        assert_eq!(declaration.interface_name, "api");
+        assert_eq!(
+            &source[declaration.declaration_range.clone()],
+            "@since(version = 1.2.3)\n  enum status {\n    ready,\n    not-ready,\n  }"
+        );
+        assert_eq!(
+            declaration
+                .cases
+                .iter()
+                .map(|case| case.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ready", "not-ready"]
+        );
+        assert_eq!(
+            &source[declaration.cases[1].declaration_range.clone()],
+            "not-ready"
+        );
+        assert_eq!(
+            declaration
+                .token_pairs
+                .iter()
+                .filter(|(_, text)| text.is_empty())
+                .count(),
+            1
+        );
+        assert_eq!(
+            declaration.cases[0]
+                .token_pairs
+                .iter()
+                .filter(|(_, text)| text.is_empty())
+                .count(),
+            1
+        );
+        let selected =
+            authored_interface_enum_tokens(source, "api", "status", &declaration.name_range)
+                .expect("the exact parsed-name span selects this enum");
+        assert_eq!(selected.declaration_range, declaration.declaration_range);
+        assert_eq!(selected.token_pairs, declaration.token_pairs);
+        assert_eq!(selected.cases.len(), 2);
+        assert!(
+            authored_interface_enum_tokens(source, "api", "status", &(0..0)).is_none(),
+            "an absent parser name span cannot identify an enum"
+        );
+    }
+
+    #[test]
+    fn enum_case_fingerprints_ignore_case_spelling_trivia_and_siblings() {
+        let first = interface_enum("interface api { enum state { ready, pending } }", "state");
+        let renamed = interface_enum(
+            "interface api {\n enum status { ready , pending , failed }\n}",
+            "status",
+        );
+        assert_eq!(first.token_pairs[0].0, renamed.token_pairs[0].0);
+        assert_ne!(
+            first.token_pairs, renamed.token_pairs,
+            "the enum fingerprint includes the ordered case names"
+        );
+        assert_eq!(
+            first.cases[0].token_pairs, renamed.cases[0].token_pairs,
+            "the first case fingerprint is independent of enum spelling, trivia, and siblings"
+        );
+        let changed = interface_enum("interface api { enum state { ready, completed } }", "state");
+        assert_eq!(first.cases[0].token_pairs, changed.cases[0].token_pairs);
+        assert_eq!(
+            first.cases[1].token_pairs, changed.cases[1].token_pairs,
+            "a unit case's declaration-local fingerprint masks its own name"
+        );
+    }
+
+    #[test]
+    fn enum_scanner_ignores_nested_declarations_and_rejects_payload_or_malformed_cases() {
+        let source =
+            "interface api { record outer { value: tuple<enum, u32> } enum visible { yes, no } }";
+        let declarations = scan_source(source).enum_declarations;
+        assert_eq!(
+            declarations
+                .iter()
+                .map(|declaration| declaration.name.as_str())
+                .collect::<Vec<_>>(),
+            ["visible"]
+        );
+
+        for invalid in [
+            "interface api { enum empty {} }",
+            "interface api { enum payload { item(u32), other } }",
+            "interface api { enum missing-comma { first second } }",
+            "interface api { enum repeated { first, , second } }",
+            "interface api { enum unfinished { first, second",
+        ] {
+            assert!(
+                scan_source(invalid).enum_declarations.is_empty(),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]
