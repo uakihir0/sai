@@ -1,0 +1,120 @@
+use acme:orbital-conjunction-review/model.{ConjunctionAlert, Spacecraft}
+
+pub fn spacecraft() -> Array<Spacecraft, 3> {
+    [
+        Spacecraft(
+            id: 11,
+            name: "Aster-1",
+            propellant_budget_mm_s: 100,
+            protected_reserve_mm_s: 60,
+            maximum_burn_mm_s: 100,
+            minimum_lead_hours: 48,
+            approved_window_open: true,
+        ),
+        Spacecraft(
+            id: 22,
+            name: "Lark-4",
+            propellant_budget_mm_s: 220,
+            protected_reserve_mm_s: 60,
+            maximum_burn_mm_s: 100,
+            minimum_lead_hours: 12,
+            approved_window_open: true,
+        ),
+        Spacecraft(
+            id: 33,
+            name: "Kestrel-9",
+            propellant_budget_mm_s: 90,
+            protected_reserve_mm_s: 25,
+            maximum_burn_mm_s: 100,
+            minimum_lead_hours: 24,
+            approved_window_open: false,
+        ),
+    ]
+}
+
+// The fixture is intentionally not in review priority order.
+pub fn alerts() -> Array<ConjunctionAlert, 9> {
+    [
+        ConjunctionAlert(
+            id: 207,
+            spacecraft_id: 22,
+            other_object: "OBJ-5",
+            miss_distance_m: 2600,
+            uncertainty_m: 400,
+            confidence_bps: 9400,
+            hours_to_tca: 50,
+        ),
+        ConjunctionAlert(
+            id: 314,
+            spacecraft_id: 33,
+            other_object: "OLD-44",
+            miss_distance_m: 14000,
+            uncertainty_m: 2000,
+            confidence_bps: 9100,
+            hours_to_tca: 180,
+        ),
+        ConjunctionAlert(
+            id: 101,
+            spacecraft_id: 11,
+            other_object: "DR-77",
+            miss_distance_m: 900,
+            uncertainty_m: 500,
+            confidence_bps: 9700,
+            hours_to_tca: 60,
+        ),
+        ConjunctionAlert(
+            id: 311,
+            spacecraft_id: 33,
+            other_object: "DEB-14",
+            miss_distance_m: 5800,
+            uncertainty_m: 1500,
+            confidence_bps: 8200,
+            hours_to_tca: 92,
+        ),
+        ConjunctionAlert(
+            id: 209,
+            spacecraft_id: 22,
+            other_object: "FRAG-22",
+            miss_distance_m: 1100,
+            uncertainty_m: 150,
+            confidence_bps: 9800,
+            hours_to_tca: 20,
+        ),
+        ConjunctionAlert(
+            id: 318,
+            spacecraft_id: 33,
+            other_object: "UNKNOWN-9",
+            miss_distance_m: 2400,
+            uncertainty_m: 200,
+            confidence_bps: 4800,
+            hours_to_tca: 30,
+        ),
+        ConjunctionAlert(
+            id: 208,
+            spacecraft_id: 22,
+            other_object: "OBJ-6",
+            miss_distance_m: 4800,
+            uncertainty_m: 1200,
+            confidence_bps: 9600,
+            hours_to_tca: 36,
+        ),
+        ConjunctionAlert(
+            id: 103,
+            spacecraft_id: 11,
+            other_object: "DR-91",
+            miss_distance_m: 2100,
+            uncertainty_m: 300,
+            confidence_bps: 9600,
+            hours_to_tca: 16,
+        ),
+        ConjunctionAlert(
+            id: 312,
+            spacecraft_id: 33,
+            other_object: "DEB-03",
+            miss_distance_m: 1600,
+            uncertainty_m: 250,
+            confidence_bps: 9100,
+            hours_to_tca: 40,
+        ),
+    ]
+}

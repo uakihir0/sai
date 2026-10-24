@@ -1,0 +1,278 @@
+use acme:orbital-conjunction-review/data
+use acme:orbital-conjunction-review/model.{
+    Assessment
+    ConjunctionAlert
+    Recommendation
+    ReviewPlan
+    ReviewReason
+    RiskBand
+    Spacecraft
+}
+use acme:orbital-conjunction-review/policy
+
+fn spacecraft_index(spacecraft: Array<Spacecraft, 3>, spacecraft_id: U32) -> Option<USize> {
+    var index: USize = 0
+    for vehicle in spacecraft {
+        if vehicle.id == spacecraft_id {
+            return Some(index)
+        }
+        index += 1
+    }
+    None
+}
+
+fn next_alert_index(alerts: Array<ConjunctionAlert, 9>, processed: Array<Bool, 9>) -> Option<
+    USize,
+> {
+    var selected: Option<USize> = None
+    var index: USize = 0
+
+    for alert in alerts {
+        if not processed[index] {
+            match selected {
+                Some(current_index) => {
+                    if policy.precedes(alert, alerts[current_index]) {
+                        selected = Some(index)
+                    }
+                }
+                None => {
+                    selected = Some(index)
+                }
+            }
+        }
+        index += 1
+    }
+    selected
+}
+
+fn default_assessment() -> Assessment {
+    Assessment(
+        alert_index: 0,
+        risk: RiskBand.Routine,
+        conservative_miss_m: 0,
+        recommendation: Recommendation.Hold,
+        reason: ReviewReason.OutsideReviewCorridor,
+        proposed_burn_mm_s: 0,
+        projected_propellant_after_burn_mm_s: 0,
+    )
+}
+
+fn review_alert(
+    alert_index: USize,
+    alert: ConjunctionAlert,
+    vehicle: Spacecraft,
+    remaining_propellant_mm_s: U32,
+) -> Assessment {
+    let risk = policy.classify(alert)
+    let clearance = policy.conservative_miss_distance(alert)
+
+    if risk == RiskBand.Critical {
+        let proposed_burn_mm_s: U32 = 80
+        let after_burn = if remaining_propellant_mm_s >= proposed_burn_mm_s {
+            remaining_propellant_mm_s - proposed_burn_mm_s
+        } else {
+            0
+        }
+
+        if not vehicle.approved_window_open {
+            return Assessment(
+                alert_index: alert_index,
+                risk: risk,
+                conservative_miss_m: clearance,
+                recommendation: Recommendation.Monitor,
+                reason: ReviewReason.NoApprovedManeuverWindow,
+                proposed_burn_mm_s: proposed_burn_mm_s,
+                projected_propellant_after_burn_mm_s: after_burn,
+            )
+        }
+        if alert.hours_to_tca < vehicle.minimum_lead_hours {
+            return Assessment(
+                alert_index: alert_index,
+                risk: risk,
+                conservative_miss_m: clearance,
+                recommendation: Recommendation.Monitor,
+                reason: ReviewReason.InsufficientLeadTime,
+                proposed_burn_mm_s: proposed_burn_mm_s,
+                projected_propellant_after_burn_mm_s: after_burn,
+            )
+        }
+        if proposed_burn_mm_s > vehicle.maximum_burn_mm_s {
+            return Assessment(
+                alert_index: alert_index,
+                risk: risk,
+                conservative_miss_m: clearance,
+                recommendation: Recommendation.Monitor,
+                reason: ReviewReason.BurnExceedsSpacecraftLimit,
+                proposed_burn_mm_s: proposed_burn_mm_s,
+                projected_propellant_after_burn_mm_s: after_burn,
+            )
+        }
+        if (
+            remaining_propellant_mm_s < vehicle.protected_reserve_mm_s
+            or after_burn < vehicle.protected_reserve_mm_s
+        ) {
+            return Assessment(
+                alert_index: alert_index,
+                risk: risk,
+                conservative_miss_m: clearance,
+                recommendation: Recommendation.Monitor,
+                reason: ReviewReason.ProtectedPropellantReserve,
+                proposed_burn_mm_s: proposed_burn_mm_s,
+                projected_propellant_after_burn_mm_s: after_burn,
+            )
+        }
+
+        return Assessment(
+            alert_index: alert_index,
+            risk: risk,
+            conservative_miss_m: clearance,
+            recommendation: Recommendation.Maneuver,
+            reason: ReviewReason.ManeuverRecommended,
+            proposed_burn_mm_s: proposed_burn_mm_s,
+            projected_propellant_after_burn_mm_s: after_burn,
+        )
+    }
+
+    if risk == RiskBand.Elevated {
+        return Assessment(
+            alert_index: alert_index,
+            risk: risk,
+            conservative_miss_m: clearance,
+            recommendation: Recommendation.Monitor,
+            reason: ReviewReason.ElevatedNeedsMonitoring,
+            proposed_burn_mm_s: 0,
+            projected_propellant_after_burn_mm_s: remaining_propellant_mm_s,
+        )
+    }
+
+    if risk == RiskBand.Watch {
+        return Assessment(
+            alert_index: alert_index,
+            risk: risk,
+            conservative_miss_m: clearance,
+            recommendation: Recommendation.Monitor,
+            reason: ReviewReason.TrackNeedsConfirmation,
+            proposed_burn_mm_s: 0,
+            projected_propellant_after_burn_mm_s: remaining_propellant_mm_s,
+        )
+    }
+
+    Assessment(
+        alert_index: alert_index,
+        risk: risk,
+        conservative_miss_m: clearance,
+        recommendation: Recommendation.Hold,
+        reason: if alert.hours_to_tca > 168 {
+            ReviewReason.OutsideReviewHorizon
+        } else {
+            ReviewReason.OutsideReviewCorridor
+        },
+        proposed_burn_mm_s: 0,
+        projected_propellant_after_burn_mm_s: remaining_propellant_mm_s,
+    )
+}
+
+pub fn build_review() -> ReviewPlan {
+    let vehicles = data.spacecraft()
+    let alerts = data.alerts()
+    var remaining_propellant_mm_s = Array<U32, 3>.filled(0)
+    var vehicle_index: USize = 0
+    for vehicle in vehicles {
+        remaining_propellant_mm_s[vehicle_index] = vehicle.propellant_budget_mm_s
+        vehicle_index += 1
+    }
+
+    var processed = Array<Bool, 9>.filled(false)
+    var assessments = Array<Assessment, 9>.filled(default_assessment())
+    var priority_order = Array<USize, 9>.filled(0)
+    var critical_count: USize = 0
+    var elevated_count: USize = 0
+    var watch_count: USize = 0
+    var routine_count: USize = 0
+    var maneuver_count: USize = 0
+    var monitor_count: USize = 0
+    var hold_count: USize = 0
+    var reviewed_count: USize = 0
+
+    while reviewed_count < alerts.len() {
+        match next_alert_index(alerts, processed) {
+            Some(index) => {
+                let alert = alerts[index]
+                processed[index] = true
+                priority_order[reviewed_count] = index
+
+                match spacecraft_index(vehicles, alert.spacecraft_id) {
+                    Some(index_of_vehicle) => {
+                        let vehicle = vehicles[index_of_vehicle]
+                        let assessment = review_alert(
+                            index,
+                            alert,
+                            vehicle,
+                            remaining_propellant_mm_s[index_of_vehicle],
+                        )
+                        assessments[index] = assessment
+                        if assessment.recommendation == Recommendation.Maneuver {
+                            remaining_propellant_mm_s[index_of_vehicle] -=
+                                assessment.proposed_burn_mm_s
+                        }
+                    }
+                    None => {
+                        assessments[index] = Assessment(
+                            alert_index: index,
+                            risk: policy.classify(alert),
+                            conservative_miss_m: policy.conservative_miss_distance(alert),
+                            recommendation: Recommendation.Monitor,
+                            reason: ReviewReason.TrackNeedsConfirmation,
+                            proposed_burn_mm_s: 0,
+                            projected_propellant_after_burn_mm_s: 0,
+                        )
+                    }
+                }
+
+                let assessment = assessments[index]
+                match assessment.risk {
+                    RiskBand.Critical => {
+                        critical_count += 1
+                    }
+                    RiskBand.Elevated => {
+                        elevated_count += 1
+                    }
+                    RiskBand.Watch => {
+                        watch_count += 1
+                    }
+                    RiskBand.Routine => {
+                        routine_count += 1
+                    }
+                }
+                match assessment.recommendation {
+                    Recommendation.Maneuver => {
+                        maneuver_count += 1
+                    }
+                    Recommendation.Monitor => {
+                        monitor_count += 1
+                    }
+                    Recommendation.Hold => {
+                        hold_count += 1
+                    }
+                }
+                reviewed_count += 1
+            }
+            None => {
+                reviewed_count = alerts.len()
+            }
+        }
+    }
+
+    ReviewPlan(
+        assessments: assessments,
+        priority_order: priority_order,
+        remaining_propellant_mm_s: remaining_propellant_mm_s,
+        critical_count: critical_count,
+        elevated_count: elevated_count,
+        watch_count: watch_count,
+        routine_count: routine_count,
+        maneuver_count: maneuver_count,
+        monitor_count: monitor_count,
+        hold_count: hold_count,
+    )
+}

@@ -1,0 +1,79 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum RiskBand {
+    Critical
+    Elevated
+    Watch
+    Routine
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Recommendation {
+    Maneuver
+    Monitor
+    Hold
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReviewReason {
+    ManeuverRecommended
+    ProtectedPropellantReserve
+    NoApprovedManeuverWindow
+    InsufficientLeadTime
+    BurnExceedsSpacecraftLimit
+    ElevatedNeedsMonitoring
+    TrackNeedsConfirmation
+    OutsideReviewHorizon
+    OutsideReviewCorridor
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Spacecraft {
+    pub id: U32
+    pub name: Str
+    // Propellant is represented as an equivalent delta-v budget in mm/s.
+    pub propellant_budget_mm_s: U32
+    pub protected_reserve_mm_s: U32
+    pub maximum_burn_mm_s: U32
+    pub minimum_lead_hours: U32
+    pub approved_window_open: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ConjunctionAlert {
+    pub id: U32
+    pub spacecraft_id: U32
+    pub other_object: Str
+    pub miss_distance_m: U32
+    pub uncertainty_m: U32
+    pub confidence_bps: U32
+    pub hours_to_tca: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Assessment {
+    pub alert_index: USize
+    pub risk: RiskBand
+    pub conservative_miss_m: U32
+    pub recommendation: Recommendation
+    pub reason: ReviewReason
+    pub proposed_burn_mm_s: U32
+    // Budget remaining after the proposed burn; for accepted burns this is committed.
+    pub projected_propellant_after_burn_mm_s: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ReviewPlan {
+    // Assessments are indexed in the same order as data.alerts().
+    pub assessments: Array<Assessment, 9>
+    // Alert indexes in operator review order.
+    pub priority_order: Array<USize, 9>
+    // Remaining equivalent delta-v budget, indexed like data.spacecraft().
+    pub remaining_propellant_mm_s: Array<U32, 3>
+    pub critical_count: USize
+    pub elevated_count: USize
+    pub watch_count: USize
+    pub routine_count: USize
+    pub maneuver_count: USize
+    pub monitor_count: USize
+    pub hold_count: USize
+}
