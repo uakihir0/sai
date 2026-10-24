@@ -1124,6 +1124,14 @@ pub struct FlagsDef {
 
 `flags_def(D)` is `Some` exactly for a type whose `adt_def` is `AdtKind::Flags`. This includes the flags types of views.
 
+**Current implementation boundary (IR-886):** `sai_ty::iface` has a private
+validated `FlagsDef` builder for local interface enums. It retains the flag
+names and spans in declaration order and selects the smallest representation.
+The existing interface-diagnostic path consumes its invalid result, but does
+not yet store or expose a valid descriptor through `adt_def` or `flags_def`.
+This step leaves Stage 0 feature gates unchanged and does not implement local
+flag constants, type-relative resolution, or generated methods.
+
 ### 16.9.3 Constants
 
 `F.X`, with `F` a flags type and `X` one of its flags, is a constant of type `F` (spec/13 §13.9.4). Type-relative path resolution (impl/03 §3.9.5) records it as `TypeDependentDef::FlagsConst { flags: F, bit: i }` (impl/03 §3.15.1). Its value is `ConstValue::Aggregate { variant: None, fields: [Int(1 << i, repr)] }` (impl/03 §3.7.15).

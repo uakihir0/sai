@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use sai_diagnostics::Code;
 use sai_hir::items::{HirOwner, InterfaceItemKind, MemberRole, OwnerNode, Variant, VariantShape};
 use sai_hir::types::Name;
-use sai_hir::{OwnerId, Span};
+use sai_hir::{DefId, OwnerId, Span, Symbol};
 use sai_intern::{Interner, LookupError};
 use sai_resolve::{
     WitNameDefinition, sai_identifier_to_wit_name, suggested_representable_name,
@@ -79,6 +81,25 @@ pub struct InterfaceCheckIssue {
     pub name: Option<String>,
     pub suggestion: Option<String>,
     pub related_span: Option<Span>,
+}
+
+/// Storage width selected for a validated local WIT flags declaration.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum FlagsRepr {
+    U8,
+    U16,
+    U32,
+}
+
+/// The validated, declaration-ordered flags data for one local interface type.
+///
+/// This value does not allocate flag `DefId`s. Flag names remain constants of
+/// the parent flags type, as specified by spec/13 §13.9.4.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct FlagsDef {
+    adt: DefId,
+    flags: Arc<[(Symbol, Span)]>,
+    repr: FlagsRepr,
 }
 
 impl InterfaceCheckIssue {
@@ -221,13 +242,11 @@ pub fn interface_item_check(
             related_span: None,
         });
     }
-    let flags_invalid = match item.kind {
-        InterfaceItemKind::Enum { variants, .. } if flags_marker_accepted => {
-            invalid_flags_enum_issue(item.owner_id, variants)
-        }
-        _ => None,
-    };
-    if let Some(issue) = flags_invalid {
+    if let InterfaceItemKind::Enum { variants, .. } = item.kind
+        && flags_marker_accepted
+        && let Err(issue) =
+            build_flags_def(item.owner_id.def_id.to_def_id(), item.owner_id, variants)
+    {
         issues.push(issue);
     }
     if let InterfaceItemKind::Enum { variants, .. } = item.kind {
@@ -322,12 +341,13 @@ pub(super) fn push_name_collisions(
     }
 }
 
-fn invalid_flags_enum_issue(
+fn build_flags_def(
+    adt: DefId,
     owner: OwnerId,
     variants: &[Variant<'_>],
-) -> Option<InterfaceCheckIssue> {
+) -> Result<Option<FlagsDef>, InterfaceCheckIssue> {
     if variants.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let payload_span = variants
@@ -338,18 +358,32 @@ fn invalid_flags_enum_issue(
         .iter()
         .find(|variant| variant.has_explicit_discriminant)
         .map(|variant| variant.span);
-    let span = payload_span
+    let invalid_span = payload_span
         .or(discriminant_span)
-        .or_else(|| variants.get(32).map(|variant| variant.name.span))?;
+        .or_else(|| variants.get(32).map(|variant| variant.name.span));
+    if let Some(span) = invalid_span {
+        return Err(InterfaceCheckIssue {
+            owner,
+            kind: InterfaceCheckIssueKind::InvalidFlagsEnum,
+            span,
+            name: None,
+            suggestion: None,
+            related_span: None,
+        });
+    }
 
-    Some(InterfaceCheckIssue {
-        owner,
-        kind: InterfaceCheckIssueKind::InvalidFlagsEnum,
-        span,
-        name: None,
-        suggestion: None,
-        related_span: None,
-    })
+    let repr = match variants.len() {
+        1..=8 => FlagsRepr::U8,
+        9..=16 => FlagsRepr::U16,
+        17..=32 => FlagsRepr::U32,
+        _ => unreachable!("the 33rd flag is rejected above"),
+    };
+    let flags = variants
+        .iter()
+        .map(|variant| (variant.name.sym, variant.name.span))
+        .collect::<Vec<_>>()
+        .into();
+    Ok(Some(FlagsDef { adt, flags, repr }))
 }
 
 fn is_empty_wit_type(kind: &InterfaceItemKind<'_>) -> bool {
@@ -362,7 +396,10 @@ fn is_empty_wit_type(kind: &InterfaceItemKind<'_>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{InterfaceCheckIssueKind, interface_item_check, is_empty_wit_type};
+    use super::{
+        FlagsRepr, InterfaceCheckIssueKind, build_flags_def, interface_item_check,
+        is_empty_wit_type,
+    };
     use sai_hir::body::{FnParam, FnSig};
     use sai_hir::items::{
         FieldDef, HirOwner, InterfaceItem, InterfaceItemKind, MemberRole, OwnerNode, Variant,
@@ -482,6 +519,18 @@ mod tests {
             span: span(start, start + 8),
             payload_span,
         }
+    }
+
+    fn flags_variants(ids: &TestIds, symbols: &Interner, count: u32) -> Vec<Variant<'static>> {
+        (0..count)
+            .map(|index| {
+                let mut variant = variant(ids, index, VariantShape::Unit, false, None);
+                variant.name.sym = symbols
+                    .intern(&format!("Flag{index}"))
+                    .expect("flag name interns");
+                variant
+            })
+            .collect()
     }
 
     fn check_enum(
@@ -746,6 +795,65 @@ mod tests {
             issues[0].message(),
             "SAI name `User_Id` cannot be represented as a WIT name"
         );
+    }
+
+    #[test]
+    fn flags_definition_preserves_bit_order_and_selects_the_smallest_repr() {
+        let (ids, symbols) = test_ids();
+        for (count, repr) in [
+            (1, FlagsRepr::U8),
+            (8, FlagsRepr::U8),
+            (9, FlagsRepr::U16),
+            (16, FlagsRepr::U16),
+            (17, FlagsRepr::U32),
+            (32, FlagsRepr::U32),
+        ] {
+            let variants = flags_variants(&ids, &symbols, count);
+            let flags = build_flags_def(ids.owner.def_id.to_def_id(), ids.owner, &variants)
+                .expect("valid flags declaration")
+                .expect("nonempty flags declaration builds a definition");
+
+            assert_eq!(flags.adt, ids.owner.def_id.to_def_id());
+            assert_eq!(flags.repr, repr);
+            assert_eq!(flags.flags.len(), count as usize);
+            for (index, (flag, flag_span)) in flags.flags.iter().enumerate() {
+                assert_eq!(
+                    symbols.resolve(*flag).expect("flag name resolves").as_ref(),
+                    format!("Flag{index}")
+                );
+                assert_eq!(*flag_span, variants[index].name.span);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_and_empty_flags_definitions_do_not_create_partial_flags_data() {
+        let (ids, symbols) = test_ids();
+
+        assert!(
+            build_flags_def(ids.owner.def_id.to_def_id(), ids.owner, &[])
+                .expect("empty flags are handled by WIT_EMPTY_TYPE")
+                .is_none()
+        );
+
+        let payload_span = span(4, 9);
+        let invalid_payload = [variant(
+            &ids,
+            0,
+            VariantShape::Tuple(&[]),
+            true,
+            Some(payload_span),
+        )];
+        let issue = build_flags_def(ids.owner.def_id.to_def_id(), ids.owner, &invalid_payload)
+            .expect_err("payload-bearing flags are rejected");
+        assert_eq!(issue.kind, InterfaceCheckIssueKind::InvalidFlagsEnum);
+        assert_eq!(issue.span, payload_span);
+
+        let invalid_count = flags_variants(&ids, &symbols, 33);
+        let issue = build_flags_def(ids.owner.def_id.to_def_id(), ids.owner, &invalid_count)
+            .expect_err("the 33rd flag is rejected");
+        assert_eq!(issue.kind, InterfaceCheckIssueKind::InvalidFlagsEnum);
+        assert_eq!(issue.span, invalid_count[32].name.span);
     }
 
     #[test]
