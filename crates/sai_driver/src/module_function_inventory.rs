@@ -43,7 +43,7 @@ impl Phase1PackageSymbolInventory {
 }
 
 /// Collects target-visible module-level functions and their generic
-/// parameters, records with their generic parameters and direct named fields,
+/// parameters, records and resources with their generic parameters and direct named fields,
 /// enums with their generic parameters, variants and record-variant fields,
 /// non-refined distinct types and their generic parameters, plain type aliases
 /// and their generic parameters, non-generic refined types, constants, user
@@ -147,6 +147,8 @@ pub(super) fn collect_module_function_inventory(
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), FunctionOwnerDescriptor>::new();
     let mut record_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
+    let mut resource_owners_by_item =
+        HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut enum_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut distinct_owners_by_item =
@@ -187,6 +189,11 @@ pub(super) fn collect_module_function_inventory(
             TopLevelOwnerKind::Struct => {
                 if record_owners_by_item.insert(key, *descriptor).is_some() {
                     reasons.insert("Phase 1 contains duplicate record owner descriptors".into());
+                }
+            }
+            TopLevelOwnerKind::Resource => {
+                if resource_owners_by_item.insert(key, *descriptor).is_some() {
+                    reasons.insert("Phase 1 contains duplicate resource owner descriptors".into());
                 }
             }
             TopLevelOwnerKind::Enum => {
@@ -255,6 +262,7 @@ pub(super) fn collect_module_function_inventory(
     let mut seen_items = HashSet::new();
     let mut consumed_owners = HashSet::new();
     let mut consumed_record_owners = HashSet::new();
+    let mut consumed_resource_owners = HashSet::new();
     let mut consumed_enum_owners = HashSet::new();
     let mut consumed_distinct_owners = HashSet::new();
     let mut consumed_const_owners = HashSet::new();
@@ -338,6 +346,25 @@ pub(super) fn collect_module_function_inventory(
                         &record_owners_by_item,
                         &mut seen_items,
                         &mut consumed_record_owners,
+                        &mut canonical_paths,
+                        &mut current_symbols,
+                        &mut reasons,
+                        def_paths,
+                        packages,
+                        symbols,
+                    );
+                }
+                ItemTreeKind::Resource => {
+                    collect_resource(
+                        entry,
+                        module.file,
+                        &module_path,
+                        package_version.package(),
+                        input,
+                        prepared.module_tree.package,
+                        &resource_owners_by_item,
+                        &mut seen_items,
+                        &mut consumed_resource_owners,
                         &mut canonical_paths,
                         &mut current_symbols,
                         &mut reasons,
@@ -504,7 +531,7 @@ pub(super) fn collect_module_function_inventory(
                 // functions are children of ExternBlock and are symbols.
                 _ => {
                     reasons.insert(format!(
-                        "target-filtered declaration {:?} is outside the function-generic-parameter-record-generic-parameter-field-enum-generic-parameter-variant-record-variant-field-distinct-type-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect-world-test-property inventory",
+                        "target-filtered declaration {:?} is outside the function-generic-parameter-record-generic-parameter-field-resource-field-enum-generic-parameter-variant-record-variant-field-distinct-type-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect-world-test-property inventory",
                         entry.kind
                     ));
                 }
@@ -521,6 +548,12 @@ pub(super) fn collect_module_function_inventory(
     if consumed_record_owners.len() != record_owners_by_item.len() {
         reasons.insert(
             "the Phase 1 record owner descriptors do not exactly match the filtered ItemTree"
+                .to_owned(),
+        );
+    }
+    if consumed_resource_owners.len() != resource_owners_by_item.len() {
+        reasons.insert(
+            "the Phase 1 resource owner descriptors do not exactly match the filtered ItemTree"
                 .to_owned(),
         );
     }
@@ -583,6 +616,13 @@ pub(super) fn collect_module_function_inventory(
         if !seen_items.contains(&(*file_id, *item_id)) {
             reasons.insert(
                 "a Phase 1 record owner has no target-filtered ItemTree declaration".to_owned(),
+            );
+        }
+    }
+    for ((file_id, item_id), _) in &resource_owners_by_item {
+        if !seen_items.contains(&(*file_id, *item_id)) {
+            reasons.insert(
+                "a Phase 1 resource owner has no target-filtered ItemTree declaration".to_owned(),
             );
         }
     }
@@ -1503,6 +1543,393 @@ fn collect_record(
             ordinal,
             field_canonical_path,
             "record field",
+            package_id,
+            reasons,
+            canonical_paths,
+            current_symbols,
+            def_paths,
+            packages,
+            symbols,
+        ) {
+            return;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_resource(
+    entry: &ItemTreeEntry,
+    file_id: FileId,
+    module_path: &[String],
+    package_identity: &str,
+    input: &OwnedPhase1ModuleInput,
+    package_id: PackageId,
+    owners_by_item: &HashMap<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>,
+    seen_items: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    consumed_owners: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    reasons: &mut HashSet<String>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) {
+    let key = (file_id, entry.ast_id);
+    if !seen_items.insert(key) {
+        reasons.insert("the target-filtered ItemTree contains a duplicate resource AST ID".into());
+    }
+    if entry.kind != ItemTreeKind::Resource {
+        reasons.insert("a non-resource ItemTree entry reached the resource collector".into());
+        return;
+    }
+    if entry.name == Symbol::ERROR {
+        reasons.insert("a target-filtered resource has no valid declaration name".into());
+        return;
+    }
+    let name = match symbols.resolve(entry.name) {
+        Ok(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            reasons.insert("a target-filtered resource name cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let Some(descriptor) = owners_by_item.get(&key).copied() else {
+        reasons.insert("a target-filtered resource has no matching Phase 1 owner".to_owned());
+        return;
+    };
+    if descriptor.kind != TopLevelOwnerKind::Resource
+        || descriptor.file != file_id
+        || descriptor.item_id != entry.ast_id
+    {
+        reasons.insert("a target-filtered resource has a mismatched Phase 1 owner".to_owned());
+        return;
+    }
+    consumed_owners.insert(key);
+
+    let Some(pointer) = input.ast_ids.pointer(entry.ast_id) else {
+        reasons.insert("a target-filtered resource AST ID has no source pointer".to_owned());
+        return;
+    };
+    let Some(syntax) = pointer.resolve(file_id, &input.root) else {
+        reasons.insert(
+            "a target-filtered resource source pointer cannot resolve in its AST root".to_owned(),
+        );
+        return;
+    };
+    let Some(declaration) = ast::ResourceDecl::cast(syntax.clone()) else {
+        reasons.insert(
+            "a target-filtered resource source pointer resolves to a non-resource node".to_owned(),
+        );
+        return;
+    };
+    if input.ast_ids.ast_id(&declaration).map(|id| id.erase()) != Some(entry.ast_id) {
+        reasons.insert("a target-filtered resource AST ID does not match its declaration".into());
+        return;
+    }
+    let Some(name_node) = declaration.name() else {
+        reasons.insert("a target-filtered resource AST has no name node".to_owned());
+        return;
+    };
+    let Some(name_token) = name_node.token() else {
+        reasons.insert("a target-filtered resource AST has no name token".to_owned());
+        return;
+    };
+    let raw_name = name_token
+        .text()
+        .strip_prefix("r#")
+        .unwrap_or(name_token.text());
+    if sai_syntax::normalize_identifier(raw_name) != name {
+        reasons.insert("the ItemTree and resource AST disagree about the declaration name".into());
+        return;
+    }
+    if syntax_has_errors(&syntax) || name_token.has_error() {
+        reasons.insert("a target-filtered resource AST contains recovery or parse errors".into());
+        return;
+    }
+    if input
+        .parser_diagnostics
+        .iter()
+        .any(|diagnostic| parser_diagnostic_overlaps_syntax(diagnostic, file_id, &syntax))
+    {
+        reasons.insert("a resource syntax node has a parser diagnostic".to_owned());
+        return;
+    }
+    let expected_visibility = syntax.children().find_map(ast::Visibility::cast).map_or(
+        sai_hir::Visibility::Private,
+        |visibility| {
+            if visibility.export_token().is_some() {
+                sai_hir::Visibility::Export
+            } else if visibility.pub_token().is_some() {
+                sai_hir::Visibility::Pub
+            } else {
+                sai_hir::Visibility::Private
+            }
+        },
+    );
+    if entry.vis != expected_visibility {
+        reasons.insert("the resource ItemTree visibility disagrees with its snapshot AST".into());
+        return;
+    }
+    if entry
+        .raw_attrs
+        .iter()
+        .any(|attribute| attribute.name == sai_hir::item_tree::AttrName::Derive)
+    {
+        reasons.insert(
+            "a resource has a rejected @derive attribute and no supported derived-symbol inventory"
+                .to_owned(),
+        );
+    }
+
+    let fields = declaration
+        .fields()
+        .map(|list| list.fields().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if entry.children.len() != fields.len() {
+        reasons
+            .insert("a resource's ItemTree field count does not match its snapshot AST".to_owned());
+        return;
+    }
+    let mut validated_fields =
+        Vec::<(ItemTreeEntry, String, SyntaxNode, sai_syntax::SyntaxToken)>::with_capacity(
+            fields.len(),
+        );
+    let mut field_names = HashSet::<String>::new();
+    for (field, child) in fields.iter().zip(&entry.children) {
+        if child.kind != ItemTreeKind::Field {
+            reasons.insert(
+                "a resource's ItemTree field kind or source order does not match its snapshot AST"
+                    .to_owned(),
+            );
+            return;
+        }
+        let Some(ast_id) = input.ast_ids.ast_id(field).map(|id| id.erase()) else {
+            reasons.insert("a resource field has no snapshot AST ID".to_owned());
+            return;
+        };
+        if child.ast_id != ast_id {
+            reasons.insert("a resource field ItemTree ID does not match its snapshot AST".into());
+            return;
+        }
+        let Some(child_pointer) = input.ast_ids.pointer(child.ast_id) else {
+            reasons.insert("a resource field AST ID has no source pointer".into());
+            return;
+        };
+        let Some(expected_pointer) = sai_syntax::SyntaxNodePtr::new(file_id, field.syntax()).ok()
+        else {
+            reasons.insert("a resource field AST cannot be bound to its source file".to_owned());
+            return;
+        };
+        if !child_pointer.is_same_source_node(&expected_pointer) {
+            reasons.insert(
+                "a resource field source pointer identifies a different AST node".to_owned(),
+            );
+            return;
+        }
+        if !child.children.is_empty() {
+            reasons.insert("a resource field has unexpected nested declarations".to_owned());
+            return;
+        }
+        if child.name == Symbol::ERROR {
+            reasons.insert("a resource field has no valid ItemTree name".to_owned());
+            return;
+        }
+        let field_name = match symbols.resolve(child.name) {
+            Ok(name) if !name.is_empty() => name.to_string(),
+            _ => {
+                reasons.insert("a resource field name cannot be resolved".to_owned());
+                return;
+            }
+        };
+        let Some(field_name_token) = field.name().and_then(|name| name.token()) else {
+            reasons.insert("a resource field AST has no name token".to_owned());
+            return;
+        };
+        let raw_field_name = field_name_token
+            .text()
+            .strip_prefix("r#")
+            .unwrap_or(field_name_token.text());
+        if sai_syntax::normalize_identifier(raw_field_name) != field_name {
+            reasons.insert("the resource ItemTree and AST field names disagree".to_owned());
+            return;
+        }
+        if field.ty().is_none() {
+            reasons.insert("a resource field has no declared type".to_owned());
+            return;
+        }
+        if syntax_has_errors(field.syntax()) || field_name_token.has_error() {
+            reasons.insert("a resource field AST contains recovery or parse errors".to_owned());
+            return;
+        }
+        if input.parser_diagnostics.iter().any(|diagnostic| {
+            parser_diagnostic_overlaps_syntax(diagnostic, file_id, field.syntax())
+        }) {
+            reasons.insert("a resource field syntax node has a parser diagnostic".to_owned());
+            return;
+        }
+        let expected_field_visibility = if field.pub_token().is_some() {
+            sai_hir::Visibility::Pub
+        } else {
+            sai_hir::Visibility::Private
+        };
+        if child.vis != expected_field_visibility {
+            reasons.insert(
+                "a resource field ItemTree visibility disagrees with its snapshot AST".into(),
+            );
+            return;
+        }
+        if !field_names.insert(field_name.clone()) {
+            reasons.insert(format!(
+                "resource `{name}` has duplicate field name `{field_name}`"
+            ));
+        }
+        validated_fields.push((
+            child.clone(),
+            field_name,
+            field.syntax().clone(),
+            field_name_token,
+        ));
+    }
+
+    let canonical_path = format!(
+        "{}{}.{name}",
+        package_identity,
+        module_path
+            .iter()
+            .map(|segment| format!("/{segment}"))
+            .collect::<String>()
+    );
+    if !canonical_paths.insert(canonical_path.clone()) {
+        reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+    }
+
+    let owner_component = DefPathData::TypeNs(entry.name);
+    let Some(item_position) = input
+        .filtered
+        .item_tree
+        .items
+        .iter()
+        .position(|candidate| candidate.ast_id == entry.ast_id)
+    else {
+        reasons.insert("a target-filtered resource is absent from its module ItemTree".to_owned());
+        return;
+    };
+    let owner_disambiguator = input.filtered.item_tree.items[..item_position]
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.kind,
+                ItemTreeKind::Struct
+                    | ItemTreeKind::Alias
+                    | ItemTreeKind::Refined
+                    | ItemTreeKind::Enum
+                    | ItemTreeKind::Distinct
+                    | ItemTreeKind::Resource
+                    | ItemTreeKind::Trait
+            ) && candidate.name == entry.name
+        })
+        .count();
+    let Ok(owner_disambiguator) = u32::try_from(owner_disambiguator) else {
+        reasons.insert("a resource owner DefPath disambiguator overflowed".to_owned());
+        return;
+    };
+    let def_path = match def_paths.resolve(descriptor.owner.def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        Ok(Some(_)) => {
+            reasons.insert(
+                "a resource owner resolves to a definition path from another package".into(),
+            );
+            return;
+        }
+        Ok(None) => {
+            reasons.insert("a resource owner has no canonical definition path".to_owned());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("a resource owner definition path cannot be resolved".to_owned());
+            return;
+        }
+    };
+    let path_matches_declaration = def_path.data().len() == module_path.len() + 1
+        && def_path
+            .data()
+            .iter()
+            .take(module_path.len())
+            .zip(module_path)
+            .all(|(component, name)| {
+                component.disambiguator == 0
+                    && matches!(&component.data, DefPathData::Module(segment)
+                        if symbols.resolve(*segment).is_ok_and(|resolved| resolved.as_ref() == name))
+            })
+        && def_path.data().last().is_some_and(|component| {
+            component.data == owner_component && component.disambiguator == owner_disambiguator
+        });
+    if !path_matches_declaration {
+        reasons.insert(
+            "the resource DefPath does not match its module, TypeNs name, or disambiguator".into(),
+        );
+        return;
+    }
+    let def_path_hash = match DefPathHash::compute(&def_path, packages, symbols) {
+        Ok(hash) => Fingerprint::new(hash.raw()),
+        Err(_) => {
+            reasons.insert("a resource definition path hash cannot be computed".to_owned());
+            return;
+        }
+    };
+    let fingerprint =
+        match declaration_fingerprint(SymbolKind::Resource, &syntax, Some(&name_token)) {
+            Ok(fingerprint) => fingerprint,
+            Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                reasons.insert(
+                    "a resource name token is outside its declaration syntax node".to_owned(),
+                );
+                return;
+            }
+        };
+    current_symbols.push(CurrentSymbol::new(
+        canonical_path.clone(),
+        def_path_hash,
+        SymbolKind::Resource,
+        fingerprint,
+    ));
+
+    let mut next_disambiguator = HashMap::<Symbol, u32>::new();
+    let mut field_paths = Vec::with_capacity(validated_fields.len());
+    for (field, _, _, _) in &validated_fields {
+        let disambiguator = next_disambiguator.entry(field.name).or_default();
+        let ordinal = *disambiguator;
+        let Some(next) = ordinal.checked_add(1) else {
+            reasons.insert("resource field DefPath disambiguator overflowed".to_owned());
+            return;
+        };
+        *disambiguator = next;
+        field_paths.push((field.name, ordinal));
+    }
+    let field_def_ids = match def_paths.intern_fields(descriptor.owner.def_id, &field_paths) {
+        Ok(def_ids) if def_ids.len() == validated_fields.len() => def_ids,
+        Ok(_) => {
+            reasons.insert("HIR returned the wrong number of resource field definitions".into());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("resource field definitions cannot be interned".to_owned());
+            return;
+        }
+    };
+    for (((field_entry, field_name, field_syntax, field_name_token), field_def_id), (_, ordinal)) in
+        validated_fields.iter().zip(field_def_ids).zip(field_paths)
+    {
+        let field_canonical_path = format!("{canonical_path}.field[{field_name}]");
+        if !collect_named_field_symbol(
+            field_entry,
+            field_syntax,
+            field_name_token,
+            field_def_id,
+            &def_path,
+            ordinal,
+            field_canonical_path,
+            "resource field",
             package_id,
             reasons,
             canonical_paths,
