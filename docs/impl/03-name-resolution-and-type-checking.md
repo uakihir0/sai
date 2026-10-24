@@ -1602,6 +1602,8 @@ pub struct TraitRef { pub def_id: DefId, pub args: GenericArgs }   // args[0] is
 - `EffectSetRef` is the `EffectSetId` of [impl/08](08-effect-and-capability-analysis.md) §8.1.6, the interned effect set of spec/08. This chapter does not resolve effect paths: when it converts a fn pointer type (§3.6.1), it takes the set of `resolved_effect_set` of impl/08 §8.1.7 for the type's clause, and impl/08 reports the diagnostics of that resolution (`UNKNOWN_EFFECT`, `EFFECT_NOT_VISIBLE`, `DUPLICATE_EFFECT`) and interprets the set. Before Stage 3 the set is always empty.
 - Interning uses a sharded hash set keyed on the structural value. The intern arena lives for the whole session; interned values are never freed during a session.
 
+**Implemented subset (IR-893):** `sai_ty::ty` now provides an interned semantic `Ty` kernel for primitive types, tuples, and references. Equal values produced by one `TyInterner` share a pointer; the interner retains strong handles and shards its structural map. The kernel currently defines only `Int`, `Uint`, `Float`, `Bool`, `Byte`, `Char`, `Never`, `Tuple`, and `Ref`; it is not yet the complete `TyKind` above and does not provide query-stable fingerprints.
+
 ### 3.5.2 Regions (N-E-24)
 
 Regions are never written in source and never affect type checking (spec/05 §5.14, spec/07). This chapter therefore carries them only as placeholders that [impl/05](05-borrow-checker.md) interprets:
@@ -1670,6 +1672,8 @@ Types in diagnostics are printed in source syntax with the shortest unambiguous 
 | `Array<T, c>` | `Array(T, c)` with `c` converted by §3.6.1.2 against `USize` |
 | `fn(T̄) -> R`, `unsafe fn …`, `… effects { E }` | `FnPtr`; omitted return is `()`; the effect set is `resolved_effect_set` of [impl/08](08-effect-and-capability-analysis.md) §8.1.7 at Stage 3, which reports `UNKNOWN_EFFECT` and the other resolution errors, and is empty before |
 | a path resolving to a function, module, trait, constant, effect or world | `WRONG_NAME_KIND` (reported by the resolver for type positions, spec/04 §4.5.2) and `{error}` |
+
+**Implemented subset (IR-893):** `sai_ty::lower_ty::lower_ty` converts only resolved primitive paths without arguments, unit and tuple forms, and `borrow` / `borrow mut`. Signature references receive owner-local pre-order `Sig` regions; body references use `Erased`; field contexts assign every borrow index 0 when the declaration has an implicit region parameter. A borrow in a field context without that parameter is explicitly unsupported. The caller must supply path resolutions for the same HIR owner and workspace snapshot. Arrays (including `Array`), aliases, generic arguments and parameters, `Self`, projections, nominal types, function pointers, inference holes, and HIR error types return an explicit unsupported reason. Path-resolution errors are likewise returned without emitting diagnostics, and this adapter never fabricates `ErrorGuaranteed`. A failed conversion invalidates its context because an earlier borrow node may already have consumed a signature-region index. This is a local lowering kernel, not the `type_of`, `fn_sig`, or complete `lower_ty` query described by this chapter.
 
 #### 3.6.1.1 Aliases
 
