@@ -1,0 +1,194 @@
+use acme:canary-release-safety-planner/model.{
+    Cohort
+    Dependency
+    HealthObservation
+    Region
+    Service
+}
+
+pub fn services() -> Array<Service, 4> {
+    [
+        Service(
+            id: 10,
+            name: "Identity",
+            min_canary_samples: 100,
+            min_general_samples: 500,
+            max_error_rate_bps: 100,
+            max_p95_latency_ms: 800,
+        ),
+        Service(
+            id: 20,
+            name: "Catalog",
+            min_canary_samples: 100,
+            min_general_samples: 500,
+            max_error_rate_bps: 100,
+            max_p95_latency_ms: 800,
+        ),
+        Service(
+            id: 30,
+            name: "Payments",
+            min_canary_samples: 100,
+            min_general_samples: 500,
+            max_error_rate_bps: 100,
+            max_p95_latency_ms: 800,
+        ),
+        Service(
+            id: 40,
+            name: "Checkout",
+            min_canary_samples: 100,
+            min_general_samples: 500,
+            max_error_rate_bps: 100,
+            max_p95_latency_ms: 800,
+        ),
+    ]
+}
+
+pub fn dependencies() -> Array<Dependency, 4> {
+    [
+        Dependency(service_id: 20, prerequisite_id: 10),
+        Dependency(service_id: 30, prerequisite_id: 10),
+        Dependency(service_id: 40, prerequisite_id: 20),
+        Dependency(service_id: 40, prerequisite_id: 30),
+    ]
+}
+
+pub fn regions() -> Array<Region, 2> {
+    [Region(id: 1, name: "North America"), Region(id: 2, name: "Europe")]
+}
+
+pub fn cohorts() -> Array<Cohort, 2> {
+    [Cohort.Canary, Cohort.General]
+}
+
+pub fn observations() -> Array<HealthObservation, 16> {
+    [
+        HealthObservation(
+            service_id: 10,
+            region_id: 1,
+            cohort: Cohort.Canary,
+            sample_count: 120,
+            error_rate_bps: 50,
+            p95_latency_ms: 400,
+        ),
+        HealthObservation(
+            service_id: 10,
+            region_id: 2,
+            cohort: Cohort.Canary,
+            sample_count: 110,
+            error_rate_bps: 40,
+            p95_latency_ms: 450,
+        ),
+        HealthObservation(
+            service_id: 10,
+            region_id: 1,
+            cohort: Cohort.General,
+            sample_count: 1000,
+            error_rate_bps: 20,
+            p95_latency_ms: 420,
+        ),
+        HealthObservation(
+            service_id: 10,
+            region_id: 2,
+            cohort: Cohort.General,
+            sample_count: 800,
+            error_rate_bps: 30,
+            p95_latency_ms: 460,
+        ),
+        HealthObservation(
+            service_id: 20,
+            region_id: 1,
+            cohort: Cohort.Canary,
+            sample_count: 120,
+            error_rate_bps: 180,
+            p95_latency_ms: 500,
+        ),
+        HealthObservation(
+            service_id: 20,
+            region_id: 2,
+            cohort: Cohort.Canary,
+            sample_count: 110,
+            error_rate_bps: 70,
+            p95_latency_ms: 560,
+        ),
+        HealthObservation(
+            service_id: 20,
+            region_id: 1,
+            cohort: Cohort.General,
+            sample_count: 800,
+            error_rate_bps: 40,
+            p95_latency_ms: 540,
+        ),
+        HealthObservation(
+            service_id: 20,
+            region_id: 2,
+            cohort: Cohort.General,
+            sample_count: 750,
+            error_rate_bps: 80,
+            p95_latency_ms: 590,
+        ),
+        HealthObservation(
+            service_id: 30,
+            region_id: 1,
+            cohort: Cohort.Canary,
+            sample_count: 130,
+            error_rate_bps: 60,
+            p95_latency_ms: 610,
+        ),
+        HealthObservation(
+            service_id: 30,
+            region_id: 2,
+            cohort: Cohort.Canary,
+            sample_count: 115,
+            error_rate_bps: 80,
+            p95_latency_ms: 650,
+        ),
+        HealthObservation(
+            service_id: 30,
+            region_id: 1,
+            cohort: Cohort.General,
+            sample_count: 900,
+            error_rate_bps: 40,
+            p95_latency_ms: 620,
+        ),
+        HealthObservation(
+            service_id: 30,
+            region_id: 2,
+            cohort: Cohort.General,
+            sample_count: 700,
+            error_rate_bps: 60,
+            p95_latency_ms: 680,
+        ),
+        HealthObservation(
+            service_id: 40,
+            region_id: 1,
+            cohort: Cohort.Canary,
+            sample_count: 125,
+            error_rate_bps: 70,
+            p95_latency_ms: 700,
+        ),
+        HealthObservation(
+            service_id: 40,
+            region_id: 2,
+            cohort: Cohort.Canary,
+            sample_count: 108,
+            error_rate_bps: 90,
+            p95_latency_ms: 740,
+        ),
+        HealthObservation(
+            service_id: 40,
+            region_id: 1,
+            cohort: Cohort.General,
+            sample_count: 850,
+            error_rate_bps: 50,
+            p95_latency_ms: 720,
+        ),
+        HealthObservation(
+            service_id: 40,
+            region_id: 2,
+            cohort: Cohort.General,
+            sample_count: 820,
+            error_rate_bps: 60,
+            p95_latency_ms: 760,
+        ),
+    ]
+}

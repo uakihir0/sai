@@ -1,0 +1,149 @@
+use acme:canary-release-safety-planner/data
+use acme:canary-release-safety-planner/gates
+use acme:canary-release-safety-planner/lookup
+use acme:canary-release-safety-planner/model.{
+    Cohort
+    Dependency
+    GateIssue
+    GraphIssue
+    HealthObservation
+    Region
+    RolloutReport
+    Service
+    WaveAction
+    WaveDecision
+}
+use acme:canary-release-safety-planner/topology
+
+fn is_health_failure(issue: GateIssue) -> Bool {
+    issue == GateIssue.ErrorRateExceeded or issue == GateIssue.LatencyExceeded
+}
+
+pub fn plan(
+    services: Array<Service, 4>,
+    dependencies: Array<Dependency, 4>,
+    regions: Array<Region, 2>,
+    observations: Array<HealthObservation, 16>,
+) -> RolloutReport {
+    let order = topology.order_services(services, dependencies)
+    var waves = Array<Option<WaveDecision>, 16>.filled(None)
+    var wave_count: USize = 0
+    var proceeded_count: U32 = 0
+    var held_count: U32 = 0
+    var rollback_count: U32 = 0
+    var halted_count: U32 = 0
+    var halt_sequence: Option<USize> = None
+    var halted = false
+
+    if order.issue.is_some() {
+        return RolloutReport(
+            service_order: order.service_ids,
+            service_order_length: order.length,
+            waves: waves,
+            wave_count: wave_count,
+            proceeded_count: proceeded_count,
+            held_count: held_count,
+            rollback_count: rollback_count,
+            halted_count: halted_count,
+            halt_sequence: halt_sequence,
+            graph_issue: order.issue,
+        )
+    }
+
+    for service_position in 0..order.length {
+        match order.service_ids[service_position] {
+            Some(service_id) => {
+                match lookup.service_index(services, service_id) {
+                    Some(service_index) => {
+                        let service = services[service_index]
+                        for cohort in data.cohorts() {
+                            for region in regions {
+                                var action = WaveAction.Halted
+                                var issue = Some(GateIssue.EarlierWaveFailed)
+                                let sequence = wave_count + 1
+
+                                if not halted {
+                                    issue = gates.evaluate(service, region.id, cohort, observations)
+                                    match issue {
+                                        Some(gate_issue) => {
+                                            if is_health_failure(gate_issue) {
+                                                action = WaveAction.RollbackAndHalt
+                                                rollback_count += 1
+                                            } else {
+                                                action = WaveAction.HoldAndHalt
+                                                held_count += 1
+                                            }
+                                            halted = true
+                                            halt_sequence = Some(sequence)
+                                        }
+                                        None => {
+                                            action = WaveAction.Proceed
+                                            proceeded_count += 1
+                                        }
+                                    }
+                                } else {
+                                    halted_count += 1
+                                }
+
+                                waves[wave_count] = Some(
+                                    WaveDecision(
+                                        sequence: sequence,
+                                        service_id: service.id,
+                                        service_name: service.name,
+                                        region_id: region.id,
+                                        region_name: region.name,
+                                        cohort: cohort,
+                                        action: action,
+                                        issue: issue,
+                                    ),
+                                )
+                                wave_count += 1
+                            }
+                        }
+                    }
+                    None => {
+                        return RolloutReport(
+                            service_order: order.service_ids,
+                            service_order_length: order.length,
+                            waves: waves,
+                            wave_count: wave_count,
+                            proceeded_count: proceeded_count,
+                            held_count: held_count,
+                            rollback_count: rollback_count,
+                            halted_count: halted_count,
+                            halt_sequence: halt_sequence,
+                            graph_issue: Some(GraphIssue.UnknownDependencyEndpoint),
+                        )
+                    }
+                }
+            }
+            None => {
+                return RolloutReport(
+                    service_order: order.service_ids,
+                    service_order_length: order.length,
+                    waves: waves,
+                    wave_count: wave_count,
+                    proceeded_count: proceeded_count,
+                    held_count: held_count,
+                    rollback_count: rollback_count,
+                    halted_count: halted_count,
+                    halt_sequence: halt_sequence,
+                    graph_issue: Some(GraphIssue.DependencyCycle),
+                )
+            }
+        }
+    }
+
+    RolloutReport(
+        service_order: order.service_ids,
+        service_order_length: order.length,
+        waves: waves,
+        wave_count: wave_count,
+        proceeded_count: proceeded_count,
+        held_count: held_count,
+        rollback_count: rollback_count,
+        halted_count: halted_count,
+        halt_sequence: halt_sequence,
+        graph_issue: order.issue,
+    )
+}

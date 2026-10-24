@@ -1,0 +1,47 @@
+use acme:canary-release-safety-planner/model.{Cohort, HealthObservation, Service}
+
+pub fn service_index(services: Array<Service, 4>, service_id: U32) -> Option<USize> {
+    for index in 0..services.len() {
+        if services[index].id == service_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn observation_count(
+    observations: Array<HealthObservation, 16>,
+    service_id: U32,
+    region_id: U32,
+    cohort: Cohort,
+) -> USize {
+    var count: USize = 0
+    for observation in observations {
+        if (
+            observation.service_id == service_id
+            and observation.region_id == region_id
+            and observation.cohort == cohort
+        ) {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn observation_index(
+    observations: Array<HealthObservation, 16>,
+    service_id: U32,
+    region_id: U32,
+    cohort: Cohort,
+) -> Option<USize> {
+    for index in 0..observations.len() {
+        if (
+            observations[index].service_id == service_id
+            and observations[index].region_id == region_id
+            and observations[index].cohort == cohort
+        ) {
+            return Some(index)
+        }
+    }
+    None
+}
