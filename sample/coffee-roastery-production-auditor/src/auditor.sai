@@ -1,0 +1,147 @@
+use acme:coffee-roastery-production-auditor/lookup
+use acme:coffee-roastery-production-auditor/model.{
+    BatchBook
+    BatchDecision
+    BeanLotBalance
+    HoldReason
+    OrderSummary
+    ProductionAudit
+    RoastBatch
+}
+
+fn first_hold_reason(
+    book: BatchBook,
+    batch: RoastBatch,
+    decisions: Array<Option<BatchDecision>, 14>,
+    previous_count: USize,
+) -> Option<HoldReason> {
+    if lookup.has_seen_batch_id(decisions, previous_count, batch.id) {
+        return Some(HoldReason.DuplicateBatchId)
+    }
+
+    let order_index = match lookup.order_index(book, batch.order_id) {
+        Some(index) => index
+        None => return Some(HoldReason.UnknownOrder)
+    }
+    let order = book.orders[order_index].unwrap()
+
+    let bean_lot_index = match lookup.bean_lot_index(book, batch.bean_lot_id) {
+        Some(index) => index
+        None => return Some(HoldReason.UnknownBeanLot)
+    }
+    let bean_lot = book.bean_lots[bean_lot_index].unwrap()
+
+    let roaster_index = match lookup.roaster_index(book, batch.roaster_id) {
+        Some(index) => index
+        None => return Some(HoldReason.UnknownRoaster)
+    }
+    let roaster = book.roasters[roaster_index].unwrap()
+
+    if not lookup.supports_profile(roaster, order.profile) {
+        return Some(HoldReason.UnsupportedRoastProfile)
+    }
+    if order.requires_organic and not bean_lot.organic_certified {
+        return Some(HoldReason.OrganicCertificationRequired)
+    }
+    if batch.roast_loss_percent >= 100 {
+        return Some(HoldReason.InvalidRoastLoss)
+    }
+    if batch.green_grams > roaster.maximum_charge_grams {
+        return Some(HoldReason.ChargeAboveRoasterLimit)
+    }
+
+    let reserved_grams = lookup.reserved_green_grams(decisions, previous_count, batch.bean_lot_id)
+    if batch.green_grams > bean_lot.available_green_grams - reserved_grams {
+        return Some(HoldReason.BeanLotQuantityExceeded)
+    }
+
+    let planned_grams = lookup.planned_roasted_grams(decisions, previous_count, batch.order_id)
+    let batch_output = lookup.roasted_grams(batch)
+    if batch_output > order.target_roasted_grams - planned_grams {
+        return Some(HoldReason.OrderQuantityExceeded)
+    }
+
+    None
+}
+
+pub fn audit(book: BatchBook) -> ProductionAudit {
+    var decisions: Array<Option<BatchDecision>, 14> = Array<Option<BatchDecision>, 14>.filled(None)
+    var accepted_count: USize = 0
+    var held_count: USize = 0
+    var accepted_roasted_grams: U32 = 0
+
+    for index in 0..book.batch_count {
+        let batch = book.batches[index].unwrap()
+        let reason = first_hold_reason(book, batch, decisions, index)
+        let accepted = reason == None
+        let roasted_grams = if accepted {
+            lookup.roasted_grams(batch)
+        } else {
+            0
+        }
+
+        decisions[index] = Some(
+            BatchDecision(
+                batch_id: batch.id,
+                order_id: batch.order_id,
+                bean_lot_id: batch.bean_lot_id,
+                roaster_id: batch.roaster_id,
+                accepted: accepted,
+                reason: reason,
+                green_grams: if accepted {
+                    batch.green_grams
+                } else {
+                    0
+                },
+                roasted_grams: roasted_grams,
+            ),
+        )
+        if accepted {
+            accepted_count += 1
+            accepted_roasted_grams += roasted_grams
+        } else {
+            held_count += 1
+        }
+    }
+
+    var order_summaries: Array<Option<OrderSummary>, 3> =
+        Array<Option<OrderSummary>, 3>.filled(None)
+    for index in 0..book.order_count {
+        let order = book.orders[index].unwrap()
+        let planned_grams = lookup.planned_roasted_grams(decisions, book.batch_count, order.id)
+        order_summaries[index] = Some(
+            OrderSummary(
+                order_id: order.id,
+                target_roasted_grams: order.target_roasted_grams,
+                planned_roasted_grams: planned_grams,
+                remaining_roasted_grams: order.target_roasted_grams - planned_grams,
+                fulfilled: planned_grams == order.target_roasted_grams,
+            ),
+        )
+    }
+
+    var bean_lot_balances: Array<Option<BeanLotBalance>, 3> =
+        Array<Option<BeanLotBalance>, 3>.filled(None)
+    for index in 0..book.bean_lot_count {
+        let bean_lot = book.bean_lots[index].unwrap()
+        let reserved_grams = lookup.reserved_green_grams(decisions, book.batch_count, bean_lot.id)
+        bean_lot_balances[index] = Some(
+            BeanLotBalance(
+                bean_lot_id: bean_lot.id,
+                available_green_grams: bean_lot.available_green_grams,
+                reserved_green_grams: reserved_grams,
+                remaining_green_grams: bean_lot.available_green_grams - reserved_grams,
+            ),
+        )
+    }
+
+    ProductionAudit(
+        decisions: decisions,
+        order_summaries: order_summaries,
+        bean_lot_balances: bean_lot_balances,
+        batch_count: book.batch_count,
+        accepted_count: accepted_count,
+        held_count: held_count,
+        accepted_roasted_grams: accepted_roasted_grams,
+    )
+}

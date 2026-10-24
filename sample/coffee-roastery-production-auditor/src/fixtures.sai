@@ -57,7 +57,7 @@ pub fn sample_book() -> BatchBook {
                 GreenBeanLot(
                     id: "GUA-03",
                     origin: "Guatemala washed",
-                    available_green_grams: 1400,
+                    available_green_grams: 1500,
                     organic_certified: true,
                 ),
             ),
@@ -195,7 +195,37 @@ pub fn sample_book() -> BatchBook {
                     roast_loss_percent: 100,
                 ),
             ),
+            Some(
+                RoastBatch(
+                    id: "RB-111",
+                    order_id: "CAFE-101",
+                    bean_lot_id: "BRA-12",
+                    roaster_id: "DRUM-12",
+                    green_grams: 1500,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-112",
+                    order_id: "CAFE-101",
+                    bean_lot_id: "LOT-MISSING",
+                    roaster_id: "DRUM-12",
+                    green_grams: 1000,
+                    roast_loss_percent: 15,
+                ),
+            ),
+            Some(
+                RoastBatch(
+                    id: "RB-113",
+                    order_id: "CAFE-101",
+                    bean_lot_id: "BRA-12",
+                    roaster_id: "ROASTER-MISSING",
+                    green_grams: 1000,
+                    roast_loss_percent: 15,
+                ),
+            ),
         ],
-        batch_count: 11,
+        batch_count: 14,
     )
 }

@@ -62,7 +62,7 @@ pub type BatchBook {
     pub bean_lot_count: USize
     pub roasters: Array<Option<Roaster>, 2>
     pub roaster_count: USize
-    pub batches: Array<Option<RoastBatch>, 11>
+    pub batches: Array<Option<RoastBatch>, 14>
     pub batch_count: USize
 }
 
@@ -97,7 +97,7 @@ pub type BeanLotBalance {
 
 @derive(Copy, Clone, PartialEq, Eq)
 pub type ProductionAudit {
-    pub decisions: Array<Option<BatchDecision>, 11>
+    pub decisions: Array<Option<BatchDecision>, 14>
     pub order_summaries: Array<Option<OrderSummary>, 3>
     pub bean_lot_balances: Array<Option<BeanLotBalance>, 3>
     pub batch_count: USize

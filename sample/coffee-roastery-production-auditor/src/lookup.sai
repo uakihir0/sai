@@ -1,0 +1,92 @@
+use acme:coffee-roastery-production-auditor/model.{
+    BatchBook
+    BatchDecision
+    RoastBatch
+    RoastProfile
+    Roaster
+}
+
+pub fn order_index(book: BatchBook, order_id: Str) -> Option<USize> {
+    for index in 0..book.order_count {
+        let order = book.orders[index].unwrap()
+        if order.id == order_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn bean_lot_index(book: BatchBook, bean_lot_id: Str) -> Option<USize> {
+    for index in 0..book.bean_lot_count {
+        let lot = book.bean_lots[index].unwrap()
+        if lot.id == bean_lot_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn roaster_index(book: BatchBook, roaster_id: Str) -> Option<USize> {
+    for index in 0..book.roaster_count {
+        let roaster = book.roasters[index].unwrap()
+        if roaster.id == roaster_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+pub fn supports_profile(roaster: Roaster, profile: RoastProfile) -> Bool {
+    match profile {
+        RoastProfile.Light => roaster.supports_light
+        RoastProfile.Medium => roaster.supports_medium
+        RoastProfile.Espresso => roaster.supports_espresso
+    }
+}
+
+pub fn roasted_grams(batch: RoastBatch) -> U32 {
+    (batch.green_grams * (100 - batch.roast_loss_percent)) / 100
+}
+
+pub fn has_seen_batch_id(
+    decisions: Array<Option<BatchDecision>, 14>,
+    decision_count: USize,
+    batch_id: Str,
+) -> Bool {
+    for index in 0..decision_count {
+        if decisions[index].unwrap().batch_id == batch_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn reserved_green_grams(
+    decisions: Array<Option<BatchDecision>, 14>,
+    decision_count: USize,
+    bean_lot_id: Str,
+) -> U32 {
+    var reserved_grams: U32 = 0
+    for index in 0..decision_count {
+        let decision = decisions[index].unwrap()
+        if decision.accepted and decision.bean_lot_id == bean_lot_id {
+            reserved_grams += decision.green_grams
+        }
+    }
+    reserved_grams
+}
+
+pub fn planned_roasted_grams(
+    decisions: Array<Option<BatchDecision>, 14>,
+    decision_count: USize,
+    order_id: Str,
+) -> U32 {
+    var planned_grams: U32 = 0
+    for index in 0..decision_count {
+        let decision = decisions[index].unwrap()
+        if decision.accepted and decision.order_id == order_id {
+            planned_grams += decision.roasted_grams
+        }
+    }
+    planned_grams
+}
