@@ -6244,6 +6244,8 @@ mod tests {
                 deprecated: None,
                 kind: WitItemKind::Record(Vec::new()),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             })
             .expect("WIT item appends");
@@ -6259,6 +6261,8 @@ mod tests {
                     is_async: false,
                 }),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             })
             .expect("WIT item appends");

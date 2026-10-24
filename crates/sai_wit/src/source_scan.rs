@@ -8,6 +8,27 @@ pub(super) struct SourceScan {
     pub package_name_range: Option<Range<usize>>,
     pub nested_package_ranges: Vec<Range<usize>>,
     pub named_result_function_ranges: Vec<Range<usize>>,
+    pub function_declarations: Vec<SourceFunctionDeclaration>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SourceFunctionDeclaration {
+    pub interface_name: String,
+    pub name: String,
+    pub name_range: Range<usize>,
+    pub declaration_range: Range<usize>,
+    pub token_pairs: Vec<(String, String)>,
+}
+
+/// Token sequence and source range for a freestanding function directly
+/// declared by one named interface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuthoredInterfaceFunctionTokens {
+    /// Exact UTF-8 byte range from attached attributes through the semicolon.
+    pub declaration_range: Range<usize>,
+    /// Ordered parser-aligned token kind/text pairs. The function-name token
+    /// has empty text while retaining its token kind.
+    pub token_pairs: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,6 +53,7 @@ enum TokenKind {
     Identifier,
     ExplicitIdentifier,
     Number,
+    String,
     Invalid,
     Arrow,
     Punctuation(u8),
@@ -54,6 +76,14 @@ struct NamedResults {
 
 pub(super) fn scan_source(source: &str) -> SourceScan {
     let tokens = lex(source);
+    // Named-result rewriting historically treats quoted strings as trivia.
+    // Keep that behavior for its recognition path while retaining atomic
+    // string tokens for declaration-local WIT fingerprints.
+    let rewrite_tokens = tokens
+        .iter()
+        .filter(|token| token.kind != TokenKind::String)
+        .cloned()
+        .collect::<Vec<_>>();
     let mut package_name_range = None;
     let mut nested_package_ranges = Vec::new();
     for (index, token) in tokens.iter().enumerate() {
@@ -71,30 +101,32 @@ pub(super) fn scan_source(source: &str) -> SourceScan {
     }
 
     let mut named_results = Vec::new();
-    for (index, token) in tokens.iter().enumerate() {
+    for (index, token) in rewrite_tokens.iter().enumerate() {
         if token.kind != TokenKind::Arrow {
             continue;
         }
-        let Some(open_index) = tokens
+        let Some(open_index) = rewrite_tokens
             .get(index + 1)
             .and_then(|token| (token.kind == TokenKind::Punctuation(b'(')).then_some(index + 1))
         else {
             continue;
         };
-        let Some(close_index) = matching_delimiter(&tokens, open_index, b'(', b')') else {
+        let Some(close_index) = matching_delimiter(&rewrite_tokens, open_index, b'(', b')') else {
             continue;
         };
-        let Some(function_name_range) = function_name_range(source, &tokens, index, open_index)
+        let Some(function_name_range) =
+            function_name_range(source, &rewrite_tokens, index, open_index)
         else {
             continue;
         };
-        let Some(fields_and_commas) = named_result_fields(source, &tokens, open_index, close_index)
+        let Some(fields_and_commas) =
+            named_result_fields(source, &rewrite_tokens, open_index, close_index)
         else {
             continue;
         };
         let fields = fields_and_commas.0;
         named_results.push(NamedResults {
-            range: tokens[open_index].range.start..tokens[close_index].range.end,
+            range: rewrite_tokens[open_index].range.start..rewrite_tokens[close_index].range.end,
             fields,
             commas: fields_and_commas.1,
             function_name: function_name_range,
@@ -230,7 +262,290 @@ pub(super) fn scan_source(source: &str) -> SourceScan {
         package_name_range,
         nested_package_ranges,
         named_result_function_ranges,
+        function_declarations: scan_function_declarations(source, &tokens),
     }
+}
+
+fn scan_function_declarations(source: &str, tokens: &[Token]) -> Vec<SourceFunctionDeclaration> {
+    let mut declarations = Vec::new();
+    for (interface_index, interface_token) in tokens.iter().enumerate() {
+        if !is_identifier(source, interface_token, "interface") {
+            continue;
+        }
+        let Some(interface_name_token) = tokens.get(interface_index + 1) else {
+            continue;
+        };
+        let Some(interface_name) = wit_identifier_text(source, interface_name_token) else {
+            continue;
+        };
+        let open_index = interface_index + 2;
+        if !tokens
+            .get(open_index)
+            .is_some_and(|token| token.kind == TokenKind::Punctuation(b'{'))
+        {
+            continue;
+        }
+        let Some(close_index) = matching_delimiter(tokens, open_index, b'{', b'}') else {
+            continue;
+        };
+
+        let mut item_index = open_index + 1;
+        let mut nested_braces = 0_u32;
+        while item_index < close_index {
+            if nested_braces == 0 {
+                let name_token = &tokens[item_index];
+                if let Some(name) = wit_identifier_text(source, name_token)
+                    && tokens
+                        .get(item_index + 1)
+                        .is_some_and(|token| token.kind == TokenKind::Punctuation(b':'))
+                {
+                    let mut function_index = item_index + 2;
+                    if tokens
+                        .get(function_index)
+                        .is_some_and(|token| is_identifier(source, token, "async"))
+                    {
+                        function_index += 1;
+                    }
+                    if tokens
+                        .get(function_index)
+                        .is_some_and(|token| is_identifier(source, token, "func"))
+                        && let Some(end) =
+                            function_declaration_end(tokens, function_index + 1, close_index)
+                    {
+                        let start = attached_attributes_start(tokens, item_index)
+                            .map_or(name_token.range.start, |index| tokens[index].range.start);
+                        if let Some(token_pairs) =
+                            function_token_pairs(source, tokens, &(start..end), &name_token.range)
+                        {
+                            declarations.push(SourceFunctionDeclaration {
+                                interface_name: interface_name.to_owned(),
+                                name: name.to_owned(),
+                                name_range: name_token.range.clone(),
+                                declaration_range: start..end,
+                                token_pairs,
+                            });
+                        }
+                    }
+                }
+            }
+
+            match tokens[item_index].kind {
+                TokenKind::Punctuation(b'{') => nested_braces = nested_braces.saturating_add(1),
+                TokenKind::Punctuation(b'}') => nested_braces = nested_braces.saturating_sub(1),
+                _ => {}
+            }
+            item_index += 1;
+        }
+    }
+    declarations
+}
+
+/// Scans authored WIT source and returns one direct interface function only
+/// when its parsed name token span identifies exactly one lexical declaration.
+///
+/// The returned range and tokens are recovered from `source` itself, so
+/// consumers can bind declaration identity to the exact VFS snapshot bytes
+/// they validated separately.
+pub fn authored_interface_function_tokens(
+    source: &str,
+    interface_name: &str,
+    name: &str,
+    name_range: &Range<usize>,
+) -> Option<AuthoredInterfaceFunctionTokens> {
+    let mut matches = scan_source(source)
+        .function_declarations
+        .into_iter()
+        .filter(|declaration| {
+            declaration.interface_name == interface_name
+                && declaration.name == name
+                && &declaration.name_range == name_range
+        });
+    let declaration = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(AuthoredInterfaceFunctionTokens {
+        declaration_range: declaration.declaration_range,
+        token_pairs: declaration.token_pairs,
+    })
+}
+
+fn function_token_pairs(
+    source: &str,
+    tokens: &[Token],
+    declaration_range: &Range<usize>,
+    name_range: &Range<usize>,
+) -> Option<Vec<(String, String)>> {
+    let mut matched_name = false;
+    let mut token_pairs = Vec::new();
+    for token in tokens.iter().filter(|token| {
+        declaration_range.start <= token.range.start && token.range.end <= declaration_range.end
+    }) {
+        let is_name = &token.range == name_range;
+        if is_name {
+            if matched_name {
+                return None;
+            }
+            matched_name = true;
+        }
+        token_pairs.push((
+            stable_wit_token_kind(source, token),
+            if is_name {
+                String::new()
+            } else {
+                source[token.range.clone()].to_owned()
+            },
+        ));
+    }
+    matched_name.then_some(token_pairs)
+}
+
+fn stable_wit_token_kind(source: &str, token: &Token) -> String {
+    match token.kind {
+        TokenKind::Identifier => {
+            let text = &source[token.range.clone()];
+            if is_wit_keyword(text) {
+                wit_keyword_token_name(text).to_owned()
+            } else {
+                "Id".to_owned()
+            }
+        }
+        TokenKind::ExplicitIdentifier => "ExplicitId".to_owned(),
+        TokenKind::Number => "Integer".to_owned(),
+        TokenKind::String => "StringLiteral".to_owned(),
+        TokenKind::Invalid => "Invalid".to_owned(),
+        TokenKind::Arrow => "RArrow".to_owned(),
+        TokenKind::Punctuation(byte) => wit_punctuation_token_name(byte).to_owned(),
+    }
+}
+
+fn wit_keyword_token_name(keyword: &str) -> &'static str {
+    match keyword {
+        "use" => "Use",
+        "type" => "Type",
+        "func" => "Func",
+        "u8" => "U8",
+        "u16" => "U16",
+        "u32" => "U32",
+        "u64" => "U64",
+        "s8" => "S8",
+        "s16" => "S16",
+        "s32" => "S32",
+        "s64" => "S64",
+        "f32" => "F32",
+        "f64" => "F64",
+        "char" => "Char",
+        "resource" => "Resource",
+        "own" => "Own",
+        "borrow" => "Borrow",
+        "record" => "Record",
+        "flags" => "Flags",
+        "variant" => "Variant",
+        "enum" => "Enum",
+        "bool" => "Bool",
+        "string" => "String_",
+        "option" => "Option_",
+        "result" => "Result_",
+        "future" => "Future",
+        "stream" => "Stream",
+        "error-context" => "ErrorContext",
+        "list" => "List",
+        "map" => "Map",
+        "_" => "Underscore",
+        "as" => "As",
+        "from" => "From_",
+        "static" => "Static",
+        "interface" => "Interface",
+        "tuple" => "Tuple",
+        "import" => "Import",
+        "export" => "Export",
+        "world" => "World",
+        "package" => "Package",
+        "constructor" => "Constructor",
+        "async" => "Async",
+        "include" => "Include",
+        "with" => "With",
+        _ => "Id",
+    }
+}
+
+fn wit_punctuation_token_name(byte: u8) -> &'static str {
+    match byte {
+        b'=' => "Equals",
+        b',' => "Comma",
+        b':' => "Colon",
+        b'.' => "Period",
+        b';' => "Semicolon",
+        b'(' => "LeftParen",
+        b')' => "RightParen",
+        b'{' => "LeftBrace",
+        b'}' => "RightBrace",
+        b'<' => "LessThan",
+        b'>' => "GreaterThan",
+        b'*' => "Star",
+        b'@' => "At",
+        b'/' => "Slash",
+        b'+' => "Plus",
+        b'-' => "Minus",
+        _ => "Invalid",
+    }
+}
+fn function_declaration_end(tokens: &[Token], start: usize, limit: usize) -> Option<usize> {
+    let mut depth = [0_u32; 4];
+    for token in tokens.iter().take(limit).skip(start) {
+        match token.kind {
+            TokenKind::Punctuation(b'(') => depth[0] = depth[0].checked_add(1)?,
+            TokenKind::Punctuation(b')') => {
+                depth[0] = depth[0].checked_sub(1)?;
+            }
+            TokenKind::Punctuation(b'[') => depth[1] = depth[1].checked_add(1)?,
+            TokenKind::Punctuation(b']') => {
+                depth[1] = depth[1].checked_sub(1)?;
+            }
+            TokenKind::Punctuation(b'{') => depth[2] = depth[2].checked_add(1)?,
+            TokenKind::Punctuation(b'}') => {
+                depth[2] = depth[2].checked_sub(1)?;
+            }
+            TokenKind::Punctuation(b'<') => depth[3] = depth[3].checked_add(1)?,
+            TokenKind::Punctuation(b'>') => {
+                depth[3] = depth[3].checked_sub(1)?;
+            }
+            TokenKind::Punctuation(b';') if depth.iter().all(|level| *level == 0) => {
+                return Some(token.range.end);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn attached_attributes_start(tokens: &[Token], name_index: usize) -> Option<usize> {
+    let mut first_attribute = None;
+    let mut end = name_index;
+    while end > 0 {
+        let attribute = if tokens[end - 1].kind == TokenKind::Punctuation(b')') {
+            let close = end - 1;
+            let open = matching_open_delimiter(tokens, close, b'(', b')')?;
+            let name = open.checked_sub(1)?;
+            let at = name.checked_sub(1)?;
+            (tokens[name].kind == TokenKind::Identifier
+                && tokens[at].kind == TokenKind::Punctuation(b'@'))
+            .then_some(at)
+        } else if end >= 2
+            && tokens[end - 1].kind == TokenKind::Identifier
+            && tokens[end - 2].kind == TokenKind::Punctuation(b'@')
+        {
+            Some(end - 2)
+        } else {
+            None
+        };
+        let Some(attribute) = attribute else {
+            break;
+        };
+        first_attribute = Some(attribute);
+        end = attribute;
+    }
+    first_attribute
 }
 
 pub(super) fn scan_foreign_references(source: &str) -> Vec<ForeignReference> {
@@ -329,14 +644,28 @@ fn parse_foreign_reference(
 }
 
 fn wit_identifier_text<'a>(source: &'a str, token: &Token) -> Option<&'a str> {
-    if !is_wit_identifier(source, token) {
-        return None;
+    let text = &source[token.range.clone()];
+    match token.kind {
+        TokenKind::ExplicitIdentifier => {
+            let identifier = text.strip_prefix('%')?;
+            wit_parser::validate_id(identifier)
+                .is_ok()
+                .then_some(identifier)
+        }
+        TokenKind::String => {
+            let identifier = text.strip_prefix('"')?.strip_suffix('"')?;
+            if identifier.contains('\\') {
+                return None;
+            }
+            wit_parser::validate_id(identifier)
+                .is_ok()
+                .then_some(identifier)
+        }
+        TokenKind::Identifier if !is_wit_keyword(text) => {
+            wit_parser::validate_id(text).is_ok().then_some(text)
+        }
+        _ => None,
     }
-    Some(
-        source[token.range.clone()]
-            .strip_prefix('%')
-            .unwrap_or(&source[token.range.clone()]),
-    )
 }
 
 fn semver_end(source: &str, start: usize) -> Option<usize> {
@@ -619,20 +948,7 @@ fn is_identifier(source: &str, token: &Token, identifier: &str) -> bool {
 }
 
 fn is_wit_identifier(source: &str, token: &Token) -> bool {
-    let text = &source[token.range.clone()];
-    let (identifier, explicit) = match token.kind {
-        TokenKind::Identifier => (text, false),
-        TokenKind::ExplicitIdentifier => {
-            let Some(identifier) = text.strip_prefix('%') else {
-                return false;
-            };
-            (identifier, true)
-        }
-        TokenKind::Number | TokenKind::Invalid | TokenKind::Arrow | TokenKind::Punctuation(_) => {
-            return false;
-        }
-    };
-    (explicit || !is_wit_keyword(identifier)) && wit_parser::validate_id(identifier).is_ok()
+    wit_identifier_text(source, token).is_some()
 }
 
 pub(super) fn is_wit_keyword(identifier: &str) -> bool {
@@ -907,6 +1223,7 @@ fn lex(source: &str) -> Vec<Token> {
             continue;
         }
         if current == '"' {
+            let start = index;
             index += 1;
             while index < source.len() {
                 let next = source[index..]
@@ -931,6 +1248,10 @@ fn lex(source: &str) -> Vec<Token> {
                     _ => index += next.len_utf8(),
                 }
             }
+            tokens.push(Token {
+                kind: TokenKind::String,
+                range: start..index,
+            });
             continue;
         }
         if source[index..].starts_with("->") {
@@ -939,6 +1260,14 @@ fn lex(source: &str) -> Vec<Token> {
                 range: index..index + 2,
             });
             index += 2;
+            continue;
+        }
+        if current == '-' {
+            tokens.push(Token {
+                kind: TokenKind::Punctuation(b'-'),
+                range: index..index + 1,
+            });
+            index += 1;
             continue;
         }
         if current == '%' {
@@ -1027,7 +1356,194 @@ fn is_keylike_continue(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_foreign_references, scan_source, world_include_docs};
+    use super::{
+        SourceFunctionDeclaration, lex, scan_foreign_references, scan_source,
+        stable_wit_token_kind, world_include_docs,
+    };
+
+    fn function(source: &str, name: &str) -> SourceFunctionDeclaration {
+        scan_source(source)
+            .function_declarations
+            .into_iter()
+            .find(|declaration| declaration.name == name)
+            .expect("direct interface function")
+    }
+
+    #[test]
+    fn direct_function_fingerprint_tokens_ignore_name_trivia_and_siblings() {
+        let first = function(
+            "interface api { /// docs\n ping: func(value: result<tuple<u32, string>, option<list<u8>>>); other: func(); }",
+            "ping",
+        );
+        let renamed = function(
+            "interface api {\n // revised docs\n pong : func ( value : result < tuple < u32 , string > , option < list < u8 > > > ) ; other: func(); }",
+            "pong",
+        );
+        assert_eq!(first.token_pairs, renamed.token_pairs);
+
+        let sibling_changed = function(
+            "interface api { ping: func(value: result<tuple<u32, string>, option<list<u8>>>); other: func(text: string); }",
+            "ping",
+        );
+        assert_eq!(first.token_pairs, sibling_changed.token_pairs);
+
+        let signature_changed = function(
+            "interface api { ping: func(value: result<tuple<u64, string>, option<list<u8>>>); other: func(); }",
+            "ping",
+        );
+        assert_ne!(first.token_pairs, signature_changed.token_pairs);
+        assert!(
+            first
+                .token_pairs
+                .iter()
+                .any(|(kind, text)| kind == "U32" && text == "u32")
+        );
+        assert_eq!(
+            first
+                .token_pairs
+                .iter()
+                .filter(|(_, text)| text.is_empty())
+                .count(),
+            1,
+            "the name token keeps its kind and only its text is omitted"
+        );
+    }
+
+    #[test]
+    fn direct_function_tokens_keep_attributes_and_atomic_strings() {
+        let first = function(
+            r#"interface api { @since(version = 1.2.3) ping: func() -> u32; }"#,
+            "ping",
+        );
+        let changed = function(
+            r#"interface api { @since(version = 2.0.0) ping: func() -> u32; }"#,
+            "ping",
+        );
+        assert_ne!(first.token_pairs, changed.token_pairs);
+
+        let source = r#"interface api { @example("inside ; and } punctuation") ping: func(); }"#;
+        let declaration = function(source, "ping");
+        assert_eq!(
+            &source[declaration.declaration_range.clone()],
+            r#"@example("inside ; and } punctuation") ping: func();"#
+        );
+        assert!(declaration.token_pairs.iter().any(|(kind, text)| {
+            kind == "StringLiteral" && text == r#""inside ; and } punctuation""#
+        }));
+    }
+
+    #[test]
+    fn stable_token_kinds_match_every_locked_wit_keyword_and_punctuation() {
+        let keywords = [
+            ("use", "Use"),
+            ("type", "Type"),
+            ("func", "Func"),
+            ("u8", "U8"),
+            ("u16", "U16"),
+            ("u32", "U32"),
+            ("u64", "U64"),
+            ("s8", "S8"),
+            ("s16", "S16"),
+            ("s32", "S32"),
+            ("s64", "S64"),
+            ("f32", "F32"),
+            ("f64", "F64"),
+            ("char", "Char"),
+            ("resource", "Resource"),
+            ("own", "Own"),
+            ("borrow", "Borrow"),
+            ("record", "Record"),
+            ("flags", "Flags"),
+            ("variant", "Variant"),
+            ("enum", "Enum"),
+            ("bool", "Bool"),
+            ("string", "String_"),
+            ("option", "Option_"),
+            ("result", "Result_"),
+            ("future", "Future"),
+            ("stream", "Stream"),
+            ("error-context", "ErrorContext"),
+            ("list", "List"),
+            ("map", "Map"),
+            ("_", "Underscore"),
+            ("as", "As"),
+            ("from", "From_"),
+            ("static", "Static"),
+            ("interface", "Interface"),
+            ("tuple", "Tuple"),
+            ("import", "Import"),
+            ("export", "Export"),
+            ("world", "World"),
+            ("package", "Package"),
+            ("constructor", "Constructor"),
+            ("async", "Async"),
+            ("include", "Include"),
+            ("with", "With"),
+        ];
+        for (spelling, expected_kind) in keywords {
+            let tokens = lex(spelling);
+            assert_eq!(tokens.len(), 1, "{spelling}");
+            assert_eq!(
+                stable_wit_token_kind(spelling, &tokens[0]),
+                expected_kind,
+                "{spelling}"
+            );
+        }
+
+        for (spelling, expected_kind) in [
+            ("=", "Equals"),
+            (",", "Comma"),
+            (":", "Colon"),
+            (".", "Period"),
+            (";", "Semicolon"),
+            ("(", "LeftParen"),
+            (")", "RightParen"),
+            ("{", "LeftBrace"),
+            ("}", "RightBrace"),
+            ("<", "LessThan"),
+            (">", "GreaterThan"),
+            ("*", "Star"),
+            ("@", "At"),
+            ("/", "Slash"),
+            ("+", "Plus"),
+            ("-", "Minus"),
+            ("->", "RArrow"),
+            ("ordinary-id", "Id"),
+            ("%func", "ExplicitId"),
+            ("42", "Integer"),
+            (r#""text""#, "StringLiteral"),
+        ] {
+            let tokens = lex(spelling);
+            assert_eq!(tokens.len(), 1, "{spelling}");
+            assert_eq!(
+                stable_wit_token_kind(spelling, &tokens[0]),
+                expected_kind,
+                "{spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_function_scanner_excludes_nested_and_unbounded_forms() {
+        let source = concat!(
+            "interface api {\n",
+            "  thing: resource { method: func(); static: static func(); constructor: constructor(); }\n",
+            "  value: record { field: u32, nested: tuple<u8, u16> }\n",
+            "  direct: func();\n",
+            "}\n",
+            "world app { imported: func(); }\n",
+        );
+        let declarations = scan_source(source).function_declarations;
+        assert_eq!(declarations.len(), 1, "{declarations:#?}");
+        assert_eq!(declarations[0].name, "direct");
+
+        for invalid in [
+            "interface api { incomplete: func() }",
+            "interface api { incomplete: func(u32; }",
+        ] {
+            assert!(scan_source(invalid).function_declarations.is_empty());
+        }
+    }
 
     #[test]
     fn recovers_docs_before_world_include_attributes_and_multiple_crlf_includes() {

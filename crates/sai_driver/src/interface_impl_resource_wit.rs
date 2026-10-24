@@ -415,6 +415,8 @@ mod tests {
             deprecated: None,
             kind,
             unsupported: None,
+            declaration_span: None,
+            declaration_token_pairs: None,
             span: Some(WitSpan {
                 path: format!("{name}.wit"),
                 range: 0..1,

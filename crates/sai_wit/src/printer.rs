@@ -848,6 +848,8 @@ mod tests {
             deprecated: None,
             kind,
             unsupported: None,
+            declaration_span: None,
+            declaration_token_pairs: None,
             span: None,
         }
     }
@@ -983,6 +985,8 @@ mod tests {
                 },
             ]),
             unsupported: None,
+            declaration_span: None,
+            declaration_token_pairs: None,
             span: None,
         };
         let items = vec![
@@ -1014,6 +1018,8 @@ mod tests {
                     err: None,
                 }),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             },
             item("empty-resource", WitItemKind::Resource(Vec::new())),

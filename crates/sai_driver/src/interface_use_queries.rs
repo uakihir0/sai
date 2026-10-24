@@ -2843,6 +2843,8 @@ fn collect_interface_uses_input(
                         is_async: false,
                     }),
                     unsupported: Some(Unsupported::WorldType),
+                    declaration_span: None,
+                    declaration_token_pairs: None,
                     span: None,
                 })
                 .map_err(InterfaceUsesQueryError::WitIndexVec)?;
@@ -6157,6 +6159,8 @@ fn generated_function_item(
         }),
         unsupported: None,
         span: None,
+        declaration_span: None,
+        declaration_token_pairs: None,
     }))
 }
 
@@ -6775,6 +6779,8 @@ fn generated_interface_type_item(
         kind,
         unsupported: None,
         span: None,
+        declaration_span: None,
+        declaration_token_pairs: None,
     }))
 }
 
@@ -7363,6 +7369,8 @@ mod tests {
             deprecated: None,
             kind,
             unsupported: None,
+            declaration_span: None,
+            declaration_token_pairs: None,
             span: None,
         }
     }

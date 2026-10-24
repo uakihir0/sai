@@ -1721,6 +1721,8 @@ mod tests {
                     },
                 ]),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             },
             WitItem {
@@ -1741,6 +1743,8 @@ mod tests {
                     },
                 ]),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             },
             WitItem {
@@ -1754,6 +1758,8 @@ mod tests {
                     is_async: false,
                 }),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             },
             WitItem {
@@ -1803,6 +1809,8 @@ mod tests {
                     },
                 ]),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             },
             WitItem {
@@ -1812,6 +1820,8 @@ mod tests {
                 deprecated: None,
                 kind: WitItemKind::Flags(vec!["read".to_owned(), "write".to_owned()]),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             },
         ];
@@ -2352,6 +2362,8 @@ mod tests {
                     is_async: false,
                 }),
                 unsupported: None,
+                declaration_span: None,
+                declaration_token_pairs: None,
                 span: None,
             })
             .unwrap();
