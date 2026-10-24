@@ -115,7 +115,7 @@ pub fn units() -> Array<ResponseUnit, 6> {
             id: 904,
             name: "County medical van",
             capability: Capability.MedicalTransport,
-            home_zone: 1,
+            home_zone: 4,
             capacity_units: 4,
             shift_end: 600,
         ),

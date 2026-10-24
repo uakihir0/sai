@@ -45,8 +45,8 @@ fn time_name(minute: U32) -> String
     }
 }
 
-fn coverage_name(plan: CoordinationPlan) -> Str {
-    if evaluation.coverage_holds(plan) {
+fn review_status(plan: CoordinationPlan) -> Str {
+    if evaluation.review_complete(plan) {
         "PASS"
     } else {
         "FAIL"
@@ -77,7 +77,7 @@ pub fn print_plan(out: borrow mut Stdout)
         }
     }
     out.write_str(
-        f"Dispatched: {plan.dispatched_count}; held: {plan.held_count}; coverage: {coverage_name(plan)}\n".as_str(),
+        f"Dispatched: {plan.dispatched_count}; held: {plan.held_count}; Review complete: {review_status(plan)}\n".as_str(),
     )
 }
 

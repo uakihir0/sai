@@ -15,7 +15,7 @@ pub fn find_assignment(plan: CoordinationPlan, mission_id: U32) -> Option<Assign
     None
 }
 
-pub fn coverage_holds(plan: CoordinationPlan) -> Bool {
+pub fn review_complete(plan: CoordinationPlan) -> Bool {
     if plan.reviewed_count != 6 {
         return false
     }

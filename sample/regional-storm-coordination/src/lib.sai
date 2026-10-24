@@ -45,7 +45,14 @@ test "bridge clearance opens the evacuation lane for its dependent mission" {
     }
 }
 
-test "limited medical capacity and a missed radio deadline remain explicit" {
+test "held missions are classified even when their services do not succeed" {
+    let empty_plan = CoordinationPlan(
+        assignments: [None, None, None, None, None, None],
+        reviewed_count: 0,
+        dispatched_count: 0,
+        held_count: 0,
+    )
+    assert routing.travel_minutes(4, 2, empty_plan) == Some(40)
     let plan = dispatch.coordinate()
     match evaluation.find_assignment(plan, 804) {
         Some(assignment) => {
@@ -65,5 +72,5 @@ test "limited medical capacity and a missed radio deadline remain explicit" {
     }
     assert plan.dispatched_count == 4
     assert plan.held_count == 2
-    assert evaluation.coverage_holds(plan)
+    assert evaluation.review_complete(plan)
 }

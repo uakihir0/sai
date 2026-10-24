@@ -156,7 +156,7 @@ pub fn coordinate() -> CoordinationPlan {
     let missions = data.missions()
     let units = data.units()
     var available_at: Array<U32, 6> = [360, 360, 360, 360, 360, 360]
-    var current_zone: Array<U32, 6> = [2, 2, 1, 1, 3, 2]
+    var current_zone: Array<U32, 6> = [2, 2, 1, 4, 3, 2]
     var plan = CoordinationPlan(
         assignments: [None, None, None, None, None, None],
         reviewed_count: 0,

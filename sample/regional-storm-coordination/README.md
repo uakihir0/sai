@@ -22,7 +22,7 @@ Window: 06:00 onward; lanes are directed, and Willow Bridge opens after mission 
   held: earliest feasible finish misses the due time or shift
 #805 [standard] Deliver drinking water to Hilltop
   Water tender 3: 06:45–07:00; load 1000
-Dispatched: 4; held: 2; coverage: PASS
+Dispatched: 4; held: 2; Review complete: PASS
 ```
 
 The schedule uses minutes after midnight internally. The mission list is
@@ -30,10 +30,13 @@ stable and priority-ordered; repeated scans let a dependent mission wait for
 an earlier prerequisite without losing its place in the report. The bridge
 approach is cleared at 06:30, after which the previously closed Eastbank to
 Hilltop lane is usable. The accessible coach carries eight residents. The
-medical van holds four people, so the five-patient transfer is held rather
-than split. The radio relay's earliest finish is 07:05 against a 07:00 due
-time. Water delivery starts when the cooling center's generator task finishes
-at 06:45.
+medical van is staged at West Clinic in zone 4 and holds four people, so the
+five-patient transfer has a feasible route but is held solely because the
+request is too large rather than split. The radio relay's earliest finish is
+07:05 against a 07:00 due time. Water delivery starts when the cooling
+center's generator task finishes at 06:45. “Review complete” means the report
+classifies every fixture mission as dispatched or held; it does not mean every
+service was completed.
 
 ## Project structure
 
@@ -44,7 +47,8 @@ at 06:45.
   clearance mission succeeds.
 - `dispatch.sai` repeats stable readiness scans, tracks unit location and
   availability, applies load and time constraints, and records hold reasons.
-- `evaluation.sai` checks mission coverage and retrieves outcomes.
+- `evaluation.sai` checks classification completeness (every mission has an
+  explicit dispatched or held result) and retrieves outcomes.
 - `report.sai` prints the human-readable coordination plan and summary.
 - `lib.sai` exposes the CLI and regression examples.
 
@@ -84,6 +88,9 @@ not split loads, model uncertainty, or optimize the schedule globally.
 - The all-or-nothing transport capacity rule keeps groups together. A real
   coordinator may need an approved split plan, additional vehicles, or a
   different transfer destination.
+- The medical van starts staged at West Clinic in zone 4 so its patient
+  transfer route is feasible in this fictional fixture. A live plan would
+  need current unit locations from dispatch telemetry.
 - Loads, deadlines, crew skills, travel minutes, and service times are
   fictional scenario assumptions. They are not operational guidance.
 
