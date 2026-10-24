@@ -6,8 +6,9 @@ use sai_hir::{
 use sai_intern::{Interner, PackageInterner, Symbol};
 use sai_package::mvs::MvsPackageVersion;
 use sai_resolve::package_scopes::{
-    FunctionOwnerDescriptor, Phase1PackageScopes, RefinementPredicateOwnerDescriptor,
-    RefinementPredicateOwnerKind, TopLevelOwnerDescriptor, TopLevelOwnerKind,
+    ExternFunctionOwnerDescriptor, FunctionOwnerDescriptor, Phase1PackageScopes,
+    RefinementPredicateOwnerDescriptor, RefinementPredicateOwnerKind, TopLevelOwnerDescriptor,
+    TopLevelOwnerKind,
 };
 use sai_semantic::{
     CurrentSymbol, DeclarationFingerprintError, PackageIndexFileName, PackageSymbolInventory,
@@ -47,10 +48,10 @@ impl Phase1PackageSymbolInventory {
 /// enums with their generic parameters, variants and record-variant fields,
 /// non-refined distinct types and their generic parameters, plain type aliases
 /// and their generic parameters, non-generic refined types, constants, user
-/// effects, worlds, tests, and properties. World import/export/include entries
-/// are validated as world contents but do not produce symbols. Every other
-/// symbol-bearing declaration makes the result incomplete until its symbol
-/// kind and path are collected as well.
+/// effects, worlds, tests, properties, and extern functions. World
+/// import/export/include entries are validated as world contents but do not
+/// produce symbols. Every other symbol-bearing declaration makes the result
+/// incomplete until its symbol kind and path are collected as well.
 pub(super) fn collect_module_function_inventory(
     package_key: &PackageKey,
     package_version: Option<&MvsPackageVersion>,
@@ -165,6 +166,10 @@ pub(super) fn collect_module_function_inventory(
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
     let mut test_owners_by_item =
         HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
+    let mut extern_block_owners_by_item =
+        HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>::new();
+    let mut extern_function_owners_by_item =
+        HashMap::<(FileId, sai_hir::item_tree::ErasedAstId), ExternFunctionOwnerDescriptor>::new();
     let mut refinement_predicate_owners_by_item = HashMap::<
         (FileId, sai_hir::item_tree::ErasedAstId),
         Vec<RefinementPredicateOwnerDescriptor>,
@@ -244,6 +249,15 @@ pub(super) fn collect_module_function_inventory(
                     );
                 }
             }
+            TopLevelOwnerKind::ExternBlock => {
+                if extern_block_owners_by_item
+                    .insert(key, *descriptor)
+                    .is_some()
+                {
+                    reasons
+                        .insert("Phase 1 contains duplicate extern-block owner descriptors".into());
+                }
+            }
             _ => continue,
         }
         if !owner_ids.insert(descriptor.owner.def_id) {
@@ -258,6 +272,20 @@ pub(super) fn collect_module_function_inventory(
             .or_default()
             .push(*descriptor);
     }
+    for descriptor in &scopes.extern_function_owners {
+        let key = (descriptor.file, descriptor.item_id);
+        if extern_function_owners_by_item
+            .insert(key, *descriptor)
+            .is_some()
+        {
+            reasons.insert("Phase 1 contains duplicate extern-function owner descriptors".into());
+        }
+        if !owner_ids.insert(descriptor.owner.def_id) {
+            reasons.insert(
+                "Phase 1 assigns one definition ID to multiple supported declarations".to_owned(),
+            );
+        }
+    }
 
     let mut seen_items = HashSet::new();
     let mut consumed_owners = HashSet::new();
@@ -271,6 +299,8 @@ pub(super) fn collect_module_function_inventory(
     let mut consumed_alias_owners = HashSet::new();
     let mut consumed_refined_owners = HashSet::new();
     let mut consumed_test_owners = HashSet::new();
+    let mut consumed_extern_block_owners = HashSet::new();
+    let mut consumed_extern_function_owners = HashSet::new();
     let mut consumed_refinement_predicate_owners = HashSet::new();
     let mut canonical_paths = HashSet::<String>::new();
     let mut current_symbols = Vec::new();
@@ -525,13 +555,33 @@ pub(super) fn collect_module_function_inventory(
                         );
                     }
                 }
-                ItemTreeKind::ExternBlock if entry.children.is_empty() => {}
+                ItemTreeKind::ExternBlock => {
+                    collect_extern_block(
+                        entry,
+                        module.file,
+                        &module_path,
+                        package_version.package(),
+                        input,
+                        prepared.module_tree.package,
+                        &extern_block_owners_by_item,
+                        &extern_function_owners_by_item,
+                        &mut seen_items,
+                        &mut consumed_extern_block_owners,
+                        &mut consumed_extern_function_owners,
+                        &mut canonical_paths,
+                        &mut current_symbols,
+                        &mut reasons,
+                        def_paths,
+                        packages,
+                        symbols,
+                    );
+                }
                 // Every other top-level ItemTree declaration is either a
                 // symbol outside this slice or an unknown shape. Extern
                 // functions are children of ExternBlock and are symbols.
                 _ => {
                     reasons.insert(format!(
-                        "target-filtered declaration {:?} is outside the function-generic-parameter-record-generic-parameter-field-resource-field-enum-generic-parameter-variant-record-variant-field-distinct-type-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect-world-test-property inventory",
+                        "target-filtered declaration {:?} is outside the function-generic-parameter-record-generic-parameter-field-resource-field-enum-generic-parameter-variant-record-variant-field-distinct-type-generic-parameter-type-alias-generic-parameter-refined-type-constant-effect-world-test-property-extern-function inventory",
                         entry.kind
                     ));
                 }
@@ -602,6 +652,18 @@ pub(super) fn collect_module_function_inventory(
     if consumed_test_owners.len() != test_owners_by_item.len() {
         reasons.insert(
             "the Phase 1 test and property owner descriptors do not exactly match the filtered ItemTree"
+                .to_owned(),
+        );
+    }
+    if consumed_extern_block_owners.len() != extern_block_owners_by_item.len() {
+        reasons.insert(
+            "the Phase 1 extern-block owner descriptors do not exactly match the filtered ItemTree"
+                .to_owned(),
+        );
+    }
+    if consumed_extern_function_owners.len() != extern_function_owners_by_item.len() {
+        reasons.insert(
+            "the Phase 1 extern-function owner descriptors do not exactly match retained extern-block children"
                 .to_owned(),
         );
     }
@@ -685,6 +747,28 @@ pub(super) fn collect_module_function_inventory(
             );
         }
     }
+    for ((file_id, item_id), _) in &extern_block_owners_by_item {
+        if !seen_items.contains(&(*file_id, *item_id)) {
+            reasons.insert(
+                "a Phase 1 extern-block owner has no target-filtered ItemTree declaration"
+                    .to_owned(),
+            );
+        }
+    }
+    for ((file_id, item_id), descriptor) in &extern_function_owners_by_item {
+        if !consumed_extern_function_owners.contains(&(*file_id, *item_id)) {
+            reasons.insert(
+                "a Phase 1 extern-function owner has no matching retained direct extern-block child"
+                    .to_owned(),
+            );
+        }
+        if !extern_block_owners_by_item.contains_key(&(*file_id, descriptor.block_item_id)) {
+            reasons.insert(
+                "a Phase 1 extern-function owner has no matching top-level extern-block owner"
+                    .to_owned(),
+            );
+        }
+    }
     for (key, descriptors) in &refinement_predicate_owners_by_item {
         if descriptors
             .iter()
@@ -714,6 +798,399 @@ pub(super) fn collect_module_function_inventory(
             current_symbols,
         ))
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_extern_block(
+    entry: &ItemTreeEntry,
+    file_id: FileId,
+    module_path: &[String],
+    package_identity: &str,
+    input: &OwnedPhase1ModuleInput,
+    package_id: PackageId,
+    block_owners: &HashMap<(FileId, sai_hir::item_tree::ErasedAstId), TopLevelOwnerDescriptor>,
+    function_owners: &HashMap<
+        (FileId, sai_hir::item_tree::ErasedAstId),
+        ExternFunctionOwnerDescriptor,
+    >,
+    seen_items: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    consumed_block_owners: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    consumed_function_owners: &mut HashSet<(FileId, sai_hir::item_tree::ErasedAstId)>,
+    canonical_paths: &mut HashSet<String>,
+    current_symbols: &mut Vec<CurrentSymbol>,
+    reasons: &mut HashSet<String>,
+    def_paths: &DefPathInterner,
+    packages: &PackageInterner,
+    symbols: &Interner,
+) {
+    let block_key = (file_id, entry.ast_id);
+    if !seen_items.insert(block_key) {
+        reasons
+            .insert("the target-filtered ItemTree contains a duplicate extern-block AST ID".into());
+    }
+    let Some(block_owner) = block_owners.get(&block_key).copied() else {
+        reasons.insert("a target-filtered extern block has no matching Phase 1 owner".into());
+        return;
+    };
+    consumed_block_owners.insert(block_key);
+    if block_owner.kind != TopLevelOwnerKind::ExternBlock
+        || block_owner.file != file_id
+        || block_owner.item_id != entry.ast_id
+    {
+        reasons.insert(
+            "an extern-block owner descriptor has the wrong source identity or kind".into(),
+        );
+        return;
+    }
+
+    let Some(pointer) = input.ast_ids.pointer(entry.ast_id) else {
+        reasons.insert("a target-filtered extern-block AST ID has no source pointer".into());
+        return;
+    };
+    let Some(syntax) = pointer.resolve(file_id, &input.root) else {
+        reasons.insert("a target-filtered extern-block source pointer is stale".into());
+        return;
+    };
+    let Some(block) = ast::ExternBlock::cast(syntax.clone()) else {
+        reasons.insert("an extern-block source pointer resolves to the wrong AST kind".into());
+        return;
+    };
+    if input.ast_ids.ast_id(&block).map(|id| id.erase()) != Some(entry.ast_id) {
+        reasons.insert("an extern-block AST ID does not match its current declaration".into());
+        return;
+    }
+    if syntax_has_errors(&syntax)
+        || input
+            .parser_diagnostics
+            .iter()
+            .any(|diagnostic| parser_diagnostic_overlaps_syntax(diagnostic, file_id, &syntax))
+    {
+        reasons.insert("a target-filtered extern block contains parser recovery or errors".into());
+    }
+
+    let Some(component) = extern_block_component(&block, symbols) else {
+        reasons.insert("an extern-block ABI or module name cannot be resolved".into());
+        return;
+    };
+    let (abi, module) = match &component {
+        DefPathData::ExternBlock { abi, module } => (
+            symbols
+                .resolve(*abi)
+                .ok()
+                .map(|name| name.to_string())
+                .unwrap_or_default(),
+            *module,
+        ),
+        _ => (String::new(), None),
+    };
+    match abi.as_str() {
+        "wasm" if module.is_none() => {
+            reasons.insert("an extern \"wasm\" block without a module name is invalid".into());
+        }
+        "wasm" => {}
+        "C" => {
+            reasons.insert("Stage 7 extern \"C\" symbols are outside supported coverage".into());
+            if block.unsafe_token().is_none() {
+                reasons.insert("an extern \"C\" block lacks its required unsafe marker".into());
+            }
+        }
+        _ => {
+            reasons.insert("an extern block uses an unsupported ABI".into());
+        }
+    }
+
+    let Some(block_position) = input
+        .filtered
+        .item_tree
+        .items
+        .iter()
+        .position(|candidate| candidate.ast_id == entry.ast_id)
+    else {
+        reasons.insert("a target-filtered extern block is absent from its module ItemTree".into());
+        return;
+    };
+    let mut block_disambiguator = 0_u32;
+    for previous in &input.filtered.item_tree.items[..block_position] {
+        if previous.kind != ItemTreeKind::ExternBlock {
+            continue;
+        }
+        let Some(previous_pointer) = input.ast_ids.pointer(previous.ast_id) else {
+            reasons.insert("a preceding extern block has no current source pointer".into());
+            return;
+        };
+        let Some(previous_syntax) = previous_pointer.resolve(file_id, &input.root) else {
+            reasons.insert("a preceding extern-block source pointer is stale".into());
+            return;
+        };
+        let Some(previous_block) = ast::ExternBlock::cast(previous_syntax) else {
+            reasons
+                .insert("a preceding extern-block pointer resolves to the wrong AST kind".into());
+            return;
+        };
+        if extern_block_component(&previous_block, symbols).as_ref() == Some(&component) {
+            let Some(next) = block_disambiguator.checked_add(1) else {
+                reasons.insert("an extern-block DefPath disambiguator overflowed".into());
+                return;
+            };
+            block_disambiguator = next;
+        }
+    }
+
+    let block_def_path = match def_paths.resolve(block_owner.owner.def_id) {
+        Ok(Some(path)) if path.package() == package_id => path,
+        Ok(Some(_)) => {
+            reasons.insert("an extern-block owner resolves to another package".into());
+            return;
+        }
+        Ok(None) => {
+            reasons.insert("an extern-block owner has no canonical definition path".into());
+            return;
+        }
+        Err(_) => {
+            reasons.insert("an extern-block owner definition path cannot be resolved".into());
+            return;
+        }
+    };
+    let block_path_matches = block_def_path.data().len() == module_path.len() + 1
+        && block_def_path
+            .data()
+            .iter()
+            .take(module_path.len())
+            .zip(module_path)
+            .all(|(path_component, name)| {
+                path_component.disambiguator == 0
+                    && matches!(&path_component.data, DefPathData::Module(segment)
+                        if symbols.resolve(*segment).is_ok_and(|resolved| resolved.as_ref() == name))
+            })
+        && block_def_path.data().last().is_some_and(|path_component| {
+            path_component.data == component && path_component.disambiguator == block_disambiguator
+        });
+    if !block_path_matches {
+        reasons.insert(
+            "the extern-block DefPath does not match its module, ABI, module name, or disambiguator"
+                .into(),
+        );
+        return;
+    }
+
+    let Some(item_list) = block.items() else {
+        reasons.insert("a target-filtered extern block has no item list".into());
+        return;
+    };
+    let ast_functions = item_list
+        .syntax()
+        .children()
+        .filter_map(ast::FnDecl::cast)
+        .collect::<Vec<_>>();
+    if entry.children.len() != ast_functions.len() {
+        reasons.insert(
+            "an extern block's ItemTree child count does not match its direct function declarations"
+                .into(),
+        );
+        return;
+    }
+
+    let mut child_disambiguators = HashMap::<Symbol, u32>::new();
+    for (function, child) in ast_functions.iter().zip(&entry.children) {
+        if child.kind != ItemTreeKind::ExternFn {
+            reasons.insert("an extern block child has the wrong ItemTree kind or order".into());
+            return;
+        }
+        let Some(ast_id) = input.ast_ids.ast_id(function).map(|id| id.erase()) else {
+            reasons.insert("an extern function has no current snapshot AST ID".into());
+            return;
+        };
+        if child.ast_id != ast_id {
+            reasons
+                .insert("an extern function ItemTree ID does not match its AST declaration".into());
+            return;
+        }
+        let Some(child_pointer) = input.ast_ids.pointer(child.ast_id) else {
+            reasons.insert("an extern function AST ID has no current source pointer".into());
+            return;
+        };
+        let Some(expected_pointer) =
+            sai_syntax::SyntaxNodePtr::new(file_id, function.syntax()).ok()
+        else {
+            reasons.insert("an extern function cannot be bound to its source file".into());
+            return;
+        };
+        if !child_pointer.is_same_source_node(&expected_pointer) {
+            reasons
+                .insert("an extern function source pointer identifies a different AST node".into());
+            return;
+        }
+        if !child.children.is_empty() || child.name == Symbol::ERROR {
+            reasons.insert("an extern function has invalid ItemTree children or name".into());
+            return;
+        }
+        let Ok(name) = symbols.resolve(child.name) else {
+            reasons.insert("an extern function ItemTree name cannot be resolved".into());
+            return;
+        };
+        if name.is_empty() {
+            reasons.insert("an extern function has an empty ItemTree name".into());
+            return;
+        }
+        let Some(name_token) = function.name().and_then(|name| name.token()) else {
+            reasons.insert("an extern function AST has no declaration name token".into());
+            return;
+        };
+        let raw_name = name_token
+            .text()
+            .strip_prefix("r#")
+            .unwrap_or(name_token.text());
+        if sai_syntax::normalize_identifier(raw_name) != name.as_ref() {
+            reasons.insert("the extern function ItemTree and AST names disagree".into());
+            return;
+        }
+        if syntax_has_errors(function.syntax())
+            || name_token.has_error()
+            || input.parser_diagnostics.iter().any(|diagnostic| {
+                parser_diagnostic_overlaps_syntax(diagnostic, file_id, function.syntax())
+            })
+        {
+            reasons.insert("an extern function contains parser recovery or errors".into());
+            return;
+        }
+        let Some(attrs) = input.filtered.validated_attrs.get(&child.ast_id) else {
+            reasons.insert("an extern function has no target-filtered attribute record".into());
+            return;
+        };
+        if attrs.target.is_some() {
+            reasons.insert("an extern function unexpectedly has a target predicate".into());
+            return;
+        }
+        let child_key = (file_id, child.ast_id);
+        let child_owner = function_owners.get(&child_key).copied();
+        let Some(child_owner) = child_owner else {
+            reasons.insert("a retained extern function has no matching Phase 1 owner".into());
+            continue;
+        };
+        consumed_function_owners.insert(child_key);
+        if child_owner.file != file_id
+            || child_owner.block_item_id != entry.ast_id
+            || child_owner.item_id != child.ast_id
+            || child_owner.block_owner != block_owner.owner
+        {
+            reasons.insert(
+                "an extern-function owner does not point to its exact enclosing block".into(),
+            );
+            continue;
+        }
+
+        let expected_disambiguator = child_disambiguators.entry(child.name).or_default();
+        let current_disambiguator = *expected_disambiguator;
+        let Some(next_disambiguator) = expected_disambiguator.checked_add(1) else {
+            reasons.insert("an extern-function DefPath disambiguator overflowed".into());
+            continue;
+        };
+        *expected_disambiguator = next_disambiguator;
+        let child_def_path = match def_paths.resolve(child_owner.owner.def_id) {
+            Ok(Some(path)) if path.package() == package_id => path,
+            Ok(Some(_)) => {
+                reasons.insert("an extern-function owner resolves to another package".into());
+                continue;
+            }
+            Ok(None) => {
+                reasons.insert("an extern-function owner has no canonical definition path".into());
+                continue;
+            }
+            Err(_) => {
+                reasons
+                    .insert("an extern-function owner definition path cannot be resolved".into());
+                continue;
+            }
+        };
+        let child_path_matches = child_def_path.data().len() == block_def_path.data().len() + 1
+            && child_def_path.data()[..block_def_path.data().len()] == *block_def_path.data()
+            && child_def_path.data().last().is_some_and(|path_component| {
+                path_component.data == DefPathData::ValueNs(child.name)
+                    && path_component.disambiguator == current_disambiguator
+            });
+        if !child_path_matches {
+            reasons.insert(
+                "the extern-function DefPath does not match its exact block, name, or disambiguator"
+                    .into(),
+            );
+            continue;
+        }
+
+        let has_self_param = function.params().is_some_and(|parameters| {
+            parameters
+                .syntax()
+                .children()
+                .any(|child| ast::SelfParam::cast(child).is_some())
+        });
+        let has_where_or_borrows = function.syntax().children().any(|child| {
+            ast::WhereClause::cast(child.clone()).is_some()
+                || ast::BorrowsClause::cast(child).is_some()
+        });
+        if function.async_token().is_some()
+            || function.generic_params().is_some()
+            || has_self_param
+            || has_where_or_borrows
+            || function.body().is_some()
+        {
+            reasons.insert(
+                "an extern function has an unsupported async, generic, self, where, borrows, or body form"
+                    .into(),
+            );
+        }
+
+        let canonical_path = format!(
+            "{}{}.{name}",
+            package_identity,
+            module_path
+                .iter()
+                .map(|segment| format!("/{segment}"))
+                .collect::<String>()
+        );
+        if !canonical_paths.insert(canonical_path.clone()) {
+            reasons.insert(format!("duplicate canonical symbol path {canonical_path}"));
+        }
+        let def_path_hash = match DefPathHash::compute(&child_def_path, packages, symbols) {
+            Ok(hash) => Fingerprint::new(hash.raw()),
+            Err(_) => {
+                reasons.insert("an extern-function definition path hash cannot be computed".into());
+                continue;
+            }
+        };
+        let fingerprint = match declaration_fingerprint(
+            SymbolKind::ExternFn,
+            function.syntax(),
+            Some(&name_token),
+        ) {
+            Ok(fingerprint) => fingerprint,
+            Err(DeclarationFingerprintError::NameTokenNotInDeclaration) => {
+                reasons.insert(
+                    "an extern-function name token is outside its declaration syntax node".into(),
+                );
+                continue;
+            }
+        };
+        current_symbols.push(CurrentSymbol::new(
+            canonical_path,
+            def_path_hash,
+            SymbolKind::ExternFn,
+            fingerprint,
+        ));
+    }
+}
+
+fn extern_block_component(block: &ast::ExternBlock, symbols: &Interner) -> Option<DefPathData> {
+    let abi_text = block
+        .abi()
+        .map(|literal| literal.value().into_owned())
+        .unwrap_or_default();
+    let abi = symbols.intern(&abi_text).ok()?;
+    let module = block
+        .module()
+        .and_then(|module| module.value())
+        .map(|literal| symbols.intern(literal.value().as_ref()))
+        .transpose()
+        .ok()?;
+    Some(DefPathData::ExternBlock { abi, module })
 }
 
 #[allow(clippy::too_many_arguments)]

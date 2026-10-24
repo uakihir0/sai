@@ -25807,6 +25807,261 @@ mod tests {
     }
 
     #[test]
+    fn module_extern_function_inventory_collects_verified_module_symbols() {
+        let (database, module_tree, snapshot, collection) = collect_package_inventory_for_target(
+            b"extern \"wasm\" module \"env\" {\n    fn read(value: U32) -> U32\n    fn write(value: U32)\n}\nextern \"wasm\" module \"clock\" {\n    fn now() -> U64\n}\n",
+            b"extern \"wasm\" module \"env\" {\n    fn read(value: U32) -> U32\n}\n",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| (symbol.path(), symbol.kind()))
+                .collect::<Vec<_>>(),
+            [
+                ("acme:phase1.read", sai_semantic::SymbolKind::ExternFn),
+                ("acme:phase1.write", sai_semantic::SymbolKind::ExternFn),
+                ("acme:phase1.now", sai_semantic::SymbolKind::ExternFn),
+                ("acme:phase1/child.read", sai_semantic::SymbolKind::ExternFn),
+            ],
+            "symbols: {:?}; extern-function owners: {:?}",
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.path())
+                .collect::<Vec<_>>(),
+            collection.scopes().extern_function_owners
+        );
+
+        let blocks = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == TopLevelOwnerKind::ExternBlock)
+            .collect::<Vec<_>>();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(collection.scopes().extern_function_owners.len(), 4);
+        for function in &collection.scopes().extern_function_owners {
+            let block = blocks
+                .iter()
+                .find(|block| {
+                    block.owner == function.block_owner
+                        && block.file == function.file
+                        && block.item_id == function.block_item_id
+                })
+                .expect("extern-function descriptor names its exact top-level block");
+            let block_path = database
+                .resolve_def_path(block.owner.def_id.to_def_id())
+                .expect("block owner DefId is valid")
+                .expect("extern block has a structural DefPath");
+            let function_path = database
+                .resolve_def_path(function.owner.def_id.to_def_id())
+                .expect("function owner DefId is valid")
+                .expect("extern function has a structural DefPath");
+            assert_eq!(function_path.package(), module_tree.package);
+            assert_eq!(function_path.data().len(), block_path.data().len() + 1);
+            assert_eq!(
+                &function_path.data()[..block_path.data().len()],
+                block_path.data()
+            );
+            let expected_hash = sai_hir::DefPathHash::compute(
+                &function_path,
+                &database.packages,
+                &database.symbols,
+            )
+            .expect("extern-function DefPath hash is defined");
+            let expected_fingerprint = sai_stable_hash::Fingerprint::new(expected_hash.raw());
+            assert!(
+                inventory.symbols().iter().any(|symbol| {
+                    symbol.kind() == sai_semantic::SymbolKind::ExternFn
+                        && symbol.def_path_hash() == expected_fingerprint
+                }),
+                "the owner DefPath hash is present in the inventory"
+            );
+        }
+
+        let parsed =
+            sai_syntax::parse(&snapshot, module_tree.modules[0].file).expect("root parses");
+        let read = parsed
+            .root
+            .descendants()
+            .filter_map(ast::FnDecl::cast)
+            .find(|function| {
+                function
+                    .name()
+                    .and_then(|name| name.token())
+                    .is_some_and(|name| name.text() == "read")
+            })
+            .expect("root read import is present");
+        let name_token = read
+            .name()
+            .and_then(|name| name.token())
+            .expect("extern-function name token is present");
+        let expected_fingerprint = sai_semantic::declaration_fingerprint(
+            sai_semantic::SymbolKind::ExternFn,
+            read.syntax(),
+            Some(&name_token),
+        )
+        .expect("extern-function fingerprint is defined");
+        assert!(
+            inventory
+                .symbols()
+                .iter()
+                .filter(|symbol| symbol.path() == "acme:phase1.read")
+                .all(|symbol| symbol.fingerprint() == expected_fingerprint)
+        );
+    }
+
+    #[test]
+    fn module_extern_function_inventory_preserves_block_and_child_disambiguators() {
+        let (database, _, _, collection) = collect_package_inventory_for_target(
+            b"extern \"wasm\" module \"env\" {\n    fn same()\n    fn same()\n}\nextern \"wasm\" module \"env\" {\n    fn same()\n}\nextern \"wasm\" module \"clock\" {\n    fn same()\n}\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&collection);
+        assert!(matches!(
+            inventory.coverage(),
+            sai_semantic::InventoryCoverage::Incomplete { reason }
+                if reason.contains("duplicate canonical symbol path")
+        ));
+        let functions = &collection.scopes().extern_function_owners;
+        assert_eq!(functions.len(), 4);
+        let paths = functions
+            .iter()
+            .map(|function| {
+                database
+                    .resolve_def_path(function.owner.def_id.to_def_id())
+                    .expect("extern-function owner is valid")
+                    .expect("extern function has a DefPath")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths
+                .iter()
+                .map(|path| path
+                    .data()
+                    .last()
+                    .expect("extern function DefPath has a terminal component")
+                    .disambiguator)
+                .collect::<Vec<_>>(),
+            [0, 1, 0, 0],
+            "same-name child DefPath disambiguators follow source order within each block"
+        );
+        assert_ne!(
+            paths[0], paths[1],
+            "same-block functions have distinct paths"
+        );
+        assert_ne!(paths[0], paths[2], "same-header blocks have distinct paths");
+        let block_disambiguators = collection
+            .scopes()
+            .top_level_owners
+            .iter()
+            .filter(|owner| owner.kind == TopLevelOwnerKind::ExternBlock)
+            .map(|owner| {
+                database
+                    .resolve_def_path(owner.owner.def_id.to_def_id())
+                    .expect("extern-block owner is valid")
+                    .expect("extern block has a DefPath")
+                    .data()
+                    .last()
+                    .expect("extern-block DefPath has a terminal component")
+                    .disambiguator
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            block_disambiguators,
+            [0, 1, 0],
+            "same-header block DefPath disambiguators follow source order"
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .filter(|symbol| symbol.path() == "acme:phase1.same")
+                .count(),
+            4,
+            "the canonical module path collides even across distinct extern blocks"
+        );
+    }
+
+    #[test]
+    fn module_extern_function_inventory_filters_targeted_blocks_and_rejects_unsupported_forms() {
+        let (_, _, _, filtered) = collect_package_inventory_for_target(
+            b"@target(\"wasm64-core\")\nextern \"wasm\" module \"hidden\" { fn hidden() }\nextern \"wasm\" module \"env\" { fn visible() }\n",
+            b"",
+            "wasm32-core",
+        );
+        let inventory = inventory_symbols(&filtered);
+        assert_eq!(
+            inventory.coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert_eq!(
+            inventory
+                .symbols()
+                .iter()
+                .map(|symbol| symbol.path())
+                .collect::<Vec<_>>(),
+            ["acme:phase1.visible"]
+        );
+        assert_eq!(filtered.scopes().extern_function_owners.len(), 1);
+
+        for source in [
+            &b"extern \"wasm\" module \"env\" { fn generic<T>(value: T) -> T }\n"[..],
+            &b"extern \"wasm\" module \"env\" { async fn later() }\n"[..],
+            &b"extern \"wasm\" module \"env\" { fn receiver(self: borrow Self) }\n"[..],
+            &b"extern \"wasm\" module \"env\" { fn bounded<T>(value: T) where T: Bound }\n"[..],
+            &b"extern \"wasm\" module \"env\" { fn borrowed(value: U32) borrows {} }\n"[..],
+            &b"extern \"wasm\" module \"env\" { fn with_body() {} }\n"[..],
+            &b"extern \"wasm\" module \"env\" { @target(host) fn targeted_child() }\n"[..],
+            &b"unsafe extern \"C\" { fn native(value: I32) -> I32 }\n"[..],
+            &b"extern \"other\" module \"env\" { fn unknown() }\n"[..],
+            &b"extern \"wasm\" { fn missing_module() }\n"[..],
+        ] {
+            let (_, _, _, collection) =
+                collect_package_inventory_for_target(source, b"", "wasm32-core");
+            assert!(
+                matches!(
+                    inventory_symbols(&collection).coverage(),
+                    sai_semantic::InventoryCoverage::Incomplete { .. }
+                ),
+                "unsupported extern form must remain incomplete: {}",
+                String::from_utf8_lossy(source)
+            );
+        }
+    }
+
+    #[test]
+    fn module_extern_function_inventory_accepts_empty_wasm_blocks() {
+        let (_, _, _, collection) = collect_package_inventory_for_target(
+            b"extern \"wasm\" module \"env\" {}\n",
+            b"",
+            "wasm32-core",
+        );
+        assert_eq!(
+            inventory_symbols(&collection).coverage(),
+            &sai_semantic::InventoryCoverage::Complete
+        );
+        assert!(inventory_symbols(&collection).symbols().is_empty());
+        assert_eq!(
+            collection
+                .scopes()
+                .top_level_owners
+                .iter()
+                .filter(|owner| owner.kind == TopLevelOwnerKind::ExternBlock)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
     fn module_resource_inventory_does_not_register_interface_resources_as_module_resources() {
         let (_, module_tree, _, collection) = collect_package_inventory_for_target(
             b"interface storage {\n    resource Handle {\n        fn close(self: borrow Self)\n    }\n}\n",
