@@ -1,0 +1,119 @@
+use acme:regional-storm-coordination/data
+use acme:regional-storm-coordination/dispatch
+use acme:regional-storm-coordination/evaluation
+use acme:regional-storm-coordination/model.{
+    Assignment
+    CoordinationPlan
+    HoldReason
+    Mission
+    Outcome
+    Priority
+}
+use sai:alloc/string.{String}
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn priority_name(priority: Priority) -> Str {
+    match priority { .Critical => "critical", .High => "high", .Standard => "standard" }
+}
+
+fn hold_name(reason: HoldReason) -> Str {
+    match reason {
+        .NoQualifiedUnit => "no qualified unit"
+        .LoadExceedsUnitCapacity => "requested load exceeds available unit capacity"
+        .RouteUnavailable => "no currently usable route"
+        .MissedDeadlineOrShift => "earliest feasible finish misses the due time or shift"
+        .PrerequisiteNotMet => "prerequisite mission was not completed"
+    }
+}
+
+fn time_name(minute: U32) -> String
+    effects { alloc }
+{
+    let hour = minute / 60
+    let minute_part = minute % 60
+    if hour < 10 {
+        if minute_part < 10 {
+            f"0{hour}:0{minute_part}"
+        } else {
+            f"0{hour}:{minute_part}"
+        }
+    } else if minute_part < 10 {
+        f"{hour}:0{minute_part}"
+    } else {
+        f"{hour}:{minute_part}"
+    }
+}
+
+fn coverage_name(plan: CoordinationPlan) -> Str {
+    if evaluation.coverage_holds(plan) {
+        "PASS"
+    } else {
+        "FAIL"
+    }
+}
+
+fn bridge_status(plan: CoordinationPlan) -> Str {
+    if evaluation.dispatched_mission(plan, 801) {
+        "open after clearance"
+    } else {
+        "still closed"
+    }
+}
+
+pub fn print_plan(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let missions = data.missions()
+    let plan = dispatch.coordinate()
+    out.write_str("North Valley regional storm coordination\n")
+    out.write_str(
+        "Window: 06:00 onward; lanes are directed, and Willow Bridge opens after mission 801\n",
+    )
+    for index in 0..6 {
+        match evaluation.find_assignment(plan, missions[index].id) {
+            Some(assignment) => print_mission(borrow mut out, missions[index], assignment)
+            None => {}
+        }
+    }
+    out.write_str(
+        f"Dispatched: {plan.dispatched_count}; held: {plan.held_count}; coverage: {coverage_name(plan)}\n".as_str(),
+    )
+}
+
+fn print_mission(out: borrow mut Stdout, mission: Mission, assignment: Assignment)
+    effects { stdio.write, alloc }
+{
+    match assignment.outcome {
+        Outcome.Dispatched => {
+            match (assignment.unit_name, assignment.depart_minute, assignment.finish_minute) {
+                (Some(unit), Some(depart), Some(finish)) => {
+                    out.write_str(
+                        f"#{mission.id} [{priority_name(mission.priority)}] {mission.label}\n  {unit}: {time_name(depart)}–{time_name(finish)}; load {mission.load_units}\n".as_str(),
+                    )
+                }
+                _ => {}
+            }
+        }
+        Outcome.Held => {
+            match assignment.hold_reason {
+                Some(reason) => {
+                    out.write_str(
+                        f"#{mission.id} [{priority_name(mission.priority)}] {mission.label}\n  held: {hold_name(reason)}\n".as_str(),
+                    )
+                }
+                None => {}
+            }
+        }
+    }
+}
+
+pub fn print_summary(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let plan = dispatch.coordinate()
+    out.write_str("North Valley response summary\n")
+    out.write_str(f"{plan.reviewed_count} missions reviewed\n".as_str())
+    out.write_str(f"{plan.dispatched_count} dispatched; {plan.held_count} held\n".as_str())
+    out.write_str(f"Willow Bridge route: {bridge_status(plan)}\n".as_str())
+}

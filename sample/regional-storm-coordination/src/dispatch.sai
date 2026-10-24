@@ -1,0 +1,234 @@
+use acme:regional-storm-coordination/data
+use acme:regional-storm-coordination/model.{
+    Assignment
+    CoordinationPlan
+    HoldReason
+    Mission
+    Outcome
+    ResponseUnit
+}
+use acme:regional-storm-coordination/routing
+use sai:core/num.{U32_MAX}
+
+fn dependency_finish(dependency: Option<U32>, plan: CoordinationPlan) -> Option<U32> {
+    match dependency {
+        Some(mission_id) => {
+            for index in 0..6 {
+                match plan.assignments[index] {
+                    Some(assignment) => {
+                        if (
+                            assignment.mission_id == mission_id
+                            and assignment.outcome == Outcome.Dispatched
+                        ) {
+                            return assignment.finish_minute
+                        }
+                    }
+                    None => {}
+                }
+            }
+            None
+        }
+        None => Some(0)
+    }
+}
+
+fn max_minute(left: U32, middle: U32, right: U32) -> U32 {
+    let first = if left > middle {
+        left
+    } else {
+        middle
+    }
+    if first > right {
+        first
+    } else {
+        right
+    }
+}
+
+fn choose_unit(
+    mission: Mission,
+    plan: CoordinationPlan,
+    units: Array<ResponseUnit, 6>,
+    available_at: Array<U32, 6>,
+    current_zone: Array<U32, 6>,
+) -> Assignment {
+    var best: Option<Assignment> = None
+    var best_finish = U32_MAX
+    var saw_qualified = false
+    var saw_capacity = false
+    var saw_route = false
+    let prerequisite_minute = match dependency_finish(mission.depends_on, plan) {
+        Some(minute) => minute
+        None => mission.earliest_minute
+    }
+
+    for index in 0..6 {
+        let unit = units[index]
+        if unit.capability == mission.capability {
+            saw_qualified = true
+            if mission.load_units <= unit.capacity_units {
+                saw_capacity = true
+                match routing.travel_minutes(current_zone[index], mission.origin_zone, plan) {
+                    Some(deadhead_minutes) => {
+                        match routing.travel_minutes(
+                            mission.origin_zone,
+                            mission.destination_zone,
+                            plan,
+                        ) {
+                            Some(response_minutes) => {
+                                saw_route = true
+                                let depart = max_minute(
+                                    available_at[index],
+                                    mission.earliest_minute,
+                                    prerequisite_minute,
+                                )
+                                let finish = (
+                                    depart
+                                    + deadhead_minutes
+                                    + response_minutes
+                                    + mission.service_minutes
+                                )
+                                if finish <= unit.shift_end and finish <= mission.due_minute {
+                                    if finish < best_finish {
+                                        best = Some(
+                                            Assignment(
+                                                mission_id: mission.id,
+                                                outcome: Outcome.Dispatched,
+                                                unit_index: Some(index),
+                                                unit_name: Some(unit.name),
+                                                depart_minute: Some(depart),
+                                                finish_minute: Some(finish),
+                                                travel_minutes: Some(
+                                                    deadhead_minutes + response_minutes,
+                                                ),
+                                                hold_reason: None,
+                                            ),
+                                        )
+                                        best_finish = finish
+                                    }
+                                }
+                            }
+                            None => {}
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    match best {
+        Some(assignment) => assignment
+        None => {
+            let reason = if not saw_qualified {
+                HoldReason.NoQualifiedUnit
+            } else if not saw_capacity {
+                HoldReason.LoadExceedsUnitCapacity
+            } else if not saw_route {
+                HoldReason.RouteUnavailable
+            } else {
+                HoldReason.MissedDeadlineOrShift
+            }
+            Assignment(
+                mission_id: mission.id,
+                outcome: Outcome.Held,
+                unit_index: None,
+                unit_name: None,
+                depart_minute: None,
+                finish_minute: None,
+                travel_minutes: None,
+                hold_reason: Some(reason),
+            )
+        }
+    }
+}
+
+fn dependency_is_ready(dependency: Option<U32>, plan: CoordinationPlan) -> Bool {
+    match dependency {
+        Some(mission_id) => {
+            match dependency_finish(Some(mission_id), plan) { Some(_) => true, None => false }
+        }
+        None => true
+    }
+}
+
+pub fn coordinate() -> CoordinationPlan {
+    let missions = data.missions()
+    let units = data.units()
+    var available_at: Array<U32, 6> = [360, 360, 360, 360, 360, 360]
+    var current_zone: Array<U32, 6> = [2, 2, 1, 1, 3, 2]
+    var plan = CoordinationPlan(
+        assignments: [None, None, None, None, None, None],
+        reviewed_count: 0,
+        dispatched_count: 0,
+        held_count: 0,
+    )
+
+    // Repeated stable scans defer dependent missions until their prerequisite
+    // has succeeded while preserving the fixture's priority order.
+    for _ in 0..6 {
+        for index in 0..6 {
+            match plan.assignments[index] {
+                Some(_) => {}
+                None => {
+                    let mission = missions[index]
+                    if dependency_is_ready(mission.depends_on, plan) {
+                        let assignment =
+                            choose_unit(mission, plan, units, available_at, current_zone)
+                        plan.assignments[index] = Some(assignment)
+                        match assignment.outcome {
+                            Outcome.Dispatched => {
+                                match assignment.unit_index {
+                                    Some(unit_index) => {
+                                        match assignment.finish_minute {
+                                            Some(finish) => {
+                                                available_at[unit_index] = finish
+                                                current_zone[unit_index] = mission.destination_zone
+                                            }
+                                            None => {}
+                                        }
+                                    }
+                                    None => {}
+                                }
+                            }
+                            Outcome.Held => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for index in 0..6 {
+        match plan.assignments[index] {
+            Some(assignment) => {
+                plan.reviewed_count += 1
+                match assignment.outcome {
+                    Outcome.Dispatched => {
+                        plan.dispatched_count += 1
+                    }
+                    Outcome.Held => {
+                        plan.held_count += 1
+                    }
+                }
+            }
+            None => {
+                plan.assignments[index] = Some(
+                    Assignment(
+                        mission_id: missions[index].id,
+                        outcome: Outcome.Held,
+                        unit_index: None,
+                        unit_name: None,
+                        depart_minute: None,
+                        finish_minute: None,
+                        travel_minutes: None,
+                        hold_reason: Some(HoldReason.PrerequisiteNotMet),
+                    ),
+                )
+                plan.reviewed_count += 1
+                plan.held_count += 1
+            }
+        }
+    }
+    plan
+}

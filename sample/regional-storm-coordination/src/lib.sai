@@ -1,0 +1,69 @@
+use acme:regional-storm-coordination/dispatch
+use acme:regional-storm-coordination/evaluation
+use acme:regional-storm-coordination/model.{CoordinationPlan, HoldReason}
+use acme:regional-storm-coordination/report
+use acme:regional-storm-coordination/routing
+use sai:core/fmt.{Writer}
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 or args[1].as_str() == "plan" {
+        report.print_plan(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if args[1].as_str() == "summary" {
+        report.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+    out.write_str("usage: regional-storm-coordination [plan|summary]\n")
+    process.ExitCode.failure()
+}
+
+test "bridge clearance opens the evacuation lane for its dependent mission" {
+    let empty_plan = CoordinationPlan(
+        assignments: [None, None, None, None, None, None],
+        reviewed_count: 0,
+        dispatched_count: 0,
+        held_count: 0,
+    )
+    assert routing.travel_minutes(1, 3, empty_plan) == None
+    let plan = dispatch.coordinate()
+    assert routing.travel_minutes(1, 3, plan) == Some(35)
+    assert evaluation.dispatched_mission(plan, 803)
+    match evaluation.find_assignment(plan, 803) {
+        Some(assignment) => {
+            assert assignment.depart_minute == Some(390)
+            assert assignment.finish_minute == Some(440)
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "limited medical capacity and a missed radio deadline remain explicit" {
+    let plan = dispatch.coordinate()
+    match evaluation.find_assignment(plan, 804) {
+        Some(assignment) => {
+            assert assignment.hold_reason == Some(HoldReason.LoadExceedsUnitCapacity)
+        }
+        None => {
+            assert false
+        }
+    }
+    match evaluation.find_assignment(plan, 806) {
+        Some(assignment) => {
+            assert assignment.hold_reason == Some(HoldReason.MissedDeadlineOrShift)
+        }
+        None => {
+            assert false
+        }
+    }
+    assert plan.dispatched_count == 4
+    assert plan.held_count == 2
+    assert evaluation.coverage_holds(plan)
+}

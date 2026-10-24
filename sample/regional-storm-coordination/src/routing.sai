@@ -1,0 +1,98 @@
+use acme:regional-storm-coordination/model.{CoordinationPlan, Lane}
+
+pub fn lanes() -> Array<Lane, 8> {
+    [
+        Lane(
+            from_zone: 1,
+            to_zone: 3,
+            travel_minutes: 35,
+            open_at_start: false,
+            cleared_by_mission: Some(801),
+        ),
+        Lane(
+            from_zone: 3,
+            to_zone: 1,
+            travel_minutes: 35,
+            open_at_start: false,
+            cleared_by_mission: Some(801),
+        ),
+        Lane(
+            from_zone: 2,
+            to_zone: 3,
+            travel_minutes: 25,
+            open_at_start: true,
+            cleared_by_mission: None,
+        ),
+        Lane(
+            from_zone: 3,
+            to_zone: 2,
+            travel_minutes: 25,
+            open_at_start: true,
+            cleared_by_mission: None,
+        ),
+        Lane(
+            from_zone: 1,
+            to_zone: 2,
+            travel_minutes: 20,
+            open_at_start: true,
+            cleared_by_mission: None,
+        ),
+        Lane(
+            from_zone: 2,
+            to_zone: 1,
+            travel_minutes: 20,
+            open_at_start: true,
+            cleared_by_mission: None,
+        ),
+        Lane(
+            from_zone: 2,
+            to_zone: 4,
+            travel_minutes: 40,
+            open_at_start: true,
+            cleared_by_mission: None,
+        ),
+        Lane(
+            from_zone: 4,
+            to_zone: 2,
+            travel_minutes: 40,
+            open_at_start: true,
+            cleared_by_mission: None,
+        ),
+    ]
+}
+
+fn mission_completed(mission_id: U32, plan: CoordinationPlan) -> Bool {
+    for index in 0..6 {
+        match plan.assignments[index] {
+            Some(assignment) => {
+                if assignment.mission_id == mission_id and assignment.outcome == .Dispatched {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+pub fn travel_minutes(from_zone: U32, to_zone: U32, plan: CoordinationPlan) -> Option<U32> {
+    if from_zone == to_zone {
+        return Some(0)
+    }
+    for lane in lanes() {
+        if lane.from_zone == from_zone and lane.to_zone == to_zone {
+            if lane.open_at_start {
+                return Some(lane.travel_minutes)
+            }
+            match lane.cleared_by_mission {
+                Some(mission_id) => {
+                    if mission_completed(mission_id, plan) {
+                        return Some(lane.travel_minutes)
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    None
+}
