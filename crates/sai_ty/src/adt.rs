@@ -375,8 +375,16 @@ pub struct LocalEnumAdtDef {
 pub enum LocalEnumVariantValueType {
     /// A unit variant has the enum's identity application as its value type.
     Unit(crate::ty::Ty),
-    /// A tuple variant's function signature template.
-    TupleConstructor(crate::ty::FnSig),
+    /// A tuple variant's function item and signature template.
+    ///
+    /// The function item carries the exact variant `DefId` and the enum's
+    /// ordered identity type arguments. Its signature retains the payload
+    /// template and binder identities until a concrete enum application is
+    /// supplied.
+    TupleConstructor {
+        function_item: crate::ty::Ty,
+        signature: crate::ty::FnSig,
+    },
     /// A record variant cannot be used as a value or positional constructor.
     RecordHasNoValueType,
 }
@@ -581,9 +589,10 @@ impl LocalEnumAdtDef {
     /// Derive the value type template for one exact variant definition.
     ///
     /// Unit variants produce the enum applied to its identity arguments.
-    /// Tuple variants produce a constructor signature whose generic binders
-    /// retain the enum's exact source order and `DefId`s. Record variants
-    /// explicitly report that they have no value type.
+    /// Tuple variants produce an `FnDef` for the exact variant with the
+    /// enum's ordered identity type arguments, plus a signature template whose
+    /// generic binders retain the enum's exact source order and `DefId`s.
+    /// Record variants explicitly report that they have no value type.
     pub fn value_type_of_variant(
         &self,
         interner: &crate::ty::TyInterner,
@@ -615,9 +624,16 @@ impl LocalEnumAdtDef {
                     .iter()
                     .map(|payload| payload.ty().clone())
                     .collect::<Vec<_>>();
-                Ok(LocalEnumVariantValueType::TupleConstructor(
-                    crate::ty::FnSig::new_with_generic_params(generic_params, inputs, output),
-                ))
+                let function_item =
+                    interner.fn_def(variant.def_id(), self.identity_type_args(interner));
+                Ok(LocalEnumVariantValueType::TupleConstructor {
+                    function_item,
+                    signature: crate::ty::FnSig::new_with_generic_params(
+                        generic_params,
+                        inputs,
+                        output,
+                    ),
+                })
             }
             LocalEnumPayloadTemplateShape::Record(_) => {
                 Ok(LocalEnumVariantValueType::RecordHasNoValueType)
@@ -639,7 +655,7 @@ impl LocalEnumAdtDef {
         variant: DefId,
     ) -> Result<crate::ty::FnSig, LocalEnumVariantTypeError> {
         let signature = match self.value_type_of_variant(interner, variant)? {
-            LocalEnumVariantValueType::TupleConstructor(signature) => signature,
+            LocalEnumVariantValueType::TupleConstructor { signature, .. } => signature,
             LocalEnumVariantValueType::Unit(_)
             | LocalEnumVariantValueType::RecordHasNoValueType => {
                 return Err(LocalEnumVariantTypeError::NotTupleVariant(variant));
@@ -754,16 +770,19 @@ impl LocalEnumAdtDef {
     }
 
     fn identity_type(&self, interner: &crate::ty::TyInterner) -> crate::ty::Ty {
-        let type_args = self
-            .payloads
+        interner.intern(crate::ty::TyKind::Adt(
+            self.payloads.owner(),
+            self.identity_type_args(interner),
+        ))
+    }
+
+    fn identity_type_args(&self, interner: &crate::ty::TyInterner) -> Arc<[crate::ty::Ty]> {
+        self.payloads
             .type_params()
             .iter()
             .map(|(_, param)| interner.intern(crate::ty::TyKind::Param(*param)))
-            .collect::<Vec<_>>();
-        interner.intern(crate::ty::TyKind::Adt(
-            self.payloads.owner(),
-            type_args.into(),
-        ))
+            .collect::<Vec<_>>()
+            .into()
     }
 }
 
@@ -1041,6 +1060,7 @@ fn local_payload_template_matches_binders(
                 pending.extend(signature.inputs());
                 pending.push(signature.output());
             }
+            crate::ty::TyKind::FnDef(_, arguments) => pending.extend(arguments.iter()),
             crate::ty::TyKind::Adt(_, arguments) => pending.extend(arguments.iter()),
             crate::ty::TyKind::Int(_)
             | crate::ty::TyKind::Uint(_)
@@ -2437,12 +2457,20 @@ mod tests {
             definition.value_type_of_variant(&interner, variant_ids[0]),
             Ok(LocalEnumVariantValueType::Unit(identity_enum.clone()))
         );
-        let LocalEnumVariantValueType::TupleConstructor(template_signature) = definition
+        let LocalEnumVariantValueType::TupleConstructor {
+            function_item,
+            signature: template_signature,
+        } = definition
             .value_type_of_variant(&interner, variant_ids[1])
             .unwrap()
         else {
-            panic!("the Pair variant has a tuple constructor signature")
+            panic!("the Pair variant has a function-item value type")
         };
+        assert_eq!(
+            function_item.kind(),
+            &crate::ty::TyKind::FnDef(variant_ids[1], Arc::from([t_ty.clone(), u_ty.clone()]),),
+            "the tuple constructor retains its exact variant identity and ordered enum arguments"
+        );
         assert_eq!(
             template_signature.generic_params(),
             &[

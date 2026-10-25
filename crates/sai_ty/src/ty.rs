@@ -2,8 +2,9 @@
 //!
 //! This is an early semantic type kernel. It represents primitive types,
 //! tuples, references, arrays with literal or enclosing `USize` const lengths,
-//! function pointers, owner-bound function type parameters, and nominal
-//! identities with explicit type arguments. Signature lowering currently
+//! function pointers, function-item identities with explicit type arguments,
+//! owner-bound function type parameters, and nominal identities with explicit
+//! type arguments. Signature lowering currently
 //! limits arrays to the resolved built-in `Array` with either a nonnegative
 //! target-fitting literal length or an exact enclosing function const parameter
 //! of type `USize`. Function pointers have no effects or borrowed children and
@@ -71,6 +72,12 @@ pub enum TyKind {
     Array(Ty, Const),
     /// A function pointer with a source-ordered signature and explicit safety.
     FnPtr(FnPtrSig),
+    /// A function item with its exact definition identity and ordered
+    /// type-only arguments.
+    ///
+    /// This initial representation does not include const or region
+    /// arguments; callers must only construct it for type-only binders.
+    FnDef(DefId, Arc<[Ty]>),
     /// A type parameter in a validated type binder.
     Param(ParamTy),
     /// A nominal definition and its explicit type arguments.
@@ -454,6 +461,14 @@ impl TyInterner {
                         .collect::<Result<Vec<_>, _>>()?,
                     substitute_inner(interner, signature.output(), args)?,
                 )),
+                TyKind::FnDef(def_id, type_args) => TyKind::FnDef(
+                    *def_id,
+                    type_args
+                        .iter()
+                        .map(|arg| substitute_inner(interner, arg, args))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into(),
+                ),
                 TyKind::Param(parameter) => {
                     return Ok(
                         interner.intern(type_argument(args, parameter.index)?.kind().clone())
@@ -499,6 +514,13 @@ impl TyInterner {
                     .collect::<Vec<_>>(),
                 self.intern(signature.output.kind().clone()),
             )),
+            TyKind::FnDef(def_id, args) => TyKind::FnDef(
+                def_id,
+                args.iter()
+                    .map(|arg| self.intern(arg.kind().clone()))
+                    .collect::<Vec<_>>()
+                    .into(),
+            ),
             TyKind::Adt(def_id, args) => TyKind::Adt(
                 def_id,
                 args.iter()
@@ -513,6 +535,12 @@ impl TyInterner {
     /// Intern a tuple in declaration order. An empty tuple is the unit type.
     pub fn tuple(&self, elements: impl Into<Arc<[Ty]>>) -> Ty {
         self.intern(TyKind::Tuple(elements.into()))
+    }
+
+    /// Intern a function item with its exact definition identity and ordered
+    /// type-only arguments.
+    pub fn fn_def(&self, def_id: DefId, type_args: impl Into<Arc<[Ty]>>) -> Ty {
+        self.intern(TyKind::FnDef(def_id, type_args.into()))
     }
 
     /// Number of distinct type shapes retained by this interner.
@@ -683,6 +711,47 @@ mod tests {
     }
 
     #[test]
+    fn function_items_preserve_exact_identity_and_ordered_type_arguments() {
+        let interner = TyInterner::new();
+        let other_interner = TyInterner::new();
+        let symbols = sai_intern::Interner::new();
+        let packages = sai_intern::PackageInterner::new();
+        let package = packages.intern("example:function-item#1").unwrap();
+        let first_def = DefId::from_foreign(package, sai_intern::DefIndex::from_raw(4));
+        let second_def = DefId::from_foreign(package, sai_intern::DefIndex::from_raw(5));
+        let parameter = interner.intern(TyKind::Param(ParamTy {
+            index: 0,
+            name: symbols.intern("T").unwrap(),
+        }));
+        let boolean = interner.intern(TyKind::Bool);
+        let local = interner.fn_def(first_def, Arc::from([parameter.clone(), boolean.clone()]));
+        let foreign_parameter = other_interner.intern(parameter.kind().clone());
+        let foreign_boolean = other_interner.intern(TyKind::Bool);
+        let foreign_children =
+            interner.fn_def(first_def, Arc::from([foreign_parameter, foreign_boolean]));
+        let different_identity =
+            interner.fn_def(second_def, Arc::from([parameter.clone(), boolean.clone()]));
+        let different_order = interner.fn_def(first_def, Arc::from([boolean, parameter]));
+
+        assert!(local.ptr_eq(&foreign_children));
+        assert!(!local.ptr_eq(&different_identity));
+        assert!(!local.ptr_eq(&different_order));
+        assert_eq!(
+            local.kind(),
+            &TyKind::FnDef(
+                first_def,
+                Arc::from([
+                    interner.intern(TyKind::Param(ParamTy {
+                        index: 0,
+                        name: symbols.intern("T").unwrap(),
+                    })),
+                    interner.intern(TyKind::Bool),
+                ]),
+            )
+        );
+    }
+
+    #[test]
     fn substitution_uses_the_shared_source_order_for_type_and_const_arguments() {
         let interner = TyInterner::new();
         let symbols = sai_intern::Interner::new();
@@ -751,7 +820,11 @@ mod tests {
             Arc::from([second.clone(), array.clone()]),
             first.clone(),
         )));
-        let original = interner.intern(TyKind::Adt(adt, Arc::from([first, array, function])));
+        let function_item = interner.fn_def(adt, Arc::from([first.clone(), second.clone()]));
+        let original = interner.intern(TyKind::Adt(
+            adt,
+            Arc::from([first, array, function, function_item]),
+        ));
         let type_replacement = interner.intern(TyKind::Float(FloatTy::F64));
         let second_replacement = interner.intern(TyKind::Char);
         let expected_array = interner.intern(TyKind::Array(
@@ -770,17 +843,26 @@ mod tests {
             Arc::from([second_replacement.clone(), expected_array.clone()]),
             type_replacement.clone(),
         )));
+        let expected_function_item = interner.fn_def(
+            adt,
+            Arc::from([type_replacement.clone(), second_replacement.clone()]),
+        );
         let expected = interner.intern(TyKind::Adt(
             adt,
-            Arc::from([type_replacement.clone(), expected_array, expected_function]),
+            Arc::from([
+                type_replacement.clone(),
+                expected_array,
+                expected_function,
+                expected_function_item,
+            ]),
         ));
 
         let substituted = interner
             .substitute(
                 &original,
                 &[
-                    GenericArg::Type(type_replacement),
-                    GenericArg::Type(second_replacement),
+                    GenericArg::Type(type_replacement.clone()),
+                    GenericArg::Type(second_replacement.clone()),
                     GenericArg::Const(Const::Value(13)),
                 ],
             )
@@ -806,6 +888,53 @@ mod tests {
             panic!("the ADT retains its function-pointer argument");
         };
         assert_eq!(signature.safety(), Safety::Unsafe);
+        let TyKind::FnDef(function_item, function_args) = args[3].kind() else {
+            panic!("the ADT retains its function-item argument");
+        };
+        assert_eq!(*function_item, adt);
+        assert_eq!(function_args[0], args[0]);
+        assert_eq!(function_args[1], second_replacement);
+    }
+
+    #[test]
+    fn substitution_preserves_caller_parameters_inside_function_item_arguments() {
+        let interner = TyInterner::new();
+        let symbols = sai_intern::Interner::new();
+        let packages = sai_intern::PackageInterner::new();
+        let package = packages
+            .intern("example:function-item-substitution#1")
+            .unwrap();
+        let function = DefId::from_foreign(package, sai_intern::DefIndex::from_raw(9));
+        let enum_parameter = interner.intern(TyKind::Param(ParamTy {
+            index: 0,
+            name: symbols.intern("T").unwrap(),
+        }));
+        let nested_parameter = interner.intern(TyKind::Param(ParamTy {
+            index: 1,
+            name: symbols.intern("U").unwrap(),
+        }));
+        let function_item =
+            interner.fn_def(function, Arc::from([enum_parameter, nested_parameter]));
+        let caller_parameter = interner.intern(TyKind::Param(ParamTy {
+            index: 1,
+            name: symbols.intern("Caller").unwrap(),
+        }));
+        let boolean = interner.intern(TyKind::Bool);
+
+        let substituted = interner
+            .substitute(
+                &function_item,
+                &[
+                    GenericArg::Type(caller_parameter.clone()),
+                    GenericArg::Type(boolean.clone()),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            substituted.kind(),
+            &TyKind::FnDef(function, Arc::from([caller_parameter, boolean]))
+        );
     }
 
     #[test]
