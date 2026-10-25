@@ -9484,6 +9484,53 @@ fn check_const_literal_leaf(
     let Some(literal_type) = resolve_const_literal_type(ty, type_paths, symbols, inputs) else {
         return Ok(None);
     };
+    check_const_literal_against_type(
+        owner.id,
+        literal_type,
+        value,
+        symbols,
+        inputs,
+        snapshot,
+        target_cfg,
+    )
+}
+
+fn local_enum_variant_literal_type(ty: &sai_ty::ty::Ty) -> Option<ConstLiteralType> {
+    use sai_resolve::prelude::PrimTy;
+
+    let primitive = match ty.kind() {
+        sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I8) => PrimTy::I8,
+        sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I16) => PrimTy::I16,
+        sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I32) => PrimTy::I32,
+        sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I64) => PrimTy::I64,
+        sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::ISize) => PrimTy::ISize,
+        sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8) => PrimTy::U8,
+        sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U16) => PrimTy::U16,
+        sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U32) => PrimTy::U32,
+        sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U64) => PrimTy::U64,
+        sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::USize) => PrimTy::USize,
+        sai_ty::ty::TyKind::Float(sai_ty::ty::FloatTy::F32) => PrimTy::F32,
+        sai_ty::ty::TyKind::Float(sai_ty::ty::FloatTy::F64) => PrimTy::F64,
+        sai_ty::ty::TyKind::Bool => PrimTy::Bool,
+        sai_ty::ty::TyKind::Byte => PrimTy::Byte,
+        sai_ty::ty::TyKind::Char => PrimTy::Char,
+        sai_ty::ty::TyKind::Tuple(elements) if elements.is_empty() => {
+            return Some(ConstLiteralType::Unit);
+        }
+        _ => return None,
+    };
+    Some(ConstLiteralType::Primitive(primitive))
+}
+
+fn check_const_literal_against_type(
+    owner: OwnerId,
+    literal_type: ConstLiteralType,
+    value: &HirExpr<'_>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    target_cfg: &TargetCfg,
+) -> Result<Option<Vec<Diagnostic>>, OwnerControlFlowResolutionError> {
     let literal = match value.kind {
         ExprKind::Lit(literal) => Some(literal),
         ExprKind::Tuple(elements) if elements.is_empty() => None,
@@ -9492,7 +9539,7 @@ fn check_const_literal_leaf(
 
     let mismatch = |expected: &str, found: &str| {
         const_literal_diagnostic(
-            owner.id,
+            owner,
             inputs,
             snapshot,
             value.span,
@@ -9515,7 +9562,7 @@ fn check_const_literal_leaf(
 
     let diagnostics = match literal_type {
         ConstLiteralType::Unit => vec![const_literal_diagnostic(
-            owner.id,
+            owner,
             inputs,
             snapshot,
             value.span,
@@ -9546,7 +9593,7 @@ fn check_const_literal_leaf(
                         "floating-point"
                     };
                     vec![const_literal_diagnostic(
-                        owner.id,
+                        owner,
                         inputs,
                         snapshot,
                         value.span,
@@ -14251,6 +14298,7 @@ fn resolve_local_enum_variant_paths(
                 &entry,
                 call,
                 value_type_entry,
+                &collection.target_cfg,
                 symbols,
                 inputs,
                 snapshot,
@@ -14281,6 +14329,7 @@ fn local_enum_variant_call_projection(
     path: &LocalEnumVariantPathEntry,
     call: &HirExpr<'_>,
     value_type: &LocalEnumVariantPathTypeEntry,
+    target_cfg: &TargetCfg,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -14350,6 +14399,25 @@ fn local_enum_variant_call_projection(
                 )
             {
                 return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+            }
+            for (argument, expected_type) in args.iter().zip(signature.inputs()) {
+                if !is_direct_const_literal_or_unit(&argument.expr) {
+                    continue;
+                }
+                let Some(expected_type) = local_enum_variant_literal_type(expected_type) else {
+                    continue;
+                };
+                if let Some(argument_diagnostics) = check_const_literal_against_type(
+                    owner,
+                    expected_type,
+                    &argument.expr,
+                    symbols,
+                    inputs,
+                    snapshot,
+                    target_cfg,
+                )? {
+                    diagnostics.extend(argument_diagnostics);
+                }
             }
             let expected = signature.inputs().len();
             let found = args.len();
@@ -97085,13 +97153,56 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
+    fn local_enum_variant_literal_type_maps_supported_semantic_scalars() {
+        use sai_resolve::prelude::PrimTy;
+        use sai_ty::ty::{FloatTy, IntTy, TyKind, UintTy};
+
+        let interner = sai_ty::ty::TyInterner::new();
+        let cases = [
+            (TyKind::Int(IntTy::I8), PrimTy::I8),
+            (TyKind::Int(IntTy::I16), PrimTy::I16),
+            (TyKind::Int(IntTy::I32), PrimTy::I32),
+            (TyKind::Int(IntTy::I64), PrimTy::I64),
+            (TyKind::Int(IntTy::ISize), PrimTy::ISize),
+            (TyKind::Uint(UintTy::U8), PrimTy::U8),
+            (TyKind::Uint(UintTy::U16), PrimTy::U16),
+            (TyKind::Uint(UintTy::U32), PrimTy::U32),
+            (TyKind::Uint(UintTy::U64), PrimTy::U64),
+            (TyKind::Uint(UintTy::USize), PrimTy::USize),
+            (TyKind::Float(FloatTy::F32), PrimTy::F32),
+            (TyKind::Float(FloatTy::F64), PrimTy::F64),
+            (TyKind::Bool, PrimTy::Bool),
+            (TyKind::Byte, PrimTy::Byte),
+            (TyKind::Char, PrimTy::Char),
+        ];
+        for (kind, primitive) in cases {
+            let ty = interner.intern(kind);
+            assert_eq!(
+                local_enum_variant_literal_type(&ty),
+                Some(ConstLiteralType::Primitive(primitive))
+            );
+        }
+
+        let unit = interner.intern(TyKind::Tuple(Arc::from([])));
+        assert_eq!(
+            local_enum_variant_literal_type(&unit),
+            Some(ConstLiteralType::Unit)
+        );
+        let byte = interner.intern(TyKind::Uint(UintTy::U8));
+        let nonempty_tuple = interner.intern(TyKind::Tuple(Arc::from([byte])));
+        assert_eq!(local_enum_variant_literal_type(&nonempty_tuple), None);
+        let never = interner.intern(TyKind::Never);
+        assert_eq!(local_enum_variant_literal_type(&never), None);
+    }
+
+    #[test]
     fn function_owner_resolves_direct_local_enum_variant_paths_with_provenance() {
         let root = concat!(
             "use acme:phase1/child as child_alias\n",
             "enum Alpha { Same, Ready }\n",
             "enum Beta { Same, Later }\n",
             "enum Duplicate { Same, Same }\n",
-            "enum Payload { Unit, Pair(U8, Bool), Named(value: Bool) }\n",
+            "enum Payload { Unit, Pair(U8, Bool), Named(value: Bool), UnitPayload(()), Signed(ISize), Wide(USize) }\n",
             "enum Generic<T> { Value(T) }\n",
             "enum Broken { Huge = 170141183460469231731687303715884105728 }\n",
             "type Widget { value: Bool }\n",
@@ -97103,6 +97214,17 @@ interface facade { use middle.{payload}; }"#;
             "fn payload_record() { Payload.Named(value: true) }\n",
             "fn repeated_paths() { (Payload.Unit, Payload.Pair) }\n",
             "fn tuple_call_ok() { Payload.Pair(Alpha.Same, Beta.Same) }\n",
+            "fn tuple_call_literal_ok() { Payload.Pair(1, true) }\n",
+            "fn tuple_call_nonliteral(value: Bool) { Payload.Pair(value, true) }\n",
+            "fn tuple_call_mismatch() { Payload.Pair(true, 1) }\n",
+            "fn tuple_call_out_of_range() { Payload.Pair(256, true) }\n",
+            "fn tuple_call_unit_payload() { Payload.UnitPayload(()) }\n",
+            "fn tuple_call_unit_mismatch() { Payload.UnitPayload(true) }\n",
+            "fn tuple_call_too_few_mismatch() { Payload.Pair(true) }\n",
+            "fn tuple_call_named_mismatch() { Payload.Pair(first: true, second: 1) }\n",
+            "fn tuple_call_isize_min() { Payload.Signed(-2147483648) }\n",
+            "fn tuple_call_isize_out_of_range() { Payload.Signed(-2147483649) }\n",
+            "fn tuple_call_usize_out_of_range() { Payload.Wide(4294967296) }\n",
             "fn tuple_call_named_one() { Payload.Pair(left: 1, true) }\n",
             "fn tuple_call_named_many() { Payload.Pair(left: 1, right: true) }\n",
             "fn tuple_call_named_too_few() { Payload.Pair(left: 1) }\n",
@@ -97609,6 +97731,166 @@ interface facade { use middle.{payload}; }"#;
             tuple_call_ok_paths.call_diagnostics().is_empty(),
             "positional tuple-variant arguments remain accepted"
         );
+        let diagnostic_primary_text = |diagnostic: &sai_diagnostics::Diagnostic| {
+            let span = diagnostic
+                .primary()
+                .expect("diagnostic has a primary span")
+                .span
+                .range;
+            root[span.start().to_usize()..span.end().to_usize()].to_owned()
+        };
+
+        for name in ["tuple_call_literal_ok", "tuple_call_nonliteral"] {
+            assert!(
+                paths_for(name).call_diagnostics().is_empty(),
+                "{name}: matching direct literals and nonliteral expressions are accepted by this bounded check"
+            );
+        }
+
+        let tuple_call_mismatch = paths_for("tuple_call_mismatch");
+        assert_eq!(
+            tuple_call_mismatch
+                .call_diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::TypeMismatch,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+            "direct literal arguments are checked against their positional payload types"
+        );
+        assert_eq!(
+            tuple_call_mismatch
+                .call_diagnostics()
+                .iter()
+                .map(diagnostic_primary_text)
+                .collect::<Vec<_>>(),
+            ["true", "1"],
+            "type mismatch spans cover the exact argument expressions"
+        );
+        assert_eq!(
+            tuple_call_mismatch
+                .call_diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "expected `U8`, found a Bool literal",
+                "expected `Bool`, found an integer literal",
+            ]
+        );
+
+        let tuple_call_out_of_range = paths_for("tuple_call_out_of_range");
+        assert_eq!(
+            tuple_call_out_of_range.call_diagnostics().len(),
+            1,
+            "one out-of-range literal produces one diagnostic"
+        );
+        assert_eq!(
+            tuple_call_out_of_range.call_diagnostics()[0].code,
+            sai_diagnostics::Code::LiteralOutOfRange
+        );
+        assert_eq!(
+            diagnostic_primary_text(&tuple_call_out_of_range.call_diagnostics()[0]),
+            "256"
+        );
+
+        let tuple_call_unit_payload = paths_for("tuple_call_unit_payload");
+        assert!(
+            tuple_call_unit_payload.call_diagnostics().is_empty(),
+            "the empty tuple literal matches a unit payload"
+        );
+        let tuple_call_unit_mismatch = paths_for("tuple_call_unit_mismatch");
+        assert_eq!(
+            tuple_call_unit_mismatch.call_diagnostics()[0].code,
+            sai_diagnostics::Code::TypeMismatch
+        );
+        assert_eq!(
+            tuple_call_unit_mismatch.call_diagnostics()[0].message,
+            "expected `()`, found a Bool literal"
+        );
+        assert_eq!(
+            diagnostic_primary_text(&tuple_call_unit_mismatch.call_diagnostics()[0]),
+            "true"
+        );
+
+        let tuple_call_too_few_mismatch = paths_for("tuple_call_too_few_mismatch");
+        assert_eq!(
+            tuple_call_too_few_mismatch
+                .call_diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            [
+                sai_diagnostics::Code::WrongArgumentCount,
+                sai_diagnostics::Code::TypeMismatch,
+            ],
+            "supplied arguments are checked even when tuple-call arity is wrong"
+        );
+        assert_eq!(
+            diagnostic_primary_text(&tuple_call_too_few_mismatch.call_diagnostics()[1]),
+            "true"
+        );
+
+        let tuple_call_named_mismatch = paths_for("tuple_call_named_mismatch");
+        assert_eq!(
+            tuple_call_named_mismatch
+                .call_diagnostics()
+                .iter()
+                .filter(
+                    |diagnostic| diagnostic.code == sai_diagnostics::Code::NamedArgumentOnFunction
+                )
+                .count(),
+            2,
+            "named argument diagnostics remain independent of literal checking"
+        );
+        let named_mismatch_values = tuple_call_named_mismatch
+            .call_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+            .map(diagnostic_primary_text)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            named_mismatch_values,
+            ["true", "1"],
+            "named values keep their positional constructor parameter types"
+        );
+
+        for (name, expected_text, expected_message) in [
+            (
+                "tuple_call_isize_min",
+                None,
+                "matching signed minimum for target-width ISize",
+            ),
+            (
+                "tuple_call_isize_out_of_range",
+                Some("-2147483649"),
+                "signed out-of-range checks use the selected 32-bit target",
+            ),
+            (
+                "tuple_call_usize_out_of_range",
+                Some("4294967296"),
+                "unsigned out-of-range checks use the selected 32-bit target",
+            ),
+        ] {
+            let paths = paths_for(name);
+            if let Some(expected_text) = expected_text {
+                assert_eq!(paths.call_diagnostics().len(), 1, "{expected_message}");
+                assert_eq!(
+                    paths.call_diagnostics()[0].code,
+                    sai_diagnostics::Code::LiteralOutOfRange,
+                    "{expected_message}"
+                );
+                assert_eq!(
+                    diagnostic_primary_text(&paths.call_diagnostics()[0]),
+                    expected_text,
+                    "{expected_message}"
+                );
+            } else {
+                assert!(paths.call_diagnostics().is_empty(), "{expected_message}");
+            }
+        }
 
         let tuple_call_named_one = paths_for("tuple_call_named_one");
         assert_eq!(
