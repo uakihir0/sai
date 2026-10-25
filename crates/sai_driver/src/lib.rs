@@ -13869,6 +13869,9 @@ fn resolve_local_enum_variant_paths(
                             )
                         } else if let Some(variant) = variant_defs
                             .iter()
+                            // The language requires distinct variant names.
+                            // For deterministic recovery on an invalid enum,
+                            // retain the first source-ordered declaration.
                             .find(|variant| variant.name() == name.sym)
                         {
                             (
@@ -14002,8 +14005,8 @@ fn local_enum_variant_path_diagnostic(
             "unknown enum variant",
         ),
         LocalEnumVariantPathOutcome::NotEnum { .. } => (
-            format!("type `{base_name}` is not an enum"),
-            "expected an enum type",
+            format!("unknown variant `{written_name}` for type `{base_name}`"),
+            "unknown variant",
         ),
         _ => {
             return Err(OwnerControlFlowResolutionError::InvalidSourceLocation(
@@ -14033,7 +14036,7 @@ fn local_enum_variant_path_diagnostic(
     diagnostic.package = inputs.source_ref.package.clone();
     diagnostic.data.insert(
         "type_name".to_owned(),
-        sai_diagnostics::Value::String(base_name),
+        sai_diagnostics::Value::String(base_name.clone()),
     );
     diagnostic.data.insert(
         "variant".to_owned(),
@@ -14079,8 +14082,8 @@ fn local_enum_variant_path_diagnostic(
     } else if matches!(&entry.outcome, LocalEnumVariantPathOutcome::NotEnum { .. }) {
         diagnostic
             .push_child(Child {
-                kind: ChildKind::Help,
-                message: "only an enum type can be followed by a variant name".to_owned(),
+                kind: ChildKind::Note,
+                message: format!("`{base_name}` is not an enum"),
                 location: None,
             })
             .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
@@ -96604,11 +96607,13 @@ interface facade { use middle.{payload}; }"#;
             "use acme:phase1/child as child_alias\n",
             "enum Alpha { Same, Ready }\n",
             "enum Beta { Same, Later }\n",
+            "enum Duplicate { Same, Same }\n",
             "enum Generic<T> { Value(T) }\n",
             "enum Broken { Huge = 170141183460469231731687303715884105728 }\n",
             "type Widget { value: Bool }\n",
             "fn alpha() { Alpha.Same }\n",
             "fn beta() { Beta.Same }\n",
+            "fn duplicate() { Duplicate.Same }\n",
             "fn unknown() { Alpha.Smae }\n",
             "fn qualified() { child_alias.Child.Hit }\n",
             "fn local(e: Bool) { e.Same }\n",
@@ -96625,14 +96630,15 @@ interface facade { use middle.{payload}; }"#;
             phase1_fixture(root.as_bytes(), child.as_bytes());
         let target = target_cfg_for_check("wasm32-core").expect("target config is valid");
         let graph = phase1_root_only_graph();
-        let (collection, member_scopes, wit_view_scopes, _) = collect_local_enum_query_inputs(
-            &mut database,
-            &module_tree,
-            &snapshot,
-            &target,
-            Phase1BuildContext::default(),
-            &graph,
-        );
+        let (collection, member_scopes, wit_view_scopes, type_owners) =
+            collect_local_enum_query_inputs(
+                &mut database,
+                &module_tree,
+                &snapshot,
+                &target,
+                Phase1BuildContext::default(),
+                &graph,
+            );
         let resolved = database
             .resolve_function_owner_analyses_with_member_scopes_and_wit_views(
                 &collection,
@@ -96667,6 +96673,30 @@ interface facade { use middle.{payload}; }"#;
                         })
                 })
                 .unwrap_or_else(|| panic!("function `{name}` has a collected owner"))
+                .owner
+        };
+        let enum_owner_named = |name: &str| {
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::Enum
+                        && def_paths
+                            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .and_then(|path| path.data().last().cloned())
+                            .is_some_and(|component| {
+                                matches!(
+                                    component.data,
+                                    DefPathData::TypeNs(symbol)
+                                        if database.symbols.resolve(symbol).ok().as_deref()
+                                            == Some(name)
+                                )
+                            })
+                })
+                .unwrap_or_else(|| panic!("enum `{name}` has a collected owner"))
                 .owner
         };
         let paths_for = |name: &str| {
@@ -96707,6 +96737,49 @@ interface facade { use middle.{payload}; }"#;
         assert_ne!(
             alpha_variant, beta_variant,
             "same-named variants retain their enum-specific DefIds"
+        );
+        let duplicate_owner = enum_owner_named("Duplicate");
+        let duplicate_projection = type_owners
+            .local_enum_adt_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                Some(&wit_view_scopes),
+                duplicate_owner,
+            )
+            .expect("duplicate enum projection keeps current scope provenance")
+            .expect("duplicate enum projection retains source declarations");
+        let first_duplicate_variant = duplicate_projection
+            .definition()
+            .expect("duplicate names do not make the enum projection unsupported")
+            .payloads()
+            .variants()[0]
+            .def_id();
+        assert_eq!(
+            duplicate_projection
+                .definition()
+                .unwrap()
+                .payloads()
+                .variants()
+                .iter()
+                .map(|variant| {
+                    database
+                        .symbols
+                        .resolve(variant.name())
+                        .unwrap()
+                        .to_string()
+                })
+                .collect::<Vec<_>>(),
+            ["Same", "Same"],
+            "the invalid declaration remains available in source order for recovery"
+        );
+        let duplicate_entry = entry_for("duplicate");
+        assert!(
+            matches!(
+                duplicate_entry.outcome(),
+                LocalEnumVariantPathOutcome::Resolved { variant, .. }
+                    if *variant == first_duplicate_variant
+            ),
+            "duplicate-name recovery selects the earliest source-ordered variant"
         );
         let alpha_entry = entry_for("alpha");
         assert_eq!(alpha_entry.field().owner, function_owner_named("alpha"));
@@ -96831,7 +96904,17 @@ interface facade { use middle.{payload}; }"#;
             non_enum.diagnostics()[0].code,
             sai_diagnostics::Code::UnknownVariant
         );
-        assert!(non_enum.diagnostics()[0].message.contains("is not an enum"));
+        let non_enum_diagnostic = &non_enum.diagnostics()[0];
+        assert_eq!(
+            non_enum_diagnostic.message,
+            "unknown variant `Foo` for type `Widget`"
+        );
+        assert!(
+            non_enum_diagnostic.children().iter().any(|child| {
+                child.kind == ChildKind::Note && child.message == "`Widget` is not an enum"
+            }),
+            "UNKNOWN_VARIANT includes the specified non-enum Note child"
+        );
 
         assert!(matches!(
             entry_for("generic_enum").outcome(),

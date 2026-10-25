@@ -1829,6 +1829,11 @@ name within that projection and the returned outcome contains its exact
 variant `DefId`; unknown variants retain that enum's candidate names and emit
 `UNKNOWN_VARIANT` with suggestions drawn only from that enum. A validated
 local nominal non-enum receives a typed `NotEnum` outcome and diagnostic.
+That `UNKNOWN_VARIANT` diagnostic includes the specified `Note` child
+`` `P` is not an enum ``. If an invalid enum repeats a variant name, this
+path-recovery slice deterministically selects the earliest source-ordered
+declaration; the later duplicate remains a `DUPLICATE_VARIANT` error under
+§3.6.4.
 Unsupported generic and other failed enum projections preserve typed reasons.
 The source-map AST check distinguishes `E.V` and `(E.V)` from `(E).V`, rejects
 generic field arguments and non-path/value receivers, and leaves a trailing
