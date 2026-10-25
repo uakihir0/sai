@@ -1,0 +1,103 @@
+pub const MAX_PLANNING_HORIZON_SLOTS: U32 = 32
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum TaskState {
+    Scheduled
+    Blocked
+    Unplaced
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PlanIssue {
+    PrerequisiteNotScheduled
+    InvalidTimeWindow
+    NoTimeBeforeDeadline
+    NoCrewWindow
+    ExceedsPowerCapacity
+    ExceedsThermalCapacity
+    ExceedsBothCapacities
+    CrewConflict
+    PowerConflict
+    ThermalConflict
+    CrewAndPowerConflict
+    CrewAndThermalConflict
+    PowerAndThermalConflict
+    CrewPowerAndThermalConflict
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum GraphIssue {
+    DuplicateTaskId
+    UnknownTaskEndpoint
+    SelfDependency
+    DuplicateDependency
+    DependencyCycle
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PlanningIssue {
+    HorizonExceedsCapacity
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type MissionTask {
+    pub id: U32
+    pub name: Str
+    pub priority: U32
+    pub earliest_start_slot: U32
+    pub latest_finish_slot: U32
+    pub duration_slots: U32
+    pub power_watts: U32
+    pub thermal_units: U32
+    pub requires_crew: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TaskDependency {
+    pub task_id: U32
+    pub prerequisite_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CrewWindow {
+    pub name: Str
+    pub start_slot: U32
+    pub end_slot: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type MissionLimits {
+    pub planning_horizon_slots: U32
+    pub max_power_watts: U32
+    pub max_thermal_units: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TaskDecision {
+    pub task_id: U32
+    pub task_name: Str
+    pub state: TaskState
+    pub start_slot: Option<U32>
+    pub end_slot: Option<U32>
+    pub issue: Option<PlanIssue>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TaskOrder {
+    pub task_ids: Array<Option<U32>, 12>
+    pub length: USize
+    pub issue: Option<GraphIssue>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type MissionPlan {
+    pub task_order: Array<Option<U32>, 12>
+    pub order_length: USize
+    pub decisions: Array<Option<TaskDecision>, 12>
+    pub decision_count: USize
+    pub scheduled_count: U32
+    pub blocked_count: U32
+    pub unplaced_count: U32
+    pub graph_issue: Option<GraphIssue>
+    pub planning_issue: Option<PlanningIssue>
+}

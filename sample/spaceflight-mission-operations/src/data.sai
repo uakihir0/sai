@@ -1,0 +1,172 @@
+use acme:spaceflight-mission-operations/model.{
+    CrewWindow
+    MAX_PLANNING_HORIZON_SLOTS
+    MissionLimits
+    MissionTask
+    TaskDependency
+}
+
+pub fn tasks() -> Array<MissionTask, 12> {
+    [
+        MissionTask(
+            id: 1,
+            name: "Boot attitude sensors",
+            priority: 1,
+            earliest_start_slot: 0,
+            latest_finish_slot: 12,
+            duration_slots: 2,
+            power_watts: 2,
+            thermal_units: 1,
+            requires_crew: false,
+        ),
+        MissionTask(
+            id: 2,
+            name: "Map payload-bay temperatures",
+            priority: 1,
+            earliest_start_slot: 2,
+            latest_finish_slot: 16,
+            duration_slots: 4,
+            power_watts: 3,
+            thermal_units: 4,
+            requires_crew: true,
+        ),
+        MissionTask(
+            id: 3,
+            name: "Balance battery strings",
+            priority: 2,
+            earliest_start_slot: 2,
+            latest_finish_slot: 20,
+            duration_slots: 3,
+            power_watts: 4,
+            thermal_units: 2,
+            requires_crew: false,
+        ),
+        MissionTask(
+            id: 4,
+            name: "Calibrate star tracker",
+            priority: 1,
+            earliest_start_slot: 0,
+            latest_finish_slot: 20,
+            duration_slots: 2,
+            power_watts: 3,
+            thermal_units: 2,
+            requires_crew: true,
+        ),
+        MissionTask(
+            id: 5,
+            name: "Capture cold-trap specimen",
+            priority: 1,
+            earliest_start_slot: 0,
+            latest_finish_slot: 30,
+            duration_slots: 3,
+            power_watts: 4,
+            thermal_units: 3,
+            requires_crew: true,
+        ),
+        MissionTask(
+            id: 6,
+            name: "Exercise cycle",
+            priority: 5,
+            earliest_start_slot: 4,
+            latest_finish_slot: 30,
+            duration_slots: 4,
+            power_watts: 3,
+            thermal_units: 2,
+            requires_crew: true,
+        ),
+        MissionTask(
+            id: 7,
+            name: "Check relay link",
+            priority: 2,
+            earliest_start_slot: 0,
+            latest_finish_slot: 32,
+            duration_slots: 2,
+            power_watts: 4,
+            thermal_units: 2,
+            requires_crew: false,
+        ),
+        MissionTask(
+            id: 8,
+            name: "Downlink science package",
+            priority: 1,
+            earliest_start_slot: 0,
+            latest_finish_slot: 32,
+            duration_slots: 3,
+            power_watts: 5,
+            thermal_units: 2,
+            requires_crew: true,
+        ),
+        MissionTask(
+            id: 9,
+            name: "Inspect radiator panel",
+            priority: 3,
+            earliest_start_slot: 0,
+            latest_finish_slot: 30,
+            duration_slots: 11,
+            power_watts: 1,
+            thermal_units: 1,
+            requires_crew: true,
+        ),
+        MissionTask(
+            id: 10,
+            name: "Run high-gain oven calibration",
+            priority: 3,
+            earliest_start_slot: 0,
+            latest_finish_slot: 16,
+            duration_slots: 4,
+            power_watts: 7,
+            thermal_units: 2,
+            requires_crew: false,
+        ),
+        MissionTask(
+            id: 11,
+            name: "Seal specimen archive",
+            priority: 4,
+            earliest_start_slot: 0,
+            latest_finish_slot: 32,
+            duration_slots: 2,
+            power_watts: 1,
+            thermal_units: 1,
+            requires_crew: true,
+        ),
+        MissionTask(
+            id: 12,
+            name: "Run thermal-soak test",
+            priority: 3,
+            earliest_start_slot: 0,
+            latest_finish_slot: 16,
+            duration_slots: 3,
+            power_watts: 2,
+            thermal_units: 6,
+            requires_crew: false,
+        ),
+    ]
+}
+
+pub fn dependencies() -> Array<TaskDependency, 8> {
+    [
+        TaskDependency(task_id: 2, prerequisite_id: 1),
+        TaskDependency(task_id: 3, prerequisite_id: 1),
+        TaskDependency(task_id: 4, prerequisite_id: 2),
+        TaskDependency(task_id: 5, prerequisite_id: 3),
+        TaskDependency(task_id: 5, prerequisite_id: 4),
+        TaskDependency(task_id: 7, prerequisite_id: 5),
+        TaskDependency(task_id: 8, prerequisite_id: 7),
+        TaskDependency(task_id: 11, prerequisite_id: 9),
+    ]
+}
+
+pub fn crew_windows() -> Array<CrewWindow, 2> {
+    [
+        CrewWindow(name: "Window A", start_slot: 4, end_slot: 14),
+        CrewWindow(name: "Window B", start_slot: 20, end_slot: 30),
+    ]
+}
+
+pub fn limits() -> MissionLimits {
+    MissionLimits(
+        planning_horizon_slots: MAX_PLANNING_HORIZON_SLOTS,
+        max_power_watts: 6,
+        max_thermal_units: 5,
+    )
+}

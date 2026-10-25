@@ -1,0 +1,124 @@
+use acme:spaceflight-mission-operations/model.{GraphIssue, MissionTask, TaskDependency, TaskOrder}
+
+fn empty_order(issue: GraphIssue) -> TaskOrder {
+    TaskOrder(task_ids: Array<Option<U32>, 12>.filled(None), length: 0, issue: Some(issue))
+}
+
+fn task_index(tasks: Array<MissionTask, 12>, task_id: U32) -> Option<USize> {
+    for index in 0..tasks.len() {
+        if tasks[index].id == task_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn dependencies_are_included(
+    task_id: U32,
+    tasks: Array<MissionTask, 12>,
+    dependencies: Array<TaskDependency, 8>,
+    included: Array<Bool, 12>,
+) -> Bool {
+    var ready = true
+    for dependency in dependencies {
+        if dependency.task_id == task_id {
+            match task_index(tasks, dependency.prerequisite_id) {
+                Some(index) => {
+                    if not included[index] {
+                        ready = false
+                    }
+                }
+                None => {
+                    ready = false
+                }
+            }
+        }
+    }
+    ready
+}
+
+fn validate_graph(tasks: Array<MissionTask, 12>, dependencies: Array<TaskDependency, 8>) -> Option<
+    GraphIssue,
+> {
+    for index in 0..tasks.len() {
+        for other_index in (index + 1)..tasks.len() {
+            if tasks[index].id == tasks[other_index].id {
+                return Some(GraphIssue.DuplicateTaskId)
+            }
+        }
+    }
+
+    for index in 0..dependencies.len() {
+        let dependency = dependencies[index]
+        if dependency.task_id == dependency.prerequisite_id {
+            return Some(GraphIssue.SelfDependency)
+        }
+        if (
+            task_index(tasks, dependency.task_id) == None
+            or task_index(tasks, dependency.prerequisite_id) == None
+        ) {
+            return Some(GraphIssue.UnknownTaskEndpoint)
+        }
+        for other_index in (index + 1)..dependencies.len() {
+            let other = dependencies[other_index]
+            if (
+                dependency.task_id == other.task_id
+                and dependency.prerequisite_id == other.prerequisite_id
+            ) {
+                return Some(GraphIssue.DuplicateDependency)
+            }
+        }
+    }
+    None
+}
+
+pub fn order_tasks(
+    tasks: Array<MissionTask, 12>,
+    dependencies: Array<TaskDependency, 8>,
+) -> TaskOrder {
+    match validate_graph(tasks, dependencies) {
+        Some(issue) => return empty_order(issue)
+        None => {}
+    }
+
+    var task_ids = Array<Option<U32>, 12>.filled(None)
+    var included = Array<Bool, 12>.filled(false)
+
+    for position in 0..tasks.len() {
+        var best_index: Option<USize> = None
+        for index in 0..tasks.len() {
+            if (
+                not included[index]
+                and dependencies_are_included(tasks[index].id, tasks, dependencies, included)
+            ) {
+                match best_index {
+                    Some(current_index) => {
+                        let candidate = tasks[index]
+                        let current = tasks[current_index]
+                        if (
+                            candidate.priority < current.priority
+                            or (
+                                candidate.priority == current.priority and candidate.id < current.id
+                            )
+                        ) {
+                            best_index = Some(index)
+                        }
+                    }
+                    None => {
+                        best_index = Some(index)
+                    }
+                }
+            }
+        }
+
+        match best_index {
+            Some(index) => {
+                task_ids[position] = Some(tasks[index].id)
+                included[index] = true
+            }
+            None => return empty_order(GraphIssue.DependencyCycle)
+        }
+    }
+
+    TaskOrder(task_ids: task_ids, length: tasks.len(), issue: None)
+}
