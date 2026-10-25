@@ -89,11 +89,12 @@ receipts, calculate taxes, or call a payment service.
   suggested reimbursement even when it marks the claim `Adjusted`. Confirm
   whether an employee or manager must accept that reduction before it can be
   included in a payment run.
-- **Receipt reuse:** Any repeated nonzero receipt reference on an earlier
-  non-denied claim holds the later claim, even when two employees split a
-  shared bill or the first claim is itself held. Confirm how shared receipts
-  should be allocated and whether a receipt should be reserved only after
-  approval.
+- **Receipt reuse:** A later claim that reaches the duplicate-reference check
+  is held when an earlier non-denied claim used the same nonzero receipt
+  reference, even when two employees split a shared bill or the first claim is
+  itself held. Claims denied by an earlier check do not reserve a reference.
+  Confirm how shared receipts should be allocated and whether a receipt should
+  be reserved only after approval.
 - **Lodging cap:** The limit is nightly rate multiplied by reported nights.
   Taxes, fees, room class, destination, occupancy, and policy exceptions are
   not modeled. Confirm which of those count toward the real cap.
@@ -109,8 +110,10 @@ command entry point, file access, network dependency, persistent state, or
 payment side effect. The multi-module design uses records, enums, fixed
 arrays, sorting, loops, and source-level assertions.
 
-This project is illustrative, not a build guarantee. The repository's current
-`sai check` attempt reports `FEATURE_NOT_IMPLEMENTED` for package checking,
-`@derive`, import resolution, and type analysis. `sai fmt --check` does pass
-for all sample files. The embedded assertions and expected totals above are
-hand-checked and have not been executed by SAI.
+This project is illustrative, not a build guarantee. The repository supports
+some narrow single-package checks and Phase 1 local module-alias and item-import
+resolution, but those slices do not cover this sample's combined features.
+Full multi-module semantic checking and derive processing remain gated by
+`FEATURE_NOT_IMPLEMENTED`. `sai fmt --check` does pass for all sample files.
+The embedded assertions and expected totals above are hand-checked and have
+not been executed by SAI.
