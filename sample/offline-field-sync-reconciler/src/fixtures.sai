@@ -1,0 +1,360 @@
+use acme:offline-field-sync-reconciler/model.{
+    FieldValue
+    LocalPatch
+    MAX_LOCAL_PATCHES
+    MAX_SERVER_CHANGES
+    MAX_SYNC_CASES
+    ServerChange
+    SyncBatch
+    SyncCase
+    WorkField
+    WorkOrder
+    WorkStatus
+}
+
+fn empty_case(order: WorkOrder, current_revision: U32, history_floor_revision: U32) -> SyncCase {
+    SyncCase(
+        server_state: order,
+        current_revision: current_revision,
+        history_floor_revision: history_floor_revision,
+        server_changes: Array<Option<ServerChange>, MAX_SERVER_CHANGES>.filled(None),
+        server_change_count: 0,
+        local_patches: Array<Option<LocalPatch>, MAX_LOCAL_PATCHES>.filled(None),
+        local_patch_count: 0,
+    )
+}
+
+fn independent_edit_case() -> SyncCase {
+    var case = empty_case(
+        WorkOrder(
+            id: 4101,
+            summary: "inspect air filter",
+            status: WorkStatus.InProgress,
+            assignee: Some(71),
+            due_day: Some(105),
+        ),
+        4,
+        1,
+    )
+    case.server_changes[0] = Some(
+        ServerChange(
+            revision: 2,
+            field: WorkField.Status,
+            value: FieldValue.Status(WorkStatus.InProgress),
+        ),
+    )
+    case.server_changes[1] = Some(
+        ServerChange(revision: 3, field: WorkField.DueDay, value: FieldValue.DueDay(Some(105))),
+    )
+    case.server_changes[2] = Some(
+        ServerChange(revision: 4, field: WorkField.Assignee, value: FieldValue.Assignee(Some(71))),
+    )
+    case.server_change_count = 3
+    case.local_patches[0] = Some(
+        LocalPatch(
+            client_id: 12,
+            event_id: 5001,
+            base_revision: 2,
+            field: WorkField.Summary,
+            value: FieldValue.Summary("replace air filter"),
+        ),
+    )
+    case.local_patch_count = 1
+    case
+}
+
+fn remote_conflict_case() -> SyncCase {
+    var case = empty_case(
+        WorkOrder(
+            id: 4102,
+            summary: "inspect lift",
+            status: WorkStatus.Complete,
+            assignee: Some(73),
+            due_day: Some(106),
+        ),
+        3,
+        1,
+    )
+    case.server_changes[0] = Some(
+        ServerChange(
+            revision: 2,
+            field: WorkField.Status,
+            value: FieldValue.Status(WorkStatus.InProgress),
+        ),
+    )
+    case.server_changes[1] = Some(
+        ServerChange(
+            revision: 3,
+            field: WorkField.Status,
+            value: FieldValue.Status(WorkStatus.Complete),
+        ),
+    )
+    case.server_change_count = 2
+    case.local_patches[0] = Some(
+        LocalPatch(
+            client_id: 17,
+            event_id: 6101,
+            base_revision: 1,
+            field: WorkField.Status,
+            value: FieldValue.Status(WorkStatus.Blocked),
+        ),
+    )
+    case.local_patch_count = 1
+    case
+}
+
+fn independent_fields_case() -> SyncCase {
+    var case = empty_case(
+        WorkOrder(
+            id: 4103,
+            summary: "inspect valve",
+            status: WorkStatus.Queued,
+            assignee: None,
+            due_day: None,
+        ),
+        5,
+        3,
+    )
+    case.server_changes[0] = Some(
+        ServerChange(revision: 4, field: WorkField.Assignee, value: FieldValue.Assignee(Some(22))),
+    )
+    case.server_changes[1] = Some(
+        ServerChange(revision: 5, field: WorkField.DueDay, value: FieldValue.DueDay(Some(108))),
+    )
+    case.server_change_count = 2
+    case.server_state.assignee = Some(22)
+    case.server_state.due_day = Some(108)
+    case.local_patches[0] = Some(
+        LocalPatch(
+            client_id: 21,
+            event_id: 7101,
+            base_revision: 3,
+            field: WorkField.Status,
+            value: FieldValue.Status(WorkStatus.InProgress),
+        ),
+    )
+    case.local_patches[1] = Some(
+        LocalPatch(
+            client_id: 21,
+            event_id: 7102,
+            base_revision: 3,
+            field: WorkField.Summary,
+            value: FieldValue.Summary("inspect valve actuator"),
+        ),
+    )
+    case.local_patch_count = 2
+    case
+}
+
+fn duplicate_arrival_case() -> SyncCase {
+    var case = empty_case(
+        WorkOrder(
+            id: 4104,
+            summary: "test backup pump",
+            status: WorkStatus.Queued,
+            assignee: Some(31),
+            due_day: Some(111),
+        ),
+        8,
+        8,
+    )
+    let replayed = LocalPatch(
+        client_id: 31,
+        event_id: 8101,
+        base_revision: 8,
+        field: WorkField.Status,
+        value: FieldValue.Status(WorkStatus.InProgress),
+    )
+    case.local_patches[0] = Some(replayed)
+    case.local_patches[1] = Some(replayed)
+    case.local_patch_count = 2
+    case
+}
+
+fn delete_update_conflict_case() -> SyncCase {
+    var case = empty_case(
+        WorkOrder(
+            id: 4105,
+            summary: "check east gate",
+            status: WorkStatus.InProgress,
+            assignee: Some(18),
+            due_day: Some(114),
+        ),
+        7,
+        6,
+    )
+    case.server_changes[0] = Some(
+        ServerChange(revision: 7, field: WorkField.DueDay, value: FieldValue.DueDay(Some(114))),
+    )
+    case.server_change_count = 1
+    case.local_patches[0] = Some(
+        LocalPatch(
+            client_id: 42,
+            event_id: 9101,
+            base_revision: 6,
+            field: WorkField.DueDay,
+            value: FieldValue.DueDay(None),
+        ),
+    )
+    case.local_patches[1] = Some(
+        LocalPatch(
+            client_id: 42,
+            event_id: 9102,
+            base_revision: 6,
+            field: WorkField.Summary,
+            value: FieldValue.Summary("inspect east gate latch"),
+        ),
+    )
+    case.local_patch_count = 2
+    case
+}
+
+fn event_id_collision_case() -> SyncCase {
+    var case = empty_case(
+        WorkOrder(
+            id: 4106,
+            summary: "inspect loading door",
+            status: WorkStatus.Queued,
+            assignee: None,
+            due_day: Some(116),
+        ),
+        11,
+        11,
+    )
+    case.local_patches[0] = Some(
+        LocalPatch(
+            client_id: 53,
+            event_id: 9901,
+            base_revision: 11,
+            field: WorkField.Summary,
+            value: FieldValue.Summary("replace loading door seal"),
+        ),
+    )
+    case.local_patches[1] = Some(
+        LocalPatch(
+            client_id: 53,
+            event_id: 9901,
+            base_revision: 11,
+            field: WorkField.Summary,
+            value: FieldValue.Summary("replace loading door spring"),
+        ),
+    )
+    let separate_edit = LocalPatch(
+        client_id: 54,
+        event_id: 9903,
+        base_revision: 11,
+        field: WorkField.Summary,
+        value: FieldValue.Summary("replace loading door seal"),
+    )
+    case.local_patches[2] = Some(separate_edit)
+    case.local_patches[3] = Some(separate_edit)
+    case.local_patches[4] = Some(
+        LocalPatch(
+            client_id: 53,
+            event_id: 9902,
+            base_revision: 11,
+            field: WorkField.Status,
+            value: FieldValue.Status(WorkStatus.InProgress),
+        ),
+    )
+    case.local_patch_count = 5
+    case
+}
+
+fn offline_field_conflict_case() -> SyncCase {
+    var case = empty_case(
+        WorkOrder(
+            id: 4107,
+            summary: "inspect west gate",
+            status: WorkStatus.InProgress,
+            assignee: None,
+            due_day: Some(122),
+        ),
+        12,
+        12,
+    )
+    case.local_patches[0] = Some(
+        LocalPatch(
+            client_id: 60,
+            event_id: 10101,
+            base_revision: 12,
+            field: WorkField.DueDay,
+            value: FieldValue.DueDay(None),
+        ),
+    )
+    case.local_patches[1] = Some(
+        LocalPatch(
+            client_id: 61,
+            event_id: 10102,
+            base_revision: 12,
+            field: WorkField.DueDay,
+            value: FieldValue.DueDay(Some(123)),
+        ),
+    )
+    case.local_patches[2] = Some(
+        LocalPatch(
+            client_id: 60,
+            event_id: 10103,
+            base_revision: 12,
+            field: WorkField.Summary,
+            value: FieldValue.Summary("inspect west gate hinge"),
+        ),
+    )
+    case.local_patch_count = 3
+    case
+}
+
+fn stale_and_fresh_patch_case() -> SyncCase {
+    var case = empty_case(
+        WorkOrder(
+            id: 4108,
+            summary: "inspect chiller",
+            status: WorkStatus.InProgress,
+            assignee: Some(29),
+            due_day: Some(127),
+        ),
+        6,
+        5,
+    )
+    case.server_changes[0] = Some(
+        ServerChange(
+            revision: 6,
+            field: WorkField.Status,
+            value: FieldValue.Status(WorkStatus.InProgress),
+        ),
+    )
+    case.server_change_count = 1
+    case.local_patches[0] = Some(
+        LocalPatch(
+            client_id: 70,
+            event_id: 11101,
+            base_revision: 4,
+            field: WorkField.Summary,
+            value: FieldValue.Summary("check chiller compressor"),
+        ),
+    )
+    case.local_patches[1] = Some(
+        LocalPatch(
+            client_id: 70,
+            event_id: 11102,
+            base_revision: 6,
+            field: WorkField.Summary,
+            value: FieldValue.Summary("inspect the chiller compressor"),
+        ),
+    )
+    case.local_patch_count = 2
+    case
+}
+
+pub fn sample_batch() -> SyncBatch {
+    var cases = Array<Option<SyncCase>, MAX_SYNC_CASES>.filled(None)
+    cases[0] = Some(independent_edit_case())
+    cases[1] = Some(remote_conflict_case())
+    cases[2] = Some(independent_fields_case())
+    cases[3] = Some(duplicate_arrival_case())
+    cases[4] = Some(delete_update_conflict_case())
+    cases[5] = Some(event_id_collision_case())
+    cases[6] = Some(offline_field_conflict_case())
+    cases[7] = Some(stale_and_fresh_patch_case())
+    SyncBatch(cases: cases, case_count: 8)
+}

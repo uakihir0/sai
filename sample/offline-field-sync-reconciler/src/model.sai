@@ -1,0 +1,155 @@
+pub const MAX_SYNC_CASES: USize = 8
+pub const MAX_SERVER_CHANGES: USize = 8
+pub const MAX_LOCAL_PATCHES: USize = 8
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum WorkStatus {
+    Queued
+    InProgress
+    Blocked
+    Complete
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type WorkOrder {
+    pub id: U32
+    pub summary: Str
+    pub status: WorkStatus
+    pub assignee: Option<U32>
+    pub due_day: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum WorkField {
+    Summary
+    Status
+    Assignee
+    DueDay
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum FieldValue {
+    Summary(Str)
+    Status(WorkStatus)
+    Assignee(Option<U32>)
+    DueDay(Option<U32>)
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ServerChange {
+    pub revision: U32
+    pub field: WorkField
+    pub value: FieldValue
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type LocalPatch {
+    pub client_id: U32
+    pub event_id: U32
+    pub base_revision: U32
+    pub field: WorkField
+    pub value: FieldValue
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SyncCase {
+    pub server_state: WorkOrder
+    pub current_revision: U32
+    // The journal contains every field change after this revision through current_revision.
+    pub history_floor_revision: U32
+    pub server_changes: Array<Option<ServerChange>, MAX_SERVER_CHANGES>
+    pub server_change_count: USize
+    pub local_patches: Array<Option<LocalPatch>, MAX_LOCAL_PATCHES>
+    pub local_patch_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReviewReason {
+    ZeroEventId
+    BaseRevisionUnavailable
+    BaseRevisionInFuture
+    RemoteFieldChanged
+    ConflictingOfflineValues
+    EventIdPayloadMismatch
+    FieldValueDoesNotMatch
+    RevisionExhausted
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PatchDisposition {
+    Applied
+    Converged
+    DuplicateArrival
+    Conflict
+    Held
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PatchOutcome {
+    pub client_id: U32
+    pub event_id: U32
+    pub field: WorkField
+    pub disposition: PatchDisposition
+    pub review_reason: Option<ReviewReason>
+    pub resulting_revision: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum SyncIssue {
+    CountsExceedCapacity
+    HistoryFloorAfterCurrentRevision
+    MissingServerChange
+    MissingLocalPatch
+    InvalidServerHistory
+    HistoryDoesNotCoverCurrentRevision
+    DuplicateWorkOrderId
+    BatchCountExceedsCapacity
+    MissingCase
+    RevisionExhausted
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum SyncStatus {
+    Merged
+    NoChanges
+    PartialMerge
+    NeedsReview
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SyncResult {
+    pub work_order_id: U32
+    pub state: WorkOrder
+    pub status: SyncStatus
+    pub final_revision: U32
+    pub outcomes: Array<Option<PatchOutcome>, MAX_LOCAL_PATCHES>
+    pub outcome_count: USize
+    pub applied_count: USize
+    pub converged_count: USize
+    pub duplicate_count: USize
+    pub conflict_count: USize
+    pub held_count: USize
+    pub issue: Option<SyncIssue>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SyncBatch {
+    pub cases: Array<Option<SyncCase>, MAX_SYNC_CASES>
+    pub case_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SyncAudit {
+    pub results: Array<Option<SyncResult>, MAX_SYNC_CASES>
+    pub result_count: USize
+    pub merged_count: USize
+    pub no_change_count: USize
+    pub partial_merge_count: USize
+    pub needs_review_count: USize
+    pub applied_patch_count: USize
+    pub converged_patch_count: USize
+    pub duplicate_arrival_count: USize
+    pub conflict_count: USize
+    pub held_count: USize
+    pub issue: Option<SyncIssue>
+}

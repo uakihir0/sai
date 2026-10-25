@@ -1,0 +1,372 @@
+use acme:offline-field-sync-reconciler/model.{
+    FieldValue
+    LocalPatch
+    MAX_LOCAL_PATCHES
+    MAX_SERVER_CHANGES
+    PatchDisposition
+    PatchOutcome
+    ReviewReason
+    ServerChange
+    SyncCase
+    SyncIssue
+    SyncResult
+    SyncStatus
+    WorkField
+    WorkOrder
+}
+use sai:core/num.{U32_MAX}
+
+fn field_value_matches(field: WorkField, value: FieldValue) -> Bool {
+    match (field, value) {
+        (WorkField.Summary, FieldValue.Summary(_)) => true
+        (WorkField.Status, FieldValue.Status(_)) => true
+        (WorkField.Assignee, FieldValue.Assignee(_)) => true
+        (WorkField.DueDay, FieldValue.DueDay(_)) => true
+        _ => false
+    }
+}
+
+fn value_in(order: WorkOrder, field: WorkField) -> FieldValue {
+    match field {
+        WorkField.Summary => FieldValue.Summary(order.summary)
+        WorkField.Status => FieldValue.Status(order.status)
+        WorkField.Assignee => FieldValue.Assignee(order.assignee)
+        WorkField.DueDay => FieldValue.DueDay(order.due_day)
+    }
+}
+
+fn with_value(order: WorkOrder, field: WorkField, value: FieldValue) -> WorkOrder {
+    match (field, value) {
+        (WorkField.Summary, FieldValue.Summary(text)) => WorkOrder(
+            id: order.id,
+            summary: text,
+            status: order.status,
+            assignee: order.assignee,
+            due_day: order.due_day,
+        )
+        (WorkField.Status, FieldValue.Status(status)) => WorkOrder(
+            id: order.id,
+            summary: order.summary,
+            status: status,
+            assignee: order.assignee,
+            due_day: order.due_day,
+        )
+        (WorkField.Assignee, FieldValue.Assignee(assignee)) => WorkOrder(
+            id: order.id,
+            summary: order.summary,
+            status: order.status,
+            assignee: assignee,
+            due_day: order.due_day,
+        )
+        (WorkField.DueDay, FieldValue.DueDay(day)) => WorkOrder(
+            id: order.id,
+            summary: order.summary,
+            status: order.status,
+            assignee: order.assignee,
+            due_day: day,
+        )
+        _ => order
+    }
+}
+
+fn same_client_event(left: LocalPatch, right: LocalPatch) -> Bool {
+    left.client_id == right.client_id and left.event_id == right.event_id
+}
+
+fn same_event_payload(left: LocalPatch, right: LocalPatch) -> Bool {
+    (
+        same_client_event(left, right)
+        and left.base_revision == right.base_revision
+        and left.field == right.field
+        and left.value == right.value
+    )
+}
+
+fn event_id_payload_conflicts(case: SyncCase, patch_index: USize, patch: LocalPatch) -> Bool {
+    for index in 0..case.local_patch_count {
+        if index == patch_index {
+            continue
+        }
+        match case.local_patches[index] {
+            Some(other) => {
+                if same_client_event(patch, other) and not same_event_payload(patch, other) {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+fn is_prior_duplicate(case: SyncCase, patch_index: USize, patch: LocalPatch) -> Bool {
+    for index in 0..patch_index {
+        match case.local_patches[index] {
+            Some(previous) => {
+                if same_event_payload(previous, patch) {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+fn local_field_conflicts(case: SyncCase, patch_index: USize, patch: LocalPatch) -> Bool {
+    for index in 0..case.local_patch_count {
+        if index == patch_index {
+            continue
+        }
+        match case.local_patches[index] {
+            Some(other) => {
+                if (
+                    other.event_id == 0
+                    or other.base_revision < case.history_floor_revision
+                    or other.base_revision > case.current_revision
+                    or not field_value_matches(other.field, other.value)
+                ) {
+                    continue
+                }
+                if (
+                    other.field == patch.field
+                    and not same_client_event(other, patch)
+                    and other.value != patch.value
+                ) {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+fn remote_field_changed_after(case: SyncCase, patch: LocalPatch) -> Bool {
+    for index in 0..case.server_change_count {
+        match case.server_changes[index] {
+            Some(change) => {
+                if change.field == patch.field and change.revision > patch.base_revision {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+pub fn validate_server_journal(case: SyncCase) -> Option<SyncIssue> {
+    if case.server_change_count > MAX_SERVER_CHANGES {
+        return Some(SyncIssue.CountsExceedCapacity)
+    }
+    if case.history_floor_revision > case.current_revision {
+        return Some(SyncIssue.HistoryFloorAfterCurrentRevision)
+    }
+
+    var expected_revision = case.history_floor_revision
+    for index in 0..case.server_change_count {
+        let change = match case.server_changes[index] {
+            Some(change) => change
+            None => return Some(SyncIssue.MissingServerChange)
+        }
+        if expected_revision == U32_MAX {
+            return Some(SyncIssue.InvalidServerHistory)
+        }
+        expected_revision += 1
+        if (
+            change.revision != expected_revision
+            or change.revision > case.current_revision
+            or not field_value_matches(change.field, change.value)
+        ) {
+            return Some(SyncIssue.InvalidServerHistory)
+        }
+    }
+    if expected_revision != case.current_revision {
+        return Some(SyncIssue.HistoryDoesNotCoverCurrentRevision)
+    }
+    None
+}
+
+pub fn validate(case: SyncCase) -> Option<SyncIssue> {
+    match validate_server_journal(case) { Some(issue) => return Some(issue), None => {} }
+    if case.local_patch_count > MAX_LOCAL_PATCHES {
+        return Some(SyncIssue.CountsExceedCapacity)
+    }
+    for index in 0..case.local_patch_count {
+        if case.local_patches[index] == None {
+            return Some(SyncIssue.MissingLocalPatch)
+        }
+    }
+    None
+}
+
+pub fn empty_result(case: SyncCase) -> SyncResult {
+    SyncResult(
+        work_order_id: case.server_state.id,
+        state: case.server_state,
+        status: SyncStatus.NeedsReview,
+        final_revision: case.current_revision,
+        outcomes: Array<Option<PatchOutcome>, MAX_LOCAL_PATCHES>.filled(None),
+        outcome_count: 0,
+        applied_count: 0,
+        converged_count: 0,
+        duplicate_count: 0,
+        conflict_count: 0,
+        held_count: 0,
+        issue: None,
+    )
+}
+
+pub fn held_result(case: SyncCase, issue: SyncIssue) -> SyncResult {
+    var result = empty_result(case)
+    result.issue = Some(issue)
+    result.held_count = case.local_patch_count
+    result
+}
+
+fn record_outcome(
+    result: SyncResult,
+    patch: LocalPatch,
+    disposition: PatchDisposition,
+    reason: Option<ReviewReason>,
+) -> SyncResult {
+    var next = result
+    next.outcomes[next.outcome_count] = Some(
+        PatchOutcome(
+            client_id: patch.client_id,
+            event_id: patch.event_id,
+            field: patch.field,
+            disposition: disposition,
+            review_reason: reason,
+            resulting_revision: next.final_revision,
+        ),
+    )
+    next.outcome_count += 1
+    match disposition {
+        PatchDisposition.Applied => {
+            next.applied_count += 1
+        }
+        PatchDisposition.Converged => {
+            next.converged_count += 1
+        }
+        PatchDisposition.DuplicateArrival => {
+            next.duplicate_count += 1
+        }
+        PatchDisposition.Conflict => {
+            next.conflict_count += 1
+        }
+        PatchDisposition.Held => {
+            next.held_count += 1
+        }
+    }
+    next
+}
+
+pub fn reconcile(case: SyncCase) -> SyncResult {
+    match validate(case) { Some(issue) => return held_result(case, issue), None => {} }
+
+    var result = empty_result(case)
+    result.status = SyncStatus.NoChanges
+
+    for index in 0..case.local_patch_count {
+        let patch = case.local_patches[index].unwrap()
+
+        if patch.event_id == 0 {
+            result =
+                record_outcome(result, patch, PatchDisposition.Held, Some(ReviewReason.ZeroEventId))
+            continue
+        }
+        if patch.base_revision < case.history_floor_revision {
+            result = record_outcome(
+                result,
+                patch,
+                PatchDisposition.Held,
+                Some(ReviewReason.BaseRevisionUnavailable),
+            )
+            continue
+        }
+        if patch.base_revision > case.current_revision {
+            result = record_outcome(
+                result,
+                patch,
+                PatchDisposition.Held,
+                Some(ReviewReason.BaseRevisionInFuture),
+            )
+            continue
+        }
+        if not field_value_matches(patch.field, patch.value) {
+            result = record_outcome(
+                result,
+                patch,
+                PatchDisposition.Held,
+                Some(ReviewReason.FieldValueDoesNotMatch),
+            )
+            continue
+        }
+        if event_id_payload_conflicts(case, index, patch) {
+            result = record_outcome(
+                result,
+                patch,
+                PatchDisposition.Held,
+                Some(ReviewReason.EventIdPayloadMismatch),
+            )
+            continue
+        }
+        if is_prior_duplicate(case, index, patch) {
+            result = record_outcome(result, patch, PatchDisposition.DuplicateArrival, None)
+            continue
+        }
+        if local_field_conflicts(case, index, patch) {
+            result = record_outcome(
+                result,
+                patch,
+                PatchDisposition.Conflict,
+                Some(ReviewReason.ConflictingOfflineValues),
+            )
+            continue
+        }
+
+        let server_value = value_in(result.state, patch.field)
+        if remote_field_changed_after(case, patch) and server_value != patch.value {
+            result = record_outcome(
+                result,
+                patch,
+                PatchDisposition.Conflict,
+                Some(ReviewReason.RemoteFieldChanged),
+            )
+            continue
+        }
+        if server_value == patch.value {
+            result = record_outcome(result, patch, PatchDisposition.Converged, None)
+            continue
+        }
+        if result.final_revision == U32_MAX {
+            result.issue = Some(SyncIssue.RevisionExhausted)
+            result = record_outcome(
+                result,
+                patch,
+                PatchDisposition.Held,
+                Some(ReviewReason.RevisionExhausted),
+            )
+            continue
+        }
+
+        result.state = with_value(result.state, patch.field, patch.value)
+        result.final_revision += 1
+        result = record_outcome(result, patch, PatchDisposition.Applied, None)
+    }
+
+    if result.conflict_count > 0 or result.held_count > 0 {
+        if result.applied_count > 0 {
+            result.status = SyncStatus.PartialMerge
+        } else {
+            result.status = SyncStatus.NeedsReview
+        }
+    } else if result.applied_count > 0 {
+        result.status = SyncStatus.Merged
+    } else {
+        result.status = SyncStatus.NoChanges
+    }
+    result
+}

@@ -61,6 +61,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`air-quality-monitor`](air-quality-monitor/README.md) | Apply a PM2.5 alert state machine with consecutive-reading hysteresis, sensor-fault resets, and trigger/recovery thresholds. |
 | Advanced | [`quota-ledger`](quota-ledger/README.md) | Model capacity-bounded reserve/release operations with contracts and property tests. |
 | Advanced | [`nonogram-solver`](nonogram-solver/README.md) | Validate line clues, enumerate fixed-width candidates, prune partial grids, and backtrack to a deterministic solution. |
+| Advanced | [`offline-field-sync-reconciler`](offline-field-sync-reconciler/README.md) | Three-way merge offline work-order edits by field; suppress exact retries and hold concurrent edits, stale bases, and event-ID collisions for review. |
 | Advanced | [`invoice-reconciliation`](invoice-reconciliation/README.md) | Match invoices against purchase orders and receipts; flag price and reference issues, partial billing, and cumulative overbilling. |
 | Advanced | [`swiss-tournament-auditor`](swiss-tournament-auditor/README.md) | Validate a fixed Swiss-style tournament, calculate match points and Buchholz tie-breaks, then produce deterministic standings. |
 | Advanced | [`municipal-microgrant-review`](municipal-microgrant-review/README.md) | Screen community project applications, rank a review rubric, and allocate whole grants under budget and district limits. |

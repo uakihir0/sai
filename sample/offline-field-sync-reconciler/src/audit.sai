@@ -1,0 +1,85 @@
+use acme:offline-field-sync-reconciler/model.{
+    MAX_SYNC_CASES
+    SyncAudit
+    SyncBatch
+    SyncIssue
+    SyncResult
+    SyncStatus
+}
+use acme:offline-field-sync-reconciler/reconcile
+
+fn batch_issue(batch: SyncBatch) -> Option<SyncIssue> {
+    if batch.case_count > MAX_SYNC_CASES {
+        return Some(SyncIssue.BatchCountExceedsCapacity)
+    }
+    for index in 0..batch.case_count {
+        let case = match batch.cases[index] {
+            Some(case) => case
+            None => return Some(SyncIssue.MissingCase)
+        }
+        match reconcile.validate_server_journal(case) {
+            Some(issue) => return Some(issue)
+            None => {}
+        }
+    }
+    for left_index in 0..batch.case_count {
+        let left = batch.cases[left_index].unwrap()
+        for right_index in 0..left_index {
+            let right = batch.cases[right_index].unwrap()
+            if left.server_state.id == right.server_state.id {
+                return Some(SyncIssue.DuplicateWorkOrderId)
+            }
+        }
+    }
+    None
+}
+
+fn empty_audit(issue: Option<SyncIssue>) -> SyncAudit {
+    SyncAudit(
+        results: Array<Option<SyncResult>, MAX_SYNC_CASES>.filled(None),
+        result_count: 0,
+        merged_count: 0,
+        no_change_count: 0,
+        partial_merge_count: 0,
+        needs_review_count: 0,
+        applied_patch_count: 0,
+        converged_patch_count: 0,
+        duplicate_arrival_count: 0,
+        conflict_count: 0,
+        held_count: 0,
+        issue: issue,
+    )
+}
+
+pub fn audit_all(batch: SyncBatch) -> SyncAudit {
+    match batch_issue(batch) { Some(issue) => return empty_audit(Some(issue)), None => {} }
+
+    var audit = empty_audit(None)
+    for index in 0..batch.case_count {
+        let case = batch.cases[index].unwrap()
+        let result = reconcile.reconcile(case)
+        audit.results[audit.result_count] = Some(result)
+        audit.result_count += 1
+
+        match result.status {
+            SyncStatus.Merged => {
+                audit.merged_count += 1
+            }
+            SyncStatus.NoChanges => {
+                audit.no_change_count += 1
+            }
+            SyncStatus.PartialMerge => {
+                audit.partial_merge_count += 1
+            }
+            SyncStatus.NeedsReview => {
+                audit.needs_review_count += 1
+            }
+        }
+        audit.applied_patch_count += result.applied_count
+        audit.converged_patch_count += result.converged_count
+        audit.duplicate_arrival_count += result.duplicate_count
+        audit.conflict_count += result.conflict_count
+        audit.held_count += result.held_count
+    }
+    audit
+}
