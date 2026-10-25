@@ -1,0 +1,225 @@
+use acme:quorum-replication-lab/model.{
+    Cluster
+    REPLICA_COUNT
+    ReadReport
+    ReadStatus
+    Replica
+    VersionedValue
+    WriteReport
+    WriteStatus
+}
+
+fn report_for_write(
+    status: WriteStatus,
+    cluster: Cluster,
+    version: U32,
+    acknowledgement_count: USize,
+    applied_replica_count: USize,
+) -> WriteReport {
+    WriteReport(
+        status: status,
+        cluster: cluster,
+        version: version,
+        acknowledgement_count: acknowledgement_count,
+        applied_replica_count: applied_replica_count,
+    )
+}
+
+fn report_for_read(
+    status: ReadStatus,
+    cluster: Cluster,
+    record: Option<VersionedValue>,
+    source_replica_id: Option<U32>,
+    conflicting_latest_value: Bool,
+    repaired_replica_count: USize,
+) -> ReadReport {
+    ReadReport(
+        status: status,
+        cluster: cluster,
+        record: record,
+        source_replica_id: source_replica_id,
+        conflicting_latest_value: conflicting_latest_value,
+        repaired_replica_count: repaired_replica_count,
+    )
+}
+
+pub fn cluster_is_valid(cluster: Cluster) -> Bool {
+    if cluster.replica_count != REPLICA_COUNT {
+        return false
+    }
+    if (
+        cluster.read_quorum == 0
+        or cluster.read_quorum > REPLICA_COUNT
+        or cluster.write_quorum == 0
+        or cluster.write_quorum > REPLICA_COUNT
+        or cluster.read_quorum + cluster.write_quorum <= REPLICA_COUNT
+    ) {
+        return false
+    }
+
+    for index in 0..REPLICA_COUNT {
+        let replica = match cluster.replicas[index] { Some(value) => value, None => return false }
+        if replica.id == 0 {
+            return false
+        }
+        if replica.acknowledgement_delivered and not replica.write_reachable {
+            return false
+        }
+        if let Some(record) = replica.record {
+            if record.version == 0 {
+                return false
+            }
+        }
+        for prior_index in 0..index {
+            let prior = cluster.replicas[prior_index].unwrap()
+            if prior.id == replica.id {
+                return false
+            }
+        }
+    }
+    true
+}
+
+fn newest_version(cluster: Cluster) -> U32 {
+    var newest: U32 = 0
+    for index in 0..REPLICA_COUNT {
+        let replica = cluster.replicas[index].unwrap()
+        if let Some(record) = replica.record {
+            if record.version > newest {
+                newest = record.version
+            }
+        }
+    }
+    newest
+}
+
+pub fn write(cluster: Cluster, version: U32, value: I32) -> WriteReport {
+    if not cluster_is_valid(cluster) {
+        return report_for_write(WriteStatus.InvalidInput, cluster, version, 0, 0)
+    }
+    if version <= newest_version(cluster) {
+        return report_for_write(WriteStatus.StaleVersion, cluster, version, 0, 0)
+    }
+
+    let next_record = VersionedValue(version: version, value: value)
+    var updated_cluster = cluster
+    var acknowledgement_count: USize = 0
+    var applied_replica_count: USize = 0
+    for index in 0..REPLICA_COUNT {
+        var replica = updated_cluster.replicas[index].unwrap()
+        if replica.write_reachable {
+            replica.record = Some(next_record)
+            applied_replica_count += 1
+        }
+        if replica.acknowledgement_delivered {
+            acknowledgement_count += 1
+        }
+        updated_cluster.replicas[index] = Some(replica)
+    }
+
+    let status = if acknowledgement_count >= cluster.write_quorum {
+        WriteStatus.QuorumAcknowledged
+    } else if applied_replica_count > 0 {
+        WriteStatus.Ambiguous
+    } else {
+        WriteStatus.NoReplicaApplied
+    }
+    report_for_write(status, updated_cluster, version, acknowledgement_count, applied_replica_count)
+}
+
+fn readable_replica_count(cluster: Cluster) -> USize {
+    var count: USize = 0
+    for index in 0..REPLICA_COUNT {
+        if cluster.replicas[index].unwrap().read_available {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn read_and_repair(cluster: Cluster) -> ReadReport {
+    if not cluster_is_valid(cluster) {
+        return report_for_read(ReadStatus.InvalidInput, cluster, None, None, false, 0)
+    }
+    if readable_replica_count(cluster) < cluster.read_quorum {
+        return report_for_read(ReadStatus.NoReadQuorum, cluster, None, None, false, 0)
+    }
+
+    var selected_record: Option<VersionedValue> = None
+    var selected_replica_id: Option<U32> = None
+    var conflicting_latest_value = false
+    for index in 0..REPLICA_COUNT {
+        let replica = cluster.replicas[index].unwrap()
+        if not replica.read_available {
+            continue
+        }
+        if let Some(candidate) = replica.record {
+            match selected_record {
+                None => {
+                    selected_record = Some(candidate)
+                    selected_replica_id = Some(replica.id)
+                }
+                Some(current) => {
+                    if candidate.version > current.version {
+                        selected_record = Some(candidate)
+                        selected_replica_id = Some(replica.id)
+                        conflicting_latest_value = false
+                    } else if candidate.version == current.version {
+                        if candidate.value != current.value {
+                            conflicting_latest_value = true
+                        }
+                        if replica.id < selected_replica_id.unwrap() {
+                            selected_record = Some(candidate)
+                            selected_replica_id = Some(replica.id)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if conflicting_latest_value {
+        return report_for_read(
+            ReadStatus.ConflictingVersions,
+            cluster,
+            selected_record,
+            selected_replica_id,
+            true,
+            0,
+        )
+    }
+
+    var repaired_cluster = cluster
+    var repaired_replica_count: USize = 0
+    if let Some(winning_record) = selected_record {
+        for index in 0..REPLICA_COUNT {
+            var replica = repaired_cluster.replicas[index].unwrap()
+            if replica.repair_reachable {
+                let needs_repair = match replica.record {
+                    None => true
+                    Some(current) => current.version < winning_record.version
+                }
+                if needs_repair {
+                    replica.record = Some(winning_record)
+                    repaired_replica_count += 1
+                    repaired_cluster.replicas[index] = Some(replica)
+                }
+            }
+        }
+    }
+    report_for_read(
+        ReadStatus.QuorumMet,
+        repaired_cluster,
+        selected_record,
+        selected_replica_id,
+        false,
+        repaired_replica_count,
+    )
+}
+
+pub fn replica(cluster: Cluster, index: USize) -> Option<Replica> {
+    if index >= cluster.replica_count or index >= REPLICA_COUNT {
+        return None
+    }
+    cluster.replicas[index]
+}

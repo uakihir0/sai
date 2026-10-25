@@ -1,0 +1,152 @@
+use acme:quorum-replication-lab/model.{Cluster, REPLICA_COUNT, Replica, VersionedValue}
+
+fn replica(
+    id: U32,
+    version: Option<U32>,
+    value: I32,
+    read_available: Bool,
+    write_reachable: Bool,
+    acknowledgement_delivered: Bool,
+    repair_reachable: Bool,
+) -> Replica {
+    let record = match version {
+        Some(number) => Some(VersionedValue(version: number, value: value))
+        None => None
+    }
+    Replica(
+        id: id,
+        record: record,
+        read_available: read_available,
+        write_reachable: write_reachable,
+        acknowledgement_delivered: acknowledgement_delivered,
+        repair_reachable: repair_reachable,
+    )
+}
+
+pub fn empty_cluster() -> Cluster {
+    Cluster(
+        replicas: Array<Option<Replica>, REPLICA_COUNT>.filled(None),
+        replica_count: 0,
+        read_quorum: 2,
+        write_quorum: 2,
+    )
+}
+
+pub fn successful_write_with_repair() -> Cluster {
+    var cluster = empty_cluster()
+    cluster.replicas[0] = Some(replica(10, Some(4), 40, true, true, true, true))
+    cluster.replicas[1] = Some(replica(20, Some(4), 40, true, false, false, true))
+    cluster.replicas[2] = Some(replica(30, Some(3), 30, false, true, true, false))
+    cluster.replica_count = 3
+    cluster
+}
+
+pub fn ambiguous_write() -> Cluster {
+    var cluster = empty_cluster()
+    cluster.replicas[0] = Some(replica(10, Some(4), 40, true, true, true, true))
+    cluster.replicas[1] = Some(replica(20, Some(4), 40, true, true, false, true))
+    cluster.replicas[2] = Some(replica(30, Some(4), 40, true, false, false, true))
+    cluster.replica_count = 3
+    cluster
+}
+
+pub fn no_write_progress() -> Cluster {
+    var cluster = successful_write_with_repair()
+    for index in 0..REPLICA_COUNT {
+        var replica = cluster.replicas[index].unwrap()
+        replica.write_reachable = false
+        replica.acknowledgement_delivered = false
+        cluster.replicas[index] = Some(replica)
+    }
+    cluster
+}
+
+pub fn empty_replica_needs_repair() -> Cluster {
+    var cluster = successful_write_with_repair()
+    var replica = cluster.replicas[0].unwrap()
+    replica.record = Some(VersionedValue(version: 5, value: 55))
+    replica.write_reachable = false
+    replica.acknowledgement_delivered = false
+    cluster.replicas[0] = Some(replica)
+    replica = cluster.replicas[1].unwrap()
+    replica.record = None
+    cluster.replicas[1] = Some(replica)
+    replica = cluster.replicas[2].unwrap()
+    replica.write_reachable = false
+    replica.acknowledgement_delivered = false
+    cluster.replicas[2] = Some(replica)
+    cluster
+}
+
+pub fn higher_version_on_unavailable_replica() -> Cluster {
+    var cluster = successful_write_with_repair()
+    var replica = cluster.replicas[0].unwrap()
+    replica.record = Some(VersionedValue(version: 3, value: 30))
+    replica.write_reachable = false
+    replica.acknowledgement_delivered = false
+    cluster.replicas[0] = Some(replica)
+    replica = cluster.replicas[1].unwrap()
+    replica.record = Some(VersionedValue(version: 3, value: 30))
+    replica.write_reachable = false
+    replica.acknowledgement_delivered = false
+    cluster.replicas[1] = Some(replica)
+    replica = cluster.replicas[2].unwrap()
+    replica.record = Some(VersionedValue(version: 4, value: 40))
+    replica.read_available = false
+    replica.write_reachable = false
+    replica.acknowledgement_delivered = false
+    cluster.replicas[2] = Some(replica)
+    cluster
+}
+
+pub fn equal_version_conflict() -> Cluster {
+    var cluster = empty_cluster()
+    cluster.replicas[0] = Some(replica(30, Some(8), 300, true, false, false, true))
+    cluster.replicas[1] = Some(replica(10, Some(8), 999, true, false, false, true))
+    cluster.replicas[2] = Some(replica(20, Some(7), 200, true, false, false, true))
+    cluster.replica_count = 3
+    cluster
+}
+
+pub fn no_read_quorum() -> Cluster {
+    var cluster = successful_write_with_repair()
+    var replica = cluster.replicas[1].unwrap()
+    replica.read_available = false
+    cluster.replicas[1] = Some(replica)
+    replica = cluster.replicas[2].unwrap()
+    replica.read_available = false
+    cluster.replicas[2] = Some(replica)
+    cluster
+}
+
+pub fn weak_quorums() -> Cluster {
+    var cluster = successful_write_with_repair()
+    cluster.read_quorum = 1
+    cluster.write_quorum = 1
+    cluster
+}
+
+pub fn acknowledgement_without_write() -> Cluster {
+    var cluster = successful_write_with_repair()
+    var replica = cluster.replicas[1].unwrap()
+    replica.acknowledgement_delivered = true
+    cluster.replicas[1] = Some(replica)
+    cluster
+}
+
+pub fn duplicate_replica_id() -> Cluster {
+    var cluster = successful_write_with_repair()
+    var replica = cluster.replicas[1].unwrap()
+    replica.id = 10
+    cluster.replicas[1] = Some(replica)
+    cluster
+}
+
+pub fn empty_replicas() -> Cluster {
+    var cluster = empty_cluster()
+    cluster.replicas[0] = Some(replica(10, None, 0, true, false, false, true))
+    cluster.replicas[1] = Some(replica(20, None, 0, true, false, false, true))
+    cluster.replicas[2] = Some(replica(30, None, 0, true, false, false, true))
+    cluster.replica_count = 3
+    cluster
+}

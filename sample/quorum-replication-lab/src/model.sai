@@ -1,0 +1,61 @@
+pub const REPLICA_COUNT: USize = 3
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type VersionedValue {
+    pub version: U32
+    pub value: I32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Replica {
+    pub id: U32
+    pub record: Option<VersionedValue>
+    pub read_available: Bool
+    pub write_reachable: Bool
+    pub acknowledgement_delivered: Bool
+    pub repair_reachable: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Cluster {
+    pub replicas: Array<Option<Replica>, REPLICA_COUNT>
+    pub replica_count: USize
+    pub read_quorum: USize
+    pub write_quorum: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum WriteStatus {
+    QuorumAcknowledged
+    Ambiguous
+    NoReplicaApplied
+    StaleVersion
+    InvalidInput
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type WriteReport {
+    pub status: WriteStatus
+    pub cluster: Cluster
+    pub version: U32
+    pub acknowledgement_count: USize
+    pub applied_replica_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReadStatus {
+    QuorumMet
+    NoReadQuorum
+    ConflictingVersions
+    InvalidInput
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ReadReport {
+    pub status: ReadStatus
+    pub cluster: Cluster
+    pub record: Option<VersionedValue>
+    pub source_replica_id: Option<U32>
+    pub conflicting_latest_value: Bool
+    pub repaired_replica_count: USize
+}
