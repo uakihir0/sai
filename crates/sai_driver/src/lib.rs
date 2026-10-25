@@ -14571,6 +14571,9 @@ impl RootDatabase {
         wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
         world_fields: Option<&FunctionOwnerWorldFieldInputs>,
     ) -> Result<FunctionOwnerResolutions, FunctionOwnerResolutionError> {
+        if collection.session_token != self.session_token {
+            return Err(OwnerControlFlowResolutionError::SessionMismatch);
+        }
         if collection.snapshot_id != snapshot.id() {
             return Err(FunctionOwnerLabelResolutionError::SnapshotMismatch);
         }
@@ -14604,6 +14607,17 @@ impl RootDatabase {
             .map(|scopes| &scopes.source_graph_packages)
             .unwrap_or(&local_source_graph_packages);
         let top_level_owner_index = index_top_level_owner_descriptors(collection);
+        let validated_unit_enum_definitions = collection
+            .local_interface_enum_projections
+            .iter()
+            .filter_map(|projection| match projection {
+                LocalInterfaceEnumAdtProjection::Unit(definition) => {
+                    Some(definition.adt_def().def_id())
+                }
+                LocalInterfaceEnumAdtProjection::Flags { .. }
+                | LocalInterfaceEnumAdtProjection::Unsupported { .. } => None,
+            })
+            .collect::<HashSet<_>>();
         let descriptors = &collection.scopes.function_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
         let mut group_start = 0;
@@ -14751,11 +14765,13 @@ impl RootDatabase {
                     );
                     signature_projection = Some(match type_path_resolution.as_ref() {
                         Some(Ok(Some(path_resolution))) => {
-                            let mut context = sai_ty::lower_ty::LowerTyContext::for_signature(
-                                &self.semantic_types,
-                                descriptor.owner,
-                                path_resolution.paths(),
-                            );
+                            let mut context =
+                                sai_ty::lower_ty::LowerTyContext::for_signature_with_unit_enums(
+                                    &self.semantic_types,
+                                    descriptor.owner,
+                                    path_resolution.paths(),
+                                    &validated_unit_enum_definitions,
+                                );
                             match hir_owner.node {
                                 OwnerNode::Item(item) => match item.kind {
                                     ItemKind::Fn { sig, generics, .. } => {
@@ -35940,6 +35956,126 @@ property "shared"() {}
             resolved.signature_projection(&changed_collection, supported_owner),
             Err(OwnerControlFlowResolutionError::SnapshotMismatch)
         ));
+    }
+
+    #[test]
+    fn function_signature_projection_lowers_only_validated_local_unit_enums() {
+        let root = concat!(
+            "interface api {\n",
+            "  enum State { Ready, Waiting }\n",
+            "  enum Other { Added, Removed }\n",
+            "  enum Payload { Wrapped(U32) }\n",
+            "  enum Generic<T> { Value(T) }\n",
+            "}\n",
+            "enum ModuleEnum { Local }\n",
+            "fn use_state(value: api.State) -> api.State {}\n",
+            "fn use_other(value: api.Other) -> api.Other {}\n",
+            "fn use_payload(value: api.Payload) -> api.Payload {}\n",
+            "fn use_generic(value: api.Generic<Bool>) -> api.Generic<Bool> {}\n",
+            "fn use_module_enum(value: ModuleEnum) -> ModuleEnum {}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let unit_enum_definitions = collection
+            .local_interface_enum_projections
+            .iter()
+            .filter_map(|projection| match projection {
+                LocalInterfaceEnumAdtProjection::Unit(definition) => {
+                    Some(definition.adt_def().def_id())
+                }
+                LocalInterfaceEnumAdtProjection::Flags { .. }
+                | LocalInterfaceEnumAdtProjection::Unsupported { .. } => None,
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(unit_enum_definitions.len(), 2);
+
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        assert!(resolved.matches_collection(&collection));
+        assert_eq!(resolved.owners().len(), 5);
+
+        let state = resolved
+            .signature_projection(&collection, resolved.owners()[0].owner())
+            .expect("the exact collection guards the projection")
+            .expect("the top-level function owner exists");
+        let FunctionSignatureProjection::Supported(state) = state else {
+            panic!("a validated local unit enum supports function signatures");
+        };
+        assert_eq!(state.inputs().len(), 1);
+        let sai_ty::ty::TyKind::Adt(state_def) = state.inputs()[0].kind() else {
+            panic!("the unit enum input has nominal semantic identity");
+        };
+        assert!(unit_enum_definitions.contains(state_def));
+        assert!(state.output().ptr_eq(&state.inputs()[0]));
+
+        let other = resolved
+            .signature_projection(&collection, resolved.owners()[1].owner())
+            .expect("the exact collection guards the projection")
+            .expect("the top-level function owner exists");
+        let FunctionSignatureProjection::Supported(other) = other else {
+            panic!("another validated unit enum supports function signatures");
+        };
+        let sai_ty::ty::TyKind::Adt(other_def) = other.inputs()[0].kind() else {
+            panic!("the second unit enum input has nominal semantic identity");
+        };
+        assert!(unit_enum_definitions.contains(other_def));
+        assert_ne!(state_def, other_def);
+        assert!(other.output().ptr_eq(&other.inputs()[0]));
+
+        for (index, expected_reason) in [
+            (2, sai_ty::lower_ty::UnsupportedTy::NominalType),
+            (3, sai_ty::lower_ty::UnsupportedTy::GenericArguments),
+            (4, sai_ty::lower_ty::UnsupportedTy::NominalType),
+        ] {
+            assert_eq!(
+                resolved
+                    .signature_projection(&collection, resolved.owners()[index].owner())
+                    .expect("the exact collection guards the projection"),
+                Some(&FunctionSignatureProjection::Unsupported(
+                    sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                        index: 0,
+                        reason: expected_reason,
+                    },
+                )),
+                "payload, generic, and module-level enum types remain unsupported"
+            );
+        }
+    }
+
+    #[test]
+    fn function_owner_analyses_reject_foreign_session_collections() {
+        let root = "fn identity(value: Bool) -> Bool { value }\n";
+        let (mut collection_database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), b"");
+        let (mut requesting_database, _, _, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = collection_database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+
+        assert_eq!(
+            requesting_database.resolve_function_owner_analyses(
+                &collection,
+                &module_tree,
+                &snapshot,
+            ),
+            Err(OwnerControlFlowResolutionError::SessionMismatch),
+            "a collection from another database must not seed types in this database's interner"
+        );
     }
 
     #[test]
