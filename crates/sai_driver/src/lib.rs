@@ -134,7 +134,7 @@ use sai_stable_hash::{Fingerprint, StableHash, StableHasher, fingerprint};
 use sai_syntax::ast::{self, AstNode, AstToken};
 use sai_syntax::{Parse, ParseQueryError, SyntaxElement, SyntaxNode, SyntaxQueries};
 use sai_ty::adt::{
-    LocalEnumAdtDef, LocalEnumAdtDefError, LocalEnumDiscriminantIssue,
+    LocalEnumAdtDef, LocalEnumAdtDefBuildError, LocalEnumAdtDefError, LocalEnumDiscriminantIssue,
     LocalEnumDiscriminantIssueKind, LocalEnumPayloadTemplateDef, LocalEnumPayloadTemplateDefError,
     LocalEnumPayloadTemplateShape, LocalEnumPayloadVariantTemplateDef,
     LocalEnumRecordPayloadTemplate, LocalEnumTuplePayloadTemplate, LocalFlagsAdtDef,
@@ -3529,10 +3529,12 @@ pub enum LocalEnumAdtProjection {
     Supported {
         owner: OwnerId,
         definition: LocalEnumAdtDef,
+        issues: Arc<[LocalEnumDiscriminantIssue]>,
     },
     Unsupported {
         owner: OwnerId,
         reason: LocalEnumAdtUnsupportedReason,
+        build_error: Option<LocalEnumAdtDefBuildError>,
     },
 }
 
@@ -3558,6 +3560,32 @@ impl LocalEnumAdtProjection {
         match self {
             Self::Supported { .. } => None,
             Self::Unsupported { reason, .. } => Some(*reason),
+        }
+    }
+
+    /// Discriminant values, issues, and failures retained when semantic
+    /// definition construction had to fail closed.
+    pub fn build_error(&self) -> Option<&LocalEnumAdtDefBuildError> {
+        match self {
+            Self::Supported { .. } => None,
+            Self::Unsupported { build_error, .. } => build_error.as_ref(),
+        }
+    }
+
+    /// Any discriminants that could be computed before construction failed.
+    pub fn partial_discriminants(&self) -> &[sai_ty::adt::LocalEnumVariantDiscriminant] {
+        self.build_error()
+            .map_or(&[], LocalEnumAdtDefBuildError::discriminants)
+    }
+
+    /// Range and duplicate issues found for all computed values, including
+    /// values after an unrepresentable source discriminant.
+    pub fn discriminant_issues(&self) -> &[LocalEnumDiscriminantIssue] {
+        match self {
+            Self::Supported { issues, .. } => issues,
+            Self::Unsupported { build_error, .. } => build_error
+                .as_ref()
+                .map_or(&[], LocalEnumAdtDefBuildError::issues),
         }
     }
 }
@@ -9242,6 +9270,7 @@ fn local_enum_discriminant_diagnostic(
     variants: &[sai_hir::items::Variant<'_>],
     issue: &LocalEnumDiscriminantIssue,
     discr_ty: sai_ty::adt::IntTy,
+    symbols: &Interner,
 ) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
     let variant = variants
         .iter()
@@ -9249,7 +9278,7 @@ fn local_enum_discriminant_diagnostic(
         .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
             owner,
         ))?;
-    let (code, message, label) = match issue.kind() {
+    let (code, message, label, previous_variant) = match issue.kind() {
         LocalEnumDiscriminantIssueKind::OutOfRange => (
             sai_diagnostics::Code::DiscriminantOutOfRange,
             format!(
@@ -9258,18 +9287,50 @@ fn local_enum_discriminant_diagnostic(
                 discr_ty
             ),
             "discriminant is outside the representation range",
+            None,
         ),
-        LocalEnumDiscriminantIssueKind::Duplicate { previous_variant } => (
-            sai_diagnostics::Code::DuplicateDiscriminant,
-            format!(
-                "enum discriminant {} duplicates variant {:?}",
-                issue.value(),
-                previous_variant
-            ),
-            "duplicate discriminant",
-        ),
+        LocalEnumDiscriminantIssueKind::Duplicate { previous_variant } => {
+            let previous = variants
+                .iter()
+                .find(|variant| variant.def_id.to_def_id() == previous_variant)
+                .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+                    owner,
+                ))?;
+            let previous_name = symbols
+                .resolve(previous.name.sym)
+                .map_err(OwnerControlFlowResolutionError::SymbolLookup)?
+                .to_string();
+            (
+                sai_diagnostics::Code::DuplicateDiscriminant,
+                format!(
+                    "enum discriminant {} duplicates earlier variant `{}`",
+                    issue.value(),
+                    previous_name
+                ),
+                "duplicate discriminant",
+                Some((previous.span, previous_name)),
+            )
+        }
     };
-    const_literal_diagnostic(owner, inputs, snapshot, variant.span, code, message, label)
+    let mut diagnostic =
+        const_literal_diagnostic(owner, inputs, snapshot, variant.span, code, message, label)?;
+    if let Some((previous_span, previous_name)) = previous_variant {
+        let location = sai_diagnostics::Location::from_decoded_source(
+            inputs.source_ref.clone(),
+            sai_diagnostics::Span::new(previous_span.file, previous_span.range),
+            &inputs.source,
+        )
+        .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+            owner,
+        ))?;
+        diagnostic
+            .push_related(Related::DeclaredHere {
+                location,
+                what: format!("earlier variant `{previous_name}` declared here"),
+            })
+            .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))?;
+    }
+    Ok(diagnostic)
 }
 
 /// Per-owner path results tagged with their package-collection provenance.
@@ -19618,6 +19679,7 @@ impl RootDatabase {
                             LocalEnumAdtProjection::Unsupported {
                                 owner: descriptor.owner,
                                 reason: LocalEnumAdtUnsupportedReason::OwnerAnalysisFailed,
+                                build_error: None,
                             }
                         }),
                         test_only_path_resolution: Err(error.clone()),
@@ -19916,6 +19978,7 @@ impl RootDatabase {
                             LocalEnumAdtProjection::Unsupported {
                                 owner: descriptor.owner,
                                 reason: LocalEnumAdtUnsupportedReason::OwnerAnalysisFailed,
+                                build_error: None,
                             }
                         }),
                         test_only_path_resolution: Err(error.clone()),
@@ -20487,6 +20550,7 @@ impl RootDatabase {
         let unsupported = |reason| LocalEnumAdtProjection::Unsupported {
             owner: descriptor.owner,
             reason,
+            build_error: None,
         };
         if descriptor.kind != TopLevelOwnerKind::Enum
             || descriptor.owner.def_id.package() != collection.module_tree.package
@@ -20585,6 +20649,7 @@ impl RootDatabase {
                             variants,
                             issue,
                             definition.discr_ty(),
+                            &self.symbols,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -20592,6 +20657,7 @@ impl RootDatabase {
                     LocalEnumAdtProjection::Supported {
                         owner: descriptor.owner,
                         definition,
+                        issues: issues.into(),
                     },
                     diagnostics,
                 ))
@@ -20608,20 +20674,25 @@ impl RootDatabase {
                             variants,
                             issue,
                             repr.map_or(sai_ty::adt::IntTy::I64, repr_discriminant_ty),
+                            &self.symbols,
                         )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                if let Some((variant_id, message)) = match error.reason() {
-                    LocalEnumAdtDefError::MissingExplicitDiscriminant(variant) => Some((
-                        variant,
-                        "explicit discriminant exceeds the supported i128 range".to_owned(),
-                    )),
-                    LocalEnumAdtDefError::DiscriminantOverflow(variant) => Some((
-                        variant,
-                        "implicit discriminant overflows the supported i128 range".to_owned(),
-                    )),
-                    _ => None,
-                } {
+                for failure in error.failures() {
+                    let (variant_id, message) = match *failure {
+                        LocalEnumAdtDefError::MissingExplicitDiscriminant(variant) => (
+                            variant,
+                            "explicit discriminant exceeds the supported i128 range",
+                        ),
+                        LocalEnumAdtDefError::DiscriminantOverflow(variant) => (
+                            variant,
+                            "implicit discriminant overflows the supported i128 range",
+                        ),
+                        LocalEnumAdtDefError::NotModuleEnum
+                        | LocalEnumAdtDefError::HirOwnerMismatch
+                        | LocalEnumAdtDefError::VariantOrderMismatch
+                        | LocalEnumAdtDefError::UnexpectedImplicitDiscriminant(_) => continue,
+                    };
                     let variant = variants
                         .iter()
                         .find(|variant| variant.def_id.to_def_id() == variant_id)
@@ -20634,12 +20705,17 @@ impl RootDatabase {
                         snapshot,
                         variant.span,
                         sai_diagnostics::Code::DiscriminantOutOfRange,
-                        message,
+                        message.to_owned(),
                         "discriminant cannot be represented",
                     )?);
                 }
+                let reason = error.reason();
                 Ok((
-                    unsupported(LocalEnumAdtUnsupportedReason::Definition(error.reason())),
+                    LocalEnumAdtProjection::Unsupported {
+                        owner: descriptor.owner,
+                        reason: LocalEnumAdtUnsupportedReason::Definition(reason),
+                        build_error: Some(error),
+                    },
                     diagnostics,
                 ))
             }
@@ -95213,6 +95289,11 @@ interface facade { use middle.{payload}; }"#;
             .definition()
             .expect("representable values retain an enum definition despite diagnostics");
         assert_eq!(
+            byte_projection.discriminant_issues().len(),
+            3,
+            "the supported projection also exposes its out-of-range and duplicate issues"
+        );
+        assert_eq!(
             byte_definition
                 .discriminants()
                 .iter()
@@ -95402,6 +95483,179 @@ interface facade { use middle.{payload}; }"#;
                 "{name} should report that the value exceeds supported discriminant range"
             );
         }
+    }
+
+    #[test]
+    fn local_enum_adt_retains_later_diagnostics_and_names_duplicate_variant() {
+        let root = concat!(
+            "@repr(U8)\n",
+            "enum MissingLater {\n",
+            "  Lost = 170141183460469231731687303715884105728,\n",
+            "  Dependent,\n",
+            "  Large = 300,\n",
+            "  Repeated = 300,\n",
+            "  After,\n",
+            "}\n",
+            "@repr(U8)\n",
+            "enum OverflowLater {\n",
+            "  Max = 170141183460469231731687303715884105727,\n",
+            "  Overflow,\n",
+            "  Dependent,\n",
+            "  RepeatMax = 170141183460469231731687303715884105727,\n",
+            "  Large = 300,\n",
+            "  After,\n",
+            "}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").unwrap(),
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot collection succeeds");
+        let resolved = database
+            .resolve_type_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("enum definitions are projected");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("local DefPath interner exists"),
+        );
+        let owner_named = |name: &str| {
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::Enum
+                        && def_paths
+                            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                path.data().last().is_some_and(|component| {
+                                    matches!(
+                                        component.data,
+                                        DefPathData::TypeNs(symbol)
+                                            if database.symbols.resolve(symbol).ok().as_deref()
+                                                == Some(name)
+                                    )
+                                })
+                            })
+                })
+                .expect("enum owner exists")
+                .owner
+        };
+
+        let missing_owner = owner_named("MissingLater");
+        let missing_projection = resolved
+            .local_enum_adt(&collection, missing_owner)
+            .unwrap()
+            .unwrap();
+        assert!(missing_projection.definition().is_none());
+        assert_eq!(
+            missing_projection
+                .partial_discriminants()
+                .iter()
+                .map(|value| value.value())
+                .collect::<Vec<_>>(),
+            [300, 300, 301]
+        );
+        assert_eq!(missing_projection.discriminant_issues().len(), 4);
+        let missing_error = missing_projection
+            .build_error()
+            .expect("the unsupported projection exposes its build error");
+        assert_eq!(missing_error.failures().len(), 1);
+        assert!(matches!(
+            missing_error.failures()[0],
+            sai_ty::adt::LocalEnumAdtDefError::MissingExplicitDiscriminant(_)
+        ));
+
+        let missing_diagnostics = resolved
+            .owners()
+            .iter()
+            .find(|result| result.owner() == missing_owner)
+            .unwrap()
+            .lowering_diagnostics();
+        let missing_range_count = missing_diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::DiscriminantOutOfRange)
+            .count();
+        assert_eq!(
+            missing_range_count, 4,
+            "later value and failure diagnostics survive"
+        );
+        let duplicate = missing_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::DuplicateDiscriminant)
+            .expect("the later explicit duplicate is diagnosed");
+        assert!(
+            duplicate
+                .message
+                .contains("duplicates earlier variant `Large`"),
+            "duplicate diagnostics name the previous variant: {}",
+            duplicate.message
+        );
+        assert!(
+            duplicate.related().iter().any(|related| matches!(
+                related,
+                sai_diagnostics::Related::DeclaredHere { what, .. }
+                    if what == "earlier variant `Large` declared here"
+            )),
+            "duplicate diagnostics point to the previous declaration"
+        );
+
+        let overflow_owner = owner_named("OverflowLater");
+        let overflow_projection = resolved
+            .local_enum_adt(&collection, overflow_owner)
+            .unwrap()
+            .unwrap();
+        assert!(overflow_projection.definition().is_none());
+        assert_eq!(
+            overflow_projection
+                .partial_discriminants()
+                .iter()
+                .map(|value| value.value())
+                .collect::<Vec<_>>(),
+            [i128::MAX, i128::MAX, 300, 301]
+        );
+        assert_eq!(overflow_projection.discriminant_issues().len(), 5);
+        let overflow_error = overflow_projection.build_error().unwrap();
+        assert_eq!(overflow_error.failures().len(), 1);
+        assert!(matches!(
+            overflow_error.failures()[0],
+            sai_ty::adt::LocalEnumAdtDefError::DiscriminantOverflow(_)
+        ));
+        let overflow_diagnostics = resolved
+            .owners()
+            .iter()
+            .find(|result| result.owner() == overflow_owner)
+            .unwrap()
+            .lowering_diagnostics();
+        assert_eq!(
+            overflow_diagnostics
+                .iter()
+                .filter(
+                    |diagnostic| diagnostic.code == sai_diagnostics::Code::DiscriminantOutOfRange
+                )
+                .count(),
+            5,
+            "overflow and later out-of-range values are all diagnosed"
+        );
+        let duplicate = overflow_diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::DuplicateDiscriminant)
+            .expect("the later repeated maximum is diagnosed");
+        assert!(
+            duplicate
+                .message
+                .contains("duplicates earlier variant `Max`"),
+            "duplicate diagnostics name the earlier variant: {}",
+            duplicate.message
+        );
     }
 
     #[test]
