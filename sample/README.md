@@ -101,6 +101,8 @@ source repository before a package resolver can fetch them.
 | Advanced | [`multi-region-failover-planner`](multi-region-failover-planner/README.md) | Plan dependency-ordered service recovery waves under replica RPO freshness, dependency-aware RTO, ranked regional targets, capacity reservations, and explicit holds. |
 | Advanced | [`tool-library-loan-scheduler`](tool-library-loan-scheduler/README.md) | Schedule multi-day community tool loans against returning stock, repair capacity, safety badges, member loan limits, duplicate holds, and ordered rejection reasons. |
 | Advanced | [`urban-tree-planting-planner`](urban-tree-planting-planner/README.md) | Match urban planting sites to tree species under soil and clearance limits, district diversity, nursery stock, and a shared establishment-watering budget. |
+| Advanced | [`spaceflight-mission-operations`](spaceflight-mission-operations/README.md) | Schedule a fictional spacecraft timeline across prerequisite graphs, crew windows, and overlapping power and thermal budgets, with explicit blocked and unplaced outcomes. |
+| Advanced | [`key-rotation-readiness-auditor`](key-rotation-readiness-auditor/README.md) | Audit fictional service-key rotations for lifetime coverage, migration evidence freshness, escrow separation, overlap windows, and in-plan dependency order. |
 
 Most of the more involved examples use fixed fixtures and in-memory
 calculations to cover practical workflows without external services or
