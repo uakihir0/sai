@@ -444,7 +444,7 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     );
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        27,
+        29,
         "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus depth-three annotated leaves, named/nested tuple literal leaves, bounded nested tuple-shape mismatches, and tuple-versus-scalar mismatches:\n{stdout}"
     );
     assert_eq!(
