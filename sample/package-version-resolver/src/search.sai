@@ -1,0 +1,163 @@
+use acme:package-version-resolver/model.{
+    CandidateDomain
+    DOMAIN_CAPACITY
+    PACKAGE_COUNT
+    ResolutionReport
+    ResolverProblem
+    SearchResult
+    SolverState
+    Version
+}
+use acme:package-version-resolver/propagate
+
+fn domain_size(domain: CandidateDomain) -> USize {
+    var count: USize = 0
+    for candidate in domain.versions {
+        match candidate {
+            Some(_) => {
+                count += 1
+            }
+            None => {}
+        }
+    }
+    count
+}
+
+fn choose_variable(state: SolverState) -> Option<USize> {
+    var selected: Option<USize> = None
+    var smallest_domain: USize = DOMAIN_CAPACITY + 1
+
+    for index in 0..PACKAGE_COUNT {
+        let size = domain_size(state.domains[index])
+        if size > 1 and size < smallest_domain {
+            selected = Some(index)
+            smallest_domain = size
+        }
+    }
+    selected
+}
+
+fn singleton_domain(candidate: Version) -> CandidateDomain {
+    CandidateDomain(versions: [Some(candidate), None])
+}
+
+fn unresolved_report(
+    visited_nodes: USize,
+    backtracks: USize,
+    propagation_rounds: USize,
+) -> SearchResult {
+    SearchResult(
+        solution: None,
+        visited_nodes: visited_nodes,
+        backtracks: backtracks,
+        propagation_rounds: propagation_rounds,
+    )
+}
+
+fn search_from(problem: ResolverProblem, initial: SolverState) -> SearchResult {
+    let propagated = propagate.propagate(problem, initial)
+    var visited_nodes: USize = 1
+    var backtracks: USize = 0
+    var rounds = propagated.rounds
+
+    if not propagated.consistent {
+        return unresolved_report(visited_nodes, backtracks, rounds)
+    }
+
+    let state = propagated.state
+    match choose_variable(state) {
+        None => {
+            SearchResult(
+                solution: Some(state),
+                visited_nodes: visited_nodes,
+                backtracks: backtracks,
+                propagation_rounds: rounds,
+            )
+        }
+        Some(variable_index) => {
+            let candidates = state.domains[variable_index]
+            var candidate_index: USize = 0
+            var solution: Option<SolverState> = None
+
+            while candidate_index < DOMAIN_CAPACITY and solution == None {
+                match candidates.versions[candidate_index] {
+                    Some(candidate) => {
+                        var branch = state
+                        branch.domains[variable_index] = singleton_domain(candidate)
+                        let attempt = search_from(problem, branch)
+                        visited_nodes += attempt.visited_nodes
+                        backtracks += attempt.backtracks
+                        rounds += attempt.propagation_rounds
+                        match attempt.solution {
+                            Some(found) => {
+                                solution = Some(found)
+                            }
+                            None => {
+                                backtracks += 1
+                            }
+                        }
+                    }
+                    None => {}
+                }
+                candidate_index += 1
+            }
+
+            SearchResult(
+                solution: solution,
+                visited_nodes: visited_nodes,
+                backtracks: backtracks,
+                propagation_rounds: rounds,
+            )
+        }
+    }
+}
+
+pub fn resolve(problem: ResolverProblem) -> ResolutionReport {
+    if problem.rule_count > problem.rules.len() {
+        return ResolutionReport(
+            found: false,
+            rule_count_valid: false,
+            versions: Array<Option<Version>, PACKAGE_COUNT>.filled(None),
+            visited_nodes: 0,
+            backtracks: 0,
+            propagation_rounds: 0,
+        )
+    }
+
+    let initial = propagate.initial_state(problem)
+    let search = search_from(problem, initial)
+    var selected = Array<Option<Version>, PACKAGE_COUNT>.filled(None)
+
+    match search.solution {
+        Some(solution) => {
+            for package_index in 0..PACKAGE_COUNT {
+                for candidate in solution.domains[package_index].versions {
+                    match candidate {
+                        Some(version) => {
+                            selected[package_index] = Some(version)
+                        }
+                        None => {}
+                    }
+                }
+            }
+            ResolutionReport(
+                found: true,
+                rule_count_valid: true,
+                versions: selected,
+                visited_nodes: search.visited_nodes,
+                backtracks: search.backtracks,
+                propagation_rounds: search.propagation_rounds,
+            )
+        }
+        None => {
+            ResolutionReport(
+                found: false,
+                rule_count_valid: true,
+                versions: selected,
+                visited_nodes: search.visited_nodes,
+                backtracks: search.backtracks,
+                propagation_rounds: search.propagation_rounds,
+            )
+        }
+    }
+}

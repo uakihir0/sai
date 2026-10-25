@@ -1,0 +1,179 @@
+use acme:package-version-resolver/model.{
+    CandidateDomain
+    DOMAIN_CAPACITY
+    DependencyRule
+    MAX_PROPAGATION_ROUNDS
+    PACKAGE_COUNT
+    PackageId
+    PropagationResult
+    ResolverProblem
+    SolverState
+    Version
+}
+use acme:package-version-resolver/version
+
+fn package_at(index: USize) -> PackageId {
+    match index { 0 => PackageId.Renderer, 1 => PackageId.Parser, _ => PackageId.UnicodeTable }
+}
+
+fn domain_size(domain: CandidateDomain) -> USize {
+    var count: USize = 0
+    for candidate in domain.versions {
+        match candidate {
+            Some(_) => {
+                count += 1
+            }
+            None => {}
+        }
+    }
+    count
+}
+
+fn source_version_matches(rule: DependencyRule, selected: Version) -> Bool {
+    match rule.source_version { Some(required) => required == selected, None => true }
+}
+
+fn satisfies_self_rules(problem: ResolverProblem, package: PackageId, selected: Version) -> Bool {
+    for rule_index in 0..problem.rule_count {
+        match problem.rules[rule_index] {
+            Some(rule) => {
+                if (
+                    rule.source == package
+                    and rule.target == package
+                    and source_version_matches(rule, selected)
+                    and not version.range_contains(rule.accepted_versions, selected)
+                ) {
+                    return false
+                }
+            }
+            None => {}
+        }
+    }
+    true
+}
+
+fn compatible_pair(
+    problem: ResolverProblem,
+    left_package: PackageId,
+    left_version: Version,
+    right_package: PackageId,
+    right_version: Version,
+) -> Bool {
+    if (
+        not satisfies_self_rules(problem, left_package, left_version)
+        or not satisfies_self_rules(problem, right_package, right_version)
+    ) {
+        return false
+    }
+
+    for rule_index in 0..problem.rule_count {
+        match problem.rules[rule_index] {
+            Some(rule) => {
+                let left_requires_right = (
+                    rule.source == left_package
+                    and rule.target == right_package
+                    and source_version_matches(rule, left_version)
+                    and not version.range_contains(rule.accepted_versions, right_version)
+                )
+                let right_requires_left = (
+                    rule.source == right_package
+                    and rule.target == left_package
+                    and source_version_matches(rule, right_version)
+                    and not version.range_contains(rule.accepted_versions, left_version)
+                )
+                if left_requires_right or right_requires_left {
+                    return false
+                }
+            }
+            None => {}
+        }
+    }
+    true
+}
+
+fn has_support(
+    problem: ResolverProblem,
+    state: SolverState,
+    variable_index: USize,
+    candidate: Version,
+    neighbor_index: USize,
+) -> Bool {
+    let variable = package_at(variable_index)
+    let neighbor = package_at(neighbor_index)
+    for neighbor_candidate in state.domains[neighbor_index].versions {
+        match neighbor_candidate {
+            Some(other) => {
+                if compatible_pair(problem, variable, candidate, neighbor, other) {
+                    return true
+                }
+            }
+            None => {}
+        }
+    }
+    false
+}
+
+fn revise(
+    problem: ResolverProblem,
+    original: SolverState,
+    variable_index: USize,
+    neighbor_index: USize,
+) -> SolverState {
+    var state = original
+    for candidate_index in 0..DOMAIN_CAPACITY {
+        match state.domains[variable_index].versions[candidate_index] {
+            Some(candidate) => {
+                if not has_support(problem, state, variable_index, candidate, neighbor_index) {
+                    state.domains[variable_index].versions[candidate_index] = None
+                }
+            }
+            None => {}
+        }
+    }
+    state
+}
+
+fn has_empty_domain(state: SolverState) -> Bool {
+    for index in 0..PACKAGE_COUNT {
+        if domain_size(state.domains[index]) == 0 {
+            return true
+        }
+    }
+    false
+}
+
+pub fn propagate(problem: ResolverProblem, initial: SolverState) -> PropagationResult {
+    if problem.rule_count > problem.rules.len() {
+        return PropagationResult(state: initial, consistent: false, rounds: 0)
+    }
+
+    var state = initial
+    var changed = true
+    var rounds: USize = 0
+
+    while changed and rounds < MAX_PROPAGATION_ROUNDS {
+        changed = false
+        rounds += 1
+        for variable_index in 0..PACKAGE_COUNT {
+            for neighbor_index in 0..PACKAGE_COUNT {
+                if variable_index != neighbor_index {
+                    let before = state.domains[variable_index]
+                    state = revise(problem, state, variable_index, neighbor_index)
+                    if state.domains[variable_index] != before {
+                        changed = true
+                    }
+                }
+            }
+        }
+    }
+
+    PropagationResult(
+        state: state,
+        consistent: not has_empty_domain(state) and not changed,
+        rounds: rounds,
+    )
+}
+
+pub fn initial_state(problem: ResolverProblem) -> SolverState {
+    SolverState(domains: problem.initial_domains)
+}

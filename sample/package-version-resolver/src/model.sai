@@ -1,0 +1,74 @@
+pub const PACKAGE_COUNT: USize = 3
+pub const DOMAIN_CAPACITY: USize = 2
+pub const RULE_CAPACITY: USize = 6
+pub const MAX_PROPAGATION_ROUNDS: USize = 7
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PackageId {
+    Renderer
+    Parser
+    UnicodeTable
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Version {
+    pub major: U32
+    pub minor: U32
+    pub patch: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type VersionRange {
+    pub minimum_inclusive: Version
+    pub maximum_exclusive: Version
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CandidateDomain {
+    pub versions: Array<Option<Version>, DOMAIN_CAPACITY>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type DependencyRule {
+    pub source: PackageId
+    pub source_version: Option<Version>
+    pub target: PackageId
+    pub accepted_versions: VersionRange
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ResolverProblem {
+    pub initial_domains: Array<CandidateDomain, PACKAGE_COUNT>
+    pub rules: Array<Option<DependencyRule>, RULE_CAPACITY>
+    pub rule_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SolverState {
+    pub domains: Array<CandidateDomain, PACKAGE_COUNT>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PropagationResult {
+    pub state: SolverState
+    pub consistent: Bool
+    pub rounds: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SearchResult {
+    pub solution: Option<SolverState>
+    pub visited_nodes: USize
+    pub backtracks: USize
+    pub propagation_rounds: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ResolutionReport {
+    pub found: Bool
+    pub rule_count_valid: Bool
+    pub versions: Array<Option<Version>, PACKAGE_COUNT>
+    pub visited_nodes: USize
+    pub backtracks: USize
+    pub propagation_rounds: USize
+}

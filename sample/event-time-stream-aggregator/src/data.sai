@@ -1,0 +1,37 @@
+use acme:event-time-stream-aggregator/model
+
+pub fn sensors() -> Array<model.Sensor, 3> {
+    [
+        model.Sensor(sensor_id: 10, display_name: "North weather mast"),
+        model.Sensor(sensor_id: 20, display_name: "Riverside weather mast"),
+        model.Sensor(sensor_id: 30, display_name: "Market weather mast"),
+    ]
+}
+
+// The source stream is in arrival order, not event-time order. Rows 9, 13,
+// 16, 19, and 20 exercise late, missing, duplicate, late, and unknown data.
+// Row 16 repeats the event ID with a far-future timestamp.
+pub fn events() -> Array<model.ReadingEvent, 20> {
+    [
+        model.ReadingEvent(event_id: 1001, sensor_id: 10, event_minute: 1, value: Some(10)),
+        model.ReadingEvent(event_id: 2001, sensor_id: 20, event_minute: 2, value: Some(4)),
+        model.ReadingEvent(event_id: 3001, sensor_id: 30, event_minute: 3, value: Some(7)),
+        model.ReadingEvent(event_id: 1002, sensor_id: 10, event_minute: 6, value: Some(16)),
+        model.ReadingEvent(event_id: 1003, sensor_id: 10, event_minute: 4, value: Some(14)),
+        model.ReadingEvent(event_id: 2002, sensor_id: 20, event_minute: 7, value: Some(8)),
+        model.ReadingEvent(event_id: 3002, sensor_id: 30, event_minute: 8, value: Some(11)),
+        model.ReadingEvent(event_id: 1004, sensor_id: 10, event_minute: 11, value: Some(9)),
+        model.ReadingEvent(event_id: 1005, sensor_id: 10, event_minute: 3, value: Some(99)),
+        model.ReadingEvent(event_id: 1006, sensor_id: 10, event_minute: 9, value: Some(15)),
+        model.ReadingEvent(event_id: 2003, sensor_id: 20, event_minute: 13, value: Some(12)),
+        model.ReadingEvent(event_id: 2004, sensor_id: 20, event_minute: 14, value: Some(18)),
+        model.ReadingEvent(event_id: 1007, sensor_id: 10, event_minute: 12, value: None),
+        model.ReadingEvent(event_id: 1008, sensor_id: 10, event_minute: 15, value: Some(20)),
+        model.ReadingEvent(event_id: 2005, sensor_id: 20, event_minute: 20, value: Some(22)),
+        model.ReadingEvent(event_id: 2005, sensor_id: 20, event_minute: 30, value: Some(99)),
+        model.ReadingEvent(event_id: 1009, sensor_id: 10, event_minute: 18, value: Some(8)),
+        model.ReadingEvent(event_id: 3003, sensor_id: 30, event_minute: 22, value: Some(6)),
+        model.ReadingEvent(event_id: 1010, sensor_id: 10, event_minute: 19, value: Some(99)),
+        model.ReadingEvent(event_id: 4001, sensor_id: 99, event_minute: 40, value: Some(2)),
+    ]
+}

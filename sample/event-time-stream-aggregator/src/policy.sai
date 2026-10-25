@@ -1,0 +1,42 @@
+use acme:event-time-stream-aggregator/model.{ReadingEvent, Sensor}
+
+pub const WINDOW_WIDTH_MINUTES: U32 = 5
+pub const ALLOWED_LATENESS_MINUTES: U32 = 2
+
+// This fixture models one bounded service day. Keeping timestamps below this
+// ceiling makes window-end arithmetic safe in U32.
+pub const MAX_EVENT_MINUTE: U32 = 10000
+
+// At most 20 accepted readings can enter one report, so this keeps any
+// aggregate total safely inside U32.
+pub const MAX_MEASUREMENT: U32 = 1000000
+
+pub fn sensor_is_known(sensors: Array<Sensor, 3>, sensor_id: U32) -> Bool {
+    for sensor in sensors {
+        if sensor.sensor_id == sensor_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn has_prior_event_id(events: Array<ReadingEvent, 20>, index: USize) -> Bool {
+    for previous in 0..index {
+        if events[previous].event_id == events[index].event_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn window_start(event_minute: U32) -> U32 {
+    (event_minute / WINDOW_WIDTH_MINUTES) * WINDOW_WIDTH_MINUTES
+}
+
+pub fn watermark_for(max_event_minute: U32) -> U32 {
+    if max_event_minute > ALLOWED_LATENESS_MINUTES {
+        max_event_minute - ALLOWED_LATENESS_MINUTES
+    } else {
+        0
+    }
+}
