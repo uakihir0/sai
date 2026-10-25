@@ -286,8 +286,9 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     let source = concat!(
         "enum Payload { Pair(U8, Bool), Named(value: Bool) }\n",
         "enum NestedPayload { Nested(((I8, Char), ((), USize))) }\n",
-        "pub fn use_it() {\n",
-        "    (Payload.Pair(1, true), ",
+        "pub fn use_it(actual: Bool) {\n",
+        "    (Payload.Pair(actual, true), ",
+        "Payload.Pair(1, true), ",
         "Payload.Pair(first: true, second: 1, third: false), ",
         "Payload.Pair(256, true), ",
         "NestedPayload.Nested(((true, 1), ((), 2))), ",
@@ -312,13 +313,25 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     );
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        4,
-        "the staged projection checks named and nested tuple literal leaves:\n{stdout}"
+        5,
+        "the staged projection checks parameter paths and named/nested tuple literal leaves:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
         2,
         "direct and nested positional literal range errors reach CLI diagnostics:\n{stdout}"
+    );
+    let parameter_call = "Payload.Pair(actual, true)";
+    let parameter_start = source
+        .find(parameter_call)
+        .expect("parameter argument call exists")
+        + "Payload.Pair(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found `Bool`",
+        parameter_start,
+        parameter_start + "actual".len(),
     );
     let named_start = source.find("first:").expect("named argument exists");
     assert_json_diagnostic_primary_span(

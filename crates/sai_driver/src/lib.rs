@@ -102,9 +102,9 @@ use sai_resolve::module_member_lookup::ModuleMemberIndex;
 use sai_resolve::module_member_lookup::ModuleTarget;
 use sai_resolve::module_path::{ModulePathError, resolve_module_prefix};
 use sai_resolve::owner::{
-    DeferredPath, LabelResolution, LabelResolutionError, LocalResolution, LocalResolutionError,
-    ModuleResolution, edit_distance_at_most_two, resolve_owner_control_flow, resolve_owner_locals,
-    resolve_owner_module_paths, resolve_predicate_expression,
+    BindingKind, DeferredPath, LabelResolution, LabelResolutionError, LocalResolution,
+    LocalResolutionError, ModuleResolution, edit_distance_at_most_two, resolve_owner_control_flow,
+    resolve_owner_locals, resolve_owner_module_paths, resolve_predicate_expression,
 };
 use sai_resolve::package_scopes::{
     BindingOrigin, DefKind, FilteredModule, ForeignPackageScope, ForeignWitViewScope, ImportIndex,
@@ -9522,10 +9522,112 @@ fn local_enum_variant_literal_type(ty: &sai_ty::ty::Ty) -> Option<ConstLiteralTy
     Some(ConstLiteralType::Primitive(primitive))
 }
 
+fn local_enum_variant_parameter_primitive(
+    value: &HirExpr<'_>,
+    hir_owner: &HirOwner<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+) -> Option<sai_resolve::prelude::PrimTy> {
+    let ExprKind::Path(path) = value.kind else {
+        return None;
+    };
+    if path.root != PathRoot::Plain || path.segments.len() != 1 || path.segments[0].args.is_some() {
+        return None;
+    }
+    let PathRes {
+        base: Res::Local(binding),
+        resolved_segments: 1,
+        segment_count: 1,
+    } = *locals.paths.get(&path.hir_id)?
+    else {
+        return None;
+    };
+    if !matches!(
+        locals.bindings.get(&binding)?.kind,
+        BindingKind::Param | BindingKind::VarParam
+    ) {
+        return None;
+    }
+
+    let parameter_index = body
+        .params
+        .iter()
+        .position(|parameter| parameter.binding == binding)?;
+    let OwnerNode::Item(item) = hir_owner.node else {
+        return None;
+    };
+    let ItemKind::Fn { sig, .. } = item.kind else {
+        return None;
+    };
+    if sig.params.len() != body.params.len() {
+        return None;
+    }
+    let body_parameter = body.params.get(parameter_index)?;
+    let signature_parameter = sig.params.get(parameter_index)?;
+    if signature_parameter.is_self
+        || body_parameter.mutable != signature_parameter.mutable
+        || body_parameter.name.map(|name| name.sym) != signature_parameter.name.map(|name| name.sym)
+    {
+        return None;
+    }
+
+    match resolve_function_direct_type(*signature_parameter.ty, type_paths, symbols, inputs)? {
+        FunctionDirectType::Primitive(primitive) => Some(primitive),
+        FunctionDirectType::Str | FunctionDirectType::Unit => None,
+    }
+}
+
+fn check_local_enum_variant_parameter_argument(
+    owner: OwnerId,
+    expected_type: &sai_ty::ty::Ty,
+    value: &HirExpr<'_>,
+    hir_owner: &HirOwner<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
+    symbols: &Interner,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Option<Diagnostic>, OwnerControlFlowResolutionError> {
+    let Some(ConstLiteralType::Primitive(expected)) =
+        local_enum_variant_literal_type(expected_type)
+    else {
+        return Ok(None);
+    };
+    let Some(actual) = local_enum_variant_parameter_primitive(
+        value, hir_owner, body, locals, type_paths, symbols, inputs,
+    ) else {
+        return Ok(None);
+    };
+    if expected == actual {
+        return Ok(None);
+    }
+    Ok(Some(const_literal_diagnostic(
+        owner,
+        inputs,
+        snapshot,
+        value.span,
+        sai_diagnostics::Code::TypeMismatch,
+        format!(
+            "expected `{}`, found `{}`",
+            const_primitive_name(expected),
+            const_primitive_name(actual)
+        ),
+        "type mismatch",
+    )?))
+}
+
 fn check_local_enum_variant_literal_argument(
     owner: OwnerId,
     expected_type: &sai_ty::ty::Ty,
     value: &HirExpr<'_>,
+    hir_owner: &HirOwner<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
@@ -9563,6 +9665,20 @@ fn check_local_enum_variant_literal_argument(
             target_cfg,
         )? {
             diagnostics.append(&mut literal_diagnostics);
+        }
+        if let Some(diagnostic) = check_local_enum_variant_parameter_argument(
+            owner,
+            expected_type,
+            value,
+            hir_owner,
+            body,
+            locals,
+            type_paths,
+            symbols,
+            inputs,
+            snapshot,
+        )? {
+            diagnostics.push(diagnostic);
         }
     }
 
@@ -14002,6 +14118,7 @@ fn resolve_local_enum_variant_paths(
     body: &sai_hir::body::Body<'_>,
     source_map: &HirSourceMap,
     locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
     module_paths: &ModuleResolution,
     type_owners: &TypeOwnerResolutions,
     interner: &sai_ty::ty::TyInterner,
@@ -14342,6 +14459,10 @@ fn resolve_local_enum_variant_paths(
         if let (Some(call), Some(value_type_entry)) = (direct_call, value_type_entry.as_ref())
             && let Some((call_entry, diagnostics)) = local_enum_variant_call_projection(
                 owner,
+                hir_owner,
+                body,
+                locals,
+                type_paths,
                 &entry,
                 call,
                 value_type_entry,
@@ -14373,6 +14494,10 @@ fn resolve_local_enum_variant_paths(
 
 fn local_enum_variant_call_projection(
     owner: OwnerId,
+    hir_owner: &HirOwner<'_>,
+    body: &sai_hir::body::Body<'_>,
+    locals: &LocalResolution,
+    type_paths: Option<&TypeOwnerPathResolution>,
     path: &LocalEnumVariantPathEntry,
     call: &HirExpr<'_>,
     value_type: &LocalEnumVariantPathTypeEntry,
@@ -14452,6 +14577,10 @@ fn local_enum_variant_call_projection(
                     owner,
                     expected_type,
                     &argument.expr,
+                    hir_owner,
+                    body,
+                    locals,
+                    type_paths,
                     symbols,
                     inputs,
                     snapshot,
@@ -18353,6 +18482,7 @@ impl RootDatabase {
                                                     body,
                                                     &source_map,
                                                     &locals,
+                                                    resolved_type_paths,
                                                     module_paths,
                                                     &local_type_owners,
                                                     &self.semantic_types,
@@ -97255,7 +97385,16 @@ interface facade { use middle.{payload}; }"#;
             "fn repeated_paths() { (Payload.Unit, Payload.Pair) }\n",
             "fn tuple_call_ok() { Payload.Pair(Alpha.Same, Beta.Same) }\n",
             "fn tuple_call_literal_ok() { Payload.Pair(1, true) }\n",
-            "fn tuple_call_nonliteral(value: Bool) { Payload.Pair(value, true) }\n",
+            "fn tuple_call_nonliteral(value: U8) { Payload.Pair(value, true) }\n",
+            "fn tuple_call_param_ok(actual: U8) { Payload.Pair(actual, true) }\n",
+            "fn tuple_call_mut_param_ok(var actual: U8) { Payload.Pair(actual, true) }\n",
+            "fn tuple_call_raw_param_ok(r#actual: U8) { Payload.Pair(r#actual, true) }\n",
+            "fn tuple_call_param_mismatch(actual: Bool) { Payload.Pair(actual, true) }\n",
+            "fn tuple_call_unicode_param_mismatch(値: Bool) { Payload.Pair(値, true) }\n",
+            "fn nested_call_param_mismatch(actual: USize) { NestedPayload.Nested(((actual, 'x'), ((), 2))) }\n",
+            "fn tuple_call_shadowed(actual: Bool) { let actual: U8 = 1; Payload.Pair(actual, true) }\n",
+            "fn tuple_call_named_param_mismatch(actual: Bool) { Payload.Pair(left: actual, true) }\n",
+            "fn tuple_call_param_too_many(actual: Bool) { Payload.Pair(1, true, actual) }\n",
             "fn tuple_call_mismatch() { Payload.Pair(true, 1) }\n",
             "fn tuple_call_out_of_range() { Payload.Pair(256, true) }\n",
             "fn tuple_call_unit_payload() { Payload.UnitPayload(()) }\n",
@@ -97788,12 +97927,81 @@ interface facade { use middle.{payload}; }"#;
             root[span.start().to_usize()..span.end().to_usize()].to_owned()
         };
 
-        for name in ["tuple_call_literal_ok", "tuple_call_nonliteral"] {
+        for name in [
+            "tuple_call_literal_ok",
+            "tuple_call_nonliteral",
+            "tuple_call_param_ok",
+            "tuple_call_mut_param_ok",
+            "tuple_call_raw_param_ok",
+            "tuple_call_shadowed",
+        ] {
             assert!(
                 paths_for(name).call_diagnostics().is_empty(),
                 "{name}: matching direct literals and nonliteral expressions are accepted by this bounded check"
             );
         }
+
+        for (name, expected_message) in [
+            ("tuple_call_param_mismatch", "expected `U8`, found `Bool`"),
+            ("nested_call_param_mismatch", "expected `I8`, found `USize`"),
+            (
+                "tuple_call_unicode_param_mismatch",
+                "expected `U8`, found `Bool`",
+            ),
+        ] {
+            let paths = paths_for(name);
+            assert_eq!(paths.call_diagnostics().len(), 1, "{name}");
+            assert_eq!(
+                paths.call_diagnostics()[0].code,
+                sai_diagnostics::Code::TypeMismatch
+            );
+            assert_eq!(
+                paths.call_diagnostics()[0].message,
+                expected_message,
+                "{name}"
+            );
+            let expected_path = if name == "tuple_call_unicode_param_mismatch" {
+                "値"
+            } else {
+                "actual"
+            };
+            assert_eq!(
+                diagnostic_primary_text(&paths.call_diagnostics()[0]),
+                expected_path,
+                "{name}"
+            );
+        }
+
+        let named_parameter_mismatch = paths_for("tuple_call_named_param_mismatch");
+        assert_eq!(named_parameter_mismatch.call_diagnostics().len(), 2);
+        assert!(
+            named_parameter_mismatch
+                .call_diagnostics()
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::NamedArgumentOnFunction
+                })
+        );
+        let named_parameter_type_mismatch = named_parameter_mismatch
+            .call_diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+            .expect("named values still use their written positional parameter");
+        assert_eq!(
+            named_parameter_type_mismatch.message,
+            "expected `U8`, found `Bool`"
+        );
+        assert_eq!(
+            diagnostic_primary_text(named_parameter_type_mismatch),
+            "actual"
+        );
+
+        let parameter_too_many = paths_for("tuple_call_param_too_many");
+        assert_eq!(parameter_too_many.call_diagnostics().len(), 1);
+        assert_eq!(
+            parameter_too_many.call_diagnostics()[0].code,
+            sai_diagnostics::Code::WrongArgumentCount
+        );
 
         let tuple_call_mismatch = paths_for("tuple_call_mismatch");
         assert_eq!(
