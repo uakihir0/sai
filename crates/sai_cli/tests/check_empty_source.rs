@@ -291,7 +291,7 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "type BoolAlias = Bool\n",
         "type UnitAlias = ()\n",
         "type Widget { value: Bool }\n",
-        "pub fn use_it(actual: Bool, depth_three_shadow: Bool) {\n",
+        "pub fn use_it(actual: Bool, depth_three_shadow: Bool, tuple_actual: (I8,)) {\n",
         "    let annotated: Bool = true\n",
         "    var matching: Bool = false\n",
         "    var extra: Bool = false\n",
@@ -405,6 +405,15 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "NestedPayload.Fixed(((tuple_nested_rejected, b'x'), ('x', ()))), ",
         "NestedPayload.Fixed(((tuple_shape_nested, b'x'), ('x', ()))), ",
         "NestedPayload.Fixed(((tuple_shape_leaf, b'x'), ('x', ()))), ",
+        "NestedPayload.Nested(((true,), ((), true))), ",
+        "NestedPayload.Nested(((true, 1, false), ((), true))), ",
+        "NestedPayload.Nested(((), ((true,), 2))), ",
+        "NestedPayload.Nested((true, ((), 2))), ",
+        "NestedPayload.Nested(((1, (false,)), ((), 2))), ",
+        "NestedPayload.Nested((actual, ((), 2))), ",
+        "NestedPayload.Nested((tuple_actual, ((), 2))), ",
+        "NestedPayload.Nested(((true,), ((), 2)), 1), ",
+        "NestedPayload.Nested(value: ((true,), ((), true)), extra: 1), ",
         "Payload.Pair(1, true), ",
         "Payload.Pair(first: true, second: 1, third: false), ",
         "Payload.Pair(1, true, extra), ",
@@ -425,18 +434,18 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         stdout
             .matches("\"code\":\"NAMED_ARGUMENT_ON_FUNCTION\"")
             .count(),
-        3,
+        5,
         "each named tuple-constructor argument is reported, but the record field is not:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
-        2,
+        4,
         "the call arity error is surfaced alongside named-argument errors:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        20,
-        "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus depth-three annotated leaves and named/nested tuple literal leaves:\n{stdout}"
+        25,
+        "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus depth-three annotated leaves, named/nested tuple literal leaves, and bounded nested tuple-arity mismatches:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
@@ -682,6 +691,55 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "expected `Char`, found an integer literal",
         nested_char_start,
         nested_char_start + "1".len(),
+    );
+    let nested_tuple_short_call = "NestedPayload.Nested(((true,), ((), true)))";
+    let nested_tuple_short_start = source
+        .find(nested_tuple_short_call)
+        .expect("nested too-short tuple call exists")
+        + "NestedPayload.Nested((".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected tuple of arity 2, found tuple of arity 1",
+        nested_tuple_short_start,
+        nested_tuple_short_start + "(true,)".len(),
+    );
+    let nested_tuple_long_call = "NestedPayload.Nested(((true, 1, false), ((), true)))";
+    let nested_tuple_long_start = source
+        .find(nested_tuple_long_call)
+        .expect("nested too-long tuple call exists")
+        + "NestedPayload.Nested((".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected tuple of arity 2, found tuple of arity 3",
+        nested_tuple_long_start,
+        nested_tuple_long_start + "(true, 1, false)".len(),
+    );
+    let nested_tuple_arity_outer_call = "NestedPayload.Nested(((true,), ((), 2)), 1)";
+    let nested_tuple_arity_outer_start = source
+        .find(nested_tuple_arity_outer_call)
+        .expect("nested tuple mismatch with extra outer argument exists")
+        + "NestedPayload.Nested((".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected tuple of arity 2, found tuple of arity 1",
+        nested_tuple_arity_outer_start,
+        nested_tuple_arity_outer_start + "(true,)".len(),
+    );
+    let nested_tuple_arity_named_call =
+        "NestedPayload.Nested(value: ((true,), ((), true)), extra: 1)";
+    let nested_tuple_arity_named_start = source
+        .find(nested_tuple_arity_named_call)
+        .expect("named nested tuple mismatch with extra argument exists")
+        + "NestedPayload.Nested(value: (".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected tuple of arity 2, found tuple of arity 1",
+        nested_tuple_arity_named_start,
+        nested_tuple_arity_named_start + "(true,)".len(),
     );
     let nested_out_of_range_call = "NestedPayload.Nested(((256, 'x'), ((), 2)))";
     let nested_out_of_range_start = source
