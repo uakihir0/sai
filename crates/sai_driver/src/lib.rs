@@ -9,6 +9,7 @@ pub mod index_operation_journal_validation;
 mod interface_impl_resource_wit;
 mod interface_resource_alias;
 mod interface_use_queries;
+mod local_enum_variant_value_queries;
 mod module_function_inventory;
 pub mod package_graph;
 mod package_wit_name_queries;
@@ -31,6 +32,7 @@ use interface_resource_alias::{
 use interface_use_queries::InterfaceUsesQueries;
 pub use interface_use_queries::InterfaceUsesQueryError;
 pub use interface_use_queries::WorldInterfaceUseGraph;
+pub use local_enum_variant_value_queries::LocalEnumVariantValueTypeQueryError;
 pub use module_function_inventory::Phase1PackageSymbolInventory;
 use module_function_inventory::collect_module_function_inventory;
 pub use sai_wit::WitPackageDiagnosticTemplate;
@@ -211,6 +213,8 @@ pub struct RootDatabase {
     package_wit_names: PackageWitNamesQueries,
     interface_uses: InterfaceUsesQueries,
     type_owner_paths: TypeOwnerPathQueries,
+    local_enum_variant_value_types:
+        local_enum_variant_value_queries::LocalEnumVariantValueTypeQueries,
     declared_requirements: DeclaredRequirementsQueries,
     wit_contracts: WitContractQueries,
     generated_wit_texts: GeneratedWitTextQueries,
@@ -14549,6 +14553,8 @@ impl RootDatabase {
             primitive_prelude.clone(),
         )?;
         let type_owner_paths = TypeOwnerPathQueries::new()?;
+        let local_enum_variant_value_types =
+            local_enum_variant_value_queries::LocalEnumVariantValueTypeQueries::new()?;
         let declared_requirements = DeclaredRequirementsQueries::new()?;
         let wit_contracts = WitContractQueries::new(declared_requirements.input.clone())?;
         let generated_wit_texts = GeneratedWitTextQueries::new()?;
@@ -14600,6 +14606,7 @@ impl RootDatabase {
             package_wit_names,
             interface_uses,
             type_owner_paths,
+            local_enum_variant_value_types,
             declared_requirements,
             wit_contracts,
             generated_wit_texts,
