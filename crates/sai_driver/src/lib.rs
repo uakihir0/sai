@@ -54,7 +54,8 @@ use sai_hir::arena::HirArena;
 use sai_hir::attrs::{ReprAttr, ValidatedAttrs};
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::expressions::{
-    BinOp, Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind, UnOp,
+    Arg as HirArg, BinOp, Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind,
+    UnOp,
 };
 use sai_hir::item_tree::{
     ItemTree, ItemTreeEntry, ItemTreeKind, TargetFilterError, TargetFilterResult,
@@ -2793,7 +2794,7 @@ impl LocalEnumVariantPathResolution {
         &self.diagnostics
     }
 
-    /// Source-ordered wrong-argument-count diagnostics for local variant calls.
+    /// Source-ordered argument diagnostics for local variant calls.
     pub fn call_diagnostics(&self) -> &[Diagnostic] {
         &self.call_diagnostics
     }
@@ -14245,7 +14246,7 @@ fn resolve_local_enum_variant_paths(
             )?);
         }
         if let (Some(call), Some(value_type_entry)) = (direct_call, value_type_entry.as_ref())
-            && let Some((call_entry, diagnostic)) = local_enum_variant_call_projection(
+            && let Some((call_entry, diagnostics)) = local_enum_variant_call_projection(
                 owner,
                 &entry,
                 call,
@@ -14255,9 +14256,7 @@ fn resolve_local_enum_variant_paths(
                 snapshot,
             )?
         {
-            if let Some(diagnostic) = diagnostic {
-                result.call_diagnostics.push(diagnostic);
-            }
+            result.call_diagnostics.extend(diagnostics);
             result.calls.insert(call_entry.call, call_entry);
         }
         if let Some(value_type_entry) = value_type_entry {
@@ -14285,8 +14284,7 @@ fn local_enum_variant_call_projection(
     symbols: &Interner,
     inputs: &CurrentOwnerInputs,
     snapshot: &WorkspaceSnapshot,
-) -> Result<Option<(LocalEnumVariantCallEntry, Option<Diagnostic>)>, OwnerControlFlowResolutionError>
-{
+) -> Result<Option<(LocalEnumVariantCallEntry, Vec<Diagnostic>)>, OwnerControlFlowResolutionError> {
     let ExprKind::Call {
         callee,
         args,
@@ -14311,6 +14309,15 @@ fn local_enum_variant_call_projection(
         || value_type.variant != *variant
     {
         return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+    }
+
+    let mut diagnostics = Vec::new();
+    for argument in args {
+        if argument.name.is_some() {
+            diagnostics.push(local_enum_variant_named_argument_diagnostic(
+                owner, argument, inputs, snapshot,
+            )?);
+        }
     }
 
     let (outcome, diagnostic) = match &value_type.value_type {
@@ -14369,6 +14376,9 @@ fn local_enum_variant_call_projection(
         }
         sai_ty::adt::LocalEnumVariantValueType::RecordHasNoValueType => return Ok(None),
     };
+    if let Some(diagnostic) = diagnostic {
+        diagnostics.push(diagnostic);
+    }
     let entry = LocalEnumVariantCallEntry {
         call: call.hir_id,
         callee_field: path.field,
@@ -14378,7 +14388,37 @@ fn local_enum_variant_call_projection(
         arguments: args.iter().map(|argument| argument.expr.hir_id).collect(),
         outcome,
     };
-    Ok(Some((entry, diagnostic)))
+    Ok(Some((entry, diagnostics)))
+}
+
+fn local_enum_variant_named_argument_diagnostic(
+    owner: OwnerId,
+    argument: &HirArg<'_>,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    let name = argument
+        .name
+        .ok_or(OwnerControlFlowResolutionError::SnapshotMismatch)?;
+    let location = sai_diagnostics::Location::from_decoded_source(
+        inputs.source_ref.clone(),
+        sai_diagnostics::Span::new(name.span.file, name.span.range),
+        &inputs.source,
+    )
+    .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+        owner,
+    ))?;
+    let mut diagnostic = Diagnostic::new(
+        sai_diagnostics::Code::NamedArgumentOnFunction,
+        sai_diagnostics::Severity::Error,
+        "named arguments are only allowed when constructing a record",
+        Some(location),
+    );
+    diagnostic.primary_label = "named argument is not allowed in a function call".to_owned();
+    diagnostic.package = inputs.source_ref.package.clone();
+    diagnostic
+        .with_workspace_snapshot(snapshot)
+        .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))
 }
 
 fn local_enum_variant_call_diagnostic(
@@ -97063,8 +97103,13 @@ interface facade { use middle.{payload}; }"#;
             "fn payload_record() { Payload.Named(value: true) }\n",
             "fn repeated_paths() { (Payload.Unit, Payload.Pair) }\n",
             "fn tuple_call_ok() { Payload.Pair(Alpha.Same, Beta.Same) }\n",
+            "fn tuple_call_named_one() { Payload.Pair(left: 1, true) }\n",
+            "fn tuple_call_named_many() { Payload.Pair(left: 1, right: true) }\n",
+            "fn tuple_call_named_too_few() { Payload.Pair(left: 1) }\n",
+            "fn tuple_call_named_too_many() { Payload.Pair(first: 1, second: true, third: false) }\n",
             "fn tuple_call_too_few() { Payload.Pair(1) }\n",
             "fn tuple_call_too_many() { Payload.Pair(1, true, false) }\n",
+            "fn unit_call_named() { Alpha.Ready(value: 1) }\n",
             "fn record_call() { Payload.Named() }\n",
             "fn record_update_call(base: Payload) { Payload.Named(value: true, ..base) }\n",
             "fn unknown() { Alpha.Smae }\n",
@@ -97560,6 +97605,142 @@ interface facade { use middle.{payload}; }"#;
             &[alpha_argument, beta_argument],
             "call arguments retain exact HIR identities in source order"
         );
+        assert!(
+            tuple_call_ok_paths.call_diagnostics().is_empty(),
+            "positional tuple-variant arguments remain accepted"
+        );
+
+        let tuple_call_named_one = paths_for("tuple_call_named_one");
+        assert_eq!(
+            tuple_call_named_one
+                .calls()
+                .values()
+                .next()
+                .unwrap()
+                .outcome(),
+            LocalEnumVariantCallOutcome::TupleVariantArityMatches { expected: 2 },
+            "a named argument does not change constructor arity"
+        );
+        assert_eq!(tuple_call_named_one.call_diagnostics().len(), 1);
+        assert_eq!(
+            tuple_call_named_one.call_diagnostics()[0].code,
+            sai_diagnostics::Code::NamedArgumentOnFunction
+        );
+        let named_one_span = tuple_call_named_one.call_diagnostics()[0]
+            .primary()
+            .expect("named-argument diagnostics point at the argument name")
+            .span
+            .range;
+        assert_eq!(
+            &root[named_one_span.start().to_usize()..named_one_span.end().to_usize()],
+            "left",
+            "the diagnostic covers only the named argument identifier"
+        );
+
+        let tuple_call_named_many = paths_for("tuple_call_named_many");
+        assert_eq!(tuple_call_named_many.call_diagnostics().len(), 2);
+        assert!(
+            tuple_call_named_many
+                .call_diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code
+                    == sai_diagnostics::Code::NamedArgumentOnFunction),
+            "each named argument receives its own diagnostic"
+        );
+        let named_spans = tuple_call_named_many
+            .call_diagnostics()
+            .iter()
+            .map(|diagnostic| {
+                let span = diagnostic
+                    .primary()
+                    .expect("named-argument diagnostics point at argument names")
+                    .span
+                    .range;
+                &root[span.start().to_usize()..span.end().to_usize()]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            named_spans,
+            ["left", "right"],
+            "multiple named-argument diagnostics preserve source order"
+        );
+
+        let tuple_call_named_too_few = paths_for("tuple_call_named_too_few");
+        assert_eq!(
+            tuple_call_named_too_few
+                .calls()
+                .values()
+                .next()
+                .unwrap()
+                .outcome(),
+            LocalEnumVariantCallOutcome::WrongArgumentCount {
+                expected: 2,
+                found: 1
+            }
+        );
+        assert_eq!(tuple_call_named_too_few.call_diagnostics().len(), 2);
+        assert!(
+            tuple_call_named_too_few
+                .call_diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::NamedArgumentOnFunction),
+            "named-argument validation runs even when arity is wrong"
+        );
+        assert!(
+            tuple_call_named_too_few
+                .call_diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::WrongArgumentCount),
+            "arity validation runs even when an argument is named"
+        );
+
+        let tuple_call_named_too_many = paths_for("tuple_call_named_too_many");
+        assert_eq!(
+            tuple_call_named_too_many
+                .calls()
+                .values()
+                .next()
+                .unwrap()
+                .outcome(),
+            LocalEnumVariantCallOutcome::WrongArgumentCount {
+                expected: 2,
+                found: 3
+            }
+        );
+        let named_too_many_codes = tuple_call_named_too_many
+            .call_diagnostics()
+            .iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            named_too_many_codes,
+            [
+                sai_diagnostics::Code::WrongArgumentCount,
+                sai_diagnostics::Code::NamedArgumentOnFunction,
+                sai_diagnostics::Code::NamedArgumentOnFunction,
+                sai_diagnostics::Code::NamedArgumentOnFunction,
+            ],
+            "the call-level arity error precedes all named-argument errors in source order"
+        );
+        let named_too_many_spans = tuple_call_named_too_many
+            .call_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::NamedArgumentOnFunction)
+            .map(|diagnostic| {
+                let span = diagnostic
+                    .primary()
+                    .expect("named-argument diagnostics point at argument names")
+                    .span
+                    .range;
+                &root[span.start().to_usize()..span.end().to_usize()]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            named_too_many_spans,
+            ["first", "second", "third"],
+            "all named arguments remain diagnosed in their written order"
+        );
+
         let tuple_call_too_few = paths_for("tuple_call_too_few");
         assert_eq!(tuple_call_too_few.calls().len(), 1);
         let tuple_call_too_few_entry = tuple_call_too_few.calls().values().next().unwrap();
@@ -97622,6 +97803,10 @@ interface facade { use middle.{payload}; }"#;
         );
 
         let payload_record_paths = paths_for("payload_record");
+        assert!(
+            payload_record_paths.call_diagnostics().is_empty(),
+            "named record fields do not receive ordinary function-call diagnostics"
+        );
         let payload_record = payload_record_paths
             .entries()
             .values()
@@ -97675,6 +97860,37 @@ interface facade { use middle.{payload}; }"#;
             &root[unit_call_span.start().to_usize()..unit_call_span.end().to_usize()],
             "Alpha.Same()",
             "unit-variant diagnostics cover the complete call expression"
+        );
+        let unit_call_named = paths_for("unit_call_named");
+        assert_eq!(unit_call_named.call_diagnostics().len(), 2);
+        assert!(
+            unit_call_named
+                .call_diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code
+                    == sai_diagnostics::Code::NamedArgumentOnFunction),
+            "a named argument to a unit variant is rejected as an ordinary function call"
+        );
+        let unit_named_span = unit_call_named
+            .call_diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::NamedArgumentOnFunction)
+            .unwrap()
+            .primary()
+            .expect("named-argument diagnostics point at the argument name")
+            .span
+            .range;
+        assert_eq!(
+            &root[unit_named_span.start().to_usize()..unit_named_span.end().to_usize()],
+            "value",
+            "unit-variant named-argument diagnostics use the identifier span"
+        );
+        assert!(
+            unit_call_named
+                .call_diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.code == sai_diagnostics::Code::WrongArgumentCount),
+            "unit-call arity remains independently diagnosed"
         );
         assert_eq!(
             paths_for("parenthesized_variant_call").calls().len(),
