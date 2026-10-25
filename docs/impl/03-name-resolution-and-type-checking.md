@@ -2264,10 +2264,9 @@ argument positionally. Record variants remain on the named-field construction
 path and receive no positional call entry or named-function-argument
 diagnostic. This projection does not type-check argument expressions, bind
 named arguments to parameters, populate `TypeckResults::call_kinds`, or accept
-generic, external, dependency, or WIT variant paths.
-The driver projection exposes these diagnostics through its owner result;
-aggregating them into the general CLI `sai check` output remains a separate
-integration step.
+generic, external, dependency, or WIT variant paths. `sai check` reports these
+staged call diagnostics while retaining its existing incomplete-stage gate;
+it does not claim full check coverage or emit a success result for these inputs.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 

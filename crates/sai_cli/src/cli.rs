@@ -6681,14 +6681,74 @@ fn module_tree_workspace_check_diagnostics(
                     public_primitive_const_set_covered = true;
                 }
 
-                if root_single_function_source_candidate {
-                    let function_resolutions = database
-                        .resolve_function_owner_analyses(
-                            &collection,
-                            module_tree,
-                            &workspace_snapshot,
+                let scopes = collection.scopes();
+                let has_local_enum_and_function = scopes
+                    .top_level_owners
+                    .iter()
+                    .any(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Enum)
+                    && scopes
+                        .top_level_owners
+                        .iter()
+                        .any(|owner| owner.kind == sai_driver::TopLevelOwnerKind::Function);
+                let function_resolutions =
+                    if root_single_function_source_candidate || has_local_enum_and_function {
+                        Some(
+                            database
+                                .resolve_function_owner_analyses(
+                                    &collection,
+                                    module_tree,
+                                    &workspace_snapshot,
+                                )
+                                .map_err(|error| {
+                                    format!("function owner analysis failed: {error:?}")
+                                })?,
                         )
-                        .map_err(|error| format!("function owner analysis failed: {error:?}"))?;
+                    } else {
+                        None
+                    };
+                if let Some(function_resolutions) = &function_resolutions
+                    && has_local_enum_and_function
+                {
+                    let mut enum_call_diagnostics = Vec::new();
+                    for owner in function_resolutions.owners() {
+                        match owner.local_enum_variant_paths() {
+                            Ok(Some(paths)) => enum_call_diagnostics
+                                .extend(paths.call_diagnostics().iter().cloned()),
+                            Ok(None) => {}
+                            Err(error) => {
+                                diagnostics.push(check_diagnostic_with_package(
+                                    check_internal_diagnostic(
+                                        &format!(
+                                            "function enum variant call processing failed: {error:?}"
+                                        ),
+                                        None,
+                                    ),
+                                    Some(&input.package_identity),
+                                ));
+                                errors = errors.saturating_add(1);
+                            }
+                        }
+                    }
+                    let (
+                        enum_call_diagnostics,
+                        enum_call_errors,
+                        enum_call_warnings,
+                        enum_call_infos,
+                    ) = phase1_check_diagnostics(
+                        &enum_call_diagnostics,
+                        &workspace_source_by_key,
+                        &input.package_identity,
+                        include_source_lines,
+                    );
+                    diagnostics.extend(enum_call_diagnostics);
+                    errors = errors.saturating_add(enum_call_errors);
+                    warnings = warnings.saturating_add(enum_call_warnings);
+                    infos = infos.saturating_add(enum_call_infos);
+                }
+
+                if root_single_function_source_candidate
+                    && let Some(function_resolutions) = &function_resolutions
+                {
                     let mut body_diagnostics = Vec::new();
                     for owner in function_resolutions.owners() {
                         match owner.body_type_check() {
@@ -7072,6 +7132,24 @@ fn module_tree_workspace_check_diagnostics(
                             diagnostics.push(check_diagnostic_with_package(
                                 check_internal_diagnostic(
                                     &format!("function type path processing failed: {error:?}"),
+                                    None,
+                                ),
+                                Some(&input.package_identity),
+                            ));
+                            errors = errors.saturating_add(1);
+                        }
+                    }
+                    match owner.local_enum_variant_paths() {
+                        Ok(Some(paths)) => {
+                            owner_diagnostics.extend(paths.call_diagnostics().iter().cloned())
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            diagnostics.push(check_diagnostic_with_package(
+                                check_internal_diagnostic(
+                                    &format!(
+                                        "function enum variant call processing failed: {error:?}"
+                                    ),
                                     None,
                                 ),
                                 Some(&input.package_identity),

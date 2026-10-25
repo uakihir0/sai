@@ -281,6 +281,50 @@ fn empty_root_package_index() -> sai_semantic::EncodedSymbolIndex {
         .expect("empty root package index encodes")
 }
 
+#[test]
+fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
+    let source = concat!(
+        "enum Payload { Pair(U8, Bool), Named(value: Bool) }\n",
+        "pub fn use_it() {\n",
+        "    (Payload.Pair(1, true), ",
+        "Payload.Pair(first: 1, second: true, third: false), ",
+        "Payload.Named(value: true))\n",
+        "}\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(&output, "local enum call diagnostics");
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"NAMED_ARGUMENT_ON_FUNCTION\"")
+            .count(),
+        3,
+        "each positional tuple-constructor argument name is reported, but the record field is not:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
+        1,
+        "the call arity error is surfaced alongside named-argument errors:\n{stdout}"
+    );
+    let named_start = source.find("first:").expect("named argument exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "NAMED_ARGUMENT_ON_FUNCTION",
+        "named arguments are only allowed when constructing a record",
+        named_start,
+        named_start + "first".len(),
+    );
+    let call = "Payload.Pair(first: 1, second: true, third: false)";
+    let call_start = source.find(call).expect("wrong-arity call exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "WRONG_ARGUMENT_COUNT",
+        "Pair: tuple variant expects 2 arguments but found 3",
+        call_start,
+        call_start + call.len(),
+    );
+}
+
 #[cfg(all(
     unix,
     not(any(target_os = "espidf", target_os = "horizon", target_os = "redox"))
