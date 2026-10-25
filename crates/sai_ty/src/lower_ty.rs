@@ -97,6 +97,7 @@ pub struct LowerTyContext<'a> {
     paths: &'a HashMap<HirId, PathRes>,
     unit_enums: Option<&'a HashSet<DefId>>,
     local_nominals: Option<&'a HashMap<DefId, LocalNominalDef>>,
+    local_aliases: Option<&'a HashMap<DefId, Ty>>,
     generic_params: HashMap<DefId, ParamTy>,
     def_paths: Option<&'a DefPathInterner>,
     array_length_pointer_width: Option<u8>,
@@ -127,6 +128,7 @@ impl<'a> LowerTyContext<'a> {
             paths,
             unit_enums: None,
             local_nominals: None,
+            local_aliases: None,
             generic_params: HashMap::new(),
             def_paths: None,
             array_length_pointer_width: None,
@@ -155,6 +157,7 @@ impl<'a> LowerTyContext<'a> {
             paths,
             unit_enums: Some(unit_enums),
             local_nominals: None,
+            local_aliases: None,
             generic_params: HashMap::new(),
             def_paths: None,
             array_length_pointer_width: None,
@@ -183,6 +186,7 @@ impl<'a> LowerTyContext<'a> {
             paths,
             unit_enums: Some(unit_enums),
             local_nominals: Some(local_nominals),
+            local_aliases: None,
             generic_params: HashMap::new(),
             def_paths: None,
             array_length_pointer_width: None,
@@ -211,6 +215,7 @@ impl<'a> LowerTyContext<'a> {
             paths,
             unit_enums: None,
             local_nominals: None,
+            local_aliases: None,
             generic_params: HashMap::new(),
             def_paths: None,
             array_length_pointer_width: None,
@@ -234,6 +239,7 @@ impl<'a> LowerTyContext<'a> {
             paths,
             unit_enums: None,
             local_nominals: None,
+            local_aliases: None,
             generic_params: HashMap::new(),
             def_paths: None,
             array_length_pointer_width: None,
@@ -261,6 +267,20 @@ impl<'a> LowerTyContext<'a> {
     pub fn with_array_length_pointer_width(mut self, pointer_width: u8) -> Self {
         if matches!(self.region_mode, RegionMode::Signature) {
             self.array_length_pointer_width = Some(pointer_width);
+        }
+        self
+    }
+
+    /// Enable only the local, already-lowered type aliases validated by the
+    /// caller for this signature projection.
+    ///
+    /// Alias expansion is intentionally not performed here. The driver
+    /// supplies values only for direct same-package aliases whose right-hand
+    /// sides were lowered independently and proven free of alias references
+    /// and regions.
+    pub fn with_local_type_aliases(mut self, aliases: &'a HashMap<DefId, Ty>) -> Self {
+        if matches!(self.region_mode, RegionMode::Signature) {
+            self.local_aliases = Some(aliases);
         }
         self
     }
@@ -530,6 +550,17 @@ fn lower_path_ty(
 
     if resolution.base == Res::PrimTy(PrimTy::Array) {
         return lower_builtin_array(context, &path, generic_args);
+    }
+
+    if let Res::Def(DefKind::Alias, def_id) = resolution.base {
+        if generic_args.is_some() {
+            return Err(UnsupportedTy::GenericArguments);
+        }
+        return context
+            .local_aliases
+            .and_then(|aliases| aliases.get(&def_id))
+            .cloned()
+            .ok_or(UnsupportedTy::Alias);
     }
 
     if let Res::Def(DefKind::Struct | DefKind::Enum, def_id) = resolution.base {
@@ -1521,6 +1552,151 @@ mod tests {
             lower_ty(&mut context, self_projection),
             Err(UnsupportedTy::Projection)
         );
+    }
+
+    #[test]
+    fn local_alias_lowering_requires_an_exact_signature_allowlist_entry() {
+        let (owner, symbols) = owner();
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let alias_def = owner.def_id.to_def_id();
+        let alias_ty = interner.intern(TyKind::Uint(UintTy::U32));
+        let aliases = HashMap::from([(alias_def, alias_ty.clone())]);
+        let (alias, alias_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            520,
+            "Count",
+            None,
+            Res::Def(DefKind::Alias, alias_def),
+        );
+
+        let mut context = LowerTyContext::for_signature(&interner, owner, &alias_paths)
+            .with_local_type_aliases(&aliases);
+        let lowered = lower_ty(&mut context, alias).expect("validated alias lowers");
+        assert!(lowered.ptr_eq(&alias_ty));
+
+        let mut unvalidated_context = LowerTyContext::for_signature(&interner, owner, &alias_paths);
+        assert_eq!(
+            lower_ty(&mut unvalidated_context, alias),
+            Err(UnsupportedTy::Alias),
+            "an alias resolution remains unsupported without its exact validated value"
+        );
+
+        let empty_args = arena.alloc_generic_args(GenericArgs {
+            args: &[],
+            span: span(),
+        });
+        let (generic_alias, generic_alias_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            530,
+            "Count",
+            Some(empty_args),
+            Res::Def(DefKind::Alias, alias_def),
+        );
+        let mut generic_context =
+            LowerTyContext::for_signature(&interner, owner, &generic_alias_paths)
+                .with_local_type_aliases(&aliases);
+        assert_eq!(
+            lower_ty(&mut generic_context, generic_alias),
+            Err(UnsupportedTy::GenericArguments),
+            "an explicit empty argument list cannot bypass alias arity checks"
+        );
+
+        let mut body_context = LowerTyContext::for_body(&interner, owner, &alias_paths)
+            .with_local_type_aliases(&aliases);
+        assert_eq!(
+            lower_ty(&mut body_context, alias),
+            Err(UnsupportedTy::Alias),
+            "the signature-only allowlist does not enable body lowering"
+        );
+    }
+
+    #[test]
+    fn local_alias_allowlist_rejects_unregistered_and_external_definitions() {
+        let packages = PackageInterner::new();
+        let local_package = packages.intern("acme:aliases#1.0").unwrap();
+        let external_package = packages.intern("acme:external#1.0").unwrap();
+        let symbols = Interner::new();
+        let local_paths = DefPathInterner::new(local_package, &packages, &symbols).unwrap();
+        let use_name = symbols.intern("use_count").unwrap();
+        let owner_path = DefPath::new(
+            local_package,
+            vec![DisambiguatedDefPathData {
+                data: DefPathData::ValueNs(use_name),
+                disambiguator: 0,
+            }],
+            &packages,
+            &symbols,
+        )
+        .unwrap();
+        let owner = sai_hir::OwnerId {
+            def_id: local_paths.intern(owner_path).unwrap(),
+        };
+        let count_name = symbols.intern("Count").unwrap();
+        let local_alias_path = DefPath::new(
+            local_package,
+            vec![DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(count_name),
+                disambiguator: 0,
+            }],
+            &packages,
+            &symbols,
+        )
+        .unwrap();
+        let local_alias = local_paths.intern(local_alias_path).unwrap().to_def_id();
+        let unregistered_name = symbols.intern("OtherCount").unwrap();
+        let unregistered_path = DefPath::new(
+            local_package,
+            vec![DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(unregistered_name),
+                disambiguator: 0,
+            }],
+            &packages,
+            &symbols,
+        )
+        .unwrap();
+        let unregistered_alias = local_paths.intern(unregistered_path).unwrap().to_def_id();
+        let external_paths = DefPathInterner::new(external_package, &packages, &symbols).unwrap();
+        let external_alias_path = DefPath::new(
+            external_package,
+            vec![DisambiguatedDefPathData {
+                data: DefPathData::TypeNs(count_name),
+                disambiguator: 0,
+            }],
+            &packages,
+            &symbols,
+        )
+        .unwrap();
+        let external_alias = external_paths
+            .intern(external_alias_path)
+            .unwrap()
+            .to_def_id();
+
+        let interner = TyInterner::new();
+        let aliases = HashMap::from([(local_alias, interner.intern(TyKind::Uint(UintTy::U32)))]);
+        let arena = HirArena::new();
+        for (local_id, def_id) in [(550, unregistered_alias), (560, external_alias)] {
+            let (hir_ty, paths) = resolved_path(
+                &arena,
+                owner,
+                &symbols,
+                local_id,
+                "Count",
+                None,
+                Res::Def(DefKind::Alias, def_id),
+            );
+            let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
+                .with_local_type_aliases(&aliases);
+            assert_eq!(
+                lower_ty(&mut context, hir_ty),
+                Err(UnsupportedTy::Alias),
+                "an alias's spelling or external package identity cannot borrow a local allowlist entry"
+            );
+        }
     }
 
     #[test]
