@@ -125,7 +125,6 @@ fn local_field_conflicts(case: SyncCase, patch_index: USize, patch: LocalPatch) 
                     or other.base_revision < case.history_floor_revision
                     or other.base_revision > case.current_revision
                     or not field_value_matches(other.field, other.value)
-                    or event_id_payload_conflicts(case, index, other)
                 ) {
                     continue
                 }

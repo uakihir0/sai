@@ -23,8 +23,8 @@ test "the fixture audit totals match the hand-checked reconciliation cases" {
     assert result.needs_review_count == 1
     assert result.applied_patch_count == 8
     assert result.converged_patch_count == 0
-    assert result.duplicate_arrival_count == 1
-    assert result.conflict_count == 4
+    assert result.duplicate_arrival_count == 2
+    assert result.conflict_count == 5
     assert result.held_count == 3
 }
 
@@ -73,15 +73,25 @@ test "a delete versus update conflict holds only that field while independent wo
     assert result.applied_count == 1
 }
 
-test "an event ID payload collision holds both copies but preserves an independent edit" {
+test "event ID collisions remain conflict evidence and an exact replay counts once" {
     let result = reconcile.reconcile(fixtures.sample_batch().cases[5].unwrap())
     assert result.status == SyncStatus.PartialMerge
     assert result.state.summary == "inspect loading door"
     assert result.state.status == WorkStatus.InProgress
+    assert result.final_revision == 12
+    assert result.outcome_count == 5
     assert result.held_count == 2
+    assert result.conflict_count == 1
+    assert result.duplicate_count == 1
     assert result.applied_count == 1
     assert result.outcomes[0].unwrap().review_reason == Some(ReviewReason.EventIdPayloadMismatch)
     assert result.outcomes[1].unwrap().review_reason == Some(ReviewReason.EventIdPayloadMismatch)
+    assert result.outcomes[2].unwrap().disposition == PatchDisposition.Conflict
+    assert (
+        result.outcomes[2].unwrap().review_reason == Some(ReviewReason.ConflictingOfflineValues)
+    )
+    assert result.outcomes[3].unwrap().disposition == PatchDisposition.DuplicateArrival
+    assert result.outcomes[4].unwrap().disposition == PatchDisposition.Applied
 }
 
 test "different offline values for one field are held while a disjoint edit merges" {

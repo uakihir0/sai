@@ -239,7 +239,16 @@ fn event_id_collision_case() -> SyncCase {
             value: FieldValue.Summary("replace loading door spring"),
         ),
     )
-    case.local_patches[2] = Some(
+    let separate_edit = LocalPatch(
+        client_id: 54,
+        event_id: 9903,
+        base_revision: 11,
+        field: WorkField.Summary,
+        value: FieldValue.Summary("replace loading door seal"),
+    )
+    case.local_patches[2] = Some(separate_edit)
+    case.local_patches[3] = Some(separate_edit)
+    case.local_patches[4] = Some(
         LocalPatch(
             client_id: 53,
             event_id: 9902,
@@ -248,7 +257,7 @@ fn event_id_collision_case() -> SyncCase {
             value: FieldValue.Status(WorkStatus.InProgress),
         ),
     )
-    case.local_patch_count = 3
+    case.local_patch_count = 5
     case
 }
 
