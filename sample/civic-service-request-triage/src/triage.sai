@@ -1,0 +1,276 @@
+use acme:civic-service-request-triage/data
+use acme:civic-service-request-triage/model.{
+    Decision
+    Department
+    ServiceKind
+    ServiceRequest
+    TriageItem
+    TriageReport
+    Urgency
+}
+
+const LAST_INTAKE_MINUTE: U32 = 10079
+
+fn has_duplicate_id(requests: Array<ServiceRequest, 11>, index: USize) -> Bool {
+    let request = requests[index]
+    for candidate in 0..requests.len() {
+        if candidate != index and requests[candidate].id == request.id {
+            return true
+        }
+    }
+    false
+}
+
+fn timestamp_matches_day(request: ServiceRequest) -> Bool {
+    if request.service_day < 7 and request.opened_minute <= LAST_INTAKE_MINUTE {
+        let day_start = request.service_day * 1440
+        let next_day_start = (request.service_day + 1) * 1440
+        request.opened_minute >= day_start and request.opened_minute < next_day_start
+    } else {
+        false
+    }
+}
+
+fn valid_record(requests: Array<ServiceRequest, 11>, index: USize) -> Bool {
+    let request = requests[index]
+    (
+        request.id != 0
+        and request.location_code != 0
+        and timestamp_matches_day(request)
+        and not has_duplicate_id(requests, index)
+    )
+}
+
+fn can_be_linked(requests: Array<ServiceRequest, 11>, index: USize) -> Bool {
+    let request = requests[index]
+    (
+        valid_record(requests, index)
+        and request.municipal_asset
+        and request.service != ServiceKind.Unclassified
+    )
+}
+
+fn same_incident(left: ServiceRequest, right: ServiceRequest) -> Bool {
+    (
+        left.location_code == right.location_code
+        and left.service_day == right.service_day
+        and left.service == right.service
+        and left.municipal_asset == right.municipal_asset
+    )
+}
+
+fn earlier(left: ServiceRequest, right: ServiceRequest) -> Bool {
+    (
+        left.opened_minute < right.opened_minute
+        or (left.opened_minute == right.opened_minute and left.id < right.id)
+    )
+}
+
+fn canonical_index(requests: Array<ServiceRequest, 11>, index: USize) -> USize {
+    let request = requests[index]
+    var selected = index
+    for candidate in 0..requests.len() {
+        if candidate != index and can_be_linked(requests, candidate) {
+            let other = requests[candidate]
+            if same_incident(request, other) and earlier(other, requests[selected]) {
+                selected = candidate
+            }
+        }
+    }
+    selected
+}
+
+fn incident_report_count(requests: Array<ServiceRequest, 11>, index: USize) -> U32 {
+    let request = requests[index]
+    var count: U32 = 0
+    for candidate in 0..requests.len() {
+        if can_be_linked(requests, candidate) and same_incident(request, requests[candidate]) {
+            count += 1
+        }
+    }
+    count
+}
+
+fn department_for(service: ServiceKind) -> Option<Department> {
+    match service {
+        .SidewalkAccess => Some(Department.AccessAndMobility)
+        .TrafficSignal => Some(Department.TrafficOperations)
+        .MissedCollection => Some(Department.Sanitation)
+        .WaterLeak => Some(Department.WaterUtility)
+        .ParkHazard => Some(Department.Parks)
+        .Unclassified => None
+    }
+}
+
+fn urgency_for(request: ServiceRequest) -> Urgency {
+    if request.immediate_hazard {
+        Urgency.Critical
+    } else if request.accessible_route_blocked {
+        Urgency.High
+    } else {
+        Urgency.Standard
+    }
+}
+
+fn response_window(urgency: Urgency) -> U32 {
+    match urgency { .Critical => 30, .High => 240, .Standard => 2880 }
+}
+
+fn urgency_rank(urgency: Urgency) -> U32 {
+    match urgency { .Critical => 0, .High => 1, .Standard => 2 }
+}
+
+fn incident_urgency(requests: Array<ServiceRequest, 11>, index: USize) -> Urgency {
+    let request = requests[index]
+    var selected = urgency_for(request)
+    for candidate in 0..requests.len() {
+        if candidate != index and can_be_linked(requests, candidate) {
+            let other = requests[candidate]
+            if same_incident(request, other) {
+                let other_urgency = urgency_for(other)
+                if urgency_rank(other_urgency) < urgency_rank(selected) {
+                    selected = other_urgency
+                }
+            }
+        }
+    }
+    selected
+}
+
+fn incident_response_due_minute(requests: Array<ServiceRequest, 11>, index: USize) -> U32 {
+    let request = requests[index]
+    var earliest_due = request.opened_minute + response_window(urgency_for(request))
+    for candidate in 0..requests.len() {
+        if candidate != index and can_be_linked(requests, candidate) {
+            let other = requests[candidate]
+            if same_incident(request, other) {
+                let other_due = other.opened_minute + response_window(urgency_for(other))
+                if other_due < earliest_due {
+                    earliest_due = other_due
+                }
+            }
+        }
+    }
+    earliest_due
+}
+
+fn item_for(requests: Array<ServiceRequest, 11>, index: USize) -> TriageItem {
+    let request = requests[index]
+    if not valid_record(requests, index) {
+        TriageItem(
+            request_id: request.id,
+            location_name: request.location_name,
+            service: request.service,
+            decision: Decision.InvalidRecord,
+            department: None,
+            urgency: None,
+            response_due_minute: None,
+            duplicate_of: None,
+            incident_report_count: 0,
+        )
+    } else if not request.municipal_asset {
+        TriageItem(
+            request_id: request.id,
+            location_name: request.location_name,
+            service: request.service,
+            decision: Decision.OutsideMunicipality,
+            department: None,
+            urgency: None,
+            response_due_minute: None,
+            duplicate_of: None,
+            incident_report_count: 0,
+        )
+    } else if request.service == ServiceKind.Unclassified {
+        TriageItem(
+            request_id: request.id,
+            location_name: request.location_name,
+            service: request.service,
+            decision: Decision.ClassificationReview,
+            department: None,
+            urgency: None,
+            response_due_minute: None,
+            duplicate_of: None,
+            incident_report_count: 0,
+        )
+    } else {
+        let canonical = canonical_index(requests, index)
+        if canonical != index {
+            TriageItem(
+                request_id: request.id,
+                location_name: request.location_name,
+                service: request.service,
+                decision: Decision.Duplicate,
+                department: None,
+                urgency: None,
+                response_due_minute: None,
+                duplicate_of: Some(requests[canonical].id),
+                incident_report_count: 0,
+            )
+        } else {
+            let urgency = incident_urgency(requests, index)
+            let response_due_minute = incident_response_due_minute(requests, index)
+            TriageItem(
+                request_id: request.id,
+                location_name: request.location_name,
+                service: request.service,
+                decision: Decision.Routed,
+                department: department_for(request.service),
+                urgency: Some(urgency),
+                response_due_minute: Some(response_due_minute),
+                duplicate_of: None,
+                incident_report_count: incident_report_count(requests, index),
+            )
+        }
+    }
+}
+
+pub fn triage_requests(requests: Array<ServiceRequest, 11>) -> TriageReport {
+    var items: Array<Option<TriageItem>, 11> =
+        [None, None, None, None, None, None, None, None, None, None, None]
+    var routed_count: USize = 0
+    var duplicate_count: USize = 0
+    var outside_municipality_count: USize = 0
+    var classification_review_count: USize = 0
+    var invalid_record_count: USize = 0
+    var critical_count: USize = 0
+
+    for index in 0..requests.len() {
+        let item = item_for(requests, index)
+        items[index] = Some(item)
+        match item.decision {
+            .InvalidRecord => {
+                invalid_record_count += 1
+            }
+            .ClassificationReview => {
+                classification_review_count += 1
+            }
+            .OutsideMunicipality => {
+                outside_municipality_count += 1
+            }
+            .Duplicate => {
+                duplicate_count += 1
+            }
+            .Routed => {
+                routed_count += 1
+                if item.urgency == Some(Urgency.Critical) {
+                    critical_count += 1
+                }
+            }
+        }
+    }
+
+    TriageReport(
+        items: items,
+        request_count: requests.len(),
+        routed_count: routed_count,
+        duplicate_count: duplicate_count,
+        outside_municipality_count: outside_municipality_count,
+        classification_review_count: classification_review_count,
+        invalid_record_count: invalid_record_count,
+        critical_count: critical_count,
+    )
+}
+
+pub fn triage() -> TriageReport {
+    triage_requests(data.requests())
+}
