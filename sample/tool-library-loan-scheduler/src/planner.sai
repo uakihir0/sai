@@ -1,0 +1,233 @@
+use acme:tool-library-loan-scheduler/data
+use acme:tool-library-loan-scheduler/model.{
+    CurrentLoan
+    Decision
+    HoldReason
+    Member
+    Plan
+    Request
+    Tool
+    Training
+}
+
+fn member_index(members: Array<Member, 5>, member_id: U32) -> Option<USize> {
+    for index in 0..members.len() {
+        if members[index].id == member_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn tool_index(tools: Array<Tool, 3>, tool_id: U32) -> Option<USize> {
+    for index in 0..tools.len() {
+        if tools[index].id == tool_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn member_has_training(member: Member, required: Training) -> Bool {
+    match required {
+        Training.None => true
+        Training.Drill => member.drill_badge
+        Training.Saw => member.saw_badge
+    }
+}
+
+fn inventory_is_consistent(tool: Tool, current_loans: Array<CurrentLoan, 4>) -> Bool {
+    var loaned_copies: U32 = 0
+    for loan in current_loans {
+        if loan.tool_id == tool.id {
+            loaned_copies += 1
+        }
+    }
+    tool.ready_copies + tool.maintenance_copies + loaned_copies == tool.total_copies
+}
+
+fn overlaps(first_start: USize, first_end: USize, second_start: USize, second_end: USize) -> Bool {
+    first_start < second_end and second_start < first_end
+}
+
+fn duplicates_scheduled_request(
+    earlier_requests: Array<Request, 16>,
+    decisions: Array<Option<Decision>, 16>,
+    request_index: USize,
+    request: Request,
+) -> Bool {
+    var duplicate = false
+    let request_end = request.pickup_day + request.duration_days
+    for earlier_index in 0..request_index {
+        match decisions[earlier_index] {
+            Some(decision) => {
+                let earlier = earlier_requests[earlier_index]
+                if (
+                    decision.scheduled
+                    and earlier.member_id == request.member_id
+                    and earlier.tool_id == request.tool_id
+                    and overlaps(
+                        request.pickup_day,
+                        request_end,
+                        earlier.pickup_day,
+                        earlier.pickup_day + earlier.duration_days,
+                    )
+                ) {
+                    duplicate = true
+                }
+            }
+            None => {}
+        }
+    }
+    duplicate
+}
+
+fn member_limit_allows(
+    active_by_day: Array<U32, 35>,
+    member_index: USize,
+    member: Member,
+    request: Request,
+) -> Bool {
+    let request_end = request.pickup_day + request.duration_days
+    var allowed = true
+    for day in request.pickup_day..request_end {
+        if active_by_day[member_index * 7 + day] >= member.max_concurrent_loans {
+            allowed = false
+        }
+    }
+    allowed
+}
+
+fn stock_available_for_window(
+    free_by_day: Array<U32, 21>,
+    tool_index: USize,
+    request: Request,
+) -> Bool {
+    let request_end = request.pickup_day + request.duration_days
+    var available = true
+    for day in request.pickup_day..request_end {
+        if free_by_day[tool_index * 7 + day] == 0 {
+            available = false
+        }
+    }
+    available
+}
+
+pub fn plan() -> Plan {
+    let tools = data.tools()
+    let members = data.members()
+    let current_loans = data.current_loans()
+    let requests = data.requests()
+    var free_by_day: Array<U32, 21> = Array<U32, 21>.filled(0)
+    var active_by_day: Array<U32, 35> = Array<U32, 35>.filled(0)
+    var decisions: Array<Option<Decision>, 16> = Array<Option<Decision>, 16>.filled(None)
+    var scheduled_count: USize = 0
+    var held_count: USize = 0
+
+    // Rebuild baseline copy availability from ready copies and current-loan
+    // returns.
+    for item_index in 0..tools.len() {
+        let tool = tools[item_index]
+        for day in 0..7 {
+            var free_copies = tool.ready_copies
+            for loan in current_loans {
+                if loan.tool_id == tool.id and loan.return_day <= day {
+                    free_copies += 1
+                }
+            }
+            free_by_day[item_index * 7 + day] = free_copies
+        }
+    }
+
+    // Existing loans count against the member limit until their exclusive return day.
+    for item_index in 0..members.len() {
+        let member = members[item_index]
+        for day in 0..7 {
+            var active = 0
+            for loan in current_loans {
+                if loan.member_id == member.id and loan.return_day > day {
+                    active += 1
+                }
+            }
+            active_by_day[item_index * 7 + day] = active
+        }
+    }
+
+    for request_index in 0..requests.len() {
+        let request = requests[request_index]
+        var decision = Decision(scheduled: false, reason: HoldReason.UnknownMember)
+        match member_index(members, request.member_id) {
+            Some(member_position) => {
+                let member = members[member_position]
+                match tool_index(tools, request.tool_id) {
+                    Some(tool_position) => {
+                        let tool = tools[tool_position]
+                        if request.pickup_day >= 7 {
+                            decision.reason = HoldReason.InvalidWindow
+                        } else if request.duration_days == 0 {
+                            decision.reason = HoldReason.InvalidWindow
+                        } else if request.duration_days > 7 - request.pickup_day {
+                            decision.reason = HoldReason.InvalidWindow
+                        } else {
+                            let request_end = request.pickup_day + request.duration_days
+                            if request.duration_days > tool.max_loan_days {
+                                decision.reason = HoldReason.LoanTooLong
+                            } else if not inventory_is_consistent(tool, current_loans) {
+                                decision.reason = HoldReason.InventoryMismatch
+                            } else if not member_has_training(member, tool.required_training) {
+                                decision.reason = HoldReason.MissingSafetyBadge
+                            } else if duplicates_scheduled_request(
+                                requests,
+                                decisions,
+                                request_index,
+                                request,
+                            ) {
+                                decision.reason = HoldReason.DuplicateOverlap
+                            } else if not member_limit_allows(
+                                active_by_day,
+                                member_position,
+                                member,
+                                request,
+                            ) {
+                                decision.reason = HoldReason.MemberLoanLimit
+                            } else if not stock_available_for_window(
+                                free_by_day,
+                                tool_position,
+                                request,
+                            ) {
+                                decision.reason = HoldReason.NoContinuousStock
+                            } else {
+                                for day in request.pickup_day..request_end {
+                                    free_by_day[tool_position * 7 + day] -= 1
+                                    active_by_day[member_position * 7 + day] += 1
+                                }
+                                decision.scheduled = true
+                                decision.reason = HoldReason.Scheduled
+                                scheduled_count += 1
+                            }
+                        }
+                    }
+                    None => {
+                        decision.reason = HoldReason.UnknownTool
+                    }
+                }
+            }
+            None => {
+                decision.reason = HoldReason.UnknownMember
+            }
+        }
+
+        if not decision.scheduled {
+            held_count += 1
+        }
+        decisions[request_index] = Some(decision)
+    }
+
+    Plan(
+        decisions: decisions,
+        free_copies_by_day: free_by_day,
+        active_loans_by_day: active_by_day,
+        scheduled_count: scheduled_count,
+        held_count: held_count,
+    )
+}

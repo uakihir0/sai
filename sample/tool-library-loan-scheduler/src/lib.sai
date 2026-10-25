@@ -1,0 +1,30 @@
+use acme:tool-library-loan-scheduler/report
+use sai:process
+
+pub fn main(env: owned process.Env) -> process.ExitCode
+    effects { env.read, stdio.write, alloc }
+{
+    var out = env.stdout()
+    let args = env.args()
+    if args.len() < 2 {
+        report.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    let command = args[1].as_str()
+    if command == "summary" {
+        report.print_summary(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "requests" {
+        report.print_requests(borrow mut out)
+        return process.ExitCode.success()
+    }
+    if command == "calendar" {
+        report.print_calendar(borrow mut out)
+        return process.ExitCode.success()
+    }
+
+    out.write_str("usage: tool-library [summary|requests|calendar]\n")
+    process.ExitCode.failure()
+}

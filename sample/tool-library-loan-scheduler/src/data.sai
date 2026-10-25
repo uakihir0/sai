@@ -1,0 +1,74 @@
+use acme:tool-library-loan-scheduler/model.{CurrentLoan, Member, Request, Tool, Training}
+
+pub fn tools() -> Array<Tool, 3> {
+    [
+        Tool(
+            id: 1,
+            name: "cordless drill",
+            total_copies: 4,
+            ready_copies: 1,
+            maintenance_copies: 1,
+            max_loan_days: 4,
+            required_training: Training.Drill,
+        ),
+        Tool(
+            id: 2,
+            name: "circular saw",
+            total_copies: 3,
+            ready_copies: 0,
+            maintenance_copies: 1,
+            max_loan_days: 3,
+            required_training: Training.Saw,
+        ),
+        Tool(
+            id: 3,
+            name: "hand truck",
+            total_copies: 2,
+            ready_copies: 2,
+            maintenance_copies: 0,
+            max_loan_days: 5,
+            required_training: Training.None,
+        ),
+    ]
+}
+
+pub fn members() -> Array<Member, 5> {
+    [
+        Member(id: 1, name: "Aiko", max_concurrent_loans: 2, drill_badge: true, saw_badge: true),
+        Member(id: 2, name: "Ben", max_concurrent_loans: 1, drill_badge: true, saw_badge: false),
+        Member(id: 3, name: "Chika", max_concurrent_loans: 2, drill_badge: true, saw_badge: false),
+        Member(id: 4, name: "Dev", max_concurrent_loans: 2, drill_badge: true, saw_badge: true),
+        Member(id: 5, name: "Eli", max_concurrent_loans: 2, drill_badge: true, saw_badge: true),
+    ]
+}
+
+pub fn current_loans() -> Array<CurrentLoan, 4> {
+    [
+        CurrentLoan(member_id: 1, tool_id: 1, return_day: 2),
+        CurrentLoan(member_id: 2, tool_id: 1, return_day: 4),
+        CurrentLoan(member_id: 3, tool_id: 2, return_day: 1),
+        CurrentLoan(member_id: 4, tool_id: 2, return_day: 3),
+    ]
+}
+
+// Requests are already sorted by queue_number; earlier rows win shared copies.
+pub fn requests() -> Array<Request, 16> {
+    [
+        Request(queue_number: 1, member_id: 5, tool_id: 1, pickup_day: 0, duration_days: 2),
+        Request(queue_number: 2, member_id: 1, tool_id: 2, pickup_day: 0, duration_days: 2),
+        Request(queue_number: 3, member_id: 3, tool_id: 1, pickup_day: 2, duration_days: 2),
+        Request(queue_number: 4, member_id: 4, tool_id: 2, pickup_day: 1, duration_days: 2),
+        Request(queue_number: 5, member_id: 1, tool_id: 2, pickup_day: 1, duration_days: 2),
+        Request(queue_number: 6, member_id: 1, tool_id: 1, pickup_day: 2, duration_days: 1),
+        Request(queue_number: 7, member_id: 2, tool_id: 2, pickup_day: 1, duration_days: 1),
+        Request(queue_number: 8, member_id: 4, tool_id: 2, pickup_day: 2, duration_days: 2),
+        Request(queue_number: 9, member_id: 3, tool_id: 3, pickup_day: 1, duration_days: 3),
+        Request(queue_number: 10, member_id: 1, tool_id: 2, pickup_day: 3, duration_days: 1),
+        Request(queue_number: 11, member_id: 2, tool_id: 3, pickup_day: 0, duration_days: 4),
+        Request(queue_number: 12, member_id: 99, tool_id: 1, pickup_day: 0, duration_days: 1),
+        Request(queue_number: 13, member_id: 3, tool_id: 2, pickup_day: 1, duration_days: 4),
+        Request(queue_number: 14, member_id: 3, tool_id: 2, pickup_day: 6, duration_days: 2),
+        Request(queue_number: 15, member_id: 5, tool_id: 1, pickup_day: 2, duration_days: 3),
+        Request(queue_number: 16, member_id: 1, tool_id: 99, pickup_day: 0, duration_days: 1),
+    ]
+}

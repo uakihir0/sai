@@ -1,0 +1,74 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Training {
+    None
+    Drill
+    Saw
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum HoldReason {
+    Scheduled
+    InventoryMismatch
+    NoContinuousStock
+    LoanTooLong
+    MissingSafetyBadge
+    DuplicateOverlap
+    MemberLoanLimit
+    UnknownMember
+    InvalidWindow
+    UnknownTool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Tool {
+    pub id: U32
+    pub name: Str
+    pub total_copies: U32
+    pub ready_copies: U32
+    pub maintenance_copies: U32
+    pub max_loan_days: USize
+    pub required_training: Training
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Member {
+    pub id: U32
+    pub name: Str
+    pub max_concurrent_loans: U32
+    pub drill_badge: Bool
+    pub saw_badge: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CurrentLoan {
+    pub member_id: U32
+    pub tool_id: U32
+    // The copy and the member loan slot are free at the start of this day.
+    pub return_day: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Request {
+    pub queue_number: U32
+    pub member_id: U32
+    pub tool_id: U32
+    pub pickup_day: USize
+    pub duration_days: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Decision {
+    pub scheduled: Bool
+    pub reason: HoldReason
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Plan {
+    pub decisions: Array<Option<Decision>, 16>
+    // Flattened as tool_index * 7 + day_index.
+    pub free_copies_by_day: Array<U32, 21>
+    // Flattened as member_index * 7 + day_index.
+    pub active_loans_by_day: Array<U32, 35>
+    pub scheduled_count: USize
+    pub held_count: USize
+}
