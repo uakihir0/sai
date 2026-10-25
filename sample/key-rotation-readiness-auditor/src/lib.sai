@@ -1,0 +1,290 @@
+use acme:key-rotation-readiness-auditor/audit
+use acme:key-rotation-readiness-auditor/data
+use acme:key-rotation-readiness-auditor/model.{
+    AuditIssue
+    AuditReport
+    CatalogEntityKind
+    CatalogIssueKind
+    Decision
+    MigrationDependency
+    MigrationEvidence
+}
+
+pub fn audit_fixture() -> AuditReport {
+    audit.audit_all(
+        data.keys(),
+        data.custody_records(),
+        data.workloads(),
+        data.migration_evidence(),
+        data.dependencies(),
+        data.plans(),
+        data.policy(),
+        data.now_minute(),
+    )
+}
+
+test "the complete payments migration clears its planned revocation gates" {
+    let report = audit_fixture()
+    let finding = report.findings[0].unwrap()
+    assert finding.plan_id == 501
+    assert finding.decision == Decision.Ready
+    assert finding.primary_issue == None
+    assert finding.issue_count == 0
+    assert finding.migrated_workload_count == 2
+    assert finding.affected_workload_count == 2
+    assert finding.overlap_minutes == Some(40)
+    assert finding.planned_revoke_minute == 1070
+    assert report.catalog_summary.issue_count == 0
+}
+
+test "stale and missing evidence after grace make a plan invalid" {
+    let report = audit_fixture()
+    let finding = report.findings[1].unwrap()
+    assert finding.decision == Decision.PlanInvalid
+    assert finding.primary_issue == Some(AuditIssue.EvidenceStale)
+    assert finding.issue_count == 3
+    assert finding.migrated_workload_count == 0
+    assert finding.affected_workload_count == 2
+}
+
+test "shared old and new escrow custodians invalidate a plan" {
+    let finding = audit_fixture().findings[2].unwrap()
+    assert finding.decision == Decision.PlanInvalid
+    assert finding.primary_issue == Some(AuditIssue.CustodianNotIndependent)
+    assert finding.issue_count == 1
+}
+
+test "overlap duration may equal the configured minimum" {
+    var plans = data.plans()
+    plans[0].overlap_end_minute = 1030
+    let report = audit.audit_all(
+        data.keys(),
+        data.custody_records(),
+        data.workloads(),
+        data.migration_evidence(),
+        data.dependencies(),
+        plans,
+        data.policy(),
+        data.now_minute(),
+    )
+    assert report.findings[0].unwrap().decision == Decision.Ready
+    assert report.findings[0].unwrap().overlap_minutes == Some(30)
+}
+
+test "an expired source key cannot cover the planned revocation time" {
+    var keys = data.keys()
+    keys[0].expires_minute = 1069
+    let report = audit.audit_all(
+        keys,
+        data.custody_records(),
+        data.workloads(),
+        data.migration_evidence(),
+        data.dependencies(),
+        data.plans(),
+        data.policy(),
+        data.now_minute(),
+    )
+    assert (
+        report.findings[0].unwrap().primary_issue == Some(AuditIssue.OldKeyExpiresBeforeRevocation)
+    )
+}
+
+test "a target key must remain valid through evaluation and planned revocation" {
+    var keys = data.keys()
+    keys[1].expires_minute = 1023
+    let report = audit.audit_all(
+        keys,
+        data.custody_records(),
+        data.workloads(),
+        data.migration_evidence(),
+        data.dependencies(),
+        data.plans(),
+        data.policy(),
+        data.now_minute(),
+    )
+    let finding = report.findings[0].unwrap()
+    assert finding.decision == Decision.PlanInvalid
+    assert finding.primary_issue == Some(AuditIssue.NewKeyExpiresBeforeRequiredValidity)
+    assert finding.issue_count == 1
+    assert finding.migrated_workload_count == 0
+}
+
+test "target key expiry after planned revocation but before evaluation is rejected" {
+    var keys = data.keys()
+    keys[1].expires_minute = 1075
+    let report = audit.audit_all(
+        keys,
+        data.custody_records(),
+        data.workloads(),
+        data.migration_evidence(),
+        data.dependencies(),
+        data.plans(),
+        data.policy(),
+        1080,
+    )
+    let finding = report.findings[0].unwrap()
+    assert finding.primary_issue == Some(AuditIssue.NewKeyExpiresBeforeRequiredValidity)
+    assert finding.issue_count == 1
+}
+
+test "a dependency must migrate strictly after its prerequisite" {
+    var evidence = data.migration_evidence()
+    evidence[0].observed_minute = 1030
+    evidence[1].observed_minute = 1024
+    let report = audit.audit_all(
+        data.keys(),
+        data.custody_records(),
+        data.workloads(),
+        evidence,
+        data.dependencies(),
+        data.plans(),
+        data.policy(),
+        data.now_minute(),
+    )
+    assert report.findings[0].unwrap().decision == Decision.Waiting
+    assert (report.findings[0].unwrap().primary_issue == Some(AuditIssue.DependencyOrderViolation))
+}
+
+test "every violating dependency edge contributes to the issue count" {
+    var workloads = data.workloads()
+    workloads[2].source_key_id = 101
+    workloads[2].target_key_id = 102
+    var evidence = data.migration_evidence()
+    evidence[0].observed_minute = 1030
+    evidence[1].observed_minute = 1024
+    evidence[2].observed_key_id = 102
+    evidence[2].observed_minute = 1032
+    var dependencies = data.dependencies()
+    dependencies[1] = MigrationDependency(prerequisite_workload_id: 10, dependent_workload_id: 1)
+    let report = audit.audit_all(
+        data.keys(),
+        data.custody_records(),
+        workloads,
+        evidence,
+        dependencies,
+        data.plans(),
+        data.policy(),
+        data.now_minute(),
+    )
+    let finding = report.findings[0].unwrap()
+    assert finding.decision == Decision.Waiting
+    assert finding.primary_issue == Some(AuditIssue.DependencyOrderViolation)
+    assert finding.issue_count == 2
+    assert finding.affected_workload_count == 3
+}
+
+test "dependency edges outside a plan's old-to-new workload set are ignored" {
+    var evidence = data.migration_evidence()
+    evidence[2].observed_key_id = 102
+    evidence[2].observed_minute = 1020
+    var dependencies = data.dependencies()
+    dependencies[0] = MigrationDependency(prerequisite_workload_id: 1, dependent_workload_id: 10)
+    let report = audit.audit_all(
+        data.keys(),
+        data.custody_records(),
+        data.workloads(),
+        evidence,
+        dependencies,
+        data.plans(),
+        data.policy(),
+        data.now_minute(),
+    )
+    let finding = report.findings[0].unwrap()
+    assert finding.decision == Decision.Ready
+    assert finding.primary_issue == None
+    assert finding.issue_count == 0
+}
+
+test "same-source workload with another target counts target error without dependency ordering" {
+    var workloads = data.workloads()
+    workloads[1].target_key_id = 202
+    var evidence = data.migration_evidence()
+    evidence[0].observed_minute = 1030
+    evidence[1].observed_minute = 1024
+    let report = audit.audit_all(
+        data.keys(),
+        data.custody_records(),
+        workloads,
+        evidence,
+        data.dependencies(),
+        data.plans(),
+        data.policy(),
+        data.now_minute(),
+    )
+    let finding = report.findings[0].unwrap()
+    assert finding.decision == Decision.Waiting
+    assert finding.primary_issue == Some(AuditIssue.UnexpectedTargetKey)
+    assert finding.issue_count == 1
+}
+
+test "migration evidence with an unknown observed key is reported in the catalog" {
+    var evidence = data.migration_evidence()
+    evidence[0].observed_key_id = 999
+    let report = audit.audit_all(
+        data.keys(),
+        data.custody_records(),
+        data.workloads(),
+        evidence,
+        data.dependencies(),
+        data.plans(),
+        data.policy(),
+        data.now_minute(),
+    )
+    let issue = report.catalog_summary.first_issue.unwrap()
+    assert issue.entity_kind == CatalogEntityKind.MigrationEvidence
+    assert issue.entity_id == 1
+    assert issue.related_id == Some(999)
+    assert issue.issue == CatalogIssueKind.UnknownKeyReference
+    assert report.catalog_summary.issue_count == 1
+}
+
+test "evidence from the future is rejected before age subtraction" {
+    var evidence = data.migration_evidence()
+    evidence[0].observed_minute = 1036
+    let report = audit.audit_all(
+        data.keys(),
+        data.custody_records(),
+        data.workloads(),
+        evidence,
+        data.dependencies(),
+        data.plans(),
+        data.policy(),
+        data.now_minute(),
+    )
+    assert report.findings[0].unwrap().primary_issue == Some(AuditIssue.EvidenceFromFuture)
+}
+
+test "duplicate key IDs remain visible and cannot resolve a plan source" {
+    var keys = data.keys()
+    keys[2].id = keys[0].id
+    let report = audit.audit_all(
+        keys,
+        data.custody_records(),
+        data.workloads(),
+        data.migration_evidence(),
+        data.dependencies(),
+        data.plans(),
+        data.policy(),
+        data.now_minute(),
+    )
+    assert report.catalog_summary.issue_count == 6
+    assert report.catalog_summary.first_issue.unwrap().entity_kind == CatalogEntityKind.Key
+    assert report.catalog_summary.first_issue.unwrap().entity_id == 101
+    assert report.findings[0].unwrap().primary_issue == Some(AuditIssue.AmbiguousKeyId)
+}
+
+test "invalid window ordering is checked before overlap arithmetic" {
+    var plans = data.plans()
+    plans[0].overlap_end_minute = 999
+    let report = audit.audit_all(
+        data.keys(),
+        data.custody_records(),
+        data.workloads(),
+        data.migration_evidence(),
+        data.dependencies(),
+        plans,
+        data.policy(),
+        data.now_minute(),
+    )
+    assert report.findings[0].unwrap().primary_issue == Some(AuditIssue.InvalidRotationWindow)
+}

@@ -1,0 +1,163 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum KeyState {
+    Active
+    Staged
+    Revoked
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Decision {
+    Ready
+    Waiting
+    PlanInvalid
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum AuditIssue {
+    DuplicatePlanId
+    MissingOldKey
+    MissingNewKey
+    AmbiguousKeyId
+    SameKeyPair
+    OldKeyNotActive
+    OldKeyNotValidAtCutover
+    NewKeyNotAvailable
+    InvalidKeyLifetime
+    TargetKeyNotValidAtCutover
+    NewKeyExpiresBeforeRequiredValidity
+    OldKeyExpiresBeforeRevocation
+    InvalidRotationWindow
+    OverlapTooShort
+    MissingCustodyRecord
+    AmbiguousCustodyRecord
+    EscrowNotVerified
+    RecoveryNotTested
+    CustodianNotIndependent
+    NoAffectedWorkloads
+    DuplicateWorkloadId
+    UnexpectedTargetKey
+    MissingMigrationEvidence
+    GraceExpiredBeforeMigration
+    AmbiguousMigrationEvidence
+    WrongKeyObserved
+    MigrationNotAttested
+    EvidenceOutsideOverlap
+    EvidenceFromFuture
+    EvidenceStale
+    DependencyOrderViolation
+    RevocationOverdue
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CatalogEntityKind {
+    Key
+    Workload
+    MigrationEvidence
+    Custody
+    Dependency
+    RotationPlan
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CatalogIssueKind {
+    DuplicateId
+    UnknownKeyReference
+    UnknownWorkloadReference
+    UnknownCustodyKey
+    SelfDependency
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CatalogIssue {
+    pub entity_kind: CatalogEntityKind
+    pub entity_id: U32
+    pub related_id: Option<U32>
+    pub issue: CatalogIssueKind
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CatalogSummary {
+    pub first_issue: Option<CatalogIssue>
+    pub issue_count: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type KeyRecord {
+    pub id: U32
+    pub name: Str
+    pub owner_team_id: U32
+    pub state: KeyState
+    pub valid_from_minute: U32
+    pub expires_minute: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type CustodyRecord {
+    pub key_id: U32
+    pub custodian_team_id: U32
+    pub escrow_verified: Bool
+    pub recovery_tested: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Workload {
+    pub id: U32
+    pub name: Str
+    pub source_key_id: U32
+    pub target_key_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type MigrationEvidence {
+    pub workload_id: U32
+    pub observed_key_id: U32
+    pub observed_minute: U32
+    pub attested: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type MigrationDependency {
+    pub prerequisite_workload_id: U32
+    pub dependent_workload_id: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type RotationPlan {
+    pub id: U32
+    pub name: Str
+    pub old_key_id: U32
+    pub new_key_id: U32
+    pub cutover_minute: U32
+    pub overlap_end_minute: U32
+    pub grace_deadline_minute: U32
+    pub revoke_minute: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditPolicy {
+    pub minimum_overlap_minutes: U32
+    pub maximum_evidence_age_minutes: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Finding {
+    pub plan_id: U32
+    pub plan_name: Str
+    pub decision: Decision
+    pub primary_issue: Option<AuditIssue>
+    pub issue_count: USize
+    pub migrated_workload_count: USize
+    pub affected_workload_count: USize
+    pub overlap_minutes: Option<U32>
+    pub planned_revoke_minute: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditReport {
+    pub findings: Array<Option<Finding>, 3>
+    pub finding_count: USize
+    pub catalog_summary: CatalogSummary
+    pub ready_count: USize
+    pub waiting_count: USize
+    pub invalid_count: USize
+}
