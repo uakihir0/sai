@@ -19354,7 +19354,13 @@ impl RootDatabase {
             .iter()
             .map(|(def_id, _)| *def_id)
             .collect::<HashSet<_>>();
-        let field_local_aliases = validated_type_params.is_empty().then_some(local_aliases);
+        let field_local_aliases = validated_type_params.is_empty().then(|| {
+            local_aliases
+                .iter()
+                .filter(|(_, alias)| !alias.type_params.is_empty())
+                .map(|(def_id, alias)| (*def_id, alias.clone()))
+                .collect::<HashMap<_, _>>()
+        });
 
         let has_implicit_region_parameter = fields
             .iter()
@@ -19369,7 +19375,7 @@ impl RootDatabase {
                 path_resolution.paths(),
                 local_nominals,
                 &type_parameter_ids,
-                field_local_aliases,
+                field_local_aliases.as_ref(),
             )
         });
 
@@ -19408,7 +19414,7 @@ impl RootDatabase {
                 has_implicit_region_parameter,
             )
             .with_field_local_nominals(local_nominals);
-            let context = if let Some(aliases) = field_local_aliases {
+            let context = if let Some(aliases) = field_local_aliases.as_ref() {
                 context.with_field_local_type_aliases(aliases)
             } else {
                 context
@@ -38871,6 +38877,7 @@ property "shared"() {}
             "type Pair<T> = (T, Bool)\n",
             "type Identity<T> = T\n",
             "type ArrayAlias<T> = Array<T, 4>\n",
+            "type Plain = Bool\n",
             "type HiddenBorrow<T> = borrow T\n",
             "type Chained<T> = Identity<T>\n",
             "type Bounded<T: Copy> = T\n",
@@ -38889,6 +38896,7 @@ property "shared"() {}
             "  sibling: Array<U8, 2>,\n",
             "}\n",
             "type UnsupportedAliases {\n",
+            "  nongeneric: Plain,\n",
             "  hidden_borrow: HiddenBorrow<Bool>,\n",
             "  chained: Chained<U8>,\n",
             "  bounded: Bounded<U8>,\n",
@@ -39043,6 +39051,7 @@ property "shared"() {}
 
         let unsupported = field_types("UnsupportedAliases");
         for field_name in [
+            "nongeneric",
             "hidden_borrow",
             "chained",
             "bounded",
@@ -41056,8 +41065,8 @@ property "shared"() {}
         };
         assert_eq!(
             fields[0].ty(),
-            Err(sai_ty::lower_ty::UnsupportedTy::Alias),
-            "the local alias named Array does not enter built-in array lowering"
+            Err(sai_ty::lower_ty::UnsupportedTy::WrongNumberOfGenericArguments),
+            "the local generic alias named Array uses alias arity checks, not built-in array lowering"
         );
         assert!(
             matches!(
