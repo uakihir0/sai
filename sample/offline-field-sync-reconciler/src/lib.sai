@@ -1,0 +1,122 @@
+use acme:offline-field-sync-reconciler/audit
+use acme:offline-field-sync-reconciler/fixtures
+use acme:offline-field-sync-reconciler/model.{
+    PatchDisposition
+    ReviewReason
+    SyncAudit
+    SyncIssue
+    SyncStatus
+    WorkField
+    WorkStatus
+}
+use acme:offline-field-sync-reconciler/reconcile
+
+pub fn sample_audit() -> SyncAudit {
+    audit.audit_all(fixtures.sample_batch())
+}
+
+test "the fixture audit totals match the hand-checked reconciliation cases" {
+    let result = sample_audit()
+    assert result.result_count == 8
+    assert result.merged_count == 3
+    assert result.partial_merge_count == 4
+    assert result.needs_review_count == 1
+    assert result.applied_patch_count == 8
+    assert result.converged_patch_count == 0
+    assert result.duplicate_arrival_count == 1
+    assert result.conflict_count == 4
+    assert result.held_count == 3
+}
+
+test "an edit to an untouched field merges across newer server revisions" {
+    let result = reconcile.reconcile(fixtures.sample_batch().cases[0].unwrap())
+    assert result.status == SyncStatus.Merged
+    assert result.state.summary == "replace air filter"
+    assert result.state.status == WorkStatus.InProgress
+    assert result.final_revision == 5
+    assert result.applied_count == 1
+}
+
+test "a server edit to the same field wins until a person resolves the conflict" {
+    let result = reconcile.reconcile(fixtures.sample_batch().cases[1].unwrap())
+    assert result.status == SyncStatus.NeedsReview
+    assert result.state.status == WorkStatus.Complete
+    assert result.final_revision == 3
+    assert result.conflict_count == 1
+    assert result.outcomes[0].unwrap().review_reason == Some(ReviewReason.RemoteFieldChanged)
+}
+
+test "independent local fields merge and each accepted change advances one revision" {
+    let result = reconcile.reconcile(fixtures.sample_batch().cases[2].unwrap())
+    assert result.status == SyncStatus.Merged
+    assert result.state.status == WorkStatus.InProgress
+    assert result.state.summary == "inspect valve actuator"
+    assert result.final_revision == 7
+    assert result.applied_count == 2
+}
+
+test "an exact retransmission does not apply its side effect twice" {
+    let result = reconcile.reconcile(fixtures.sample_batch().cases[3].unwrap())
+    assert result.status == SyncStatus.Merged
+    assert result.final_revision == 9
+    assert result.applied_count == 1
+    assert result.duplicate_count == 1
+    assert result.outcomes[1].unwrap().disposition == PatchDisposition.DuplicateArrival
+}
+
+test "a delete versus update conflict holds only that field while independent work merges" {
+    let result = reconcile.reconcile(fixtures.sample_batch().cases[4].unwrap())
+    assert result.status == SyncStatus.PartialMerge
+    assert result.state.due_day == Some(114)
+    assert result.state.summary == "inspect east gate latch"
+    assert result.conflict_count == 1
+    assert result.applied_count == 1
+}
+
+test "an event ID payload collision holds both copies but preserves an independent edit" {
+    let result = reconcile.reconcile(fixtures.sample_batch().cases[5].unwrap())
+    assert result.status == SyncStatus.PartialMerge
+    assert result.state.summary == "inspect loading door"
+    assert result.state.status == WorkStatus.InProgress
+    assert result.held_count == 2
+    assert result.applied_count == 1
+    assert result.outcomes[0].unwrap().review_reason == Some(ReviewReason.EventIdPayloadMismatch)
+    assert result.outcomes[1].unwrap().review_reason == Some(ReviewReason.EventIdPayloadMismatch)
+}
+
+test "different offline values for one field are held while a disjoint edit merges" {
+    let result = reconcile.reconcile(fixtures.sample_batch().cases[6].unwrap())
+    assert result.status == SyncStatus.PartialMerge
+    assert result.state.due_day == Some(122)
+    assert result.state.summary == "inspect west gate hinge"
+    assert result.conflict_count == 2
+    assert result.applied_count == 1
+    assert result.outcomes[0].unwrap().review_reason == Some(ReviewReason.ConflictingOfflineValues)
+    assert result.outcomes[1].unwrap().review_reason == Some(ReviewReason.ConflictingOfflineValues)
+}
+
+test "a stale edit is held without blocking a patch based on retained history" {
+    let result = reconcile.reconcile(fixtures.sample_batch().cases[7].unwrap())
+    assert result.status == SyncStatus.PartialMerge
+    assert result.state.summary == "inspect the chiller compressor"
+    assert result.state.due_day == Some(127)
+    assert result.held_count == 1
+    assert result.applied_count == 1
+    assert result.outcomes[0].unwrap().review_reason == Some(ReviewReason.BaseRevisionUnavailable)
+}
+
+test "an incomplete server journal rejects the batch before reconciling any case" {
+    var batch = fixtures.sample_batch()
+    batch.cases[0].unwrap().server_change_count = 2
+    let result = audit.audit_all(batch)
+    assert result.issue == Some(SyncIssue.HistoryDoesNotCoverCurrentRevision)
+    assert result.result_count == 0
+}
+
+test "duplicate work-order cases are rejected before any patch is applied" {
+    var batch = fixtures.sample_batch()
+    batch.cases[1].unwrap().server_state.id = batch.cases[0].unwrap().server_state.id
+    let result = audit.audit_all(batch)
+    assert result.issue == Some(SyncIssue.DuplicateWorkOrderId)
+    assert result.result_count == 0
+}
