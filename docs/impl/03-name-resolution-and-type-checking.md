@@ -798,6 +798,10 @@ IR-933 accepts explicitly annotated tuple patterns through that same maximum
 pattern depth when the annotation has matching tuple structure and direct
 primitive type paths at every leaf. The annotation supplies each binding type;
 the initializer is not inspected or inferred.
+IR-935 extends only the unannotated fixed-literal projection to a maximum
+tuple-pattern depth of three, with exact recursive shape and arity and the
+same fixed-literal requirement at every binding and wildcard leaf. A fourth
+tuple-pattern level remains unsupported.
 The resolver uses the current package collection, snapshot, active source
 member closure, WIT-view closure, and test-only import filtering. Unresolved,
 external, dependency/WIT, and type-alias heads remain outside this local
@@ -2063,6 +2067,15 @@ match recursively, and every leaf initializer, including wildcard-matched
 values, must be a direct fixed-type Bool, Byte, Char, or unit literal. This
 does not diagnose shape errors or infer tuple types.
 
+**Implemented subset (IR-935):** The same unannotated fixed-literal projection
+allows two nested tuple-pattern levels (three tuple nodes including the root).
+Every tuple pattern must pair with a same-arity tuple initializer, recursively
+in source order. Binding and wildcard leaves still require direct Bool, Byte,
+Char, or unit literals; binding selection still uses the exact `BindingId`
+and verifies the HIR name, `Pattern { var }` kind, and binding mode. A fourth
+tuple-pattern level, annotations, computed or numeric initializer leaves,
+complex patterns, and nested-scope declarations remain outside this check.
+
 **Implemented subset (IR-933/934):** At those same local enum-call sites, a path
 may resolve to a binding in a directly declared outer-block `let` tuple
 pattern with an explicit tuple annotation. The pattern and annotation must
@@ -2409,7 +2422,7 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 
 **Tuple variants and distinct construction** are calls of the constructor's `FnDef` (§3.6.3). `D(e)` with a refinement clause is a B→R conversion recorded for [impl/04](04-mir.md) (§3.13.1). Unit variants with an argument list are `WRONG_ARGUMENT_COUNT`.
 
-**IR-924–IR-934 local enum-call slices.** For a direct callee path to a
+**IR-924–IR-935 local enum-call slices.** For a direct callee path to a
 supported, local, non-generic enum variant, the owner result records a call
 entry under the call expression's `HirId`, retaining the exact callee field,
 enum owner, enum and variant `DefId`s, and source-ordered argument `HirId`s.
