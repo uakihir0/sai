@@ -3047,7 +3047,7 @@ impl LocalRecordFieldTypesProjection {
         if type_params.is_empty() {
             return Err(LocalRecordFieldTypeInstantiationError::NotGenericRecord);
         }
-        validate_record_projection_type_params(type_params)
+        validate_local_projection_type_params(type_params)
             .map_err(|()| LocalRecordFieldTypeInstantiationError::InvalidBinderMetadata)?;
 
         let sai_ty::ty::TyKind::Adt(record_def, type_args) = record_ty.kind() else {
@@ -3076,7 +3076,7 @@ impl LocalRecordFieldTypesProjection {
             .ty
             .as_ref()
             .map_err(|reason| LocalRecordFieldTypeInstantiationError::UnsupportedField(*reason))?;
-        if !local_record_template_matches_binders(template, type_params) {
+        if !local_type_template_matches_binders(template, type_params) {
             return Err(LocalRecordFieldTypeInstantiationError::UnsupportedTemplate);
         }
         let arguments = type_args
@@ -3097,6 +3097,7 @@ pub enum LocalEnumPayloadTypesUnsupportedReason {
     NotDirectLocalEnum,
     InvalidOwnerIdentity,
     GenericParameters,
+    UnvalidatedGenericDefinition,
     WherePredicates,
     RecoveredSyntax,
     OwnerAnalysisFailed,
@@ -3173,6 +3174,34 @@ pub enum LocalEnumVariantPayload {
     Record(Arc<[LocalEnumPayloadTypeProjection]>),
 }
 
+/// Why an enum payload template cannot be instantiated for a local enum use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnumPayloadTypeInstantiationError {
+    UnsupportedProjection(LocalEnumPayloadTypesUnsupportedReason),
+    NotGenericEnum,
+    NotAdt,
+    WrongEnum { expected: DefId, found: DefId },
+    WrongNumberOfTypeArguments { expected: usize, found: usize },
+    PayloadNotFound(LocalEnumPayloadTypeIdentity),
+    UnsupportedPayload(sai_ty::lower_ty::UnsupportedTy),
+    InvalidProjectionProvenance,
+    InvalidBinderMetadata,
+    UnsupportedTemplate,
+    Substitution(sai_ty::ty::SubstitutionError),
+}
+
+/// Opaque validation record attached to driver-created enum projections.
+///
+/// Instantiation checks that the visible owner, ordered binders, and every
+/// source-ordered variant and payload still match the validated owner.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnumPayloadTypesValidation {
+    owner: OwnerId,
+    type_params: Arc<[(DefId, sai_ty::ty::ParamTy)]>,
+    variants: Arc<[LocalEnumVariantPayloadProjection]>,
+}
+
 /// The bounded payload-type projection for one direct local enum.
 ///
 /// Successful projections retain variants and their payloads in source order.
@@ -3182,7 +3211,9 @@ pub enum LocalEnumVariantPayload {
 pub enum LocalEnumPayloadTypesProjection {
     Supported {
         owner: OwnerId,
+        type_params: Arc<[(DefId, sai_ty::ty::ParamTy)]>,
         variants: Arc<[LocalEnumVariantPayloadProjection]>,
+        provenance: LocalEnumPayloadTypesValidation,
     },
     Unsupported {
         owner: OwnerId,
@@ -3207,6 +3238,14 @@ impl LocalEnumPayloadTypesProjection {
         }
     }
 
+    /// Exact source-ordered type binders for the payload templates.
+    pub fn type_params(&self) -> Option<&[(DefId, sai_ty::ty::ParamTy)]> {
+        match self {
+            Self::Supported { type_params, .. } => Some(type_params),
+            Self::Unsupported { .. } => None,
+        }
+    }
+
     /// Owner-level reason when this enum cannot be projected.
     pub const fn unsupported_reason(&self) -> Option<LocalEnumPayloadTypesUnsupportedReason> {
         match self {
@@ -3214,9 +3253,92 @@ impl LocalEnumPayloadTypesProjection {
             Self::Unsupported { reason, .. } => Some(*reason),
         }
     }
+
+    /// Instantiate one generic payload template from an exact local-enum
+    /// application.
+    ///
+    /// The enum type must have the projected enum's exact `DefId` and one
+    /// type argument per validated binder. The tuple/record identity must
+    /// exactly match one source payload in this projection. Substitution is
+    /// performed once, so caller parameters in replacement arguments remain
+    /// in their caller's binder.
+    pub fn instantiate_payload_type(
+        &self,
+        interner: &sai_ty::ty::TyInterner,
+        enum_ty: &sai_ty::ty::Ty,
+        identity: LocalEnumPayloadTypeIdentity,
+    ) -> Result<sai_ty::ty::Ty, LocalEnumPayloadTypeInstantiationError> {
+        let (owner, type_params, variants, provenance) = match self {
+            Self::Supported {
+                owner,
+                type_params,
+                variants,
+                provenance,
+            } => (owner, type_params, variants, provenance),
+            Self::Unsupported { reason, .. } => {
+                return Err(LocalEnumPayloadTypeInstantiationError::UnsupportedProjection(*reason));
+            }
+        };
+        if provenance.owner != *owner
+            || provenance.type_params.as_ref() != type_params.as_ref()
+            || provenance.variants.as_ref() != variants.as_ref()
+        {
+            return Err(LocalEnumPayloadTypeInstantiationError::InvalidProjectionProvenance);
+        }
+        if type_params.is_empty() {
+            return Err(LocalEnumPayloadTypeInstantiationError::NotGenericEnum);
+        }
+        validate_local_projection_type_params(type_params)
+            .map_err(|()| LocalEnumPayloadTypeInstantiationError::InvalidBinderMetadata)?;
+
+        let sai_ty::ty::TyKind::Adt(enum_def, type_args) = enum_ty.kind() else {
+            return Err(LocalEnumPayloadTypeInstantiationError::NotAdt);
+        };
+        let expected_enum_def = owner.def_id.to_def_id();
+        if *enum_def != expected_enum_def {
+            return Err(LocalEnumPayloadTypeInstantiationError::WrongEnum {
+                expected: expected_enum_def,
+                found: *enum_def,
+            });
+        }
+        if type_args.len() != type_params.len() {
+            return Err(
+                LocalEnumPayloadTypeInstantiationError::WrongNumberOfTypeArguments {
+                    expected: type_params.len(),
+                    found: type_args.len(),
+                },
+            );
+        }
+
+        let payload = variants
+            .iter()
+            .flat_map(|variant| match &variant.payload {
+                LocalEnumVariantPayload::Unit => &[][..],
+                LocalEnumVariantPayload::Tuple(payloads)
+                | LocalEnumVariantPayload::Record(payloads) => payloads.as_ref(),
+            })
+            .find(|payload| payload.identity == identity)
+            .ok_or(LocalEnumPayloadTypeInstantiationError::PayloadNotFound(
+                identity,
+            ))?;
+        let template = payload.ty.as_ref().map_err(|reason| {
+            LocalEnumPayloadTypeInstantiationError::UnsupportedPayload(*reason)
+        })?;
+        if !local_type_template_matches_binders(template, type_params) {
+            return Err(LocalEnumPayloadTypeInstantiationError::UnsupportedTemplate);
+        }
+        let arguments = type_args
+            .iter()
+            .cloned()
+            .map(sai_ty::ty::GenericArg::Type)
+            .collect::<Vec<_>>();
+        interner
+            .substitute(template, &arguments)
+            .map_err(LocalEnumPayloadTypeInstantiationError::Substitution)
+    }
 }
 
-fn validate_record_projection_type_params(
+fn validate_local_projection_type_params(
     type_params: &[(DefId, sai_ty::ty::ParamTy)],
 ) -> Result<(), ()> {
     let mut def_ids = HashSet::with_capacity(type_params.len());
@@ -3233,7 +3355,7 @@ fn validate_record_projection_type_params(
     Ok(())
 }
 
-fn local_record_template_matches_binders(
+fn local_type_template_matches_binders(
     template: &sai_ty::ty::Ty,
     type_params: &[(DefId, sai_ty::ty::ParamTy)],
 ) -> bool {
@@ -19716,12 +19838,15 @@ impl RootDatabase {
         if source_parameter_count != generics.params.len() {
             return unsupported(LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity);
         }
-        if !generics.params.is_empty() {
-            return unsupported(LocalEnumPayloadTypesUnsupportedReason::GenericParameters);
-        }
 
         let owner_components = expected_path.data();
         if expected_path.package() != package
+            || def_paths
+                .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                .ok()
+                .flatten()
+                .as_ref()
+                != Some(expected_path)
             || !matches!(
                 owner_components.last(),
                 Some(component)
@@ -19731,6 +19856,28 @@ impl RootDatabase {
             )
         {
             return unsupported(LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity);
+        }
+        let Some(validated_type_params) =
+            validated_local_record_type_params(generics.params, expected_path, &def_paths)
+        else {
+            return unsupported(LocalEnumPayloadTypesUnsupportedReason::GenericParameters);
+        };
+        if !validated_type_params.is_empty() {
+            let expected_nominal_params = validated_type_params
+                .iter()
+                .map(|(def_id, parameter)| (*def_id, parameter.name))
+                .collect::<Vec<_>>();
+            let Some(validated_nominal) = local_nominals.get(&descriptor.owner.def_id.to_def_id())
+            else {
+                return unsupported(
+                    LocalEnumPayloadTypesUnsupportedReason::UnvalidatedGenericDefinition,
+                );
+            };
+            if validated_nominal.type_params.as_ref() != expected_nominal_params.as_slice() {
+                return unsupported(
+                    LocalEnumPayloadTypesUnsupportedReason::UnvalidatedGenericDefinition,
+                );
+            }
         }
 
         let Some(source_variants) = declaration
@@ -19748,7 +19895,10 @@ impl RootDatabase {
             .filter(|(_, alias)| !alias.type_params.is_empty())
             .map(|(def_id, alias)| (*def_id, alias.clone()))
             .collect::<HashMap<_, _>>();
-        let type_parameters = HashSet::new();
+        let type_parameter_ids = validated_type_params
+            .iter()
+            .map(|(def_id, _)| *def_id)
+            .collect::<HashSet<_>>();
         let has_implicit_region_parameter = variants.iter().any(|variant| match variant.shape {
             VariantShape::Unit => false,
             VariantShape::Tuple(types) => types
@@ -19768,7 +19918,7 @@ impl RootDatabase {
                     descriptor.owner,
                     path_resolution.paths(),
                     local_nominals,
-                    &type_parameters,
+                    &type_parameter_ids,
                     Some(&field_local_aliases),
                 )
             }),
@@ -19778,7 +19928,7 @@ impl RootDatabase {
                     descriptor.owner,
                     path_resolution.paths(),
                     local_nominals,
-                    &type_parameters,
+                    &type_parameter_ids,
                     Some(&field_local_aliases),
                 )
             }),
@@ -19839,7 +19989,7 @@ impl RootDatabase {
                                 LocalEnumPayloadTypesUnsupportedReason::InvalidOwnerIdentity,
                             );
                         }
-                        let mut context = sai_ty::lower_ty::LowerTyContext::for_field(
+                        let context = sai_ty::lower_ty::LowerTyContext::for_field(
                             &self.semantic_types,
                             descriptor.owner,
                             path_resolution.paths(),
@@ -19847,6 +19997,13 @@ impl RootDatabase {
                         )
                         .with_field_local_nominals(local_nominals)
                         .with_field_local_type_aliases(&field_local_aliases);
+                        let Ok(mut context) =
+                            context.with_field_type_params(&validated_type_params)
+                        else {
+                            return unsupported(
+                                LocalEnumPayloadTypesUnsupportedReason::GenericParameters,
+                            );
+                        };
                         if literal_arrays_are_region_free {
                             context = context.with_field_array_literal_pointer_width(
                                 collection.target_cfg.pointer_width(),
@@ -19893,7 +20050,7 @@ impl RootDatabase {
                             );
                         }
 
-                        let mut context = sai_ty::lower_ty::LowerTyContext::for_field(
+                        let context = sai_ty::lower_ty::LowerTyContext::for_field(
                             &self.semantic_types,
                             descriptor.owner,
                             path_resolution.paths(),
@@ -19901,6 +20058,13 @@ impl RootDatabase {
                         )
                         .with_field_local_nominals(local_nominals)
                         .with_field_local_type_aliases(&field_local_aliases);
+                        let Ok(mut context) =
+                            context.with_field_type_params(&validated_type_params)
+                        else {
+                            return unsupported(
+                                LocalEnumPayloadTypesUnsupportedReason::GenericParameters,
+                            );
+                        };
                         if literal_arrays_are_region_free {
                             context = context.with_field_array_literal_pointer_width(
                                 collection.target_cfg.pointer_width(),
@@ -19925,9 +20089,18 @@ impl RootDatabase {
             });
         }
 
+        let projected_variants: Arc<[LocalEnumVariantPayloadProjection]> =
+            projected_variants.into();
+        let provenance = LocalEnumPayloadTypesValidation {
+            owner: descriptor.owner,
+            type_params: Arc::clone(&validated_type_params),
+            variants: Arc::clone(&projected_variants),
+        };
         LocalEnumPayloadTypesProjection::Supported {
             owner: descriptor.owner,
-            variants: projected_variants.into(),
+            type_params: validated_type_params,
+            variants: projected_variants,
+            provenance,
         }
     }
 
@@ -94390,6 +94563,455 @@ interface facade { use middle.{payload}; }"#;
     }
 
     #[test]
+    fn local_generic_enum_payload_projection_instantiates_exact_templates_once() {
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "enum Generic<T, U> {\n",
+            "  Value(T),\n",
+            "  Callback(fn(child_alias.Identity<T>, Array<T, 2>) -> Bool),\n",
+            "  Pair(T, (U, Bool)),\n",
+            "  Named(value: U),\n",
+            "  Unknown(fn(Missing) -> Bool),\n",
+            "}\n",
+            "enum Other<T> { Value(T) }\n",
+            "enum Plain { Value(Bool) }\n",
+        );
+        let child = "pub type Identity<T> = (T, Bool)\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("empty active source-member closure validates");
+        let resolved = database
+            .resolve_type_owner_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("generic enum payload paths resolve with current member scopes");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("local DefPath interner exists"),
+        );
+        let owner_for = |name: &str| {
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::Enum
+                        && def_paths
+                            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                path.data().last().is_some_and(|component| {
+                                    matches!(
+                                        component.data,
+                                        DefPathData::TypeNs(symbol)
+                                            if database.symbols.resolve(symbol).ok().as_deref()
+                                                == Some(name)
+                                    )
+                                })
+                            })
+                })
+                .expect("the direct local enum owner is collected")
+                .owner
+        };
+        let owner = owner_for("Generic");
+        let projection = resolved
+            .local_enum_payload_types_with_scopes(&collection, Some(&member_scopes), None, owner)
+            .expect("collection and member-scope provenance matches")
+            .expect("the generic enum has a payload projection");
+        let variants = projection.variants().unwrap_or_else(|| {
+            panic!(
+                "generic enum projection rejected: {:?}",
+                projection.unsupported_reason()
+            )
+        });
+        let type_params = projection
+            .type_params()
+            .expect("supported generic enums retain their binder metadata");
+        assert_eq!(type_params.len(), 2);
+        assert_eq!(type_params[0].1.index, 0);
+        assert_eq!(type_params[1].1.index, 1);
+        assert_eq!(
+            database
+                .symbols
+                .resolve(type_params[0].1.name)
+                .unwrap()
+                .as_ref(),
+            "T"
+        );
+        assert_eq!(
+            database
+                .symbols
+                .resolve(type_params[1].1.name)
+                .unwrap()
+                .as_ref(),
+            "U"
+        );
+        let enum_path = database
+            .resolve_def_path(owner.def_id.to_def_id())
+            .expect("the enum path resolves")
+            .expect("the enum path exists");
+        for (index, (def_id, parameter)) in type_params.iter().enumerate() {
+            let binder_path = database
+                .resolve_def_path(*def_id)
+                .expect("the binder path resolves")
+                .expect("the binder path exists");
+            assert_eq!(parameter.index as usize, index);
+            assert_eq!(
+                &binder_path.data()[..enum_path.data().len()],
+                enum_path.data(),
+                "each exact type binder is a child of the projected enum"
+            );
+            assert!(matches!(
+                binder_path.data().last(),
+                Some(sai_hir::DisambiguatedDefPathData {
+                    data: DefPathData::TypeParam(name),
+                    ..
+                }) if *name == parameter.name
+            ));
+        }
+
+        let LocalEnumVariantPayload::Tuple(value) = variants[0].payload() else {
+            panic!("Value has a tuple payload")
+        };
+        let value_identity = LocalEnumPayloadTypeIdentity::Tuple {
+            variant: variants[0].def_id(),
+            index: 0,
+        };
+        assert_eq!(value[0].identity(), value_identity);
+        assert!(matches!(
+            value[0].ty().unwrap().kind(),
+            sai_ty::ty::TyKind::Param(parameter) if parameter == &type_params[0].1
+        ));
+        let bool_ty = database.semantic_types.intern(sai_ty::ty::TyKind::Bool);
+        let char_ty = database.semantic_types.intern(sai_ty::ty::TyKind::Char);
+        let enum_bool_char = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
+            owner.def_id.to_def_id(),
+            Arc::from([bool_ty.clone(), char_ty.clone()]),
+        ));
+        let instantiated_bool = projection
+            .instantiate_payload_type(&database.semantic_types, &enum_bool_char, value_identity)
+            .expect("the exact generic enum instance substitutes the payload");
+        assert!(instantiated_bool.ptr_eq(&bool_ty));
+
+        let caller_name = database.symbols.intern("U").expect("caller binder interns");
+        let caller_parameter =
+            database
+                .semantic_types
+                .intern(sai_ty::ty::TyKind::Param(sai_ty::ty::ParamTy {
+                    index: 1,
+                    name: caller_name,
+                }));
+        let enum_caller = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
+            owner.def_id.to_def_id(),
+            Arc::from([caller_parameter.clone(), char_ty.clone()]),
+        ));
+        let caller_result = projection
+            .instantiate_payload_type(&database.semantic_types, &enum_caller, value_identity)
+            .expect("the supplied caller binder is substituted once");
+        assert!(
+            caller_result.ptr_eq(&caller_parameter),
+            "the replacement ParamTy at caller index 1 is not captured recursively"
+        );
+
+        let LocalEnumVariantPayload::Tuple(callback) = variants[1].payload() else {
+            panic!("Callback has a tuple payload")
+        };
+        assert!(
+            matches!(
+                callback[0].ty().unwrap().kind(),
+                sai_ty::ty::TyKind::FnPtr(signature)
+                    if matches!(
+                        signature.inputs()[0].kind(),
+                        sai_ty::ty::TyKind::Tuple(elements)
+                            if elements.len() == 2
+                                && matches!(
+                                    elements[0].kind(),
+                            sai_ty::ty::TyKind::Param(parameter)
+                                if parameter == &type_params[0].1
+                                )
+                                && matches!(elements[1].kind(), sai_ty::ty::TyKind::Bool)
+                    )
+                        && matches!(
+                            signature.inputs()[1].kind(),
+                            sai_ty::ty::TyKind::Array(
+                                element,
+                                sai_ty::ty::Const::Value(2)
+                            ) if matches!(
+                                element.kind(),
+                                sai_ty::ty::TyKind::Param(parameter)
+                                if parameter == &type_params[0].1
+                            )
+                        )
+                        && matches!(signature.output().kind(), sai_ty::ty::TyKind::Bool)
+            ),
+            "the alias template keeps its own binder while use-site T resolves in the enum map"
+        );
+
+        let LocalEnumVariantPayload::Tuple(pair) = variants[2].payload() else {
+            panic!("Pair has a tuple payload")
+        };
+        let nested_identity = LocalEnumPayloadTypeIdentity::Tuple {
+            variant: variants[2].def_id(),
+            index: 1,
+        };
+        let nested = projection
+            .instantiate_payload_type(&database.semantic_types, &enum_bool_char, nested_identity)
+            .expect("nested templates substitute recursively through their own structure");
+        assert!(matches!(
+            nested.kind(),
+            sai_ty::ty::TyKind::Tuple(elements)
+                if elements.len() == 2
+                    && elements[0].ptr_eq(&char_ty)
+                    && matches!(elements[1].kind(), sai_ty::ty::TyKind::Bool)
+        ));
+        assert_eq!(
+            pair[1].identity(),
+            nested_identity,
+            "tuple positions remain source ordered and use the exact variant"
+        );
+
+        let LocalEnumVariantPayload::Record(named) = variants[3].payload() else {
+            panic!("Named has a record payload")
+        };
+        let record_identity = named[0].identity();
+        assert!(matches!(
+            record_identity,
+            LocalEnumPayloadTypeIdentity::Record {
+                variant,
+                field: _,
+                name: _
+            } if variant == variants[3].def_id()
+        ));
+        assert!(
+            projection
+                .instantiate_payload_type(
+                    &database.semantic_types,
+                    &enum_bool_char,
+                    record_identity,
+                )
+                .expect("record payload identities instantiate through the same checked API")
+                .ptr_eq(&char_ty)
+        );
+        let LocalEnumVariantPayload::Tuple(unknown) = variants[4].payload() else {
+            panic!("Unknown has a tuple payload")
+        };
+        assert!(
+            unknown[0].ty().is_err(),
+            "the unsupported nested path stays local"
+        );
+        assert!(matches!(
+            projection.instantiate_payload_type(
+                &database.semantic_types,
+                &enum_bool_char,
+                unknown[0].identity()
+            ),
+            Err(LocalEnumPayloadTypeInstantiationError::UnsupportedPayload(
+                _
+            ))
+        ));
+
+        let other_owner = owner_for("Other");
+        let wrong_enum = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
+            other_owner.def_id.to_def_id(),
+            Arc::from([bool_ty.clone()]),
+        ));
+        assert!(matches!(
+            projection.instantiate_payload_type(
+                &database.semantic_types,
+                &wrong_enum,
+                value_identity
+            ),
+            Err(LocalEnumPayloadTypeInstantiationError::WrongEnum { .. })
+        ));
+        assert_eq!(
+            projection.instantiate_payload_type(&database.semantic_types, &bool_ty, value_identity),
+            Err(LocalEnumPayloadTypeInstantiationError::NotAdt)
+        );
+        let missing_argument = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
+            owner.def_id.to_def_id(),
+            Arc::from([bool_ty.clone()]),
+        ));
+        assert_eq!(
+            projection.instantiate_payload_type(
+                &database.semantic_types,
+                &missing_argument,
+                value_identity
+            ),
+            Err(
+                LocalEnumPayloadTypeInstantiationError::WrongNumberOfTypeArguments {
+                    expected: 2,
+                    found: 1,
+                }
+            )
+        );
+        let extra_arguments = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
+            owner.def_id.to_def_id(),
+            Arc::from([bool_ty.clone(), char_ty.clone(), bool_ty.clone()]),
+        ));
+        assert_eq!(
+            projection.instantiate_payload_type(
+                &database.semantic_types,
+                &extra_arguments,
+                value_identity
+            ),
+            Err(
+                LocalEnumPayloadTypeInstantiationError::WrongNumberOfTypeArguments {
+                    expected: 2,
+                    found: 3,
+                }
+            )
+        );
+        let nonexistent_identity = LocalEnumPayloadTypeIdentity::Tuple {
+            variant: variants[0].def_id(),
+            index: 9,
+        };
+        assert_eq!(
+            projection.instantiate_payload_type(
+                &database.semantic_types,
+                &enum_bool_char,
+                nonexistent_identity
+            ),
+            Err(LocalEnumPayloadTypeInstantiationError::PayloadNotFound(
+                nonexistent_identity
+            ))
+        );
+        let plain_owner = owner_for("Plain");
+        let plain = resolved
+            .local_enum_payload_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                plain_owner,
+            )
+            .expect("exact scopes are accepted")
+            .expect("nongeneric owner projection exists");
+        let plain_variants = plain.variants().expect("Plain is supported");
+        let LocalEnumVariantPayload::Tuple(plain_value) = plain_variants[0].payload() else {
+            panic!("Plain::Value has a tuple payload")
+        };
+        assert_eq!(
+            plain.instantiate_payload_type(
+                &database.semantic_types,
+                &bool_ty,
+                plain_value[0].identity()
+            ),
+            Err(LocalEnumPayloadTypeInstantiationError::NotGenericEnum),
+            "the binder-bearing projection is required for instantiation"
+        );
+
+        let forged_owner = match projection.clone() {
+            LocalEnumPayloadTypesProjection::Supported {
+                type_params,
+                variants,
+                provenance,
+                ..
+            } => LocalEnumPayloadTypesProjection::Supported {
+                owner: other_owner,
+                type_params,
+                variants,
+                provenance,
+            },
+            LocalEnumPayloadTypesProjection::Unsupported { .. } => {
+                panic!("the generic enum projection is supported")
+            }
+        };
+        assert_eq!(
+            forged_owner.instantiate_payload_type(
+                &database.semantic_types,
+                &enum_bool_char,
+                value_identity
+            ),
+            Err(LocalEnumPayloadTypeInstantiationError::InvalidProjectionProvenance)
+        );
+        let forged_binders = match projection.clone() {
+            LocalEnumPayloadTypesProjection::Supported {
+                owner,
+                type_params,
+                variants,
+                provenance,
+            } => {
+                let mut changed_type_params = type_params.to_vec();
+                changed_type_params[1].1.index = 0;
+                LocalEnumPayloadTypesProjection::Supported {
+                    owner,
+                    type_params: changed_type_params.into(),
+                    variants,
+                    provenance,
+                }
+            }
+            LocalEnumPayloadTypesProjection::Unsupported { .. } => {
+                panic!("the generic enum projection is supported")
+            }
+        };
+        assert_eq!(
+            forged_binders.instantiate_payload_type(
+                &database.semantic_types,
+                &enum_bool_char,
+                value_identity
+            ),
+            Err(LocalEnumPayloadTypeInstantiationError::InvalidProjectionProvenance),
+            "opaque provenance authenticates binder identity and source order"
+        );
+        let forged_payload = match projection.clone() {
+            LocalEnumPayloadTypesProjection::Supported {
+                owner,
+                type_params,
+                variants,
+                provenance,
+            } => {
+                let mut changed_variants = variants.to_vec();
+                let LocalEnumVariantPayload::Tuple(payloads) = changed_variants[0].payload() else {
+                    panic!("Value has a tuple payload")
+                };
+                let mut changed_payloads = payloads.to_vec();
+                changed_payloads[0].ty = Ok(bool_ty.clone());
+                changed_variants[0].payload =
+                    LocalEnumVariantPayload::Tuple(changed_payloads.into());
+                LocalEnumPayloadTypesProjection::Supported {
+                    owner,
+                    type_params,
+                    variants: changed_variants.into(),
+                    provenance,
+                }
+            }
+            LocalEnumPayloadTypesProjection::Unsupported { .. } => {
+                panic!("the generic enum projection is supported")
+            }
+        };
+        assert_eq!(
+            forged_payload.instantiate_payload_type(
+                &database.semantic_types,
+                &enum_bool_char,
+                value_identity
+            ),
+            Err(LocalEnumPayloadTypeInstantiationError::InvalidProjectionProvenance),
+            "opaque provenance authenticates the payload types and identities"
+        );
+    }
+
+    #[test]
     fn local_enum_payload_projection_uses_declaration_wide_regions_and_isolates_errors() {
         let root = concat!(
             "enum Borrowed {\n",
@@ -94536,7 +95158,9 @@ interface facade { use middle.{payload}; }"#;
     #[test]
     fn local_enum_payload_projection_rejects_unsupported_owners_and_checks_scopes() {
         let root = concat!(
-            "enum Generic<T> { Value(T) }\n",
+            "enum Bounded<T: Copy> { Value(T) }\n",
+            "enum ConstGeneric<const N: USize> { Value(U8) }\n",
+            "enum RegionBearing<T> { BorrowedValue(borrow T), SafeValue(T) }\n",
             "enum WhereOnly where I32: Copy { Value(Bool) }\n",
             "enum Recovered { Broken { malformed: Bool = }, Safe(U8) }\n",
         );
@@ -94606,17 +95230,32 @@ interface facade { use middle.{payload}; }"#;
                 ),
             )
         };
-        let (generic_owner, generic_result) = projection_for("Generic");
-        assert!(matches!(
-            resolved.local_enum_payload_types(&collection, generic_owner),
-            Err(OwnerControlFlowResolutionError::SnapshotMismatch)
-        ));
+        let (_, generic_result) = projection_for("Bounded");
         let generic = generic_result
             .expect("the active closure matches")
-            .expect("the generic enum retains a fail-closed result");
+            .expect("the bounded enum retains a fail-closed result");
         assert_eq!(
             generic.unsupported_reason(),
             Some(LocalEnumPayloadTypesUnsupportedReason::GenericParameters)
+        );
+
+        let (_, const_result) = projection_for("ConstGeneric");
+        let const_generic = const_result
+            .expect("the active closure matches")
+            .expect("the const-generic enum retains a fail-closed result");
+        assert_eq!(
+            const_generic.unsupported_reason(),
+            Some(LocalEnumPayloadTypesUnsupportedReason::GenericParameters)
+        );
+
+        let (_, region_result) = projection_for("RegionBearing");
+        let region = region_result
+            .expect("the active closure matches")
+            .expect("the implicit-region enum retains a fail-closed result");
+        assert_eq!(
+            region.unsupported_reason(),
+            Some(LocalEnumPayloadTypesUnsupportedReason::UnvalidatedGenericDefinition),
+            "generic enums excluded by the local nominal gate cannot form Adt templates"
         );
 
         let (_, where_result) = projection_for("WhereOnly");
