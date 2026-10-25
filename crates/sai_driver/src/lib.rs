@@ -13039,6 +13039,36 @@ fn signature_generic_argument_syntax_has_recovery(function: &ast::FnDecl) -> boo
             .is_some_and(|ty| generic_argument_syntax_has_recovery(ty.syntax()))
 }
 
+fn signature_function_pointer_syntax_has_recovery(function: &ast::FnDecl) -> bool {
+    let type_syntax_has_recovered_function_pointer = |root: &SyntaxNode| {
+        std::iter::once(root.clone())
+            .chain(root.descendants())
+            .filter(|node| node.kind() == sai_syntax::SyntaxKind::FN_PTR_TYPE)
+            .any(|function_pointer| {
+                std::iter::once(function_pointer.clone())
+                    .chain(function_pointer.descendants())
+                    .any(|node| {
+                        node.kind() == sai_syntax::SyntaxKind::ERROR
+                            || node.children_with_tokens().any(|element| {
+                                element.as_token().is_some_and(|token| token.has_error())
+                            })
+                    })
+            })
+    };
+    let parameter_has_recovery = function.params().is_some_and(|parameters| {
+        parameters.params().any(|parameter| {
+            parameter
+                .ty()
+                .is_some_and(|ty| type_syntax_has_recovered_function_pointer(ty.syntax()))
+        })
+    });
+    parameter_has_recovery
+        || function
+            .ret_type()
+            .and_then(|ret| ret.ty())
+            .is_some_and(|ty| type_syntax_has_recovered_function_pointer(ty.syntax()))
+}
+
 impl RootDatabase {
     /// Creates a fresh compiler session with empty VFS inputs.
     pub fn new() -> Result<Self, QueryError> {
@@ -15295,6 +15325,12 @@ impl RootDatabase {
                                                 ) {
                                                     Some(
                                                         sai_ty::lower_ty::UnsupportedFnSig::RecoveredGenericSyntax,
+                                                    )
+                                                } else if signature_function_pointer_syntax_has_recovery(
+                                                    &function,
+                                                ) {
+                                                    Some(
+                                                        sai_ty::lower_ty::UnsupportedFnSig::RecoveredFunctionPointerSyntax,
                                                     )
                                                 } else if function.where_clause().is_some() {
                                                     Some(
@@ -36783,6 +36819,7 @@ property "shared"() {}
     }
 
     #[test]
+
     fn function_signature_projection_lowers_only_direct_local_non_generic_aliases() {
         let root = concat!(
             "type Count = U32\n",
@@ -36807,6 +36844,7 @@ property "shared"() {}
             "fn region_alias(value: Borrowed) -> U8 {}\n",
             "fn nested_region_alias(value: NestedBorrow) -> U8 {}\n",
             "fn recovered_alias(value: Recovered) -> U32 {}\n",
+
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -36822,6 +36860,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         assert_eq!(resolved.owners().len(), 10);
+
         assert!(resolved.matches_collection(&collection));
 
         let supported = resolved
@@ -36919,6 +36958,107 @@ property "shared"() {}
             resolved.signature_projection(&stale_collection, resolved.owners()[0].owner()),
             Err(OwnerControlFlowResolutionError::SnapshotMismatch)
         ));
+
+    }
+
+    #[test]
+    fn function_signature_projection_lowers_constrained_function_pointers() {
+        let root = concat!(
+            "fn callback_ordered(value: fn((I32, Bool), Array<U8, 3>) -> Char) {}\n",
+            "fn callback_unsafe(value: unsafe fn()) {}\n",
+            "fn callback_omitted_return(value: fn()) {}\n",
+            "fn callback_explicit_unit(value: fn() -> ()) {}\n",
+            "fn callback_generic<T>(value: fn((T,))) {}\n",
+            "fn callback_borrowed(value: fn((borrow I32,))) {}\n",
+            "fn callback_empty_effects(value: fn() effects {}) {}\n",
+            "fn callback_effects(value: fn() effects { io }) {}\n",
+            "fn callback_unresolved(value: fn(Missing)) {}\n",
+            "fn callback_recovered(value: fn(I32) ->) {}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        assert_eq!(resolved.owners().len(), 10);
+
+        let projection = |index: usize| {
+            resolved
+                .signature_projection(&collection, resolved.owners()[index].owner())
+                .expect("the exact collection guards the signature")
+                .expect("the top-level function owner exists")
+                .clone()
+        };
+        let FunctionSignatureProjection::Supported(ordered) = projection(0) else {
+            panic!("a function pointer with supported child types projects");
+        };
+        let sai_ty::ty::TyKind::FnPtr(ordered) = ordered.inputs()[0].kind() else {
+            panic!("the outer input keeps its function pointer signature");
+        };
+        assert_eq!(ordered.safety(), sai_hir::Safety::Safe);
+        assert_eq!(ordered.inputs().len(), 2);
+        let sai_ty::ty::TyKind::Tuple(pair) = ordered.inputs()[0].kind() else {
+            panic!("the first function pointer input remains a tuple");
+        };
+        assert!(matches!(
+            pair[0].kind(),
+            sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I32)
+        ));
+        assert!(matches!(pair[1].kind(), sai_ty::ty::TyKind::Bool));
+        assert!(matches!(
+            ordered.inputs()[1].kind(),
+            sai_ty::ty::TyKind::Array(element, 3)
+                if matches!(element.kind(), sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8))
+        ));
+        assert!(matches!(ordered.output().kind(), sai_ty::ty::TyKind::Char));
+
+        let FunctionSignatureProjection::Supported(unsafe_callback) = projection(1) else {
+            panic!("unsafe function pointers preserve their safety bit");
+        };
+        let sai_ty::ty::TyKind::FnPtr(unsafe_callback) = unsafe_callback.inputs()[0].kind() else {
+            panic!("the input is a function pointer");
+        };
+        assert_eq!(unsafe_callback.safety(), sai_hir::Safety::Unsafe);
+
+        let FunctionSignatureProjection::Supported(omitted) = projection(2) else {
+            panic!("a function pointer with omitted output is supported");
+        };
+        let FunctionSignatureProjection::Supported(explicit) = projection(3) else {
+            panic!("a function pointer with explicit unit output is supported");
+        };
+        assert!(omitted.inputs()[0].ptr_eq(&explicit.inputs()[0]));
+
+        for (index, reason) in [
+            (
+                4,
+                sai_ty::lower_ty::UnsupportedTy::FunctionPointerGenericParameter,
+            ),
+            (5, sai_ty::lower_ty::UnsupportedTy::FunctionPointerRegion),
+            (6, sai_ty::lower_ty::UnsupportedTy::FunctionPointerEffects),
+            (7, sai_ty::lower_ty::UnsupportedTy::FunctionPointerEffects),
+            (8, sai_ty::lower_ty::UnsupportedTy::MissingPathResolution),
+        ] {
+            assert_eq!(
+                projection(index),
+                FunctionSignatureProjection::Unsupported(
+                    sai_ty::lower_ty::UnsupportedFnSig::ParameterType { index: 0, reason }
+                )
+            );
+        }
+        assert_eq!(
+            projection(9),
+            FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::RecoveredFunctionPointerSyntax
+            )
+        );
     }
 
     #[test]
