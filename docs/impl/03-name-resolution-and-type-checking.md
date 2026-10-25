@@ -1862,6 +1862,43 @@ and diagnostic behavior, test-only/module/source/WIT provenance, and the
 deferred boundaries above. Focused verification is recorded in
 `docs/design/implementation-review.md` under IR-921.
 
+**Implemented subset (IR-922):** `LocalEnumVariantPathResolution` now also
+exposes value-type entries keyed by each resolved suffix `Field` HIR ID.
+Entries retain the exact enum owner, enum `DefId`, variant `DefId`, and the
+existing local value-type model: a unit variant has its enum `Adt`, a tuple
+variant has its exact `FnDef` and source-ordered `FnSig` template, and a record
+variant explicitly has `RecordHasNoValueType`. Before retaining a type, the
+driver checks the path result's complete enum owner/definition pair against
+the validated type projection and checks the returned variant identity and
+semantic type shape. An invariant mismatch fails the owner analysis rather
+than dropping the type or pairing unrelated definitions. Unknown,
+non-enum, and unsupported paths have no value-type entry; each separate HIR
+occurrence retains its own entry. This projection uses the existing direct
+scope-validated type accessor and does not promise a new cached query.
+
+This remains a bounded path-type projection. It does not populate
+`TypeckResults::node_types` or `type_dependent_defs`, implement general
+`type_of`, accept generic enums, or perform constructor-call checking. Record
+constructor misuse remains deferred until call-versus-value context is
+available.
+
+**IR-922 compatibility decisions and review record:** Keep path results and
+their value types together in the existing owner-local `LocalEnumVariantPathResolution`
+instead of extending `FunctionOwnerResolution` or claiming a complete
+`TypeckResults`; the field HIR ID provides exact occurrence identity without
+adding another owner-level slot. Reuse the direct scoped projection because
+the caller already has the validated collection and source/WIT closures, and
+this local result makes no caching contract. Verify the owner/enum/variant
+identity join and unit/tuple type shapes before insertion; treat a failed join
+as an invariant error. Record variants still receive an explicit
+no-value-type entry, while the path scanner does not emit
+`RECORD_CONSTRUCTOR_AS_VALUE` before it can distinguish a constructor callee
+from a value use. **Review required:** verify occurrence-keyed results,
+exact identity and shape checks, record constructor context, scope provenance,
+and the boundary around generic enums and full expression typing. Focused
+verification is recorded in `docs/design/implementation-review.md` under
+IR-922.
+
 ### 3.6.4 `adt_def`
 
 `adt_def(def) -> Arc<AdtDef>` describes a nominal type:
