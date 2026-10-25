@@ -14895,26 +14895,76 @@ impl RootDatabase {
                     );
                     signature_projection = Some(match type_path_resolution.as_ref() {
                         Some(Ok(Some(path_resolution))) => {
-                            let mut context = sai_ty::lower_ty::LowerTyContext::for_signature_with_local_nongeneric_nominals(
-                                &self.semantic_types,
-                                descriptor.owner,
-                                path_resolution.paths(),
-                                &validated_unit_enum_definitions,
-                                &local_nongeneric_nominal_definitions,
-                            );
+                            let mut context =
+                                sai_ty::lower_ty::LowerTyContext::for_signature_with_local_nongeneric_nominals(
+                                    &self.semantic_types,
+                                    descriptor.owner,
+                                    path_resolution.paths(),
+                                    &validated_unit_enum_definitions,
+                                    &local_nongeneric_nominal_definitions,
+                                )
+                                .with_def_path_interner(def_paths.as_ref());
                             match hir_owner.node {
                                 OwnerNode::Item(item) => match item.kind {
                                     ItemKind::Fn { sig, generics, .. } => {
-                                        match sai_ty::lower_ty::lower_fn_sig(
-                                            &mut context,
-                                            generics,
-                                            sig,
-                                        ) {
-                                            Ok(signature) => Ok(
-                                                FunctionSignatureProjection::Supported(signature),
+                                        let function_ast = inputs
+                                            .ast_ids
+                                            .pointer(owner_descriptor.item_id)
+                                            .and_then(|pointer| {
+                                                pointer.resolve(
+                                                    inputs.filtered_item_tree.file,
+                                                    &inputs.root,
+                                                )
+                                            })
+                                            .and_then(ast::FnDecl::cast);
+                                        let syntax_subtree_has_error = |root: &SyntaxNode| {
+                                            root.descendants().any(|node| {
+                                                node.kind() == sai_syntax::SyntaxKind::ERROR
+                                                    || node.children_with_tokens().any(|element| {
+                                                        element
+                                                            .as_token()
+                                                            .is_some_and(|token| token.has_error())
+                                                    })
+                                            })
+                                        };
+                                        let syntax_unsupported = match function_ast {
+                                            Some(function) => {
+                                                if function.generic_params().is_some_and(|params| {
+                                                    syntax_subtree_has_error(params.syntax())
+                                                }) {
+                                                    Some(
+                                                        sai_ty::lower_ty::UnsupportedFnSig::RecoveredGenericSyntax,
+                                                    )
+                                                } else if function.where_clause().is_some() {
+                                                    Some(
+                                                        sai_ty::lower_ty::UnsupportedFnSig::WherePredicates,
+                                                    )
+                                                } else {
+                                                    None
+                                                }
+                                            }
+                                            None => Some(
+                                                sai_ty::lower_ty::UnsupportedFnSig::RecoveredGenericSyntax,
                                             ),
-                                            Err(reason) => {
-                                                Ok(FunctionSignatureProjection::Unsupported(reason))
+                                        };
+                                        if let Some(reason) = syntax_unsupported {
+                                            Ok(FunctionSignatureProjection::Unsupported(reason))
+                                        } else {
+                                            match sai_ty::lower_ty::lower_fn_sig(
+                                                &mut context,
+                                                generics,
+                                                sig,
+                                            ) {
+                                                Ok(signature) => {
+                                                    Ok(FunctionSignatureProjection::Supported(
+                                                        signature,
+                                                    ))
+                                                }
+                                                Err(reason) => {
+                                                    Ok(FunctionSignatureProjection::Unsupported(
+                                                        reason,
+                                                    ))
+                                                }
                                             }
                                         }
                                     }
@@ -36018,7 +36068,18 @@ property "shared"() {}
     fn function_owner_signature_projection_is_collection_bound_and_conservative() {
         let root = concat!(
             "fn signature(first: I32, pair: (Bool, I64)) -> U8 {}\n",
-            "fn generic<T>(value: T) {}\n",
+            "type Packet<T> { value: T }\n",
+            "type BoolAlias = Bool\n",
+            "fn generic<T>(value: T) -> T {}\n",
+            "fn other_generic<T>(value: T) -> T {}\n",
+            "fn nested<B, A>(value: (A, (B, A))) -> B {}\n",
+            "fn bounded<T: Copy>(value: T) -> T {}\n",
+            "fn where_clause<T>(value: T) -> T where T: Copy {}\n",
+            "fn const_parameter<const N: U32>(value: Bool) -> Bool {}\n",
+            "fn generic_adt<T>(value: Packet<T>) -> T {}\n",
+            "fn alias<T>(value: BoolAlias) -> T {}\n",
+            "fn recovered<123>(value: Bool) -> Bool {}\n",
+            "fn generic_borrow<T>(first: borrow T, pair: (borrow mut T, T)) -> borrow T {}\n",
         );
         let child = "";
         let (mut database, module_tree, snapshot, _) =
@@ -36036,6 +36097,84 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         assert!(resolved.matches_collection(&collection));
+        let recovered_function = collection.scopes.function_owners[9];
+        let recovered_descriptor = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .find(|descriptor| descriptor.owner == recovered_function.owner)
+            .expect("the recovered top-level function has a current owner descriptor");
+        let recovered_inputs = database
+            .current_owner_inputs(&snapshot, recovered_descriptor.file, &collection.target_cfg)
+            .expect("recovered function owner inputs are available");
+        let recovered_ast = recovered_inputs
+            .ast_ids
+            .pointer(recovered_descriptor.item_id)
+            .and_then(|pointer| {
+                pointer.resolve(
+                    recovered_inputs.filtered_item_tree.file,
+                    &recovered_inputs.root,
+                )
+            })
+            .and_then(ast::FnDecl::cast)
+            .expect("the malformed generic function remains an AST function");
+        let recovered_generic_syntax = recovered_ast
+            .generic_params()
+            .expect("the malformed function retains its generic parameter list")
+            .syntax()
+            .clone();
+        assert!(
+            recovered_generic_syntax.descendants().any(|node| {
+                node.kind() == sai_syntax::SyntaxKind::ERROR
+                    || node
+                        .children_with_tokens()
+                        .any(|element| element.as_token().is_some_and(|token| token.has_error()))
+            }),
+            "the fixture exercises parser recovery inside a function's generic list"
+        );
+
+        let recovered_def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&module_tree.package)
+                .expect("the package DefPath interner is available"),
+        );
+        let recovered_expected_path = recovered_def_paths
+            .resolve_def_id(recovered_descriptor.owner.def_id.to_def_id())
+            .expect("the recovered function DefPath resolves")
+            .expect("the recovered function DefPath exists");
+        let recovered_arena = HirArena::new();
+        let recovered_context = HirLoweringContext::new(
+            &recovered_inputs.ast_ids,
+            &snapshot,
+            &recovered_inputs.root,
+            &recovered_arena,
+            &database.symbols,
+            &recovered_def_paths,
+        );
+        let (recovered_owner, _) = lower_top_level_owner(
+            recovered_descriptor,
+            &recovered_expected_path,
+            &recovered_inputs.filtered_item_tree,
+            &recovered_inputs.retained_item_kinds,
+            &recovered_context,
+        )
+        .expect("generic-list parser recovery does not prevent HIR lowering");
+        let OwnerNode::Item(recovered_item) = recovered_owner.node else {
+            panic!("the recovered function remains an item owner");
+        };
+        let ItemKind::Fn {
+            generics: recovered_generics,
+            ..
+        } = recovered_item.kind
+        else {
+            panic!("the recovered function retains its HIR function kind");
+        };
+        assert!(
+            recovered_generics.params.is_empty(),
+            "the parser-recovered type argument disappears from the HIR binder list"
+        );
 
         let supported_owner = collection.scopes.function_owners[0].owner;
         let supported = resolved
@@ -36064,12 +36203,197 @@ property "shared"() {}
             sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
         ));
 
-        let generic_owner = collection.scopes.function_owners[1].owner;
+        let generic_projection = resolved
+            .signature_projection(&collection, collection.scopes.function_owners[1].owner)
+            .expect("the exact collection guards the generic signature")
+            .expect("the generic function owner exists");
+        let FunctionSignatureProjection::Supported(generic) = generic_projection else {
+            panic!("an unbounded type-only generic function signature is supported");
+        };
+        assert_eq!(generic.type_params().len(), 1);
+        assert_eq!(generic.type_params()[0].param.index, 0);
         assert_eq!(
-            resolved.signature_projection(&collection, generic_owner),
-            Ok(Some(&FunctionSignatureProjection::Unsupported(
+            database
+                .symbols
+                .resolve(generic.type_params()[0].param.name)
+                .unwrap()
+                .as_ref(),
+            "T"
+        );
+        assert_eq!(
+            generic.inputs()[0].kind(),
+            &sai_ty::ty::TyKind::Param(generic.type_params()[0].param)
+        );
+        assert_eq!(
+            generic.output().kind(),
+            &sai_ty::ty::TyKind::Param(generic.type_params()[0].param)
+        );
+
+        let other_generic_projection = resolved
+            .signature_projection(&collection, collection.scopes.function_owners[2].owner)
+            .expect("the exact collection guards the second generic signature")
+            .expect("the second generic owner exists");
+        let FunctionSignatureProjection::Supported(other_generic) = other_generic_projection else {
+            panic!("a second unbounded type-only generic signature is supported");
+        };
+        assert_eq!(
+            generic.type_params()[0].param,
+            other_generic.type_params()[0].param,
+            "the binder indices and names are the same"
+        );
+        assert_ne!(
+            generic.type_params()[0].def_id,
+            other_generic.type_params()[0].def_id,
+            "same-spelled binders retain distinct owner-local identities"
+        );
+
+        let nested_projection = resolved
+            .signature_projection(&collection, collection.scopes.function_owners[3].owner)
+            .expect("the exact collection guards the nested generic signature")
+            .expect("the nested generic owner exists");
+        let FunctionSignatureProjection::Supported(nested) = nested_projection else {
+            panic!("nested tuples with generic parameters are supported");
+        };
+        assert_eq!(
+            nested
+                .type_params()
+                .iter()
+                .map(|parameter| parameter.param.index)
+                .collect::<Vec<_>>(),
+            [0, 1],
+            "binder order follows source order B, A"
+        );
+        let sai_ty::ty::TyKind::Tuple(outer) = nested.inputs()[0].kind() else {
+            panic!("the nested function input is a tuple");
+        };
+        assert_eq!(
+            outer[0].kind(),
+            &sai_ty::ty::TyKind::Param(nested.type_params()[1].param)
+        );
+        let sai_ty::ty::TyKind::Tuple(inner) = outer[1].kind() else {
+            panic!("the second outer element is a nested tuple");
+        };
+        assert_eq!(
+            inner[0].kind(),
+            &sai_ty::ty::TyKind::Param(nested.type_params()[0].param)
+        );
+        assert_eq!(
+            inner[1].kind(),
+            &sai_ty::ty::TyKind::Param(nested.type_params()[1].param)
+        );
+        assert_eq!(
+            nested.output().kind(),
+            &sai_ty::ty::TyKind::Param(nested.type_params()[0].param)
+        );
+
+        let unsupported_signature = |index: usize| {
+            resolved
+                .signature_projection(&collection, collection.scopes.function_owners[index].owner)
+                .expect("the exact collection guards the signature")
+                .expect("the function owner exists")
+                .clone()
+        };
+        assert_eq!(
+            unsupported_signature(4),
+            FunctionSignatureProjection::Unsupported(
                 sai_ty::lower_ty::UnsupportedFnSig::GenericParameters
-            )))
+            ),
+            "type-parameter bounds remain unsupported"
+        );
+        assert_eq!(
+            unsupported_signature(5),
+            FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::WherePredicates
+            ),
+            "where clauses remain unsupported"
+        );
+        assert_eq!(
+            unsupported_signature(6),
+            FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::GenericParameters
+            ),
+            "const parameters remain unsupported"
+        );
+        assert_eq!(
+            unsupported_signature(7),
+            FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                    index: 0,
+                    reason: sai_ty::lower_ty::UnsupportedTy::GenericArguments,
+                }
+            ),
+            "generic ADT arguments remain unsupported"
+        );
+        assert_eq!(
+            unsupported_signature(8),
+            FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                    index: 0,
+                    reason: sai_ty::lower_ty::UnsupportedTy::Alias,
+                }
+            ),
+            "aliases remain unsupported"
+        );
+        assert_eq!(
+            unsupported_signature(9),
+            FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::RecoveredGenericSyntax
+            ),
+            "parser-recovered generic syntax cannot masquerade as a nongeneric function"
+        );
+        let borrowed_projection = resolved
+            .signature_projection(&collection, collection.scopes.function_owners[10].owner)
+            .expect("the exact collection guards the generic borrowed signature")
+            .expect("the generic borrowed function owner exists");
+        let FunctionSignatureProjection::Supported(borrowed) = borrowed_projection else {
+            panic!("borrow types around type parameters remain supported");
+        };
+        assert_eq!(borrowed.type_params().len(), 1);
+        let sai_ty::ty::TyKind::Ref(
+            sai_ty::ty::Region::Sig(first_region),
+            first_inner,
+            sai_hir::Mutability::Not,
+        ) = borrowed.inputs()[0].kind()
+        else {
+            panic!("the first input is an immutable signature reference");
+        };
+        assert_eq!(first_region.index, 0);
+        assert_eq!(
+            first_inner.kind(),
+            &sai_ty::ty::TyKind::Param(borrowed.type_params()[0].param)
+        );
+        let sai_ty::ty::TyKind::Tuple(pair) = borrowed.inputs()[1].kind() else {
+            panic!("the second input is a tuple");
+        };
+        let sai_ty::ty::TyKind::Ref(
+            sai_ty::ty::Region::Sig(second_region),
+            second_inner,
+            sai_hir::Mutability::Mut,
+        ) = pair[0].kind()
+        else {
+            panic!("the first tuple element is a mutable signature reference");
+        };
+        assert_eq!(second_region.index, 1);
+        assert_eq!(
+            second_inner.kind(),
+            &sai_ty::ty::TyKind::Param(borrowed.type_params()[0].param)
+        );
+        assert_eq!(
+            pair[1].kind(),
+            &sai_ty::ty::TyKind::Param(borrowed.type_params()[0].param)
+        );
+        let sai_ty::ty::TyKind::Ref(
+            sai_ty::ty::Region::Sig(return_region),
+            return_inner,
+            sai_hir::Mutability::Not,
+        ) = borrowed.output().kind()
+        else {
+            panic!("the return type is an immutable signature reference");
+        };
+        assert_eq!(return_region.index, 2);
+        assert_eq!(
+            return_inner.kind(),
+            &sai_ty::ty::TyKind::Param(borrowed.type_params()[0].param)
         );
 
         let changed_cfg =
