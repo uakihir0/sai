@@ -1,0 +1,59 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum Drainage {
+    WellDrained
+    Moist
+    PoorlyDrained
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum HoldReason {
+    NoSuitableSpecies
+    NurseryStockUnavailable
+    DistrictDiversityLimit
+    SharedWaterBudgetExceeded
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PlantingSite {
+    pub id: U32
+    pub name: Str
+    pub district_id: U32
+    pub priority: U32
+    pub drainage: Drainage
+    pub usable_root_volume_ft3: U32
+    pub overhead_clearance_ft: U32
+    pub sidewalk_width_ft: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TreeSpecies {
+    pub id: U32
+    pub name: Str
+    pub drainage: Drainage
+    pub minimum_root_volume_ft3: U32
+    pub minimum_overhead_clearance_ft: U32
+    pub minimum_sidewalk_width_ft: U32
+    pub establishment_water_liters: U32
+    pub nursery_stock: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PlantingDecision {
+    pub site_id: U32
+    pub site_name: Str
+    pub district_id: U32
+    pub priority: U32
+    pub species_id: Option<U32>
+    pub hold_reason: Option<HoldReason>
+    pub establishment_water_liters: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PlantingPlan {
+    pub decisions: Array<Option<PlantingDecision>, 10>
+    pub decision_count: USize
+    pub planted_count: USize
+    pub held_count: USize
+    pub water_reserved_liters: U32
+    pub water_budget_liters: U32
+}

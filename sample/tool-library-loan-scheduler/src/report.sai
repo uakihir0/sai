@@ -1,0 +1,138 @@
+use acme:tool-library-loan-scheduler/data
+use acme:tool-library-loan-scheduler/model.{Decision, HoldReason, Plan, Request}
+use acme:tool-library-loan-scheduler/planner
+use sai:core/fmt.{Writer}
+use sai:process.{Stdout}
+
+fn member_name(id: U32) -> Str {
+    for member in data.members() {
+        if member.id == id {
+            return member.name
+        }
+    }
+    "(unknown member)"
+}
+
+fn tool_name(id: U32) -> Str {
+    for tool in data.tools() {
+        if tool.id == id {
+            return tool.name
+        }
+    }
+    "(unknown tool)"
+}
+
+fn reason_name(reason: HoldReason) -> Str {
+    match reason {
+        HoldReason.Scheduled => "scheduled"
+        HoldReason.InventoryMismatch => "inventory mismatch"
+        HoldReason.NoContinuousStock => "no continuous stock"
+        HoldReason.LoanTooLong => "loan exceeds tool limit"
+        HoldReason.MissingSafetyBadge => "missing safety badge"
+        HoldReason.DuplicateOverlap => "duplicate overlapping request"
+        HoldReason.MemberLoanLimit => "member loan limit"
+        HoldReason.UnknownMember => "unknown member"
+        HoldReason.InvalidWindow => "invalid loan window"
+        HoldReason.UnknownTool => "unknown tool"
+    }
+}
+
+fn day_name(day: USize) -> Str {
+    match day {
+        0 => "Monday"
+        1 => "Tuesday"
+        2 => "Wednesday"
+        3 => "Thursday"
+        4 => "Friday"
+        5 => "Saturday"
+        6 => "Sunday"
+        _ => "after Sunday"
+    }
+}
+
+fn print_decision(out: borrow mut Stdout, request: Request, decision: Decision)
+    effects { stdio.write, alloc }
+{
+    if decision.scheduled {
+        out.write_str(
+            f"#{request.queue_number} {member_name(request.member_id)} — {tool_name(request.tool_id)}, {day_name(request.pickup_day)} for {request.duration_days} days: scheduled\n".as_str(),
+        )
+    } else {
+        out.write_str(
+            f"#{request.queue_number} {member_name(request.member_id)} — {tool_name(request.tool_id)}, {day_name(request.pickup_day)} for {request.duration_days} days: held ({reason_name(decision.reason)})\n".as_str(),
+        )
+    }
+}
+
+fn count_held_reason(plan: Plan, reason: HoldReason) -> USize {
+    var count: USize = 0
+    for decision_option in plan.decisions {
+        match decision_option {
+            Some(decision) => {
+                if not decision.scheduled and decision.reason == reason {
+                    count += 1
+                }
+            }
+            None => {}
+        }
+    }
+    count
+}
+
+pub fn print_summary(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let plan = planner.plan()
+    out.write_str("Tool library reservations\n")
+    out.write_str(
+        f"{data.requests().len()} requests; {plan.scheduled_count} scheduled; {plan.held_count} held\n".as_str(),
+    )
+    out.write_str("Held by reason\n")
+    for reason in [
+        HoldReason.InventoryMismatch,
+        HoldReason.NoContinuousStock,
+        HoldReason.LoanTooLong,
+        HoldReason.MissingSafetyBadge,
+        HoldReason.DuplicateOverlap,
+        HoldReason.MemberLoanLimit,
+        HoldReason.UnknownMember,
+        HoldReason.InvalidWindow,
+        HoldReason.UnknownTool,
+    ] {
+        let count = count_held_reason(plan, reason)
+        if count > 0 {
+            out.write_str(f"  {reason_name(reason)}: {count}\n".as_str())
+        }
+    }
+}
+
+pub fn print_requests(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let plan = planner.plan()
+    out.write_str("Tool loan requests\n")
+    for index in 0..data.requests().len() {
+        let request = data.requests()[index]
+        match plan.decisions[index] {
+            Some(decision) => print_decision(borrow mut out, request, decision)
+            None => {}
+        }
+    }
+}
+
+pub fn print_calendar(out: borrow mut Stdout)
+    effects { stdio.write, alloc }
+{
+    let plan = planner.plan()
+    let tools = data.tools()
+    out.write_str("Free tool copies by day\n")
+    for tool_index in 0..tools.len() {
+        let tool = tools[tool_index]
+        out.write_str(f"{tool.name}\n".as_str())
+        for day in 0..7 {
+            out.write_str(
+                f"  {day_name(day)}: {plan.free_copies_by_day[tool_index * 7 + day]} free\n".as_str(),
+            )
+        }
+    }
+}

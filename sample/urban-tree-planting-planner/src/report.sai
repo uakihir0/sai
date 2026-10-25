@@ -1,0 +1,73 @@
+use acme:urban-tree-planting-planner/data
+use acme:urban-tree-planting-planner/model.{HoldReason, PlantingPlan}
+use acme:urban-tree-planting-planner/planner
+use sai:alloc/string.{String}
+use sai:core/fmt.{Writer}
+
+fn species_name(species_id: U32) -> Str {
+    for species in data.species() {
+        if species.id == species_id {
+            return species.name
+        }
+    }
+    "(unknown species)"
+}
+
+fn hold_text(reason: HoldReason) -> Str {
+    match reason {
+        HoldReason.NoSuitableSpecies => "no species fits soil and site clearances"
+        HoldReason.NurseryStockUnavailable => "no compatible nursery stock remains"
+        HoldReason.DistrictDiversityLimit => "district species limit reached"
+        HoldReason.SharedWaterBudgetExceeded => "shared watering budget is insufficient"
+    }
+}
+
+pub fn render(plan: PlantingPlan) -> String
+    effects { alloc }
+{
+    var out = String.new()
+    out.write_str("Urban tree planting plan — North Valley, spring round\n")
+    out.write_str("Order: higher-priority sites first; ties use ascending site ID\n\n")
+
+    for index in 0..plan.decision_count {
+        let decision = plan.decisions[index].unwrap()
+        out.write_str(f"#{decision.site_id} {decision.site_name}: ".as_str())
+        match decision.species_id {
+            Some(species_id) => {
+                out.write_str(
+                    f"plant {species_name(species_id)}; reserve {decision.establishment_water_liters} L for establishment watering\n".as_str(),
+                )
+            }
+            None => {
+                let reason = match decision.hold_reason {
+                    Some(value) => hold_text(value)
+                    None => "needs review"
+                }
+                out.write_str(f"held — {reason}\n".as_str())
+            }
+        }
+    }
+
+    let remaining_water_liters = plan.water_budget_liters - plan.water_reserved_liters
+    out.write_str("\n")
+    out.write_str(
+        f"Planted: {plan.planted_count}/{plan.decision_count}; held: {plan.held_count}\n".as_str(),
+    )
+    out.write_str(
+        f"Establishment watering: {plan.water_reserved_liters}/{plan.water_budget_liters} L reserved; {remaining_water_liters} L remain\n".as_str(),
+    )
+    out
+}
+
+pub fn sample_report() -> String
+    effects { alloc }
+{
+    render(
+        planner.plan(
+            data.sites(),
+            data.species(),
+            data.district_species_limit(),
+            data.city_water_budget_liters(),
+        ),
+    )
+}

@@ -1,0 +1,58 @@
+use acme:urban-tree-planting-planner/data
+use acme:urban-tree-planting-planner/model.{HoldReason}
+use acme:urban-tree-planting-planner/planner
+use acme:urban-tree-planting-planner/report
+use sai:alloc/string.{String}
+
+pub fn sample_plan() -> planner.PlantingPlan {
+    planner.plan(
+        data.sites(),
+        data.species(),
+        data.district_species_limit(),
+        data.city_water_budget_liters(),
+    )
+}
+
+pub fn sample_report() -> String
+    effects { alloc }
+{
+    report.render(sample_plan())
+}
+
+test "the fixed round plants compatible sites and keeps every other site visible" {
+    let result = sample_plan()
+    assert result.decision_count == 10
+    assert result.planted_count == 6
+    assert result.held_count == 4
+    assert result.water_reserved_liters == 296
+    assert result.water_budget_liters == 300
+}
+
+test "the planner sorts by urgency and stable site ID" {
+    let result = sample_plan()
+    assert result.decisions[0].unwrap().site_id == 3101
+    assert result.decisions[1].unwrap().site_id == 3102
+    assert result.decisions[2].unwrap().site_id == 3103
+    assert result.decisions[3].unwrap().site_id == 3104
+}
+
+test "site suitability and district diversity constraints are explicit" {
+    let result = sample_plan()
+    assert result.decisions[2].unwrap().hold_reason == Some(HoldReason.NoSuitableSpecies)
+    assert result.decisions[6].unwrap().hold_reason == Some(HoldReason.DistrictDiversityLimit)
+    assert result.decisions[5].unwrap().species_id == Some(104)
+}
+
+test "water and nursery shortages hold later sites without reserving resources" {
+    let result = sample_plan()
+    assert (result.decisions[7].unwrap().hold_reason == Some(HoldReason.SharedWaterBudgetExceeded))
+    assert (result.decisions[9].unwrap().hold_reason == Some(HoldReason.NurseryStockUnavailable))
+    assert result.water_reserved_liters <= result.water_budget_liters
+}
+
+test "the rendered report names trees and explains held sites" {
+    let result = sample_report()
+    assert result.as_str().contains("plant Swamp white oak")
+    assert result.as_str().contains("district species limit reached")
+    assert result.as_str().contains("296/300 L reserved")
+}
