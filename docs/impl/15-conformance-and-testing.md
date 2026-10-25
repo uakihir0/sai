@@ -6,6 +6,10 @@
 
 This chapter defines the conformance suite of SAI: how it is organized, the format of its tests, how expected diagnostics are checked, which outputs are compared with golden files, how Wasm artifacts are executed deterministically, which configurations must give equal results, how the specification itself is turned into tests, and which tests a conformance claim for a range of stages must pass. It also defines the testing strategy of the reference implementation: fuzzing, differential testing against independent oracles, benchmarks, and the compiler's own tests and merge gates. The meaning of `test` and `property` declarations belongs to [spec/14](../spec/14-testing.md), and the `sai test` command to [13](13-cli.md) §13.6.6. This chapter uses them as tools; it does not restate them.
 
+**Implementation status (2026-10-25).** The requirements in this chapter specify the target conformance system; they do not describe checks already implemented unless explicitly stated. The current [GitHub Actions workflow](../../.github/workflows/ci.yml) checks formatting and `cargo test --workspace --locked` on Ubuntu, macOS and Windows, and runs two additional package-cache tests on Windows. The current `sai check` implementation explicitly does not establish Stage 0 conformance ([13](13-cli.md) §13.6). The target claim and merge gate below remain normative requirements.
+
+**Review required:** Revalidate this status when conformance infrastructure is introduced, before presenting the target claim or gate as active.
+
 ---
 
 ## 15.1 Overview
@@ -219,7 +223,7 @@ A test whose stage is above the highest stage `k` of the claim is run in **stage
 1. `staged` if a command reports an error `FEATURE_NOT_IMPLEMENTED` whose `stage` datum is greater than `k`;
 2. otherwise, the result that the test has with its own expectations in that configuration (§15.3.4 and the kind), because an IUT that reports no staged feature has accepted every construct of the test and MUST implement all of their semantics ([spec/01](../spec/01-introduction.md) §1.4.5 item 3).
 
-An `INTERNAL_COMPILER_ERROR` fails the test in both cases (§15.3.4 item 1). A compiler therefore cannot pass a claim by accepting part of a later stage: it either rejects the feature with the staged diagnostic or implements it fully. In particular, a compiler that accepts an ill-formed program of a later stage without reporting a staged feature, such as a use after move under a Stage 1 claim, fails that test. The reference implementation of v0.1 claims Stages 0 to 4 (§15.9.5), so every CI run checks the tests of Stages 5 to 7 in this mode against it.
+An `INTERNAL_COMPILER_ERROR` fails the test in both cases (§15.3.4 item 1). A compiler therefore cannot pass a claim by accepting part of a later stage: it either rejects the feature with the staged diagnostic or implements it fully. In particular, a compiler that accepts an ill-formed program of a later stage without reporting a staged feature, such as a use after move under a Stage 1 claim, fails that test. The target v0.1 reference-implementation claim covers Stages 0 to 4 (§15.9.5); once the planned conformance gate is implemented, it will check the tests of Stages 5 to 7 in this mode against that implementation.
 
 ### 15.3.6 Panic expectations
 
@@ -552,15 +556,15 @@ The harness checks a claim when it is invoked as `cargo xtask test --iut <path> 
 
 The summary record of the report (§15.1.4 item 5) states the claim, the suite version, the IUT's `sai --version` output, the adapter if any, the counts of each outcome, and the list of deviations, which is part of the claim. A claim that is checked with an older suite version names that version.
 
-### 15.9.5 The claim of the reference implementation
+### 15.9.5 Target claim of the reference implementation
 
-The v0.1 reference implementation claims `SAI 0.1, stages 0-4, targets wasm32-core wasm32-wasi wasm64-core`, which is a v0.1 conformance claim ([spec/01](../spec/01-introduction.md) §1.4.3). It does not claim `wasm64-wasi`, because its component build for that target stops with `FEATURE_NOT_IMPLEMENTED` ([07](07-component-lowering.md) §7.11.7, N-D-58); the tests whose only configurations are on `wasm64-wasi` are therefore not applicable to its claim. The merge gate checks this claim on every change (§15.12.6), and each release publishes the report of §15.9.4 with it.
+The target v0.1 reference implementation is intended to claim `SAI 0.1, stages 0-4, targets wasm32-core wasm32-wasi wasm64-core`, which is a v0.1 conformance claim ([spec/01](../spec/01-introduction.md) §1.4.3). The target claim excludes `wasm64-wasi`, because the component build for that target stops with `FEATURE_NOT_IMPLEMENTED` ([07](07-component-lowering.md) §7.11.7, N-D-58); the tests whose only configurations are on `wasm64-wasi` are therefore not applicable to this claim. Once implemented, the planned merge gate checks this claim on every change (§15.12.6), and each release publishes the report of §15.9.4 with it.
 
 ---
 
 ## 15.10 Differential testing (reference implementation, N-J-48)
 
-Differential tests compare the reference implementation with an **oracle**: an independent computation of the same result. An oracle is code of the harness that shares no code with the compiler crates ([01](01-architecture.md) §1.3), except the parsers of data formats that the specification defines by reference (WIT, WAVE and JSON). A disagreement is a defect of the compiler or of the oracle, and it is investigated before either is changed. The tests live in `tests/differential/`, run with the merge gate on a fixed set of seeds (§15.12.6) and nightly on fresh seeds, and every disagreement found with a fresh seed is added as a conformance test with its minimized input.
+Differential tests compare the reference implementation with an **oracle**: an independent computation of the same result. An oracle is code of the harness that shares no code with the compiler crates ([01](01-architecture.md) §1.3), except the parsers of data formats that the specification defines by reference (WIT, WAVE and JSON). A disagreement is a defect of the compiler or of the oracle, and it is investigated before either is changed. The target strategy places the tests in `tests/differential/`; the planned merge gate runs them on a fixed set of seeds (§15.12.6), and a planned nightly job runs fresh seeds. Every disagreement found with a fresh seed must be added as a conformance test with its minimized input.
 
 ### 15.10.1 Host oracles for values
 
@@ -672,7 +676,7 @@ These tests live in `tests/impl/` and use the reference implementation's crates 
 
 ### 15.12.6 Merge gates and releases
 
-1. **Merge gate.** Every change to the compiler repository, including changes to `library/`, `tests/` and `docs/`, is merged only if the following pass on an `x86_64` host and on an `aarch64` host:
+1. **Planned v0.1 merge gate.** Once the target conformance infrastructure is implemented, every change to the compiler repository, including changes to `library/`, `tests/` and `docs/`, MUST pass the following checks on both an `x86_64` host and an `aarch64` host before merge:
    - `cargo build` and `cargo test --workspace`, and `cargo clippy` with warnings denied and the disallowed types and methods of [01](01-architecture.md) §1.8.3 rule 3;
    - `cargo xtask spec-tests`, which MUST leave `tests/spec/` unchanged (§15.8);
    - the canonical form of every test file and of the library source (§15.2.2 item 3);
