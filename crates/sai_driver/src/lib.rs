@@ -2879,6 +2879,7 @@ pub enum LocalRecordFieldTypesUnsupportedReason {
     InvalidOwnerIdentity,
     GenericParameters,
     WherePredicates,
+    UnvalidatedGenericDefinition,
     RecoveredSyntax,
     OwnerAnalysisFailed,
 }
@@ -2908,17 +2909,50 @@ impl LocalRecordFieldTypeProjection {
     }
 }
 
+/// Why a field type cannot be instantiated for a generic local record use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalRecordFieldTypeInstantiationError {
+    UnsupportedProjection(LocalRecordFieldTypesUnsupportedReason),
+    NotGenericRecord,
+    NotAdt,
+    WrongRecord { expected: DefId, found: DefId },
+    WrongNumberOfTypeArguments { expected: usize, found: usize },
+    FieldNotFound(DefId),
+    UnsupportedField(sai_ty::lower_ty::UnsupportedTy),
+    InvalidProjectionProvenance,
+    InvalidBinderMetadata,
+    UnsupportedTemplate,
+    Substitution(sai_ty::ty::SubstitutionError),
+}
+
+/// Opaque validation record attached to driver-created field projections.
+///
+/// The public projection enum can be pattern matched, but callers cannot
+/// construct or alter this token. Instantiation checks it to ensure the
+/// visible owner, binder list, and ordered field identities are the values
+/// validated from the exact HIR owner.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalRecordFieldTypesValidation {
+    owner: OwnerId,
+    type_params: Arc<[(DefId, sai_ty::ty::ParamTy)]>,
+    field_results: Arc<[LocalRecordFieldTypeProjection]>,
+}
+
 /// The bounded `type_of(field)` projection for one direct local record.
 ///
 /// Successful projections retain fields in source order, including a
 /// per-field unsupported result so one unsupported field cannot hide its
-/// siblings. The owner-level rejection is used when the declaration itself
-/// cannot be trusted as a nongeneric, unrecovered local record.
+/// siblings. Generic field types are declaration templates indexed by their
+/// exact owner's source-ordered type binders. Instantiation is a separate
+/// checked operation and is available only for validated generic records.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LocalRecordFieldTypesProjection {
     Supported {
         owner: OwnerId,
+        type_params: Arc<[(DefId, sai_ty::ty::ParamTy)]>,
         fields: Arc<[LocalRecordFieldTypeProjection]>,
+        provenance: LocalRecordFieldTypesValidation,
     },
     Unsupported {
         owner: OwnerId,
@@ -2938,6 +2972,17 @@ impl LocalRecordFieldTypesProjection {
     pub fn fields(&self) -> Option<&[LocalRecordFieldTypeProjection]> {
         match self {
             Self::Supported { fields, .. } => Some(fields),
+            Self::Unsupported { .. } => None,
+        }
+    }
+
+    /// Exact source-ordered type binders for the field templates.
+    ///
+    /// Each pair retains the binder `DefId` validated for this record and the
+    /// `ParamTy` used in its lowered field templates.
+    pub fn type_params(&self) -> Option<&[(DefId, sai_ty::ty::ParamTy)]> {
+        match self {
+            Self::Supported { type_params, .. } => Some(type_params),
             Self::Unsupported { .. } => None,
         }
     }
@@ -2966,6 +3011,142 @@ impl LocalRecordFieldTypesProjection {
             .find(|candidate| candidate.def_id == field)
             .map(LocalRecordFieldTypeProjection::ty)
     }
+
+    /// Instantiate one generic field template from an exact local-record
+    /// application.
+    ///
+    /// The projection retains the exact binder `DefId`s and source-order
+    /// indices. The supplied `Adt` must have the same record `DefId` and
+    /// exactly one type argument per validated binder. Substitution is
+    /// one-step through IR-908, so type parameters inside a supplied
+    /// replacement remain in their caller's binder.
+    pub fn instantiate_field_type(
+        &self,
+        interner: &sai_ty::ty::TyInterner,
+        record_ty: &sai_ty::ty::Ty,
+        field: DefId,
+    ) -> Result<sai_ty::ty::Ty, LocalRecordFieldTypeInstantiationError> {
+        let (owner, type_params, fields, provenance) = match self {
+            Self::Supported {
+                owner,
+                type_params,
+                fields,
+                provenance,
+            } => (owner, type_params, fields, provenance),
+            Self::Unsupported { reason, .. } => {
+                return Err(LocalRecordFieldTypeInstantiationError::UnsupportedProjection(*reason));
+            }
+        };
+        if provenance.owner != *owner
+            || provenance.type_params.as_ref() != type_params.as_ref()
+            || provenance.field_results.as_ref() != fields.as_ref()
+        {
+            return Err(LocalRecordFieldTypeInstantiationError::InvalidProjectionProvenance);
+        }
+        if type_params.is_empty() {
+            return Err(LocalRecordFieldTypeInstantiationError::NotGenericRecord);
+        }
+        validate_record_projection_type_params(type_params)
+            .map_err(|()| LocalRecordFieldTypeInstantiationError::InvalidBinderMetadata)?;
+
+        let sai_ty::ty::TyKind::Adt(record_def, type_args) = record_ty.kind() else {
+            return Err(LocalRecordFieldTypeInstantiationError::NotAdt);
+        };
+        let expected_record_def = owner.def_id.to_def_id();
+        if *record_def != expected_record_def {
+            return Err(LocalRecordFieldTypeInstantiationError::WrongRecord {
+                expected: expected_record_def,
+                found: *record_def,
+            });
+        }
+        if type_args.len() != type_params.len() {
+            return Err(
+                LocalRecordFieldTypeInstantiationError::WrongNumberOfTypeArguments {
+                    expected: type_params.len(),
+                    found: type_args.len(),
+                },
+            );
+        }
+        let field = fields
+            .iter()
+            .find(|candidate| candidate.def_id == field)
+            .ok_or(LocalRecordFieldTypeInstantiationError::FieldNotFound(field))?;
+        let template = field
+            .ty
+            .as_ref()
+            .map_err(|reason| LocalRecordFieldTypeInstantiationError::UnsupportedField(*reason))?;
+        if !local_record_template_matches_binders(template, type_params) {
+            return Err(LocalRecordFieldTypeInstantiationError::UnsupportedTemplate);
+        }
+        let arguments = type_args
+            .iter()
+            .cloned()
+            .map(sai_ty::ty::GenericArg::Type)
+            .collect::<Vec<_>>();
+        interner
+            .substitute(template, &arguments)
+            .map_err(LocalRecordFieldTypeInstantiationError::Substitution)
+    }
+}
+
+fn validate_record_projection_type_params(
+    type_params: &[(DefId, sai_ty::ty::ParamTy)],
+) -> Result<(), ()> {
+    let mut def_ids = HashSet::with_capacity(type_params.len());
+    let mut names = HashSet::with_capacity(type_params.len());
+    for (index, (def_id, parameter)) in type_params.iter().enumerate() {
+        if u32::try_from(index).ok() != Some(parameter.index)
+            || parameter.name.is_error()
+            || !def_ids.insert(*def_id)
+            || !names.insert(parameter.name)
+        {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn local_record_template_matches_binders(
+    template: &sai_ty::ty::Ty,
+    type_params: &[(DefId, sai_ty::ty::ParamTy)],
+) -> bool {
+    let mut pending = vec![template];
+    while let Some(ty) = pending.pop() {
+        match ty.kind() {
+            sai_ty::ty::TyKind::Param(parameter) => {
+                let Some(index) = usize::try_from(parameter.index).ok() else {
+                    return false;
+                };
+                if type_params
+                    .get(index)
+                    .is_none_or(|(_, expected)| expected != parameter)
+                {
+                    return false;
+                }
+            }
+            sai_ty::ty::TyKind::Ref(..) => return false,
+            sai_ty::ty::TyKind::Tuple(elements) => pending.extend(elements.iter()),
+            sai_ty::ty::TyKind::Array(element, length) => {
+                if matches!(length, sai_ty::ty::Const::Param(_)) {
+                    return false;
+                }
+                pending.push(element);
+            }
+            sai_ty::ty::TyKind::FnPtr(signature) => {
+                pending.extend(signature.inputs());
+                pending.push(signature.output());
+            }
+            sai_ty::ty::TyKind::Adt(_, arguments) => pending.extend(arguments.iter()),
+            sai_ty::ty::TyKind::Int(_)
+            | sai_ty::ty::TyKind::Uint(_)
+            | sai_ty::ty::TyKind::Float(_)
+            | sai_ty::ty::TyKind::Bool
+            | sai_ty::ty::TyKind::Byte
+            | sai_ty::ty::TyKind::Char
+            | sai_ty::ty::TyKind::Never => {}
+        }
+    }
+    true
 }
 
 /// Compatibility name for the original type-owner test-only adapter result.
@@ -13148,6 +13329,7 @@ fn local_record_field_type_is_region_free_for_array_projection(
     owner: OwnerId,
     paths: &HashMap<HirId, PathRes>,
     local_nominals: &HashMap<DefId, sai_ty::lower_ty::LocalNominalDef>,
+    type_parameters: &HashSet<DefId>,
 ) -> bool {
     if ty.hir_id.owner != owner {
         return false;
@@ -13160,6 +13342,7 @@ fn local_record_field_type_is_region_free_for_array_projection(
                 owner,
                 paths,
                 local_nominals,
+                type_parameters,
             )
         }),
         // The declaration implicit-region rule explicitly excludes function
@@ -13223,6 +13406,7 @@ fn local_record_field_type_is_region_free_for_array_projection(
                                     owner,
                                     paths,
                                     local_nominals,
+                                    type_parameters,
                                 )
                             }
                             // Const syntax cannot carry a borrow or region.
@@ -13260,11 +13444,17 @@ fn local_record_field_type_is_region_free_for_array_projection(
                                         owner,
                                         paths,
                                         local_nominals,
+                                        type_parameters,
                                     )
                                 }
                                 GenericArg::Const(_) => true,
                             })
                         })
+                }
+                Res::Def(DefKind::TyParam, def_id) => {
+                    path.segments.len() == 1
+                        && segment.args.is_none()
+                        && type_parameters.contains(&def_id)
                 }
                 Res::Def(DefKind::Struct | DefKind::Enum, def_id)
                     if local_nominals.contains_key(&def_id) =>
@@ -13277,6 +13467,7 @@ fn local_record_field_type_is_region_free_for_array_projection(
                                     owner,
                                     paths,
                                     local_nominals,
+                                    type_parameters,
                                 )
                             }
                             // Const arguments cannot contain regions. The
@@ -13323,6 +13514,52 @@ fn local_record_array_length_is_exact_const_path(
             && resolution.segment_count == segment_count
             && matches!(resolution.base, Res::Def(DefKind::Const, _))
     })
+}
+
+fn validated_local_record_type_params(
+    parameters: &[sai_hir::types::GenericParam<'_>],
+    owner_path: &DefPath,
+    def_paths: &DefPathInterner,
+) -> Option<Arc<[(DefId, sai_ty::ty::ParamTy)]>> {
+    let mut names = HashSet::with_capacity(parameters.len());
+    let mut def_ids = HashSet::with_capacity(parameters.len());
+    let mut result = Vec::with_capacity(parameters.len());
+    let owner_components = owner_path.data();
+    for (index, parameter) in parameters.iter().enumerate() {
+        let sai_hir::types::GenericParamKind::Type { bounds } = parameter.kind else {
+            return None;
+        };
+        let name = parameter.name.sym;
+        if !bounds.is_empty()
+            || name.is_error()
+            || !names.insert(name)
+            || !def_ids.insert(parameter.def_id.to_def_id())
+        {
+            return None;
+        }
+        let parameter_path = def_paths.resolve(parameter.def_id).ok().flatten()?;
+        let parameter_components = parameter_path.data();
+        if parameter_path.package() != owner_path.package()
+            || parameter_components.len() != owner_components.len() + 1
+            || parameter_components[..owner_components.len()] != *owner_components
+            || !matches!(
+                parameter_components.last(),
+                Some(component)
+                    if component.data == DefPathData::TypeParam(name)
+                        && component.disambiguator == 0
+            )
+        {
+            return None;
+        }
+        result.push((
+            parameter.def_id.to_def_id(),
+            sai_ty::ty::ParamTy {
+                index: u32::try_from(index).ok()?,
+                name,
+            },
+        ));
+    }
+    Some(result.into())
 }
 
 fn nominal_fields_are_region_free(
@@ -15034,7 +15271,11 @@ impl RootDatabase {
                     }
                     _ => continue,
                 };
-                if syntax_subtree_has_error(&declaration_syntax)
+                let source_parameter_count = generic_params
+                    .as_ref()
+                    .map_or(0, |parameters| parameters.params().count());
+                if source_parameter_count != generics.params.len()
+                    || syntax_subtree_has_error(&declaration_syntax)
                     || generic_params
                         .as_ref()
                         .is_some_and(|params| syntax_subtree_has_error(params.syntax()))
@@ -15045,43 +15286,15 @@ impl RootDatabase {
                 {
                     continue;
                 }
-                let mut parameter_names = HashSet::with_capacity(generics.params.len());
-                let mut type_params = Vec::with_capacity(generics.params.len());
-                let owner_components = expected_path.data();
-                let mut valid_parameters = true;
-                for parameter in generics.params {
-                    let GenericParamKind::Type { bounds } = parameter.kind else {
-                        valid_parameters = false;
-                        break;
-                    };
-                    let name = parameter.name.sym;
-                    if !bounds.is_empty() || name.is_error() || !parameter_names.insert(name) {
-                        valid_parameters = false;
-                        break;
-                    }
-                    let Ok(Some(parameter_path)) = def_paths.resolve(parameter.def_id) else {
-                        valid_parameters = false;
-                        break;
-                    };
-                    let parameter_components = parameter_path.data();
-                    if parameter_path.package() != expected_path.package()
-                        || parameter_components.len() != owner_components.len() + 1
-                        || parameter_components[..owner_components.len()] != *owner_components
-                        || !matches!(
-                            parameter_components.last(),
-                            Some(component)
-                                if component.data == DefPathData::TypeParam(name)
-                                    && component.disambiguator == 0
-                        )
-                    {
-                        valid_parameters = false;
-                        break;
-                    }
-                    type_params.push((parameter.def_id.to_def_id(), name));
-                }
-                if !valid_parameters {
+                let Some(validated_type_params) =
+                    validated_local_record_type_params(generics.params, &expected_path, &def_paths)
+                else {
                     continue;
-                }
+                };
+                let type_params = validated_type_params
+                    .iter()
+                    .map(|(def_id, parameter)| (*def_id, parameter.name))
+                    .collect::<Vec<_>>();
                 let Ok(module_scope) =
                     module_scope_for_file(collection, &collection.module_tree, file)
                 else {
@@ -19035,9 +19248,6 @@ impl RootDatabase {
         let ItemKind::Struct { generics, fields } = item.kind else {
             return unsupported(LocalRecordFieldTypesUnsupportedReason::NotDirectLocalRecord);
         };
-        if !generics.params.is_empty() {
-            return unsupported(LocalRecordFieldTypesUnsupportedReason::GenericParameters);
-        }
         if !generics.where_preds.is_empty() {
             return unsupported(LocalRecordFieldTypesUnsupportedReason::WherePredicates);
         }
@@ -19055,6 +19265,39 @@ impl RootDatabase {
             return unsupported(LocalRecordFieldTypesUnsupportedReason::InvalidOwnerIdentity);
         }
 
+        let source_parameter_count = declaration
+            .generic_params()
+            .map_or(0, |parameters| parameters.params().count());
+        if source_parameter_count != generics.params.len() {
+            return unsupported(LocalRecordFieldTypesUnsupportedReason::InvalidOwnerIdentity);
+        }
+        let Some(validated_type_params) =
+            validated_local_record_type_params(generics.params, expected_path, &def_paths)
+        else {
+            return unsupported(LocalRecordFieldTypesUnsupportedReason::GenericParameters);
+        };
+        if !validated_type_params.is_empty() {
+            let expected_nominal_params = validated_type_params
+                .iter()
+                .map(|(def_id, parameter)| (*def_id, parameter.name))
+                .collect::<Vec<_>>();
+            let Some(validated_nominal) = local_nominals.get(&descriptor.owner.def_id.to_def_id())
+            else {
+                return unsupported(
+                    LocalRecordFieldTypesUnsupportedReason::UnvalidatedGenericDefinition,
+                );
+            };
+            if validated_nominal.type_params.as_ref() != expected_nominal_params.as_slice() {
+                return unsupported(
+                    LocalRecordFieldTypesUnsupportedReason::UnvalidatedGenericDefinition,
+                );
+            }
+        }
+        let type_parameter_ids = validated_type_params
+            .iter()
+            .map(|(def_id, _)| *def_id)
+            .collect::<HashSet<_>>();
+
         let has_implicit_region_parameter = fields
             .iter()
             .any(|field| local_record_field_type_has_explicit_borrow(field.ty, descriptor.owner));
@@ -19067,6 +19310,7 @@ impl RootDatabase {
                 descriptor.owner,
                 path_resolution.paths(),
                 local_nominals,
+                &type_parameter_ids,
             )
         });
 
@@ -19105,6 +19349,9 @@ impl RootDatabase {
                 has_implicit_region_parameter,
             )
             .with_field_local_nominals(local_nominals);
+            let Ok(context) = context.with_field_type_params(&validated_type_params) else {
+                return unsupported(LocalRecordFieldTypesUnsupportedReason::GenericParameters);
+            };
             let mut context = if literal_arrays_are_region_free {
                 context
                     .with_field_array_literal_pointer_width(collection.target_cfg.pointer_width())
@@ -19119,9 +19366,17 @@ impl RootDatabase {
             });
         }
 
+        let projected_fields: Arc<[LocalRecordFieldTypeProjection]> = projected_fields.into();
+        let provenance = LocalRecordFieldTypesValidation {
+            owner: descriptor.owner,
+            type_params: Arc::clone(&validated_type_params),
+            field_results: Arc::clone(&projected_fields),
+        };
         LocalRecordFieldTypesProjection::Supported {
             owner: descriptor.owner,
-            fields: projected_fields.into(),
+            type_params: validated_type_params,
+            fields: projected_fields,
+            provenance,
         }
     }
 
@@ -38592,6 +38847,16 @@ property "shared"() {}
             "type Recovered { malformed: Bool = }\n",
             "enum LocalEnum { Ready, Value(Bool) }\n",
             "enum Payload { Wrapped(Bool) }\n",
+            "type GenericPair<T, U> { first: T, nested: (U, T), callback: fn(T) -> U }\n",
+            "type GenericEffect<T> { callback: fn(T) effects {} }\n",
+            "type GenericBorrow<T> { value: borrow T }\n",
+            "type GenericAlias<T> { value: Alias }\n",
+            "type GenericStr<T> { value: Str }\n",
+            "type GenericUnknown<T> { value: Missing }\n",
+            "type Bounded<T: Copy> { value: T }\n",
+            "type ConstGeneric<const N: USize> { value: Bool }\n",
+            "type GenericWhere<T> where T: Copy { value: T }\n",
+            "type GenericRecovered<T> { malformed: T = }\n",
         );
         let child = concat!("pub type Packet { value: I32 }\n",);
         let (mut database, module_tree, snapshot, _) =
@@ -38695,6 +38960,7 @@ property "shared"() {}
         let LocalRecordFieldTypesProjection::Supported {
             owner: projected_owner,
             fields: projected_fields,
+            ..
         } = fields
         else {
             panic!("nongeneric unrecovered record fields can be projected");
@@ -39518,19 +39784,376 @@ property "shared"() {}
             Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Bool)
         ));
 
+        let generic_owner = owner_for("Generic");
         let generic = resolved
             .local_record_field_types_with_scopes(
                 &collection,
                 Some(&member_scopes),
                 None,
-                owner_for("Generic"),
+                generic_owner,
             )
-            .expect("exact collection guards generic record rejection")
-            .expect("generic record rejection is retained");
+            .expect("exact collection guards generic record fields")
+            .expect("generic record field templates are projected");
+        let generic_parameters = generic
+            .type_params()
+            .expect("the generic record retains its exact ordered binders");
+        assert_eq!(generic_parameters.len(), 1);
+        let generic_t = database.symbols.intern("T").expect("T interns");
+        assert_ne!(generic_parameters[0].0, generic_owner.def_id.to_def_id());
+        let generic_record_path = def_paths
+            .resolve_def_id(generic_owner.def_id.to_def_id())
+            .expect("generic record path resolves")
+            .expect("generic record path exists");
+        let generic_binder_path = def_paths
+            .resolve_def_id(generic_parameters[0].0)
+            .expect("generic binder path resolves")
+            .expect("generic binder path exists");
+        assert_eq!(generic_binder_path.package(), generic_record_path.package());
         assert_eq!(
-            generic.unsupported_reason(),
-            Some(LocalRecordFieldTypesUnsupportedReason::GenericParameters)
+            generic_binder_path.data().len(),
+            generic_record_path.data().len() + 1
         );
+        assert_eq!(
+            &generic_binder_path.data()[..generic_record_path.data().len()],
+            generic_record_path.data()
+        );
+        assert!(matches!(
+            generic_binder_path.data().last(),
+            Some(component)
+                if component.data == DefPathData::TypeParam(generic_t)
+                    && component.disambiguator == 0
+        ));
+        assert_eq!(generic_parameters[0].1.index, 0);
+        assert_eq!(generic_parameters[0].1.name, generic_t);
+        let generic_value = generic.fields().unwrap()[0].def_id();
+        assert!(matches!(
+            generic.type_of_field(generic_value),
+            Some(Ok(ty)) if matches!(
+                ty.kind(),
+                sai_ty::ty::TyKind::Param(parameter)
+                    if parameter == &generic_parameters[0].1
+            )
+        ));
+
+        let bool_ty = database.semantic_types.intern(sai_ty::ty::TyKind::Bool);
+        let generic_bool = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
+            generic_owner.def_id.to_def_id(),
+            Arc::from([bool_ty.clone()]),
+        ));
+        let instantiated_bool = generic
+            .instantiate_field_type(&database.semantic_types, &generic_bool, generic_value)
+            .expect("the exact one-argument record instance instantiates its field");
+        assert!(instantiated_bool.ptr_eq(&bool_ty));
+
+        let caller_u = database.symbols.intern("U").expect("U interns");
+        let caller_u_ty =
+            database
+                .semantic_types
+                .intern(sai_ty::ty::TyKind::Param(sai_ty::ty::ParamTy {
+                    index: 1,
+                    name: caller_u,
+                }));
+        let generic_caller_instance = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
+            generic_owner.def_id.to_def_id(),
+            Arc::from([caller_u_ty.clone()]),
+        ));
+        let caller_result = generic
+            .instantiate_field_type(
+                &database.semantic_types,
+                &generic_caller_instance,
+                generic_value,
+            )
+            .expect("caller-binder replacements remain valid");
+        assert!(
+            caller_result.ptr_eq(&caller_u_ty),
+            "the replacement ParamTy at caller index 1 is not recursively captured"
+        );
+        let forged_projection = match generic.clone() {
+            LocalRecordFieldTypesProjection::Supported {
+                type_params,
+                fields,
+                provenance,
+                ..
+            } => LocalRecordFieldTypesProjection::Supported {
+                owner: fields_owner,
+                type_params,
+                fields,
+                provenance,
+            },
+            LocalRecordFieldTypesProjection::Unsupported { .. } => {
+                panic!("the generic projection is supported")
+            }
+        };
+        assert_eq!(
+            forged_projection.instantiate_field_type(
+                &database.semantic_types,
+                &generic_bool,
+                generic_value
+            ),
+            Err(LocalRecordFieldTypeInstantiationError::InvalidProjectionProvenance),
+            "public enum pattern matching cannot transplant validated fields to another owner"
+        );
+        let forged_field_result_projection = match generic.clone() {
+            LocalRecordFieldTypesProjection::Supported {
+                owner,
+                type_params,
+                fields,
+                provenance,
+            } => {
+                let mut changed_fields = fields.to_vec();
+                changed_fields[0].ty = Ok(bool_ty.clone());
+                LocalRecordFieldTypesProjection::Supported {
+                    owner,
+                    type_params,
+                    fields: changed_fields.into(),
+                    provenance,
+                }
+            }
+            LocalRecordFieldTypesProjection::Unsupported { .. } => {
+                panic!("the generic projection is supported")
+            }
+        };
+        assert_eq!(
+            forged_field_result_projection.instantiate_field_type(
+                &database.semantic_types,
+                &generic_bool,
+                generic_value
+            ),
+            Err(LocalRecordFieldTypeInstantiationError::InvalidProjectionProvenance),
+            "opaque provenance authenticates complete field results, not just their identities"
+        );
+
+        assert_eq!(
+            generic.instantiate_field_type(&database.semantic_types, &bool_ty, generic_value),
+            Err(LocalRecordFieldTypeInstantiationError::NotAdt)
+        );
+        let wrong_record = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
+            fields_owner.def_id.to_def_id(),
+            Arc::from([]),
+        ));
+        assert!(matches!(
+            generic.instantiate_field_type(&database.semantic_types, &wrong_record, generic_value),
+            Err(LocalRecordFieldTypeInstantiationError::WrongRecord { .. })
+        ));
+        let missing_argument = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
+            generic_owner.def_id.to_def_id(),
+            Arc::from([]),
+        ));
+        assert_eq!(
+            generic.instantiate_field_type(
+                &database.semantic_types,
+                &missing_argument,
+                generic_value
+            ),
+            Err(
+                LocalRecordFieldTypeInstantiationError::WrongNumberOfTypeArguments {
+                    expected: 1,
+                    found: 0,
+                }
+            )
+        );
+        let extra_arguments = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
+            generic_owner.def_id.to_def_id(),
+            Arc::from([bool_ty.clone(), bool_ty.clone()]),
+        ));
+        assert_eq!(
+            generic.instantiate_field_type(
+                &database.semantic_types,
+                &extra_arguments,
+                generic_value
+            ),
+            Err(
+                LocalRecordFieldTypeInstantiationError::WrongNumberOfTypeArguments {
+                    expected: 1,
+                    found: 2,
+                }
+            )
+        );
+        assert_eq!(
+            generic.instantiate_field_type(
+                &database.semantic_types,
+                &generic_bool,
+                integer.def_id()
+            ),
+            Err(LocalRecordFieldTypeInstantiationError::FieldNotFound(
+                integer.def_id()
+            ))
+        );
+        assert_eq!(
+            fields.instantiate_field_type(
+                &database.semantic_types,
+                &generic_bool,
+                integer.def_id()
+            ),
+            Err(LocalRecordFieldTypeInstantiationError::NotGenericRecord)
+        );
+
+        let pair_owner = owner_for("GenericPair");
+        let pair = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                pair_owner,
+            )
+            .expect("exact collection guards the generic pair")
+            .expect("generic pair templates are projected");
+        let pair_parameters = pair.type_params().unwrap();
+        assert_eq!(pair_parameters.len(), 2);
+        let pair_t = database.symbols.intern("T").expect("T interns");
+        let pair_u = database.symbols.intern("U").expect("U interns");
+        assert_ne!(pair_parameters[0].0, pair_parameters[1].0);
+        assert_ne!(
+            pair_parameters[0].0, generic_parameters[0].0,
+            "same-spelled binders on different records retain distinct DefIds"
+        );
+        assert_eq!(
+            pair_parameters[0].1,
+            sai_ty::ty::ParamTy {
+                index: 0,
+                name: pair_t
+            }
+        );
+        assert_eq!(
+            pair_parameters[1].1,
+            sai_ty::ty::ParamTy {
+                index: 1,
+                name: pair_u
+            }
+        );
+        let pair_fields = pair.fields().unwrap();
+        let pair_field = |name: &str| {
+            pair_fields
+                .iter()
+                .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some(name))
+                .expect("the generic pair field is retained")
+        };
+        let nested_field = pair_field("nested");
+        let nested_template = pair
+            .type_of_field(nested_field.def_id())
+            .unwrap()
+            .expect("nested tuple template lowers");
+        let sai_ty::ty::TyKind::Tuple(nested_template_args) = nested_template.kind() else {
+            panic!("the nested generic field keeps its tuple structure");
+        };
+        assert!(matches!(
+            nested_template_args[0].kind(),
+            sai_ty::ty::TyKind::Param(parameter) if parameter == &pair_parameters[1].1
+        ));
+        assert!(matches!(
+            nested_template_args[1].kind(),
+            sai_ty::ty::TyKind::Param(parameter) if parameter == &pair_parameters[0].1
+        ));
+        let i32_ty = database
+            .semantic_types
+            .intern(sai_ty::ty::TyKind::Int(sai_ty::ty::IntTy::I32));
+        let pair_i32_bool = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
+            pair_owner.def_id.to_def_id(),
+            Arc::from([i32_ty.clone(), bool_ty.clone()]),
+        ));
+        let nested_instantiation = pair
+            .instantiate_field_type(
+                &database.semantic_types,
+                &pair_i32_bool,
+                nested_field.def_id(),
+            )
+            .expect("both source-ordered parameters instantiate");
+        assert!(matches!(
+            nested_instantiation.kind(),
+            sai_ty::ty::TyKind::Tuple(arguments)
+                if arguments[0].ptr_eq(&bool_ty) && arguments[1].ptr_eq(&i32_ty)
+        ));
+        let callback = pair_field("callback");
+        let instantiated_callback = pair
+            .instantiate_field_type(&database.semantic_types, &pair_i32_bool, callback.def_id())
+            .expect("function-pointer child types instantiate");
+        let sai_ty::ty::TyKind::FnPtr(callback_signature) = instantiated_callback.kind() else {
+            panic!("the callback remains a function pointer");
+        };
+        assert!(callback_signature.inputs()[0].ptr_eq(&i32_ty));
+        assert!(callback_signature.output().ptr_eq(&bool_ty));
+
+        let generic_effect_owner = owner_for("GenericEffect");
+        let generic_effect = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                generic_effect_owner,
+            )
+            .expect("exact collection guards the effectful generic record")
+            .expect("generic function-pointer field keeps a local failure");
+        let effect_field = generic_effect.fields().unwrap()[0].def_id();
+        let effect_instance = database.semantic_types.intern(sai_ty::ty::TyKind::Adt(
+            generic_effect_owner.def_id.to_def_id(),
+            Arc::from([bool_ty.clone()]),
+        ));
+        assert!(matches!(
+            generic_effect.instantiate_field_type(
+                &database.semantic_types,
+                &effect_instance,
+                effect_field
+            ),
+            Err(LocalRecordFieldTypeInstantiationError::UnsupportedField(
+                sai_ty::lower_ty::UnsupportedTy::FunctionPointerEffects
+            ))
+        ));
+
+        for (name, expected_reason) in [
+            (
+                "GenericBorrow",
+                LocalRecordFieldTypesUnsupportedReason::UnvalidatedGenericDefinition,
+            ),
+            (
+                "GenericAlias",
+                LocalRecordFieldTypesUnsupportedReason::UnvalidatedGenericDefinition,
+            ),
+            (
+                "GenericStr",
+                LocalRecordFieldTypesUnsupportedReason::UnvalidatedGenericDefinition,
+            ),
+            (
+                "GenericUnknown",
+                LocalRecordFieldTypesUnsupportedReason::UnvalidatedGenericDefinition,
+            ),
+            (
+                "Bounded",
+                LocalRecordFieldTypesUnsupportedReason::GenericParameters,
+            ),
+            (
+                "ConstGeneric",
+                LocalRecordFieldTypesUnsupportedReason::GenericParameters,
+            ),
+            (
+                "GenericWhere",
+                LocalRecordFieldTypesUnsupportedReason::WherePredicates,
+            ),
+            (
+                "GenericRecovered",
+                LocalRecordFieldTypesUnsupportedReason::RecoveredSyntax,
+            ),
+        ] {
+            let projection = resolved
+                .local_record_field_types_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    None,
+                    owner_for(name),
+                )
+                .expect("exact collection guards generic rejection")
+                .expect("generic owner rejection is retained");
+            assert_eq!(
+                projection.unsupported_reason(),
+                Some(expected_reason),
+                "{name} must retain the documented generic-owner rejection boundary"
+            );
+            assert!(matches!(
+                projection.instantiate_field_type(&database.semantic_types, &generic_bool, generic_value),
+                Err(LocalRecordFieldTypeInstantiationError::UnsupportedProjection(reason))
+                    if reason == expected_reason
+            ));
+        }
+
         let where_only = resolved
             .local_record_field_types_with_scopes(
                 &collection,

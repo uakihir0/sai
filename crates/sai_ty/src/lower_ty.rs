@@ -285,6 +285,36 @@ impl<'a> LowerTyContext<'a> {
         self
     }
 
+    /// Enable the validated type parameters of one local record while
+    /// lowering that record's field templates.
+    ///
+    /// The caller must supply the exact source-ordered binders validated for
+    /// this field owner's current collection and snapshot. This builder is
+    /// inert outside field contexts; function signatures and bodies keep
+    /// their own binder rules.
+    pub fn with_field_type_params(
+        mut self,
+        type_params: &[(DefId, ParamTy)],
+    ) -> Result<Self, UnsupportedTy> {
+        if !matches!(self.region_mode, RegionMode::Field { .. }) {
+            return Ok(self);
+        }
+
+        let mut generic_params = HashMap::with_capacity(type_params.len());
+        let mut names = HashSet::with_capacity(type_params.len());
+        for (index, (def_id, parameter)) in type_params.iter().enumerate() {
+            if u32::try_from(index).ok() != Some(parameter.index)
+                || parameter.name.is_error()
+                || !names.insert(parameter.name)
+                || generic_params.insert(*def_id, *parameter).is_some()
+            {
+                return Err(UnsupportedTy::GenericParameter);
+            }
+        }
+        self.generic_params = generic_params;
+        Ok(self)
+    }
+
     /// Create a body context. Every borrow region is erased.
     pub fn for_body(
         interner: &'a TyInterner,
@@ -2756,6 +2786,73 @@ mod tests {
             lower_ty(&mut body_context, nominal),
             Err(UnsupportedTy::NominalType),
             "the field-only builder cannot widen body lowering"
+        );
+    }
+
+    #[test]
+    fn validated_type_parameters_are_enabled_only_for_field_contexts() {
+        let (owner, symbols, parameter_ids, _) = owner_with_generic_params(&["T"]);
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let parameter_def = parameter_ids[0].to_def_id();
+        let (parameter_ty, paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            590,
+            "T",
+            None,
+            Res::Def(DefKind::TyParam, parameter_def),
+        );
+        let parameter_name = symbols.intern("T").expect("parameter name interns");
+        let type_params = [(
+            parameter_def,
+            ParamTy {
+                index: 0,
+                name: parameter_name,
+            },
+        )];
+
+        let mut field_context = LowerTyContext::for_field(&interner, owner, &paths, false)
+            .with_field_type_params(&type_params)
+            .expect("validated field binders form a source-ordered map");
+        assert!(matches!(
+            lower_ty(&mut field_context, parameter_ty),
+            Ok(ty) if matches!(ty.kind(), TyKind::Param(param)
+                if *param == type_params[0].1)
+        ));
+
+        let mut signature_context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_field_type_params(&type_params)
+            .expect("field-only binder setup is inert for signatures");
+        assert_eq!(
+            lower_ty(&mut signature_context, parameter_ty),
+            Err(UnsupportedTy::GenericParameter),
+            "field parameters cannot widen signature lowering"
+        );
+
+        let mut body_context = LowerTyContext::for_body(&interner, owner, &paths)
+            .with_field_type_params(&type_params)
+            .expect("field-only binder setup is inert for bodies");
+        assert_eq!(
+            lower_ty(&mut body_context, parameter_ty),
+            Err(UnsupportedTy::GenericParameter),
+            "field parameters cannot widen body lowering"
+        );
+
+        let invalid_params = [(
+            parameter_def,
+            ParamTy {
+                index: 1,
+                name: parameter_name,
+            },
+        )];
+        assert_eq!(
+            LowerTyContext::for_field(&interner, owner, &paths, false)
+                .with_field_type_params(&invalid_params)
+                .err(),
+            Some(UnsupportedTy::GenericParameter),
+            "a mismatched source-order index is rejected before any binder is installed"
         );
     }
 
