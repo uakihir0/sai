@@ -788,7 +788,10 @@ identity. IR-929 also checks explicitly annotated primitive `let` and `var`
 locals declared directly in the same function body's outer block. IR-930
 extends those local paths to unannotated direct `let` and `var` initializers
 whose fixed type is `Bool`, `Byte`, `Char`, or unit. A local receiver such as
-`e.V` remains a value member path.
+`e.V` remains a value member path. IR-931 also supports simple one-level
+tuple patterns with same-arity tuple initializers whose elements are all
+direct `Bool`, `Byte`, `Char`, or unit literals; the selected element is
+matched to the argument by its exact `BindingId`.
 The resolver uses the current package collection, snapshot, active source
 member closure, WIT-view closure, and test-only import filtering. Unresolved,
 external, dependency/WIT, and type-alias heads remain outside this local
@@ -796,7 +799,7 @@ subset. This path result records path identity only; it does not record
 `type_dependent_defs` or synthesize expression types. That sentence describes
 the original IR-921 recognition slice: IR-922/923 later add the value-type and
 type-dependent-definition projections to the per-owner result. IR-924 through
-IR-930 add limited constructor-call diagnostics without claiming general
+IR-931 add limited constructor-call diagnostics without claiming general
 expression types.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
@@ -2027,6 +2030,25 @@ values keep their written positional parameter, and extra arguments receive
 only the existing arity diagnostic. This does not add general local inference,
 coercions, expression type results, `call_kinds`, or source-acceptance claims;
 `sai check` remains behind its incomplete-stage gate.
+
+**Implemented subset (IR-931):** At those same call sites, a single-segment
+plain path may resolve to a binding in a simple, one-level tuple pattern
+declared directly in the function body's outer block. The `let` must have no
+type annotation or `else` block; its pattern and initializer must both be
+tuples of the same arity, and every initializer element must be a direct
+`Bool`, `Byte`, `Char`, or unit literal. Pattern components may be simple
+`let` bindings, `var` bindings, or `_`. The exact resolved `BindingId` selects
+the corresponding initializer element, and the binding's name, pattern kind,
+and mode must agree. A selected literal with a different primitive or unit
+constructor input emits `TYPE_MISMATCH` on the exact argument path span.
+
+Requiring every tuple value, including values matched by `_`, to be a fixed
+literal is a conservative boundary: an unsupported sibling initializer does
+not indirectly make another binding eligible. Tuple arity mismatch, annotated
+tuple bindings, integer and floating-point leaves, computed leaves (including
+those matched by `_`), nested or complex patterns, nested-scope declarations,
+and extra call arguments remain unexamined. This does not add tuple-shape
+diagnostics, inference, coercions, or general pattern typing.
 
 ### 3.6.4 `adt_def`
 
