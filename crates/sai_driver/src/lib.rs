@@ -13064,50 +13064,70 @@ fn mixed_source_diagnostic_snapshot(
 
 fn nominal_field_type_is_region_free(
     ty: &Ty<'_>,
-    type_parameters: &HashSet<Symbol>,
-    symbols: &Interner,
+    owner: OwnerId,
+    paths: &HashMap<HirId, PathRes>,
+    type_parameters: &HashSet<DefId>,
 ) -> bool {
+    if ty.hir_id.owner != owner {
+        return false;
+    }
     match ty.kind {
         TyKind::Borrow(..) | TyKind::Infer | TyKind::Err => false,
-        TyKind::Tuple(elements) => elements
-            .iter()
-            .all(|element| nominal_field_type_is_region_free(element, type_parameters, symbols)),
+        TyKind::Tuple(elements) => elements.iter().all(|element| {
+            nominal_field_type_is_region_free(element, owner, paths, type_parameters)
+        }),
         // The implicit region-parameter rule explicitly excludes function
         // pointer types.
         TyKind::FnPtr { .. } => true,
         TyKind::Path(path) => {
-            if path.root != PathRoot::Plain || path.segments.len() != 1 {
+            if path.hir_id.owner != owner
+                || path.root != PathRoot::Plain
+                || path.segments.len() != 1
+                || path.segments[0].hir_id.owner != owner
+                || path.segments[0].args.is_some()
+            {
                 return false;
             }
-            let segment = path.segments[0];
-            if segment.args.is_some() {
+            let Ok(segment_count) = u32::try_from(path.segments.len()) else {
+                return false;
+            };
+            let Some(resolution) = paths.get(&path.hir_id) else {
+                return false;
+            };
+            if resolution.resolved_segments != segment_count
+                || resolution.segment_count != segment_count
+            {
                 return false;
             }
-            if type_parameters.contains(&segment.name.sym) {
-                return true;
+            match resolution.base {
+                Res::PrimTy(
+                    sai_resolve::prelude::PrimTy::I8
+                    | sai_resolve::prelude::PrimTy::I16
+                    | sai_resolve::prelude::PrimTy::I32
+                    | sai_resolve::prelude::PrimTy::I64
+                    | sai_resolve::prelude::PrimTy::ISize
+                    | sai_resolve::prelude::PrimTy::U8
+                    | sai_resolve::prelude::PrimTy::U16
+                    | sai_resolve::prelude::PrimTy::U32
+                    | sai_resolve::prelude::PrimTy::U64
+                    | sai_resolve::prelude::PrimTy::USize
+                    | sai_resolve::prelude::PrimTy::F32
+                    | sai_resolve::prelude::PrimTy::F64
+                    | sai_resolve::prelude::PrimTy::Bool
+                    | sai_resolve::prelude::PrimTy::Byte
+                    | sai_resolve::prelude::PrimTy::Char
+                    | sai_resolve::prelude::PrimTy::Never,
+                ) => true,
+                Res::Def(DefKind::TyParam, def_id) => type_parameters.contains(&def_id),
+                // Do not admit nested nominal references into the allowlist
+                // builder. A later field-use context may use only definitions
+                // already independently validated in this map.
+                Res::PrimTy(sai_resolve::prelude::PrimTy::Array)
+                | Res::Def(_, _)
+                | Res::Local(_)
+                | Res::Err
+                | Res::TestOnly(_) => false,
             }
-            symbols.resolve(segment.name.sym).is_ok_and(|name| {
-                matches!(
-                    name.as_ref(),
-                    "I8" | "I16"
-                        | "I32"
-                        | "I64"
-                        | "ISize"
-                        | "U8"
-                        | "U16"
-                        | "U32"
-                        | "U64"
-                        | "USize"
-                        | "F32"
-                        | "F64"
-                        | "Bool"
-                        | "Byte"
-                        | "Char"
-                        | "Never"
-                        | "Int"
-                        | "UInt"
-                )
-            })
         }
     }
 }
@@ -13116,15 +13136,18 @@ fn nominal_field_type_is_region_free(
 /// before enabling the field-only literal-array lowerer.
 ///
 /// This is deliberately stricter than ordinary region inference: only
-/// resolved scalar primitives, tuples, function pointers, and exactly
-/// resolved built-in arrays are understood. Function pointers are excluded
-/// from implicit-region inference; their own lowering still rejects
-/// unsupported borrows and effects. Aliases, nominal types, borrows, and
-/// incomplete or unknown paths fail closed.
+/// resolved scalar primitives, tuples, function pointers, exactly resolved
+/// built-in arrays, and nominal types in the validated local-definition
+/// allowlist are understood. Nominal type arguments are recursively proven
+/// region-free. Function pointers are excluded from implicit-region
+/// inference; their own lowering still rejects unsupported borrows and
+/// effects. Aliases, unvalidated nominals, borrows, and incomplete or
+/// unknown paths fail closed.
 fn local_record_field_type_is_region_free_for_array_projection(
     ty: &Ty<'_>,
     owner: OwnerId,
     paths: &HashMap<HirId, PathRes>,
+    local_nominals: &HashMap<DefId, sai_ty::lower_ty::LocalNominalDef>,
 ) -> bool {
     if ty.hir_id.owner != owner {
         return false;
@@ -13132,7 +13155,12 @@ fn local_record_field_type_is_region_free_for_array_projection(
     match ty.kind {
         TyKind::Borrow(..) | TyKind::Infer | TyKind::Err => false,
         TyKind::Tuple(elements) => elements.iter().all(|element| {
-            local_record_field_type_is_region_free_for_array_projection(element, owner, paths)
+            local_record_field_type_is_region_free_for_array_projection(
+                element,
+                owner,
+                paths,
+                local_nominals,
+            )
         }),
         // The declaration implicit-region rule explicitly excludes function
         // pointers. Their children still go through ordinary field lowering,
@@ -13141,11 +13169,14 @@ fn local_record_field_type_is_region_free_for_array_projection(
         TyKind::Path(path) => {
             if path.hir_id.owner != owner
                 || path.root != PathRoot::Plain
-                || path.segments.len() != 1
+                || path.segments.is_empty()
                 || path
                     .segments
                     .iter()
                     .any(|segment| segment.hir_id.owner != owner)
+                || path.segments[..path.segments.len() - 1]
+                    .iter()
+                    .any(|segment| segment.args.is_some())
             {
                 return false;
             }
@@ -13161,9 +13192,12 @@ fn local_record_field_type_is_region_free_for_array_projection(
                 return false;
             }
 
-            let segment = path.segments[0];
+            let segment = path.segments[path.segments.len() - 1];
             match resolution.base {
                 Res::PrimTy(sai_resolve::prelude::PrimTy::Array) => {
+                    if path.segments.len() != 1 {
+                        return false;
+                    }
                     let Some(arguments) = segment.args else {
                         // The exact built-in constructor has no type children
                         // that could carry a region. Normal lowering still
@@ -13185,7 +13219,10 @@ fn local_record_field_type_is_region_free_for_array_projection(
                             }
                             GenericArg::Type(ty) | GenericArg::Binding { ty, .. } => {
                                 local_record_field_type_is_region_free_for_array_projection(
-                                    ty, owner, paths,
+                                    ty,
+                                    owner,
+                                    paths,
+                                    local_nominals,
                                 )
                             }
                             // Const syntax cannot carry a borrow or region.
@@ -13209,22 +13246,50 @@ fn local_record_field_type_is_region_free_for_array_projection(
                     | sai_resolve::prelude::PrimTy::Byte
                     | sai_resolve::prelude::PrimTy::Char
                     | sai_resolve::prelude::PrimTy::Never,
-                ) => segment.args.is_none_or(|arguments| {
-                    // Primitive paths reject all generic syntax in ordinary
-                    // lowering. Still inspect known argument children here so
-                    // a local error cannot gate valid sibling arrays.
-                    arguments.args.iter().all(|argument| match argument {
-                        GenericArg::Type(ty) | GenericArg::Binding { ty, .. } => {
-                            local_record_field_type_is_region_free_for_array_projection(
-                                ty, owner, paths,
-                            )
-                        }
-                        GenericArg::Const(_) => true,
+                ) => {
+                    path.segments.len() == 1
+                        && segment.args.is_none_or(|arguments| {
+                            // Primitive paths reject all generic syntax in
+                            // ordinary lowering. Still inspect known argument
+                            // children here so a local error cannot gate valid
+                            // sibling arrays.
+                            arguments.args.iter().all(|argument| match argument {
+                                GenericArg::Type(ty) | GenericArg::Binding { ty, .. } => {
+                                    local_record_field_type_is_region_free_for_array_projection(
+                                        ty,
+                                        owner,
+                                        paths,
+                                        local_nominals,
+                                    )
+                                }
+                                GenericArg::Const(_) => true,
+                            })
+                        })
+                }
+                Res::Def(DefKind::Struct | DefKind::Enum, def_id)
+                    if local_nominals.contains_key(&def_id) =>
+                {
+                    segment.args.is_none_or(|arguments| {
+                        arguments.args.iter().all(|argument| match argument {
+                            GenericArg::Type(ty) | GenericArg::Binding { ty, .. } => {
+                                local_record_field_type_is_region_free_for_array_projection(
+                                    ty,
+                                    owner,
+                                    paths,
+                                    local_nominals,
+                                )
+                            }
+                            // Const arguments cannot contain regions. The
+                            // field lowerer still rejects them for these
+                            // type-only nominal definitions.
+                            GenericArg::Const(_) => true,
+                        })
                     })
-                }),
+                }
                 // Do not infer safety from spelling: aliases and nominal
-                // types may hide a region-bearing field. Str and slice-like
-                // types are not primitive variants and fail closed here.
+                // definitions absent from the validated allowlist may hide a
+                // region-bearing field. Str and slice-like types are not
+                // primitive variants and fail closed here.
                 _ => false,
             }
         }
@@ -13262,11 +13327,12 @@ fn local_record_array_length_is_exact_const_path(
 
 fn nominal_fields_are_region_free(
     item_kind: ItemKind<'_>,
-    type_parameters: &HashSet<Symbol>,
-    symbols: &Interner,
+    owner: OwnerId,
+    paths: &HashMap<HirId, PathRes>,
+    type_parameters: &HashSet<DefId>,
 ) -> bool {
     let type_is_region_free =
-        |ty: &Ty<'_>| nominal_field_type_is_region_free(ty, type_parameters, symbols);
+        |ty: &Ty<'_>| nominal_field_type_is_region_free(ty, owner, paths, type_parameters);
     match item_kind {
         ItemKind::Struct { fields, .. } => fields.iter().all(|field| type_is_region_free(field.ty)),
         ItemKind::Enum { variants, .. } => variants.iter().all(|variant| match variant.shape {
@@ -13277,6 +13343,46 @@ fn nominal_fields_are_region_free(
             }
         }),
         _ => false,
+    }
+}
+
+/// Detect whether a direct record declaration needs its one implicit region
+/// parameter by walking only borrow-capable HIR type positions.
+///
+/// Function-pointer types are a boundary in the declaration-level rule. Path
+/// generic type arguments and associated-binding types are traversed, while
+/// const arguments carry no type edge. Any HIR node or path segment from a
+/// different owner fails closed.
+fn local_record_field_type_has_explicit_borrow(ty: &Ty<'_>, owner: OwnerId) -> bool {
+    if ty.hir_id.owner != owner {
+        return false;
+    }
+    match ty.kind {
+        TyKind::Borrow(_, inner) => inner.hir_id.owner == owner,
+        TyKind::Tuple(elements) => elements
+            .iter()
+            .any(|element| local_record_field_type_has_explicit_borrow(element, owner)),
+        TyKind::FnPtr { .. } | TyKind::Infer | TyKind::Err => false,
+        TyKind::Path(path) => {
+            if path.hir_id.owner != owner
+                || path
+                    .segments
+                    .iter()
+                    .any(|segment| segment.hir_id.owner != owner)
+            {
+                return false;
+            }
+            path.segments.iter().any(|segment| {
+                segment.args.is_some_and(|arguments| {
+                    arguments.args.iter().any(|argument| match argument {
+                        GenericArg::Type(ty) | GenericArg::Binding { ty, .. } => {
+                            local_record_field_type_has_explicit_borrow(ty, owner)
+                        }
+                        GenericArg::Const(_) => false,
+                    })
+                })
+            })
+        }
     }
 }
 
@@ -14842,6 +14948,10 @@ impl RootDatabase {
         collection: &Phase1PackageScopesCollection,
         snapshot: &WorkspaceSnapshot,
     ) -> HashMap<DefId, sai_ty::lower_ty::LocalNominalDef> {
+        let Ok(primitive_prelude) = self.primitive_prelude.clone() else {
+            return HashMap::new();
+        };
+        let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
         let mut file_groups = Vec::<(FileId, Vec<TopLevelOwnerDescriptor>)>::new();
         let mut group_indices = HashMap::<FileId, usize>::new();
         for descriptor in collection
@@ -14997,12 +15107,35 @@ impl RootDatabase {
                 if !valid_parameters {
                     continue;
                 }
-                let type_parameter_names = type_params
+                let Ok(module_scope) =
+                    module_scope_for_file(collection, &collection.module_tree, file)
+                else {
+                    continue;
+                };
+                let path_candidates = owner_test_only_path_candidates(&hir_owner);
+                let generic_resolutions = owner_type_generic_resolutions(&hir_owner);
+                let rejected_test_only_paths = HashSet::new();
+                let path_resolution = resolve_type_owner_module_paths(
+                    descriptor.owner,
+                    &path_candidates,
+                    &generic_resolutions,
+                    &primitive_prelude,
+                    &rejected_test_only_paths,
+                    module_scope,
+                    None,
+                    collection.module_tree.package,
+                    Some(&local_source_graph_packages),
+                );
+                let type_parameter_ids = type_params
                     .iter()
-                    .map(|(_, name)| *name)
+                    .map(|(def_id, _)| *def_id)
                     .collect::<HashSet<_>>();
-                if !nominal_fields_are_region_free(item.kind, &type_parameter_names, &self.symbols)
-                {
+                if !nominal_fields_are_region_free(
+                    item.kind,
+                    descriptor.owner,
+                    path_resolution.paths(),
+                    &type_parameter_ids,
+                ) {
                     continue;
                 }
                 definitions.insert(
@@ -18583,6 +18716,7 @@ impl RootDatabase {
             .primitive_prelude
             .clone()
             .map_err(OwnerControlFlowResolutionError::PrimitivePrelude)?;
+        let local_nominal_definitions = self.local_nominal_definitions(collection, snapshot);
         let mut owners = Vec::with_capacity(descriptors.len());
 
         for descriptor in descriptors {
@@ -18801,6 +18935,7 @@ impl RootDatabase {
                 let local_record_field_types = if descriptor.kind == TopLevelOwnerKind::Struct {
                     Some(self.lower_local_record_field_types(
                         collection,
+                        &local_nominal_definitions,
                         descriptor,
                         &expected_path,
                         &inputs,
@@ -18872,6 +19007,7 @@ impl RootDatabase {
     fn lower_local_record_field_types(
         &self,
         collection: &Phase1PackageScopesCollection,
+        local_nominals: &HashMap<DefId, sai_ty::lower_ty::LocalNominalDef>,
         descriptor: TopLevelOwnerDescriptor,
         expected_path: &DefPath,
         inputs: &CurrentOwnerInputs,
@@ -18943,16 +19079,18 @@ impl RootDatabase {
             return unsupported(LocalRecordFieldTypesUnsupportedReason::InvalidOwnerIdentity);
         }
 
-        // The record-level implicit-region classifier is intentionally
-        // conservative for this adapter: an unsupported or unknown shape is
-        // treated as region-bearing. Keep field lowering itself in the
-        // no-region mode so borrow fields remain unsupported; this decision
-        // only gates literal arrays for the declaration.
-        let has_implicit_region_parameter = fields.iter().any(|field| {
-            !local_record_field_type_is_region_free_for_array_projection(
+        let has_implicit_region_parameter = fields
+            .iter()
+            .any(|field| local_record_field_type_has_explicit_borrow(field.ty, descriptor.owner));
+        // Array lowering has a separate conservative declaration-wide gate.
+        // Unknown or unsupported shapes close this gate even when the HIR
+        // borrow walk found no explicit borrow.
+        let literal_arrays_are_region_free = fields.iter().all(|field| {
+            local_record_field_type_is_region_free_for_array_projection(
                 field.ty,
                 descriptor.owner,
                 path_resolution.paths(),
+                local_nominals,
             )
         });
 
@@ -18988,13 +19126,14 @@ impl RootDatabase {
                 &self.semantic_types,
                 descriptor.owner,
                 path_resolution.paths(),
-                false,
-            );
-            let mut context = if has_implicit_region_parameter {
-                context
-            } else {
+                has_implicit_region_parameter,
+            )
+            .with_field_local_nominals(local_nominals);
+            let mut context = if literal_arrays_are_region_free {
                 context
                     .with_field_array_literal_pointer_width(collection.target_cfg.pointer_width())
+            } else {
+                context
             };
             let ty = sai_ty::lower_ty::lower_ty(&mut context, field.ty);
             projected_fields.push(LocalRecordFieldTypeProjection {
@@ -25873,6 +26012,7 @@ mod tests {
 
     use super::*;
     use crate::package_graph::{PackageGraphEdge, PackageGraphNode};
+    use sai_intern::Idx;
     use sai_package::local_source::LocalPackageDirectory;
     use sai_package::mixed_source::resolve_mixed_source_packages;
     use sai_package::mvs::{MvsContract, MvsEdge, MvsPackageVersion, select};
@@ -38070,8 +38210,211 @@ property "shared"() {}
     }
 
     #[test]
+    fn local_record_borrow_walker_checks_bindings_and_exact_hir_owners() {
+        fn hir_id(owner: OwnerId, local_id: u32) -> HirId {
+            HirId {
+                owner,
+                local_id: sai_hir::ItemLocalId::from_raw(local_id),
+            }
+        }
+
+        fn borrow_ty<'hir>(
+            arena: &'hir HirArena<'hir>,
+            owner: OwnerId,
+            span: sai_hir::Span,
+            local_id: u32,
+        ) -> &'hir Ty<'hir> {
+            let inner = arena.alloc_ty(Ty {
+                hir_id: hir_id(owner, local_id + 1),
+                kind: TyKind::Err,
+                span,
+            });
+            arena.alloc_ty(Ty {
+                hir_id: hir_id(owner, local_id),
+                kind: TyKind::Borrow(sai_hir::Mutability::Not, inner),
+                span,
+            })
+        }
+
+        fn path_with_argument<'hir>(
+            arena: &'hir HirArena<'hir>,
+            ty_owner: OwnerId,
+            path_owner: OwnerId,
+            segment_owner: OwnerId,
+            span: sai_hir::Span,
+            local_id: u32,
+            argument: GenericArg<'hir>,
+        ) -> &'hir Ty<'hir> {
+            let arguments = arena.alloc_generic_args(GenericArgs {
+                args: arena.alloc_generic_args_list(&[argument]),
+                span,
+            });
+            let segments = arena.alloc_path_segments(&[PathSegment {
+                hir_id: hir_id(segment_owner, local_id + 1),
+                name: Name {
+                    sym: Symbol::ERROR,
+                    span,
+                },
+                args: Some(arguments),
+            }]);
+            let path = arena.alloc_path(HirPath {
+                hir_id: hir_id(path_owner, local_id + 2),
+                root: PathRoot::Plain,
+                segments,
+                span,
+            });
+            arena.alloc_ty(Ty {
+                hir_id: hir_id(ty_owner, local_id + 3),
+                kind: TyKind::Path(*path),
+                span,
+            })
+        }
+
+        let root = concat!(
+            "type Record { value: Bool }\n",
+            "type Other { value: Bool }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("the test package has a current collection");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("the local DefPath interner exists"),
+        );
+        let owner_for = |name: &str| {
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::Struct
+                        && def_paths
+                            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                path.data().last().is_some_and(|component| {
+                                    matches!(
+                                        component.data,
+                                        DefPathData::TypeNs(symbol)
+                                            if database.symbols.resolve(symbol).ok().as_deref()
+                                                == Some(name)
+                                    )
+                                })
+                            })
+                })
+                .unwrap_or_else(|| panic!("local record {name:?} exists"))
+                .owner
+        };
+        let record_owner = owner_for("Record");
+        let other_owner = owner_for("Other");
+        let span = sai_hir::Span {
+            file: module_tree.modules[0].file,
+            range: sai_vfs::TextRange::new(sai_vfs::TextSize::new(0), sai_vfs::TextSize::new(1))
+                .expect("the test span is ordered"),
+            ctxt: sai_hir::SpanCtxt::Root,
+        };
+        let arena = HirArena::new();
+        let borrowed = borrow_ty(&arena, record_owner, span, 1);
+        let binding_name = Name {
+            sym: database
+                .symbols
+                .intern("Item")
+                .expect("the binding name interns"),
+            span,
+        };
+        let binding_ty = path_with_argument(
+            &arena,
+            record_owner,
+            record_owner,
+            record_owner,
+            span,
+            10,
+            GenericArg::Binding {
+                name: binding_name,
+                ty: borrowed,
+            },
+        );
+        assert!(
+            local_record_field_type_has_explicit_borrow(binding_ty, record_owner),
+            "the declaration walker follows associated-binding type children"
+        );
+
+        let const_ty = path_with_argument(
+            &arena,
+            record_owner,
+            record_owner,
+            record_owner,
+            span,
+            20,
+            GenericArg::Const(sai_hir::types::ConstArg::Bool(true)),
+        );
+        assert!(
+            !local_record_field_type_has_explicit_borrow(const_ty, record_owner),
+            "const arguments do not contribute borrow types"
+        );
+
+        let function_pointer = arena.alloc_ty(Ty {
+            hir_id: hir_id(record_owner, 30),
+            kind: TyKind::FnPtr {
+                safety: sai_hir::Safety::Safe,
+                params: arena.alloc_tys(&[*borrowed]),
+                ret: None,
+                effects: None,
+            },
+            span,
+        });
+        assert!(
+            !local_record_field_type_has_explicit_borrow(function_pointer, record_owner),
+            "function-pointer children stop the record-level borrow walk"
+        );
+
+        let foreign_borrow = borrow_ty(&arena, other_owner, span, 40);
+        let foreign_child_ty = path_with_argument(
+            &arena,
+            record_owner,
+            record_owner,
+            record_owner,
+            span,
+            50,
+            GenericArg::Type(foreign_borrow),
+        );
+        assert!(
+            !local_record_field_type_has_explicit_borrow(foreign_child_ty, record_owner),
+            "a type child from another owner fails closed"
+        );
+
+        let foreign_segment_ty = path_with_argument(
+            &arena,
+            record_owner,
+            record_owner,
+            other_owner,
+            span,
+            60,
+            GenericArg::Binding {
+                name: binding_name,
+                ty: borrowed,
+            },
+        );
+        assert!(
+            !local_record_field_type_has_explicit_borrow(foreign_segment_ty, record_owner),
+            "a path segment from another owner fails closed"
+        );
+    }
+
+    #[test]
     fn local_record_field_type_projection_is_exact_and_isolated() {
         let root = concat!(
+            "use acme:phase1/child as child_alias\n",
             "type Alias = Bool\n",
             "type Fields {\n",
             "  integer: I32,\n",
@@ -38106,17 +38449,32 @@ property "shared"() {}
             "  after_unsupported: Char,\n",
             "}\n",
             "type AliasBearing { alias: Alias, array: Array<U8, 2>, later: Char }\n",
+            "type BorrowShapes { shared: borrow Bool, mutable: borrow mut U8, tuple: (Char, (borrow Bool, borrow mut U8)), array: Array<U8, 4>, later: Char }\n",
             "type NominalBearing { nested: Other, array: Array<U8, 2>, later: Char }\n",
             "type UnknownBearing { missing: Missing, array: Array<U8, 2>, later: Char }\n",
             "type ViewBearing { text: Str, slice: Slice<U8>, array: Array<U8, 2>, later: Char }\n",
+            "type UnvalidatedNominalBearing { nested: RegionType, array: Array<U8, 2>, later: Char }\n",
+            "type RecoveredNominalBearing { nested: Recovered, array: Array<U8, 2>, later: Char }\n",
+            "type NominalBorrowArgumentBearing { nested: GenericNominal<borrow Bool>, array: Array<U8, 2>, later: Char }\n",
+            "type GenericNominalBearing { nested: GenericNominal<Array<U8, 2>>, array: Array<U8, 3>, later: Char }\n",
+            "type GenericNominalWrongArity { nested: GenericNominal, array: Array<U8, 2>, later: Char }\n",
+            "type GenericNominalWrongKind { nested: GenericNominal<3>, array: Array<U8, 2>, later: Char }\n",
+            "type EnumNominalBearing { nested: LocalEnum, array: Array<U8, 2>, later: Char }\n",
+            "type CollidingNominalBearing { local: Packet, qualified: child_alias.Packet, array: Array<U8, 2>, later: Char }\n",
+            "type Packet { value: I32 }\n",
+            "type GenericNominal<T> { value: T }\n",
+            "type RegionType { borrowed: borrow Bool }\n",
             "type Other { integer: Bool }\n",
             "type Repeated { same: I32, same: Bool }\n",
             "type Generic<T> { value: T }\n",
             "type WhereOnly where I32: Copy { value: Bool }\n",
             "type Recovered { malformed: Bool = }\n",
+            "enum LocalEnum { Ready, Value(Bool) }\n",
             "enum Payload { Wrapped(Bool) }\n",
         );
-        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let child = concat!("pub type Packet { value: I32 }\n",);
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
         let graph = phase1_root_only_graph();
         database
@@ -38174,6 +38532,33 @@ property "shared"() {}
                             })
                 })
                 .unwrap_or_else(|| panic!("direct local record {name:?} is in this collection"))
+                .owner
+        };
+        let owner_for_file = |name: &str, file| {
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::Struct
+                        && descriptor.file == file
+                        && def_paths
+                            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                path.data().last().is_some_and(|component| {
+                                    matches!(
+                                        component.data,
+                                        DefPathData::TypeNs(symbol)
+                                            if database.symbols.resolve(symbol).ok().as_deref()
+                                                == Some(name)
+                                    )
+                                })
+                            })
+                })
+                .unwrap_or_else(|| panic!("direct local record {name:?} is in file {file:?}"))
                 .owner
         };
         let fields_owner = owner_for("Fields");
@@ -38285,10 +38670,6 @@ property "shared"() {}
             ("overflow_array", sai_ty::lower_ty::UnsupportedTy::Array),
             ("array", sai_ty::lower_ty::UnsupportedTy::Array),
             ("nested_array", sai_ty::lower_ty::UnsupportedTy::Array),
-            (
-                "borrowed",
-                sai_ty::lower_ty::UnsupportedTy::FieldRegionWithoutParameter,
-            ),
             (
                 "callback_borrowed",
                 sai_ty::lower_ty::UnsupportedTy::FunctionPointerRegion,
@@ -38507,6 +38888,62 @@ property "shared"() {}
             "known primitive arguments do not gate a valid array sibling"
         );
 
+        for (record_name, expected_error) in [
+            (
+                "GenericNominalWrongArity",
+                sai_ty::lower_ty::UnsupportedTy::WrongNumberOfGenericArguments,
+            ),
+            (
+                "GenericNominalWrongKind",
+                sai_ty::lower_ty::UnsupportedTy::GenericArgumentKind,
+            ),
+        ] {
+            let projection = resolved
+                .local_record_field_types_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    None,
+                    owner_for(record_name),
+                )
+                .expect("exact collection guards malformed nominal arguments")
+                .expect("the record retains independent field results");
+            let field_by_name = |field_name: &str| {
+                projection
+                    .fields()
+                    .expect("the malformed-argument record is field-projectable")
+                    .iter()
+                    .find(|field| {
+                        database.symbols.resolve(field.name()).ok().as_deref() == Some(field_name)
+                    })
+                    .expect("the requested field exists")
+            };
+            assert_eq!(
+                projection.type_of_field(field_by_name("nested").def_id()),
+                Some(Err(expected_error)),
+                "{record_name} keeps its ordinary field-local nominal argument error"
+            );
+            assert!(
+                matches!(
+                    projection.type_of_field(field_by_name("array").def_id()),
+                    Some(Ok(ty)) if matches!(
+                        ty.kind(),
+                        sai_ty::ty::TyKind::Array(
+                            element,
+                            sai_ty::ty::Const::Value(2)
+                        ) if matches!(
+                            element.kind(),
+                            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+                        )
+                    )
+                ),
+                "known malformed nominal arguments do not disable the valid array sibling in {record_name}"
+            );
+            assert!(matches!(
+                projection.type_of_field(field_by_name("later").def_id()),
+                Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Char)
+            ));
+        }
+
         let region_bearing = resolved
             .local_record_field_types_with_scopes(
                 &collection,
@@ -38529,23 +38966,121 @@ property "shared"() {}
             Some(Err(sai_ty::lower_ty::UnsupportedTy::Array)),
             "borrow-bearing declarations cannot enable the literal-array builder"
         );
-        assert_eq!(
+        assert!(
+            matches!(
             region_bearing.type_of_field(region_field_by_name("borrowed").def_id()),
-            Some(Err(
-                sai_ty::lower_ty::UnsupportedTy::FieldRegionWithoutParameter
-            )),
-            "the region proof does not turn borrow fields into supported references"
+            Some(Ok(ty)) if matches!(
+                    ty.kind(),
+                    sai_ty::ty::TyKind::Ref(
+                        sai_ty::ty::Region::Sig(sai_ty::ty::SigRegion { item, index: 0 }),
+                        inner,
+                        sai_hir::Mutability::Not
+                    ) if *item == owner_for("RegionBearing").def_id.to_def_id()
+                        && matches!(inner.kind(), sai_ty::ty::TyKind::Bool)
+                )
+            ),
+            "the declaration's borrow uses its implicit Sig(owner, 0) region"
         );
         assert!(matches!(
             region_bearing.type_of_field(region_field_by_name("after_unsupported").def_id()),
             Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Char)
         ));
 
+        let borrow_shapes_owner = owner_for("BorrowShapes");
+        let borrow_shapes = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                borrow_shapes_owner,
+            )
+            .expect("exact collection guards nested borrow fields")
+            .expect("the borrow-shape record remains field-projectable");
+        let borrow_field_by_name = |name: &str| {
+            borrow_shapes
+                .fields()
+                .expect("the borrow-shape record is supported")
+                .iter()
+                .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some(name))
+                .expect("the requested borrow field exists")
+        };
+        let borrowed_bool = borrow_shapes
+            .type_of_field(borrow_field_by_name("shared").def_id())
+            .expect("the exact shared-borrow field DefId exists")
+            .expect("a direct shared borrow lowers");
+        assert!(matches!(
+            borrowed_bool.kind(),
+            sai_ty::ty::TyKind::Ref(
+                sai_ty::ty::Region::Sig(sai_ty::ty::SigRegion { item, index: 0 }),
+                inner,
+                sai_hir::Mutability::Not
+            ) if *item == borrow_shapes_owner.def_id.to_def_id()
+                && matches!(inner.kind(), sai_ty::ty::TyKind::Bool)
+        ));
+        let borrowed_u8 = borrow_shapes
+            .type_of_field(borrow_field_by_name("mutable").def_id())
+            .expect("the exact mutable-borrow field DefId exists")
+            .expect("a direct mutable borrow lowers");
+        assert!(matches!(
+            borrowed_u8.kind(),
+            sai_ty::ty::TyKind::Ref(
+                sai_ty::ty::Region::Sig(sai_ty::ty::SigRegion { item, index: 0 }),
+                inner,
+                sai_hir::Mutability::Mut
+            ) if *item == borrow_shapes_owner.def_id.to_def_id()
+                && matches!(
+                    inner.kind(),
+                    sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+                )
+        ));
+        let nested_borrows = borrow_shapes
+            .type_of_field(borrow_field_by_name("tuple").def_id())
+            .expect("the exact nested-borrow field DefId exists")
+            .expect("tuple-nested borrows lower");
+        let sai_ty::ty::TyKind::Tuple(tuple_elements) = nested_borrows.kind() else {
+            panic!("the tuple field retains its nested tuple shape");
+        };
+        let sai_ty::ty::TyKind::Tuple(nested_elements) = tuple_elements[1].kind() else {
+            panic!("the inner tuple retains both borrow fields");
+        };
+        assert!(matches!(
+            nested_elements[0].kind(),
+            sai_ty::ty::TyKind::Ref(
+                sai_ty::ty::Region::Sig(sai_ty::ty::SigRegion { item, index: 0 }),
+                inner,
+                sai_hir::Mutability::Not
+            ) if *item == borrow_shapes_owner.def_id.to_def_id()
+                && matches!(inner.kind(), sai_ty::ty::TyKind::Bool)
+        ));
+        assert!(matches!(
+            nested_elements[1].kind(),
+            sai_ty::ty::TyKind::Ref(
+                sai_ty::ty::Region::Sig(sai_ty::ty::SigRegion { item, index: 0 }),
+                inner,
+                sai_hir::Mutability::Mut
+            ) if *item == borrow_shapes_owner.def_id.to_def_id()
+                && matches!(
+                    inner.kind(),
+                    sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+                )
+        ));
+        assert_eq!(
+            borrow_shapes.type_of_field(borrow_field_by_name("array").def_id()),
+            Some(Err(sai_ty::lower_ty::UnsupportedTy::Array)),
+            "a non-FnPtr borrow disables sibling literal arrays"
+        );
+        assert!(matches!(
+            borrow_shapes.type_of_field(borrow_field_by_name("later").def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Char)
+        ));
+
         for name in [
             "AliasBearing",
-            "NominalBearing",
             "UnknownBearing",
             "ViewBearing",
+            "UnvalidatedNominalBearing",
+            "RecoveredNominalBearing",
+            "NominalBorrowArgumentBearing",
         ] {
             let projection = resolved
                 .local_record_field_types_with_scopes(
@@ -38579,6 +39114,228 @@ property "shared"() {}
                 "the supported sibling remains available in {name}"
             );
         }
+
+        let borrow_nominal_owner = owner_for("NominalBorrowArgumentBearing");
+        let borrow_nominal = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                borrow_nominal_owner,
+            )
+            .expect("exact collection guards a generic nominal borrow argument")
+            .expect("the generic nominal borrow record remains field-projectable");
+        let borrow_nominal_field = borrow_nominal
+            .fields()
+            .expect("the generic nominal borrow record is supported")
+            .iter()
+            .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some("nested"))
+            .expect("the generic nominal field exists");
+        let Some(Ok(borrow_nominal_ty)) =
+            borrow_nominal.type_of_field(borrow_nominal_field.def_id())
+        else {
+            panic!("a borrow in a validated local nominal's type argument lowers");
+        };
+        let sai_ty::ty::TyKind::Adt(borrow_nominal_def, borrow_nominal_args) =
+            borrow_nominal_ty.kind()
+        else {
+            panic!("the generic nominal keeps its validated ADT identity");
+        };
+        assert_eq!(
+            *borrow_nominal_def,
+            owner_for("GenericNominal").def_id.to_def_id()
+        );
+        assert_eq!(borrow_nominal_args.len(), 1);
+        assert!(matches!(
+            borrow_nominal_args[0].kind(),
+            sai_ty::ty::TyKind::Ref(
+                sai_ty::ty::Region::Sig(sai_ty::ty::SigRegion { item, index: 0 }),
+                inner,
+                sai_hir::Mutability::Not
+            ) if *item == borrow_nominal_owner.def_id.to_def_id()
+                && matches!(inner.kind(), sai_ty::ty::TyKind::Bool)
+        ));
+
+        let nominal_bearing = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("NominalBearing"),
+            )
+            .expect("exact collection guards validated nominal fields")
+            .expect("the nominal-bearing record has a field projection");
+        let nominal_field_by_name = |name: &str| {
+            nominal_bearing
+                .fields()
+                .expect("the record is field-projectable")
+                .iter()
+                .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some(name))
+                .expect("the requested nominal field exists")
+        };
+        let other_def_id = owner_for("Other").def_id.to_def_id();
+        assert!(matches!(
+            nominal_bearing.type_of_field(nominal_field_by_name("nested").def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Adt(def_id, args)
+                if *def_id == other_def_id && args.is_empty())
+        ));
+        assert!(
+            matches!(
+                nominal_bearing.type_of_field(nominal_field_by_name("array").def_id()),
+                Some(Ok(ty)) if matches!(
+                    ty.kind(),
+                    sai_ty::ty::TyKind::Array(
+                        element,
+                        sai_ty::ty::Const::Value(2)
+                    ) if matches!(
+                        element.kind(),
+                        sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+                    )
+                )
+            ),
+            "a validated region-free nominal field does not disable its literal-array sibling"
+        );
+        assert!(matches!(
+            nominal_bearing.type_of_field(nominal_field_by_name("later").def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Char)
+        ));
+
+        let generic_nominal = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("GenericNominalBearing"),
+            )
+            .expect("exact collection guards generic local nominal fields")
+            .expect("the generic nominal-bearing record has a projection");
+        let generic_field = generic_nominal
+            .fields()
+            .expect("the generic nominal-bearing record is supported")
+            .iter()
+            .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some("nested"))
+            .expect("the generic nominal field exists");
+        let generic_nominal_def = owner_for("GenericNominal").def_id.to_def_id();
+        let Some(Ok(generic_ty)) = generic_nominal.type_of_field(generic_field.def_id()) else {
+            panic!("a validated local generic nominal with explicit type arguments lowers");
+        };
+        let sai_ty::ty::TyKind::Adt(generic_def, generic_args) = generic_ty.kind() else {
+            panic!("the validated generic nominal retains its exact ADT identity");
+        };
+        assert_eq!(*generic_def, generic_nominal_def);
+        assert_eq!(generic_args.len(), 1);
+        assert!(matches!(
+            generic_args[0].kind(),
+            sai_ty::ty::TyKind::Array(
+                element,
+                sai_ty::ty::Const::Value(2)
+            ) if matches!(
+                element.kind(),
+                sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+            )
+        ));
+
+        let enum_nominal = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("EnumNominalBearing"),
+            )
+            .expect("exact collection guards local enum fields")
+            .expect("the enum-bearing record has a field projection");
+        let enum_field = |name: &str| {
+            enum_nominal
+                .fields()
+                .expect("the enum-bearing record is field-projectable")
+                .iter()
+                .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some(name))
+                .expect("the requested enum-bearing field exists")
+        };
+        let local_enum_def = collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .find(|descriptor| {
+                descriptor.kind == TopLevelOwnerKind::Enum
+                    && def_paths
+                        .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                        .ok()
+                        .flatten()
+                        .is_some_and(|path| {
+                            path.data().last().is_some_and(|component| {
+                                matches!(
+                                    component.data,
+                                    DefPathData::TypeNs(symbol)
+                                        if database.symbols.resolve(symbol).ok().as_deref()
+                                            == Some("LocalEnum")
+                                )
+                            })
+                        })
+            })
+            .expect("the direct local enum is in this collection")
+            .owner
+            .def_id
+            .to_def_id();
+        assert!(matches!(
+            enum_nominal.type_of_field(enum_field("nested").def_id()),
+            Some(Ok(ty)) if matches!(
+                ty.kind(),
+                sai_ty::ty::TyKind::Adt(def_id, args)
+                    if *def_id == local_enum_def && args.is_empty()
+            )
+        ));
+        assert!(
+            enum_nominal
+                .type_of_field(enum_field("array").def_id())
+                .is_some_and(|result| result.is_ok()),
+            "a validated local enum field preserves its exact identity beside an array"
+        );
+
+        let collision_projection = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("CollidingNominalBearing"),
+            )
+            .expect("exact collection guards colliding local nominal paths")
+            .expect("the collision record has a field projection");
+        let collision_field = |name: &str| {
+            collision_projection
+                .fields()
+                .expect("the collision record is field-projectable")
+                .iter()
+                .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some(name))
+                .expect("the requested colliding nominal field exists")
+        };
+        let root_packet = owner_for_file("Packet", module_tree.modules[0].file)
+            .def_id
+            .to_def_id();
+        let child_packet = owner_for_file("Packet", module_tree.modules[1].file)
+            .def_id
+            .to_def_id();
+        assert_ne!(root_packet, child_packet);
+        for (field_name, expected_def_id) in [("local", root_packet), ("qualified", child_packet)] {
+            assert!(
+                matches!(
+                    collision_projection.type_of_field(collision_field(field_name).def_id()),
+                    Some(Ok(ty)) if matches!(
+                        ty.kind(),
+                        sai_ty::ty::TyKind::Adt(def_id, args)
+                            if *def_id == expected_def_id && args.is_empty()
+                    )
+                ),
+                "the {field_name} path lowers to its exact same-named local DefId"
+            );
+        }
+        assert!(
+            collision_projection
+                .type_of_field(collision_field("array").def_id())
+                .is_some_and(|result| result.is_ok()),
+            "qualified exact-DefId nominal paths remain compatible with sibling arrays"
+        );
 
         let other_owner = owner_for("Other");
         let other = resolved
@@ -38738,6 +39495,165 @@ property "shared"() {}
                 fields_owner,
             ),
             Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+        ));
+    }
+
+    #[test]
+    fn local_nominal_region_gate_resolves_primitive_name_collisions_exactly() {
+        let root = concat!(
+            "type Bool { borrowed: borrow U8 }\n",
+            "type RegionHidden { inner: Bool }\n",
+            "type RegionHiddenBearing { nested: RegionHidden, array: Array<U8, 2>, later: Char }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let mut collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("the local shadowing fixture collects");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("local DefPath interner exists"),
+        );
+        let root_file = module_tree.modules[0].file;
+        let (bool_owner, region_hidden_owner, region_hidden_bearing_owner) = {
+            let owner_for = |name: &str| {
+                collection
+                    .scopes
+                    .top_level_owners
+                    .iter()
+                    .copied()
+                    .find(|descriptor| {
+                        descriptor.kind == TopLevelOwnerKind::Struct
+                            && descriptor.file == root_file
+                            && def_paths
+                                .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                                .ok()
+                                .flatten()
+                                .is_some_and(|path| {
+                                    path.data().last().is_some_and(|component| {
+                                        matches!(
+                                            component.data,
+                                            DefPathData::TypeNs(symbol)
+                                                if database.symbols.resolve(symbol).ok().as_deref()
+                                                    == Some(name)
+                                        )
+                                    })
+                                })
+                    })
+                    .unwrap_or_else(|| panic!("direct local record {name:?} is in this collection"))
+                    .owner
+            };
+            (
+                owner_for("Bool"),
+                owner_for("RegionHidden"),
+                owner_for("RegionHiddenBearing"),
+            )
+        };
+        let bool_def = bool_owner.def_id.to_def_id();
+        let region_hidden_def = region_hidden_owner.def_id.to_def_id();
+        let initially_resolved = database
+            .resolve_type_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("the current type owners resolve against the source scopes");
+        assert!(
+            initially_resolved
+                .owners()
+                .iter()
+                .find(|owner| owner.owner() == region_hidden_owner)
+                .and_then(|owner| owner.path_resolution().ok())
+                .is_some_and(|resolution| {
+                    resolution.paths().values().any(|path| {
+                        *path
+                            == PathRes {
+                                base: Res::PrimTy(sai_resolve::prelude::PrimTy::Bool),
+                                resolved_segments: 1,
+                                segment_count: 1,
+                            }
+                    })
+                }),
+            "the source resolver prefers the prelude primitive for the colliding spelling"
+        );
+        let bool_symbol = database.symbols.intern("Bool").expect("Bool interns");
+        let region_hidden_symbol = database
+            .symbols
+            .intern("RegionHidden")
+            .expect("RegionHidden interns");
+        let root_scope = &mut collection.scopes.modules[ModuleId::ROOT.raw() as usize];
+        let mut exact_local_bool_binding = root_scope
+            .scope
+            .get(&region_hidden_symbol)
+            .cloned()
+            .expect("the exact local record has a scope binding");
+        exact_local_bool_binding.res = Res::Def(DefKind::Struct, bool_def);
+        root_scope
+            .scope
+            .insert(bool_symbol, exact_local_bool_binding.clone());
+        root_scope
+            .declared
+            .insert(bool_symbol, exact_local_bool_binding);
+
+        let resolved = database
+            .resolve_type_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("the current type owners resolve against the exact local binding");
+        let local_nominals = database.local_nominal_definitions(&collection, &snapshot);
+        assert!(
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| owner.owner() == region_hidden_owner)
+                .and_then(|owner| owner.path_resolution().ok())
+                .is_some_and(|resolution| resolution.paths().values().any(|path| {
+                    *path
+                        == PathRes {
+                            base: Res::Def(DefKind::Struct, bool_def),
+                            resolved_segments: 1,
+                            segment_count: 1,
+                        }
+                })),
+            "the `Bool` field path resolves to the exact local nominal DefId"
+        );
+        assert!(
+            !local_nominals.contains_key(&bool_def),
+            "a local `Bool` containing a borrow is not a validated nominal"
+        );
+        assert!(
+            !local_nominals.contains_key(&region_hidden_def)
+                && !local_nominals.contains_key(&region_hidden_bearing_owner.def_id.to_def_id()),
+            "wrappers around the exact local `Bool` remain outside the nominal allowlist"
+        );
+
+        let projection = resolved
+            .local_record_field_types(&collection, region_hidden_bearing_owner)
+            .expect("exact collection guards the shadowed-primitive fields")
+            .expect("the direct local record retains independent field results");
+        let field_by_name = |name: &str| {
+            projection
+                .fields()
+                .expect("the containing record is field-projectable")
+                .iter()
+                .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some(name))
+                .expect("the requested field exists")
+        };
+        assert_eq!(
+            projection.type_of_field(field_by_name("array").def_id()),
+            Some(Err(sai_ty::lower_ty::UnsupportedTy::Array)),
+            "a nominal wrapper with the primitive spelling closes the sibling array gate"
+        );
+        assert!(
+            projection
+                .type_of_field(field_by_name("nested").def_id())
+                .is_some_and(|result| result.is_err()),
+            "a nominal wrapper outside the validated map remains unsupported as a field"
+        );
+        assert!(matches!(
+            projection.type_of_field(field_by_name("later").def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Char)
         ));
     }
 

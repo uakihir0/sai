@@ -245,6 +245,23 @@ impl<'a> LowerTyContext<'a> {
         }
     }
 
+    /// Enable only validated local record and enum definitions in a field
+    /// context.
+    ///
+    /// The caller must derive this exact-`DefId` allowlist from the same
+    /// package collection and source snapshot as `paths`. This builder is
+    /// deliberately inert for signature and body contexts, whose nominal
+    /// allowlists are configured separately.
+    pub fn with_field_local_nominals(
+        mut self,
+        local_nominals: &'a HashMap<DefId, LocalNominalDef>,
+    ) -> Self {
+        if matches!(self.region_mode, RegionMode::Field { .. }) {
+            self.local_nominals = Some(local_nominals);
+        }
+        self
+    }
+
     /// Create a body context. Every borrow region is erased.
     pub fn for_body(
         interner: &'a TyInterner,
@@ -2488,6 +2505,53 @@ mod tests {
         assert_eq!(
             lower_ty(&mut context, self_projection),
             Err(UnsupportedTy::Projection)
+        );
+    }
+
+    #[test]
+    fn validated_local_nominals_are_enabled_only_for_field_contexts() {
+        let (owner, symbols) = owner();
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let nominal_def = owner.def_id.to_def_id();
+        let (nominal, paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            80,
+            "Record",
+            None,
+            Res::Def(DefKind::Struct, nominal_def),
+        );
+        let local_nominals = HashMap::from([(
+            nominal_def,
+            LocalNominalDef {
+                type_params: Arc::from([]),
+            },
+        )]);
+
+        let mut field_context = LowerTyContext::for_field(&interner, owner, &paths, false)
+            .with_field_local_nominals(&local_nominals);
+        assert!(matches!(
+            lower_ty(&mut field_context, nominal),
+            Ok(ty) if matches!(ty.kind(), TyKind::Adt(def_id, args)
+                if *def_id == nominal_def && args.is_empty())
+        ));
+
+        let mut signature_context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_field_local_nominals(&local_nominals);
+        assert_eq!(
+            lower_ty(&mut signature_context, nominal),
+            Err(UnsupportedTy::NominalType),
+            "the field-only builder cannot widen signature lowering"
+        );
+
+        let mut body_context = LowerTyContext::for_body(&interner, owner, &paths)
+            .with_field_local_nominals(&local_nominals);
+        assert_eq!(
+            lower_ty(&mut body_context, nominal),
+            Err(UnsupportedTy::NominalType),
+            "the field-only builder cannot widen body lowering"
         );
     }
 
