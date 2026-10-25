@@ -779,17 +779,20 @@ Generic and otherwise unsupported local enums retain typed unsupported
 outcomes. The AST shape check rejects `(E).V`, while `(E.V)` still denotes the
 inner path; a trailing value field in `E.V.other` is not promoted to another
 variant candidate. When the field is a call callee, `E.V()` retains only the
-inner `E.V` path result; the separate IR-924 projection later checks limited
-arity for supported local enum variant calls. A local receiver such as `e.V`
-remains a value member path.
+inner `E.V` path result; a separate occurrence-keyed projection checks limited
+call semantics for supported local enum variant calls. IR-924 checks arity,
+IR-925 diagnoses named arguments, and IR-926 checks direct literal arguments
+at tuple-variant coercion sites. A local receiver such as `e.V` remains a
+value member path.
 The resolver uses the current package collection, snapshot, active source
 member closure, WIT-view closure, and test-only import filtering. Unresolved,
 external, dependency/WIT, and type-alias heads remain outside this local
 subset. This path result records path identity only; it does not record
 `type_dependent_defs` or synthesize expression types. That sentence describes
 the original IR-921 recognition slice: IR-922/923 later add the value-type and
-type-dependent-definition projections to the per-owner result, and IR-924 adds
-limited constructor-call arity without claiming general expression types.
+type-dependent-definition projections to the per-owner result. IR-924 through
+IR-926 add limited constructor-call diagnostics without claiming general
+expression types.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
 implements the segment-consumption step after a caller has resolved the first
@@ -1924,6 +1927,27 @@ selected variant's validated constructor signature. Unit calls receive
 §6.18.2. Record variants remain selected as type-dependent paths but are not
 treated as positional calls. This does not check argument types, populate
 `call_kinds`, or extend the supported path set.
+
+**Implemented subset (IR-925):** Direct local non-generic tuple- and
+unit-variant calls diagnose each named argument with
+`NAMED_ARGUMENT_ON_FUNCTION`, at the argument name span. Arity diagnostics
+remain independent, and record-variant named fields stay on the record
+construction path. This is a diagnostic projection and does not bind names to
+parameters.
+
+**Implemented subset (IR-926):** For a direct local non-generic tuple-variant
+call, supplied arguments are paired with payload types by source position.
+Primitive direct literals and the empty tuple literal are checked using the
+existing literal range and type-mismatch logic. This also applies to named
+arguments by their position; the named-argument diagnostic remains separate.
+Only arguments for which the signature supplies a parameter are checked, so
+extra arguments receive the arity diagnostic without an inferred type error.
+Nonliteral expressions, nominal and other unsupported payload types, unit
+variant calls, record constructors, generic enums, and external/dependency/WIT
+paths remain outside this check. Pointer-sized literals use the selected
+target's pointer width. It does not populate `call_kinds`, perform general
+expression type checking, or change source acceptance; `sai check` remains
+behind its incomplete-stage gate.
 
 ### 3.6.4 `adt_def`
 

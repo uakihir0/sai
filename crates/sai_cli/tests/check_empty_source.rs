@@ -287,7 +287,8 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "enum Payload { Pair(U8, Bool), Named(value: Bool) }\n",
         "pub fn use_it() {\n",
         "    (Payload.Pair(1, true), ",
-        "Payload.Pair(first: 1, second: true, third: false), ",
+        "Payload.Pair(first: true, second: 1, third: false), ",
+        "Payload.Pair(256, true), ",
         "Payload.Named(value: true))\n",
         "}\n",
     );
@@ -306,6 +307,16 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         1,
         "the call arity error is surfaced alongside named-argument errors:\n{stdout}"
     );
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        2,
+        "the staged projection checks only the first two named call arguments by position:\n{stdout}"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
+        1,
+        "the positional U8 argument range error reaches CLI diagnostics:\n{stdout}"
+    );
     let named_start = source.find("first:").expect("named argument exists");
     assert_json_diagnostic_primary_span(
         &stdout,
@@ -314,7 +325,7 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         named_start,
         named_start + "first".len(),
     );
-    let call = "Payload.Pair(first: 1, second: true, third: false)";
+    let call = "Payload.Pair(first: true, second: 1, third: false)";
     let call_start = source.find(call).expect("wrong-arity call exists");
     assert_json_diagnostic_primary_span(
         &stdout,
@@ -322,6 +333,40 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "Pair: tuple variant expects 2 arguments but found 3",
         call_start,
         call_start + call.len(),
+    );
+    let named_bool_start = source
+        .find("first: true")
+        .expect("mismatched named Bool literal exists")
+        + "first: ".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `U8`, found a Bool literal",
+        named_bool_start,
+        named_bool_start + "true".len(),
+    );
+    let named_integer_start = source
+        .find("second: 1")
+        .expect("mismatched named integer literal exists")
+        + "second: ".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Bool`, found an integer literal",
+        named_integer_start,
+        named_integer_start + "1".len(),
+    );
+    let out_of_range_call = "Payload.Pair(256, true)";
+    let out_of_range_start = source
+        .find(out_of_range_call)
+        .expect("out-of-range variant call exists")
+        + "Payload.Pair(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "LITERAL_OUT_OF_RANGE",
+        "integer literal is out of range for `U8`",
+        out_of_range_start,
+        out_of_range_start + "256".len(),
     );
 }
 
