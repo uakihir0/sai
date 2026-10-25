@@ -1,0 +1,113 @@
+use acme:key-rotation-readiness-auditor/model.{
+    AuditIssue
+    CustodyRecord
+    KeyRecord
+    MigrationEvidence
+    Workload
+}
+
+pub fn key_count(keys: Array<KeyRecord, 6>, key_id: U32) -> USize {
+    var count: USize = 0
+    for key in keys {
+        if key.id == key_id {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn key_index(keys: Array<KeyRecord, 6>, key_id: U32) -> Result<USize, AuditIssue> {
+    var found: Option<USize> = None
+    for index in 0..keys.len() {
+        if keys[index].id == key_id {
+            match found {
+                Some(_) => return Err(AuditIssue.AmbiguousKeyId)
+                None => {
+                    found = Some(index)
+                }
+            }
+        }
+    }
+    match found { Some(index) => Ok(index), None => Err(AuditIssue.MissingOldKey) }
+}
+
+pub fn custody_count(records: Array<CustodyRecord, 6>, key_id: U32) -> USize {
+    var count: USize = 0
+    for record in records {
+        if record.key_id == key_id {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn custody_index(records: Array<CustodyRecord, 6>, key_id: U32) -> Result<USize, AuditIssue> {
+    var found: Option<USize> = None
+    for index in 0..records.len() {
+        if records[index].key_id == key_id {
+            match found {
+                Some(_) => return Err(AuditIssue.AmbiguousCustodyRecord)
+                None => {
+                    found = Some(index)
+                }
+            }
+        }
+    }
+    match found { Some(index) => Ok(index), None => Err(AuditIssue.MissingCustodyRecord) }
+}
+
+pub fn workload_count(workloads: Array<Workload, 5>, workload_id: U32) -> USize {
+    var count: USize = 0
+    for workload in workloads {
+        if workload.id == workload_id {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn workload_index(workloads: Array<Workload, 5>, workload_id: U32) -> Result<
+    USize,
+    AuditIssue,
+> {
+    var found: Option<USize> = None
+    for index in 0..workloads.len() {
+        if workloads[index].id == workload_id {
+            match found {
+                Some(_) => return Err(AuditIssue.DuplicateWorkloadId)
+                None => {
+                    found = Some(index)
+                }
+            }
+        }
+    }
+    match found { Some(index) => Ok(index), None => Err(AuditIssue.MissingMigrationEvidence) }
+}
+
+pub fn evidence_count(evidence: Array<MigrationEvidence, 4>, workload_id: U32) -> USize {
+    var count: USize = 0
+    for item in evidence {
+        if item.workload_id == workload_id {
+            count += 1
+        }
+    }
+    count
+}
+
+pub fn evidence_index(evidence: Array<MigrationEvidence, 4>, workload_id: U32) -> Result<
+    USize,
+    AuditIssue,
+> {
+    var found: Option<USize> = None
+    for index in 0..evidence.len() {
+        if evidence[index].workload_id == workload_id {
+            match found {
+                Some(_) => return Err(AuditIssue.AmbiguousMigrationEvidence)
+                None => {
+                    found = Some(index)
+                }
+            }
+        }
+    }
+    match found { Some(index) => Ok(index), None => Err(AuditIssue.MissingMigrationEvidence) }
+}

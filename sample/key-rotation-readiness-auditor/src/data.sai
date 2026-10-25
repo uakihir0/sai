@@ -1,0 +1,193 @@
+use acme:key-rotation-readiness-auditor/model.{
+    AuditPolicy
+    CustodyRecord
+    KeyRecord
+    KeyState
+    MigrationDependency
+    MigrationEvidence
+    RotationPlan
+    Workload
+}
+
+pub fn now_minute() -> U32 {
+    1035
+}
+
+pub fn policy() -> AuditPolicy {
+    AuditPolicy(minimum_overlap_minutes: 30, maximum_evidence_age_minutes: 30)
+}
+
+pub fn keys() -> Array<KeyRecord, 6> {
+    [
+        KeyRecord(
+            id: 101,
+            name: "payments-legacy",
+            owner_team_id: 7,
+            state: KeyState.Active,
+            valid_from_minute: 100,
+            expires_minute: 1100,
+        ),
+        KeyRecord(
+            id: 102,
+            name: "payments-2026",
+            owner_team_id: 7,
+            state: KeyState.Active,
+            valid_from_minute: 999,
+            expires_minute: 1500,
+        ),
+        KeyRecord(
+            id: 201,
+            name: "data-legacy",
+            owner_team_id: 8,
+            state: KeyState.Active,
+            valid_from_minute: 100,
+            expires_minute: 1100,
+        ),
+        KeyRecord(
+            id: 202,
+            name: "data-2026",
+            owner_team_id: 8,
+            state: KeyState.Active,
+            valid_from_minute: 949,
+            expires_minute: 1500,
+        ),
+        KeyRecord(
+            id: 301,
+            name: "logs-legacy",
+            owner_team_id: 9,
+            state: KeyState.Active,
+            valid_from_minute: 100,
+            expires_minute: 1100,
+        ),
+        KeyRecord(
+            id: 302,
+            name: "logs-2026",
+            owner_team_id: 9,
+            state: KeyState.Active,
+            valid_from_minute: 999,
+            expires_minute: 1500,
+        ),
+    ]
+}
+
+pub fn custody_records() -> Array<CustodyRecord, 6> {
+    [
+        CustodyRecord(
+            key_id: 101,
+            custodian_team_id: 70,
+            escrow_verified: true,
+            recovery_tested: true,
+        ),
+        CustodyRecord(
+            key_id: 102,
+            custodian_team_id: 71,
+            escrow_verified: true,
+            recovery_tested: true,
+        ),
+        CustodyRecord(
+            key_id: 201,
+            custodian_team_id: 80,
+            escrow_verified: true,
+            recovery_tested: true,
+        ),
+        CustodyRecord(
+            key_id: 202,
+            custodian_team_id: 81,
+            escrow_verified: true,
+            recovery_tested: true,
+        ),
+        CustodyRecord(
+            key_id: 301,
+            custodian_team_id: 90,
+            escrow_verified: true,
+            recovery_tested: true,
+        ),
+        CustodyRecord(
+            key_id: 302,
+            custodian_team_id: 90,
+            escrow_verified: true,
+            recovery_tested: true,
+        ),
+    ]
+}
+
+pub fn workloads() -> Array<Workload, 5> {
+    [
+        Workload(id: 1, name: "payments-api", source_key_id: 101, target_key_id: 102),
+        Workload(id: 2, name: "settlement-worker", source_key_id: 101, target_key_id: 102),
+        Workload(id: 10, name: "data-cache", source_key_id: 201, target_key_id: 202),
+        Workload(id: 11, name: "nightly-export", source_key_id: 201, target_key_id: 202),
+        Workload(id: 20, name: "log-ingestor", source_key_id: 301, target_key_id: 302),
+    ]
+}
+
+pub fn migration_evidence() -> Array<MigrationEvidence, 4> {
+    [
+        MigrationEvidence(
+            workload_id: 1,
+            observed_key_id: 102,
+            observed_minute: 1024,
+            attested: true,
+        ),
+        MigrationEvidence(
+            workload_id: 2,
+            observed_key_id: 102,
+            observed_minute: 1030,
+            attested: true,
+        ),
+        MigrationEvidence(
+            workload_id: 10,
+            observed_key_id: 202,
+            observed_minute: 980,
+            attested: true,
+        ),
+        MigrationEvidence(
+            workload_id: 20,
+            observed_key_id: 302,
+            observed_minute: 1020,
+            attested: true,
+        ),
+    ]
+}
+
+pub fn dependencies() -> Array<MigrationDependency, 2> {
+    [
+        MigrationDependency(prerequisite_workload_id: 1, dependent_workload_id: 2),
+        MigrationDependency(prerequisite_workload_id: 10, dependent_workload_id: 11),
+    ]
+}
+
+pub fn plans() -> Array<RotationPlan, 3> {
+    [
+        RotationPlan(
+            id: 501,
+            name: "payments key rotation",
+            old_key_id: 101,
+            new_key_id: 102,
+            cutover_minute: 1000,
+            overlap_end_minute: 1040,
+            grace_deadline_minute: 1060,
+            revoke_minute: 1070,
+        ),
+        RotationPlan(
+            id: 502,
+            name: "data platform key rotation",
+            old_key_id: 201,
+            new_key_id: 202,
+            cutover_minute: 950,
+            overlap_end_minute: 990,
+            grace_deadline_minute: 1000,
+            revoke_minute: 1010,
+        ),
+        RotationPlan(
+            id: 503,
+            name: "log pipeline key rotation",
+            old_key_id: 301,
+            new_key_id: 302,
+            cutover_minute: 1000,
+            overlap_end_minute: 1040,
+            grace_deadline_minute: 1060,
+            revoke_minute: 1070,
+        ),
+    ]
+}

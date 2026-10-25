@@ -1,0 +1,434 @@
+use acme:spaceflight-mission-operations/model.{
+    CrewWindow
+    GraphIssue
+    MAX_PLANNING_HORIZON_SLOTS
+    MissionLimits
+    MissionPlan
+    MissionTask
+    PlanIssue
+    PlanningIssue
+    TaskDecision
+    TaskDependency
+    TaskState
+}
+use acme:spaceflight-mission-operations/ordering
+
+@derive(Copy, Clone, PartialEq, Eq)
+type ResourceFit {
+    power_ok: Bool
+    thermal_ok: Bool
+}
+
+fn task_index(tasks: Array<MissionTask, 12>, task_id: U32) -> Option<USize> {
+    for index in 0..tasks.len() {
+        if tasks[index].id == task_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn decision(
+    task: MissionTask,
+    state: TaskState,
+    start_slot: Option<U32>,
+    end_slot: Option<U32>,
+    issue: Option<PlanIssue>,
+) -> TaskDecision {
+    TaskDecision(
+        task_id: task.id,
+        task_name: task.name,
+        state: state,
+        start_slot: start_slot,
+        end_slot: end_slot,
+        issue: issue,
+    )
+}
+
+fn prerequisite_end_slot(
+    task_id: U32,
+    tasks: Array<MissionTask, 12>,
+    dependencies: Array<TaskDependency, 8>,
+    decisions_by_task: Array<Option<TaskDecision>, 12>,
+) -> Option<U32> {
+    var ready = true
+    var latest_end: U32 = 0
+
+    for dependency in dependencies {
+        if dependency.task_id == task_id {
+            match task_index(tasks, dependency.prerequisite_id) {
+                Some(index) => {
+                    match decisions_by_task[index] {
+                        Some(prerequisite) => {
+                            if prerequisite.state != TaskState.Scheduled {
+                                ready = false
+                            } else {
+                                match prerequisite.end_slot {
+                                    Some(end_slot) => {
+                                        if end_slot > latest_end {
+                                            latest_end = end_slot
+                                        }
+                                    }
+                                    None => {
+                                        ready = false
+                                    }
+                                }
+                            }
+                        }
+                        None => {
+                            ready = false
+                        }
+                    }
+                }
+                None => {
+                    ready = false
+                }
+            }
+        }
+    }
+
+    if ready {
+        Some(latest_end)
+    } else {
+        None
+    }
+}
+
+fn inside_crew_window(
+    task: MissionTask,
+    start_slot: U32,
+    end_slot: U32,
+    crew_windows: Array<CrewWindow, 2>,
+) -> Bool {
+    if not task.requires_crew {
+        return true
+    }
+
+    for window in crew_windows {
+        if start_slot >= window.start_slot and end_slot <= window.end_slot {
+            return true
+        }
+    }
+    false
+}
+
+fn intervals_overlap(first_start: U32, first_end: U32, second_start: U32, second_end: U32) -> Bool {
+    first_start < second_end and second_start < first_end
+}
+
+fn crew_is_free(
+    task: MissionTask,
+    start_slot: U32,
+    end_slot: U32,
+    tasks: Array<MissionTask, 12>,
+    decisions_by_task: Array<Option<TaskDecision>, 12>,
+) -> Bool {
+    if not task.requires_crew {
+        return true
+    }
+
+    var free = true
+    for index in 0..tasks.len() {
+        if tasks[index].requires_crew {
+            match decisions_by_task[index] {
+                Some(existing) => {
+                    if existing.state == TaskState.Scheduled {
+                        match (existing.start_slot, existing.end_slot) {
+                            (Some(existing_start), Some(existing_end)) => {
+                                if intervals_overlap(
+                                    start_slot,
+                                    end_slot,
+                                    existing_start,
+                                    existing_end,
+                                ) {
+                                    free = false
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    free
+}
+
+fn resource_fit(
+    task: MissionTask,
+    start_slot: U32,
+    end_slot: U32,
+    tasks: Array<MissionTask, 12>,
+    decisions_by_task: Array<Option<TaskDecision>, 12>,
+    limits: MissionLimits,
+) -> ResourceFit {
+    var power_ok = true
+    var thermal_ok = true
+
+    for slot in start_slot..end_slot {
+        var used_power = task.power_watts
+        var used_thermal = task.thermal_units
+        for index in 0..tasks.len() {
+            match decisions_by_task[index] {
+                Some(existing) => {
+                    if existing.state == TaskState.Scheduled {
+                        match (existing.start_slot, existing.end_slot) {
+                            (Some(existing_start), Some(existing_end)) => {
+                                if slot >= existing_start and slot < existing_end {
+                                    if (
+                                        power_ok
+                                        and tasks[index].power_watts
+                                            > limits.max_power_watts - used_power
+                                    ) {
+                                        power_ok = false
+                                    } else if power_ok {
+                                        used_power += tasks[index].power_watts
+                                    }
+                                    if (
+                                        thermal_ok
+                                        and tasks[index].thermal_units
+                                            > limits.max_thermal_units - used_thermal
+                                    ) {
+                                        thermal_ok = false
+                                    } else if thermal_ok {
+                                        used_thermal += tasks[index].thermal_units
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        if used_power > limits.max_power_watts {
+            power_ok = false
+        }
+        if used_thermal > limits.max_thermal_units {
+            thermal_ok = false
+        }
+    }
+
+    ResourceFit(power_ok: power_ok, thermal_ok: thermal_ok)
+}
+
+fn resource_issue(crew: Bool, power: Bool, thermal: Bool) -> PlanIssue {
+    if crew and power and thermal {
+        PlanIssue.CrewPowerAndThermalConflict
+    } else if crew and power {
+        PlanIssue.CrewAndPowerConflict
+    } else if crew and thermal {
+        PlanIssue.CrewAndThermalConflict
+    } else if power and thermal {
+        PlanIssue.PowerAndThermalConflict
+    } else if crew {
+        PlanIssue.CrewConflict
+    } else if power {
+        PlanIssue.PowerConflict
+    } else {
+        PlanIssue.ThermalConflict
+    }
+}
+
+fn plan_task(
+    task: MissionTask,
+    tasks: Array<MissionTask, 12>,
+    dependencies: Array<TaskDependency, 8>,
+    crew_windows: Array<CrewWindow, 2>,
+    decisions_by_task: Array<Option<TaskDecision>, 12>,
+    limits: MissionLimits,
+) -> TaskDecision {
+    let prerequisite_end = prerequisite_end_slot(task.id, tasks, dependencies, decisions_by_task)
+    match prerequisite_end {
+        None => {
+            return decision(
+                task,
+                TaskState.Blocked,
+                None,
+                None,
+                Some(PlanIssue.PrerequisiteNotScheduled),
+            )
+        }
+        Some(_) => {}
+    }
+
+    if (
+        task.duration_slots == 0
+        or task.latest_finish_slot < task.earliest_start_slot
+        or task.duration_slots > limits.planning_horizon_slots
+    ) {
+        return decision(task, TaskState.Unplaced, None, None, Some(PlanIssue.InvalidTimeWindow))
+    }
+
+    if (
+        task.power_watts > limits.max_power_watts and task.thermal_units > limits.max_thermal_units
+    ) {
+        return decision(task, TaskState.Unplaced, None, None, Some(PlanIssue.ExceedsBothCapacities))
+    }
+    if task.power_watts > limits.max_power_watts {
+        return decision(task, TaskState.Unplaced, None, None, Some(PlanIssue.ExceedsPowerCapacity))
+    }
+    if task.thermal_units > limits.max_thermal_units {
+        return decision(
+            task,
+            TaskState.Unplaced,
+            None,
+            None,
+            Some(PlanIssue.ExceedsThermalCapacity),
+        )
+    }
+
+    let prerequisite_start = prerequisite_end.unwrap()
+    var first_start = task.earliest_start_slot
+    if prerequisite_start > first_start {
+        first_start = prerequisite_start
+    }
+
+    var deadline = task.latest_finish_slot
+    if limits.planning_horizon_slots < deadline {
+        deadline = limits.planning_horizon_slots
+    }
+    if deadline < task.duration_slots {
+        return decision(task, TaskState.Unplaced, None, None, Some(PlanIssue.NoTimeBeforeDeadline))
+    }
+
+    let latest_start = deadline - task.duration_slots
+    if latest_start < first_start {
+        return decision(task, TaskState.Unplaced, None, None, Some(PlanIssue.NoTimeBeforeDeadline))
+    }
+
+    var crew_window_seen = false
+    var crew_conflict = false
+    var power_conflict = false
+    var thermal_conflict = false
+
+    for offset in 0..(latest_start - first_start + 1) {
+        let start_slot = first_start + offset
+        let end_slot = start_slot + task.duration_slots
+        if inside_crew_window(task, start_slot, end_slot, crew_windows) {
+            crew_window_seen = true
+            let crew_free = crew_is_free(task, start_slot, end_slot, tasks, decisions_by_task)
+            let fit = resource_fit(task, start_slot, end_slot, tasks, decisions_by_task, limits)
+            if not crew_free {
+                crew_conflict = true
+            }
+            if not fit.power_ok {
+                power_conflict = true
+            }
+            if not fit.thermal_ok {
+                thermal_conflict = true
+            }
+            if crew_free and fit.power_ok and fit.thermal_ok {
+                return decision(task, TaskState.Scheduled, Some(start_slot), Some(end_slot), None)
+            }
+        }
+    }
+
+    if task.requires_crew and not crew_window_seen {
+        return decision(task, TaskState.Unplaced, None, None, Some(PlanIssue.NoCrewWindow))
+    }
+
+    decision(
+        task,
+        TaskState.Unplaced,
+        None,
+        None,
+        Some(resource_issue(crew_conflict, power_conflict, thermal_conflict)),
+    )
+}
+
+fn empty_plan(issue: GraphIssue) -> MissionPlan {
+    MissionPlan(
+        task_order: Array<Option<U32>, 12>.filled(None),
+        order_length: 0,
+        decisions: Array<Option<TaskDecision>, 12>.filled(None),
+        decision_count: 0,
+        scheduled_count: 0,
+        blocked_count: 0,
+        unplaced_count: 0,
+        graph_issue: Some(issue),
+        planning_issue: None,
+    )
+}
+
+fn horizon_exceeded_plan() -> MissionPlan {
+    MissionPlan(
+        task_order: Array<Option<U32>, 12>.filled(None),
+        order_length: 0,
+        decisions: Array<Option<TaskDecision>, 12>.filled(None),
+        decision_count: 0,
+        scheduled_count: 0,
+        blocked_count: 0,
+        unplaced_count: 0,
+        graph_issue: None,
+        planning_issue: Some(PlanningIssue.HorizonExceedsCapacity),
+    )
+}
+
+pub fn plan(
+    tasks: Array<MissionTask, 12>,
+    dependencies: Array<TaskDependency, 8>,
+    crew_windows: Array<CrewWindow, 2>,
+    limits: MissionLimits,
+) -> MissionPlan {
+    if limits.planning_horizon_slots > MAX_PLANNING_HORIZON_SLOTS {
+        return horizon_exceeded_plan()
+    }
+
+    let order = ordering.order_tasks(tasks, dependencies)
+    match order.issue { Some(issue) => return empty_plan(issue), None => {} }
+
+    var decisions_by_task = Array<Option<TaskDecision>, 12>.filled(None)
+    var decisions = Array<Option<TaskDecision>, 12>.filled(None)
+    var scheduled_count: U32 = 0
+    var blocked_count: U32 = 0
+    var unplaced_count: U32 = 0
+
+    for position in 0..order.length {
+        match order.task_ids[position] {
+            Some(task_id) => {
+                match task_index(tasks, task_id) {
+                    Some(index) => {
+                        let result = plan_task(
+                            tasks[index],
+                            tasks,
+                            dependencies,
+                            crew_windows,
+                            decisions_by_task,
+                            limits,
+                        )
+                        decisions_by_task[index] = Some(result)
+                        decisions[position] = Some(result)
+                        match result.state {
+                            TaskState.Scheduled => {
+                                scheduled_count += 1
+                            }
+                            TaskState.Blocked => {
+                                blocked_count += 1
+                            }
+                            TaskState.Unplaced => {
+                                unplaced_count += 1
+                            }
+                        }
+                    }
+                    None => return empty_plan(GraphIssue.UnknownTaskEndpoint)
+                }
+            }
+            None => return empty_plan(GraphIssue.DependencyCycle)
+        }
+    }
+
+    MissionPlan(
+        task_order: order.task_ids,
+        order_length: order.length,
+        decisions: decisions,
+        decision_count: order.length,
+        scheduled_count: scheduled_count,
+        blocked_count: blocked_count,
+        unplaced_count: unplaced_count,
+        graph_issue: None,
+        planning_issue: None,
+    )
+}

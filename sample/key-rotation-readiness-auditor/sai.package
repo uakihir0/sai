@@ -1,0 +1,5 @@
+package acme:key-rotation-readiness-auditor @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Audit bounded key rotation plans and migration evidence"

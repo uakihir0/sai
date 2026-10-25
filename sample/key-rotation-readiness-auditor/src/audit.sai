@@ -1,0 +1,596 @@
+use acme:key-rotation-readiness-auditor/lookup
+use acme:key-rotation-readiness-auditor/model.{
+    AuditIssue
+    AuditPolicy
+    AuditReport
+    CatalogEntityKind
+    CatalogIssue
+    CatalogIssueKind
+    CatalogSummary
+    CustodyRecord
+    Decision
+    Finding
+    KeyRecord
+    KeyState
+    MigrationDependency
+    MigrationEvidence
+    RotationPlan
+    Workload
+}
+
+fn add_catalog_issue(
+    summary: CatalogSummary,
+    entity_kind: CatalogEntityKind,
+    entity_id: U32,
+    related_id: Option<U32>,
+    issue: CatalogIssueKind,
+) -> CatalogSummary {
+    let entry = CatalogIssue(
+        entity_kind: entity_kind,
+        entity_id: entity_id,
+        related_id: related_id,
+        issue: issue,
+    )
+    let first_issue = match summary.first_issue { Some(first) => Some(first), None => Some(entry) }
+    CatalogSummary(first_issue: first_issue, issue_count: summary.issue_count + 1)
+}
+
+fn catalog_summary(
+    keys: Array<KeyRecord, 6>,
+    custody: Array<CustodyRecord, 6>,
+    workloads: Array<Workload, 5>,
+    evidence: Array<MigrationEvidence, 4>,
+    dependencies: Array<MigrationDependency, 2>,
+    plans: Array<RotationPlan, 3>,
+) -> CatalogSummary {
+    var summary = CatalogSummary(first_issue: None, issue_count: 0)
+
+    for key in keys {
+        if lookup.key_count(keys, key.id) > 1 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.Key,
+                key.id,
+                None,
+                CatalogIssueKind.DuplicateId,
+            )
+        }
+    }
+
+    for workload in workloads {
+        if lookup.workload_count(workloads, workload.id) > 1 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.Workload,
+                workload.id,
+                None,
+                CatalogIssueKind.DuplicateId,
+            )
+        }
+        if lookup.key_count(keys, workload.source_key_id) == 0 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.Workload,
+                workload.id,
+                Some(workload.source_key_id),
+                CatalogIssueKind.UnknownKeyReference,
+            )
+        }
+        if lookup.key_count(keys, workload.target_key_id) == 0 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.Workload,
+                workload.id,
+                Some(workload.target_key_id),
+                CatalogIssueKind.UnknownKeyReference,
+            )
+        }
+    }
+
+    for item in evidence {
+        if lookup.workload_count(workloads, item.workload_id) == 0 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.MigrationEvidence,
+                item.workload_id,
+                None,
+                CatalogIssueKind.UnknownWorkloadReference,
+            )
+        }
+        if lookup.key_count(keys, item.observed_key_id) == 0 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.MigrationEvidence,
+                item.workload_id,
+                Some(item.observed_key_id),
+                CatalogIssueKind.UnknownKeyReference,
+            )
+        }
+        if lookup.evidence_count(evidence, item.workload_id) > 1 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.MigrationEvidence,
+                item.workload_id,
+                None,
+                CatalogIssueKind.DuplicateId,
+            )
+        }
+    }
+
+    for record in custody {
+        if lookup.key_count(keys, record.key_id) == 0 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.Custody,
+                record.key_id,
+                None,
+                CatalogIssueKind.UnknownCustodyKey,
+            )
+        }
+        if lookup.custody_count(custody, record.key_id) > 1 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.Custody,
+                record.key_id,
+                None,
+                CatalogIssueKind.DuplicateId,
+            )
+        }
+    }
+
+    for dependency in dependencies {
+        if dependency.prerequisite_workload_id == dependency.dependent_workload_id {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.Dependency,
+                dependency.prerequisite_workload_id,
+                Some(dependency.dependent_workload_id),
+                CatalogIssueKind.SelfDependency,
+            )
+        }
+        if lookup.workload_count(workloads, dependency.prerequisite_workload_id) == 0 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.Dependency,
+                dependency.prerequisite_workload_id,
+                Some(dependency.dependent_workload_id),
+                CatalogIssueKind.UnknownWorkloadReference,
+            )
+        }
+        if lookup.workload_count(workloads, dependency.dependent_workload_id) == 0 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.Dependency,
+                dependency.dependent_workload_id,
+                Some(dependency.prerequisite_workload_id),
+                CatalogIssueKind.UnknownWorkloadReference,
+            )
+        }
+    }
+
+    for plan in plans {
+        if plan_count(plans, plan.id) > 1 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.RotationPlan,
+                plan.id,
+                None,
+                CatalogIssueKind.DuplicateId,
+            )
+        }
+        if lookup.key_count(keys, plan.old_key_id) == 0 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.RotationPlan,
+                plan.id,
+                Some(plan.old_key_id),
+                CatalogIssueKind.UnknownKeyReference,
+            )
+        }
+        if lookup.key_count(keys, plan.new_key_id) == 0 {
+            summary = add_catalog_issue(
+                summary,
+                CatalogEntityKind.RotationPlan,
+                plan.id,
+                Some(plan.new_key_id),
+                CatalogIssueKind.UnknownKeyReference,
+            )
+        }
+    }
+
+    summary
+}
+
+fn plan_count(plans: Array<RotationPlan, 3>, plan_id: U32) -> USize {
+    var count: USize = 0
+    for plan in plans {
+        if plan.id == plan_id {
+            count += 1
+        }
+    }
+    count
+}
+
+fn affected_workload_count(workloads: Array<Workload, 5>, plan: RotationPlan) -> USize {
+    var count: USize = 0
+    for workload in workloads {
+        if affected_workload(workload, plan) {
+            count += 1
+        }
+    }
+    count
+}
+
+fn planned_overlap(plan: RotationPlan) -> Option<U32> {
+    if plan.cutover_minute <= plan.overlap_end_minute {
+        Some(plan.overlap_end_minute - plan.cutover_minute)
+    } else {
+        None
+    }
+}
+
+fn invalid_finding(
+    plan: RotationPlan,
+    workloads: Array<Workload, 5>,
+    issue: AuditIssue,
+) -> Finding {
+    Finding(
+        plan_id: plan.id,
+        plan_name: plan.name,
+        decision: Decision.PlanInvalid,
+        primary_issue: Some(issue),
+        issue_count: 1,
+        migrated_workload_count: 0,
+        affected_workload_count: affected_workload_count(workloads, plan),
+        overlap_minutes: planned_overlap(plan),
+        planned_revoke_minute: plan.revoke_minute,
+    )
+}
+
+fn key_by_id(keys: Array<KeyRecord, 6>, key_id: U32, missing: AuditIssue) -> Result<
+    KeyRecord,
+    AuditIssue,
+> {
+    match lookup.key_index(keys, key_id) {
+        Ok(index) => Ok(keys[index])
+        Err(AuditIssue.AmbiguousKeyId) => Err(AuditIssue.AmbiguousKeyId)
+        Err(_) => Err(missing)
+    }
+}
+
+fn custody_by_key(custody: Array<CustodyRecord, 6>, key_id: U32) -> Result<
+    CustodyRecord,
+    AuditIssue,
+> {
+    match lookup.custody_index(custody, key_id) {
+        Ok(index) => Ok(custody[index])
+        Err(AuditIssue.AmbiguousCustodyRecord) => Err(AuditIssue.AmbiguousCustodyRecord)
+        Err(_) => Err(AuditIssue.MissingCustodyRecord)
+    }
+}
+
+fn acceptable_evidence(
+    item: MigrationEvidence,
+    plan: RotationPlan,
+    policy: AuditPolicy,
+    now: U32,
+) -> Bool {
+    if (
+        item.observed_key_id != plan.new_key_id
+        or not item.attested
+        or item.observed_minute < plan.cutover_minute
+        or item.observed_minute > plan.overlap_end_minute
+        or item.observed_minute > now
+    ) {
+        return false
+    }
+    now - item.observed_minute <= policy.maximum_evidence_age_minutes
+}
+
+fn workload_evidence_issue(
+    workloads: Array<Workload, 5>,
+    evidence: Array<MigrationEvidence, 4>,
+    plan: RotationPlan,
+    workload: Workload,
+    policy: AuditPolicy,
+    now: U32,
+) -> Option<AuditIssue> {
+    if lookup.workload_count(workloads, workload.id) > 1 {
+        return Some(AuditIssue.DuplicateWorkloadId)
+    }
+    if workload.target_key_id != plan.new_key_id {
+        return Some(AuditIssue.UnexpectedTargetKey)
+    }
+
+    match lookup.evidence_index(evidence, workload.id) {
+        Err(AuditIssue.AmbiguousMigrationEvidence) => Some(AuditIssue.AmbiguousMigrationEvidence)
+        Err(_) => {
+            if now > plan.grace_deadline_minute {
+                Some(AuditIssue.GraceExpiredBeforeMigration)
+            } else {
+                Some(AuditIssue.MissingMigrationEvidence)
+            }
+        }
+        Ok(index) => {
+            let item = evidence[index]
+            if item.observed_key_id != plan.new_key_id {
+                Some(AuditIssue.WrongKeyObserved)
+            } else if not item.attested {
+                Some(AuditIssue.MigrationNotAttested)
+            } else if item.observed_minute > now {
+                Some(AuditIssue.EvidenceFromFuture)
+            } else if (
+                item.observed_minute < plan.cutover_minute
+                or item.observed_minute > plan.overlap_end_minute
+            ) {
+                Some(AuditIssue.EvidenceOutsideOverlap)
+            } else if now - item.observed_minute > policy.maximum_evidence_age_minutes {
+                Some(AuditIssue.EvidenceStale)
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn affected_workload(workload: Workload, plan: RotationPlan) -> Bool {
+    workload.source_key_id == plan.old_key_id
+}
+
+fn matches_plan_key_pair(workload: Workload, plan: RotationPlan) -> Bool {
+    workload.source_key_id == plan.old_key_id and workload.target_key_id == plan.new_key_id
+}
+
+fn dependency_issue_count(
+    workloads: Array<Workload, 5>,
+    evidence: Array<MigrationEvidence, 4>,
+    dependencies: Array<MigrationDependency, 2>,
+    plan: RotationPlan,
+    policy: AuditPolicy,
+    now: U32,
+) -> USize {
+    var issue_count: USize = 0
+    for dependency in dependencies {
+        match (
+            lookup.workload_index(workloads, dependency.prerequisite_workload_id),
+            lookup.workload_index(workloads, dependency.dependent_workload_id),
+        ) {
+            (Ok(prerequisite_index), Ok(dependent_index)) => {
+                let prerequisite = workloads[prerequisite_index]
+                let dependent = workloads[dependent_index]
+                if (
+                    matches_plan_key_pair(prerequisite, plan)
+                    and matches_plan_key_pair(dependent, plan)
+                ) {
+                    match (
+                        lookup.evidence_index(evidence, prerequisite.id),
+                        lookup.evidence_index(evidence, dependent.id),
+                    ) {
+                        (Ok(prerequisite_evidence_index), Ok(dependent_evidence_index)) => {
+                            let prerequisite_evidence = evidence[prerequisite_evidence_index]
+                            let dependent_evidence = evidence[dependent_evidence_index]
+                            if (
+                                acceptable_evidence(prerequisite_evidence, plan, policy, now)
+                                and acceptable_evidence(dependent_evidence, plan, policy, now)
+                                and prerequisite_evidence.observed_minute
+                                    >= dependent_evidence.observed_minute
+                            ) {
+                                issue_count += 1
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    issue_count
+}
+
+fn audit_plan(
+    keys: Array<KeyRecord, 6>,
+    custody: Array<CustodyRecord, 6>,
+    workloads: Array<Workload, 5>,
+    evidence: Array<MigrationEvidence, 4>,
+    dependencies: Array<MigrationDependency, 2>,
+    plans: Array<RotationPlan, 3>,
+    plan: RotationPlan,
+    policy: AuditPolicy,
+    now: U32,
+) -> Finding {
+    if plan_count(plans, plan.id) > 1 {
+        // The canonical catalog audit below reports duplicates. Keep the
+        // plan-level result deterministic when an ambiguous plan is selected.
+        return invalid_finding(plan, workloads, AuditIssue.DuplicatePlanId)
+    }
+    if plan.old_key_id == plan.new_key_id {
+        return invalid_finding(plan, workloads, AuditIssue.SameKeyPair)
+    }
+
+    let old_key = match key_by_id(keys, plan.old_key_id, AuditIssue.MissingOldKey) {
+        Ok(key) => key
+        Err(issue) => return invalid_finding(plan, workloads, issue)
+    }
+    let new_key = match key_by_id(keys, plan.new_key_id, AuditIssue.MissingNewKey) {
+        Ok(key) => key
+        Err(issue) => return invalid_finding(plan, workloads, issue)
+    }
+
+    if (
+        old_key.valid_from_minute > old_key.expires_minute
+        or new_key.valid_from_minute > new_key.expires_minute
+    ) {
+        return invalid_finding(plan, workloads, AuditIssue.InvalidKeyLifetime)
+    }
+    if old_key.state != KeyState.Active {
+        return invalid_finding(plan, workloads, AuditIssue.OldKeyNotActive)
+    }
+    if (
+        old_key.valid_from_minute > plan.cutover_minute
+        or old_key.expires_minute < plan.cutover_minute
+    ) {
+        return invalid_finding(plan, workloads, AuditIssue.OldKeyNotValidAtCutover)
+    }
+    if (
+        new_key.state == KeyState.Revoked
+        or (new_key.state == KeyState.Staged and now >= plan.cutover_minute)
+    ) {
+        return invalid_finding(plan, workloads, AuditIssue.NewKeyNotAvailable)
+    }
+    if (
+        new_key.valid_from_minute > plan.cutover_minute
+        or new_key.expires_minute < plan.cutover_minute
+    ) {
+        return invalid_finding(plan, workloads, AuditIssue.TargetKeyNotValidAtCutover)
+    }
+    if (
+        plan.cutover_minute > plan.overlap_end_minute
+        or plan.overlap_end_minute > plan.grace_deadline_minute
+        or plan.grace_deadline_minute > plan.revoke_minute
+    ) {
+        return invalid_finding(plan, workloads, AuditIssue.InvalidRotationWindow)
+    }
+    if plan.overlap_end_minute - plan.cutover_minute < policy.minimum_overlap_minutes {
+        return invalid_finding(plan, workloads, AuditIssue.OverlapTooShort)
+    }
+    let required_new_key_valid_until = if now > plan.revoke_minute {
+        now
+    } else {
+        plan.revoke_minute
+    }
+    if new_key.expires_minute < required_new_key_valid_until {
+        return invalid_finding(plan, workloads, AuditIssue.NewKeyExpiresBeforeRequiredValidity)
+    }
+    if old_key.expires_minute < plan.revoke_minute {
+        return invalid_finding(plan, workloads, AuditIssue.OldKeyExpiresBeforeRevocation)
+    }
+
+    let old_custody = match custody_by_key(custody, old_key.id) {
+        Ok(record) => record
+        Err(issue) => return invalid_finding(plan, workloads, issue)
+    }
+    let new_custody = match custody_by_key(custody, new_key.id) {
+        Ok(record) => record
+        Err(issue) => return invalid_finding(plan, workloads, issue)
+    }
+    if not old_custody.escrow_verified or not new_custody.escrow_verified {
+        return invalid_finding(plan, workloads, AuditIssue.EscrowNotVerified)
+    }
+    if not old_custody.recovery_tested or not new_custody.recovery_tested {
+        return invalid_finding(plan, workloads, AuditIssue.RecoveryNotTested)
+    }
+    if (
+        old_custody.custodian_team_id == old_key.owner_team_id
+        or new_custody.custodian_team_id == new_key.owner_team_id
+        or old_custody.custodian_team_id == new_custody.custodian_team_id
+    ) {
+        return invalid_finding(plan, workloads, AuditIssue.CustodianNotIndependent)
+    }
+
+    if affected_workload_count(workloads, plan) == 0 {
+        return invalid_finding(plan, workloads, AuditIssue.NoAffectedWorkloads)
+    }
+
+    var affected_count: USize = 0
+    var migrated_count: USize = 0
+    var issue_count: USize = 0
+    var first_issue: Option<AuditIssue> = None
+
+    for workload in workloads {
+        if affected_workload(workload, plan) {
+            affected_count += 1
+            let issue = workload_evidence_issue(workloads, evidence, plan, workload, policy, now)
+            match issue {
+                Some(value) => {
+                    if first_issue == None {
+                        first_issue = Some(value)
+                    }
+                    issue_count += 1
+                }
+                None => {
+                    migrated_count += 1
+                }
+            }
+        }
+    }
+
+    let dependency_issues =
+        dependency_issue_count(workloads, evidence, dependencies, plan, policy, now)
+    if dependency_issues > 0 {
+        if first_issue == None {
+            first_issue = Some(AuditIssue.DependencyOrderViolation)
+        }
+        issue_count += dependency_issues
+    }
+
+    if now > plan.revoke_minute {
+        if first_issue == None {
+            first_issue = Some(AuditIssue.RevocationOverdue)
+        }
+        issue_count += 1
+    }
+
+    let decision = if issue_count == 0 {
+        Decision.Ready
+    } else if now > plan.grace_deadline_minute {
+        Decision.PlanInvalid
+    } else {
+        Decision.Waiting
+    }
+    Finding(
+        plan_id: plan.id,
+        plan_name: plan.name,
+        decision: decision,
+        primary_issue: first_issue,
+        issue_count: issue_count,
+        migrated_workload_count: migrated_count,
+        affected_workload_count: affected_count,
+        overlap_minutes: Some(plan.overlap_end_minute - plan.cutover_minute),
+        planned_revoke_minute: plan.revoke_minute,
+    )
+}
+
+pub fn audit_all(
+    keys: Array<KeyRecord, 6>,
+    custody: Array<CustodyRecord, 6>,
+    workloads: Array<Workload, 5>,
+    evidence: Array<MigrationEvidence, 4>,
+    dependencies: Array<MigrationDependency, 2>,
+    plans: Array<RotationPlan, 3>,
+    policy: AuditPolicy,
+    now: U32,
+) -> AuditReport {
+    var findings = Array<Option<Finding>, 3>.filled(None)
+    var ready_count: USize = 0
+    var waiting_count: USize = 0
+    var invalid_count: USize = 0
+    let summary = catalog_summary(keys, custody, workloads, evidence, dependencies, plans)
+
+    for index in 0..plans.len() {
+        let plan = plans[index]
+        let finding =
+            audit_plan(keys, custody, workloads, evidence, dependencies, plans, plan, policy, now)
+        findings[index] = Some(finding)
+        match finding.decision {
+            Decision.Ready => {
+                ready_count += 1
+            }
+            Decision.Waiting => {
+                waiting_count += 1
+            }
+            Decision.PlanInvalid => {
+                invalid_count += 1
+            }
+        }
+    }
+
+    AuditReport(
+        findings: findings,
+        finding_count: plans.len(),
+        catalog_summary: summary,
+        ready_count: ready_count,
+        waiting_count: waiting_count,
+        invalid_count: invalid_count,
+    )
+}
