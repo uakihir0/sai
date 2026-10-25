@@ -1,0 +1,48 @@
+use acme:expense-reimbursement-auditor/model.{
+    ExpenseClaim
+    ExpenseKind
+    Policy
+    ReceiptEvidence
+    ReviewReason
+}
+
+pub fn requires_itemized_receipt(kind: ExpenseKind) -> Bool {
+    match kind {
+        ExpenseKind.Lodging => true
+        ExpenseKind.Airfare => true
+        ExpenseKind.Meal => false
+        ExpenseKind.GroundTransport => false
+        ExpenseKind.Alcohol => false
+    }
+}
+
+pub fn receipt_issue(policy: Policy, claim: ExpenseClaim) -> Option<ReviewReason> {
+    if (
+        (claim.receipt_evidence == ReceiptEvidence.Missing and claim.receipt_reference != 0)
+        or (claim.receipt_evidence != ReceiptEvidence.Missing and claim.receipt_reference == 0)
+    ) {
+        return Some(ReviewReason.MissingReceiptReference)
+    }
+    if (
+        requires_itemized_receipt(claim.kind) and claim.receipt_evidence != ReceiptEvidence.Itemized
+    ) {
+        return Some(ReviewReason.ItemizedReceiptRequired)
+    }
+    if (
+        claim.amount_cents >= policy.receipt_threshold_cents
+        and claim.receipt_evidence == ReceiptEvidence.Missing
+    ) {
+        return Some(ReviewReason.ReceiptRequired)
+    }
+    None
+}
+
+pub fn category_limit_cents(policy: Policy, claim: ExpenseClaim) -> U32 {
+    match claim.kind {
+        ExpenseKind.Meal => policy.daily_meal_limit_cents
+        ExpenseKind.Lodging => policy.lodging_per_night_limit_cents * claim.nights
+        ExpenseKind.Airfare => policy.airfare_claim_limit_cents
+        ExpenseKind.GroundTransport => policy.ground_transport_claim_limit_cents
+        ExpenseKind.Alcohol => 0
+    }
+}

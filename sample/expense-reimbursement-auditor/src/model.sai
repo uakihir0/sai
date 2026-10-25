@@ -1,0 +1,127 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ExpenseKind {
+    Meal
+    Lodging
+    Airfare
+    GroundTransport
+    Alcohol
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReceiptEvidence {
+    Missing
+    Summary
+    Itemized
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum DecisionStatus {
+    Approved
+    Adjusted
+    Held
+    Denied
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ReviewReason {
+    UnknownEmployee
+    InactiveEmployee
+    UnknownTrip
+    TripEmployeeMismatch
+    OutsideTripWindow
+    MissingBusinessPurpose
+    ZeroAmount
+    ZeroNights
+    ReceiptRequired
+    ItemizedReceiptRequired
+    MissingReceiptReference
+    DuplicateReceipt
+    ProhibitedExpense
+    DailyMealLimit
+    CategoryLimit
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Employee {
+    pub id: U32
+    pub active: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BusinessTrip {
+    pub id: U32
+    pub employee_id: U32
+    pub start_day: U32
+    pub end_day: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ExpenseClaim {
+    pub id: U32
+    pub employee_id: U32
+    pub trip_id: U32
+    pub expense_day: U32
+    pub purchase_minute: U32
+    pub kind: ExpenseKind
+    pub merchant: Str
+    pub amount_cents: U32
+    pub nights: U32
+    pub business_purpose_present: Bool
+    pub receipt_reference: U32
+    pub receipt_evidence: ReceiptEvidence
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Policy {
+    pub daily_meal_limit_cents: U32
+    pub lodging_per_night_limit_cents: U32
+    pub airfare_claim_limit_cents: U32
+    pub ground_transport_claim_limit_cents: U32
+    pub receipt_threshold_cents: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ReimbursementBatch {
+    pub employees: Array<Option<Employee>, 2>
+    pub employee_count: USize
+    pub trips: Array<Option<BusinessTrip>, 2>
+    pub trip_count: USize
+    pub claims: Array<Option<ExpenseClaim>, 16>
+    pub claim_count: USize
+    pub policy: Policy
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ClaimDecision {
+    pub claim_id: U32
+    pub employee_id: U32
+    pub trip_id: U32
+    pub expense_day: U32
+    pub purchase_minute: U32
+    pub kind: ExpenseKind
+    pub merchant: Str
+    pub receipt_reference: U32
+    pub gross_cents: U32
+    pub reimbursable_cents: U32
+    pub status: DecisionStatus
+    pub reason: Option<ReviewReason>
+    pub duplicate_of_claim_id: Option<U32>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditTotals {
+    pub claim_count: USize
+    pub approved_count: USize
+    pub adjusted_count: USize
+    pub held_count: USize
+    pub denied_count: USize
+    pub gross_cents: U32
+    pub reimbursable_cents: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ReimbursementAudit {
+    pub decisions: Array<Option<ClaimDecision>, 16>
+    pub decision_count: USize
+    pub totals: AuditTotals
+}

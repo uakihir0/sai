@@ -1,0 +1,206 @@
+use acme:expense-reimbursement-auditor/lookups
+use acme:expense-reimbursement-auditor/model.{
+    ClaimDecision
+    DecisionStatus
+    ExpenseClaim
+    ExpenseKind
+    ReimbursementBatch
+    ReviewReason
+}
+use acme:expense-reimbursement-auditor/policy
+
+fn decision(
+    claim: ExpenseClaim,
+    status: DecisionStatus,
+    reason: Option<ReviewReason>,
+    reimbursable_cents: U32,
+    duplicate_of_claim_id: Option<U32>,
+) -> ClaimDecision {
+    ClaimDecision(
+        claim_id: claim.id,
+        employee_id: claim.employee_id,
+        trip_id: claim.trip_id,
+        expense_day: claim.expense_day,
+        purchase_minute: claim.purchase_minute,
+        kind: claim.kind,
+        merchant: claim.merchant,
+        receipt_reference: claim.receipt_reference,
+        gross_cents: claim.amount_cents,
+        reimbursable_cents: reimbursable_cents,
+        status: status,
+        reason: reason,
+        duplicate_of_claim_id: duplicate_of_claim_id,
+    )
+}
+
+fn previous_meal_cents(
+    previous: Array<Option<ClaimDecision>, 16>,
+    previous_count: USize,
+    employee_id: U32,
+    expense_day: U32,
+) -> U32 {
+    var total: U32 = 0
+    for index in 0..previous_count {
+        let earlier = previous[index].unwrap()
+        if (
+            earlier.employee_id == employee_id
+            and earlier.expense_day == expense_day
+            and earlier.kind == ExpenseKind.Meal
+            and (
+                earlier.status == DecisionStatus.Approved
+                or earlier.status == DecisionStatus.Adjusted
+            )
+        ) {
+            total += earlier.reimbursable_cents
+        }
+    }
+    total
+}
+
+fn duplicate_receipt_claim(
+    previous: Array<Option<ClaimDecision>, 16>,
+    previous_count: USize,
+    receipt_reference: U32,
+) -> Option<U32> {
+    if receipt_reference == 0 {
+        return None
+    }
+    for index in 0..previous_count {
+        let earlier = previous[index].unwrap()
+        if (
+            earlier.receipt_reference == receipt_reference
+            and earlier.status != DecisionStatus.Denied
+        ) {
+            return Some(earlier.claim_id)
+        }
+    }
+    None
+}
+
+pub fn review(
+    batch: ReimbursementBatch,
+    claim: ExpenseClaim,
+    previous: Array<Option<ClaimDecision>, 16>,
+    previous_count: USize,
+) -> ClaimDecision {
+    let employee_index = match lookups.employee_index(batch, claim.employee_id) {
+        Some(index) => index
+        None => {
+            return decision(claim, DecisionStatus.Held, Some(ReviewReason.UnknownEmployee), 0, None)
+        }
+    }
+    let employee = batch.employees[employee_index].unwrap()
+    if not employee.active {
+        return decision(claim, DecisionStatus.Held, Some(ReviewReason.InactiveEmployee), 0, None)
+    }
+
+    let trip_index = match lookups.trip_index(batch, claim.trip_id) {
+        Some(index) => index
+        None => {
+            return decision(claim, DecisionStatus.Held, Some(ReviewReason.UnknownTrip), 0, None)
+        }
+    }
+    let trip = batch.trips[trip_index].unwrap()
+    if trip.employee_id != claim.employee_id {
+        return decision(
+            claim,
+            DecisionStatus.Held,
+            Some(ReviewReason.TripEmployeeMismatch),
+            0,
+            None,
+        )
+    }
+    if claim.expense_day < trip.start_day or claim.expense_day > trip.end_day {
+        return decision(claim, DecisionStatus.Held, Some(ReviewReason.OutsideTripWindow), 0, None)
+    }
+    if not claim.business_purpose_present {
+        return decision(
+            claim,
+            DecisionStatus.Held,
+            Some(ReviewReason.MissingBusinessPurpose),
+            0,
+            None,
+        )
+    }
+    if claim.amount_cents == 0 {
+        return decision(claim, DecisionStatus.Held, Some(ReviewReason.ZeroAmount), 0, None)
+    }
+    if claim.kind == ExpenseKind.Alcohol {
+        return decision(claim, DecisionStatus.Denied, Some(ReviewReason.ProhibitedExpense), 0, None)
+    }
+    if claim.kind == ExpenseKind.Lodging and claim.nights == 0 {
+        return decision(claim, DecisionStatus.Held, Some(ReviewReason.ZeroNights), 0, None)
+    }
+
+    match policy.receipt_issue(batch.policy, claim) {
+        Some(reason) => {
+            return decision(claim, DecisionStatus.Held, Some(reason), 0, None)
+        }
+        None => {}
+    }
+
+    match duplicate_receipt_claim(previous, previous_count, claim.receipt_reference) {
+        Some(earlier_claim_id) => {
+            return decision(
+                claim,
+                DecisionStatus.Held,
+                Some(ReviewReason.DuplicateReceipt),
+                0,
+                Some(earlier_claim_id),
+            )
+        }
+        None => {}
+    }
+
+    if claim.kind == ExpenseKind.Meal {
+        let previously_allocated =
+            previous_meal_cents(previous, previous_count, claim.employee_id, claim.expense_day)
+        let remaining = if previously_allocated < batch.policy.daily_meal_limit_cents {
+            batch.policy.daily_meal_limit_cents - previously_allocated
+        } else {
+            0
+        }
+        if remaining == 0 {
+            return decision(
+                claim,
+                DecisionStatus.Denied,
+                Some(ReviewReason.DailyMealLimit),
+                0,
+                None,
+            )
+        }
+        let reimbursable_cents = if claim.amount_cents < remaining {
+            claim.amount_cents
+        } else {
+            remaining
+        }
+        if reimbursable_cents < claim.amount_cents {
+            return decision(
+                claim,
+                DecisionStatus.Adjusted,
+                Some(ReviewReason.DailyMealLimit),
+                reimbursable_cents,
+                None,
+            )
+        }
+        return decision(claim, DecisionStatus.Approved, None, reimbursable_cents, None)
+    }
+
+    let limit = policy.category_limit_cents(batch.policy, claim)
+    let reimbursable_cents = if claim.amount_cents < limit {
+        claim.amount_cents
+    } else {
+        limit
+    }
+    if reimbursable_cents < claim.amount_cents {
+        decision(
+            claim,
+            DecisionStatus.Adjusted,
+            Some(ReviewReason.CategoryLimit),
+            reimbursable_cents,
+            None,
+        )
+    } else {
+        decision(claim, DecisionStatus.Approved, None, reimbursable_cents, None)
+    }
+}

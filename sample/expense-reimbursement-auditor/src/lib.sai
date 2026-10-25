@@ -1,0 +1,65 @@
+use acme:expense-reimbursement-auditor/audit
+use acme:expense-reimbursement-auditor/fixtures
+use acme:expense-reimbursement-auditor/model.{DecisionStatus, ReimbursementAudit, ReviewReason}
+
+pub fn sample_audit() -> ReimbursementAudit {
+    audit.audit(fixtures.sample_batch())
+}
+
+test "chronological audit applies per-diem and category caps" {
+    let result = sample_audit()
+    assert result.decision_count == 16
+    assert result.totals.claim_count == 16
+    assert result.totals.approved_count == 2
+    assert result.totals.adjusted_count == 3
+    assert result.totals.held_count == 9
+    assert result.totals.denied_count == 2
+    assert result.totals.gross_cents == 240200
+    assert result.totals.reimbursable_cents == 145700
+
+    assert result.decisions[0].unwrap().claim_id == 1001
+    assert result.decisions[0].unwrap().status == DecisionStatus.Adjusted
+    assert result.decisions[0].unwrap().reimbursable_cents == 80000
+    assert result.decisions[0].unwrap().reason == Some(ReviewReason.CategoryLimit)
+
+    assert result.decisions[1].unwrap().claim_id == 1002
+    assert result.decisions[1].unwrap().status == DecisionStatus.Approved
+    assert result.decisions[2].unwrap().claim_id == 1003
+    assert result.decisions[2].unwrap().reimbursable_cents == 3300
+    assert result.decisions[2].unwrap().reason == Some(ReviewReason.DailyMealLimit)
+
+    assert result.decisions[3].unwrap().claim_id == 1016
+    assert result.decisions[3].unwrap().status == DecisionStatus.Denied
+    assert result.decisions[3].unwrap().reason == Some(ReviewReason.DailyMealLimit)
+    assert result.decisions[3].unwrap().reimbursable_cents == 0
+
+    assert result.decisions[5].unwrap().claim_id == 1004
+    assert result.decisions[5].unwrap().status == DecisionStatus.Adjusted
+    assert result.decisions[5].unwrap().reimbursable_cents == 54000
+}
+
+test "evidence and identity exceptions are held without adding payout" {
+    let result = sample_audit()
+    assert result.decisions[4].unwrap().claim_id == 1013
+    assert result.decisions[4].unwrap().reason == Some(ReviewReason.UnknownEmployee)
+
+    assert result.decisions[7].unwrap().claim_id == 1006
+    assert result.decisions[7].unwrap().reason == Some(ReviewReason.DuplicateReceipt)
+    assert result.decisions[7].unwrap().duplicate_of_claim_id == Some(1005)
+
+    assert result.decisions[9].unwrap().reason == Some(ReviewReason.TripEmployeeMismatch)
+    assert result.decisions[10].unwrap().reason == Some(ReviewReason.MissingBusinessPurpose)
+    assert result.decisions[11].unwrap().reason == Some(ReviewReason.ItemizedReceiptRequired)
+    assert result.decisions[12].unwrap().reason == Some(ReviewReason.ItemizedReceiptRequired)
+    assert result.decisions[13].unwrap().reason == Some(ReviewReason.ReceiptRequired)
+    assert result.decisions[14].unwrap().reason == Some(ReviewReason.OutsideTripWindow)
+    assert result.decisions[15].unwrap().reason == Some(ReviewReason.InactiveEmployee)
+}
+
+test "prohibited expenses are denied and do not enter the suggested reimbursement total" {
+    let result = sample_audit()
+    assert result.decisions[8].unwrap().claim_id == 1007
+    assert result.decisions[8].unwrap().status == DecisionStatus.Denied
+    assert result.decisions[8].unwrap().reason == Some(ReviewReason.ProhibitedExpense)
+    assert result.decisions[8].unwrap().reimbursable_cents == 0
+}
