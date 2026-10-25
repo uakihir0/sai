@@ -13322,14 +13322,16 @@ fn nominal_field_type_is_region_free(
 /// allowlist are understood. Nominal type arguments are recursively proven
 /// region-free. Function pointers are excluded from implicit-region
 /// inference; their own lowering still rejects unsupported borrows and
-/// effects. Aliases, unvalidated nominals, borrows, and incomplete or
-/// unknown paths fail closed.
+/// effects. Only direct local aliases in the validated map are understood;
+/// their use-site arguments are recursively checked. Unvalidated nominals,
+/// borrows, and incomplete or unknown paths fail closed.
 fn local_record_field_type_is_region_free_for_array_projection(
     ty: &Ty<'_>,
     owner: OwnerId,
     paths: &HashMap<HirId, PathRes>,
     local_nominals: &HashMap<DefId, sai_ty::lower_ty::LocalNominalDef>,
     type_parameters: &HashSet<DefId>,
+    local_aliases: Option<&HashMap<DefId, sai_ty::lower_ty::LocalTypeAlias>>,
 ) -> bool {
     if ty.hir_id.owner != owner {
         return false;
@@ -13343,6 +13345,7 @@ fn local_record_field_type_is_region_free_for_array_projection(
                 paths,
                 local_nominals,
                 type_parameters,
+                local_aliases,
             )
         }),
         // The declaration implicit-region rule explicitly excludes function
@@ -13407,6 +13410,7 @@ fn local_record_field_type_is_region_free_for_array_projection(
                                     paths,
                                     local_nominals,
                                     type_parameters,
+                                    local_aliases,
                                 )
                             }
                             // Const syntax cannot carry a borrow or region.
@@ -13445,6 +13449,7 @@ fn local_record_field_type_is_region_free_for_array_projection(
                                         paths,
                                         local_nominals,
                                         type_parameters,
+                                        local_aliases,
                                     )
                                 }
                                 GenericArg::Const(_) => true,
@@ -13455,6 +13460,30 @@ fn local_record_field_type_is_region_free_for_array_projection(
                     path.segments.len() == 1
                         && segment.args.is_none()
                         && type_parameters.contains(&def_id)
+                }
+                Res::Def(DefKind::Alias, def_id) => {
+                    let Some(alias) = local_aliases.and_then(|aliases| aliases.get(&def_id)) else {
+                        return false;
+                    };
+                    match alias.type_params.len() {
+                        0 => segment.args.is_none(),
+                        expected => segment.args.is_some_and(|arguments| {
+                            arguments.args.len() == expected
+                                && arguments.args.iter().all(|argument| match argument {
+                                    GenericArg::Type(ty) => {
+                                        local_record_field_type_is_region_free_for_array_projection(
+                                            ty,
+                                            owner,
+                                            paths,
+                                            local_nominals,
+                                            type_parameters,
+                                            local_aliases,
+                                        )
+                                    }
+                                    GenericArg::Const(_) | GenericArg::Binding { .. } => false,
+                                })
+                        }),
+                    }
                 }
                 Res::Def(DefKind::Struct | DefKind::Enum, def_id)
                     if local_nominals.contains_key(&def_id) =>
@@ -13468,6 +13497,7 @@ fn local_record_field_type_is_region_free_for_array_projection(
                                     paths,
                                     local_nominals,
                                     type_parameters,
+                                    local_aliases,
                                 )
                             }
                             // Const arguments cannot contain regions. The
@@ -18906,6 +18936,31 @@ impl RootDatabase {
             .clone()
             .map_err(OwnerControlFlowResolutionError::PrimitivePrelude)?;
         let local_nominal_definitions = self.local_nominal_definitions(collection, snapshot);
+        let validated_unit_enum_definitions = collection
+            .local_interface_enum_projections
+            .iter()
+            .filter_map(|projection| match projection {
+                LocalInterfaceEnumAdtProjection::Unit(definition) => {
+                    Some(definition.adt_def().def_id())
+                }
+                LocalInterfaceEnumAdtProjection::Flags { .. }
+                | LocalInterfaceEnumAdtProjection::Unsupported { .. } => None,
+            })
+            .collect::<HashSet<_>>();
+        let fallback_module_members = ModuleMemberIndex::new(std::iter::once(collection.scopes()));
+        let alias_module_members = members.unwrap_or(&fallback_module_members);
+        let local_source_graph_packages = HashSet::from([collection.module_tree.package]);
+        let source_graph_packages = member_scopes
+            .map(|scopes| &scopes.source_graph_packages)
+            .unwrap_or(&local_source_graph_packages);
+        let local_type_alias_definitions = self.local_type_alias_definitions(
+            collection,
+            snapshot,
+            alias_module_members,
+            source_graph_packages,
+            &validated_unit_enum_definitions,
+            &local_nominal_definitions,
+        );
         let mut owners = Vec::with_capacity(descriptors.len());
 
         for descriptor in descriptors {
@@ -19125,6 +19180,7 @@ impl RootDatabase {
                     Some(self.lower_local_record_field_types(
                         collection,
                         &local_nominal_definitions,
+                        &local_type_alias_definitions,
                         descriptor,
                         &expected_path,
                         &inputs,
@@ -19197,6 +19253,7 @@ impl RootDatabase {
         &self,
         collection: &Phase1PackageScopesCollection,
         local_nominals: &HashMap<DefId, sai_ty::lower_ty::LocalNominalDef>,
+        local_aliases: &HashMap<DefId, sai_ty::lower_ty::LocalTypeAlias>,
         descriptor: TopLevelOwnerDescriptor,
         expected_path: &DefPath,
         inputs: &CurrentOwnerInputs,
@@ -19297,6 +19354,7 @@ impl RootDatabase {
             .iter()
             .map(|(def_id, _)| *def_id)
             .collect::<HashSet<_>>();
+        let field_local_aliases = validated_type_params.is_empty().then_some(local_aliases);
 
         let has_implicit_region_parameter = fields
             .iter()
@@ -19311,6 +19369,7 @@ impl RootDatabase {
                 path_resolution.paths(),
                 local_nominals,
                 &type_parameter_ids,
+                field_local_aliases,
             )
         });
 
@@ -19349,6 +19408,11 @@ impl RootDatabase {
                 has_implicit_region_parameter,
             )
             .with_field_local_nominals(local_nominals);
+            let context = if let Some(aliases) = field_local_aliases {
+                context.with_field_local_type_aliases(aliases)
+            } else {
+                context
+            };
             let Ok(context) = context.with_field_type_params(&validated_type_params) else {
                 return unsupported(LocalRecordFieldTypesUnsupportedReason::GenericParameters);
             };
@@ -38784,6 +38848,382 @@ property "shared"() {}
         assert!(
             !local_record_field_type_has_explicit_borrow(foreign_segment_ty, record_owner),
             "a path segment from another owner fails closed"
+        );
+    }
+
+    #[test]
+    fn local_record_field_projection_expands_only_validated_local_generic_aliases() {
+        fn field<'a>(
+            database: &RootDatabase,
+            fields: &'a LocalRecordFieldTypesProjection,
+            name: &str,
+        ) -> &'a LocalRecordFieldTypeProjection {
+            fields
+                .fields()
+                .unwrap_or_else(|| panic!("record projection is unsupported: {fields:?}"))
+                .iter()
+                .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("field {name:?} exists"))
+        }
+
+        let root = concat!(
+            "use acme:phase1/child as child_alias\n",
+            "type Pair<T> = (T, Bool)\n",
+            "type Identity<T> = T\n",
+            "type ArrayAlias<T> = Array<T, 4>\n",
+            "type HiddenBorrow<T> = borrow T\n",
+            "type Chained<T> = Identity<T>\n",
+            "type Bounded<T: Copy> = T\n",
+            "type Unused<T, U> = T\n",
+            "type ConstAlias<const N: USize> = Array<U8, N>\n",
+            "type Malformed<T:> = T\n",
+            "type ValidAliases {\n",
+            "  pair: Pair<U8>,\n",
+            "  array: ArrayAlias<U16>,\n",
+            "  sibling: Array<U32, 2>,\n",
+            "  external: child_alias.External<U32>,\n",
+            "}\n",
+            "type BorrowArgument {\n",
+            "  identity: Identity<borrow Bool>,\n",
+            "  array: ArrayAlias<U8>,\n",
+            "  sibling: Array<U8, 2>,\n",
+            "}\n",
+            "type UnsupportedAliases {\n",
+            "  hidden_borrow: HiddenBorrow<Bool>,\n",
+            "  chained: Chained<U8>,\n",
+            "  bounded: Bounded<U8>,\n",
+            "  unused: Unused<U8, Bool>,\n",
+            "  const_alias: ConstAlias<4>,\n",
+            "  malformed: Malformed<U8>,\n",
+            "  missing: Pair,\n",
+            "  extra: Pair<U8, Bool>,\n",
+            "  wrong_kind: Pair<4>,\n",
+            "  array: Array<U8, 2>,\n",
+            "}\n",
+            "type GenericRecord<T> { value: Identity<T> }\n",
+        );
+        let child = "pub type External<T> = (T, U8)\n";
+        let (mut database, module_tree, snapshot, _) =
+            phase1_fixture(root.as_bytes(), child.as_bytes());
+        let graph = phase1_root_only_graph();
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("the package graph is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot package scopes collect");
+        let member_scopes = database
+            .collect_active_source_member_scopes(&collection, &graph, &[])
+            .expect("the local source member closure validates");
+        let resolved = database
+            .resolve_type_owner_paths_with_member_scopes(
+                &collection,
+                &module_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("type owner paths resolve with the package's source members");
+
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("the package DefPath interner exists"),
+        );
+        let owner_for = |name: &str| {
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::Struct
+                        && def_paths
+                            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                path.data().last().is_some_and(|component| {
+                                    matches!(
+                                        component.data,
+                                        DefPathData::TypeNs(symbol)
+                                            if database.symbols.resolve(symbol).ok().as_deref()
+                                                == Some(name)
+                                    )
+                                })
+                            })
+                })
+                .unwrap_or_else(|| panic!("record {name:?} exists"))
+                .owner
+        };
+        let field_types = |name: &str| {
+            resolved
+                .local_record_field_types_with_scopes(
+                    &collection,
+                    Some(&member_scopes),
+                    None,
+                    owner_for(name),
+                )
+                .expect("the exact collection and member scopes guard field results")
+                .expect("the named local record has a field projection")
+        };
+        let valid = field_types("ValidAliases");
+        let pair = field(&database, valid, "pair")
+            .ty()
+            .expect("a direct generic alias expands at its field use site");
+        let sai_ty::ty::TyKind::Tuple(pair) = pair.kind() else {
+            panic!("the generic alias template keeps its tuple structure");
+        };
+        assert!(matches!(
+            pair[0].kind(),
+            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+        ));
+        assert!(matches!(pair[1].kind(), sai_ty::ty::TyKind::Bool));
+        assert!(matches!(
+            field(&database, valid, "array")
+                .ty()
+                .expect("validated array alias lowers")
+                .kind(),
+            sai_ty::ty::TyKind::Array(
+                element,
+                sai_ty::ty::Const::Value(4)
+            ) if matches!(element.kind(), sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U16))
+        ));
+        assert!(matches!(
+            field(&database, valid, "sibling")
+                .ty()
+                .expect("the sibling literal array lowers")
+                .kind(),
+            sai_ty::ty::TyKind::Array(
+                element,
+                sai_ty::ty::Const::Value(2)
+            ) if matches!(element.kind(), sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U32))
+        ));
+        assert!(matches!(
+            field(&database, valid, "external")
+                .ty()
+                .expect("a same-package alias declared in another module expands")
+                .kind(),
+            sai_ty::ty::TyKind::Tuple(elements)
+                if matches!(elements[0].kind(), sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U32))
+                    && matches!(elements[1].kind(), sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8))
+        ));
+
+        let borrowed_owner = owner_for("BorrowArgument");
+        let borrowed = field_types("BorrowArgument");
+        assert!(
+            matches!(
+                borrowed.type_of_field(field(&database, borrowed, "identity").def_id()),
+                Some(Ok(ty))
+                    if matches!(
+                        ty.kind(),
+                        sai_ty::ty::TyKind::Ref(
+                            sai_ty::ty::Region::Sig(sai_ty::ty::SigRegion { item, index: 0 }),
+                            inner,
+                            sai_hir::Mutability::Not
+                        ) if *item == borrowed_owner.def_id.to_def_id()
+                            && matches!(inner.kind(), sai_ty::ty::TyKind::Bool)
+                    )
+            ),
+            "a borrow passed through an alias receives the record's implicit region"
+        );
+        for field_name in ["array", "sibling"] {
+            assert_eq!(
+                borrowed.type_of_field(field(&database, borrowed, field_name).def_id()),
+                Some(Err(sai_ty::lower_ty::UnsupportedTy::Array)),
+                "the borrow in an alias argument closes the declaration-wide array gate"
+            );
+        }
+
+        let unsupported = field_types("UnsupportedAliases");
+        for field_name in [
+            "hidden_borrow",
+            "chained",
+            "bounded",
+            "unused",
+            "const_alias",
+            "malformed",
+        ] {
+            assert!(
+                unsupported
+                    .type_of_field(field(&database, unsupported, field_name).def_id())
+                    .is_some_and(|result| result.is_err()),
+                "unsupported alias form {field_name:?} does not acquire a validated template"
+            );
+        }
+        for (field_name, reason) in [
+            (
+                "missing",
+                sai_ty::lower_ty::UnsupportedTy::WrongNumberOfGenericArguments,
+            ),
+            (
+                "extra",
+                sai_ty::lower_ty::UnsupportedTy::WrongNumberOfGenericArguments,
+            ),
+            (
+                "wrong_kind",
+                sai_ty::lower_ty::UnsupportedTy::GenericArgumentKind,
+            ),
+            ("array", sai_ty::lower_ty::UnsupportedTy::Array),
+        ] {
+            assert_eq!(
+                unsupported.type_of_field(field(&database, unsupported, field_name).def_id()),
+                Some(Err(reason)),
+                "malformed use-site arguments and the declaration array gate remain exact"
+            );
+        }
+
+        let generic = field_types("GenericRecord");
+        assert!(
+            matches!(
+                generic,
+                LocalRecordFieldTypesProjection::Unsupported {
+                    reason: LocalRecordFieldTypesUnsupportedReason::UnvalidatedGenericDefinition,
+                    ..
+                }
+            ),
+            "generic alias field owners stay outside the IR-911 non-generic record allowlist"
+        );
+    }
+
+    #[test]
+    fn local_record_field_projection_keeps_foreign_aliases_out_of_the_local_allowlist() {
+        fn field<'a>(
+            database: &RootDatabase,
+            fields: &'a LocalRecordFieldTypesProjection,
+            name: &str,
+        ) -> &'a LocalRecordFieldTypeProjection {
+            fields
+                .fields()
+                .expect("the record field projection is supported")
+                .iter()
+                .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some(name))
+                .unwrap_or_else(|| panic!("field {name:?} exists"))
+        }
+
+        let mut database = RootDatabase::new().expect("driver initializes");
+        let (_, root_tree, mut snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:root#1",
+            "acme:root@1.0.0",
+            &[(
+                "lib.sai",
+                b"use acme:dep as dep\n\
+                  type ForeignAliasFields {\n\
+                    alias: dep.Identity<U8>,\n\
+                    array: Array<U8, 2>,\n\
+                  }\n",
+            )],
+        );
+        let (_, dependency_tree, dependency_snapshot_files) = multi_package_fixture(
+            &mut database,
+            "acme:dep#1",
+            "acme:dep@1.0.0",
+            &[("lib.sai", b"pub type Identity<T> = T\n")],
+        );
+        snapshot_files.extend(dependency_snapshot_files);
+        let snapshot =
+            WorkspaceSnapshot::new(snapshot_files).expect("multi-package snapshot is valid");
+        let root_manifest: Arc<[u8]> =
+            Arc::from(&b"package acme:root @ 1.0.0\nrequires { acme:dep @ ^1 }\n"[..]);
+        let dependency_manifest: Arc<[u8]> = Arc::from(&b"package acme:dep @ 1.0.0\n"[..]);
+        let graph = PackageGraph::new(
+            Version::parse("1.8.2").expect("toolchain version is valid"),
+            [
+                graph_node(
+                    "acme:root#1",
+                    "acme:root",
+                    "1.0.0",
+                    PackageGraphRole::Root,
+                    vec![graph_edge("acme:dep#1", "acme:dep")],
+                ),
+                graph_node(
+                    "acme:dep#1",
+                    "acme:dep",
+                    "1.0.0",
+                    PackageGraphRole::Dependency,
+                    Vec::new(),
+                ),
+            ],
+        )
+        .expect("source dependency graph is valid");
+        database
+            .set_package_graph(Some(graph.clone()))
+            .expect("active package graph is recorded");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let dependency_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &dependency_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext {
+                    is_root_package: false,
+                    ..Phase1BuildContext::default()
+                },
+                dependency_manifest,
+                PackageRole::Dependency,
+                &[],
+            )
+            .expect("source dependency scopes collect");
+        let dependency_member_package = dependency_collection.module_member_scope_package();
+        let root_collection = database
+            .collect_phase1_package_scopes_with_manifest_and_foreign_scopes(
+                &root_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+                root_manifest,
+                PackageRole::Root,
+                &[dependency_member_package.as_foreign_package_scopes("acme:dep")],
+            )
+            .expect("root can resolve a foreign source alias");
+        let member_scopes = database
+            .collect_active_source_member_scopes(
+                &root_collection,
+                &graph,
+                &[dependency_member_package],
+            )
+            .expect("source dependency closure validates");
+        let resolved = database
+            .resolve_type_owner_paths_with_member_scopes(
+                &root_collection,
+                &root_tree,
+                &snapshot,
+                &member_scopes,
+            )
+            .expect("type owner paths resolve with foreign source members");
+        let owner = root_collection
+            .scopes
+            .top_level_owners
+            .iter()
+            .copied()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::Struct)
+            .expect("the local record owner exists")
+            .owner;
+        let fields = resolved
+            .local_record_field_types_with_scopes(
+                &root_collection,
+                Some(&member_scopes),
+                None,
+                owner,
+            )
+            .expect("the exact collection and member scopes guard field results")
+            .expect("the local record has a field projection");
+        assert_eq!(
+            fields.type_of_field(field(&database, fields, "alias").def_id()),
+            Some(Err(sai_ty::lower_ty::UnsupportedTy::Alias)),
+            "a foreign alias does not enter the current package's validated local map"
+        );
+        assert_eq!(
+            fields.type_of_field(field(&database, fields, "array").def_id()),
+            Some(Err(sai_ty::lower_ty::UnsupportedTy::Array)),
+            "an unsupported foreign alias closes the declaration-wide array gate"
         );
     }
 

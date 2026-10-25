@@ -397,6 +397,23 @@ impl<'a> LowerTyContext<'a> {
         self
     }
 
+    /// Enable validated local aliases while projecting fields of a direct
+    /// local record.
+    ///
+    /// This separate entry point keeps the existing signature alias adapter
+    /// unchanged. The driver supplies only same-package aliases whose
+    /// owner-local templates were independently validated, and only for the
+    /// non-generic field projection slice.
+    pub fn with_field_local_type_aliases(
+        mut self,
+        aliases: &'a HashMap<DefId, LocalTypeAlias>,
+    ) -> Self {
+        if matches!(self.region_mode, RegionMode::Field { .. }) {
+            self.local_aliases = Some(aliases);
+        }
+        self
+    }
+
     fn region(&mut self) -> Result<Region, UnsupportedTy> {
         match self.region_mode {
             RegionMode::Body => Ok(Region::Erased),
@@ -760,6 +777,31 @@ fn semantic_type_contains_reference(root: &Ty) -> bool {
     false
 }
 
+fn semantic_type_contains_array(root: &Ty) -> bool {
+    let mut pending = vec![root];
+    while let Some(ty) = pending.pop() {
+        match ty.kind() {
+            TyKind::Array(..) => return true,
+            TyKind::Tuple(elements) => pending.extend(elements.iter()),
+            TyKind::Ref(_, inner, _) => pending.push(inner),
+            TyKind::FnPtr(signature) => {
+                pending.extend(signature.inputs());
+                pending.push(signature.output());
+            }
+            TyKind::Adt(_, arguments) => pending.extend(arguments.iter()),
+            TyKind::Int(_)
+            | TyKind::Uint(_)
+            | TyKind::Float(_)
+            | TyKind::Bool
+            | TyKind::Byte
+            | TyKind::Char
+            | TyKind::Never
+            | TyKind::Param(_) => {}
+        }
+    }
+    false
+}
+
 fn semantic_type_parameter_usage(root: &Ty, count: usize) -> Option<Vec<bool>> {
     let mut used = vec![false; count];
     let mut pending = vec![root];
@@ -939,6 +981,15 @@ fn lower_path_ty(
             .local_aliases
             .and_then(|aliases| aliases.get(&def_id))
             .ok_or(UnsupportedTy::Alias)?;
+        if matches!(context.region_mode, RegionMode::Field { .. })
+            && context.array_length_pointer_width.is_none()
+            && semantic_type_contains_array(&alias.template)
+        {
+            // Alias templates are lowered before their field use site. Keep
+            // arrays hidden inside those templates behind the same
+            // declaration-wide gate used by direct field array syntax.
+            return Err(UnsupportedTy::Array);
+        }
         if alias.type_params.is_empty() {
             if generic_args.is_some() {
                 return Err(UnsupportedTy::GenericArguments);
@@ -2885,11 +2936,26 @@ mod tests {
         let lowered = lower_ty(&mut context, alias).expect("validated alias lowers");
         assert!(lowered.ptr_eq(&alias_ty));
 
+        let mut field_context = LowerTyContext::for_field(&interner, owner, &alias_paths, false)
+            .with_field_local_type_aliases(&aliases);
+        let field_lowered = lower_ty(&mut field_context, alias)
+            .expect("the field-scoped validated alias adapter lowers");
+        assert!(field_lowered.ptr_eq(&alias_ty));
+
         let mut unvalidated_context = LowerTyContext::for_signature(&interner, owner, &alias_paths);
         assert_eq!(
             lower_ty(&mut unvalidated_context, alias),
             Err(UnsupportedTy::Alias),
             "an alias resolution remains unsupported without its exact validated value"
+        );
+
+        let mut signature_field_alias_context =
+            LowerTyContext::for_signature(&interner, owner, &alias_paths)
+                .with_field_local_type_aliases(&aliases);
+        assert_eq!(
+            lower_ty(&mut signature_field_alias_context, alias),
+            Err(UnsupportedTy::Alias),
+            "the field-scoped adapter does not broaden signature alias lowering"
         );
 
         let empty_args = arena.alloc_generic_args(GenericArgs {
