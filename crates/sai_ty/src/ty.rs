@@ -1,8 +1,9 @@
 //! Interned semantic types shared by declaration and body checking.
 //!
-//! This is the initial semantic type kernel. It represents primitive types,
-//! tuples, and references; nominal types, function pointers, projections,
-//! inference variables, and error types are added by later slices.
+//! This is an early semantic type kernel. It represents primitive types,
+//! tuples, references, and nongeneric nominal identities; generic arguments,
+//! function pointers, projections, inference variables, and error types are
+//! added by later slices.
 
 use sai_hir::{DefId, Mutability};
 use std::collections::HashMap;
@@ -58,6 +59,12 @@ pub enum TyKind {
     Never,
     Tuple(Arc<[Ty]>),
     Ref(Region, Ty, Mutability),
+    /// A nongeneric nominal definition.
+    ///
+    /// This slice currently constructs this form only for validated local
+    /// interface unit enums. Generic arguments will be represented when the
+    /// generic substitution model is implemented.
+    Adt(DefId),
 }
 
 /// Signed integer type.
@@ -209,6 +216,7 @@ impl TyInterner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sai_intern::Idx;
     use std::collections::hash_map::DefaultHasher;
 
     fn hash(value: &impl Hash) -> u64 {
@@ -280,5 +288,22 @@ mod tests {
 
         assert!(local_parent.ptr_eq(&foreign_parent));
         assert_eq!(interner.len(), 2);
+    }
+
+    #[test]
+    fn distinct_adt_definitions_keep_distinct_semantic_identity() {
+        let packages = sai_intern::PackageInterner::new();
+        let package = packages.intern("acme:types#1.0").expect("package interns");
+        let interner = TyInterner::new();
+        let first = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(1));
+        let second = DefId::from_foreign(package, sai_hir::DefIndex::from_raw(2));
+
+        let first_ty = interner.intern(TyKind::Adt(first));
+        let same_first_ty = interner.intern(TyKind::Adt(first));
+        let second_ty = interner.intern(TyKind::Adt(second));
+
+        assert!(first_ty.ptr_eq(&same_first_ty));
+        assert!(!first_ty.ptr_eq(&second_ty));
+        assert_ne!(first_ty.kind(), second_ty.kind());
     }
 }

@@ -5,10 +5,10 @@
 
 use crate::ty::{FloatTy, FnSig, IntTy, Region, SigRegion, Ty, TyInterner, TyKind, UintTy};
 use sai_hir::types::{Generics, PathRoot, Ty as HirTy, TyKind as HirTyKind};
-use sai_hir::{HirId, OwnerId, Safety, body::FnSig as HirFnSig};
+use sai_hir::{DefId, HirId, OwnerId, Safety, body::FnSig as HirFnSig};
 use sai_resolve::package_scopes::{DefKind, PathRes, Res};
 use sai_resolve::prelude::PrimTy;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// The reason an HIR type cannot be converted by the current subset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +65,7 @@ pub struct LowerTyContext<'a> {
     interner: &'a TyInterner,
     owner: OwnerId,
     paths: &'a HashMap<HirId, PathRes>,
+    unit_enums: Option<&'a HashSet<DefId>>,
     region_mode: RegionMode,
     next_region_index: u32,
     failed: bool,
@@ -90,6 +91,31 @@ impl<'a> LowerTyContext<'a> {
             interner,
             owner,
             paths,
+            unit_enums: None,
+            region_mode: RegionMode::Signature,
+            next_region_index: 0,
+            failed: false,
+        }
+    }
+
+    /// Create a signature context that can lower only the validated local
+    /// unit enums explicitly supplied by the caller's matching collection.
+    ///
+    /// The set must be derived from the same source snapshot and package
+    /// collection as `paths`; this crate cannot establish that provenance on
+    /// its own. The driver checks and preserves that relationship before
+    /// calling this constructor.
+    pub fn for_signature_with_unit_enums(
+        interner: &'a TyInterner,
+        owner: OwnerId,
+        paths: &'a HashMap<HirId, PathRes>,
+        unit_enums: &'a HashSet<DefId>,
+    ) -> Self {
+        Self {
+            interner,
+            owner,
+            paths,
+            unit_enums: Some(unit_enums),
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             failed: false,
@@ -113,6 +139,7 @@ impl<'a> LowerTyContext<'a> {
             interner,
             owner,
             paths,
+            unit_enums: None,
             region_mode: RegionMode::Field {
                 has_implicit_region_parameter,
             },
@@ -131,6 +158,7 @@ impl<'a> LowerTyContext<'a> {
             interner,
             owner,
             paths,
+            unit_enums: None,
             region_mode: RegionMode::Body,
             next_region_index: 0,
             failed: false,
@@ -305,6 +333,25 @@ fn lower_path_ty(
     if resolution.resolved_segments != segment_count || resolution.segment_count != segment_count {
         return Err(UnsupportedTy::IncompletePathResolution);
     }
+    if path.segments.is_empty() {
+        return Err(UnsupportedTy::QualifiedPath);
+    }
+
+    if path.segments.iter().any(|segment| segment.args.is_some()) {
+        return Err(UnsupportedTy::GenericArguments);
+    }
+
+    if let Res::Def(DefKind::Enum, def_id) = resolution.base {
+        return if context
+            .unit_enums
+            .is_some_and(|unit_enums| unit_enums.contains(&def_id))
+        {
+            Ok(context.interner.intern(TyKind::Adt(def_id)))
+        } else {
+            Err(UnsupportedTy::NominalType)
+        };
+    }
+
     if path.segments.len() != 1 {
         return Err(UnsupportedTy::QualifiedPath);
     }
@@ -312,9 +359,6 @@ fn lower_path_ty(
     match resolution.base {
         Res::PrimTy(PrimTy::Array) => Err(UnsupportedTy::Array),
         Res::PrimTy(primitive) => {
-            if path.segments[0].args.is_some() {
-                return Err(UnsupportedTy::GenericArguments);
-            }
             let kind = primitive_ty_kind(primitive)?;
             Ok(context.interner.intern(kind))
         }
@@ -322,18 +366,9 @@ fn lower_path_ty(
         Res::Def(DefKind::TyParam, _) => Err(UnsupportedTy::GenericParameter),
         Res::Def(DefKind::ConstParam, _) => Err(UnsupportedTy::ConstParameter),
         Res::Def(DefKind::AssocTy, _) => Err(UnsupportedTy::Projection),
-        Res::Def(
-            DefKind::Struct
-            | DefKind::Enum
-            | DefKind::Distinct
-            | DefKind::Refined
-            | DefKind::Resource,
-            _,
-        ) => Err(if path.segments[0].args.is_some() {
-            UnsupportedTy::GenericArguments
-        } else {
-            UnsupportedTy::NominalType
-        }),
+        Res::Def(DefKind::Struct | DefKind::Distinct | DefKind::Refined | DefKind::Resource, _) => {
+            Err(UnsupportedTy::NominalType)
+        }
         Res::Def(_, _) => Err(UnsupportedTy::WrongNameKind),
         Res::Local(_) => Err(UnsupportedTy::LocalValue),
         Res::TestOnly(_) => Err(UnsupportedTy::TestOnlyPath),
@@ -453,6 +488,166 @@ mod tests {
             },
         )]);
         (ty, paths)
+    }
+
+    fn resolved_qualified_path<'hir>(
+        arena: &'hir HirArena<'hir>,
+        owner: sai_hir::OwnerId,
+        symbols: &Interner,
+        local_id: u32,
+        prefix: &str,
+        name: &str,
+        resolved_segments: u32,
+        resolved: Res,
+    ) -> (&'hir HirTy<'hir>, HashMap<HirId, PathRes>) {
+        let path_id = hir_id(owner, local_id);
+        let prefix = arena.alloc_path_segment(PathSegment {
+            hir_id: hir_id(owner, local_id + 1),
+            name: Name {
+                sym: symbols.intern(prefix).expect("symbol interns"),
+                span: span(),
+            },
+            args: None,
+        });
+        let segment = arena.alloc_path_segment(PathSegment {
+            hir_id: hir_id(owner, local_id + 2),
+            name: Name {
+                sym: symbols.intern(name).expect("symbol interns"),
+                span: span(),
+            },
+            args: None,
+        });
+        let segments = arena.alloc_path_segments(&[*prefix, *segment]);
+        let path = arena.alloc_path(Path {
+            hir_id: path_id,
+            root: PathRoot::Plain,
+            segments,
+            span: span(),
+        });
+        let ty = arena.alloc_ty(HirTy {
+            hir_id: hir_id(owner, local_id + 3),
+            kind: HirTyKind::Path(*path),
+            span: span(),
+        });
+        let paths = HashMap::from([(
+            path_id,
+            PathRes {
+                base: resolved,
+                resolved_segments,
+                segment_count: 2,
+            },
+        )]);
+        (ty, paths)
+    }
+
+    #[test]
+    fn validated_unit_enum_paths_lower_only_with_the_supplied_definition_set() {
+        let (owner, symbols) = owner();
+        let enum_def = owner.def_id.to_def_id();
+        let unit_enums = HashSet::from([enum_def]);
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+
+        let (direct, direct_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            60,
+            "State",
+            None,
+            Res::Def(DefKind::Enum, enum_def),
+        );
+        let (qualified, qualified_paths) = resolved_qualified_path(
+            &arena,
+            owner,
+            &symbols,
+            70,
+            "api",
+            "State",
+            2,
+            Res::Def(DefKind::Enum, enum_def),
+        );
+        let mut direct_context = LowerTyContext::for_signature_with_unit_enums(
+            &interner,
+            owner,
+            &direct_paths,
+            &unit_enums,
+        );
+        let direct_ty = lower_ty(&mut direct_context, direct).expect("validated unit enum lowers");
+        assert_eq!(direct_ty.kind(), &TyKind::Adt(enum_def));
+
+        let mut qualified_context = LowerTyContext::for_signature_with_unit_enums(
+            &interner,
+            owner,
+            &qualified_paths,
+            &unit_enums,
+        );
+        let qualified_ty =
+            lower_ty(&mut qualified_context, qualified).expect("qualified unit enum lowers");
+        assert!(direct_ty.ptr_eq(&qualified_ty));
+
+        let mut unsupported_context =
+            LowerTyContext::for_signature(&interner, owner, &direct_paths);
+        assert_eq!(
+            lower_ty(&mut unsupported_context, direct),
+            Err(UnsupportedTy::NominalType),
+            "an enum does not become supported without validated provenance"
+        );
+    }
+
+    #[test]
+    fn unit_enum_lowering_rejects_generic_and_incompletely_resolved_paths() {
+        let (owner, symbols) = owner();
+        let enum_def = owner.def_id.to_def_id();
+        let unit_enums = HashSet::from([enum_def]);
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+
+        let empty_args = arena.alloc_generic_args(sai_hir::types::GenericArgs {
+            args: &[],
+            span: span(),
+        });
+        let (generic, generic_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            80,
+            "State",
+            Some(empty_args),
+            Res::Def(DefKind::Enum, enum_def),
+        );
+        let mut generic_context = LowerTyContext::for_signature_with_unit_enums(
+            &interner,
+            owner,
+            &generic_paths,
+            &unit_enums,
+        );
+        assert_eq!(
+            lower_ty(&mut generic_context, generic),
+            Err(UnsupportedTy::GenericArguments),
+            "even empty explicit generic arguments are not erased"
+        );
+
+        let (partial, partial_paths) = resolved_qualified_path(
+            &arena,
+            owner,
+            &symbols,
+            90,
+            "api",
+            "State",
+            1,
+            Res::Def(DefKind::Enum, enum_def),
+        );
+        let mut partial_context = LowerTyContext::for_signature_with_unit_enums(
+            &interner,
+            owner,
+            &partial_paths,
+            &unit_enums,
+        );
+        assert_eq!(
+            lower_ty(&mut partial_context, partial),
+            Err(UnsupportedTy::IncompletePathResolution)
+        );
     }
 
     #[test]
