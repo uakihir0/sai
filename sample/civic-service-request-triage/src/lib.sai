@@ -103,3 +103,20 @@ test "a later input can become canonical when its report time is earlier" {
     assert canonical.incident_report_count == 2
     assert canonical.response_due_minute == Some(670)
 }
+
+test "a later duplicate raises canonical urgency and only shortens its deadline" {
+    let original = sample_report()
+    assert original.items[0].unwrap().response_due_minute == Some(690)
+
+    var requests = data.requests()
+    requests[2].immediate_hazard = true
+    let report = triage.triage_requests(requests)
+    let canonical = report.items[0].unwrap()
+    let duplicate = report.items[2].unwrap()
+    assert canonical.request_id == 8401
+    assert canonical.decision == Decision.Routed
+    assert canonical.urgency == Some(Urgency.Critical)
+    assert canonical.response_due_minute == Some(510)
+    assert duplicate.decision == Decision.Duplicate
+    assert duplicate.duplicate_of == Some(8401)
+}

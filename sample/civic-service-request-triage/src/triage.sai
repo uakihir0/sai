@@ -116,6 +116,44 @@ fn response_window(urgency: Urgency) -> U32 {
     match urgency { .Critical => 30, .High => 240, .Standard => 2880 }
 }
 
+fn urgency_rank(urgency: Urgency) -> U32 {
+    match urgency { .Critical => 0, .High => 1, .Standard => 2 }
+}
+
+fn incident_urgency(requests: Array<ServiceRequest, 11>, index: USize) -> Urgency {
+    let request = requests[index]
+    var selected = urgency_for(request)
+    for candidate in 0..requests.len() {
+        if candidate != index and can_be_linked(requests, candidate) {
+            let other = requests[candidate]
+            if same_incident(request, other) {
+                let other_urgency = urgency_for(other)
+                if urgency_rank(other_urgency) < urgency_rank(selected) {
+                    selected = other_urgency
+                }
+            }
+        }
+    }
+    selected
+}
+
+fn incident_response_due_minute(requests: Array<ServiceRequest, 11>, index: USize) -> U32 {
+    let request = requests[index]
+    var earliest_due = request.opened_minute + response_window(urgency_for(request))
+    for candidate in 0..requests.len() {
+        if candidate != index and can_be_linked(requests, candidate) {
+            let other = requests[candidate]
+            if same_incident(request, other) {
+                let other_due = other.opened_minute + response_window(urgency_for(other))
+                if other_due < earliest_due {
+                    earliest_due = other_due
+                }
+            }
+        }
+    }
+    earliest_due
+}
+
 fn item_for(requests: Array<ServiceRequest, 11>, index: USize) -> TriageItem {
     let request = requests[index]
     if not valid_record(requests, index) {
@@ -169,7 +207,8 @@ fn item_for(requests: Array<ServiceRequest, 11>, index: USize) -> TriageItem {
                 incident_report_count: 0,
             )
         } else {
-            let urgency = urgency_for(request)
+            let urgency = incident_urgency(requests, index)
+            let response_due_minute = incident_response_due_minute(requests, index)
             TriageItem(
                 request_id: request.id,
                 location_name: request.location_name,
@@ -177,7 +216,7 @@ fn item_for(requests: Array<ServiceRequest, 11>, index: USize) -> TriageItem {
                 decision: Decision.Routed,
                 department: department_for(request.service),
                 urgency: Some(urgency),
-                response_due_minute: Some(request.opened_minute + response_window(urgency)),
+                response_due_minute: Some(response_due_minute),
                 duplicate_of: None,
                 incident_report_count: incident_report_count(requests, index),
             )

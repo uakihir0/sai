@@ -35,6 +35,15 @@ Times are absolute minutes from the beginning of a fictional seven-day intake
 fixture. The output retains submission order for auditability. The response
 target is a policy deadline for first response, not a promised repair time.
 
+Within a duplicate group, the earliest received report remains canonical,
+while the lower request ID breaks same-minute ties. The case inherits the
+strongest screened urgency from any valid linked report.
+Each report's response clock starts at its own receipt time; the case target is
+the earliest of those per-report deadlines. A later report can raise urgency or
+shorten the target, but it cannot move the existing target later. The base
+fixture's duplicates have equal impact flags, so its canonical output remains
+unchanged by this aggregation rule.
+
 ## Workflow and concepts
 
 - `model.sai` defines request identity, service categories, triage decisions,
@@ -75,6 +84,11 @@ recipient is not supplied by this example.
   using the lower ID only for a same-minute tie. A real system may need
   distance-based matching, reopen windows, privacy constraints, or human
   confirmation before merging.
+- Confirm that a linked case inherits the strongest screened urgency and
+  takes the minimum of each report's receipt-based response deadlines. This
+  conservative policy lets a later hazard report shorten a deadline but never
+  lengthen it; both the aggregation and the 30/240/2,880-minute targets are
+  illustrative and need review by the service owner.
 - Confirm that unknown categories and invalid identities are held without
   dispatch, and that out-of-jurisdiction requests receive a hold rather than
   an automatic transfer. This sample has no verified receiving authority or
