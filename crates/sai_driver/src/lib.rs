@@ -85189,7 +85189,7 @@ interface facade { use middle.{payload}; }"#;
 
     #[test]
     fn type_owner_paths_resolve_active_wit_members_and_track_view_revisions() {
-        let root = b"use acme:wit-api/streams as api\ntype Client = api.Request\n";
+        let root = b"use acme:wit-api/streams as api\ntype Client = api.Request\ntype Local { value: Bool, request: api.Request }\n";
         let (mut database, module_tree, snapshot, _root_package) = phase1_fixture(root, b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
         let artifact = database
@@ -85306,6 +85306,54 @@ interface facade { use middle.{payload}; }"#;
         assert!(matches!(path_v1.base, Res::Def(DefKind::Struct, _)));
         assert_eq!(path_v1.resolved_segments, 2);
         assert!(resolved_v1.matches_wit_view_scopes(&collection_v1, &wit_scopes_v1));
+        let local_owner = collection_v1
+            .scopes
+            .top_level_owners
+            .iter()
+            .find(|descriptor| descriptor.kind == TopLevelOwnerKind::Struct)
+            .expect("the local record owner is collected")
+            .owner;
+        let local_paths = resolved_v1
+            .owners()
+            .iter()
+            .find(|owner| owner.owner() == local_owner)
+            .expect("type-owner resolution includes the local record")
+            .path_resolution()
+            .expect("local record path analysis succeeds");
+        assert!(
+            local_paths
+                .paths()
+                .values()
+                .any(|path| matches!(path.base, Res::Def(DefKind::Struct, _))
+                    && path.resolved_segments == 2),
+            "the record field path resolves through the active WIT view"
+        );
+        let local_field_types = resolved_v1
+            .local_record_field_types_with_scopes(
+                &collection_v1,
+                None,
+                Some(&wit_scopes_v1),
+                local_owner,
+            )
+            .expect("matching active WIT-view closure guards the field projection")
+            .expect("the direct local record has a projection");
+        let local_value = local_field_types
+            .fields()
+            .expect("the record itself is eligible for projection")
+            .iter()
+            .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some("value"))
+            .expect("the local primitive field is projected");
+        assert!(matches!(
+            local_field_types.type_of_field(local_value.def_id()),
+            Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Bool)
+        ));
+        assert!(
+            matches!(
+                resolved_v1.local_record_field_types(&collection_v1, local_owner),
+                Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+            ),
+            "a WIT-scoped resolution rejects lookup without its active closure"
+        );
 
         let owner_index = collection_v1.scopes.top_level_owners[0]
             .owner
@@ -85360,6 +85408,18 @@ interface facade { use middle.{payload}; }"#;
             wit_scopes_v1.closure_fingerprint(),
             wit_scopes_changed.closure_fingerprint(),
             "view content is part of the active WIT closure identity"
+        );
+        assert!(
+            matches!(
+                resolved_v1.local_record_field_types_with_scopes(
+                    &collection_v1,
+                    None,
+                    Some(&wit_scopes_changed),
+                    local_owner,
+                ),
+                Err(OwnerControlFlowResolutionError::SnapshotMismatch)
+            ),
+            "the original field projection rejects a changed WIT-view closure"
         );
         let collection_changed = database
             .collect_phase1_package_scopes_with_manifest_and_wit_views(
