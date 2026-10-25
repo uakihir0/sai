@@ -9997,12 +9997,18 @@ fn local_enum_variant_fixed_tuple_pattern_matches<'hir>(
     }
 }
 
-fn local_enum_variant_fixed_tuple_initializer_leaf(value: &HirExpr<'_>) -> bool {
+fn local_enum_variant_fixed_literal_description(value: &HirExpr<'_>) -> Option<&'static str> {
     match value.kind {
-        ExprKind::Lit(Lit::Bool(_) | Lit::Byte(_) | Lit::Char(_)) => true,
-        ExprKind::Tuple(elements) => elements.is_empty(),
-        _ => false,
+        ExprKind::Lit(Lit::Bool(_)) => Some("a Bool literal"),
+        ExprKind::Lit(Lit::Byte(_)) => Some("a byte literal"),
+        ExprKind::Lit(Lit::Char(_)) => Some("a character literal"),
+        ExprKind::Tuple(elements) if elements.is_empty() => Some("unit"),
+        _ => None,
     }
+}
+
+fn local_enum_variant_fixed_tuple_initializer_leaf(value: &HirExpr<'_>) -> bool {
+    local_enum_variant_fixed_literal_description(value).is_some()
 }
 
 fn check_local_enum_variant_parameter_argument(
@@ -10124,6 +10130,13 @@ fn check_local_enum_variant_unannotated_local_argument(
     )?))
 }
 
+fn expected_tuple_literal_mismatch(
+    expected_arity: usize,
+    actual_literal_description: &str,
+) -> String {
+    format!("expected tuple of arity {expected_arity}, found {actual_literal_description}")
+}
+
 fn local_enum_variant_type_name(literal_type: ConstLiteralType) -> &'static str {
     match literal_type {
         ConstLiteralType::Primitive(primitive) => const_primitive_name(primitive),
@@ -10149,6 +10162,22 @@ fn check_local_enum_variant_literal_argument(
     let mut diagnostics = Vec::new();
 
     while let Some((expected_type, value)) = pending.pop() {
+        if let sai_ty::ty::TyKind::Tuple(expected_elements) = expected_type.kind()
+            && !expected_elements.is_empty()
+            && let Some(actual_description) = local_enum_variant_fixed_literal_description(value)
+        {
+            diagnostics.push(const_literal_diagnostic(
+                owner,
+                inputs,
+                snapshot,
+                value.span,
+                sai_diagnostics::Code::TypeMismatch,
+                expected_tuple_literal_mismatch(expected_elements.len(), actual_description),
+                "type mismatch",
+            )?);
+            continue;
+        }
+
         if let (sai_ty::ty::TyKind::Tuple(expected_elements), ExprKind::Tuple(values)) =
             (expected_type.kind(), value.kind)
         {
@@ -97946,7 +97975,8 @@ interface facade { use middle.{payload}; }"#;
             "type Widget { value: Bool }\n",
             "type BoolAlias = Bool\n",
             "type UnitAlias = ()\n",
-            "enum ExcludedPayload { Alias(BoolAlias), Text(Str), Nominal(Widget) }\n",
+            "type TupleAlias = (I8, Char)\n",
+            "enum ExcludedPayload { Alias(BoolAlias), Text(Str), Nominal(Widget), TupleAlias(TupleAlias) }\n",
             "fn tuple_factory() -> (U8,) { (1,) }\n",
             "fn alpha() { Alpha.Same }\n",
             "fn beta() { Beta.Same }\n",
@@ -98069,10 +98099,20 @@ interface facade { use middle.{payload}; }"#;
             "fn nested_call_named_mismatch() { NestedPayload.Nested(value: ((true, 1), ((), 2))) }\n",
             "fn nested_call_tuple_arity_mismatch() { NestedPayload.Nested(((true,), ((), true))) }\n",
             "fn nested_call_tuple_arity_too_long_sibling() { NestedPayload.Nested(((true, 1, false), ((), true))) }\n",
-            "fn nested_call_tuple_arity_unit_exclusions() { NestedPayload.Nested(((), ((), 2))) }\n",
+            "fn nested_call_tuple_arity_unit_exclusions() { NestedPayload.Nested(((1, 'x'), ((), 2))) }\n",
             "fn nested_call_tuple_arity_expected_tuple_scalar() { NestedPayload.Nested((true, ((), 2))) }\n",
+            "fn nested_call_tuple_arity_byte_literal() { NestedPayload.Nested((b'x', ((), 2))) }\n",
+            "fn nested_call_tuple_arity_char_literal() { NestedPayload.Nested(('x', ((), 2))) }\n",
+            "fn nested_call_tuple_arity_unit_literal() { NestedPayload.Nested(((), ((), 2))) }\n",
+            "fn nested_call_tuple_arity_sibling_order() { NestedPayload.Nested((true, ((), true))) }\n",
+            "fn nested_call_tuple_arity_numeric_exclusion() { NestedPayload.Nested((1, ((), 2))) }\n",
+            "fn nested_call_tuple_arity_string_exclusion() { NestedPayload.Nested((\"text\", ((), 2))) }\n",
             "fn nested_call_tuple_arity_actual_tuple_scalar() { NestedPayload.Nested(((1, (false,)), ((), 2))) }\n",
             "fn nested_call_tuple_arity_nonliteral(actual: (I8,)) { NestedPayload.Nested((actual, ((), 2))) }\n",
+            "fn nested_call_tuple_arity_tuple_call_exclusion() { NestedPayload.Nested((tuple_factory(), ((), 2))) }\n",
+            "fn nested_call_tuple_arity_tuple_alias_exclusion() { ExcludedPayload.TupleAlias(true) }\n",
+            "fn nested_call_tuple_expected_outer_bool() { NestedPayload.Single(true) }\n",
+            "fn nested_call_tuple_arity_named_scalar_outer_too_many() { NestedPayload.Nested(value: (true, ((), 2)), extra: true) }\n",
             "fn scalar_expected_tuple_actual_outer() { Payload.Pair((true, false), true) }\n",
             "fn unit_expected_tuple_actual_outer() { Payload.UnitPayload((true, false)) }\n",
             "fn nested_scalar_expected_tuple_actual() { NestedPayload.Fixed(((1, (false,)), (1, (1,)))) }\n",
@@ -99213,14 +99253,170 @@ interface facade { use middle.{payload}; }"#;
 
         for name in [
             "nested_call_tuple_arity_unit_exclusions",
-            "nested_call_tuple_arity_expected_tuple_scalar",
+            "nested_call_tuple_arity_numeric_exclusion",
+            "nested_call_tuple_arity_string_exclusion",
             "nested_call_tuple_arity_nonliteral",
+            "nested_call_tuple_arity_tuple_call_exclusion",
+            "nested_call_tuple_arity_tuple_alias_exclusion",
         ] {
             assert!(
                 paths_for(name).call_diagnostics().is_empty(),
                 "{name}: empty/unit tuple nodes, tuple-versus-scalar pairs, and nonliteral tuple-typed paths remain outside the arity diagnostic"
             );
         }
+
+        let assert_tuple_expected_literal_mismatch =
+            |name: &str, expression: &str, expected_message: &str| {
+                let paths = paths_for(name);
+                let diagnostics = paths
+                    .call_diagnostics()
+                    .iter()
+                    .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    diagnostics.len(),
+                    1,
+                    "{name}: {:?}",
+                    paths.call_diagnostics()
+                );
+                assert_eq!(diagnostics[0].message, expected_message, "{name}");
+                assert_eq!(
+                    diagnostic_primary_text(diagnostics[0]),
+                    expression,
+                    "{name}"
+                );
+                let function_start = root
+                    .find(&format!("fn {name}"))
+                    .unwrap_or_else(|| panic!("{name}: function declaration exists"));
+                let body_start = function_start
+                    + root[function_start..]
+                        .find('{')
+                        .unwrap_or_else(|| panic!("{name}: function body exists"))
+                    + 1;
+                let expression_start = body_start
+                    + root[body_start..]
+                        .find(expression)
+                        .unwrap_or_else(|| panic!("{name}: literal expression exists"));
+                assert_primary_span(diagnostics[0], expression_start, expression.len());
+            };
+        assert_tuple_expected_literal_mismatch(
+            "nested_call_tuple_arity_expected_tuple_scalar",
+            "true",
+            "expected tuple of arity 2, found a Bool literal",
+        );
+        assert_tuple_expected_literal_mismatch(
+            "nested_call_tuple_arity_byte_literal",
+            "b'x'",
+            "expected tuple of arity 2, found a byte literal",
+        );
+        assert_tuple_expected_literal_mismatch(
+            "nested_call_tuple_arity_char_literal",
+            "'x'",
+            "expected tuple of arity 2, found a character literal",
+        );
+        assert_tuple_expected_literal_mismatch(
+            "nested_call_tuple_arity_unit_literal",
+            "()",
+            "expected tuple of arity 2, found unit",
+        );
+        assert_tuple_expected_literal_mismatch(
+            "nested_call_tuple_expected_outer_bool",
+            "true",
+            "expected tuple of arity 1, found a Bool literal",
+        );
+
+        let nested_tuple_scalar_sibling = paths_for("nested_call_tuple_arity_sibling_order");
+        let nested_tuple_scalar_diagnostics = nested_tuple_scalar_sibling
+            .call_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            nested_tuple_scalar_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "expected tuple of arity 2, found a Bool literal",
+                "expected `USize`, found a Bool literal",
+            ],
+            "a fixed literal mismatch stops locally while eligible source-order siblings continue"
+        );
+        assert_eq!(
+            nested_tuple_scalar_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic_primary_text(diagnostic))
+                .collect::<Vec<_>>(),
+            ["true", "true"]
+        );
+        let nested_scalar_sibling_function_start = root
+            .find("fn nested_call_tuple_arity_sibling_order()")
+            .expect("nested scalar sibling function exists");
+        let nested_scalar_start = nested_scalar_sibling_function_start
+            + root[nested_scalar_sibling_function_start..]
+                .find("(true, ((), true))")
+                .expect("nested scalar sibling expression exists");
+        let first_nested_scalar_start = nested_scalar_start + 1;
+        let second_nested_scalar_start = nested_scalar_start + "(true, ((), ".len();
+        assert_primary_span(
+            nested_tuple_scalar_diagnostics[0],
+            first_nested_scalar_start,
+            "true".len(),
+        );
+        assert_primary_span(
+            nested_tuple_scalar_diagnostics[1],
+            second_nested_scalar_start,
+            "true".len(),
+        );
+
+        let named_tuple_expected_literal =
+            paths_for("nested_call_tuple_arity_named_scalar_outer_too_many");
+        assert_eq!(
+            named_tuple_expected_literal
+                .call_diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WrongArgumentCount)
+                .count(),
+            1,
+            "the outer arity diagnostic remains independent"
+        );
+        assert_eq!(
+            named_tuple_expected_literal
+                .call_diagnostics()
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::NamedArgumentOnFunction
+                })
+                .count(),
+            2,
+            "named arguments remain independently diagnosed"
+        );
+        let named_expected_tuple_type_mismatch = named_tuple_expected_literal
+            .call_diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+            .expect("named expected tuple literal mismatch is diagnosed");
+        assert_eq!(
+            named_expected_tuple_type_mismatch.message,
+            "expected tuple of arity 2, found a Bool literal"
+        );
+        assert_eq!(
+            diagnostic_primary_text(named_expected_tuple_type_mismatch),
+            "true"
+        );
+        let named_tuple_function_start = root
+            .find("fn nested_call_tuple_arity_named_scalar_outer_too_many()")
+            .expect("named tuple expected literal function exists");
+        let named_tuple_literal_start = named_tuple_function_start
+            + root[named_tuple_function_start..]
+                .find("(true, ((), 2))")
+                .expect("named tuple actual literal exists")
+            + 1;
+        assert_primary_span(
+            named_expected_tuple_type_mismatch,
+            named_tuple_literal_start,
+            "true".len(),
+        );
 
         let assert_scalar_expected_tuple_mismatch =
             |name: &str, expression: &str, expected_message: &str| {
@@ -99455,11 +99651,38 @@ interface facade { use middle.{payload}; }"#;
             ["(true,)", "true"],
             "named values still receive the positional expected tuple type and sibling diagnostics continue"
         );
-        assert!(
-            paths_for("nested_call_parenthesized_scalar")
-                .call_diagnostics()
-                .is_empty(),
-            "parentheses around a scalar do not turn it into a tuple literal"
+        let nested_parenthesized_scalar = paths_for("nested_call_parenthesized_scalar");
+        assert_eq!(
+            nested_parenthesized_scalar.call_diagnostics().len(),
+            1,
+            "a parenthesized scalar remains a scalar HIR value against the tuple payload"
+        );
+        assert_eq!(
+            nested_parenthesized_scalar.call_diagnostics()[0].message,
+            "expected tuple of arity 1, found a Bool literal"
+        );
+        let parenthesized_scalar_diagnostic = &nested_parenthesized_scalar.call_diagnostics()[0];
+        assert_eq!(
+            diagnostic_primary_text(parenthesized_scalar_diagnostic),
+            "true",
+            "the scalar literal retains its own span inside redundant parentheses"
+        );
+        let parenthesized_scalar_function_start = root
+            .find("fn nested_call_parenthesized_scalar()")
+            .expect("parenthesized scalar function exists");
+        let parenthesized_scalar_body_start = parenthesized_scalar_function_start
+            + root[parenthesized_scalar_function_start..]
+                .find('{')
+                .expect("parenthesized scalar body exists")
+            + 1;
+        let parenthesized_scalar_start = parenthesized_scalar_body_start
+            + root[parenthesized_scalar_body_start..]
+                .find("true")
+                .expect("parenthesized scalar Bool literal exists");
+        assert_primary_span(
+            parenthesized_scalar_diagnostic,
+            parenthesized_scalar_start,
+            "true".len(),
         );
         let singleton_tuple = paths_for("nested_call_singleton_tuple");
         assert_eq!(singleton_tuple.call_diagnostics().len(), 1);
@@ -99471,6 +99694,28 @@ interface facade { use middle.{payload}; }"#;
             diagnostic_primary_text(&singleton_tuple.call_diagnostics()[0]),
             "true",
             "the comma in a singleton tuple keeps its literal element association"
+        );
+        assert_eq!(
+            singleton_tuple.call_diagnostics()[0].message,
+            "expected `I8`, found a Bool literal",
+            "a singleton tuple recurses to its scalar payload"
+        );
+        let singleton_tuple_function_start = root
+            .find("fn nested_call_singleton_tuple()")
+            .expect("singleton tuple function exists");
+        let singleton_tuple_body_start = singleton_tuple_function_start
+            + root[singleton_tuple_function_start..]
+                .find('{')
+                .expect("singleton tuple body exists")
+            + 1;
+        let singleton_literal_start = singleton_tuple_body_start
+            + root[singleton_tuple_body_start..]
+                .find("true")
+                .expect("singleton tuple Bool literal exists");
+        assert_primary_span(
+            &singleton_tuple.call_diagnostics()[0],
+            singleton_literal_start,
+            "true".len(),
         );
 
         let nested_too_many = paths_for("nested_call_too_many");
