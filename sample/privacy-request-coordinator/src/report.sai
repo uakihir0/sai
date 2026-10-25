@@ -1,0 +1,163 @@
+use acme:privacy-request-coordinator/model.{
+    CoordinatorReport
+    DataClass
+    DataStore
+    DeletionTask
+    RequestError
+    RequestKind
+    RequestState
+    StoreRecord
+    WorkState
+}
+use sai:alloc/string.{String}
+use sai:core/fmt.{Writer}
+
+fn request_kind_text(kind: RequestKind) -> Str {
+    match kind {
+        RequestKind.Access => "access"
+        RequestKind.Erasure => "erasure"
+        RequestKind.AccessAndErasure => "access and erasure"
+    }
+}
+
+fn request_state_text(state: RequestState) -> Str {
+    match state {
+        RequestState.InvalidRequest => "INVALID REQUEST"
+        RequestState.NeedsReview => "NEEDS REVIEW"
+        RequestState.AccessPrepared => "ACCESS INVENTORY READY"
+        RequestState.Completed => "ERASURE COMPLETED"
+        RequestState.PartiallyBlocked => "PARTIALLY BLOCKED BY POLICY"
+        RequestState.NoMatchingData => "NO MATCHING DATA"
+    }
+}
+
+fn request_error_text(error: RequestError) -> Str {
+    match error {
+        RequestError.MissingRequestId => "request ID is zero"
+        RequestError.MissingSubjectId => "subject ID is zero"
+        RequestError.IdentityNotVerified => "identity verification is incomplete"
+        RequestError.ScopeNotConfirmed => "request scope is not confirmed"
+        RequestError.ReceivedInFuture => "received timestamp is after the fixture clock"
+    }
+}
+
+fn store_text(store: DataStore) -> Str {
+    match store {
+        DataStore.ProfileService => "profile service"
+        DataStore.SearchIndex => "search index"
+        DataStore.MarketingPlatform => "marketing platform"
+        DataStore.SessionCache => "session cache"
+        DataStore.BillingLedger => "billing ledger"
+        DataStore.SupportArchive => "support archive"
+    }
+}
+
+fn data_class_text(data_class: DataClass) -> Str {
+    match data_class {
+        DataClass.Profile => "profile"
+        DataClass.SearchDocument => "search document"
+        DataClass.MarketingPreference => "marketing preference"
+        DataClass.SessionToken => "session token"
+        DataClass.Invoice => "invoice"
+        DataClass.SupportConversation => "support conversation"
+    }
+}
+
+fn work_state_text(state: WorkState) -> Str {
+    match state {
+        WorkState.Planned => "planned"
+        WorkState.Deleted => "deleted"
+        WorkState.BlockedByLegalHold => "blocked by legal hold"
+        WorkState.BlockedByRetention => "retained until policy expiry"
+        WorkState.BlockedByDependency => "blocked because a prerequisite was not deleted"
+        WorkState.RetryPending => "retry outcome incomplete"
+        WorkState.RetryExhausted => "retry budget exhausted"
+        WorkState.PermanentFailure => "permanent failure"
+        WorkState.NoAttempt => "no receipt recorded"
+        WorkState.InvalidPlan => "invalid plan"
+        WorkState.InvalidReceipt => "invalid receipt"
+        WorkState.InvalidDependency => "invalid dependency endpoint"
+        WorkState.DependencyOrderUnresolved => "dependency order unresolved; review the graph"
+    }
+}
+
+fn write_inventory_record(out: borrow mut String, record: StoreRecord)
+    effects { alloc }
+{
+    out.write_str(
+        f"- Record {record.record_id}: {data_class_text(record.data_class)} in {store_text(record.store)}\n".as_str(),
+    )
+}
+
+fn write_task(out: borrow mut String, task: DeletionTask)
+    effects { alloc }
+{
+    out.write_str(
+        f"- Record {task.record_id} ({store_text(task.store)}): {work_state_text(task.state)}; {task.attempt_count} attempt(s)\n".as_str(),
+    )
+    if task.state == WorkState.BlockedByRetention {
+        match task.retained_until_minute {
+            Some(until_minute) => {
+                out.write_str(f"  Retention deadline: fixture minute {until_minute}\n".as_str())
+            }
+            None => {}
+        }
+    }
+    if task.plan_rank != None {
+        out.write_str(f"  Planned order: {task.plan_rank.unwrap() + 1}\n")
+    }
+}
+
+pub fn render(report: CoordinatorReport) -> String
+    effects { alloc }
+{
+    var out = String.new()
+    out.write_str("Privacy request coordination report\n")
+    out.write_str(
+        f"Request {report.request_id} for subject {report.subject_id} — {request_kind_text(report.kind)}\n".as_str(),
+    )
+    out.write_str(f"Status: {request_state_text(report.state)}\n".as_str())
+    match report.request_error {
+        Some(error) => out.write_str(f"Validation: {request_error_text(error)}\n".as_str())
+        None => {}
+    }
+    out.write_str(
+        f"Data discovered: {report.record_count}; catalog issues: {report.catalog_issue_count}\n".as_str(),
+    )
+    out.write_str(
+        f"Deletion work: {report.deleted_count}/{report.task_count} deleted; {report.legal_hold_count} legal hold; {report.retention_blocked_count} active retention; {report.dependency_blocked_count} dependency blocked\n".as_str(),
+    )
+    out.write_str(
+        f"Retries: {report.retry_recovered_count} recovered; {report.retry_exhausted_count} exhausted; {report.retry_pending_count} incomplete\n".as_str(),
+    )
+    if (
+        report.plan_issue_count > 0
+        or report.receipt_issue_count > 0
+        or report.unused_receipt_count > 0
+    ) {
+        out.write_str(
+            f"Review details: {report.plan_issue_count} plan issue(s), {report.receipt_issue_count} invalid receipt sequence(s), {report.unused_receipt_count} unused receipt(s)\n".as_str(),
+        )
+    }
+    if report.invalid_dependency_count > 0 {
+        out.write_str(
+            f"Invalid dependencies: {report.invalid_dependency_count} edge(s) reference records missing from this subject's discovery\n".as_str(),
+        )
+    }
+    if report.record_count > 0 {
+        out.write_str("\nAccess inventory\n")
+        for index in 0..report.record_count {
+            match report.records[index] {
+                Some(record) => write_inventory_record(borrow mut out, record)
+                None => {}
+            }
+        }
+    }
+    if report.task_count > 0 {
+        out.write_str("\nErasure work plan and outcomes\n")
+        for index in 0..report.task_count {
+            match report.tasks[index] { Some(task) => write_task(borrow mut out, task), None => {} }
+        }
+    }
+    out
+}

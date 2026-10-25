@@ -1,0 +1,166 @@
+use acme:privacy-request-coordinator/model.{
+    DeletionDependency
+    DeletionPlan
+    DeletionReceipt
+    DeletionTask
+    ExecutionResult
+    MAX_DEPENDENCIES
+    MAX_RECEIPTS
+    MAX_RECORDS
+    ReceiptOutcome
+    WorkState
+}
+
+fn task_index(
+    tasks: Array<Option<DeletionTask>, MAX_RECORDS>,
+    task_count: USize,
+    record_id: U32,
+) -> Option<USize> {
+    for index in 0..task_count {
+        if tasks[index].unwrap().record_id == record_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn task_index_for_rank(
+    tasks: Array<Option<DeletionTask>, MAX_RECORDS>,
+    task_count: USize,
+    rank: USize,
+) -> Option<USize> {
+    for index in 0..task_count {
+        if tasks[index].unwrap().plan_rank == Some(rank) {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn dependencies_succeeded(
+    tasks: Array<Option<DeletionTask>, MAX_RECORDS>,
+    task_count: USize,
+    dependencies: Array<DeletionDependency, MAX_DEPENDENCIES>,
+    record_id: U32,
+) -> Bool {
+    for edge in dependencies {
+        if edge.after_record_id == record_id {
+            match task_index(tasks, task_count, edge.before_record_id) {
+                Some(index) => {
+                    if tasks[index].unwrap().state != WorkState.Deleted {
+                        return false
+                    }
+                }
+                None => return false
+            }
+        }
+    }
+    true
+}
+
+fn invalid_receipts_result(plan: DeletionPlan) -> ExecutionResult {
+    var tasks = plan.tasks
+    for index in 0..plan.task_count {
+        var task = tasks[index].unwrap()
+        if task.state == WorkState.Planned {
+            task.state = WorkState.InvalidReceipt
+            tasks[index] = Some(task)
+        }
+    }
+    var held_plan = plan
+    held_plan.tasks = tasks
+    ExecutionResult(plan: held_plan, receipt_issue_count: 1, unused_receipt_count: 0)
+}
+
+pub fn apply_receipts(
+    plan: DeletionPlan,
+    dependencies: Array<DeletionDependency, MAX_DEPENDENCIES>,
+    receipts: Array<Option<DeletionReceipt>, MAX_RECEIPTS>,
+    receipt_count: USize,
+) -> ExecutionResult {
+    if receipt_count > receipts.len() {
+        return invalid_receipts_result(plan)
+    }
+
+    var tasks = plan.tasks
+    var consumed = Array<Bool, MAX_RECEIPTS>.filled(false)
+    var receipt_issue_count: USize = 0
+
+    for rank in 0..plan.task_count {
+        match task_index_for_rank(tasks, plan.task_count, rank) {
+            Some(task_position) => {
+                var task = tasks[task_position].unwrap()
+                if task.state == WorkState.Planned {
+                    if not dependencies_succeeded(
+                        tasks,
+                        plan.task_count,
+                        dependencies,
+                        task.record_id,
+                    ) {
+                        task.state = WorkState.BlockedByDependency
+                    } else {
+                        for receipt_position in 0..receipt_count {
+                            match receipts[receipt_position] {
+                                Some(receipt) => {
+                                    if receipt.record_id == task.record_id {
+                                        consumed[receipt_position] = true
+                                        if task.state != WorkState.Planned {
+                                            receipt_issue_count += 1
+                                        } else if (
+                                            receipt.attempt != task.attempt_count + 1
+                                            or receipt.attempt > MAX_ATTEMPTS
+                                            or receipt.operation_key != task.operation_key
+                                        ) {
+                                            task.state = WorkState.InvalidReceipt
+                                            receipt_issue_count += 1
+                                        } else {
+                                            task.attempt_count += 1
+                                            match receipt.outcome {
+                                                ReceiptOutcome.Succeeded => {
+                                                    task.state = WorkState.Deleted
+                                                }
+                                                ReceiptOutcome.RetryableFailure => {
+                                                    if task.attempt_count >= MAX_ATTEMPTS {
+                                                        task.state = WorkState.RetryExhausted
+                                                    }
+                                                }
+                                                ReceiptOutcome.PermanentFailure => {
+                                                    task.state = WorkState.PermanentFailure
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                        if task.state == WorkState.Planned {
+                            task.state = if task.attempt_count == 0 {
+                                WorkState.NoAttempt
+                            } else {
+                                WorkState.RetryPending
+                            }
+                        }
+                    }
+                }
+                tasks[task_position] = Some(task)
+            }
+            None => {}
+        }
+    }
+
+    var unused_receipt_count: USize = 0
+    for receipt_position in 0..receipt_count {
+        if not consumed[receipt_position] {
+            unused_receipt_count += 1
+        }
+    }
+
+    var applied_plan = plan
+    applied_plan.tasks = tasks
+    ExecutionResult(
+        plan: applied_plan,
+        receipt_issue_count: receipt_issue_count,
+        unused_receipt_count: unused_receipt_count,
+    )
+}

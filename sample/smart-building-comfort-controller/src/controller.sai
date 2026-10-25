@@ -1,0 +1,260 @@
+use acme:smart-building-comfort-controller/model.{
+    BuildingAudit
+    BuildingSnapshot
+    ControllerMemory
+    EquipmentLimits
+    ZoneAudit
+    ZoneMemory
+    ZoneReading
+}
+use acme:smart-building-comfort-controller/policy
+
+const CONFIRMATION_SAMPLES: USize = 2
+
+fn smaller(left: USize, right: USize) -> USize {
+    if left < right {
+        left
+    } else {
+        right
+    }
+}
+
+fn larger(left: USize, right: USize) -> USize {
+    if left > right {
+        left
+    } else {
+        right
+    }
+}
+
+fn setpoint_movement(from: I32, to: I32) -> USize {
+    if to >= from {
+        USize.from(to - from)
+    } else {
+        USize.from(from - to)
+    }
+}
+
+fn move_setpoint(from: I32, to: I32, amount_deci_c: USize) -> I32 {
+    let signed_amount = I32.from(amount_deci_c)
+    if to > from {
+        from + signed_amount
+    } else if to < from {
+        from - signed_amount
+    } else {
+        from
+    }
+}
+
+fn next_hysteresis_memory(
+    reading: ZoneReading,
+    previous: ZoneMemory,
+    bounded_target: I32,
+) -> ZoneMemory {
+    if bounded_target == previous.commanded_setpoint_deci_c {
+        return ZoneMemory(
+            commanded_setpoint_deci_c: previous.commanded_setpoint_deci_c,
+            pending_setpoint_deci_c: bounded_target,
+            pending_samples: 0,
+        )
+    }
+    if policy.comfort_excursion(reading) {
+        return ZoneMemory(
+            commanded_setpoint_deci_c: previous.commanded_setpoint_deci_c,
+            pending_setpoint_deci_c: bounded_target,
+            pending_samples: CONFIRMATION_SAMPLES,
+        )
+    }
+    if previous.pending_setpoint_deci_c == bounded_target {
+        let count = if previous.pending_samples < CONFIRMATION_SAMPLES {
+            previous.pending_samples + 1
+        } else {
+            CONFIRMATION_SAMPLES
+        }
+        ZoneMemory(
+            commanded_setpoint_deci_c: previous.commanded_setpoint_deci_c,
+            pending_setpoint_deci_c: bounded_target,
+            pending_samples: count,
+        )
+    } else {
+        ZoneMemory(
+            commanded_setpoint_deci_c: previous.commanded_setpoint_deci_c,
+            pending_setpoint_deci_c: bounded_target,
+            pending_samples: 1,
+        )
+    }
+}
+
+fn next_request_index(snapshot: BuildingSnapshot, processed: Array<Bool, 3>) -> Option<USize> {
+    var selected: Option<USize> = None
+    var index: USize = 0
+    for reading in snapshot.zones {
+        if not processed[index] {
+            match selected {
+                Some(current) => {
+                    if policy.precedes(reading, snapshot.zones[current]) {
+                        selected = Some(index)
+                    }
+                }
+                None => {
+                    selected = Some(index)
+                }
+            }
+        }
+        index += 1
+    }
+    selected
+}
+
+pub fn evaluate(
+    snapshot: BuildingSnapshot,
+    previous_memory: ControllerMemory,
+    equipment: EquipmentLimits,
+) -> BuildingAudit {
+    let movement_budget = policy.allowed_movement_deci_c(snapshot, equipment)
+    var next_memory = previous_memory
+    var processed = Array<Bool, 3>.filled(false)
+    var service_order = Array<USize, 3>.filled(0)
+    var decisions = Array<Option<ZoneAudit>, 3>.filled(None)
+    var movement_used: USize = 0
+    var heating_used: USize = 0
+    var cooling_used: USize = 0
+    var unmet_thermal_count: USize = 0
+    var ventilation_shortfall_count: USize = 0
+    var unmet_ventilation_units: USize = 0
+    var service_rank: USize = 0
+
+    while service_rank < snapshot.zones.len() {
+        match next_request_index(snapshot, processed) {
+            Some(input_index) => {
+                let reading = snapshot.zones[input_index]
+                let state_index = policy.zone_index(reading.zone)
+                let previous = previous_memory.zones[state_index]
+                let bounded_target = policy.comfort_bounded_setpoint(reading)
+                let excursion = policy.comfort_excursion(reading)
+                let hysteresis = next_hysteresis_memory(reading, previous, bounded_target)
+                let requested_movement =
+                    setpoint_movement(previous.commanded_setpoint_deci_c, bounded_target)
+                let hysteresis_waiting = (
+                    requested_movement > 0
+                    and not excursion
+                    and hysteresis.pending_samples < CONFIRMATION_SAMPLES
+                )
+                let eligible = (
+                    requested_movement > 0
+                    and (excursion or hysteresis.pending_samples >= CONFIRMATION_SAMPLES)
+                )
+                let remaining_budget = movement_budget - movement_used
+                // Temperature affects urgency; request direction controls movement.
+                let cooling_direction = bounded_target < previous.commanded_setpoint_deci_c
+                let directional_capacity = if cooling_direction {
+                    if cooling_used < equipment.cooling_movement_capacity_deci_c {
+                        equipment.cooling_movement_capacity_deci_c - cooling_used
+                    } else {
+                        0
+                    }
+                } else if heating_used < equipment.heating_movement_capacity_deci_c {
+                    equipment.heating_movement_capacity_deci_c - heating_used
+                } else {
+                    0
+                }
+                let equipment_available =
+                    smaller(reading.max_setpoint_change_deci_c, directional_capacity)
+                let available = smaller(equipment_available, remaining_budget)
+                let movement = if eligible {
+                    smaller(requested_movement, available)
+                } else {
+                    0
+                }
+                let commanded_target =
+                    move_setpoint(previous.commanded_setpoint_deci_c, bounded_target, movement)
+                let unmet_request = reading.requested_setpoint_deci_c - commanded_target
+                let equipment_limited = eligible and requested_movement > equipment_available
+                let signal_limited = eligible and requested_movement > remaining_budget
+
+                if cooling_direction {
+                    cooling_used += movement
+                } else {
+                    heating_used += movement
+                }
+                movement_used += movement
+
+                if commanded_target == bounded_target {
+                    next_memory.zones[state_index] = ZoneMemory(
+                        commanded_setpoint_deci_c: commanded_target,
+                        pending_setpoint_deci_c: bounded_target,
+                        pending_samples: 0,
+                    )
+                } else {
+                    next_memory.zones[state_index] = ZoneMemory(
+                        commanded_setpoint_deci_c: commanded_target,
+                        pending_setpoint_deci_c: hysteresis.pending_setpoint_deci_c,
+                        pending_samples: hysteresis.pending_samples,
+                    )
+                }
+
+                let minimum_ventilation = policy.required_ventilation_units(reading)
+                let effective_ventilation =
+                    larger(reading.requested_ventilation_units, minimum_ventilation)
+                let supplied_ventilation =
+                    smaller(effective_ventilation, reading.max_ventilation_units)
+                let unmet_required_ventilation = if supplied_ventilation < minimum_ventilation {
+                    minimum_ventilation - supplied_ventilation
+                } else {
+                    0
+                }
+
+                if unmet_request != 0 {
+                    unmet_thermal_count += 1
+                }
+                if unmet_required_ventilation > 0 {
+                    ventilation_shortfall_count += 1
+                    unmet_ventilation_units += unmet_required_ventilation
+                }
+
+                decisions[input_index] = Some(
+                    ZoneAudit(
+                        zone: reading.zone,
+                        service_rank: service_rank,
+                        measured_temp_deci_c: reading.measured_temp_deci_c,
+                        requested_setpoint_deci_c: reading.requested_setpoint_deci_c,
+                        comfort_bounded_setpoint_deci_c: bounded_target,
+                        commanded_setpoint_deci_c: commanded_target,
+                        unmet_requested_setpoint_deci_c: unmet_request,
+                        comfort_clamped: reading.requested_setpoint_deci_c != bounded_target,
+                        comfort_excursion: excursion,
+                        hysteresis_waiting: hysteresis_waiting,
+                        equipment_limit_applied: equipment_limited,
+                        signal_budget_applied: signal_limited,
+                        required_ventilation_units: minimum_ventilation,
+                        requested_ventilation_units: reading.requested_ventilation_units,
+                        supplied_ventilation_units: supplied_ventilation,
+                        unmet_required_ventilation_units: unmet_required_ventilation,
+                    ),
+                )
+                processed[input_index] = true
+                service_order[service_rank] = input_index
+                service_rank += 1
+            }
+            None => {
+                service_rank = snapshot.zones.len()
+            }
+        }
+    }
+
+    BuildingAudit(
+        period: snapshot.period,
+        price_signal: snapshot.price_signal,
+        carbon_signal: snapshot.carbon_signal,
+        allowed_movement_deci_c: movement_budget,
+        movement_used_deci_c: movement_used,
+        heating_movement_used_deci_c: heating_used,
+        cooling_movement_used_deci_c: cooling_used,
+        service_order: service_order,
+        decisions: decisions,
+        unmet_thermal_request_count: unmet_thermal_count,
+        ventilation_shortfall_count: ventilation_shortfall_count,
+        unmet_ventilation_units: unmet_ventilation_units,
+        next_memory: next_memory,
+    )
+}

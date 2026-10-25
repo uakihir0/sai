@@ -1,0 +1,142 @@
+use acme:smart-building-comfort-controller/model.{
+    BuildingSnapshot
+    CarbonSignal
+    ControllerMemory
+    EquipmentLimits
+    PriceSignal
+    ZoneId
+    ZoneMemory
+    ZoneReading
+}
+
+pub fn equipment_limits() -> EquipmentLimits {
+    EquipmentLimits(
+        base_period_movement_deci_c: 30,
+        heating_movement_capacity_deci_c: 20,
+        cooling_movement_capacity_deci_c: 15,
+    )
+}
+
+fn studio(measured_temp_deci_c: I32, requested_setpoint_deci_c: I32) -> ZoneReading {
+    ZoneReading(
+        zone: ZoneId.Studio,
+        measured_temp_deci_c: measured_temp_deci_c,
+        requested_setpoint_deci_c: requested_setpoint_deci_c,
+        comfort_min_deci_c: 205,
+        comfort_max_deci_c: 240,
+        priority: 0,
+        occupied: true,
+        co2_ppm: 800,
+        requested_ventilation_units: 4,
+        max_ventilation_units: 5,
+        max_setpoint_change_deci_c: 15,
+    )
+}
+
+fn archive(measured_temp_deci_c: I32, co2_ppm: U32) -> ZoneReading {
+    ZoneReading(
+        zone: ZoneId.Archive,
+        measured_temp_deci_c: measured_temp_deci_c,
+        requested_setpoint_deci_c: 200,
+        comfort_min_deci_c: 180,
+        comfort_max_deci_c: 230,
+        priority: 3,
+        occupied: false,
+        co2_ppm: co2_ppm,
+        requested_ventilation_units: 1,
+        max_ventilation_units: 4,
+        max_setpoint_change_deci_c: 15,
+    )
+}
+
+fn nursery(measured_temp_deci_c: I32, co2_ppm: U32) -> ZoneReading {
+    ZoneReading(
+        zone: ZoneId.Nursery,
+        measured_temp_deci_c: measured_temp_deci_c,
+        requested_setpoint_deci_c: 250,
+        comfort_min_deci_c: 200,
+        comfort_max_deci_c: 240,
+        priority: 2,
+        occupied: true,
+        co2_ppm: co2_ppm,
+        requested_ventilation_units: 3,
+        max_ventilation_units: 6,
+        max_setpoint_change_deci_c: 20,
+    )
+}
+
+fn hot_studio() -> ZoneReading {
+    ZoneReading(
+        zone: ZoneId.Studio,
+        measured_temp_deci_c: 250,
+        requested_setpoint_deci_c: 230,
+        comfort_min_deci_c: 205,
+        comfort_max_deci_c: 240,
+        priority: 0,
+        occupied: true,
+        co2_ppm: 800,
+        requested_ventilation_units: 4,
+        max_ventilation_units: 5,
+        max_setpoint_change_deci_c: 15,
+    )
+}
+
+pub fn snapshots() -> Array<BuildingSnapshot, 4> {
+    [
+        BuildingSnapshot(
+            period: "06:00",
+            price_signal: PriceSignal.Low,
+            carbon_signal: CarbonSignal.Low,
+            zones: [studio(218, 235), archive(228, 600), nursery(185, 1250)],
+        ),
+        BuildingSnapshot(
+            period: "12:00",
+            price_signal: PriceSignal.High,
+            carbon_signal: CarbonSignal.High,
+            zones: [studio(223, 233), archive(234, 1250), nursery(203, 1100)],
+        ),
+        BuildingSnapshot(
+            period: "15:00",
+            price_signal: PriceSignal.Low,
+            carbon_signal: CarbonSignal.High,
+            zones: [studio(215, 233), archive(220, 700), nursery(207, 900)],
+        ),
+        BuildingSnapshot(
+            period: "18:00",
+            price_signal: PriceSignal.Elevated,
+            carbon_signal: CarbonSignal.Low,
+            zones: [studio(229, 232), archive(210, 700), nursery(220, 700)],
+        ),
+    ]
+}
+
+pub fn hot_room_snapshot() -> BuildingSnapshot {
+    BuildingSnapshot(
+        period: "hot-room policy regression",
+        price_signal: PriceSignal.Low,
+        carbon_signal: CarbonSignal.Low,
+        zones: [hot_studio(), archive(228, 600), nursery(185, 1250)],
+    )
+}
+
+pub fn initial_memory() -> ControllerMemory {
+    ControllerMemory(
+        zones: [
+            ZoneMemory(
+                commanded_setpoint_deci_c: 225,
+                pending_setpoint_deci_c: 225,
+                pending_samples: 0,
+            ),
+            ZoneMemory(
+                commanded_setpoint_deci_c: 215,
+                pending_setpoint_deci_c: 215,
+                pending_samples: 0,
+            ),
+            ZoneMemory(
+                commanded_setpoint_deci_c: 210,
+                pending_setpoint_deci_c: 210,
+                pending_samples: 0,
+            ),
+        ],
+    )
+}

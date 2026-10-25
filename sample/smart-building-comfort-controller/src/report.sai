@@ -1,0 +1,30 @@
+use acme:smart-building-comfort-controller/model.{AuditSummary, ControllerRun}
+
+pub fn summarize(run: ControllerRun) -> AuditSummary {
+    var period_count: USize = 0
+    var total_movement_deci_c: USize = 0
+    var unmet_thermal_request_count: USize = 0
+    var ventilation_shortfall_count: USize = 0
+    var unmet_ventilation_units: USize = 0
+
+    for period in run.periods {
+        match period {
+            Some(audit) => {
+                period_count += 1
+                total_movement_deci_c += audit.movement_used_deci_c
+                unmet_thermal_request_count += audit.unmet_thermal_request_count
+                ventilation_shortfall_count += audit.ventilation_shortfall_count
+                unmet_ventilation_units += audit.unmet_ventilation_units
+            }
+            None => {}
+        }
+    }
+
+    AuditSummary(
+        period_count: period_count,
+        total_movement_deci_c: total_movement_deci_c,
+        unmet_thermal_request_count: unmet_thermal_request_count,
+        ventilation_shortfall_count: ventilation_shortfall_count,
+        unmet_ventilation_units: unmet_ventilation_units,
+    )
+}

@@ -1,0 +1,186 @@
+use acme:privacy-request-coordinator/model.{
+    DeletionDependency
+    DeletionPlan
+    DeletionTask
+    DiscoveryReport
+    MAX_DEPENDENCIES
+    MAX_RECORDS
+    WorkState
+}
+
+fn duplicated_operation_key(discovery: DiscoveryReport, index: USize) -> Bool {
+    let candidate = discovery.records[index].unwrap()
+    for other_index in 0..discovery.record_count {
+        if (
+            other_index != index
+            and discovery.records[other_index].unwrap().operation_key == candidate.operation_key
+        ) {
+            return true
+        }
+    }
+    false
+}
+
+fn task_index(
+    tasks: Array<Option<DeletionTask>, MAX_RECORDS>,
+    task_count: USize,
+    record_id: U32,
+) -> Option<USize> {
+    for index in 0..task_count {
+        if tasks[index].unwrap().record_id == record_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn task_index_for_discovery(discovery: DiscoveryReport, record_id: U32) -> Option<USize> {
+    for index in 0..discovery.record_count {
+        if discovery.records[index].unwrap().record_id == record_id {
+            return Some(index)
+        }
+    }
+    None
+}
+
+fn can_assign_next_rank(
+    tasks: Array<Option<DeletionTask>, MAX_RECORDS>,
+    task_count: USize,
+    dependencies: Array<DeletionDependency, MAX_DEPENDENCIES>,
+    candidate_id: U32,
+) -> Bool {
+    for edge in dependencies {
+        if edge.after_record_id == candidate_id {
+            match task_index(tasks, task_count, edge.before_record_id) {
+                Some(prerequisite_index) => {
+                    let prerequisite = tasks[prerequisite_index].unwrap()
+                    if prerequisite.state == WorkState.Planned and prerequisite.plan_rank == None {
+                        return false
+                    }
+                }
+                None => return false
+            }
+        }
+    }
+    true
+}
+
+pub fn create_plan(
+    discovery: DiscoveryReport,
+    dependencies: Array<DeletionDependency, MAX_DEPENDENCIES>,
+    now_minute: U32,
+) -> DeletionPlan {
+    var tasks = Array<Option<DeletionTask>, MAX_RECORDS>.filled(None)
+    var invalid_key_count: USize = 0
+    var invalid_dependency_count: USize = 0
+    var unresolved_order_count: USize = 0
+
+    for index in 0..discovery.record_count {
+        let record = discovery.records[index].unwrap()
+        let invalid_key = record.operation_key == 0 or duplicated_operation_key(discovery, index)
+        let state = if invalid_key {
+            invalid_key_count += 1
+            WorkState.InvalidPlan
+        } else if record.legal_hold {
+            WorkState.BlockedByLegalHold
+        } else {
+            match record.retained_until_minute {
+                Some(until_minute) => {
+                    if now_minute < until_minute {
+                        WorkState.BlockedByRetention
+                    } else {
+                        WorkState.Planned
+                    }
+                }
+                None => WorkState.Planned
+            }
+        }
+        tasks[index] = Some(
+            DeletionTask(
+                record_id: record.record_id,
+                operation_key: record.operation_key,
+                store: record.store,
+                data_class: record.data_class,
+                retained_until_minute: record.retained_until_minute,
+                state: state,
+                plan_rank: None,
+                attempt_count: 0,
+            ),
+        )
+    }
+
+    for edge in dependencies {
+        let before_index = task_index_for_discovery(discovery, edge.before_record_id)
+        let after_index = task_index_for_discovery(discovery, edge.after_record_id)
+        if before_index == None or after_index == None {
+            invalid_dependency_count += 1
+            match before_index {
+                Some(index) => {
+                    var task = tasks[index].unwrap()
+                    task.state = WorkState.InvalidDependency
+                    tasks[index] = Some(task)
+                }
+                None => {}
+            }
+            match after_index {
+                Some(index) => {
+                    var task = tasks[index].unwrap()
+                    task.state = WorkState.InvalidDependency
+                    tasks[index] = Some(task)
+                }
+                None => {}
+            }
+        }
+    }
+
+    var next_rank: USize = 0
+    for _step in 0..discovery.record_count {
+        var selected_index: Option<USize> = None
+        for index in 0..discovery.record_count {
+            let candidate = tasks[index].unwrap()
+            if (
+                candidate.state == WorkState.Planned
+                and candidate.plan_rank == None
+                and can_assign_next_rank(
+                    tasks,
+                    discovery.record_count,
+                    dependencies,
+                    candidate.record_id,
+                )
+            ) {
+                match selected_index {
+                    None => {
+                        selected_index = Some(index)
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        match selected_index {
+            Some(index) => {
+                var task = tasks[index].unwrap()
+                task.plan_rank = Some(next_rank)
+                tasks[index] = Some(task)
+                next_rank += 1
+            }
+            None => {}
+        }
+    }
+
+    for index in 0..discovery.record_count {
+        var task = tasks[index].unwrap()
+        if task.state == WorkState.Planned and task.plan_rank == None {
+            task.state = WorkState.DependencyOrderUnresolved
+            tasks[index] = Some(task)
+            unresolved_order_count += 1
+        }
+    }
+
+    DeletionPlan(
+        tasks: tasks,
+        task_count: discovery.record_count,
+        unresolved_order_count: unresolved_order_count,
+        invalid_key_count: invalid_key_count,
+        invalid_dependency_count: invalid_dependency_count,
+    )
+}

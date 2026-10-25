@@ -1,0 +1,32 @@
+use acme:privacy-request-coordinator/model.{DiscoveryReport, MAX_RECORDS, StoreRecord}
+
+fn has_prior_record_id(records: Array<StoreRecord, MAX_RECORDS>, index: USize) -> Bool {
+    for prior_index in 0..index {
+        if records[prior_index].record_id == records[index].record_id {
+            return true
+        }
+    }
+    false
+}
+
+pub fn discover(records: Array<StoreRecord, MAX_RECORDS>, subject_id: U32) -> DiscoveryReport {
+    var matched = Array<Option<StoreRecord>, MAX_RECORDS>.filled(None)
+    var matched_count: USize = 0
+    var catalog_issue_count: USize = 0
+
+    for index in 0..records.len() {
+        let record = records[index]
+        if has_prior_record_id(records, index) {
+            catalog_issue_count += 1
+        } else if record.subject_id == subject_id {
+            matched[matched_count] = Some(record)
+            matched_count += 1
+        }
+    }
+
+    DiscoveryReport(
+        records: matched,
+        record_count: matched_count,
+        catalog_issue_count: catalog_issue_count,
+    )
+}
