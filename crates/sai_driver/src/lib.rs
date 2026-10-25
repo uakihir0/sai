@@ -2572,6 +2572,13 @@ pub enum LocalEnumVariantPathUnsupportedReason {
     Enum(LocalEnumAdtUnsupportedReason),
 }
 
+/// The supported subset of type-dependent definitions selected by direct
+/// local enum-variant paths. This is not the complete typeck result enum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalTypeDependentDef {
+    Variant(DefId),
+}
+
 /// One direct enum-variant suffix and the exact HIR/source identity used to
 /// resolve it.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2674,6 +2681,7 @@ pub struct LocalEnumVariantPathResolution {
     owner: OwnerId,
     entries: HashMap<HirId, LocalEnumVariantPathEntry>,
     value_type_entries: HashMap<HirId, LocalEnumVariantPathTypeEntry>,
+    type_dependent_defs: HashMap<HirId, LocalTypeDependentDef>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -2697,6 +2705,17 @@ impl LocalEnumVariantPathResolution {
     /// Value-type projection for the exact direct variant field expression.
     pub fn value_type_for_field(&self, field: HirId) -> Option<&LocalEnumVariantPathTypeEntry> {
         self.value_type_entries.get(&field)
+    }
+
+    /// Successful type-dependent item selections, keyed by exact `Field` HIR ID.
+    /// Only supported direct local enum paths are recorded.
+    pub fn type_dependent_defs(&self) -> &HashMap<HirId, LocalTypeDependentDef> {
+        &self.type_dependent_defs
+    }
+
+    /// Selected type-dependent item for this exact direct variant field.
+    pub fn type_dependent_def_for_field(&self, field: HirId) -> Option<LocalTypeDependentDef> {
+        self.type_dependent_defs.get(&field).copied()
     }
 
     /// Source-ordered unknown-variant and non-enum diagnostics.
@@ -13891,6 +13910,7 @@ fn resolve_local_enum_variant_paths(
         owner,
         entries: HashMap::new(),
         value_type_entries: HashMap::new(),
+        type_dependent_defs: HashMap::new(),
         diagnostics: Vec::new(),
     };
     if candidates.is_empty() {
@@ -14079,6 +14099,14 @@ fn resolve_local_enum_variant_paths(
             _ => continue,
         };
 
+        let type_dependent_def = match &outcome {
+            LocalEnumVariantPathOutcome::Resolved { variant, .. } => {
+                Some(LocalTypeDependentDef::Variant(*variant))
+            }
+            LocalEnumVariantPathOutcome::UnknownVariant { .. }
+            | LocalEnumVariantPathOutcome::NotEnum { .. }
+            | LocalEnumVariantPathOutcome::UnsupportedEnum { .. } => None,
+        };
         let value_type_entry = match &outcome {
             LocalEnumVariantPathOutcome::Resolved {
                 enum_owner,
@@ -14127,6 +14155,11 @@ fn resolve_local_enum_variant_paths(
             result
                 .value_type_entries
                 .insert(value_type_entry.field, value_type_entry);
+        }
+        if let Some(type_dependent_def) = type_dependent_def {
+            result
+                .type_dependent_defs
+                .insert(entry.field, type_dependent_def);
         }
         result.entries.insert(entry.field, entry);
     }
@@ -96914,6 +96947,11 @@ interface facade { use middle.{payload}; }"#;
         assert_eq!(alpha_type_entry.enum_owner(), alpha_owner);
         assert_eq!(alpha_type_entry.enum_def(), alpha_enum);
         assert_eq!(alpha_type_entry.variant(), alpha_variant);
+        assert_eq!(
+            alpha_paths.type_dependent_def_for_field(alpha_entry.field()),
+            Some(LocalTypeDependentDef::Variant(alpha_variant)),
+            "the selected item is recorded under the exact suffix field HIR ID"
+        );
         assert!(matches!(
             alpha_type_entry.value_type(),
             sai_ty::adt::LocalEnumVariantValueType::Unit(value_type)
@@ -96929,6 +96967,11 @@ interface facade { use middle.{payload}; }"#;
             .expect("the second same-named unit variant has a value type");
         assert_eq!(beta_type_entry.enum_def(), beta_enum);
         assert_eq!(beta_type_entry.variant(), beta_variant);
+        assert_eq!(
+            beta_paths.type_dependent_def_for_field(entry_for("beta").field()),
+            Some(LocalTypeDependentDef::Variant(beta_variant)),
+            "same-named variants keep their enum-specific type-dependent DefIds"
+        );
         assert!(
             !alpha_paths.value_type_entries().is_empty()
                 && alpha_type_entry.variant() != beta_type_entry.variant(),
@@ -97039,9 +97082,11 @@ interface facade { use middle.{payload}; }"#;
             LocalEnumVariantPathOutcome::Resolved {
                 enum_owner,
                 enum_def,
-                ..
+                variant,
             } if enum_owner.def_id.to_def_id() == *enum_def
                 && enum_owner.def_id.package() == collection.module_tree.package
+                && qualified_paths.type_dependent_def_for_field(qualified.field())
+                    == Some(LocalTypeDependentDef::Variant(*variant))
         ));
         assert!(
             paths_for("local").entries().is_empty(),
@@ -97095,6 +97140,7 @@ interface facade { use middle.{payload}; }"#;
             LocalEnumVariantPathOutcome::NotEnum { type_def, .. }
                 if type_def.package == collection.module_tree.package
         ));
+        assert!(non_enum.type_dependent_defs().is_empty());
         assert_eq!(
             non_enum.diagnostics()[0].code,
             sai_diagnostics::Code::UnknownVariant
@@ -97141,6 +97187,10 @@ interface facade { use middle.{payload}; }"#;
         let payload_unit_type = payload_unit_paths
             .value_type_for_field(payload_unit.field())
             .expect("unit variant type is keyed by the exact field HIR ID");
+        assert_eq!(
+            payload_unit_paths.type_dependent_def_for_field(payload_unit.field()),
+            Some(LocalTypeDependentDef::Variant(payload_unit_type.variant()))
+        );
         assert!(matches!(
             payload_unit_type.value_type(),
             sai_ty::adt::LocalEnumVariantValueType::Unit(value_type)
@@ -97161,6 +97211,10 @@ interface facade { use middle.{payload}; }"#;
         let payload_tuple_type = payload_tuple_paths
             .value_type_for_field(payload_tuple.field())
             .expect("tuple variant path retains its constructor type");
+        assert_eq!(
+            payload_tuple_paths.type_dependent_def_for_field(payload_tuple.field()),
+            Some(LocalTypeDependentDef::Variant(payload_tuple_type.variant()))
+        );
         let sai_ty::adt::LocalEnumVariantValueType::TupleConstructor {
             function_item,
             signature,
@@ -97195,17 +97249,24 @@ interface facade { use middle.{payload}; }"#;
             .values()
             .next()
             .expect("record constructor callee retains its variant path");
-        assert!(
-            payload_record_paths
-                .value_type_for_field(payload_record.field())
-                .is_some_and(|entry| matches!(
-                    entry.value_type(),
-                    sai_ty::adt::LocalEnumVariantValueType::RecordHasNoValueType
-                ))
+        let payload_record_type = payload_record_paths
+            .value_type_for_field(payload_record.field())
+            .expect("record path keeps its explicit no-value result");
+        assert!(matches!(
+            payload_record_type.value_type(),
+            sai_ty::adt::LocalEnumVariantValueType::RecordHasNoValueType
+        ));
+        assert_eq!(
+            payload_record_paths.type_dependent_def_for_field(payload_record.field()),
+            Some(LocalTypeDependentDef::Variant(
+                payload_record_type.variant()
+            )),
+            "the selected record variant is recorded before later call/value checking"
         );
         let repeated_paths = paths_for("repeated_paths");
         assert_eq!(repeated_paths.entries().len(), 2);
         assert_eq!(repeated_paths.value_type_entries().len(), 2);
+        assert_eq!(repeated_paths.type_dependent_defs().len(), 2);
         let repeated_fields = repeated_paths
             .value_type_entries()
             .keys()
@@ -97215,6 +97276,15 @@ interface facade { use middle.{payload}; }"#;
             repeated_fields.len(),
             2,
             "each source occurrence has its own exact HIR-keyed type entry"
+        );
+        let repeated_type_dependent_fields = repeated_paths
+            .type_dependent_defs()
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            repeated_type_dependent_fields, repeated_fields,
+            "each selected item is keyed by the same exact field HIR occurrence"
         );
         assert!(
             repeated_paths
@@ -97234,9 +97304,14 @@ interface facade { use middle.{payload}; }"#;
             "multiple variant paths in one owner retain separate shapes"
         );
         for name in ["unknown", "non_enum", "generic_enum", "unsupported_enum"] {
+            let paths = paths_for(name);
             assert!(
-                paths_for(name).value_type_entries().is_empty(),
+                paths.value_type_entries().is_empty(),
                 "{name} does not receive a variant value type"
+            );
+            assert!(
+                paths.type_dependent_defs().is_empty(),
+                "{name} does not receive a successful type-dependent item selection"
             );
         }
 

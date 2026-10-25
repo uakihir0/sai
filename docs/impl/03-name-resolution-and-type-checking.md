@@ -1877,10 +1877,11 @@ occurrence retains its own entry. This projection uses the existing direct
 scope-validated type accessor and does not promise a new cached query.
 
 This remains a bounded path-type projection. It does not populate
-`TypeckResults::node_types` or `type_dependent_defs`, implement general
-`type_of`, accept generic enums, or perform constructor-call checking. Record
-constructor misuse remains deferred until call-versus-value context is
-available.
+`TypeckResults::node_types`, implement general `type_of`, accept generic enums,
+or perform constructor-call checking. IR-923 adds only the successful local
+`Variant(DefId)` selection to a separate occurrence-keyed projection; it is not
+the complete `TypeckResults::type_dependent_defs` map. Record constructor misuse
+remains deferred until call-versus-value context is available.
 
 **IR-922 compatibility decisions and review record:** Keep path results and
 their value types together in the existing owner-local `LocalEnumVariantPathResolution`
@@ -1898,6 +1899,18 @@ exact identity and shape checks, record constructor context, scope provenance,
 and the boundary around generic enums and full expression typing. Focused
 verification is recorded in `docs/design/implementation-review.md` under
 IR-922.
+
+
+**Implemented subset (IR-923):** When a supported direct local enum path
+resolves to a variant, `LocalEnumVariantPathResolution::type_dependent_defs`
+records `LocalTypeDependentDef::Variant(DefId)` under the exact suffix `Field`
+HIR ID. Unit, tuple, and record variants all record the selected item; unknown
+variants, non-enum heads, and unsupported enums do not. The entry is derived
+from the already validated path outcome, so no name-only lookup is repeated.
+This narrow map is not the complete `TypeckResults::type_dependent_defs`: it
+does not select methods, implicit members, flags constants, external heads, or
+other type-relative definitions, and it adds no error entries or expression
+types.
 
 ### 3.6.4 `adt_def`
 
