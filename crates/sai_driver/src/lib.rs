@@ -13165,7 +13165,10 @@ fn local_record_field_type_is_region_free_for_array_projection(
             match resolution.base {
                 Res::PrimTy(sai_resolve::prelude::PrimTy::Array) => {
                     let Some(arguments) = segment.args else {
-                        return false;
+                        // The exact built-in constructor has no type children
+                        // that could carry a region. Normal lowering still
+                        // rejects this malformed array use.
+                        return true;
                     };
                     arguments
                         .args
@@ -38080,6 +38083,7 @@ property "shared"() {}
             "  nested_array: Array<Array<U8, 2>, 3>,\n",
             "  after_unsupported: Char,\n",
             "}\n",
+            "type R { malformed: Array, good: Array<U8, 2> }\n",
             "type RegionBearing {\n",
             "  borrowed: borrow Bool,\n",
             "  array: Array<U8, 2>,\n",
@@ -38397,6 +38401,54 @@ property "shared"() {}
             array_fields.type_of_field(array_fields_by_name("after_unsupported").def_id()),
             Some(Ok(ty)) if matches!(ty.kind(), sai_ty::ty::TyKind::Char)
         ));
+
+        let malformed_array_record = resolved
+            .local_record_field_types_with_scopes(
+                &collection,
+                Some(&member_scopes),
+                None,
+                owner_for("R"),
+            )
+            .expect("exact collection guards no-argument array fields")
+            .expect("the record retains each field's lowering result");
+        let malformed_array_field = malformed_array_record
+            .fields()
+            .expect("the record remains field-projectable")
+            .iter()
+            .find(|field| {
+                database.symbols.resolve(field.name()).ok().as_deref() == Some("malformed")
+            })
+            .expect("the malformed array field exists");
+        let good_array_field = malformed_array_record
+            .fields()
+            .expect("the record remains field-projectable")
+            .iter()
+            .find(|field| database.symbols.resolve(field.name()).ok().as_deref() == Some("good"))
+            .expect("the valid array field exists");
+        assert_eq!(
+            malformed_array_record.type_of_field(malformed_array_field.def_id()),
+            Some(Err(
+                sai_ty::lower_ty::UnsupportedTy::WrongNumberOfGenericArguments
+            )),
+            "the no-argument array stays unsupported by ordinary field lowering"
+        );
+        assert!(
+            matches!(
+                malformed_array_record.type_of_field(good_array_field.def_id()),
+                Some(Ok(ty))
+                    if matches!(
+                        ty.kind(),
+                        sai_ty::ty::TyKind::Array(
+                            element,
+                            sai_ty::ty::Const::Value(2)
+                        ) if matches!(
+                            element.kind(),
+                            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+                        )
+                    )
+            ),
+            "a malformed sibling with the exact Array constructor does not gate valid array fields"
+        );
 
         let region_bearing = resolved
             .local_record_field_types_with_scopes(
