@@ -284,14 +284,14 @@ fn empty_root_package_index() -> sai_semantic::EncodedSymbolIndex {
 #[test]
 fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     let source = concat!(
-        "enum Payload { Pair(U8, Bool), Named(value: Bool), UnitPayload(()) }\n",
+        "enum Payload { Pair(U8, Bool), Named(value: Bool), UnitPayload(()), CharPayload(Char) }\n",
         "enum FixedPayload { Values(Bool, Byte, Char, ()) }\n",
         "enum NestedPayload { Nested(((I8, Char), ((), USize))), Fixed(((I8, Byte), (Char, ()))), AnnotatedFixed(((I8, Byte), (Char, Bool))) }\n",
         "enum DeepPayload { DeepBool((((Bool, Char), Bool), Bool)), DeepByte((((Byte, Char), Bool), Bool)) }\n",
         "type BoolAlias = Bool\n",
         "type UnitAlias = ()\n",
         "type Widget { value: Bool }\n",
-        "pub fn use_it(actual: Bool) {\n",
+        "pub fn use_it(actual: Bool, depth_three_shadow: Bool) {\n",
         "    let annotated: Bool = true\n",
         "    var matching: Bool = false\n",
         "    var extra: Bool = false\n",
@@ -323,7 +323,16 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "    let ((tuple_annotation_nested_bad, _), (nested_bad_tail, _)): ((Bool, Byte), (Char, Bool)) = ((true, b'x'), ('x', false))\n",
         "    let (tuple_annotation_shape_bad, (shape_nested, _)): (Bool, Bool) = (true, false)\n",
         "    let (tuple_annotation_arity_bad, _): (Bool,) = (true, false)\n",
-        "    let (((tuple_annotation_deep_bad, _), _), deep_tail): (((Bool, Bool), Bool), Bool) = (((true, false), false), true)\n",
+        "    let ((((tuple_annotation_deep_bad, _), _), _), deep_tail): ((((Bool, Bool), Bool), Bool), Bool) = true\n",
+        "    let (((shape_depth_three_target, _), _), _): ((Bool, Bool), Bool) = true\n",
+        "    let ((shape_depth_three_target_reverse, _), _): (((Bool, Bool), Bool), Bool) = true\n",
+        "    let (((arity_depth_three_target, _), _), _): (((Bool,), Bool), Bool) = true\n",
+        "    let ((((depth_four_target, _), _), _), _): ((((Bool, Bool), Bool), Bool), Bool) = true\n",
+        "    let ((unsupported_depth_three_target, _), ((nested_unsupported, unsupported_depth_three_wildcard), _)): ((Bool, Bool), ((Bool, UnitAlias), Bool)) = true\n",
+        "    let (((empty_structural_depth_three_target, _), _), (_, ())): (((Bool, Byte), Bool), (Bool, ())) = true\n",
+        "    let (((_, _), (depth_three_mismatch, _)), _): (((Bool, Byte), (Bool, ())), Bool) = true\n",
+        "    let (((_, _), (depth_three_char, var depth_three_unit)), _): (((Bool, Byte), (Char, ())), Bool) = true\n",
+        "    let (((_, _), (var depth_three_shadow, _)), _): (((Bool, Byte), (Char, ())), Bool) = true\n",
         "    let (tuple_annotation_alias_bad, _): (BoolAlias, Bool) = (true, false)\n",
         "    let (tuple_annotation_str_bad, _): (Str, Bool) = (\"text\", true)\n",
         "    let (tuple_annotation_unit_bad, _): ((), Bool) = (true, true)\n",
@@ -364,6 +373,15 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "Payload.Pair(tuple_annotation_shape_bad, true), ",
         "Payload.Pair(tuple_annotation_arity_bad, true), ",
         "Payload.Pair(tuple_annotation_deep_bad, true), ",
+        "Payload.Pair(shape_depth_three_target, true), ",
+        "Payload.Pair(shape_depth_three_target_reverse, true), ",
+        "Payload.Pair(arity_depth_three_target, true), ",
+        "Payload.Pair(depth_four_target, true), ",
+        "Payload.Pair(unsupported_depth_three_target, true), ",
+        "Payload.CharPayload(empty_structural_depth_three_target), ",
+        "Payload.CharPayload(depth_three_mismatch), ",
+        "Payload.UnitPayload(depth_three_unit), ",
+        "Payload.CharPayload(depth_three_shadow), ",
         "Payload.Pair(tuple_annotation_alias_bad, true), ",
         "Payload.Pair(tuple_annotation_str_bad, true), ",
         "Payload.UnitPayload(tuple_annotation_unit_bad), ",
@@ -417,8 +435,8 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     );
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        19,
-        "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus named/nested tuple literal leaves:\n{stdout}"
+        20,
+        "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus depth-three annotated leaves and named/nested tuple literal leaves:\n{stdout}"
     );
     assert_eq!(
         stdout.matches("\"code\":\"LITERAL_OUT_OF_RANGE\"").count(),
@@ -533,6 +551,18 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "expected `I8`, found `Bool`",
         annotated_nested_start,
         annotated_nested_start + "tuple_annotation_nested_bad".len(),
+    );
+    let depth_three_call = "Payload.CharPayload(depth_three_mismatch)";
+    let depth_three_start = source
+        .find(depth_three_call)
+        .expect("deepest annotated tuple mismatch call exists")
+        + "Payload.CharPayload(".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Char`, found `Bool`",
+        depth_three_start,
+        depth_three_start + "depth_three_mismatch".len(),
     );
     let annotated_wildcard_unit_call = "Payload.Pair(tuple_annotation_wildcard_unit, true)";
     let annotated_wildcard_unit_start = source

@@ -9742,7 +9742,7 @@ fn local_enum_variant_annotated_tuple_pattern_matches(
 
     match (pattern.kind, ty.kind) {
         (PatKind::Tuple(patterns), TyKind::Tuple(types)) => {
-            if tuple_depth > 2 || patterns.is_empty() || patterns.len() != types.len() {
+            if tuple_depth > 3 || patterns.is_empty() || patterns.len() != types.len() {
                 return None;
             }
             for (pattern, ty) in patterns.iter().zip(types) {
@@ -97894,7 +97894,7 @@ interface facade { use middle.{payload}; }"#;
             "enum Alpha { Same, Ready }\n",
             "enum Beta { Same, Later }\n",
             "enum Duplicate { Same, Same }\n",
-            "enum Payload { Unit, Pair(U8, Bool), Fixed(Bool, Byte, Char, ()), Named(value: Bool), UnitPayload(()), Signed(ISize), Wide(USize) }\n",
+            "enum Payload { Unit, Pair(U8, Bool), Fixed(Bool, Byte, Char, ()), Named(value: Bool), UnitPayload(()), CharPayload(Char), Signed(ISize), Wide(USize) }\n",
             "enum NestedPayload { Nested(((I8, Char), ((), USize))), Fixed(((I8, Byte), (Char, Bool))), Single((I8,)) }\n",
             "enum DeepPayload { DeepBool((((Bool, Char), Bool), Bool)), DeepByte((((Byte, Char), Bool), Bool)) }\n",
             "enum Generic<T> { Value(T) }\n",
@@ -97984,9 +97984,17 @@ interface facade { use middle.{payload}; }"#;
             "fn tuple_call_annotated_tuple_nominal_wildcard() {\n    let (actual, _): (Bool, Widget) = (true, false)\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_annotated_nested_tuple_destructure_ok() {\n    let ((actual, _), (tail, _)): ((I8, Byte), (Char, Bool)) = ((true, 1 + 2), ('x', false))\n    NestedPayload.Fixed(((actual, b'x'), ('x', true)))\n}\n",
             "fn tuple_call_annotated_nested_tuple_destructure_mismatch() {\n    let ((actual, _), (tail, _)): ((Bool, Byte), (Char, Bool)) = ((true, b'x'), ('x', false))\n    NestedPayload.Fixed(((actual, b'x'), ('x', true)))\n}\n",
+            "fn tuple_call_annotated_depth_three_ok(deep_actual: Bool) {\n    let (((other, _), (var deep_actual, _)), _): (((Bool, Byte), (Char, ())), Bool) = true\n    Payload.CharPayload(deep_actual)\n}\n",
+            "fn tuple_call_annotated_depth_three_unit_ok() {\n    let (((other, _), (deep_actual, var unit_actual)), _): (((Bool, Byte), (Char, ())), Bool) = ()\n    Payload.UnitPayload(unit_actual)\n}\n",
+            "fn tuple_call_annotated_depth_three_mismatch() {\n    let (((other, _), (deep_actual, _)), _): (((Bool, Byte), (Bool, ())), Bool) = true\n    Payload.CharPayload(deep_actual)\n}\n",
+            "fn tuple_call_annotated_depth_three_pattern_vs_leaf() {\n    let (((deep_actual, _), _), _): ((Bool, Bool), Bool) = true\n    Payload.Pair(deep_actual, true)\n}\n",
+            "fn tuple_call_annotated_depth_three_leaf_vs_pattern() {\n    let ((deep_actual, _), _): (((Bool, Bool), Bool), Bool) = true\n    Payload.Pair(deep_actual, true)\n}\n",
+            "fn tuple_call_annotated_depth_three_arity_mismatch() {\n    let (((deep_actual, _), _), _): (((Bool,), Bool), Bool) = true\n    Payload.Pair(deep_actual, true)\n}\n",
+            "fn tuple_call_annotated_depth_three_wildcard_alias() {\n    let ((deep_actual, _), ((nested, wildcard), _)): ((Bool, Bool), ((Bool, UnitAlias), Bool)) = true\n    Payload.Pair(deep_actual, true)\n}\n",
+            "fn tuple_call_annotated_depth_three_empty_tuple_structural() {\n    let (((deep_actual, _), _), (_, ())): (((Bool, Byte), Bool), (Bool, ())) = true\n    Payload.CharPayload(deep_actual)\n}\n",
             "fn tuple_call_annotated_tuple_shape_mismatch() {\n    let (actual, (nested, _)): (Bool, Bool) = (true, false)\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_annotated_tuple_arity_mismatch() {\n    let (actual, _): (Bool,) = (true, false)\n    Payload.Pair(actual, true)\n}\n",
-            "fn tuple_call_annotated_tuple_pattern_too_deep() {\n    let (((actual, _), _), other): (((Bool, Bool), Bool), Bool) = (((true, false), false), true)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_annotated_tuple_pattern_too_deep() {\n    let ((((actual, _), _), _), other): ((((Bool, Bool), Bool), Bool), Bool) = true\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_annotated_tuple_nested_scope() {\n    {\n        let (actual, _): (Bool, Bool) = (true, false)\n        Payload.Pair(actual, true)\n    }\n}\n",
             "fn tuple_call_annotated_tuple_else() {\n    let (actual, _): (Bool, Bool) = (true, false) else { return }\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_annotated_tuple_alias_leaf() {\n    let (actual, _): (BoolAlias, Bool) = (false, true)\n    Payload.Pair(actual, true)\n}\n",
@@ -98579,6 +98587,13 @@ interface facade { use middle.{payload}; }"#;
             "tuple_call_annotated_tuple_destructure_ok",
             "tuple_call_annotated_tuple_destructure_var_ok",
             "tuple_call_annotated_nested_tuple_destructure_ok",
+            "tuple_call_annotated_depth_three_ok",
+            "tuple_call_annotated_depth_three_unit_ok",
+            "tuple_call_annotated_depth_three_pattern_vs_leaf",
+            "tuple_call_annotated_depth_three_leaf_vs_pattern",
+            "tuple_call_annotated_depth_three_arity_mismatch",
+            "tuple_call_annotated_depth_three_wildcard_alias",
+            "tuple_call_annotated_depth_three_empty_tuple_structural",
             "tuple_call_annotated_tuple_wildcard_alias_leaf",
             "tuple_call_annotated_tuple_nested_unit_leaf",
             "tuple_call_annotated_tuple_shape_mismatch",
@@ -98667,6 +98682,10 @@ interface facade { use middle.{payload}; }"#;
                 "expected `I8`, found `Bool`",
             ),
             (
+                "tuple_call_annotated_depth_three_mismatch",
+                "expected `Char`, found `Bool`",
+            ),
+            (
                 "tuple_call_annotated_tuple_wildcard_unit_mismatch",
                 "expected `U8`, found `Bool`",
             ),
@@ -98736,10 +98755,10 @@ interface facade { use middle.{payload}; }"#;
                 expected_message,
                 "{name}"
             );
-            let expected_path = if name == "tuple_call_unicode_param_mismatch" {
-                "値"
-            } else {
-                "actual"
+            let expected_path = match name {
+                "tuple_call_unicode_param_mismatch" => "値",
+                "tuple_call_annotated_depth_three_mismatch" => "deep_actual",
+                _ => "actual",
             };
             assert_eq!(
                 diagnostic_primary_text(&paths.call_diagnostics()[0]),
@@ -98801,6 +98820,7 @@ interface facade { use middle.{payload}; }"#;
                     | "tuple_call_annotated_tuple_initializer_shape_ignored"
                     | "tuple_call_annotated_tuple_destructure_var_mismatch"
                     | "tuple_call_annotated_nested_tuple_destructure_mismatch"
+                    | "tuple_call_annotated_depth_three_mismatch"
                     | "tuple_call_annotated_tuple_wildcard_unit_mismatch"
                     | "tuple_call_annotated_tuple_unit_primitive_mismatch"
                     | "tuple_call_annotated_tuple_primitive_unit_mismatch"
@@ -98829,6 +98849,10 @@ interface facade { use middle.{payload}; }"#;
                         "NestedPayload.Fixed(((actual, b'x'), ('x', true)))",
                         "NestedPayload.Fixed(((".len(),
                     ),
+                    "tuple_call_annotated_depth_three_mismatch" => (
+                        "Payload.CharPayload(deep_actual)",
+                        "Payload.CharPayload(".len(),
+                    ),
                     "tuple_call_inferred_char_mismatch" => (
                         "NestedPayload.Nested(((actual, 'x'), ((), 2)))",
                         "NestedPayload.Nested(((".len(),
@@ -98855,7 +98879,7 @@ interface facade { use middle.{payload}; }"#;
                 assert_primary_span(
                     &paths.call_diagnostics()[0],
                     local_path_start,
-                    "actual".len(),
+                    expected_path.len(),
                 );
             }
         }

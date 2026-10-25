@@ -8400,3 +8400,27 @@
 - **Verification:** Under pinned Rust 1.99.1, the focused driver regression `function_owner_resolves_direct_local_enum_variant_paths_with_provenance` and CLI regression `check_reports_local_enum_call_diagnostics_without_claiming_full_coverage` passed. Driver fixtures cover matching depth-three destructuring, a depth-three Bool/Byte mismatch at the binding path, and a depth-four negative; the CLI fixture checks the deepest mismatch's exact byte span, includes a matching depth-three path, and confirms a depth-four path emits no additional mismatch while the Stage 0 gate remains. The full `cargo test --locked --offline --workspace -- --quiet` suite, `cargo fmt --all -- --check`, and `git diff --check` passed.
 - **Hostile review:** An independent read-only review confirmed that the depth guard counts the root tuple as depth one and rejects tuple nodes at depth four; shape and arity are matched recursively; fixed-literal, exact-binding, name, pattern-kind, and mode checks remain; and the CLI retains the exact deepest-leaf span and incomplete-stage gate. No actionable P0–P2 findings remain.
 - **Remaining scope:** A fourth tuple-pattern level, annotated tuple-pattern depth beyond IR-933/934's existing limit, general tuple-pattern type checking, numeric/defaulted or computed leaves, tuple-shape diagnostics, nested scopes, coercions, generic/external enum calls, `call_kinds`, and complete call checking remain separate work.
+
+### IR-936 (2026-10-26): extend annotated tuple-pattern locals to depth three
+
+- **Decision:** Raise only the explicitly annotated tuple-pattern local projection's maximum tuple-pattern depth from two to three levels, counting the outer tuple as level one. Continue to require exact recursive pattern/annotation shape and arity at every tuple node. Keep simple binding or wildcard leaves, direct primitive or unit annotation leaves, exact `BindingId`/HIR-name/`Pattern { var }`/binding-mode checks, and annotation-authoritative behavior that ignores the initializer. Leave the unannotated fixed-literal tuple matcher unchanged.
+- **Reason:** Spec/06 §§6.12.1 and 6.21.2 require a tuple pattern to correspond to the tuple type at each level; §6.21.7 defines recursive tuple subpattern matching. The current implementation has a narrow fixed-depth projection, so a one-level increase makes common three-level annotated destructuring usable without claiming general pattern typing. A strict depth-four rejection keeps recursion bounded and reviewable. Direct unit leaves retain IR-934's distinction between `TyKind::Tuple([])` as a leaf type and `PatKind::Tuple([])` as a structural pattern node.
+- **Failure boundary and judgment:** Consider the same direct outer-block `let` statements with explicit tuple annotation and no `else`. Reject depth four, mismatched tuple/leaf shapes, any tuple arity mismatch, empty structural tuple patterns, non-simple leaves, unsupported or aliased/view/`Str`/nominal leaves, nested scopes, and unsupported binding kinds or modes. Do not inspect the initializer, infer types, emit shape diagnostics, or modify the separate unannotated fixed-literal matcher. This is a bounded argument-path diagnostic projection, not general tuple pattern checking.
+- **Review required:** Adversarially verify acceptance at depth three and rejection at depth four; shape and arity correspondence at the deepest supported level in both tuple-vs-leaf directions; deepest-binding mismatch text and exact argument path span; binding identity, name, kind, and mode under same-name shadowing; direct unit at depth three versus an empty tuple structural pattern; unsupported leaves in deep wildcard siblings; ignored initializer shape; and the CLI Stage 0 incomplete-check gate.
+- **Verification:** Under pinned Rust 1.99.1, the focused driver regression
+  `function_owner_resolves_direct_local_enum_variant_paths_with_provenance`
+  and CLI regression
+  `check_reports_local_enum_call_diagnostics_without_claiming_full_coverage`
+  passed. The driver covers depth-three success and deepest mismatch, depth-four
+  rejection, both shape directions, deepest arity mismatch, shadowed `var`
+  binding identity, direct unit at depth three, empty structural tuple rejection,
+  unsupported deep wildcard aliases, and ignored initializers. CLI coverage
+  asserts the deepest mismatch's exact source span, the same rejection and
+  boundary cases, and the Stage 0 incomplete-check gate. Full workspace tests,
+  `cargo check --locked --offline --workspace`,
+  `cargo fmt --all -- --check`, and `git diff --check` passed.
+- **Hostile review:** A final read-only adversarial review found no actionable
+  P0–P2 findings. It confirmed the direct scalar argument invokes the annotated
+  projection, the depth and leaf boundaries are covered, and the unannotated
+  fixed-literal matcher remains unchanged.
+- **Remaining scope:** General pattern typing and tuple-shape diagnostics, tuple patterns deeper than three levels, aliases/views/nominal or other unsupported annotation leaves, initializer checking or inference, `else` declarations, complex patterns, nested scopes, coercions, generic/external enum calls, complete expression results, `call_kinds`, and complete call checking remain separate work.
