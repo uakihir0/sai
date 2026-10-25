@@ -27,6 +27,40 @@ pub fn isolated_cell() -> Board {
     Board(cells: cells)
 }
 
+pub fn overcrowded_block() -> Board {
+    var cells = Array<Bool, CELL_COUNT>.filled(false)
+    cells[6] = true
+    cells[7] = true
+    cells[8] = true
+    cells[11] = true
+    cells[12] = true
+    cells[13] = true
+    cells[16] = true
+    cells[17] = true
+    cells[18] = true
+    Board(cells: cells)
+}
+
+pub fn glider() -> Board {
+    var cells = Array<Bool, CELL_COUNT>.filled(false)
+    cells[1] = true
+    cells[7] = true
+    cells[10] = true
+    cells[11] = true
+    cells[12] = true
+    Board(cells: cells)
+}
+
+pub fn glider_after_eight() -> Board {
+    var cells = Array<Bool, CELL_COUNT>.filled(false)
+    cells[13] = true
+    cells[19] = true
+    cells[22] = true
+    cells[23] = true
+    cells[24] = true
+    Board(cells: cells)
+}
+
 pub fn opposite_edge_triad() -> Board {
     var cells = Array<Bool, CELL_COUNT>.filled(false)
     cells[0] = true

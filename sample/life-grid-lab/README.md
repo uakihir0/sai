@@ -23,16 +23,20 @@ The horizontal blinker fixture evolves as follows:
 ```
 
 After two generations it returns to its horizontal orientation. A 2×2 block
-stays unchanged, while an isolated live cell dies. The edge fixture places
-live cells at the upper-left, upper-right, and lower-left corners. They all
-die, and no cell appears at the lower-right corner. A toroidal grid would give
-that lower-right cell three neighbors and make it live.
+stays unchanged, an isolated live cell dies, and a cell surrounded by eight
+live neighbors dies from overpopulation. A glider fixture is checked after
+eight generations so the maximum accepted work count has a non-periodic
+expected result. The edge fixture places live cells at the upper-left,
+upper-right, and lower-left corners. They all die, and no cell appears at the
+lower-right corner. A toroidal grid would give that lower-right cell three
+neighbors and make it live.
 
 ## Project structure and concepts
 
 - `src/model.sai` defines the fixed board and the generation limit.
-- `src/fixtures.sai` provides the blinker, stable block, isolated cell, and
-  corner cases.
+- `src/fixtures.sai` provides the blinker, stable block, isolated and
+  overcrowded patterns, a glider with its eight-generation expected result,
+  and corner cases.
 - `src/simulation.sai` counts each cell's bounded neighborhood, computes the
   next board, and rejects requests above the generation limit.
 - `src/lib.sai` exposes the stepping API and embeds assertions for the example

@@ -36,13 +36,18 @@ test "a live cell with no neighbors dies" {
     assert next.cells == Array<Bool, CELL_COUNT>.filled(false)
 }
 
+test "a live cell with eight neighbors dies from overpopulation" {
+    let crowded = fixtures.overcrowded_block()
+    let next = step(crowded)
+
+    assert not next.cells[12]
+}
+
 test "the finite boundary does not wrap corner neighbors to the opposite edge" {
     let triad = fixtures.opposite_edge_triad()
     let next = step(triad)
 
-    assert not next.cells[0]
-    assert not next.cells[4]
-    assert not next.cells[20]
+    assert next.cells == Array<Bool, CELL_COUNT>.filled(false)
     assert not next.cells[24]
 }
 
@@ -50,6 +55,7 @@ test "zero generations preserves the input and excess work is rejected" {
     let start = fixtures.horizontal_blinker()
 
     assert evolve(start, 0).unwrap() == start
-    assert evolve(start, 8).unwrap() == start
+    assert evolve(start, 1).unwrap() == step(start)
+    assert evolve(fixtures.glider(), 8).unwrap() == fixtures.glider_after_eight()
     assert evolve(start, 9) == Err(SimulationError.TooManyGenerations)
 }
