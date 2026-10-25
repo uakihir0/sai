@@ -9757,42 +9757,90 @@ fn local_enum_variant_simple_pattern_initializer<'hir>(
             binding_mode_is_supported(binding, mode, false)?;
             (binding == target_binding && name.sym == target_name).then_some(initializer)
         }
-        PatKind::Tuple(patterns) => {
-            let ExprKind::Tuple(values) = initializer.kind else {
-                return None;
-            };
-            if patterns.len() != values.len()
-                || !values
-                    .iter()
-                    .all(local_enum_variant_fixed_tuple_initializer_leaf)
-            {
-                return None;
-            }
-
+        PatKind::Tuple(_) => {
             let mut binding_initializer = None;
-            for (pattern, value) in patterns.iter().zip(values) {
-                match pattern.kind {
-                    PatKind::Wild => {}
-                    PatKind::Binding {
-                        mode,
-                        name,
-                        binding,
-                        sub: None,
-                    } => {
-                        binding_mode_is_supported(binding, mode, true)?;
-                        if binding == target_binding {
-                            if name.sym != target_name || binding_initializer.is_some() {
-                                return None;
-                            }
-                            binding_initializer = Some(value);
-                        }
-                    }
-                    _ => return None,
-                }
+            if local_enum_variant_fixed_tuple_pattern_matches(
+                pattern,
+                initializer,
+                1,
+                target_binding,
+                target_name,
+                locals,
+                &mut binding_initializer,
+            ) {
+                binding_initializer
+            } else {
+                None
             }
-            binding_initializer
         }
         _ => None,
+    }
+}
+
+fn local_enum_variant_fixed_tuple_pattern_matches<'hir>(
+    pattern: &'hir HirPat<'hir>,
+    initializer: &'hir HirExpr<'hir>,
+    tuple_depth: usize,
+    target_binding: sai_hir::BindingId,
+    target_name: Symbol,
+    locals: &LocalResolution,
+    binding_initializer: &mut Option<&'hir HirExpr<'hir>>,
+) -> bool {
+    use sai_hir::patterns::BindingMode;
+
+    match pattern.kind {
+        PatKind::Wild => local_enum_variant_fixed_tuple_initializer_leaf(initializer),
+        PatKind::Binding {
+            mode,
+            name,
+            binding,
+            sub: None,
+        } => {
+            if !local_enum_variant_fixed_tuple_initializer_leaf(initializer) {
+                return false;
+            }
+            let Some(kind) = locals.bindings.get(&binding).map(|binding| binding.kind) else {
+                return false;
+            };
+            let supported_mode = matches!(
+                (kind, mode),
+                (BindingKind::Pattern { var: false }, BindingMode::Value)
+                    | (BindingKind::Pattern { var: true }, BindingMode::Var)
+            );
+            if !supported_mode {
+                return false;
+            }
+            if binding == target_binding {
+                if name.sym != target_name || binding_initializer.is_some() {
+                    return false;
+                }
+                *binding_initializer = Some(initializer);
+            }
+            true
+        }
+        PatKind::Tuple(patterns) => {
+            if tuple_depth > 2 {
+                return false;
+            }
+            let ExprKind::Tuple(values) = initializer.kind else {
+                return false;
+            };
+            if patterns.len() != values.len() {
+                return false;
+            }
+            patterns.iter().zip(values).all(|(pattern, value)| {
+                local_enum_variant_fixed_tuple_pattern_matches(
+                    pattern,
+                    value,
+                    tuple_depth + 1,
+                    target_binding,
+                    target_name,
+                    locals,
+                    binding_initializer,
+                )
+            })
+        }
+        _ => false,
     }
 }
 
@@ -97703,6 +97751,17 @@ interface facade { use middle.{payload}; }"#;
             "fn tuple_call_inferred_tuple_computed_leaf() {\n    let (actual, other) = (true && false, true)\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_inferred_tuple_wildcard_numeric_leaf() {\n    let (actual, _) = (true, 1)\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_inferred_tuple_wildcard_computed_leaf() {\n    let (actual, _) = (true, true && false)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_nested_tuple_destructure_ok() {\n    let ((actual_bool, var actual_byte), (actual_char, var actual_unit)) = ((true, b'x'), ('x', ()))\n    FixedPayload.Values(actual_bool, actual_byte, actual_char, actual_unit)\n}\n",
+            "fn tuple_call_inferred_nested_tuple_destructure_bool_mismatch() {\n    let (other, (actual, _)) = (true, (false, false))\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_nested_tuple_destructure_var_mismatch() {\n    let ((other, var actual), tail) = ((true, b'x'), 'x')\n    Payload.Pair(1, actual)\n}\n",
+            "fn tuple_call_inferred_nested_tuple_destructure_shadowing(actual: Bool) {\n    let (other, (actual, _)) = (true, (b'x', false))\n    Payload.Pair(1, actual)\n}\n",
+            "fn tuple_call_inferred_nested_tuple_arity_mismatch() {\n    let (actual, (nested, _)) = (true, (false,))\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_nested_tuple_pattern_vs_leaf() {\n    let ((actual, _), other) = (true, false)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_nested_tuple_leaf_vs_pattern() {\n    let (actual, other) = ((true, false), true)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_nested_tuple_wildcard_numeric_leaf() {\n    let (actual, (nested, _)) = (true, (false, 1))\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_nested_tuple_wildcard_computed_leaf() {\n    let (actual, (nested, _)) = (true, (false, true && false))\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_nested_tuple_bound_numeric_leaf() {\n    let (actual, (nested, other)) = (true, (false, 1))\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_tuple_pattern_too_deep() {\n    let (((actual, _), _), other) = (((true, false), true), false)\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_inferred_tuple_nested_scope() {\n    {\n        let (actual, other) = (true, false)\n        Payload.Pair(actual, true)\n    }\n}\n",
             "fn tuple_call_param_mismatch(actual: Bool) { Payload.Pair(actual, true) }\n",
             "fn tuple_call_unicode_param_mismatch(値: Bool) { Payload.Pair(値, true) }\n",
@@ -98274,11 +98333,18 @@ interface facade { use middle.{payload}; }"#;
             "tuple_call_inferred_tuple_destructure_ok",
             "tuple_call_inferred_tuple_arity_mismatch",
             "tuple_call_inferred_tuple_destructure_annotated",
-            "tuple_call_inferred_tuple_nested_pattern",
             "tuple_call_inferred_tuple_numeric_leaf",
             "tuple_call_inferred_tuple_computed_leaf",
             "tuple_call_inferred_tuple_wildcard_numeric_leaf",
             "tuple_call_inferred_tuple_wildcard_computed_leaf",
+            "tuple_call_inferred_nested_tuple_destructure_ok",
+            "tuple_call_inferred_nested_tuple_arity_mismatch",
+            "tuple_call_inferred_nested_tuple_pattern_vs_leaf",
+            "tuple_call_inferred_nested_tuple_leaf_vs_pattern",
+            "tuple_call_inferred_nested_tuple_wildcard_numeric_leaf",
+            "tuple_call_inferred_nested_tuple_wildcard_computed_leaf",
+            "tuple_call_inferred_nested_tuple_bound_numeric_leaf",
+            "tuple_call_inferred_tuple_pattern_too_deep",
             "tuple_call_inferred_tuple_nested_scope",
         ] {
             assert!(
@@ -98325,6 +98391,22 @@ interface facade { use middle.{payload}; }"#;
             (
                 "tuple_call_inferred_tuple_destructure_bool_mismatch",
                 "expected `U8`, found `Bool`",
+            ),
+            (
+                "tuple_call_inferred_tuple_nested_pattern",
+                "expected `U8`, found `Bool`",
+            ),
+            (
+                "tuple_call_inferred_nested_tuple_destructure_bool_mismatch",
+                "expected `U8`, found `Bool`",
+            ),
+            (
+                "tuple_call_inferred_nested_tuple_destructure_var_mismatch",
+                "expected `Bool`, found `Byte`",
+            ),
+            (
+                "tuple_call_inferred_nested_tuple_destructure_shadowing",
+                "expected `Bool`, found `Byte`",
             ),
             (
                 "tuple_call_inferred_tuple_destructure_var_mismatch",
@@ -98417,16 +98499,21 @@ interface facade { use middle.{payload}; }"#;
                     | "tuple_call_inferred_unit_mismatch"
                     | "tuple_call_inferred_shadowing"
                     | "tuple_call_inferred_destructuring"
+                    | "tuple_call_inferred_tuple_nested_pattern"
                     | "tuple_call_inferred_tuple_destructure_bool_mismatch"
                     | "tuple_call_inferred_tuple_destructure_var_mismatch"
                     | "tuple_call_inferred_tuple_destructure_shadowing"
+                    | "tuple_call_inferred_nested_tuple_destructure_bool_mismatch"
+                    | "tuple_call_inferred_nested_tuple_destructure_var_mismatch"
             ) {
                 let function_start = root
                     .find(&format!("fn {name}"))
                     .expect("inferred local mismatch function exists");
                 let (call, argument_prefix_len) = match name {
                     "tuple_call_inferred_var_byte_mismatch"
-                    | "tuple_call_inferred_tuple_destructure_var_mismatch" => {
+                    | "tuple_call_inferred_tuple_destructure_var_mismatch"
+                    | "tuple_call_inferred_nested_tuple_destructure_var_mismatch"
+                    | "tuple_call_inferred_nested_tuple_destructure_shadowing" => {
                         ("Payload.Pair(1, actual)", "Payload.Pair(1, ".len())
                     }
                     "tuple_call_inferred_char_mismatch" => (
