@@ -2251,17 +2251,23 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 
 **Tuple variants and distinct construction** are calls of the constructor's `FnDef` (§3.6.3). `D(e)` with a refinement clause is a B→R conversion recorded for [impl/04](04-mir.md) (§3.13.1). Unit variants with an argument list are `WRONG_ARGUMENT_COUNT`.
 
-**IR-924 local enum-call arity slice.** For a direct callee path to a supported,
-local, non-generic enum variant, the owner result records a call entry under
-the call expression's `HirId`, retaining the exact callee field, enum owner,
-enum and variant `DefId`s, and source-ordered argument `HirId`s. Tuple variant
-arity is compared with the already validated constructor signature; a mismatch
-emits `WRONG_ARGUMENT_COUNT` on the complete call. Calling a unit variant
-emits `WRONG_ARGUMENT_COUNT`, including `E.V()`. Record variants remain on the
-named-field construction path and receive no positional call entry. This
-projection does not type-check argument expressions, handle named function
-arguments, populate `TypeckResults::call_kinds`, or accept generic, external,
-dependency, or WIT variant paths.
+**IR-924/IR-925 local enum-call slices.** For a direct callee path to a
+supported, local, non-generic enum variant, the owner result records a call
+entry under the call expression's `HirId`, retaining the exact callee field,
+enum owner, enum and variant `DefId`s, and source-ordered argument `HirId`s.
+Tuple variant arity is compared with the already validated constructor
+signature; a mismatch emits `WRONG_ARGUMENT_COUNT` on the complete call.
+Calling a unit variant emits `WRONG_ARGUMENT_COUNT`, including `E.V()`. For
+tuple and unit calls, each named argument emits `NAMED_ARGUMENT_ON_FUNCTION`
+on its exact name span; this is independent of arity, which still counts every
+argument positionally. Record variants remain on the named-field construction
+path and receive no positional call entry or named-function-argument
+diagnostic. This projection does not type-check argument expressions, bind
+named arguments to parameters, populate `TypeckResults::call_kinds`, or accept
+generic, external, dependency, or WIT variant paths.
+The driver projection exposes these diagnostics through its owner result;
+aggregating them into the general CLI `sai check` output remains a separate
+integration step.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
