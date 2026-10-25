@@ -1,0 +1,209 @@
+use acme:municipal-procurement-bid-review/evaluation
+use acme:municipal-procurement-bid-review/fixtures
+use acme:municipal-procurement-bid-review/intake
+use acme:municipal-procurement-bid-review/model.{AwardReport, BidStage}
+
+pub fn procurement_report() -> AwardReport {
+    evaluation.build_report()
+}
+
+test "only bids clearing every gate enter the best-value ranking" {
+    let report = procurement_report()
+    assert report.evaluation_count == 14
+    assert report.qualified_count == 3
+    assert report.excluded_count == 11
+    assert report.arithmetic_correction_count == 1
+    assert report.recommendation_ready
+    assert report.recommended_bid_id == Some(7309)
+    assert report.recommended_amount_thousands == Some(920)
+}
+
+test "a technically failing low bid cannot set qualified price points" {
+    let report = procurement_report()
+    assert intake.corrected_total_thousands(fixtures.bids()[1]) == 700
+    assert report.lowest_qualified_price_thousands == 840
+    match report.evaluations[1] {
+        Some(item) => {
+            assert item.stage == BidStage.TechnicalScoreBelowMinimum
+            assert item.rank == 0
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "a zero-price schedule is invalid and cannot replace a positive baseline" {
+    let report = procurement_report()
+    assert report.qualified_count == 3
+    assert report.lowest_qualified_price_thousands == 840
+    match report.evaluations[13] {
+        Some(item) => {
+            assert item.bid.id == 7316
+            assert item.stage == BidStage.InvalidPriceSchedule
+            assert item.rank == 0
+            assert not item.recommended_award
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "unit price controls a corrected extension and both equal bids are ranked" {
+    let report = procurement_report()
+    match report.evaluations[2] {
+        Some(item) => {
+            assert item.stage == BidStage.Qualified
+            assert item.arithmetic_corrected
+            assert item.corrected_total_thousands == 840
+            assert item.combined_score_hundredths == 9200
+            assert item.rank == 2
+        }
+        None => {
+            assert false
+        }
+    }
+    match report.evaluations[0] {
+        Some(item) => {
+            assert item.bid.id == 7307
+            assert item.combined_score_hundredths == 9200
+            assert item.rank == 3
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "the strongest total score wins after all mandatory gates" {
+    let report = procurement_report()
+    match report.evaluations[3] {
+        Some(item) => {
+            assert item.stage == BidStage.Qualified
+            assert item.combined_score_hundredths == 9252
+            assert item.rank == 1
+            assert item.recommended_award
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "independent intake, responsibility, and ceiling failures are retained" {
+    let report = procurement_report()
+    match report.evaluations[4] {
+        Some(item) => {
+            assert item.stage == BidStage.AboveCostCeiling
+        }
+        None => {
+            assert false
+        }
+    }
+    match report.evaluations[5] {
+        Some(item) => {
+            assert item.stage == BidStage.LateSubmission
+        }
+        None => {
+            assert false
+        }
+    }
+    match report.evaluations[6] {
+        Some(item) => {
+            assert item.stage == BidStage.MissingAddendaAcknowledgment
+        }
+        None => {
+            assert false
+        }
+    }
+    match report.evaluations[7] {
+        Some(item) => {
+            assert item.stage == BidStage.ConflictReviewRequired
+        }
+        None => {
+            assert false
+        }
+    }
+    match report.evaluations[8] {
+        Some(item) => {
+            assert item.stage == BidStage.SuspendedVendor
+        }
+        None => {
+            assert false
+        }
+    }
+    match report.evaluations[9] {
+        Some(item) => {
+            assert item.stage == BidStage.InvalidTechnicalRecord
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "missing security, registration, and signature block ranking" {
+    let report = procurement_report()
+    match report.evaluations[10] {
+        Some(item) => {
+            assert item.stage == BidStage.MissingBidSecurity
+        }
+        None => {
+            assert false
+        }
+    }
+    match report.evaluations[11] {
+        Some(item) => {
+            assert item.stage == BidStage.VendorNotRegistered
+        }
+        None => {
+            assert false
+        }
+    }
+    match report.evaluations[12] {
+        Some(item) => {
+            assert item.stage == BidStage.MissingSignedForm
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "an invalid extreme score is widened before its rubric gate is applied" {
+    var extreme_bid = fixtures.bids()[9]
+    extreme_bid.technical.delivery_plan = 4294967295
+    let item = intake.assess(extreme_bid)
+    assert item.stage == BidStage.InvalidTechnicalRecord
+    assert item.technical_total == 4294967330
+}
+
+test "a repeated bid ID excludes the later record from recommendation ranking" {
+    var duplicate_bids = fixtures.bids()
+    duplicate_bids[2].id = duplicate_bids[0].id
+    let report = evaluation.build_report_from(duplicate_bids)
+    assert report.qualified_count == 2
+    assert report.excluded_count == 12
+    assert report.recommended_bid_id == Some(7309)
+    match report.evaluations[0] {
+        Some(item) => {
+            assert item.stage == BidStage.Qualified
+            assert item.rank == 2
+            assert not item.recommended_award
+        }
+        None => {
+            assert false
+        }
+    }
+    match report.evaluations[2] {
+        Some(item) => {
+            assert item.stage == BidStage.DuplicateBidIdentifier
+            assert item.rank == 0
+            assert not item.recommended_award
+        }
+        None => {
+            assert false
+        }
+    }
+}

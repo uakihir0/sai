@@ -1,0 +1,91 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SubmissionDocuments {
+    pub signed_form: Bool
+    pub addenda_acknowledged: Bool
+    pub bid_security: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SupplierRecord {
+    pub registration_current: Bool
+    pub suspended: Bool
+    pub unresolved_conflict: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type TechnicalScore {
+    pub delivery_plan: U32
+    pub work_quality: U32
+    pub accessibility: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PriceLine {
+    pub unit_thousands: U32
+    pub quoted_extension_thousands: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type PriceSchedule {
+    pub paving: PriceLine
+    pub lighting: PriceLine
+    pub crossings: PriceLine
+    pub quoted_total_thousands: U32
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Bid {
+    pub id: U32
+    pub supplier: Str
+    // Minutes after the fictional 09:00 opening date.
+    pub received_minute: U32
+    pub documents: SubmissionDocuments
+    pub supplier_record: SupplierRecord
+    pub technical: TechnicalScore
+    pub prices: PriceSchedule
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum BidStage {
+    InvalidTechnicalRecord
+    LateSubmission
+    MissingSignedForm
+    MissingAddendaAcknowledgment
+    MissingBidSecurity
+    VendorNotRegistered
+    SuspendedVendor
+    ConflictReviewRequired
+    DuplicateBidIdentifier
+    InvalidPriceSchedule
+    TechnicalScoreBelowMinimum
+    AboveCostCeiling
+    Qualified
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BidEvaluation {
+    pub bid: Bid
+    pub stage: BidStage
+    pub technical_total: U64
+    pub corrected_total_thousands: U64
+    pub arithmetic_corrected: Bool
+    // Scores are hundredths of a point: 9,252 means 92.52 points.
+    pub price_score_hundredths: U64
+    pub combined_score_hundredths: U64
+    // Qualified bids receive a 1-based rank; all other bids have rank zero.
+    pub rank: USize
+    pub recommended_award: Bool
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AwardReport {
+    pub evaluations: Array<Option<BidEvaluation>, 14>
+    pub evaluation_count: USize
+    pub qualified_count: USize
+    pub excluded_count: USize
+    pub arithmetic_correction_count: USize
+    pub lowest_qualified_price_thousands: U64
+    pub recommendation_ready: Bool
+    pub recommended_bid_id: Option<U32>
+    pub recommended_amount_thousands: Option<U64>
+}
