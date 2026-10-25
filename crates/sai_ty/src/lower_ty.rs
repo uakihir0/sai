@@ -9,15 +9,17 @@ use crate::ty::{
     UintTy,
 };
 use sai_hir::types::{
-    GenericParam, GenericParamKind, Generics, PathRoot, Ty as HirTy, TyKind as HirTyKind,
+    GenericArg as HirGenericArg, GenericParam, GenericParamKind, Generics, PathRoot, Ty as HirTy,
+    TyKind as HirTyKind,
 };
 use sai_hir::{
-    DefId, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, OwnerId, Safety,
+    DefId, DefPathData, DefPathInterner, DisambiguatedDefPathData, HirId, OwnerId, Safety, Symbol,
     body::FnSig as HirFnSig,
 };
 use sai_resolve::package_scopes::{DefKind, PathRes, Res};
 use sai_resolve::prelude::PrimTy;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// The reason an HIR type cannot be converted by the current subset.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,6 +31,8 @@ pub enum UnsupportedTy {
     Array,
     Alias,
     GenericArguments,
+    WrongNumberOfGenericArguments,
+    GenericArgumentKind,
     GenericParameter,
     ConstParameter,
     SelfType,
@@ -65,6 +69,20 @@ pub enum UnsupportedFnSig {
     ReturnType(UnsupportedTy),
 }
 
+/// The type parameters of a direct local nominal declaration accepted by
+/// partial signature lowering.
+///
+/// The driver constructs this metadata only from the exact current package
+/// collection, snapshot, target-filtered HIR owner, and matching DefPath
+/// interner. Every parameter must be type-only and unbounded; where clauses
+/// and parser-recovered declaration syntax are rejected before construction.
+/// Record fields and enum payloads must also be proven not to require an
+/// implicit region parameter before the definition enters this allowlist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalNominalDef {
+    pub type_params: Arc<[(DefId, Symbol)]>,
+}
+
 /// Region policy and type-path inputs for one HIR owner.
 ///
 /// A context belongs to one owner and snapshot of the caller's choice. Callers
@@ -77,7 +95,7 @@ pub struct LowerTyContext<'a> {
     owner: OwnerId,
     paths: &'a HashMap<HirId, PathRes>,
     unit_enums: Option<&'a HashSet<DefId>>,
-    local_nongeneric_nominals: Option<&'a HashSet<DefId>>,
+    local_nominals: Option<&'a HashMap<DefId, LocalNominalDef>>,
     generic_params: HashMap<DefId, ParamTy>,
     def_paths: Option<&'a DefPathInterner>,
     region_mode: RegionMode,
@@ -106,7 +124,7 @@ impl<'a> LowerTyContext<'a> {
             owner,
             paths,
             unit_enums: None,
-            local_nongeneric_nominals: None,
+            local_nominals: None,
             generic_params: HashMap::new(),
             def_paths: None,
             region_mode: RegionMode::Signature,
@@ -133,7 +151,7 @@ impl<'a> LowerTyContext<'a> {
             owner,
             paths,
             unit_enums: Some(unit_enums),
-            local_nongeneric_nominals: None,
+            local_nominals: None,
             generic_params: HashMap::new(),
             def_paths: None,
             region_mode: RegionMode::Signature,
@@ -142,26 +160,25 @@ impl<'a> LowerTyContext<'a> {
         }
     }
 
-    /// Create a signature context that can lower only validated local unit
-    /// enums and direct, nongeneric local records/enums from the same
-    /// collection as `paths`.
+    /// Create a signature context that can lower validated local unit enums
+    /// and direct local records/enums with type-only generic arguments.
     ///
     /// The driver derives both sets from the exact current package collection,
     /// source snapshot, and target-filtered HIR. This crate cannot establish
     /// that provenance on its own.
-    pub fn for_signature_with_local_nongeneric_nominals(
+    pub fn for_signature_with_local_nominals(
         interner: &'a TyInterner,
         owner: OwnerId,
         paths: &'a HashMap<HirId, PathRes>,
         unit_enums: &'a HashSet<DefId>,
-        local_nongeneric_nominals: &'a HashSet<DefId>,
+        local_nominals: &'a HashMap<DefId, LocalNominalDef>,
     ) -> Self {
         Self {
             interner,
             owner,
             paths,
             unit_enums: Some(unit_enums),
-            local_nongeneric_nominals: Some(local_nongeneric_nominals),
+            local_nominals: Some(local_nominals),
             generic_params: HashMap::new(),
             def_paths: None,
             region_mode: RegionMode::Signature,
@@ -188,7 +205,7 @@ impl<'a> LowerTyContext<'a> {
             owner,
             paths,
             unit_enums: None,
-            local_nongeneric_nominals: None,
+            local_nominals: None,
             generic_params: HashMap::new(),
             def_paths: None,
             region_mode: RegionMode::Field {
@@ -210,7 +227,7 @@ impl<'a> LowerTyContext<'a> {
             owner,
             paths,
             unit_enums: None,
-            local_nongeneric_nominals: None,
+            local_nominals: None,
             generic_params: HashMap::new(),
             def_paths: None,
             region_mode: RegionMode::Body,
@@ -483,23 +500,63 @@ fn lower_path_ty(
         return Err(UnsupportedTy::QualifiedPath);
     }
 
-    if path.segments.iter().any(|segment| segment.args.is_some()) {
+    if path.segments[..path.segments.len() - 1]
+        .iter()
+        .any(|segment| segment.args.is_some())
+    {
         return Err(UnsupportedTy::GenericArguments);
     }
+    let generic_args = path.segments.last().and_then(|segment| segment.args);
 
     if let Res::Def(DefKind::Struct | DefKind::Enum, def_id) = resolution.base {
-        let local_nongeneric_nominal = context
-            .local_nongeneric_nominals
-            .is_some_and(|definitions| definitions.contains(&def_id));
+        if let Some(definition) = context
+            .local_nominals
+            .and_then(|definitions| definitions.get(&def_id))
+        {
+            let written_args = generic_args.map_or(&[][..], |args| args.args);
+            let type_arg_count = written_args
+                .iter()
+                .filter(|arg| !matches!(arg, HirGenericArg::Binding { .. }))
+                .count();
+            if type_arg_count != definition.type_params.len() {
+                return Err(UnsupportedTy::WrongNumberOfGenericArguments);
+            }
+            if written_args
+                .iter()
+                .any(|arg| !matches!(arg, HirGenericArg::Type(_)))
+            {
+                return Err(UnsupportedTy::GenericArgumentKind);
+            }
+            let type_args = written_args
+                .iter()
+                .map(|arg| match arg {
+                    HirGenericArg::Type(ty) => lower_ty_inner(context, ty),
+                    HirGenericArg::Const(_) | HirGenericArg::Binding { .. } => {
+                        Err(UnsupportedTy::GenericArgumentKind)
+                    }
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(context
+                .interner
+                .intern(TyKind::Adt(def_id, type_args.into())));
+        }
+
         let validated_unit_enum = matches!(resolution.base, Res::Def(DefKind::Enum, _))
             && context
                 .unit_enums
                 .is_some_and(|unit_enums| unit_enums.contains(&def_id));
-        return if local_nongeneric_nominal || validated_unit_enum {
-            Ok(context.interner.intern(TyKind::Adt(def_id)))
+        if generic_args.is_some() {
+            return Err(UnsupportedTy::GenericArguments);
+        }
+        return if validated_unit_enum {
+            Ok(context.interner.intern(TyKind::Adt(def_id, Arc::from([]))))
         } else {
             Err(UnsupportedTy::NominalType)
         };
+    }
+
+    if generic_args.is_some() {
+        return Err(UnsupportedTy::GenericArguments);
     }
 
     if path.segments.len() != 1 {
@@ -814,7 +871,7 @@ mod tests {
             &unit_enums,
         );
         let direct_ty = lower_ty(&mut direct_context, direct).expect("validated unit enum lowers");
-        assert_eq!(direct_ty.kind(), &TyKind::Adt(enum_def));
+        assert_eq!(direct_ty.kind(), &TyKind::Adt(enum_def, Arc::from([])));
 
         let mut qualified_context = LowerTyContext::for_signature_with_unit_enums(
             &interner,

@@ -12919,6 +12919,105 @@ fn mixed_source_diagnostic_snapshot(
     Ok((snapshot, final_manifest_file_ids))
 }
 
+fn nominal_field_type_is_region_free(
+    ty: &Ty<'_>,
+    type_parameters: &HashSet<Symbol>,
+    symbols: &Interner,
+) -> bool {
+    match ty.kind {
+        TyKind::Borrow(..) | TyKind::Infer | TyKind::Err => false,
+        TyKind::Tuple(elements) => elements
+            .iter()
+            .all(|element| nominal_field_type_is_region_free(element, type_parameters, symbols)),
+        // The implicit region-parameter rule explicitly excludes function
+        // pointer types.
+        TyKind::FnPtr { .. } => true,
+        TyKind::Path(path) => {
+            if path.root != PathRoot::Plain || path.segments.len() != 1 {
+                return false;
+            }
+            let segment = path.segments[0];
+            if segment.args.is_some() {
+                return false;
+            }
+            if type_parameters.contains(&segment.name.sym) {
+                return true;
+            }
+            symbols.resolve(segment.name.sym).is_ok_and(|name| {
+                matches!(
+                    name.as_ref(),
+                    "I8" | "I16"
+                        | "I32"
+                        | "I64"
+                        | "ISize"
+                        | "U8"
+                        | "U16"
+                        | "U32"
+                        | "U64"
+                        | "USize"
+                        | "F32"
+                        | "F64"
+                        | "Bool"
+                        | "Byte"
+                        | "Char"
+                        | "Never"
+                        | "Int"
+                        | "UInt"
+                )
+            })
+        }
+    }
+}
+
+fn nominal_fields_are_region_free(
+    item_kind: ItemKind<'_>,
+    type_parameters: &HashSet<Symbol>,
+    symbols: &Interner,
+) -> bool {
+    let type_is_region_free =
+        |ty: &Ty<'_>| nominal_field_type_is_region_free(ty, type_parameters, symbols);
+    match item_kind {
+        ItemKind::Struct { fields, .. } => fields.iter().all(|field| type_is_region_free(field.ty)),
+        ItemKind::Enum { variants, .. } => variants.iter().all(|variant| match variant.shape {
+            VariantShape::Unit => true,
+            VariantShape::Tuple(types) => types.iter().all(type_is_region_free),
+            VariantShape::Record(fields) => {
+                fields.iter().all(|field| type_is_region_free(field.ty))
+            }
+        }),
+        _ => false,
+    }
+}
+
+fn generic_argument_syntax_has_recovery(root: &SyntaxNode) -> bool {
+    root.descendants()
+        .filter_map(ast::GenericArgList::cast)
+        .any(|arguments| {
+            let syntax = arguments.syntax();
+            syntax.descendants().any(|node| {
+                node.kind() == sai_syntax::SyntaxKind::ERROR
+                    || node
+                        .children_with_tokens()
+                        .any(|element| element.as_token().is_some_and(|token| token.has_error()))
+            })
+        })
+}
+
+fn signature_generic_argument_syntax_has_recovery(function: &ast::FnDecl) -> bool {
+    let parameter_has_recovery = function.params().is_some_and(|parameters| {
+        parameters.params().any(|parameter| {
+            parameter
+                .ty()
+                .is_some_and(|ty| generic_argument_syntax_has_recovery(ty.syntax()))
+        })
+    });
+    parameter_has_recovery
+        || function
+            .ret_type()
+            .and_then(|ret| ret.ty())
+            .is_some_and(|ty| generic_argument_syntax_has_recovery(ty.syntax()))
+}
+
 impl RootDatabase {
     /// Creates a fresh compiler session with empty VFS inputs.
     pub fn new() -> Result<Self, QueryError> {
@@ -14392,11 +14491,11 @@ impl RootDatabase {
         })
     }
 
-    fn local_nongeneric_nominal_definitions(
+    fn local_nominal_definitions(
         &mut self,
         collection: &Phase1PackageScopesCollection,
         snapshot: &WorkspaceSnapshot,
-    ) -> HashSet<DefId> {
+    ) -> HashMap<DefId, sai_ty::lower_ty::LocalNominalDef> {
         let mut file_groups = Vec::<(FileId, Vec<TopLevelOwnerDescriptor>)>::new();
         let mut group_indices = HashMap::<FileId, usize>::new();
         for descriptor in collection
@@ -14420,7 +14519,7 @@ impl RootDatabase {
         }
 
         let Some(def_paths) = self.def_paths.get(&collection.module_tree.package).cloned() else {
-            return HashSet::new();
+            return HashMap::new();
         };
         let syntax_subtree_has_error = |root: &SyntaxNode| {
             root.descendants().any(|node| {
@@ -14430,7 +14529,7 @@ impl RootDatabase {
                         .any(|element| element.as_token().is_some_and(|token| token.has_error()))
             })
         };
-        let mut definitions = HashSet::new();
+        let mut definitions = HashMap::new();
         for (file, descriptors) in file_groups {
             let Ok(inputs) = self.current_owner_inputs(snapshot, file, &collection.target_cfg)
             else {
@@ -14476,7 +14575,7 @@ impl RootDatabase {
                     | (TopLevelOwnerKind::Enum, ItemKind::Enum { generics, .. }) => generics,
                     _ => continue,
                 };
-                if !generics.params.is_empty() || !generics.where_preds.is_empty() {
+                if !generics.where_preds.is_empty() {
                     continue;
                 }
 
@@ -14504,9 +14603,10 @@ impl RootDatabase {
                     }
                     _ => continue,
                 };
-                if generic_params
-                    .as_ref()
-                    .is_some_and(|params| syntax_subtree_has_error(params.syntax()))
+                if syntax_subtree_has_error(&declaration_syntax)
+                    || generic_params
+                        .as_ref()
+                        .is_some_and(|params| syntax_subtree_has_error(params.syntax()))
                     || declaration_syntax
                         .descendants()
                         .filter_map(ast::WhereClause::cast)
@@ -14514,7 +14614,57 @@ impl RootDatabase {
                 {
                     continue;
                 }
-                definitions.insert(def_id);
+                let mut parameter_names = HashSet::with_capacity(generics.params.len());
+                let mut type_params = Vec::with_capacity(generics.params.len());
+                let owner_components = expected_path.data();
+                let mut valid_parameters = true;
+                for parameter in generics.params {
+                    let GenericParamKind::Type { bounds } = parameter.kind else {
+                        valid_parameters = false;
+                        break;
+                    };
+                    let name = parameter.name.sym;
+                    if !bounds.is_empty() || name.is_error() || !parameter_names.insert(name) {
+                        valid_parameters = false;
+                        break;
+                    }
+                    let Ok(Some(parameter_path)) = def_paths.resolve(parameter.def_id) else {
+                        valid_parameters = false;
+                        break;
+                    };
+                    let parameter_components = parameter_path.data();
+                    if parameter_path.package() != expected_path.package()
+                        || parameter_components.len() != owner_components.len() + 1
+                        || parameter_components[..owner_components.len()] != *owner_components
+                        || !matches!(
+                            parameter_components.last(),
+                            Some(component)
+                                if component.data == DefPathData::TypeParam(name)
+                                    && component.disambiguator == 0
+                        )
+                    {
+                        valid_parameters = false;
+                        break;
+                    }
+                    type_params.push((parameter.def_id.to_def_id(), name));
+                }
+                if !valid_parameters {
+                    continue;
+                }
+                let type_parameter_names = type_params
+                    .iter()
+                    .map(|(_, name)| *name)
+                    .collect::<HashSet<_>>();
+                if !nominal_fields_are_region_free(item.kind, &type_parameter_names, &self.symbols)
+                {
+                    continue;
+                }
+                definitions.insert(
+                    def_id,
+                    sai_ty::lower_ty::LocalNominalDef {
+                        type_params: type_params.into(),
+                    },
+                );
             }
         }
         definitions
@@ -14746,8 +14896,7 @@ impl RootDatabase {
                 | LocalInterfaceEnumAdtProjection::Unsupported { .. } => None,
             })
             .collect::<HashSet<_>>();
-        let local_nongeneric_nominal_definitions =
-            self.local_nongeneric_nominal_definitions(collection, snapshot);
+        let local_nominal_definitions = self.local_nominal_definitions(collection, snapshot);
         let descriptors = &collection.scopes.function_owners;
         let mut owners = Vec::with_capacity(descriptors.len());
         let mut group_start = 0;
@@ -14896,12 +15045,12 @@ impl RootDatabase {
                     signature_projection = Some(match type_path_resolution.as_ref() {
                         Some(Ok(Some(path_resolution))) => {
                             let mut context =
-                                sai_ty::lower_ty::LowerTyContext::for_signature_with_local_nongeneric_nominals(
+                                sai_ty::lower_ty::LowerTyContext::for_signature_with_local_nominals(
                                     &self.semantic_types,
                                     descriptor.owner,
                                     path_resolution.paths(),
                                     &validated_unit_enum_definitions,
-                                    &local_nongeneric_nominal_definitions,
+                                    &local_nominal_definitions,
                                 )
                                 .with_def_path_interner(def_paths.as_ref());
                             match hir_owner.node {
@@ -14917,21 +15066,22 @@ impl RootDatabase {
                                                 )
                                             })
                                             .and_then(ast::FnDecl::cast);
-                                        let syntax_subtree_has_error = |root: &SyntaxNode| {
-                                            root.descendants().any(|node| {
-                                                node.kind() == sai_syntax::SyntaxKind::ERROR
-                                                    || node.children_with_tokens().any(|element| {
-                                                        element
-                                                            .as_token()
-                                                            .is_some_and(|token| token.has_error())
-                                                    })
-                                            })
-                                        };
                                         let syntax_unsupported = match function_ast {
                                             Some(function) => {
                                                 if function.generic_params().is_some_and(|params| {
-                                                    syntax_subtree_has_error(params.syntax())
-                                                }) {
+                                                    params.syntax().descendants().any(|node| {
+                                                        node.kind() == sai_syntax::SyntaxKind::ERROR
+                                                            || node.children_with_tokens().any(
+                                                                |element| {
+                                                                    element.as_token().is_some_and(
+                                                                        |token| token.has_error(),
+                                                                    )
+                                                                },
+                                                            )
+                                                    })
+                                                }) || signature_generic_argument_syntax_has_recovery(
+                                                    &function,
+                                                ) {
                                                     Some(
                                                         sai_ty::lower_ty::UnsupportedFnSig::RecoveredGenericSyntax,
                                                     )
@@ -36314,15 +36464,24 @@ property "shared"() {}
             ),
             "const parameters remain unsupported"
         );
+        let generic_adt_projection = unsupported_signature(7);
+        let FunctionSignatureProjection::Supported(generic_adt) = generic_adt_projection else {
+            panic!("an explicit local generic ADT argument is supported");
+        };
+        assert_eq!(generic_adt.type_params().len(), 1);
+        let generic_adt_param = generic_adt.type_params()[0].param;
+        let sai_ty::ty::TyKind::Adt(_, generic_adt_args) = generic_adt.inputs()[0].kind() else {
+            panic!("the input retains its local generic ADT application");
+        };
+        assert_eq!(generic_adt_args.len(), 1);
         assert_eq!(
-            unsupported_signature(7),
-            FunctionSignatureProjection::Unsupported(
-                sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
-                    index: 0,
-                    reason: sai_ty::lower_ty::UnsupportedTy::GenericArguments,
-                }
-            ),
-            "generic ADT arguments remain unsupported"
+            generic_adt_args[0].kind(),
+            &sai_ty::ty::TyKind::Param(generic_adt_param)
+        );
+        assert_eq!(
+            generic_adt.output().kind(),
+            &sai_ty::ty::TyKind::Param(generic_adt_param),
+            "the nested ADT argument and output share the function-owned binder"
         );
         assert_eq!(
             unsupported_signature(8),
@@ -36465,9 +36624,10 @@ property "shared"() {}
             panic!("a validated local unit enum supports function signatures");
         };
         assert_eq!(state.inputs().len(), 1);
-        let sai_ty::ty::TyKind::Adt(state_def) = state.inputs()[0].kind() else {
+        let sai_ty::ty::TyKind::Adt(state_def, state_args) = state.inputs()[0].kind() else {
             panic!("the unit enum input has nominal semantic identity");
         };
+        assert!(state_args.is_empty());
         assert!(unit_enum_definitions.contains(state_def));
         assert!(state.output().ptr_eq(&state.inputs()[0]));
 
@@ -36478,9 +36638,10 @@ property "shared"() {}
         let FunctionSignatureProjection::Supported(other) = other else {
             panic!("another validated unit enum supports function signatures");
         };
-        let sai_ty::ty::TyKind::Adt(other_def) = other.inputs()[0].kind() else {
+        let sai_ty::ty::TyKind::Adt(other_def, other_args) = other.inputs()[0].kind() else {
             panic!("the second unit enum input has nominal semantic identity");
         };
+        assert!(other_args.is_empty());
         assert!(unit_enum_definitions.contains(other_def));
         assert_ne!(state_def, other_def);
         assert!(other.output().ptr_eq(&other.inputs()[0]));
@@ -36510,14 +36671,14 @@ property "shared"() {}
             panic!("a direct top-level nongeneric unit enum supports signatures");
         };
         assert!(
-            matches!(module_enum.inputs()[0].kind(), sai_ty::ty::TyKind::Adt(_)),
+            matches!(module_enum.inputs()[0].kind(), sai_ty::ty::TyKind::Adt(_, args) if args.is_empty()),
             "the direct top-level enum is represented by its nominal identity"
         );
         assert!(module_enum.output().ptr_eq(&module_enum.inputs()[0]));
     }
 
     #[test]
-    fn function_signature_projection_lowers_only_direct_local_nongeneric_nominals() {
+    fn function_signature_projection_lowers_direct_local_nominals() {
         let root = concat!(
             "use acme:phase1/child as child_alias\n",
             "type Packet { value: U32 }\n",
@@ -36539,6 +36700,8 @@ property "shared"() {}
             "fn generic_record_explicit(value: GenericRecord<U32>) -> GenericRecord<U32> {}\n",
             "fn generic_enum_omitted(value: GenericEnum) -> GenericEnum {}\n",
             "fn generic_enum_explicit(value: GenericEnum<U32>) -> GenericEnum<U32> {}\n",
+            "fn generic_enum_too_many(value: GenericEnum<U32, Bool>) -> Bool {}\n",
+            "fn generic_enum_wrong_kind(value: GenericEnum<3>) -> Bool {}\n",
             "fn alias(value: Alias) -> Alias {}\n",
             "fn unresolved(value: Missing) -> Missing {}\n",
             "fn filtered(value: Filtered) -> Filtered {}\n",
@@ -36564,7 +36727,7 @@ property "shared"() {}
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
         assert!(resolved.matches_collection(&collection));
-        assert_eq!(resolved.owners().len(), 13);
+        assert_eq!(resolved.owners().len(), 15);
 
         let recovered_descriptor = collection
             .scopes
@@ -36639,8 +36802,8 @@ property "shared"() {}
         assert!(recovered_generics.where_preds.is_empty());
         assert!(
             !database
-                .local_nongeneric_nominal_definitions(&collection, &snapshot)
-                .contains(&recovered_def_id),
+                .local_nominal_definitions(&collection, &snapshot)
+                .contains_key(&recovered_def_id),
             "an empty recovered HIR generic list must not enter the nominal allowlist"
         );
 
@@ -36652,13 +36815,16 @@ property "shared"() {}
             let FunctionSignatureProjection::Supported(signature) = projection else {
                 panic!("a direct local nongeneric nominal signature is supported");
             };
-            let sai_ty::ty::TyKind::Adt(input_def) = signature.inputs()[0].kind() else {
+            let sai_ty::ty::TyKind::Adt(input_def, input_args) = signature.inputs()[0].kind()
+            else {
                 panic!("the input retains nominal DefId identity");
             };
-            let sai_ty::ty::TyKind::Adt(output_def) = signature.output().kind() else {
+            let sai_ty::ty::TyKind::Adt(output_def, output_args) = signature.output().kind() else {
                 panic!("the output retains nominal DefId identity");
             };
             assert_eq!(input_def, output_def);
+            assert!(input_args.is_empty());
+            assert!(output_args.is_empty());
             *input_def
         };
         let root_packet = supported_nominal(0);
@@ -36694,22 +36860,48 @@ property "shared"() {}
         for index in [4, 6] {
             assert_eq!(
                 unsupported_reason(index),
-                sai_ty::lower_ty::UnsupportedTy::NominalType,
-                "a generic definition without use-site arguments stays unsupported"
+                sai_ty::lower_ty::UnsupportedTy::WrongNumberOfGenericArguments,
+                "an omitted type argument does not silently use arity zero"
             );
         }
         for index in [5, 7] {
-            assert_eq!(
-                unsupported_reason(index),
-                sai_ty::lower_ty::UnsupportedTy::GenericArguments,
-                "explicit generic arguments stay unsupported"
-            );
+            let projection = resolved
+                .signature_projection(&collection, resolved.owners()[index].owner())
+                .expect("the exact collection guards the signature")
+                .expect("the top-level function owner exists");
+            let FunctionSignatureProjection::Supported(signature) = projection else {
+                panic!("an explicit type argument for a direct local nominal is supported");
+            };
+            let sai_ty::ty::TyKind::Adt(input_def, input_args) = signature.inputs()[0].kind()
+            else {
+                panic!("the input retains nominal identity");
+            };
+            let sai_ty::ty::TyKind::Adt(output_def, output_args) = signature.output().kind() else {
+                panic!("the output retains nominal identity");
+            };
+            assert_eq!(input_def, output_def);
+            assert_eq!(input_args.len(), 1);
+            assert!(matches!(
+                input_args[0].kind(),
+                sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U32)
+            ));
+            assert!(input_args[0].ptr_eq(&output_args[0]));
         }
         assert_eq!(
             unsupported_reason(8),
+            sai_ty::lower_ty::UnsupportedTy::WrongNumberOfGenericArguments,
+            "too many explicit type arguments fail closed"
+        );
+        assert_eq!(
+            unsupported_reason(9),
+            sai_ty::lower_ty::UnsupportedTy::GenericArgumentKind,
+            "a const argument cannot fill a type-only parameter"
+        );
+        assert_eq!(
+            unsupported_reason(10),
             sai_ty::lower_ty::UnsupportedTy::Alias
         );
-        for index in [9, 10] {
+        for index in [11, 12] {
             assert_eq!(
                 unsupported_reason(index),
                 sai_ty::lower_ty::UnsupportedTy::MissingPathResolution,
@@ -36717,14 +36909,242 @@ property "shared"() {}
             );
         }
         assert_eq!(
-            unsupported_reason(11),
+            unsupported_reason(13),
             sai_ty::lower_ty::UnsupportedTy::NominalType,
             "a local interface-member record is outside the direct top-level allowlist"
         );
         assert_eq!(
-            unsupported_reason(12),
+            unsupported_reason(14),
             sai_ty::lower_ty::UnsupportedTy::NominalType,
             "a recovered generic parameter list cannot masquerade as HIR arity zero"
+        );
+    }
+
+    #[test]
+    fn function_signature_projection_rejects_region_bearing_local_nominals() {
+        let root = concat!(
+            "type Borrowed { value: borrow Bool }\n",
+            "type BorrowedGeneric<T> { value: borrow T }\n",
+            "enum BorrowedEnum<T> { Value(borrow T) }\n",
+            "type TextView { value: Str }\n",
+            "type SliceView { value: Slice<U32> }\n",
+            "type TransitiveView { value: Borrowed }\n",
+            "type RecoveredField { value: Bool = }\n",
+            "type Safe<T> { value: T }\n",
+            "enum SafeEnum<T> { Value(T) }\n",
+            "fn direct_borrow(value: Borrowed) {}\n",
+            "fn generic_borrow(value: BorrowedGeneric<U32>) {}\n",
+            "fn enum_borrow(value: BorrowedEnum<U32>) {}\n",
+            "fn text_view(value: TextView) {}\n",
+            "fn slice_view(value: SliceView) {}\n",
+            "fn transitive_view(value: TransitiveView) {}\n",
+            "fn recovered_field(value: RecoveredField) {}\n",
+            "fn safe_record(value: Safe<U32>) -> Safe<U32> {}\n",
+            "fn safe_enum(value: SafeEnum<Bool>) -> SafeEnum<Bool> {}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        assert_eq!(resolved.owners().len(), 9);
+
+        let unsupported_reason = |index: usize| {
+            let projection = resolved
+                .signature_projection(&collection, resolved.owners()[index].owner())
+                .expect("the exact collection guards the signature")
+                .expect("the top-level function owner exists");
+            match projection {
+                FunctionSignatureProjection::Unsupported(
+                    sai_ty::lower_ty::UnsupportedFnSig::ParameterType { reason, .. },
+                ) => *reason,
+                FunctionSignatureProjection::Supported(_) => {
+                    panic!("region-bearing local nominals must stay outside the ADT allowlist")
+                }
+                FunctionSignatureProjection::Unsupported(reason) => {
+                    panic!("expected a parameter type rejection, got {reason:?}")
+                }
+            }
+        };
+        assert_eq!(
+            unsupported_reason(0),
+            sai_ty::lower_ty::UnsupportedTy::NominalType,
+            "nongeneric borrow fields require an implicit region parameter"
+        );
+        assert_eq!(
+            unsupported_reason(1),
+            sai_ty::lower_ty::UnsupportedTy::GenericArguments,
+            "a generic nominal with a borrow field cannot drop its region argument"
+        );
+        assert_eq!(
+            unsupported_reason(2),
+            sai_ty::lower_ty::UnsupportedTy::GenericArguments,
+            "enum payloads use the same conservative region gate as record fields"
+        );
+        for index in [3, 4, 5] {
+            assert_eq!(
+                unsupported_reason(index),
+                sai_ty::lower_ty::UnsupportedTy::NominalType,
+                "view, slice, and nested nominal fields are not proven region-free"
+            );
+        }
+        assert_eq!(
+            unsupported_reason(6),
+            sai_ty::lower_ty::UnsupportedTy::NominalType,
+            "a malformed field declaration cannot enter the nominal allowlist"
+        );
+
+        for (index, expected) in [(7, "U32"), (8, "Bool")] {
+            let projection = resolved
+                .signature_projection(&collection, resolved.owners()[index].owner())
+                .expect("the exact collection guards the signature")
+                .expect("the top-level function owner exists");
+            let FunctionSignatureProjection::Supported(signature) = projection else {
+                panic!("simple type-parameter payloads are region-free");
+            };
+            let sai_ty::ty::TyKind::Adt(_, args) = signature.inputs()[0].kind() else {
+                panic!("the input retains nominal identity");
+            };
+            assert_eq!(args.len(), 1);
+            assert!(
+                match expected {
+                    "U32" => matches!(
+                        args[0].kind(),
+                        sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U32)
+                    ),
+                    "Bool" => matches!(args[0].kind(), sai_ty::ty::TyKind::Bool),
+                    _ => unreachable!(),
+                },
+                "the argument remains {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn function_signature_projection_rejects_recovered_generic_argument_syntax() {
+        let root = concat!(
+            "type Box<T> { value: T }\n",
+            "type Choice<T> { value: T }\n",
+            "fn missing_close(value: Box<U32) -> Bool {}\n",
+            "fn missing_nested_close(value: Box<Choice<U32>) -> Bool {}\n",
+            "fn empty_generic_args(value: Box<>) -> Bool {}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        assert_eq!(resolved.owners().len(), 3);
+
+        for (index, expected_name) in [
+            (0, "missing_close"),
+            (1, "missing_nested_close"),
+            (2, "empty_generic_args"),
+        ] {
+            let descriptor = collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .copied()
+                .find(|descriptor| descriptor.owner == resolved.owners()[index].owner())
+                .expect("the function has an exact current owner descriptor");
+            let inputs = database
+                .current_owner_inputs(&snapshot, descriptor.file, &collection.target_cfg)
+                .expect("current owner source is available");
+            let function = inputs
+                .ast_ids
+                .pointer(descriptor.item_id)
+                .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.root))
+                .and_then(ast::FnDecl::cast)
+                .expect("the recovered function remains in the AST");
+            assert_eq!(
+                function.name().unwrap().token().unwrap().text(),
+                expected_name
+            );
+            assert!(
+                signature_generic_argument_syntax_has_recovery(&function),
+                "the function's parameter type contains a recovered generic argument list"
+            );
+            let projection = resolved
+                .signature_projection(&collection, resolved.owners()[index].owner())
+                .expect("the exact collection guards the signature")
+                .expect("the top-level function owner exists");
+            assert_eq!(
+                projection,
+                &FunctionSignatureProjection::Unsupported(
+                    sai_ty::lower_ty::UnsupportedFnSig::RecoveredGenericSyntax
+                ),
+                "missing generic closers must not disappear when HIR retains a prefix of the arguments"
+            );
+        }
+    }
+
+    #[test]
+    fn function_signature_projection_lowers_nested_generic_adts_with_owner_params() {
+        let root = concat!(
+            "type Inner<T> { value: T }\n",
+            "type Wrapper<T> { value: T }\n",
+            "fn nested<T>(value: Wrapper<Inner<T>>) -> Wrapper<Inner<T>> {}\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg,
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot Phase 1 collection succeeds");
+        let resolved = database
+            .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
+            .expect("function owner analyses succeed");
+        let projection = resolved
+            .signature_projection(&collection, resolved.owners()[0].owner())
+            .expect("the exact collection guards the signature")
+            .expect("the top-level function owner exists");
+        let FunctionSignatureProjection::Supported(signature) = projection else {
+            panic!("nested direct-local type arguments with a function parameter are supported");
+        };
+        assert_eq!(signature.type_params().len(), 1);
+        let param = signature.type_params()[0].param;
+        assert_eq!(param.index, 0);
+        assert_eq!(database.symbols.resolve(param.name).unwrap().as_ref(), "T");
+
+        let sai_ty::ty::TyKind::Adt(wrapper_def, wrapper_args) = signature.inputs()[0].kind()
+        else {
+            panic!("the outer application is the local Wrapper");
+        };
+        assert_eq!(wrapper_args.len(), 1);
+        let sai_ty::ty::TyKind::Adt(inner_def, inner_args) = wrapper_args[0].kind() else {
+            panic!("the nested application is the local Inner");
+        };
+        assert_ne!(wrapper_def, inner_def);
+        assert_eq!(inner_args.len(), 1);
+        assert_eq!(
+            inner_args[0].kind(),
+            &sai_ty::ty::TyKind::Param(param),
+            "the nested occurrence resolves to the exact function-owned binder"
+        );
+        assert!(
+            signature.inputs()[0].ptr_eq(signature.output()),
+            "equivalent nested applications intern to the same structure"
         );
     }
 
