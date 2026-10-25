@@ -2628,11 +2628,52 @@ impl LocalEnumVariantPathEntry {
     }
 }
 
+/// Value-type projection for one resolved direct local enum-variant path.
+///
+/// This is keyed by the exact suffix `Field` HIR ID and remains a narrow
+/// projection; it is not the expression-type map required by `TypeckResults`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalEnumVariantPathTypeEntry {
+    field: HirId,
+    enum_owner: OwnerId,
+    enum_def: DefId,
+    variant: DefId,
+    value_type: sai_ty::adt::LocalEnumVariantValueType,
+}
+
+impl LocalEnumVariantPathTypeEntry {
+    /// HIR identity of the direct variant field expression.
+    pub const fn field(&self) -> HirId {
+        self.field
+    }
+
+    /// Exact validated local enum owner.
+    pub const fn enum_owner(&self) -> OwnerId {
+        self.enum_owner
+    }
+
+    /// Exact enum definition paired with `enum_owner`.
+    pub const fn enum_def(&self) -> DefId {
+        self.enum_def
+    }
+
+    /// Exact variant definition selected by the path resolver.
+    pub const fn variant(&self) -> DefId {
+        self.variant
+    }
+
+    /// Unit, tuple-constructor, or record-no-value result for this path.
+    pub const fn value_type(&self) -> &sai_ty::adt::LocalEnumVariantValueType {
+        &self.value_type
+    }
+}
+
 /// Owned direct enum-variant paths and diagnostics for one function owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalEnumVariantPathResolution {
     owner: OwnerId,
     entries: HashMap<HirId, LocalEnumVariantPathEntry>,
+    value_type_entries: HashMap<HirId, LocalEnumVariantPathTypeEntry>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -2644,6 +2685,18 @@ impl LocalEnumVariantPathResolution {
     /// Results keyed by the HIR identity of each direct field expression.
     pub fn entries(&self) -> &HashMap<HirId, LocalEnumVariantPathEntry> {
         &self.entries
+    }
+
+    /// Value-type projections keyed by the exact resolved suffix `Field` HIR
+    /// ID. Unknown, non-enum, and unsupported paths have no entry; record
+    /// variants do have an entry whose value type is `RecordHasNoValueType`.
+    pub fn value_type_entries(&self) -> &HashMap<HirId, LocalEnumVariantPathTypeEntry> {
+        &self.value_type_entries
+    }
+
+    /// Value-type projection for the exact direct variant field expression.
+    pub fn value_type_for_field(&self, field: HirId) -> Option<&LocalEnumVariantPathTypeEntry> {
+        self.value_type_entries.get(&field)
     }
 
     /// Source-ordered unknown-variant and non-enum diagnostics.
@@ -9729,6 +9782,12 @@ pub enum OwnerControlFlowResolutionError {
         file: FileId,
         package_key: String,
     },
+    LocalEnumVariantPathTypeInvariant {
+        field: HirId,
+        enum_owner: OwnerId,
+        enum_def: DefId,
+        variant: DefId,
+    },
     TopLevelOwnerDescriptorMismatch {
         owner: OwnerId,
         file: FileId,
@@ -13658,6 +13717,81 @@ fn direct_enum_variant_ast_type_head(mut base: ast::Expr) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn local_enum_variant_path_type_entry(
+    interner: &sai_ty::ty::TyInterner,
+    type_owners: &TypeOwnerResolutions,
+    collection: &Phase1PackageScopesCollection,
+    member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+    wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+    field: HirId,
+    enum_owner: OwnerId,
+    enum_def: DefId,
+    variant: DefId,
+) -> Result<LocalEnumVariantPathTypeEntry, OwnerControlFlowResolutionError> {
+    let invariant_error = || OwnerControlFlowResolutionError::LocalEnumVariantPathTypeInvariant {
+        field,
+        enum_owner,
+        enum_def,
+        variant,
+    };
+    if enum_owner.def_id.to_def_id() != enum_def {
+        return Err(invariant_error());
+    }
+    let value_type = match type_owners.local_enum_variant_value_type_with_scopes(
+        interner,
+        collection,
+        member_scopes,
+        wit_view_scopes,
+        enum_owner,
+        variant,
+    )? {
+        Some(LocalEnumVariantValueTypeProjection::Supported {
+            owner,
+            variant: projected_variant,
+            value_type,
+        }) if owner == enum_owner && projected_variant == variant => value_type,
+        Some(LocalEnumVariantValueTypeProjection::Supported { .. })
+        | Some(LocalEnumVariantValueTypeProjection::UnsupportedEnum { .. })
+        | Some(LocalEnumVariantValueTypeProjection::InvalidVariant { .. })
+        | None => return Err(invariant_error()),
+    };
+    let has_expected_shape = match &value_type {
+        sai_ty::adt::LocalEnumVariantValueType::Unit(value_type) => {
+            matches!(
+                value_type.kind(),
+                sai_ty::ty::TyKind::Adt(definition, arguments)
+                    if *definition == enum_def && arguments.is_empty()
+            )
+        }
+        sai_ty::adt::LocalEnumVariantValueType::TupleConstructor {
+            function_item,
+            signature,
+        } => {
+            matches!(
+                function_item.kind(),
+                sai_ty::ty::TyKind::FnDef(definition, arguments)
+                    if *definition == variant && arguments.is_empty()
+            ) && signature.generic_params().is_empty()
+                && matches!(
+                    signature.output().kind(),
+                    sai_ty::ty::TyKind::Adt(definition, arguments)
+                        if *definition == enum_def && arguments.is_empty()
+                )
+        }
+        sai_ty::adt::LocalEnumVariantValueType::RecordHasNoValueType => true,
+    };
+    if !has_expected_shape {
+        return Err(invariant_error());
+    }
+    Ok(LocalEnumVariantPathTypeEntry {
+        field,
+        enum_owner,
+        enum_def,
+        variant,
+        value_type,
+    })
+}
+
 fn resolve_local_enum_variant_paths(
     owner: OwnerId,
     hir_owner: &HirOwner<'_>,
@@ -13666,6 +13800,7 @@ fn resolve_local_enum_variant_paths(
     locals: &LocalResolution,
     module_paths: &ModuleResolution,
     type_owners: &TypeOwnerResolutions,
+    interner: &sai_ty::ty::TyInterner,
     generic_resolutions: &HashMap<Symbol, Res>,
     symbols: &Interner,
     module_scope: &Phase1ModuleScopes,
@@ -13755,6 +13890,7 @@ fn resolve_local_enum_variant_paths(
     let mut result = LocalEnumVariantPathResolution {
         owner,
         entries: HashMap::new(),
+        value_type_entries: HashMap::new(),
         diagnostics: Vec::new(),
     };
     if candidates.is_empty() {
@@ -13943,6 +14079,26 @@ fn resolve_local_enum_variant_paths(
             _ => continue,
         };
 
+        let value_type_entry = match &outcome {
+            LocalEnumVariantPathOutcome::Resolved {
+                enum_owner,
+                enum_def,
+                variant,
+            } => Some(local_enum_variant_path_type_entry(
+                interner,
+                type_owners,
+                collection,
+                member_scopes,
+                wit_view_scopes,
+                field.hir_id,
+                *enum_owner,
+                *enum_def,
+                *variant,
+            )?),
+            LocalEnumVariantPathOutcome::UnknownVariant { .. }
+            | LocalEnumVariantPathOutcome::NotEnum { .. }
+            | LocalEnumVariantPathOutcome::UnsupportedEnum { .. } => None,
+        };
         let entry = LocalEnumVariantPathEntry {
             field: field.hir_id,
             base_expression: base_expression.hir_id,
@@ -13966,6 +14122,11 @@ fn resolve_local_enum_variant_paths(
                 inputs,
                 snapshot,
             )?);
+        }
+        if let Some(value_type_entry) = value_type_entry {
+            result
+                .value_type_entries
+                .insert(value_type_entry.field, value_type_entry);
         }
         result.entries.insert(entry.field, entry);
     }
@@ -17766,6 +17927,7 @@ impl RootDatabase {
                                                     &locals,
                                                     module_paths,
                                                     &local_type_owners,
+                                                    &self.semantic_types,
                                                     &generic_resolutions,
                                                     &self.symbols,
                                                     module_scope,
@@ -96608,12 +96770,17 @@ interface facade { use middle.{payload}; }"#;
             "enum Alpha { Same, Ready }\n",
             "enum Beta { Same, Later }\n",
             "enum Duplicate { Same, Same }\n",
+            "enum Payload { Unit, Pair(U8, Bool), Named(value: Bool) }\n",
             "enum Generic<T> { Value(T) }\n",
             "enum Broken { Huge = 170141183460469231731687303715884105728 }\n",
             "type Widget { value: Bool }\n",
             "fn alpha() { Alpha.Same }\n",
             "fn beta() { Beta.Same }\n",
             "fn duplicate() { Duplicate.Same }\n",
+            "fn payload_unit() { Payload.Unit }\n",
+            "fn payload_tuple() { Payload.Pair }\n",
+            "fn payload_record() { Payload.Named(value: true) }\n",
+            "fn repeated_paths() { (Payload.Unit, Payload.Pair) }\n",
             "fn unknown() { Alpha.Smae }\n",
             "fn qualified() { child_alias.Child.Hit }\n",
             "fn local(e: Bool) { e.Same }\n",
@@ -96738,6 +96905,35 @@ interface facade { use middle.{payload}; }"#;
             alpha_variant, beta_variant,
             "same-named variants retain their enum-specific DefIds"
         );
+        let alpha_entry = entry_for("alpha");
+        let alpha_paths = paths_for("alpha");
+        let alpha_type_entry = alpha_paths
+            .value_type_for_field(alpha_entry.field())
+            .expect("a resolved unit variant has a value-type entry");
+        assert_eq!(alpha_type_entry.field(), alpha_entry.field());
+        assert_eq!(alpha_type_entry.enum_owner(), alpha_owner);
+        assert_eq!(alpha_type_entry.enum_def(), alpha_enum);
+        assert_eq!(alpha_type_entry.variant(), alpha_variant);
+        assert!(matches!(
+            alpha_type_entry.value_type(),
+            sai_ty::adt::LocalEnumVariantValueType::Unit(value_type)
+                if matches!(
+                    value_type.kind(),
+                    sai_ty::ty::TyKind::Adt(definition, arguments)
+                        if *definition == alpha_enum && arguments.is_empty()
+                )
+        ));
+        let beta_paths = paths_for("beta");
+        let beta_type_entry = beta_paths
+            .value_type_for_field(entry_for("beta").field())
+            .expect("the second same-named unit variant has a value type");
+        assert_eq!(beta_type_entry.enum_def(), beta_enum);
+        assert_eq!(beta_type_entry.variant(), beta_variant);
+        assert!(
+            !alpha_paths.value_type_entries().is_empty()
+                && alpha_type_entry.variant() != beta_type_entry.variant(),
+            "the exact enum/variant identity pair survives type projection"
+        );
         let duplicate_owner = enum_owner_named("Duplicate");
         let duplicate_projection = type_owners
             .local_enum_adt_with_scopes(
@@ -96781,7 +96977,6 @@ interface facade { use middle.{payload}; }"#;
             ),
             "duplicate-name recovery selects the earliest source-ordered variant"
         );
-        let alpha_entry = entry_for("alpha");
         assert_eq!(alpha_entry.field().owner, function_owner_named("alpha"));
         assert_eq!(
             alpha_entry.base_expression().owner,
@@ -96936,6 +97131,114 @@ interface facade { use middle.{payload}; }"#;
             paths_for("unsupported_enum").diagnostics().is_empty(),
             "an unsupported enum is left to the owning semantic phase"
         );
+
+        let payload_unit_paths = paths_for("payload_unit");
+        let payload_unit = payload_unit_paths
+            .entries()
+            .values()
+            .next()
+            .expect("unit variant path exists");
+        let payload_unit_type = payload_unit_paths
+            .value_type_for_field(payload_unit.field())
+            .expect("unit variant type is keyed by the exact field HIR ID");
+        assert!(matches!(
+            payload_unit_type.value_type(),
+            sai_ty::adt::LocalEnumVariantValueType::Unit(value_type)
+                if matches!(
+                    value_type.kind(),
+                    sai_ty::ty::TyKind::Adt(definition, arguments)
+                        if *definition == payload_unit_type.enum_def()
+                            && arguments.is_empty()
+                )
+        ));
+
+        let payload_tuple_paths = paths_for("payload_tuple");
+        let payload_tuple = payload_tuple_paths
+            .entries()
+            .values()
+            .next()
+            .expect("tuple variant path exists");
+        let payload_tuple_type = payload_tuple_paths
+            .value_type_for_field(payload_tuple.field())
+            .expect("tuple variant path retains its constructor type");
+        let sai_ty::adt::LocalEnumVariantValueType::TupleConstructor {
+            function_item,
+            signature,
+        } = payload_tuple_type.value_type()
+        else {
+            panic!("tuple variant path has a function-item value type");
+        };
+        assert!(matches!(
+            function_item.kind(),
+            sai_ty::ty::TyKind::FnDef(definition, arguments)
+                if *definition == payload_tuple_type.variant() && arguments.is_empty()
+        ));
+        assert!(signature.generic_params().is_empty());
+        assert_eq!(signature.inputs().len(), 2);
+        assert!(matches!(
+            signature.inputs()[0].kind(),
+            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+        ));
+        assert!(matches!(
+            signature.inputs()[1].kind(),
+            sai_ty::ty::TyKind::Bool
+        ));
+        assert!(matches!(
+            signature.output().kind(),
+            sai_ty::ty::TyKind::Adt(definition, arguments)
+                if *definition == payload_tuple_type.enum_def() && arguments.is_empty()
+        ));
+
+        let payload_record_paths = paths_for("payload_record");
+        let payload_record = payload_record_paths
+            .entries()
+            .values()
+            .next()
+            .expect("record constructor callee retains its variant path");
+        assert!(
+            payload_record_paths
+                .value_type_for_field(payload_record.field())
+                .is_some_and(|entry| matches!(
+                    entry.value_type(),
+                    sai_ty::adt::LocalEnumVariantValueType::RecordHasNoValueType
+                ))
+        );
+        let repeated_paths = paths_for("repeated_paths");
+        assert_eq!(repeated_paths.entries().len(), 2);
+        assert_eq!(repeated_paths.value_type_entries().len(), 2);
+        let repeated_fields = repeated_paths
+            .value_type_entries()
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            repeated_fields.len(),
+            2,
+            "each source occurrence has its own exact HIR-keyed type entry"
+        );
+        assert!(
+            repeated_paths
+                .value_type_entries()
+                .values()
+                .any(|entry| matches!(
+                    entry.value_type(),
+                    sai_ty::adt::LocalEnumVariantValueType::Unit(_)
+                ))
+                && repeated_paths
+                    .value_type_entries()
+                    .values()
+                    .any(|entry| matches!(
+                        entry.value_type(),
+                        sai_ty::adt::LocalEnumVariantValueType::TupleConstructor { .. }
+                    )),
+            "multiple variant paths in one owner retain separate shapes"
+        );
+        for name in ["unknown", "non_enum", "generic_enum", "unsupported_enum"] {
+            assert!(
+                paths_for(name).value_type_entries().is_empty(),
+                "{name} does not receive a variant value type"
+            );
+        }
 
         assert!(matches!(
             resolved.local_enum_variant_paths_with_scopes(

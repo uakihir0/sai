@@ -7688,6 +7688,7 @@ fn owner_resolution_error_tag(error: &OwnerControlFlowResolutionError) -> u8 {
         OwnerControlFlowResolutionError::ExportWorldQuery(_) => 38,
         OwnerControlFlowResolutionError::ExportWorldSelectionMismatch => 39,
         OwnerControlFlowResolutionError::MissingExportWorldLocation => 40,
+        OwnerControlFlowResolutionError::LocalEnumVariantPathTypeInvariant { .. } => 41,
         OwnerControlFlowResolutionError::MissingInterfaceScope(_) => 30,
         OwnerControlFlowResolutionError::MissingInterfaceImplTarget(_) => 31,
         OwnerControlFlowResolutionError::InterfaceImplDiagnosticSourceMismatch { .. } => 32,
