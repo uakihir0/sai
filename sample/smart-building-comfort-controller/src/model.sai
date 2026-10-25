@@ -1,0 +1,120 @@
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum ZoneId {
+    Nursery
+    Studio
+    Archive
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum PriceSignal {
+    Low
+    Elevated
+    High
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum CarbonSignal {
+    Low
+    Elevated
+    High
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ZoneReading {
+    pub zone: ZoneId
+    pub measured_temp_deci_c: I32
+    pub requested_setpoint_deci_c: I32
+    pub comfort_min_deci_c: I32
+    pub comfort_max_deci_c: I32
+    // Lower numbers are served first after comfort excursions.
+    pub priority: U32
+    pub occupied: Bool
+    pub co2_ppm: U32
+    pub requested_ventilation_units: USize
+    pub max_ventilation_units: USize
+    pub max_setpoint_change_deci_c: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BuildingSnapshot {
+    pub period: Str
+    pub price_signal: PriceSignal
+    pub carbon_signal: CarbonSignal
+    pub zones: Array<ZoneReading, 3>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type EquipmentLimits {
+    // Abstract setpoint-change units per period; these are not kW or kWh.
+    pub base_period_movement_deci_c: USize
+    pub heating_movement_capacity_deci_c: USize
+    pub cooling_movement_capacity_deci_c: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ZoneMemory {
+    pub commanded_setpoint_deci_c: I32
+    pub pending_setpoint_deci_c: I32
+    pub pending_samples: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ControllerMemory {
+    // Array indexes are the declaration order in ZoneId.
+    pub zones: Array<ZoneMemory, 3>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ZoneAudit {
+    pub zone: ZoneId
+    pub service_rank: USize
+    pub measured_temp_deci_c: I32
+    pub requested_setpoint_deci_c: I32
+    pub comfort_bounded_setpoint_deci_c: I32
+    pub commanded_setpoint_deci_c: I32
+    // Signed difference: requested minus commanded, in tenths of a degree C.
+    pub unmet_requested_setpoint_deci_c: I32
+    pub comfort_clamped: Bool
+    pub comfort_excursion: Bool
+    pub hysteresis_waiting: Bool
+    pub equipment_limit_applied: Bool
+    pub signal_budget_applied: Bool
+    pub required_ventilation_units: USize
+    pub requested_ventilation_units: USize
+    pub supplied_ventilation_units: USize
+    pub unmet_required_ventilation_units: USize
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type BuildingAudit {
+    pub period: Str
+    pub price_signal: PriceSignal
+    pub carbon_signal: CarbonSignal
+    pub allowed_movement_deci_c: USize
+    pub movement_used_deci_c: USize
+    pub heating_movement_used_deci_c: USize
+    pub cooling_movement_used_deci_c: USize
+    // Indexes into the input snapshot's zones array, in decision order.
+    pub service_order: Array<USize, 3>
+    // Indexes are the same as the input snapshot's zones array.
+    pub decisions: Array<Option<ZoneAudit>, 3>
+    pub unmet_thermal_request_count: USize
+    pub ventilation_shortfall_count: USize
+    pub unmet_ventilation_units: USize
+    pub next_memory: ControllerMemory
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type ControllerRun {
+    pub periods: Array<Option<BuildingAudit>, 4>
+    pub final_memory: ControllerMemory
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type AuditSummary {
+    pub period_count: USize
+    pub total_movement_deci_c: USize
+    pub unmet_thermal_request_count: USize
+    pub ventilation_shortfall_count: USize
+    pub unmet_ventilation_units: USize
+}

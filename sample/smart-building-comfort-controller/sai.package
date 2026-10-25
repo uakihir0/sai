@@ -1,0 +1,5 @@
+package acme:smart-building-comfort-controller @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Plan bounded comfort and ventilation actions from fixed building fixtures"

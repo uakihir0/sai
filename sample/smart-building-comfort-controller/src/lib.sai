@@ -1,0 +1,247 @@
+use acme:smart-building-comfort-controller/controller
+use acme:smart-building-comfort-controller/data
+use acme:smart-building-comfort-controller/model.{
+    AuditSummary
+    BuildingAudit
+    ControllerMemory
+    ControllerRun
+    EquipmentLimits
+    ZoneAudit
+    ZoneId
+    ZoneMemory
+}
+use acme:smart-building-comfort-controller/report
+
+pub fn run_fixture() -> ControllerRun {
+    let snapshots = data.snapshots()
+    var memory = data.initial_memory()
+    var periods = Array<Option<BuildingAudit>, 4>.filled(None)
+    var index: USize = 0
+
+    for snapshot in snapshots {
+        let audit = controller.evaluate(snapshot, memory, data.equipment_limits())
+        periods[index] = Some(audit)
+        memory = audit.next_memory
+        index += 1
+    }
+
+    ControllerRun(periods: periods, final_memory: memory)
+}
+
+pub fn fixture_summary() -> AuditSummary {
+    report.summarize(run_fixture())
+}
+
+fn decision_at(audit: BuildingAudit, zone: ZoneId) -> ZoneAudit {
+    let wanted = zone
+    for decision in audit.decisions {
+        match decision {
+            Some(record) => {
+                if record.zone == wanted {
+                    return record
+                }
+            }
+            None => {}
+        }
+    }
+    ZoneAudit(
+        zone: ZoneId.Nursery,
+        service_rank: 0,
+        measured_temp_deci_c: 0,
+        requested_setpoint_deci_c: 0,
+        comfort_bounded_setpoint_deci_c: 0,
+        commanded_setpoint_deci_c: 0,
+        unmet_requested_setpoint_deci_c: 0,
+        comfort_clamped: false,
+        comfort_excursion: false,
+        hysteresis_waiting: false,
+        equipment_limit_applied: false,
+        signal_budget_applied: false,
+        required_ventilation_units: 0,
+        requested_ventilation_units: 0,
+        supplied_ventilation_units: 0,
+        unmet_required_ventilation_units: 0,
+    )
+}
+
+test "comfort excursions are served before elective setpoint changes" {
+    let run = run_fixture()
+    match run.periods[1] {
+        Some(audit) => {
+            assert audit.service_order[0] == 1
+            assert audit.decisions[1].unwrap().zone == ZoneId.Archive
+            assert audit.decisions[1].unwrap().comfort_excursion
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "comfort bounds and ventilation safety produce explicit audit shortfalls" {
+    let run = run_fixture()
+    match run.periods[0] {
+        Some(audit) => {
+            let nursery = decision_at(audit, ZoneId.Nursery)
+            assert nursery.comfort_clamped
+            assert nursery.requested_setpoint_deci_c == 250
+            assert nursery.comfort_bounded_setpoint_deci_c == 240
+            assert nursery.commanded_setpoint_deci_c == 240
+            assert nursery.unmet_requested_setpoint_deci_c == 10
+            assert nursery.required_ventilation_units == 8
+            assert nursery.supplied_ventilation_units == 6
+            assert nursery.unmet_required_ventilation_units == 2
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "price and carbon signals bound the period movement budget" {
+    let run = run_fixture()
+    match run.periods[0] {
+        Some(audit) => {
+            assert audit.allowed_movement_deci_c == 30
+            assert audit.movement_used_deci_c == 15
+        }
+        None => {
+            assert false
+        }
+    }
+    match run.periods[1] {
+        Some(audit) => {
+            assert audit.allowed_movement_deci_c == 10
+            assert audit.movement_used_deci_c == 10
+            let archive = decision_at(audit, ZoneId.Archive)
+            assert archive.commanded_setpoint_deci_c == 200
+            assert archive.required_ventilation_units == 8
+            assert archive.supplied_ventilation_units == 4
+            assert archive.unmet_required_ventilation_units == 4
+            let studio = decision_at(audit, ZoneId.Studio)
+            assert studio.hysteresis_waiting
+            assert studio.commanded_setpoint_deci_c == 215
+            assert studio.unmet_requested_setpoint_deci_c == 18
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "a stable target moves within equipment limits and a one-period reversal waits" {
+    let run = run_fixture()
+    match run.periods[2] {
+        Some(audit) => {
+            assert audit.allowed_movement_deci_c == 20
+            assert audit.movement_used_deci_c == 15
+            let studio = decision_at(audit, ZoneId.Studio)
+            assert studio.commanded_setpoint_deci_c == 230
+            assert studio.equipment_limit_applied
+            assert studio.unmet_requested_setpoint_deci_c == 3
+        }
+        None => {
+            assert false
+        }
+    }
+    match run.periods[3] {
+        Some(audit) => {
+            assert audit.allowed_movement_deci_c == 25
+            let studio = decision_at(audit, ZoneId.Studio)
+            assert studio.hysteresis_waiting
+            assert studio.commanded_setpoint_deci_c == 230
+            assert studio.unmet_requested_setpoint_deci_c == 2
+            assert audit.movement_used_deci_c == 0
+        }
+        None => {
+            assert false
+        }
+    }
+}
+
+test "the structured audit summary totals the fixed fixture" {
+    let summary = fixture_summary()
+    assert summary.period_count == 4
+    assert summary.total_movement_deci_c == 40
+    assert summary.unmet_thermal_request_count == 9
+    assert summary.ventilation_shortfall_count == 2
+    assert summary.unmet_ventilation_units == 6
+
+    let run = run_fixture()
+    var heating_total: USize = 0
+    var cooling_total: USize = 0
+    for period in run.periods {
+        match period {
+            Some(audit) => {
+                heating_total += audit.heating_movement_used_deci_c
+                cooling_total += audit.cooling_movement_used_deci_c
+            }
+            None => {}
+        }
+    }
+    assert heating_total == 30
+    assert cooling_total == 10
+}
+
+test "heating capacity directly limits an urgent setpoint move" {
+    let equipment = EquipmentLimits(
+        base_period_movement_deci_c: 30,
+        heating_movement_capacity_deci_c: 5,
+        cooling_movement_capacity_deci_c: 15,
+    )
+    let audit = controller.evaluate(data.snapshots()[0], data.initial_memory(), equipment)
+    let nursery = decision_at(audit, ZoneId.Nursery)
+    assert audit.allowed_movement_deci_c == 20
+    assert audit.movement_used_deci_c == 5
+    assert audit.heating_movement_used_deci_c == 5
+    assert audit.cooling_movement_used_deci_c == 0
+    assert nursery.equipment_limit_applied
+    assert nursery.commanded_setpoint_deci_c == 230
+    assert nursery.unmet_requested_setpoint_deci_c == 20
+}
+
+test "cooling capacity directly limits a confirmed request" {
+    let initial = data.initial_memory()
+    let memory = ControllerMemory(
+        zones: [
+            initial.zones[0],
+            initial.zones[1],
+            ZoneMemory(
+                commanded_setpoint_deci_c: 210,
+                pending_setpoint_deci_c: 200,
+                pending_samples: 1,
+            ),
+        ],
+    )
+    let equipment = EquipmentLimits(
+        base_period_movement_deci_c: 30,
+        heating_movement_capacity_deci_c: 30,
+        cooling_movement_capacity_deci_c: 4,
+    )
+    let audit = controller.evaluate(data.snapshots()[0], memory, equipment)
+    let archive = decision_at(audit, ZoneId.Archive)
+    assert audit.allowed_movement_deci_c == 30
+    assert audit.movement_used_deci_c == 19
+    assert audit.heating_movement_used_deci_c == 15
+    assert audit.cooling_movement_used_deci_c == 4
+    assert archive.equipment_limit_applied
+    assert archive.commanded_setpoint_deci_c == 206
+    assert archive.unmet_requested_setpoint_deci_c == -6
+}
+
+test "a hot reading does not reverse an above-command requested setpoint" {
+    let audit = controller.evaluate(
+        data.hot_room_snapshot(),
+        data.initial_memory(),
+        data.equipment_limits(),
+    )
+    let studio = decision_at(audit, ZoneId.Studio)
+    assert audit.service_order[0] == 0
+    assert studio.measured_temp_deci_c == 250
+    assert studio.comfort_excursion
+    assert studio.requested_setpoint_deci_c == 230
+    assert studio.comfort_bounded_setpoint_deci_c == 230
+    assert studio.commanded_setpoint_deci_c == 230
+    assert audit.heating_movement_used_deci_c > 0
+    assert audit.cooling_movement_used_deci_c == 0
+}

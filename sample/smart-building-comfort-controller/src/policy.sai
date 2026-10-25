@@ -1,0 +1,88 @@
+use acme:smart-building-comfort-controller/model.{
+    BuildingSnapshot
+    CarbonSignal
+    EquipmentLimits
+    PriceSignal
+    ZoneId
+    ZoneReading
+}
+
+pub fn zone_index(zone: ZoneId) -> USize {
+    match zone { ZoneId.Nursery => 0, ZoneId.Studio => 1, ZoneId.Archive => 2 }
+}
+
+pub fn comfort_bounded_setpoint(reading: ZoneReading) -> I32 {
+    if reading.requested_setpoint_deci_c < reading.comfort_min_deci_c {
+        reading.comfort_min_deci_c
+    } else if reading.requested_setpoint_deci_c > reading.comfort_max_deci_c {
+        reading.comfort_max_deci_c
+    } else {
+        reading.requested_setpoint_deci_c
+    }
+}
+
+pub fn comfort_excursion(reading: ZoneReading) -> Bool {
+    (
+        reading.measured_temp_deci_c < reading.comfort_min_deci_c
+        or reading.measured_temp_deci_c > reading.comfort_max_deci_c
+    )
+}
+
+fn price_penalty(signal: PriceSignal) -> USize {
+    match signal { PriceSignal.Low => 0, PriceSignal.Elevated => 5, PriceSignal.High => 10 }
+}
+
+fn carbon_penalty(signal: CarbonSignal) -> USize {
+    match signal { CarbonSignal.Low => 0, CarbonSignal.Elevated => 5, CarbonSignal.High => 10 }
+}
+
+pub fn allowed_movement_deci_c(snapshot: BuildingSnapshot, equipment: EquipmentLimits) -> USize {
+    let signal_penalty =
+        price_penalty(snapshot.price_signal) + carbon_penalty(snapshot.carbon_signal)
+    let equipment_limit =
+        equipment.heating_movement_capacity_deci_c + equipment.cooling_movement_capacity_deci_c
+    let base_limit = if equipment.base_period_movement_deci_c < equipment_limit {
+        equipment.base_period_movement_deci_c
+    } else {
+        equipment_limit
+    }
+    if signal_penalty >= base_limit {
+        0
+    } else {
+        base_limit - signal_penalty
+    }
+}
+
+pub fn required_ventilation_units(reading: ZoneReading) -> USize {
+    if reading.co2_ppm >= 1200 {
+        8
+    } else if reading.co2_ppm >= 1000 {
+        6
+    } else if reading.occupied {
+        3
+    } else {
+        0
+    }
+}
+
+fn stable_zone_rank(zone: ZoneId) -> USize {
+    zone_index(zone)
+}
+
+pub fn precedes(left: ZoneReading, right: ZoneReading) -> Bool {
+    let left_excursion = comfort_excursion(left)
+    let right_excursion = comfort_excursion(right)
+    if left_excursion and not right_excursion {
+        return true
+    }
+    if right_excursion and not left_excursion {
+        return false
+    }
+    if left.priority < right.priority {
+        return true
+    }
+    if left.priority > right.priority {
+        return false
+    }
+    stable_zone_rank(left.zone) < stable_zone_rank(right.zone)
+}
