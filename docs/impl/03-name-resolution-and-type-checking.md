@@ -2006,6 +2006,22 @@ general tuple type checking, coercions, `call_kinds`, expression type results,
 or source acceptance, and `sai check` remains behind its incomplete-stage
 gate.
 
+**Implemented subset (IR-938):** At those same direct local non-generic
+tuple-variant call sites, an already-supported primitive or unit payload
+paired with a nonempty HIR tuple literal now emits one `TYPE_MISMATCH` over
+the complete tuple expression. Do not inspect the tuple's children, but
+continue checking eligible sibling arguments or tuple leaves in source order.
+The rule applies at outer arguments and at nested leaves reached through
+IR-927's equal-arity tuple traversal. An empty tuple expression remains unit;
+`(e)` remains scalar while `(e,)` is a tuple. Tuple-expected/scalar-actual
+pairs, tuple-typed paths and calls, aliases, `Str`, nominal or other
+unsupported payloads, and coercions remain outside this rule. Named-argument
+diagnostics, outer call-arity diagnostics, and checks in other
+signature-backed positions remain independent. This is still a narrow
+diagnostic projection rather than general expression typing: it adds no
+`call_kinds`, expression type results, or source-acceptance claim, and
+`sai check` remains behind its incomplete-stage gate.
+
 **Implemented subset (IR-928):** At the same direct local non-generic
 tuple-variant call sites, a single-segment plain path is checked when local
 resolution identifies it as a function parameter binding and both the
