@@ -1191,7 +1191,7 @@ fn check_reports_tuple_expected_primitive_parameter_path_mismatches() {
         "type Widget { value: Bool }\n",
         "fn bool_factory() -> Bool { true }\n",
         "fn use_it(actual: Bool, nested: USize, var byte: Byte, alias: BoolAlias, text: Str, unit: (), tuple: (I8,), owner: Widget, extra: Bool) {\n",
-        "    let local: Bool = true\n",
+        "    let local = true\n",
         "    (\n",
         "        Payload.Single(actual), ",
         "        Payload.Nested((nested, ((), 2))), ",
@@ -1207,7 +1207,7 @@ fn check_reports_tuple_expected_primitive_parameter_path_mismatches() {
         "    )\n",
         "}\n",
         "fn shadowed(actual: Bool) {\n",
-        "    let actual: I8 = 1\n",
+        "    let actual = 1\n",
         "    Payload.Single(actual)\n",
         "}\n",
     );
@@ -1313,6 +1313,205 @@ fn check_reports_tuple_expected_primitive_parameter_path_mismatches() {
     let named_start = source
         .find(named_call)
         .expect("named call with an unmatched extra parameter exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "WRONG_ARGUMENT_COUNT",
+        "Single: tuple variant expects 1 arguments but found 2",
+        named_start,
+        named_start + named_call.len(),
+    );
+}
+
+#[test]
+fn check_reports_tuple_expected_annotated_primitive_local_mismatches() {
+    let source = concat!(
+        "enum Payload { Single((I8,)), Nested(((I8, Char), ((), USize))) }\n",
+        "type BoolAlias = Bool\n",
+        "type Widget { value: Bool }\n",
+        "fn bool_factory() -> Bool { true }\n",
+        "fn let_outer() {\n",
+        "    let local: Bool = 'x'\n",
+        "    Payload.Single(local)\n",
+        "}\n",
+        "fn var_outer() {\n",
+        "    var mutable_local: Byte = b'x'\n",
+        "    Payload.Single(mutable_local)\n",
+        "}\n",
+        "fn nested() {\n",
+        "    let nested_local: USize = 'x'\n",
+        "    Payload.Nested((nested_local, ((), 2)))\n",
+        "}\n",
+        "fn sibling_order() {\n",
+        "    var sibling: Bool = 'x'\n",
+        "    Payload.Nested((sibling, ((), true)))\n",
+        "}\n",
+        "fn shadowed(parameter: Byte) {\n",
+        "    let parameter: Bool = 'x'\n",
+        "    Payload.Single(parameter)\n",
+        "}\n",
+        "fn named_extra(extra: Bool) {\n",
+        "    let named_local: Bool = 'x'\n",
+        "    Payload.Single(value: named_local, extra: extra)\n",
+        "}\n",
+        "fn extra_argument() {\n",
+        "    let extra_local: Bool = true\n",
+        "    Payload.Single((1,), extra_local)\n",
+        "}\n",
+        "fn unannotated_exclusion() {\n",
+        "    let unannotated = true\n",
+        "    Payload.Single(unannotated)\n",
+        "}\n",
+        "fn nested_scope_exclusion() {\n",
+        "    {\n",
+        "        let nested_scope: Bool = 'x'\n",
+        "        Payload.Single(nested_scope)\n",
+        "    }\n",
+        "}\n",
+        "fn else_declaration_exclusion() {\n",
+        "    let else_local: Bool = 'x' else { return }\n",
+        "    Payload.Single(else_local)\n",
+        "}\n",
+        "fn alias_exclusion() {\n",
+        "    let alias_local: BoolAlias = true\n",
+        "    Payload.Single(alias_local)\n",
+        "}\n",
+        "fn str_exclusion() {\n",
+        "    let text_local: Str = \"text\"\n",
+        "    Payload.Single(text_local)\n",
+        "}\n",
+        "fn unit_exclusion() {\n",
+        "    let unit_local: () = ()\n",
+        "    Payload.Single(unit_local)\n",
+        "}\n",
+        "fn nominal_exclusion() {\n",
+        "    let nominal_local: Widget = true\n",
+        "    Payload.Single(nominal_local)\n",
+        "}\n",
+        "fn tuple_type_exclusion() {\n",
+        "    let tuple_local: (I8,) = (1,)\n",
+        "    Payload.Single(tuple_local)\n",
+        "}\n",
+        "fn tuple_pattern_exclusion() {\n",
+        "    let (pattern_local, _): (Bool, Bool) = (true, false)\n",
+        "    Payload.Single(pattern_local)\n",
+        "}\n",
+        "fn call_exclusion() { Payload.Single(bool_factory()) }\n",
+    );
+    let output = run_check(source, "", &[], &[]);
+    assert_check_stays_gated_without_syntax_errors(
+        &output,
+        "tuple-expected annotated primitive locals",
+    );
+    let stdout = String::from_utf8(output.stdout).expect("CLI stdout is UTF-8");
+    assert_eq!(
+        stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
+        7,
+        "only explicit primitive locals at nonempty tuple positions plus the eligible tuple sibling mismatch:\n{stdout}"
+    );
+    assert_eq!(
+        stdout
+            .matches("\"code\":\"NAMED_ARGUMENT_ON_FUNCTION\"")
+            .count(),
+        2,
+        "named-argument diagnostics remain independent"
+    );
+    assert_eq!(
+        stdout.matches("\"code\":\"WRONG_ARGUMENT_COUNT\"").count(),
+        2,
+        "named and positional extra arguments retain their independent arity diagnostics"
+    );
+
+    let assert_path_mismatch =
+        |call: &str, path: &str, expected_message: &str, occurrence: usize| {
+            let call_start = source
+                .find(call)
+                .expect("annotated local mismatch call exists");
+            let relative_start = call
+                .match_indices(path)
+                .nth(occurrence)
+                .map(|(start, _)| start)
+                .expect("path occurs in its call");
+            let start = call_start + relative_start;
+            assert_json_diagnostic_primary_span(
+                &stdout,
+                "TYPE_MISMATCH",
+                expected_message,
+                start,
+                start + path.len(),
+            );
+        };
+    assert_path_mismatch(
+        "Payload.Single(local)",
+        "local",
+        "expected tuple of arity 1, found `Bool`",
+        0,
+    );
+    assert_path_mismatch(
+        "Payload.Single(mutable_local)",
+        "mutable_local",
+        "expected tuple of arity 1, found `Byte`",
+        0,
+    );
+    assert_path_mismatch(
+        "Payload.Nested((nested_local, ((), 2)))",
+        "nested_local",
+        "expected tuple of arity 2, found `USize`",
+        0,
+    );
+    assert_path_mismatch(
+        "Payload.Single(parameter)",
+        "parameter",
+        "expected tuple of arity 1, found `Bool`",
+        0,
+    );
+    assert_path_mismatch(
+        "Payload.Single(value: named_local, extra: extra)",
+        "named_local",
+        "expected tuple of arity 1, found `Bool`",
+        0,
+    );
+
+    let sibling_call = "Payload.Nested((sibling, ((), true)))";
+    let sibling_start = source
+        .find(sibling_call)
+        .expect("annotated sibling call exists");
+    let sibling_path_start = sibling_start
+        + sibling_call
+            .find("sibling")
+            .expect("annotated sibling path exists");
+    let sibling_literal_start = sibling_start
+        + sibling_call
+            .rfind("true")
+            .expect("Bool sibling literal exists");
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected tuple of arity 2, found `Bool`",
+        sibling_path_start,
+        sibling_path_start + "sibling".len(),
+    );
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `USize`, found a Bool literal",
+        sibling_literal_start,
+        sibling_literal_start + "true".len(),
+    );
+    let sibling_path_record = stdout
+        .find(&format!("\"start\":{{\"byte\":{sibling_path_start},"))
+        .expect("annotated local mismatch record exists");
+    let sibling_literal_record = stdout
+        .find(&format!("\"start\":{{\"byte\":{sibling_literal_start},"))
+        .expect("following literal mismatch record exists");
+    assert!(
+        sibling_path_record < sibling_literal_record,
+        "the annotated local and eligible sibling diagnostics retain source order"
+    );
+
+    let named_call = "Payload.Single(value: named_local, extra: extra)";
+    let named_start = source
+        .find(named_call)
+        .expect("annotated named call exists");
     assert_json_diagnostic_primary_span(
         &stdout,
         "WRONG_ARGUMENT_COUNT",

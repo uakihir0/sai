@@ -814,14 +814,16 @@ subset. This path result records path identity only; it does not record
 `type_dependent_defs` or synthesize expression types. That sentence describes
 the original IR-921 recognition slice: IR-922/923 later add the value-type and
 type-dependent-definition projections to the per-owner result. IR-924 through
-IR-940 add limited constructor-call diagnostics without claiming general
+IR-941 add limited constructor-call diagnostics without claiming general
 expression types. IR-938 reports nonempty tuple literals supplied where
 supported primitive or unit payloads are expected. IR-939 reports direct
 fixed-type Bool, Byte, Char, or unit literals supplied where nonempty tuple
 payloads are expected. IR-940 reports a direct path to a supported primitive
 function parameter at a nonempty tuple payload position, using the resolved
 parameter binding and declaration type. Empty tuple/unit and scalar-parenthesis
-versus singleton-tuple forms retain their distinct HIR meanings; numeric
+versus singleton-tuple forms retain their distinct HIR meanings. IR-941 adds
+the corresponding projection for directly declared, explicitly annotated
+primitive `let`/`var` locals in the function body's outer block. Numeric
 defaulting and other nonliteral expressions remain outside these shape checks.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
@@ -2044,6 +2046,23 @@ unit, nominal or tuple parameter types, computed expressions, and non-parameter
 paths. This adds no coercions, `call_kinds`, expression type results, or source
 acceptance behavior; `sai check` remains behind its incomplete-stage gate.
 
+**Implemented subset (IR-941):** At those same call sites, extend the
+tuple-expected primitive-path diagnostic to a direct path resolving to a simple
+`let` or `var` binding declared in the function body's outer block with a
+direct supported primitive annotation and no `else` clause. Resolve the path
+to its exact `BindingId`, require the expected binding kind and matching
+binding mode, and read the declaration annotation; ignore its initializer.
+Emit one `TYPE_MISMATCH` over the full path span when the expected type at that
+node is a nonempty tuple. Apply to signature-backed outer arguments and nested
+leaves reached by equal-arity tuple traversal. Stop checking at the path and
+continue eligible siblings in source order. Exclude unannotated locals,
+nested-scope declarations, `else` declarations, tuple-destructured bindings,
+aliases, `Str`, unit, nominal or tuple annotations, calls, computed expressions,
+and unmatched extra arguments. This reuses IR-929's bounded local evidence and
+does not extend local inference, coercions, `call_kinds`, expression type
+results, or source acceptance; `sai check` remains behind its incomplete-stage
+gate.
+
 **Implemented subset (IR-928):** At the same direct local non-generic
 tuple-variant call sites, a single-segment plain path is checked when local
 resolution identifies it as a function parameter binding and both the
@@ -2480,7 +2499,7 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 
 **Tuple variants and distinct construction** are calls of the constructor's `FnDef` (§3.6.3). `D(e)` with a refinement clause is a B→R conversion recorded for [impl/04](04-mir.md) (§3.13.1). Unit variants with an argument list are `WRONG_ARGUMENT_COUNT`.
 
-**IR-924–IR-940 local enum-call slices.** For a direct callee path to a
+**IR-924–IR-941 local enum-call slices.** For a direct callee path to a
 supported, local, non-generic enum variant, the owner result records a call
 entry under the call expression's `HirId`, retaining the exact callee field,
 enum owner, enum and variant `DefId`s, and source-ordered argument `HirId`s.
@@ -2516,12 +2535,16 @@ reports nonempty tuple literals against supported primitive/unit inputs;
 IR-939 reports direct fixed-type Bool/Byte/Char/unit literals against
 nonempty tuple inputs. IR-940 reports direct paths to function parameters
 declared with supported primitive types at nonempty tuple payload positions.
-It reuses IR-928's exact resolved binding and signature alignment and applies
-at outer arguments and nested leaves. Empty tuple/unit and `(e)` versus `(e,)`
-retain their distinct meanings; numeric defaulting, strings, non-parameter
-paths, locals, calls, coercions, aliases, and unsupported payload types remain
-excluded. These diagnostics preserve eligible sibling checks, independent
-named-argument and outer-arity errors, and the CLI incomplete-stage gate.
+It reuses IR-928's exact resolved binding and signature alignment. IR-941
+extends the rule to direct paths of primitive-annotated `let`/`var` locals
+declared in the function body's outer block, reusing IR-929's `BindingId` and
+binding-mode checks while ignoring initializers. Both apply at outer arguments
+and nested leaves. Empty tuple/unit and `(e)` versus `(e,)` retain their
+distinct meanings; numeric defaulting, strings, non-parameter/noneligible-local
+paths, inferred and nested locals, tuple destructuring, calls, coercions,
+aliases, and unsupported payload types remain excluded. These diagnostics
+preserve eligible sibling checks, independent named-argument and outer-arity
+errors, and the CLI incomplete-stage gate.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
