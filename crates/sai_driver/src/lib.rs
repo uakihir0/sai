@@ -20709,6 +20709,7 @@ impl RootDatabase {
                         "discriminant cannot be represented",
                     )?);
                 }
+                sort_phase1_diagnostics(&mut diagnostics);
                 let reason = error.reason();
                 Ok((
                     LocalEnumAdtProjection::Unsupported {
@@ -95588,6 +95589,13 @@ interface facade { use middle.{payload}; }"#;
             missing_range_count, 4,
             "later value and failure diagnostics survive"
         );
+        assert!(
+            missing_diagnostics.windows(2).all(|pair| {
+                pair[0].primary().unwrap().span.range.start()
+                    <= pair[1].primary().unwrap().span.range.start()
+            }),
+            "failure and later range/duplicate diagnostics are returned in source order"
+        );
         let duplicate = missing_diagnostics
             .iter()
             .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::DuplicateDiscriminant)
@@ -95644,6 +95652,13 @@ interface facade { use middle.{payload}; }"#;
                 .count(),
             5,
             "overflow and later out-of-range values are all diagnosed"
+        );
+        assert!(
+            overflow_diagnostics.windows(2).all(|pair| {
+                pair[0].primary().unwrap().span.range.start()
+                    <= pair[1].primary().unwrap().span.range.start()
+            }),
+            "overflow and later range/duplicate diagnostics are returned in source order"
         );
         let duplicate = overflow_diagnostics
             .iter()
