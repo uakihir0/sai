@@ -49,7 +49,7 @@ use sai_diagnostics::{
     Related, SourceRef, source_text_status_diagnostic,
 };
 use sai_hir::arena::HirArena;
-use sai_hir::attrs::ValidatedAttrs;
+use sai_hir::attrs::{ReprAttr, ValidatedAttrs};
 pub use sai_hir::attrs::{TargetCfg, TargetCfgError};
 use sai_hir::expressions::{
     BinOp, Block as HirBlock, Expr as HirExpr, ExprKind, FmtPiece, Stmt, StmtKind, UnOp,
@@ -134,9 +134,11 @@ use sai_stable_hash::{Fingerprint, StableHash, StableHasher, fingerprint};
 use sai_syntax::ast::{self, AstNode, AstToken};
 use sai_syntax::{Parse, ParseQueryError, SyntaxElement, SyntaxNode, SyntaxQueries};
 use sai_ty::adt::{
-    LocalEnumPayloadTemplateDef, LocalEnumPayloadTemplateDefError, LocalEnumPayloadTemplateShape,
-    LocalEnumPayloadVariantTemplateDef, LocalEnumRecordPayloadTemplate,
-    LocalEnumTuplePayloadTemplate, LocalFlagsAdtDef, LocalInterfaceEnumAdtProjection,
+    LocalEnumAdtDef, LocalEnumAdtDefError, LocalEnumDiscriminantIssue,
+    LocalEnumDiscriminantIssueKind, LocalEnumPayloadTemplateDef, LocalEnumPayloadTemplateDefError,
+    LocalEnumPayloadTemplateShape, LocalEnumPayloadVariantTemplateDef,
+    LocalEnumRecordPayloadTemplate, LocalEnumTuplePayloadTemplate, LocalFlagsAdtDef,
+    LocalInterfaceEnumAdtProjection,
 };
 use sai_vfs::{
     FileContents, FileId, FileInterner, FileInternerError, FileKey, LineIndex, PackageFileKind,
@@ -2830,6 +2832,7 @@ pub struct TypeOwnerResolution {
     path_resolution: Result<TypeOwnerPathResolution, OwnerControlFlowResolutionError>,
     local_record_field_types: Option<LocalRecordFieldTypesProjection>,
     local_enum_payload_types: Option<LocalEnumPayloadTypesProjection>,
+    local_enum_adt: Option<LocalEnumAdtProjection>,
     test_only_path_resolution: Result<OwnerTestOnlyPathResolution, OwnerControlFlowResolutionError>,
     test_only_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
     module_path_diagnostics: Result<Vec<Diagnostic>, OwnerControlFlowResolutionError>,
@@ -2849,6 +2852,13 @@ impl TypeOwnerResolution {
         &self,
     ) -> Result<&TypeOwnerPathResolution, &OwnerControlFlowResolutionError> {
         self.path_resolution.as_ref()
+    }
+
+    /// Typed enum metadata composed from payloads, discriminants, and the
+    /// exact owner's validated `@repr`, without claiming the general ADT
+    /// query contract.
+    pub fn local_enum_adt(&self) -> Option<&LocalEnumAdtProjection> {
+        self.local_enum_adt.as_ref()
     }
 
     pub fn test_only_path_resolution(
@@ -3511,6 +3521,58 @@ impl LocalEnumPayloadTypesProjection {
     }
 }
 
+/// The enum-level typed definition produced by joining one verified payload
+/// template with discriminants and validated representation from its exact
+/// current HIR owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LocalEnumAdtProjection {
+    Supported {
+        owner: OwnerId,
+        definition: LocalEnumAdtDef,
+    },
+    Unsupported {
+        owner: OwnerId,
+        reason: LocalEnumAdtUnsupportedReason,
+    },
+}
+
+impl LocalEnumAdtProjection {
+    /// Exact enum owner represented by this projection.
+    pub const fn owner(&self) -> OwnerId {
+        match self {
+            Self::Supported { owner, .. } | Self::Unsupported { owner, .. } => *owner,
+        }
+    }
+
+    /// Typed enum definition when all values needed to compute it are
+    /// representable.
+    pub fn definition(&self) -> Option<&LocalEnumAdtDef> {
+        match self {
+            Self::Supported { definition, .. } => Some(definition),
+            Self::Unsupported { .. } => None,
+        }
+    }
+
+    /// Owner-level reason when the enum definition could not be built.
+    pub const fn unsupported_reason(&self) -> Option<LocalEnumAdtUnsupportedReason> {
+        match self {
+            Self::Supported { .. } => None,
+            Self::Unsupported { reason, .. } => Some(*reason),
+        }
+    }
+}
+
+/// Why a direct local enum could not be composed into a typed enum definition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalEnumAdtUnsupportedReason {
+    OwnerAnalysisFailed,
+    InvalidOwnerIdentity,
+    MissingValidatedAttrs,
+    RecoveredSyntax,
+    PayloadTemplate(LocalEnumPayloadTemplateProjectionError),
+    Definition(LocalEnumAdtDefError),
+}
+
 fn validate_local_projection_type_params(
     type_params: &[(DefId, sai_ty::ty::ParamTy)],
 ) -> Result<(), ()> {
@@ -3728,6 +3790,51 @@ impl TypeOwnerResolutions {
             .iter()
             .find(|result| result.owner == owner)
             .and_then(|result| result.local_enum_payload_types.as_ref()))
+    }
+
+    /// Returns one direct local enum's typed metadata after checking
+    /// collection and active-scope provenance.
+    pub fn local_enum_adt(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        owner: OwnerId,
+    ) -> Result<Option<&LocalEnumAdtProjection>, OwnerControlFlowResolutionError> {
+        self.local_enum_adt_with_scopes(collection, None, None, owner)
+    }
+
+    /// Returns enum-level typed metadata after checking every source-member
+    /// and WIT-view closure used to resolve its payload paths.
+    pub fn local_enum_adt_with_scopes(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        member_scopes: Option<&Phase1ActiveSourceMemberScopes>,
+        wit_view_scopes: Option<&Phase1ActiveWitViewScopes>,
+        owner: OwnerId,
+    ) -> Result<Option<&LocalEnumAdtProjection>, OwnerControlFlowResolutionError> {
+        let matches_member_scopes = match member_scopes {
+            Some(scopes) => self.matches_member_scopes(collection, scopes),
+            None => {
+                self.matches_collection(collection)
+                    && self.member_scope_closure_fingerprint.is_none()
+            }
+        };
+        let matches_wit_view_scopes = match wit_view_scopes {
+            Some(scopes) => self.matches_wit_view_scopes(collection, scopes),
+            None => {
+                self.matches_collection(collection) && self.wit_view_closure_fingerprint.is_none()
+            }
+        };
+        if !self.matches_collection(collection)
+            || !matches_member_scopes
+            || !matches_wit_view_scopes
+        {
+            return Err(OwnerControlFlowResolutionError::SnapshotMismatch);
+        }
+        Ok(self
+            .owners
+            .iter()
+            .find(|result| result.owner == owner)
+            .and_then(|result| result.local_enum_adt.as_ref()))
     }
 }
 
@@ -9109,6 +9216,60 @@ fn const_literal_diagnostic(
     diagnostic
         .with_workspace_snapshot(snapshot)
         .map_err(|_| OwnerControlFlowResolutionError::InvalidSourceLocation(owner))
+}
+
+fn repr_discriminant_ty(repr: ReprAttr) -> sai_ty::adt::IntTy {
+    use sai_hir::attrs::ReprInteger;
+    use sai_ty::adt::IntTy;
+
+    match repr {
+        ReprAttr::C => IntTy::I32,
+        ReprAttr::Integer(ReprInteger::I8) => IntTy::I8,
+        ReprAttr::Integer(ReprInteger::I16) => IntTy::I16,
+        ReprAttr::Integer(ReprInteger::I32) => IntTy::I32,
+        ReprAttr::Integer(ReprInteger::I64) => IntTy::I64,
+        ReprAttr::Integer(ReprInteger::U8) => IntTy::U8,
+        ReprAttr::Integer(ReprInteger::U16) => IntTy::U16,
+        ReprAttr::Integer(ReprInteger::U32) => IntTy::U32,
+        ReprAttr::Integer(ReprInteger::U64) => IntTy::U64,
+    }
+}
+
+fn local_enum_discriminant_diagnostic(
+    owner: OwnerId,
+    inputs: &CurrentOwnerInputs,
+    snapshot: &WorkspaceSnapshot,
+    variants: &[sai_hir::items::Variant<'_>],
+    issue: &LocalEnumDiscriminantIssue,
+    discr_ty: sai_ty::adt::IntTy,
+) -> Result<Diagnostic, OwnerControlFlowResolutionError> {
+    let variant = variants
+        .iter()
+        .find(|variant| variant.def_id.to_def_id() == issue.variant())
+        .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+            owner,
+        ))?;
+    let (code, message, label) = match issue.kind() {
+        LocalEnumDiscriminantIssueKind::OutOfRange => (
+            sai_diagnostics::Code::DiscriminantOutOfRange,
+            format!(
+                "enum discriminant {} is outside the range of {:?}",
+                issue.value(),
+                discr_ty
+            ),
+            "discriminant is outside the representation range",
+        ),
+        LocalEnumDiscriminantIssueKind::Duplicate { previous_variant } => (
+            sai_diagnostics::Code::DuplicateDiscriminant,
+            format!(
+                "enum discriminant {} duplicates variant {:?}",
+                issue.value(),
+                previous_variant
+            ),
+            "duplicate discriminant",
+        ),
+    };
+    const_literal_diagnostic(owner, inputs, snapshot, variant.span, code, message, label)
 }
 
 /// Per-owner path results tagged with their package-collection provenance.
@@ -19453,6 +19614,12 @@ impl RootDatabase {
                                 owner: descriptor.owner,
                                 reason: LocalEnumPayloadTypesUnsupportedReason::OwnerAnalysisFailed,
                             }),
+                        local_enum_adt: (descriptor.kind == TopLevelOwnerKind::Enum).then(|| {
+                            LocalEnumAdtProjection::Unsupported {
+                                owner: descriptor.owner,
+                                reason: LocalEnumAdtUnsupportedReason::OwnerAnalysisFailed,
+                            }
+                        }),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error.clone()),
                         module_path_diagnostics: Err(error),
@@ -19470,6 +19637,7 @@ impl RootDatabase {
                     Vec<Diagnostic>,
                     Option<LocalRecordFieldTypesProjection>,
                     Option<LocalEnumPayloadTypesProjection>,
+                    Option<LocalEnumAdtProjection>,
                 ),
                 OwnerControlFlowResolutionError,
             > = (|| {
@@ -19677,6 +19845,24 @@ impl RootDatabase {
                 } else {
                     None
                 };
+                let local_enum_adt = if descriptor.kind == TopLevelOwnerKind::Enum {
+                    let payload_projection = local_enum_payload_types
+                        .as_ref()
+                        .expect("enum owners have a payload projection");
+                    let (projection, diagnostics) = self.lower_local_enum_adt_def(
+                        collection,
+                        descriptor,
+                        &inputs,
+                        &hir_owner,
+                        &path_resolution,
+                        payload_projection,
+                        snapshot,
+                    )?;
+                    lowering_diagnostics.extend(diagnostics);
+                    Some(projection)
+                } else {
+                    None
+                };
                 Ok((
                     path_resolution,
                     test_only_path_resolution,
@@ -19684,6 +19870,7 @@ impl RootDatabase {
                     module_path_diagnostics,
                     local_record_field_types,
                     local_enum_payload_types,
+                    local_enum_adt,
                 ))
             })();
 
@@ -19695,6 +19882,7 @@ impl RootDatabase {
                     module_path_diagnostics,
                     local_record_field_types,
                     local_enum_payload_types,
+                    local_enum_adt,
                 )) => {
                     owners.push(TypeOwnerResolution {
                         owner: descriptor.owner,
@@ -19702,6 +19890,7 @@ impl RootDatabase {
                         path_resolution: Ok(path_resolution),
                         local_record_field_types,
                         local_enum_payload_types,
+                        local_enum_adt,
                         test_only_path_resolution: Ok(test_only_path_resolution),
                         test_only_diagnostics: Ok(diagnostics),
                         module_path_diagnostics: Ok(module_path_diagnostics),
@@ -19723,6 +19912,12 @@ impl RootDatabase {
                                 owner: descriptor.owner,
                                 reason: LocalEnumPayloadTypesUnsupportedReason::OwnerAnalysisFailed,
                             }),
+                        local_enum_adt: (descriptor.kind == TopLevelOwnerKind::Enum).then(|| {
+                            LocalEnumAdtProjection::Unsupported {
+                                owner: descriptor.owner,
+                                reason: LocalEnumAdtUnsupportedReason::OwnerAnalysisFailed,
+                            }
+                        }),
                         test_only_path_resolution: Err(error.clone()),
                         test_only_diagnostics: Err(error.clone()),
                         module_path_diagnostics: Err(error),
@@ -20276,6 +20471,178 @@ impl RootDatabase {
             type_params: validated_type_params,
             variants: projected_variants,
             provenance,
+        }
+    }
+
+    fn lower_local_enum_adt_def(
+        &self,
+        collection: &Phase1PackageScopesCollection,
+        descriptor: TopLevelOwnerDescriptor,
+        inputs: &CurrentOwnerInputs,
+        hir_owner: &HirOwner<'_>,
+        path_resolution: &TypeOwnerPathResolution,
+        payload_projection: &LocalEnumPayloadTypesProjection,
+        snapshot: &WorkspaceSnapshot,
+    ) -> Result<(LocalEnumAdtProjection, Vec<Diagnostic>), OwnerControlFlowResolutionError> {
+        let unsupported = |reason| LocalEnumAdtProjection::Unsupported {
+            owner: descriptor.owner,
+            reason,
+        };
+        if descriptor.kind != TopLevelOwnerKind::Enum
+            || descriptor.owner.def_id.package() != collection.module_tree.package
+            || descriptor.file != inputs.filtered_item_tree.file
+            || inputs.retained_item_kinds.get(&descriptor.item_id) != Some(&ItemTreeKind::Enum)
+            || hir_owner.id != descriptor.owner
+            || path_resolution.owner() != descriptor.owner
+            || payload_projection.owner() != descriptor.owner
+        {
+            return Ok((
+                unsupported(LocalEnumAdtUnsupportedReason::InvalidOwnerIdentity),
+                Vec::new(),
+            ));
+        }
+
+        let Some(source_syntax) = inputs
+            .ast_ids
+            .pointer(descriptor.item_id)
+            .and_then(|pointer| pointer.resolve(inputs.filtered_item_tree.file, &inputs.root))
+        else {
+            return Ok((
+                unsupported(LocalEnumAdtUnsupportedReason::OwnerAnalysisFailed),
+                Vec::new(),
+            ));
+        };
+        let Some(declaration) = ast::EnumDecl::cast(source_syntax) else {
+            return Ok((
+                unsupported(LocalEnumAdtUnsupportedReason::InvalidOwnerIdentity),
+                Vec::new(),
+            ));
+        };
+        let syntax_has_error = declaration.syntax().descendants().any(|node| {
+            node.kind() == sai_syntax::SyntaxKind::ERROR
+                || node
+                    .children_with_tokens()
+                    .any(|element| element.as_token().is_some_and(|token| token.has_error()))
+        });
+        if syntax_has_error {
+            return Ok((
+                unsupported(LocalEnumAdtUnsupportedReason::RecoveredSyntax),
+                Vec::new(),
+            ));
+        }
+
+        let OwnerNode::Item(item) = hir_owner.node else {
+            return Ok((
+                unsupported(LocalEnumAdtUnsupportedReason::InvalidOwnerIdentity),
+                Vec::new(),
+            ));
+        };
+        if item.owner_id != descriptor.owner || hir_owner.id != item.owner_id {
+            return Ok((
+                unsupported(LocalEnumAdtUnsupportedReason::InvalidOwnerIdentity),
+                Vec::new(),
+            ));
+        }
+        let ItemKind::Enum { variants, .. } = item.kind else {
+            return Ok((
+                unsupported(LocalEnumAdtUnsupportedReason::InvalidOwnerIdentity),
+                Vec::new(),
+            ));
+        };
+
+        let Some(validated_attrs) = inputs.validated_attrs.get(&descriptor.item_id) else {
+            return Ok((
+                unsupported(LocalEnumAdtUnsupportedReason::MissingValidatedAttrs),
+                Vec::new(),
+            ));
+        };
+        let repr: Option<ReprAttr> = validated_attrs.repr.map(|(repr, _span)| repr);
+        let payloads = match payload_projection.to_payload_template_def() {
+            Ok(payloads) => payloads,
+            Err(error) => {
+                return Ok((
+                    unsupported(LocalEnumAdtUnsupportedReason::PayloadTemplate(error)),
+                    Vec::new(),
+                ));
+            }
+        };
+        if payloads.owner() != descriptor.owner.def_id.to_def_id() {
+            return Ok((
+                unsupported(LocalEnumAdtUnsupportedReason::InvalidOwnerIdentity),
+                Vec::new(),
+            ));
+        }
+
+        match LocalEnumAdtDef::from_hir_owner(payloads, repr, hir_owner) {
+            Ok((definition, issues)) => {
+                let diagnostics = issues
+                    .iter()
+                    .map(|issue| {
+                        local_enum_discriminant_diagnostic(
+                            descriptor.owner,
+                            inputs,
+                            snapshot,
+                            variants,
+                            issue,
+                            definition.discr_ty(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((
+                    LocalEnumAdtProjection::Supported {
+                        owner: descriptor.owner,
+                        definition,
+                    },
+                    diagnostics,
+                ))
+            }
+            Err(error) => {
+                let mut diagnostics = error
+                    .issues()
+                    .iter()
+                    .map(|issue| {
+                        local_enum_discriminant_diagnostic(
+                            descriptor.owner,
+                            inputs,
+                            snapshot,
+                            variants,
+                            issue,
+                            repr.map_or(sai_ty::adt::IntTy::I64, repr_discriminant_ty),
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if let Some((variant_id, message)) = match error.reason() {
+                    LocalEnumAdtDefError::MissingExplicitDiscriminant(variant) => Some((
+                        variant,
+                        "explicit discriminant exceeds the supported i128 range".to_owned(),
+                    )),
+                    LocalEnumAdtDefError::DiscriminantOverflow(variant) => Some((
+                        variant,
+                        "implicit discriminant overflows the supported i128 range".to_owned(),
+                    )),
+                    _ => None,
+                } {
+                    let variant = variants
+                        .iter()
+                        .find(|variant| variant.def_id.to_def_id() == variant_id)
+                        .ok_or(OwnerControlFlowResolutionError::InvalidSourceLocation(
+                            descriptor.owner,
+                        ))?;
+                    diagnostics.push(const_literal_diagnostic(
+                        descriptor.owner,
+                        inputs,
+                        snapshot,
+                        variant.span,
+                        sai_diagnostics::Code::DiscriminantOutOfRange,
+                        message,
+                        "discriminant cannot be represented",
+                    )?);
+                }
+                Ok((
+                    unsupported(LocalEnumAdtUnsupportedReason::Definition(error.reason())),
+                    diagnostics,
+                ))
+            }
         }
     }
 
@@ -94779,6 +95146,262 @@ interface facade { use middle.{payload}; }"#;
                 .kind(),
             sai_ty::ty::TyKind::Array(_, sai_ty::ty::Const::Value(3))
         ));
+    }
+
+    #[test]
+    fn local_enum_adt_joins_exact_repr_and_retains_invalid_source_ordered_values() {
+        let root = concat!(
+            "@repr(U8)\n",
+            "enum ByteCode { Max = 255, Outside = 256, Duplicate = 256 }\n",
+            "@repr(C)\n",
+            "enum CLayout { First = 0 }\n",
+            "@repr(I32)\n",
+            "enum I32Layout { First = 0 }\n",
+            "@repr(U8)\n",
+            "enum Mixed { Explicit = 7, Payload(I32) = 170141183460469231731687303715884105728, Tail = 99 }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").unwrap(),
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot collection succeeds");
+        let resolved = database
+            .resolve_type_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("enum payload and typed definition projections resolve");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("local DefPath interner exists"),
+        );
+        let owner_named = |name: &str| {
+            collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::Enum
+                        && def_paths
+                            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                path.data().last().is_some_and(|component| {
+                                    matches!(
+                                        component.data,
+                                        DefPathData::TypeNs(symbol)
+                                            if database.symbols.resolve(symbol).ok().as_deref()
+                                                == Some(name)
+                                    )
+                                })
+                            })
+                })
+                .expect("enum owner exists")
+                .owner
+        };
+
+        let byte_owner = owner_named("ByteCode");
+        let byte_projection = resolved
+            .local_enum_adt(&collection, byte_owner)
+            .unwrap()
+            .unwrap();
+        let byte_definition = byte_projection
+            .definition()
+            .expect("representable values retain an enum definition despite diagnostics");
+        assert_eq!(
+            byte_definition
+                .discriminants()
+                .iter()
+                .map(|discriminant| discriminant.value())
+                .collect::<Vec<_>>(),
+            [255, 256, 256]
+        );
+        assert_eq!(byte_definition.discr_ty(), sai_ty::adt::IntTy::U8);
+        assert_eq!(
+            byte_definition.repr(),
+            Some(ReprAttr::Integer(sai_hir::attrs::ReprInteger::U8))
+        );
+        let byte_diagnostics = resolved
+            .owners()
+            .iter()
+            .find(|owner| owner.owner() == byte_owner)
+            .unwrap()
+            .lowering_diagnostics();
+        assert_eq!(
+            byte_diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::DiscriminantOutOfRange
+                })
+                .count(),
+            2
+        );
+        assert_eq!(
+            byte_diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.code == sai_diagnostics::Code::DuplicateDiscriminant
+                })
+                .count(),
+            1
+        );
+
+        let c_definition = resolved
+            .local_enum_adt(&collection, owner_named("CLayout"))
+            .unwrap()
+            .unwrap()
+            .definition()
+            .unwrap();
+        let integer_definition = resolved
+            .local_enum_adt(&collection, owner_named("I32Layout"))
+            .unwrap()
+            .unwrap()
+            .definition()
+            .unwrap();
+        assert_eq!(c_definition.discr_ty(), sai_ty::adt::IntTy::I32);
+        assert_eq!(integer_definition.discr_ty(), sai_ty::adt::IntTy::I32);
+        assert_eq!(c_definition.repr(), Some(ReprAttr::C));
+        assert_eq!(
+            integer_definition.repr(),
+            Some(ReprAttr::Integer(sai_hir::attrs::ReprInteger::I32))
+        );
+
+        let mixed_owner = owner_named("Mixed");
+        let mixed = resolved
+            .local_enum_adt(&collection, mixed_owner)
+            .unwrap()
+            .unwrap();
+        let mixed_definition = mixed
+            .definition()
+            .expect("the parser-owned explicit-value error does not suppress ordinal values");
+        assert_eq!(
+            mixed_definition
+                .discriminants()
+                .iter()
+                .map(|discriminant| discriminant.value())
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        assert!(
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| owner.owner() == mixed_owner)
+                .unwrap()
+                .lowering_diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code
+                    != sai_diagnostics::Code::ExplicitDiscriminantOnDataEnum),
+            "this projection must not repeat the parser's data-enum diagnostic"
+        );
+        assert!(
+            resolved
+                .owners()
+                .iter()
+                .find(|owner| owner.owner() == mixed_owner)
+                .unwrap()
+                .lowering_diagnostics()
+                .iter()
+                .all(|diagnostic| diagnostic.code != sai_diagnostics::Code::DiscriminantOutOfRange),
+            "data-enum ordinals must not inherit a forbidden, lost explicit literal"
+        );
+
+        assert_eq!(
+            resolved
+                .local_enum_adt(&collection, byte_owner)
+                .unwrap()
+                .unwrap()
+                .owner(),
+            byte_owner
+        );
+    }
+
+    #[test]
+    fn local_enum_adt_fails_closed_for_unrepresentable_explicit_and_implicit_values() {
+        let root = concat!(
+            "enum TooLarge { Huge = 170141183460469231731687303715884105728, Next }\n",
+            "enum Overflow { Max = 170141183460469231731687303715884105727, Next }\n",
+        );
+        let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
+        let collection = database
+            .collect_phase1_package_scopes_collection(
+                &module_tree,
+                &snapshot,
+                &target_cfg_for_check("wasm32-core").unwrap(),
+                Phase1BuildContext::default(),
+            )
+            .expect("current-snapshot collection succeeds");
+        let resolved = database
+            .resolve_type_owner_paths(&collection, &module_tree, &snapshot)
+            .expect("enum definitions are projected");
+        let def_paths = Arc::clone(
+            database
+                .def_paths
+                .get(&collection.module_tree.package)
+                .expect("local DefPath interner exists"),
+        );
+        for (name, is_overflow) in [("TooLarge", false), ("Overflow", true)] {
+            let owner = collection
+                .scopes
+                .top_level_owners
+                .iter()
+                .find(|descriptor| {
+                    descriptor.kind == TopLevelOwnerKind::Enum
+                        && def_paths
+                            .resolve_def_id(descriptor.owner.def_id.to_def_id())
+                            .ok()
+                            .flatten()
+                            .is_some_and(|path| {
+                                path.data().last().is_some_and(|component| {
+                                    matches!(
+                                        component.data,
+                                        DefPathData::TypeNs(symbol)
+                                            if database.symbols.resolve(symbol).ok().as_deref()
+                                                == Some(name)
+                                    )
+                                })
+                            })
+                })
+                .expect("enum owner exists")
+                .owner;
+            let projection = resolved
+                .local_enum_adt(&collection, owner)
+                .unwrap()
+                .unwrap();
+            assert!(projection.definition().is_none());
+            assert!(
+                matches!(
+                    projection.unsupported_reason(),
+                    Some(LocalEnumAdtUnsupportedReason::Definition(
+                        sai_ty::adt::LocalEnumAdtDefError::MissingExplicitDiscriminant(_)
+                    )) if !is_overflow
+                ) || matches!(
+                    projection.unsupported_reason(),
+                    Some(LocalEnumAdtUnsupportedReason::Definition(
+                        sai_ty::adt::LocalEnumAdtDefError::DiscriminantOverflow(_)
+                    )) if is_overflow
+                ),
+                "{name} should fail closed with its specific arithmetic reason: {:?}",
+                projection.unsupported_reason()
+            );
+            let owner_diagnostics = resolved
+                .owners()
+                .iter()
+                .find(|result| result.owner() == owner)
+                .unwrap()
+                .lowering_diagnostics();
+            assert!(
+                owner_diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code
+                        == sai_diagnostics::Code::DiscriminantOutOfRange),
+                "{name} should report that the value exceeds supported discriminant range"
+            );
+        }
     }
 
     #[test]
