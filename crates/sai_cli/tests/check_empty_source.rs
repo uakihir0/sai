@@ -287,6 +287,7 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "enum Payload { Pair(U8, Bool), Named(value: Bool), UnitPayload(()) }\n",
         "enum FixedPayload { Values(Bool, Byte, Char, ()) }\n",
         "enum NestedPayload { Nested(((I8, Char), ((), USize))), Fixed(((I8, Byte), (Char, ()))), AnnotatedFixed(((I8, Byte), (Char, Bool))) }\n",
+        "enum DeepPayload { DeepBool((((Bool, Char), Bool), Bool)), DeepByte((((Byte, Char), Bool), Bool)) }\n",
         "type BoolAlias = Bool\n",
         "type UnitAlias = ()\n",
         "type Widget { value: Bool }\n",
@@ -305,6 +306,9 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "    let (tuple_annotated, other_annotated): (Bool, Bool) = (true, false)\n",
         "    let ((tuple_nested, _), other_nested) = ((true, false), true)\n",
         "    let ((tuple_nested_bool, tuple_nested_byte), (tuple_nested_char, tuple_nested_unit)) = ((true, b'x'), ('x', ()))\n",
+        "    let (((deep_tuple_actual, _), _), _) = (((true, 'x'), false), true)\n",
+        "    let (((deepest_mismatch, _), _), _) = (((true, 'x'), false), true)\n",
+        "    let ((((depth_four_actual, _), _), _), _) = ((((true, 'x'), false), true), false)\n",
         "    let (tuple_nested_rejected, (tuple_nested_inner, _)) = (true, (false, 1))\n",
         "    let ((tuple_shape_nested, _), tuple_shape_tail) = (true, false)\n",
         "    let (tuple_shape_leaf, tuple_shape_leaf_tail) = ((true, false), true)\n",
@@ -377,6 +381,9 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "Payload.Pair(tuple_annotation_nominal_bad, true), ",
         "Payload.Pair(tuple_annotation_else, true), ",
         "NestedPayload.Fixed(((tuple_nested_bool, tuple_nested_byte), (tuple_nested_char, tuple_nested_unit))), ",
+        "DeepPayload.DeepBool((((deep_tuple_actual, 'x'), false), true)), ",
+        "DeepPayload.DeepByte((((deepest_mismatch, 'x'), false), true)), ",
+        "DeepPayload.DeepByte((((depth_four_actual, 'x'), false), true)), ",
         "NestedPayload.Fixed(((tuple_nested_rejected, b'x'), ('x', ()))), ",
         "NestedPayload.Fixed(((tuple_shape_nested, b'x'), ('x', ()))), ",
         "NestedPayload.Fixed(((tuple_shape_leaf, b'x'), ('x', ()))), ",
@@ -410,7 +417,7 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
     );
     assert_eq!(
         stdout.matches("\"code\":\"TYPE_MISMATCH\"").count(),
-        18,
+        19,
         "the staged projection checks parameter, annotated, fixed-literal inferred, and nested tuple-destructured local paths plus named/nested tuple literal leaves:\n{stdout}"
     );
     assert_eq!(
@@ -574,6 +581,18 @@ fn check_reports_local_enum_call_diagnostics_without_claiming_full_coverage() {
         "expected `I8`, found `Bool`",
         nested_tuple_start,
         nested_tuple_start + "tuple_nested_bool".len(),
+    );
+    let deepest_tuple_call = "DeepPayload.DeepByte((((deepest_mismatch, 'x'), false), true))";
+    let deepest_tuple_start = source
+        .find(deepest_tuple_call)
+        .expect("depth-three tuple-destructured local mismatch call exists")
+        + "DeepPayload.DeepByte((((".len();
+    assert_json_diagnostic_primary_span(
+        &stdout,
+        "TYPE_MISMATCH",
+        "expected `Byte`, found `Bool`",
+        deepest_tuple_start,
+        deepest_tuple_start + "deepest_mismatch".len(),
     );
     let named_start = source.find("first:").expect("named argument exists");
     assert_json_diagnostic_primary_span(
