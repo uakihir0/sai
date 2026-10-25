@@ -120,3 +120,18 @@ test "a later duplicate raises canonical urgency and only shortens its deadline"
     assert duplicate.decision == Decision.Duplicate
     assert duplicate.duplicate_of == Some(8401)
 }
+
+test "a later critical duplicate cannot extend the canonical incident deadline" {
+    var requests = data.requests()
+    requests[2].opened_minute = 700
+    requests[2].immediate_hazard = true
+    let report = triage.triage_requests(requests)
+    let canonical = report.items[0].unwrap()
+    let duplicate = report.items[2].unwrap()
+    assert canonical.request_id == 8401
+    assert canonical.urgency == Some(Urgency.Critical)
+    assert canonical.response_due_minute == Some(690)
+    assert duplicate.decision == Decision.Duplicate
+    assert duplicate.duplicate_of == Some(8401)
+    assert report.critical_count == 3
+}
