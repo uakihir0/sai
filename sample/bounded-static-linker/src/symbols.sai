@@ -1,0 +1,63 @@
+use acme:bounded-static-linker/layout.{validate}
+use acme:bounded-static-linker/model.{LinkInput, ObjectFile, Symbol, SymbolBinding}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SymbolLocation {
+    pub object_index: USize
+    pub symbol_index: USize
+}
+
+fn object_at(input: LinkInput, object_index: USize) -> ObjectFile {
+    input.objects[object_index].unwrap()
+}
+
+fn symbol_at(object: ObjectFile, symbol_index: USize) -> Symbol {
+    object.symbols[symbol_index].unwrap()
+}
+
+pub fn resolve(input: LinkInput, requesting_object_index: USize, target_name: Str) -> Option<
+    SymbolLocation,
+> {
+    match validate(input) { Some(_) => return None, None => {} }
+    if requesting_object_index >= input.object_count {
+        return None
+    }
+
+    let requester = object_at(input, requesting_object_index)
+    for symbol_index in 0..requester.symbol_count {
+        let symbol = symbol_at(requester, symbol_index)
+        if (
+            symbol.defined and symbol.binding == SymbolBinding.Local and symbol.name == target_name
+        ) {
+            return Some(
+                SymbolLocation(object_index: requesting_object_index, symbol_index: symbol_index),
+            )
+        }
+    }
+
+    var selected: Option<SymbolLocation> = None
+    var selected_is_strong = false
+    for object_index in 0..input.object_count {
+        let object = object_at(input, object_index)
+        for symbol_index in 0..object.symbol_count {
+            let symbol = symbol_at(object, symbol_index)
+            if (
+                not symbol.defined
+                or symbol.binding == SymbolBinding.Local
+                or symbol.name != target_name
+            ) {
+                continue
+            }
+
+            if (
+                selected == None
+                or (symbol.binding == SymbolBinding.Strong and not selected_is_strong)
+            ) {
+                selected =
+                    Some(SymbolLocation(object_index: object_index, symbol_index: symbol_index))
+                selected_is_strong = symbol.binding == SymbolBinding.Strong
+            }
+        }
+    }
+    selected
+}

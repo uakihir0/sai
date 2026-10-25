@@ -1,0 +1,129 @@
+use acme:bounded-static-linker/model.{
+    LinkInput
+    LinkIssue
+    MAX_OBJECT_COUNT
+    ObjectFile
+    SymbolBinding
+}
+use sai:core/num.{U32_MAX}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type SectionLayout {
+    pub bases: Array<Option<U32>, MAX_OBJECT_COUNT>
+    pub total_size: U32
+}
+
+fn object_at(input: LinkInput, object_index: USize) -> ObjectFile {
+    input.objects[object_index].unwrap()
+}
+
+fn valid_alignment(alignment: U32) -> Bool {
+    if alignment == 0 {
+        return false
+    }
+    (alignment & (alignment - 1)) == 0
+}
+
+fn duplicate_strong_definition(input: LinkInput) -> Bool {
+    for object_index in 0..input.object_count {
+        let object = object_at(input, object_index)
+        for symbol_index in 0..object.symbol_count {
+            let symbol = match object.symbols[symbol_index] {
+                Some(value) => value
+                None => continue
+            }
+            if not symbol.defined or symbol.binding != SymbolBinding.Strong {
+                continue
+            }
+
+            for other_object_index in object_index..input.object_count {
+                let other_object = object_at(input, other_object_index)
+                let first_other_symbol = if other_object_index == object_index {
+                    symbol_index + 1
+                } else {
+                    0
+                }
+                for other_symbol_index in first_other_symbol..other_object.symbol_count {
+                    let other_symbol = match other_object.symbols[other_symbol_index] {
+                        Some(value) => value
+                        None => continue
+                    }
+                    if (
+                        other_symbol.defined
+                        and other_symbol.binding == SymbolBinding.Strong
+                        and other_symbol.name == symbol.name
+                    ) {
+                        return true
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+pub fn validate(input: LinkInput) -> Option<LinkIssue> {
+    if input.object_count == 0 or input.object_count > input.objects.len() {
+        return Some(LinkIssue.InvalidObjectCount)
+    }
+
+    for object_index in 0..input.object_count {
+        let object = match input.objects[object_index] {
+            Some(value) => value
+            None => return Some(LinkIssue.MissingObject)
+        }
+        if not valid_alignment(object.text_alignment) {
+            return Some(LinkIssue.InvalidSectionAlignment)
+        }
+        if object.symbol_count > object.symbols.len() {
+            return Some(LinkIssue.TooManySymbols)
+        }
+        if object.relocation_count > object.relocations.len() {
+            return Some(LinkIssue.TooManyRelocations)
+        }
+        for symbol_index in 0..object.symbol_count {
+            let symbol = match object.symbols[symbol_index] {
+                Some(value) => value
+                None => return Some(LinkIssue.MissingSymbol)
+            }
+            if symbol.defined and symbol.section_offset > object.text_size {
+                return Some(LinkIssue.SymbolOutsideSection)
+            }
+        }
+        for relocation_index in 0..object.relocation_count {
+            match object.relocations[relocation_index] {
+                Some(_) => {}
+                None => return Some(LinkIssue.MissingRelocation)
+            }
+        }
+    }
+
+    if duplicate_strong_definition(input) {
+        return Some(LinkIssue.DuplicateStrongDefinition)
+    }
+    None
+}
+
+pub fn layout(input: LinkInput) -> Result<SectionLayout, LinkIssue> {
+    match validate(input) { Some(issue) => return Err(issue), None => {} }
+
+    var bases = Array<Option<U32>, MAX_OBJECT_COUNT>.filled(None)
+    var cursor: U32 = 0
+
+    for object_index in 0..input.object_count {
+        let object = object_at(input, object_index)
+        let remainder = cursor % object.text_alignment
+        let padding = (object.text_alignment - remainder) % object.text_alignment
+        if cursor > U32_MAX - padding {
+            return Err(LinkIssue.AddressOverflow)
+        }
+        let base = cursor + padding
+        if base > U32_MAX - object.text_size {
+            return Err(LinkIssue.AddressOverflow)
+        }
+        bases[object_index] = Some(base)
+        cursor = base + object.text_size
+    }
+
+    Ok(SectionLayout(bases: bases, total_size: cursor))
+}
