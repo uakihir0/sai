@@ -794,15 +794,16 @@ direct `Bool`, `Byte`, `Char`, or unit literals; the selected element is
 matched to the argument by its exact `BindingId`. IR-932 extends this to one
 nested tuple level, requiring the same tuple shape and arity recursively and
 fixed literals for every leaf, including wildcard-matched leaves.
-IR-933 accepts explicitly annotated tuple patterns through that same maximum
-pattern depth when the annotation has matching tuple structure and direct
-primitive type paths at every leaf. The annotation supplies each binding type;
-the initializer is not inspected or inferred.
-IR-935 extends only the unannotated fixed-literal projection to a maximum
-tuple-pattern depth of three, with exact recursive shape and arity and the
-same fixed-literal requirement at every binding and wildcard leaf. A fourth
-tuple-pattern level remains unsupported.
-The resolver uses the current package collection, snapshot, active source
+IR-933 accepts explicitly annotated tuple patterns through two nested tuple
+levels when their tuple shape matches and every leaf annotation is a direct
+primitive type path; the annotation supplies binding types and initializers
+are ignored. IR-934 adds direct unit leaves for simple bindings and wildcards
+while keeping empty tuple pattern nodes unsupported structurally. IR-935
+extends the unannotated fixed-literal projection to depth three, with
+recursive shape/arity and fixed-literal checks. IR-936 extends only the
+annotated projection to three tuple-pattern levels, retaining exact shape and
+arity; a fourth remains unsupported. The resolver uses the current package
+collection, snapshot, active source
 member closure, WIT-view closure, and test-only import filtering. Unresolved,
 external, dependency/WIT, and type-alias heads remain outside this local
 subset. This path result records path identity only; it does not record
@@ -2067,20 +2068,12 @@ match recursively, and every leaf initializer, including wildcard-matched
 values, must be a direct fixed-type Bool, Byte, Char, or unit literal. This
 does not diagnose shape errors or infer tuple types.
 
-**Implemented subset (IR-935):** The same unannotated fixed-literal projection
-allows two nested tuple-pattern levels (three tuple nodes including the root).
-Every tuple pattern must pair with a same-arity tuple initializer, recursively
-in source order. Binding and wildcard leaves still require direct Bool, Byte,
-Char, or unit literals; binding selection still uses the exact `BindingId`
-and verifies the HIR name, `Pattern { var }` kind, and binding mode. A fourth
-tuple-pattern level, annotations, computed or numeric initializer leaves,
-complex patterns, and nested-scope declarations remain outside this check.
-
-**Implemented subset (IR-933/934):** At those same local enum-call sites, a path
-may resolve to a binding in a directly declared outer-block `let` tuple
+**Implemented subset (IR-933/934/936):** At those same local enum-call sites, a
+path may resolve to a binding in a directly declared outer-block `let` tuple
 pattern with an explicit tuple annotation. The pattern and annotation must
-have identical tuple shape and arity through at most one nested tuple level.
-Leaves must be simple bindings or `_`; each annotation leaf must resolve
+have identical tuple shape and arity through at most three tuple-pattern
+levels total (two nested levels below the outer tuple). Leaves must be simple
+bindings or `_`; each annotation leaf must resolve
 through `resolve_function_direct_type` to a direct primitive type path or the
 unit type `()`. At a binding or wildcard leaf, HIR's empty `TyKind::Tuple([])`
 is interpreted as scalar unit. An empty `PatKind::Tuple([])` remains
@@ -2094,7 +2087,12 @@ tuple-shape or arity mismatch, deeper or complex patterns, aliases, views,
 `Str`, nominal or other unsupported annotation leaves, nested scopes, and
 non-path expressions remain outside the projection. This does not add
 shape diagnostics, general type queries, inference, coercions, or full
-expression results.
+expression results. IR-936's depth-three cap is a bounded extension: it permits
+one more nested tuple level without broadening general pattern typing. Review
+must challenge the depth-four boundary, deepest shape and arity mismatches,
+shadowed binding identity and mode, direct unit versus empty structural tuples,
+unsupported deep wildcard leaves, ignored initializers, exact mismatch spans,
+and the CLI's incomplete-stage gate.
 
 ### 3.6.4 `adt_def`
 
@@ -2422,7 +2420,7 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 
 **Tuple variants and distinct construction** are calls of the constructor's `FnDef` (§3.6.3). `D(e)` with a refinement clause is a B→R conversion recorded for [impl/04](04-mir.md) (§3.13.1). Unit variants with an argument list are `WRONG_ARGUMENT_COUNT`.
 
-**IR-924–IR-935 local enum-call slices.** For a direct callee path to a
+**IR-924–IR-936 local enum-call slices.** For a direct callee path to a
 supported, local, non-generic enum variant, the owner result records a call
 entry under the call expression's `HirId`, retaining the exact callee field,
 enum owner, enum and variant `DefId`s, and source-ordered argument `HirId`s.
@@ -2445,12 +2443,14 @@ initializers. IR-933 checks matching explicitly annotated tuple patterns
 through one nested tuple level using direct primitive annotation leaves, while
 ignoring their initializers. IR-934 also recognizes direct unit annotation
 leaves on simple binding and wildcard patterns; an empty tuple pattern remains
-unsupported as a structural node. These are limited argument checks: named
-arguments are not bound by their names, and general expression
-typing, `TypeckResults::call_kinds`, and generic, external, dependency, or WIT
-variant paths remain outside the projection. `sai check`
-reports the staged diagnostics while retaining its incomplete-stage gate; it
-does not claim full check coverage or emit a success result for these inputs.
+unsupported as a structural node. IR-936 extends the annotated projection to
+three tuple-pattern levels total, with the same recursive shape and arity gates.
+These are limited argument checks: named arguments are not bound by their
+names, and general expression typing, `TypeckResults::call_kinds`, and generic,
+external, dependency, or WIT variant paths remain outside the projection.
+`sai check` reports the staged diagnostics while retaining its incomplete-stage
+gate; it does not claim full check coverage or emit a success result for these
+inputs.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
