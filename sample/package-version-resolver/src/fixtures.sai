@@ -1,0 +1,106 @@
+use acme:package-version-resolver/model.{
+    CandidateDomain
+    DependencyRule
+    PackageId
+    RULE_CAPACITY
+    ResolverProblem
+    Version
+    VersionRange
+}
+
+fn version(major: U32, minor: U32, patch: U32) -> Version {
+    Version(major: major, minor: minor, patch: patch)
+}
+
+fn range(minimum: Version, maximum_exclusive: Version) -> VersionRange {
+    VersionRange(minimum_inclusive: minimum, maximum_exclusive: maximum_exclusive)
+}
+
+fn rule(
+    source: PackageId,
+    source_version: Option<Version>,
+    target: PackageId,
+    accepted_versions: VersionRange,
+) -> DependencyRule {
+    DependencyRule(
+        source: source,
+        source_version: source_version,
+        target: target,
+        accepted_versions: accepted_versions,
+    )
+}
+
+pub fn satisfiable_problem() -> ResolverProblem {
+    let renderer_v2 = version(2, 0, 0)
+    let renderer_v1 = version(1, 0, 0)
+    let parser_v2 = version(2, 1, 0)
+    let parser_v1 = version(1, 8, 0)
+    let unicode_v2 = version(2, 0, 0)
+    let unicode_v1 = version(1, 9, 0)
+
+    let renderer_domain = CandidateDomain(versions: [Some(renderer_v2), Some(renderer_v1)])
+    let parser_domain = CandidateDomain(versions: [Some(parser_v2), Some(parser_v1)])
+    let unicode_domain = CandidateDomain(versions: [Some(unicode_v2), Some(unicode_v1)])
+
+    ResolverProblem(
+        initial_domains: [renderer_domain, parser_domain, unicode_domain],
+        rules: [
+            Some(
+                rule(
+                    PackageId.Renderer,
+                    Some(renderer_v2),
+                    PackageId.Parser,
+                    range(version(2, 0, 0), version(3, 0, 0)),
+                ),
+            ),
+            Some(
+                rule(
+                    PackageId.Renderer,
+                    Some(renderer_v1),
+                    PackageId.Parser,
+                    range(version(1, 0, 0), version(2, 0, 0)),
+                ),
+            ),
+            Some(
+                rule(
+                    PackageId.Parser,
+                    Some(parser_v2),
+                    PackageId.UnicodeTable,
+                    range(version(2, 0, 0), version(3, 0, 0)),
+                ),
+            ),
+            Some(
+                rule(
+                    PackageId.Parser,
+                    Some(parser_v1),
+                    PackageId.UnicodeTable,
+                    range(version(1, 0, 0), version(2, 0, 0)),
+                ),
+            ),
+            Some(
+                rule(
+                    PackageId.Renderer,
+                    Some(renderer_v2),
+                    PackageId.UnicodeTable,
+                    range(version(1, 0, 0), version(2, 0, 0)),
+                ),
+            ),
+            None,
+        ],
+        rule_count: 5,
+    )
+}
+
+pub fn unsatisfiable_problem() -> ResolverProblem {
+    var problem = satisfiable_problem()
+    problem.rules[5] = Some(
+        rule(
+            PackageId.Renderer,
+            None,
+            PackageId.UnicodeTable,
+            range(version(2, 0, 0), version(3, 0, 0)),
+        ),
+    )
+    problem.rule_count = RULE_CAPACITY
+    problem
+}

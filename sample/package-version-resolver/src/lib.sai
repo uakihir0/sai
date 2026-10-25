@@ -1,0 +1,68 @@
+use acme:package-version-resolver/fixtures
+use acme:package-version-resolver/model.{PackageId, RULE_CAPACITY, ResolutionReport, Version}
+use acme:package-version-resolver/propagate
+use acme:package-version-resolver/search
+use acme:package-version-resolver/version
+
+pub fn resolve_satisfiable_fixture() -> ResolutionReport {
+    search.resolve(fixtures.satisfiable_problem())
+}
+
+pub fn resolve_unsatisfiable_fixture() -> ResolutionReport {
+    search.resolve(fixtures.unsatisfiable_problem())
+}
+
+pub fn selected_version(report: ResolutionReport, package: PackageId) -> Option<Version> {
+    match package {
+        PackageId.Renderer => report.versions[0]
+        PackageId.Parser => report.versions[1]
+        PackageId.UnicodeTable => report.versions[2]
+    }
+}
+
+test "the resolver rolls back a dead end and selects a complete assignment" {
+    let report = resolve_satisfiable_fixture()
+    let expected_renderer = Version(major: 1, minor: 0, patch: 0)
+    let expected_parser = Version(major: 1, minor: 8, patch: 0)
+    let expected_unicode_table = Version(major: 1, minor: 9, patch: 0)
+    assert report.found
+    assert report.rule_count_valid
+    assert selected_version(report, PackageId.Renderer) == Some(expected_renderer)
+    assert selected_version(report, PackageId.Parser) == Some(expected_parser)
+    assert selected_version(report, PackageId.UnicodeTable) == Some(expected_unicode_table)
+    assert report.backtracks == 1
+}
+
+test "fixed candidate order makes the selected resolution deterministic" {
+    assert resolve_satisfiable_fixture() == resolve_satisfiable_fixture()
+}
+
+test "an unsatisfiable requirement produces no partial selection" {
+    let report = resolve_unsatisfiable_fixture()
+    assert not report.found
+    assert report.rule_count_valid
+    assert selected_version(report, PackageId.Renderer) == None
+    assert selected_version(report, PackageId.Parser) == None
+    assert selected_version(report, PackageId.UnicodeTable) == None
+}
+
+test "rule counts beyond fixed capacity are rejected without indexing the array" {
+    var problem = fixtures.satisfiable_problem()
+    problem.rule_count = RULE_CAPACITY + 1
+    let report = search.resolve(problem)
+    let propagation = propagate.propagate(problem, propagate.initial_state(problem))
+    assert not report.rule_count_valid
+    assert not report.found
+    assert report.visited_nodes == 0
+    assert not propagation.consistent
+    assert propagation.rounds == 0
+}
+
+test "version ranges include the lower bound and exclude the upper bound" {
+    let problem = fixtures.satisfiable_problem()
+    let range = problem.rules[0].unwrap().accepted_versions
+    let lower = Version(major: 2, minor: 0, patch: 0)
+    let upper = Version(major: 3, minor: 0, patch: 0)
+    assert version.range_contains(range, lower)
+    assert not version.range_contains(range, upper)
+}
