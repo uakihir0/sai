@@ -1,0 +1,163 @@
+use acme:multi-region-failover-planner/model.{
+    Dependency
+    MAX_DEPENDENCIES
+    MAX_REGIONS
+    MAX_REPLICAS
+    MAX_SERVICES
+    MAX_TARGETS
+    RecoveryTarget
+    Region
+    Replica
+    Service
+}
+
+pub const INCIDENT_MINUTE: U32 = 1000
+
+pub fn services() -> Array<Service, MAX_SERVICES> {
+    [
+        Service(
+            id: 10,
+            name: "customer-db",
+            primary_region_id: 3,
+            priority: 100,
+            rpo_minutes: 2,
+            rto_minutes: 30,
+            startup_minutes: 6,
+            capacity_units: 4,
+        ),
+        Service(
+            id: 20,
+            name: "order-db",
+            primary_region_id: 2,
+            priority: 90,
+            rpo_minutes: 1,
+            rto_minutes: 18,
+            startup_minutes: 8,
+            capacity_units: 5,
+        ),
+        Service(
+            id: 30,
+            name: "identity-api",
+            primary_region_id: 3,
+            priority: 80,
+            rpo_minutes: 3,
+            rto_minutes: 40,
+            startup_minutes: 5,
+            capacity_units: 2,
+        ),
+        Service(
+            id: 40,
+            name: "checkout-api",
+            primary_region_id: 3,
+            priority: 100,
+            rpo_minutes: 2,
+            rto_minutes: 25,
+            startup_minutes: 7,
+            capacity_units: 3,
+        ),
+        Service(
+            id: 50,
+            name: "catalog-cache",
+            primary_region_id: 1,
+            priority: 50,
+            rpo_minutes: 2,
+            rto_minutes: 20,
+            startup_minutes: 2,
+            capacity_units: 2,
+        ),
+        Service(
+            id: 60,
+            name: "search-index",
+            primary_region_id: 2,
+            priority: 40,
+            rpo_minutes: 5,
+            rto_minutes: 25,
+            startup_minutes: 4,
+            capacity_units: 2,
+        ),
+        Service(
+            id: 70,
+            name: "fraud-model",
+            primary_region_id: 2,
+            priority: 60,
+            rpo_minutes: 5,
+            rto_minutes: 5,
+            startup_minutes: 6,
+            capacity_units: 1,
+        ),
+        Service(
+            id: 80,
+            name: "email-queue",
+            primary_region_id: 3,
+            priority: 20,
+            rpo_minutes: 10,
+            rto_minutes: 20,
+            startup_minutes: 3,
+            capacity_units: 1,
+        ),
+        Service(
+            id: 90,
+            name: "media-renderer",
+            primary_region_id: 2,
+            priority: 10,
+            rpo_minutes: 3,
+            rto_minutes: 20,
+            startup_minutes: 4,
+            capacity_units: 6,
+        ),
+    ]
+}
+
+pub fn regions() -> Array<Region, MAX_REGIONS> {
+    [
+        Region(id: 1, name: "us-east", failover_capacity_units: 7),
+        Region(id: 2, name: "eu-west", failover_capacity_units: 8),
+        Region(id: 3, name: "ap-south", failover_capacity_units: 5),
+    ]
+}
+
+pub fn targets() -> Array<RecoveryTarget, MAX_TARGETS> {
+    [
+        RecoveryTarget(service_id: 10, region_id: 2, preference: 1, activation_minutes: 2),
+        RecoveryTarget(service_id: 10, region_id: 1, preference: 2, activation_minutes: 0),
+        RecoveryTarget(service_id: 20, region_id: 1, preference: 1, activation_minutes: 0),
+        RecoveryTarget(service_id: 20, region_id: 3, preference: 2, activation_minutes: 1),
+        RecoveryTarget(service_id: 30, region_id: 2, preference: 1, activation_minutes: 0),
+        RecoveryTarget(service_id: 30, region_id: 1, preference: 2, activation_minutes: 1),
+        RecoveryTarget(service_id: 40, region_id: 2, preference: 1, activation_minutes: 0),
+        RecoveryTarget(service_id: 40, region_id: 1, preference: 2, activation_minutes: 0),
+        RecoveryTarget(service_id: 50, region_id: 3, preference: 1, activation_minutes: 0),
+        RecoveryTarget(service_id: 60, region_id: 3, preference: 1, activation_minutes: 0),
+        RecoveryTarget(service_id: 70, region_id: 3, preference: 1, activation_minutes: 0),
+        RecoveryTarget(service_id: 80, region_id: 1, preference: 1, activation_minutes: 0),
+        RecoveryTarget(service_id: 90, region_id: 1, preference: 1, activation_minutes: 0),
+        RecoveryTarget(service_id: 90, region_id: 3, preference: 2, activation_minutes: 0),
+    ]
+}
+
+pub fn replicas() -> Array<Replica, MAX_REPLICAS> {
+    [
+        Replica(service_id: 10, region_id: 2, replicated_minute: 999, available: true),
+        Replica(service_id: 10, region_id: 1, replicated_minute: 998, available: true),
+        Replica(service_id: 20, region_id: 1, replicated_minute: 999, available: true),
+        Replica(service_id: 20, region_id: 3, replicated_minute: 999, available: true),
+        Replica(service_id: 30, region_id: 2, replicated_minute: 998, available: true),
+        Replica(service_id: 30, region_id: 1, replicated_minute: 999, available: true),
+        Replica(service_id: 40, region_id: 2, replicated_minute: 999, available: true),
+        Replica(service_id: 40, region_id: 1, replicated_minute: 998, available: true),
+        Replica(service_id: 50, region_id: 3, replicated_minute: 997, available: true),
+        Replica(service_id: 60, region_id: 3, replicated_minute: 999, available: true),
+        Replica(service_id: 70, region_id: 3, replicated_minute: 999, available: true),
+        Replica(service_id: 90, region_id: 1, replicated_minute: 999, available: true),
+        Replica(service_id: 90, region_id: 3, replicated_minute: 999, available: true),
+    ]
+}
+
+pub fn dependencies() -> Array<Dependency, MAX_DEPENDENCIES> {
+    [
+        Dependency(service_id: 30, prerequisite_id: 10),
+        Dependency(service_id: 40, prerequisite_id: 30),
+        Dependency(service_id: 40, prerequisite_id: 20),
+        Dependency(service_id: 60, prerequisite_id: 50),
+    ]
+}
