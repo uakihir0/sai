@@ -14,6 +14,7 @@
 
 use sai_hir::{DefId, Mutability, Safety, Symbol};
 use std::collections::HashMap;
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
@@ -155,6 +156,65 @@ pub enum Const {
     Value(u128),
     Param(ParamConst),
 }
+
+/// A type or constant argument in one source-ordered generic binder.
+///
+/// Type and const arguments share an index space. Region arguments are not
+/// represented by this type kernel and are not substituted by this API.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GenericArg {
+    Type(Ty),
+    Const(Const),
+}
+
+/// The kind of a generic argument expected by a semantic parameter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GenericArgKind {
+    Type,
+    Const,
+}
+
+impl fmt::Display for GenericArgKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Type => formatter.write_str("a type"),
+            Self::Const => formatter.write_str("a const"),
+        }
+    }
+}
+
+/// A missing or incorrectly typed argument encountered during substitution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SubstitutionError {
+    MissingArgument {
+        index: u32,
+    },
+    ArgumentKindMismatch {
+        index: u32,
+        expected: GenericArgKind,
+        found: GenericArgKind,
+    },
+}
+
+impl fmt::Display for SubstitutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingArgument { index } => {
+                write!(formatter, "generic argument {index} is missing")
+            }
+            Self::ArgumentKindMismatch {
+                index,
+                expected,
+                found,
+            } => write!(
+                formatter,
+                "generic argument {index} must be {expected}, found {found}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SubstitutionError {}
 
 /// One type-only binder in a function signature.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -319,6 +379,100 @@ impl TyInterner {
         let ty = Ty(Arc::new(kind.clone()));
         types.insert(kind, ty.clone());
         ty
+    }
+
+    /// Substitute source-ordered type and const arguments through a semantic
+    /// type, interning the resulting structure in this interner.
+    ///
+    /// `ParamTy::index` and `ParamConst::index` address the same mixed argument
+    /// slice. Replacement values are inserted as-is and are not recursively
+    /// substituted. The caller must provide arguments for the binder that
+    /// owns `ty`, in the correct order and with the correct arity.
+    ///
+    /// Regions are preserved unchanged. This routine does not substitute
+    /// implicit region arguments or validate binder identity.
+    pub fn substitute(&self, ty: &Ty, args: &[GenericArg]) -> Result<Ty, SubstitutionError> {
+        fn type_argument<'a>(
+            args: &'a [GenericArg],
+            index: u32,
+        ) -> Result<&'a Ty, SubstitutionError> {
+            match args.get(index as usize) {
+                Some(GenericArg::Type(ty)) => Ok(ty),
+                Some(GenericArg::Const(_)) => Err(SubstitutionError::ArgumentKindMismatch {
+                    index,
+                    expected: GenericArgKind::Type,
+                    found: GenericArgKind::Const,
+                }),
+                None => Err(SubstitutionError::MissingArgument { index }),
+            }
+        }
+
+        fn const_argument(args: &[GenericArg], index: u32) -> Result<Const, SubstitutionError> {
+            match args.get(index as usize) {
+                Some(GenericArg::Const(value)) => Ok(*value),
+                Some(GenericArg::Type(_)) => Err(SubstitutionError::ArgumentKindMismatch {
+                    index,
+                    expected: GenericArgKind::Const,
+                    found: GenericArgKind::Type,
+                }),
+                None => Err(SubstitutionError::MissingArgument { index }),
+            }
+        }
+
+        fn substitute_inner(
+            interner: &TyInterner,
+            ty: &Ty,
+            args: &[GenericArg],
+        ) -> Result<Ty, SubstitutionError> {
+            let kind = match ty.kind() {
+                TyKind::Tuple(elements) => TyKind::Tuple(
+                    elements
+                        .iter()
+                        .map(|element| substitute_inner(interner, element, args))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into(),
+                ),
+                TyKind::Ref(region, inner, mutability) => TyKind::Ref(
+                    *region,
+                    substitute_inner(interner, inner, args)?,
+                    *mutability,
+                ),
+                TyKind::Array(element, length) => {
+                    let element = substitute_inner(interner, element, args)?;
+                    let length = match length {
+                        Const::Value(value) => Const::Value(*value),
+                        Const::Param(parameter) => const_argument(args, parameter.index)?,
+                    };
+                    TyKind::Array(element, length)
+                }
+                TyKind::FnPtr(signature) => TyKind::FnPtr(FnPtrSig::new(
+                    signature.safety(),
+                    signature
+                        .inputs()
+                        .iter()
+                        .map(|input| substitute_inner(interner, input, args))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    substitute_inner(interner, signature.output(), args)?,
+                )),
+                TyKind::Param(parameter) => {
+                    return Ok(
+                        interner.intern(type_argument(args, parameter.index)?.kind().clone())
+                    );
+                }
+                TyKind::Adt(def_id, type_args) => TyKind::Adt(
+                    *def_id,
+                    type_args
+                        .iter()
+                        .map(|arg| substitute_inner(interner, arg, args))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into(),
+                ),
+                primitive => return Ok(interner.intern(primitive.clone())),
+            };
+            Ok(interner.intern(kind))
+        }
+
+        substitute_inner(self, ty, args)
     }
 
     fn canonicalize_children(&self, kind: TyKind) -> TyKind {
@@ -526,6 +680,244 @@ mod tests {
             panic!("the output retains its nested tuple");
         };
         assert!(output[0].ptr_eq(&local_bool));
+    }
+
+    #[test]
+    fn substitution_uses_the_shared_source_order_for_type_and_const_arguments() {
+        let interner = TyInterner::new();
+        let symbols = sai_intern::Interner::new();
+        let type_parameter = interner.intern(TyKind::Param(ParamTy {
+            index: 1,
+            name: symbols.intern("T").unwrap(),
+        }));
+        let length_parameter = ParamConst {
+            index: 0,
+            name: symbols.intern("N").unwrap(),
+        };
+        let array = interner.intern(TyKind::Array(
+            type_parameter,
+            Const::Param(length_parameter),
+        ));
+        let replacement = interner.intern(TyKind::Bool);
+
+        let substituted = interner
+            .substitute(
+                &array,
+                &[
+                    GenericArg::Const(Const::Value(11)),
+                    GenericArg::Type(replacement.clone()),
+                ],
+            )
+            .unwrap();
+
+        let TyKind::Array(element, Const::Value(11)) = substituted.kind() else {
+            panic!("the mixed const argument supplies the array length");
+        };
+        assert!(element.ptr_eq(&replacement));
+    }
+
+    #[test]
+    fn substitution_recurses_through_all_current_composite_types() {
+        let interner = TyInterner::new();
+        let symbols = sai_intern::Interner::new();
+        let packages = sai_intern::PackageInterner::new();
+        let package = packages.intern("example:substitution#1").unwrap();
+        let adt = DefId::from_foreign(package, sai_intern::DefIndex::from_raw(7));
+        let parameter = |index, name| {
+            interner.intern(TyKind::Param(ParamTy {
+                index,
+                name: symbols.intern(name).unwrap(),
+            }))
+        };
+        let first = parameter(0, "T");
+        let second = parameter(1, "U");
+        let length = ParamConst {
+            index: 2,
+            name: symbols.intern("N").unwrap(),
+        };
+        let region = Region::Sig(SigRegion {
+            item: adt,
+            index: 4,
+        });
+        let array = interner.intern(TyKind::Array(
+            interner.tuple(Arc::from([
+                second.clone(),
+                interner.intern(TyKind::Ref(region, first.clone(), Mutability::Mut)),
+            ])),
+            Const::Param(length),
+        ));
+        let function = interner.intern(TyKind::FnPtr(FnPtrSig::new(
+            Safety::Unsafe,
+            Arc::from([second.clone(), array.clone()]),
+            first.clone(),
+        )));
+        let original = interner.intern(TyKind::Adt(adt, Arc::from([first, array, function])));
+        let type_replacement = interner.intern(TyKind::Float(FloatTy::F64));
+        let second_replacement = interner.intern(TyKind::Char);
+        let expected_array = interner.intern(TyKind::Array(
+            interner.tuple(Arc::from([
+                second_replacement.clone(),
+                interner.intern(TyKind::Ref(
+                    region,
+                    type_replacement.clone(),
+                    Mutability::Mut,
+                )),
+            ])),
+            Const::Value(13),
+        ));
+        let expected_function = interner.intern(TyKind::FnPtr(FnPtrSig::new(
+            Safety::Unsafe,
+            Arc::from([second_replacement.clone(), expected_array.clone()]),
+            type_replacement.clone(),
+        )));
+        let expected = interner.intern(TyKind::Adt(
+            adt,
+            Arc::from([type_replacement.clone(), expected_array, expected_function]),
+        ));
+
+        let substituted = interner
+            .substitute(
+                &original,
+                &[
+                    GenericArg::Type(type_replacement),
+                    GenericArg::Type(second_replacement),
+                    GenericArg::Const(Const::Value(13)),
+                ],
+            )
+            .unwrap();
+
+        assert!(substituted.ptr_eq(&expected));
+        let TyKind::Adt(actual_adt, args) = substituted.kind() else {
+            panic!("the nominal type remains an ADT");
+        };
+        assert_eq!(*actual_adt, adt);
+        let TyKind::Array(tuple, Const::Value(13)) = args[1].kind() else {
+            panic!("nested array types and const parameters are substituted");
+        };
+        let TyKind::Tuple(elements) = tuple.kind() else {
+            panic!("the array element remains a tuple");
+        };
+        let TyKind::Ref(actual_region, _, actual_mutability) = elements[1].kind() else {
+            panic!("the reference remains a reference");
+        };
+        assert_eq!(*actual_region, region);
+        assert_eq!(*actual_mutability, Mutability::Mut);
+        let TyKind::FnPtr(signature) = args[2].kind() else {
+            panic!("the ADT retains its function-pointer argument");
+        };
+        assert_eq!(signature.safety(), Safety::Unsafe);
+    }
+
+    #[test]
+    fn substitution_interns_identity_structure_and_preserves_regions() {
+        let interner = TyInterner::new();
+        let other_interner = TyInterner::new();
+        let packages = sai_intern::PackageInterner::new();
+        let package = packages.intern("example:identity#1").unwrap();
+        let item = DefId::from_foreign(package, sai_intern::DefIndex::from_raw(2));
+        let foreign_bool = other_interner.intern(TyKind::Bool);
+        let foreign_reference = other_interner.intern(TyKind::Ref(
+            Region::Sig(SigRegion { item, index: 3 }),
+            foreign_bool,
+            Mutability::Not,
+        ));
+
+        let result = interner.substitute(&foreign_reference, &[]).unwrap();
+        let expected = interner.intern(TyKind::Ref(
+            Region::Sig(SigRegion { item, index: 3 }),
+            interner.intern(TyKind::Bool),
+            Mutability::Not,
+        ));
+
+        assert!(result.ptr_eq(&expected));
+    }
+
+    #[test]
+    fn substitution_inserts_type_replacements_without_substituting_them_again() {
+        let interner = TyInterner::new();
+        let symbols = sai_intern::Interner::new();
+        let replacement_inner = interner.intern(TyKind::Param(ParamTy {
+            index: 1,
+            name: symbols.intern("U").unwrap(),
+        }));
+        let replacement = interner.tuple(Arc::from([replacement_inner.clone()]));
+        let original = interner.intern(TyKind::Param(ParamTy {
+            index: 0,
+            name: symbols.intern("T").unwrap(),
+        }));
+
+        let result = interner
+            .substitute(
+                &original,
+                &[
+                    GenericArg::Type(replacement.clone()),
+                    GenericArg::Type(interner.intern(TyKind::Bool)),
+                ],
+            )
+            .unwrap();
+
+        assert!(result.ptr_eq(&replacement));
+        let TyKind::Tuple(elements) = result.kind() else {
+            panic!("the replacement tuple is inserted intact");
+        };
+        assert!(elements[0].ptr_eq(&replacement_inner));
+    }
+
+    #[test]
+    fn substitution_reports_missing_and_wrong_kind_arguments() {
+        let interner = TyInterner::new();
+        let symbols = sai_intern::Interner::new();
+        let type_parameter = interner.intern(TyKind::Param(ParamTy {
+            index: 2,
+            name: symbols.intern("T").unwrap(),
+        }));
+        let const_parameter = interner.intern(TyKind::Array(
+            interner.intern(TyKind::Bool),
+            Const::Param(ParamConst {
+                index: 1,
+                name: symbols.intern("N").unwrap(),
+            }),
+        ));
+
+        assert_eq!(
+            interner.substitute(&type_parameter, &[]),
+            Err(SubstitutionError::MissingArgument { index: 2 })
+        );
+        assert_eq!(
+            interner.substitute(&const_parameter, &[]),
+            Err(SubstitutionError::MissingArgument { index: 1 })
+        );
+        assert_eq!(
+            interner.substitute(
+                &interner.intern(TyKind::Param(ParamTy {
+                    index: 0,
+                    name: symbols.intern("U").unwrap(),
+                })),
+                &[GenericArg::Const(Const::Value(1))],
+            ),
+            Err(SubstitutionError::ArgumentKindMismatch {
+                index: 0,
+                expected: GenericArgKind::Type,
+                found: GenericArgKind::Const,
+            })
+        );
+        assert_eq!(
+            interner.substitute(
+                &interner.intern(TyKind::Array(
+                    interner.intern(TyKind::Bool),
+                    Const::Param(ParamConst {
+                        index: 0,
+                        name: symbols.intern("M").unwrap(),
+                    }),
+                )),
+                &[GenericArg::Type(interner.intern(TyKind::Bool))],
+            ),
+            Err(SubstitutionError::ArgumentKindMismatch {
+                index: 0,
+                expected: GenericArgKind::Const,
+                found: GenericArgKind::Type,
+            })
+        );
     }
 
     #[test]

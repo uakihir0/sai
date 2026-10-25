@@ -5,8 +5,8 @@
 //! manufacturing semantic error types or guessing at unresolved names.
 
 use crate::ty::{
-    Const, FloatTy, FnPtrSig, FnSig, FnSigConstParam, FnSigGenericParam, FnSigTypeParam, IntTy,
-    ParamConst, ParamTy, Region, SigRegion, Ty, TyInterner, TyKind, UintTy,
+    Const, FloatTy, FnPtrSig, FnSig, FnSigConstParam, FnSigGenericParam, FnSigTypeParam,
+    GenericArg, IntTy, ParamConst, ParamTy, Region, SigRegion, Ty, TyInterner, TyKind, UintTy,
 };
 use sai_hir::types::{
     GenericArg as HirGenericArg, GenericParam, GenericParamKind, Generics, PathRoot, Ty as HirTy,
@@ -87,6 +87,29 @@ pub struct LocalNominalDef {
     pub type_params: Arc<[(DefId, Symbol)]>,
 }
 
+/// A validated direct local alias template and its ordered type binders.
+///
+/// The template's `ParamTy` indices belong to the alias binder. The driver
+/// constructs this value only from the exact current package collection,
+/// snapshot, target-filtered HIR owner, matching DefPath interner, and
+/// owner-local path resolutions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalTypeAlias {
+    pub type_params: Arc<[(DefId, ParamTy)]>,
+    pub template: Ty,
+}
+
+/// Why a local alias definition cannot be represented by this projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnsupportedLocalTypeAlias {
+    ContextAfterFailure,
+    WherePredicates,
+    GenericParameters,
+    Type(UnsupportedTy),
+    RegionBearingType,
+    UnusedTypeParameter,
+}
+
 /// Region policy and type-path inputs for one HIR owner.
 ///
 /// A context belongs to one owner and snapshot of the caller's choice. Callers
@@ -100,7 +123,7 @@ pub struct LowerTyContext<'a> {
     paths: &'a HashMap<HirId, PathRes>,
     unit_enums: Option<&'a HashSet<DefId>>,
     local_nominals: Option<&'a HashMap<DefId, LocalNominalDef>>,
-    local_aliases: Option<&'a HashMap<DefId, Ty>>,
+    local_aliases: Option<&'a HashMap<DefId, LocalTypeAlias>>,
     generic_params: HashMap<DefId, ParamTy>,
     def_paths: Option<&'a DefPathInterner>,
     array_length_pointer_width: Option<u8>,
@@ -337,7 +360,7 @@ impl<'a> LowerTyContext<'a> {
     /// supplies values only for direct same-package aliases whose right-hand
     /// sides were lowered independently and proven free of alias references
     /// and regions.
-    pub fn with_local_type_aliases(mut self, aliases: &'a HashMap<DefId, Ty>) -> Self {
+    pub fn with_local_type_aliases(mut self, aliases: &'a HashMap<DefId, LocalTypeAlias>) -> Self {
         if matches!(self.region_mode, RegionMode::Signature) {
             self.local_aliases = Some(aliases);
         }
@@ -437,7 +460,7 @@ pub fn lower_fn_sig(
             .zip(context.def_paths)
             .is_some_and(|(owner_path, def_paths)| match parameter.kind {
                 GenericParamKind::Type { .. } => {
-                    is_direct_function_type_parameter(def_paths, owner_path, parameter)
+                    is_direct_owner_type_parameter(def_paths, owner_path, parameter)
                 }
                 GenericParamKind::Const { .. } => {
                     is_direct_function_const_parameter(def_paths, owner_path, parameter)
@@ -534,7 +557,103 @@ pub fn lower_fn_sig(
     ))
 }
 
-fn is_direct_function_type_parameter(
+/// Lower a direct local alias RHS into a template whose type parameters are
+/// indexed in the alias's own source order.
+///
+/// The caller must first validate the alias declaration's current source
+/// owner and syntax recovery. This routine verifies the HIR binder kinds,
+/// bounds, owner-local DefPaths, and path-map owner before lowering the RHS.
+/// The resulting template is deliberately not expanded here; function
+/// signature uses substitute their explicitly lowered arguments into it.
+pub fn lower_local_type_alias(
+    context: &mut LowerTyContext<'_>,
+    generics: Generics<'_>,
+    ty: &HirTy<'_>,
+) -> Result<LocalTypeAlias, UnsupportedLocalTypeAlias> {
+    if context.failed {
+        return Err(UnsupportedLocalTypeAlias::ContextAfterFailure);
+    }
+    if !generics.where_preds.is_empty() {
+        context.failed = true;
+        return Err(UnsupportedLocalTypeAlias::WherePredicates);
+    }
+
+    let owner_path = if generics.params.is_empty() {
+        None
+    } else {
+        let Some(def_paths) = context.def_paths else {
+            context.failed = true;
+            return Err(UnsupportedLocalTypeAlias::GenericParameters);
+        };
+        match def_paths.resolve(context.owner.def_id) {
+            Ok(Some(path)) if path.package() == context.owner.def_id.package() => Some(path),
+            Ok(Some(_)) | Ok(None) | Err(_) => {
+                context.failed = true;
+                return Err(UnsupportedLocalTypeAlias::GenericParameters);
+            }
+        }
+    };
+
+    let mut type_params = Vec::with_capacity(generics.params.len());
+    let mut generic_param_map = HashMap::with_capacity(generics.params.len());
+    let mut generic_names = HashSet::with_capacity(generics.params.len());
+    for (index, parameter) in generics.params.iter().enumerate() {
+        let GenericParamKind::Type { bounds } = parameter.kind else {
+            context.failed = true;
+            return Err(UnsupportedLocalTypeAlias::GenericParameters);
+        };
+        let name = parameter.name.sym;
+        let parameter_has_exact_owner =
+            owner_path
+                .as_ref()
+                .zip(context.def_paths)
+                .is_some_and(|(owner_path, def_paths)| {
+                    is_direct_owner_type_parameter(def_paths, owner_path, parameter)
+                });
+        if !bounds.is_empty()
+            || name.is_error()
+            || !generic_names.insert(name)
+            || !parameter_has_exact_owner
+        {
+            context.failed = true;
+            return Err(UnsupportedLocalTypeAlias::GenericParameters);
+        }
+        let index = u32::try_from(index).map_err(|_| {
+            context.failed = true;
+            UnsupportedLocalTypeAlias::GenericParameters
+        })?;
+        let def_id = parameter.def_id.to_def_id();
+        let param = ParamTy { index, name };
+        if generic_param_map.insert(def_id, param).is_some() {
+            context.failed = true;
+            return Err(UnsupportedLocalTypeAlias::GenericParameters);
+        }
+        type_params.push((def_id, param));
+    }
+
+    context.generic_params = generic_param_map;
+    context.const_params.clear();
+    let template = lower_ty(context, ty).map_err(UnsupportedLocalTypeAlias::Type)?;
+    if semantic_type_contains_reference(&template) {
+        context.failed = true;
+        return Err(UnsupportedLocalTypeAlias::RegionBearingType);
+    }
+    let Some(used_params) = semantic_type_parameter_usage(&template, type_params.len()) else {
+        context.failed = true;
+        return Err(UnsupportedLocalTypeAlias::GenericParameters);
+    };
+    if used_params.iter().any(|used| !used) {
+        context.failed = true;
+        return Err(UnsupportedLocalTypeAlias::UnusedTypeParameter);
+    }
+
+    Ok(LocalTypeAlias {
+        type_params: type_params.into(),
+        template,
+    })
+}
+
+fn is_direct_owner_type_parameter(
     def_paths: &DefPathInterner,
     owner_path: &sai_hir::DefPath,
     parameter: &GenericParam<'_>,
@@ -584,6 +703,58 @@ fn is_direct_function_const_parameter(
             disambiguator: 0,
         }) if *name == parameter.name.sym
     )
+}
+
+fn semantic_type_contains_reference(root: &Ty) -> bool {
+    let mut pending = vec![root];
+    while let Some(ty) = pending.pop() {
+        match ty.kind() {
+            TyKind::Ref(..) => return true,
+            TyKind::Tuple(elements) => pending.extend(elements.iter()),
+            TyKind::Array(element, _) => pending.push(element),
+            TyKind::FnPtr(signature) => {
+                pending.extend(signature.inputs());
+                pending.push(signature.output());
+            }
+            TyKind::Adt(_, arguments) => pending.extend(arguments.iter()),
+            TyKind::Int(_)
+            | TyKind::Uint(_)
+            | TyKind::Float(_)
+            | TyKind::Bool
+            | TyKind::Byte
+            | TyKind::Char
+            | TyKind::Never
+            | TyKind::Param(_) => {}
+        }
+    }
+    false
+}
+
+fn semantic_type_parameter_usage(root: &Ty, count: usize) -> Option<Vec<bool>> {
+    let mut used = vec![false; count];
+    let mut pending = vec![root];
+    while let Some(ty) = pending.pop() {
+        match ty.kind() {
+            TyKind::Param(parameter) => {
+                *used.get_mut(usize::try_from(parameter.index).ok()?)? = true;
+            }
+            TyKind::Tuple(elements) => pending.extend(elements.iter()),
+            TyKind::Ref(_, inner, _) | TyKind::Array(inner, _) => pending.push(inner),
+            TyKind::FnPtr(signature) => {
+                pending.extend(signature.inputs());
+                pending.push(signature.output());
+            }
+            TyKind::Adt(_, arguments) => pending.extend(arguments.iter()),
+            TyKind::Int(_)
+            | TyKind::Uint(_)
+            | TyKind::Float(_)
+            | TyKind::Bool
+            | TyKind::Byte
+            | TyKind::Char
+            | TyKind::Never => {}
+        }
+    }
+    Some(used)
 }
 
 fn is_builtin_usize_const_type(context: &LowerTyContext<'_>, ty: &HirTy<'_>) -> bool {
@@ -734,14 +905,47 @@ fn lower_path_ty(
     }
 
     if let Res::Def(DefKind::Alias, def_id) = resolution.base {
-        if generic_args.is_some() {
-            return Err(UnsupportedTy::GenericArguments);
-        }
-        return context
+        let alias = context
             .local_aliases
             .and_then(|aliases| aliases.get(&def_id))
-            .cloned()
-            .ok_or(UnsupportedTy::Alias);
+            .ok_or(UnsupportedTy::Alias)?;
+        if alias.type_params.is_empty() {
+            if generic_args.is_some() {
+                return Err(UnsupportedTy::GenericArguments);
+            }
+            return Ok(alias.template.clone());
+        }
+
+        let Some(generic_args) = generic_args else {
+            return Err(UnsupportedTy::WrongNumberOfGenericArguments);
+        };
+        let written_args = generic_args.args;
+        let type_arg_count = written_args
+            .iter()
+            .filter(|arg| !matches!(arg, HirGenericArg::Binding { .. }))
+            .count();
+        if type_arg_count != alias.type_params.len() {
+            return Err(UnsupportedTy::WrongNumberOfGenericArguments);
+        }
+        if written_args
+            .iter()
+            .any(|arg| !matches!(arg, HirGenericArg::Type(_)))
+        {
+            return Err(UnsupportedTy::GenericArgumentKind);
+        }
+        let arguments = written_args
+            .iter()
+            .map(|arg| match arg {
+                HirGenericArg::Type(ty) => lower_ty_inner(context, ty).map(GenericArg::Type),
+                HirGenericArg::Const(_) | HirGenericArg::Binding { .. } => {
+                    Err(UnsupportedTy::GenericArgumentKind)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return context
+            .interner
+            .substitute(&alias.template, &arguments)
+            .map_err(|_| UnsupportedTy::Alias);
     }
 
     if let Res::Def(DefKind::Struct | DefKind::Enum, def_id) = resolution.base {
@@ -2562,7 +2766,13 @@ mod tests {
         let arena = HirArena::new();
         let alias_def = owner.def_id.to_def_id();
         let alias_ty = interner.intern(TyKind::Uint(UintTy::U32));
-        let aliases = HashMap::from([(alias_def, alias_ty.clone())]);
+        let aliases = HashMap::from([(
+            alias_def,
+            LocalTypeAlias {
+                type_params: Arc::from([]),
+                template: alias_ty.clone(),
+            },
+        )]);
         let (alias, alias_paths) = resolved_path(
             &arena,
             owner,
@@ -2613,6 +2823,108 @@ mod tests {
             lower_ty(&mut body_context, alias),
             Err(UnsupportedTy::Alias),
             "the signature-only allowlist does not enable body lowering"
+        );
+    }
+
+    #[test]
+    fn generic_local_alias_substitutes_arguments_in_the_use_context_once() {
+        let (owner, symbols, generic_defs, _) = owner_with_generic_params(&["T", "U"]);
+        let interner = TyInterner::new();
+        let arena = HirArena::new();
+        let alias_def = owner.def_id.to_def_id();
+        let alias_parameter = ParamTy {
+            index: 0,
+            name: symbols.intern("T").unwrap(),
+        };
+        let caller_parameter = ParamTy {
+            index: 1,
+            name: symbols.intern("U").unwrap(),
+        };
+        let caller_parameter_def = generic_defs[1].to_def_id();
+        let aliases = HashMap::from([(
+            alias_def,
+            LocalTypeAlias {
+                type_params: Arc::from([(generic_defs[0].to_def_id(), alias_parameter)]),
+                template: interner.intern(TyKind::Param(alias_parameter)),
+            },
+        )]);
+
+        let (caller_type, caller_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            540,
+            "U",
+            None,
+            Res::Def(DefKind::TyParam, caller_parameter_def),
+        );
+        let arguments = arena.alloc_generic_args_list(&[HirGenericArg::Type(caller_type)]);
+        let generic_args = arena.alloc_generic_args(GenericArgs {
+            args: arguments,
+            span: span(),
+        });
+        let (alias_type, mut paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            550,
+            "Generic",
+            Some(generic_args),
+            Res::Def(DefKind::Alias, alias_def),
+        );
+        paths.extend(caller_paths);
+        let mut context = LowerTyContext::for_signature(&interner, owner, &paths)
+            .with_local_type_aliases(&aliases);
+        context
+            .generic_params
+            .insert(caller_parameter_def, caller_parameter);
+        let lowered =
+            lower_ty(&mut context, alias_type).expect("the use-site type argument lowers");
+        assert_eq!(
+            lowered.kind(),
+            &TyKind::Param(caller_parameter),
+            "the caller's index-one parameter replaces the alias's index-zero parameter"
+        );
+
+        let (missing, missing_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            560,
+            "Generic",
+            None,
+            Res::Def(DefKind::Alias, alias_def),
+        );
+        let mut missing_context = LowerTyContext::for_signature(&interner, owner, &missing_paths)
+            .with_local_type_aliases(&aliases);
+        assert_eq!(
+            lower_ty(&mut missing_context, missing),
+            Err(UnsupportedTy::WrongNumberOfGenericArguments)
+        );
+
+        let const_args = arena.alloc_generic_args_list(&[HirGenericArg::Const(ConstArg::Int {
+            value: Some(4),
+            negated: false,
+        })]);
+        let const_args = arena.alloc_generic_args(GenericArgs {
+            args: const_args,
+            span: span(),
+        });
+        let (wrong_kind, wrong_kind_paths) = resolved_path(
+            &arena,
+            owner,
+            &symbols,
+            570,
+            "Generic",
+            Some(const_args),
+            Res::Def(DefKind::Alias, alias_def),
+        );
+        let mut wrong_kind_context =
+            LowerTyContext::for_signature(&interner, owner, &wrong_kind_paths)
+                .with_local_type_aliases(&aliases);
+        assert_eq!(
+            lower_ty(&mut wrong_kind_context, wrong_kind),
+            Err(UnsupportedTy::GenericArgumentKind)
         );
     }
 
@@ -2678,7 +2990,13 @@ mod tests {
             .to_def_id();
 
         let interner = TyInterner::new();
-        let aliases = HashMap::from([(local_alias, interner.intern(TyKind::Uint(UintTy::U32)))]);
+        let aliases = HashMap::from([(
+            local_alias,
+            LocalTypeAlias {
+                type_params: Arc::from([]),
+                template: interner.intern(TyKind::Uint(UintTy::U32)),
+            },
+        )]);
         let arena = HirArena::new();
         for (local_id, def_id) in [(550, unregistered_alias), (560, external_alias)] {
             let (hir_ty, paths) = resolved_path(

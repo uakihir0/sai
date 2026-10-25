@@ -13386,31 +13386,6 @@ fn local_record_field_type_has_explicit_borrow(ty: &Ty<'_>, owner: OwnerId) -> b
     }
 }
 
-fn type_contains_reference(root: &sai_ty::ty::Ty) -> bool {
-    let mut pending = vec![root];
-    while let Some(ty) = pending.pop() {
-        match ty.kind() {
-            sai_ty::ty::TyKind::Ref(..) => return true,
-            sai_ty::ty::TyKind::Tuple(elements) => pending.extend(elements.iter()),
-            sai_ty::ty::TyKind::Array(element, _) => pending.push(element),
-            sai_ty::ty::TyKind::Adt(_, arguments) => pending.extend(arguments.iter()),
-            sai_ty::ty::TyKind::FnPtr(signature) => {
-                pending.extend(signature.inputs());
-                pending.push(signature.output());
-            }
-            sai_ty::ty::TyKind::Int(_)
-            | sai_ty::ty::TyKind::Uint(_)
-            | sai_ty::ty::TyKind::Float(_)
-            | sai_ty::ty::TyKind::Bool
-            | sai_ty::ty::TyKind::Byte
-            | sai_ty::ty::TyKind::Char
-            | sai_ty::ty::TyKind::Never
-            | sai_ty::ty::TyKind::Param(_) => {}
-        }
-    }
-    false
-}
-
 fn generic_argument_syntax_has_recovery(root: &SyntaxNode) -> bool {
     root.descendants()
         .filter_map(ast::GenericArgList::cast)
@@ -15157,7 +15132,7 @@ impl RootDatabase {
         source_graph_packages: &HashSet<PackageId>,
         unit_enums: &HashSet<DefId>,
         local_nominals: &HashMap<DefId, sai_ty::lower_ty::LocalNominalDef>,
-    ) -> HashMap<DefId, sai_ty::ty::Ty> {
+    ) -> HashMap<DefId, sai_ty::lower_ty::LocalTypeAlias> {
         let mut aliases = HashMap::new();
         let Some(def_paths) = self.def_paths.get(&collection.module_tree.package).cloned() else {
             return aliases;
@@ -15238,13 +15213,13 @@ impl RootDatabase {
                     continue;
                 };
                 if alias_definition.refinement().is_some()
-                    || declaration
-                        .generic_params()
-                        .is_some_and(|params| params.params().next().is_some())
                     || syntax_subtree_has_error(declaration.syntax())
                 {
                     continue;
                 }
+                let source_parameter_count = declaration
+                    .generic_params()
+                    .map_or(0, |parameters| parameters.params().count());
 
                 let arena = HirArena::new();
                 let context = HirLoweringContext::new(
@@ -15285,7 +15260,9 @@ impl RootDatabase {
                 let ItemKind::Alias { generics, ty } = item.kind else {
                     continue;
                 };
-                if !generics.params.is_empty() || !generics.where_preds.is_empty() {
+                if generics.params.len() != source_parameter_count
+                    || !generics.where_preds.is_empty()
+                {
                     continue;
                 }
 
@@ -15315,13 +15292,12 @@ impl RootDatabase {
                     )
                     .with_def_path_interner(&def_paths)
                     .with_array_length_pointer_width(collection.target_cfg.pointer_width());
-                let Ok(ty) = sai_ty::lower_ty::lower_ty(&mut context, ty) else {
+                let Ok(alias) =
+                    sai_ty::lower_ty::lower_local_type_alias(&mut context, generics, ty)
+                else {
                     continue;
                 };
-                if type_contains_reference(&ty) {
-                    continue;
-                }
-                aliases.insert(def_id, ty);
+                aliases.insert(def_id, alias);
             }
         }
         aliases
@@ -37422,7 +37398,7 @@ property "shared"() {}
 
     #[test]
 
-    fn function_signature_projection_lowers_only_direct_local_non_generic_aliases() {
+    fn function_signature_projection_lowers_direct_local_aliases_with_type_parameters() {
         let root = concat!(
             "type Count = U32\n",
             "type Pair = (Bool, I64)\n",
@@ -37434,12 +37410,29 @@ property "shared"() {}
             "type Borrowed = borrow U8\n",
             "type NestedBorrow = (U8, Array<borrow Bool, 2>)\n",
             "type Generic<T> = T\n",
+            "type GenericPair<T, U> = (T, U)\n",
+            "type GenericArray<T> = Array<T, 2>\n",
+            "type GenericCallback<T> = fn(T) -> T\n",
+            "type GenericChain<T> = Generic<T>\n",
+            "type GenericUnused<T, U> = T\n",
+            "type GenericBorrow<T> = borrow T\n",
+            "type GenericConst<const N: USize> = Array<U8, N>\n",
+            "type Bounded<T: Numeric> = T\n",
             "type Refined = U8 where self > 0\n",
             "type Recovered<T = U32\n",
             "type Callback = fn(I32) -> Bool\n",
             "fn aliases(count: Count, pair: Pair, bytes: Buffer) -> Count {}\n",
             "fn repeated(first: Count, second: Count) -> Count {}\n",
             "fn generic_alias(value: Generic<U8>) -> U8 {}\n",
+            "fn generic_alias_capture<const N: USize, U>(value: Generic<U>) -> Generic<U> {}\n",
+            "fn generic_pair(value: GenericPair<U8, Bool>) -> (U8, Bool) {}\n",
+            "fn generic_array(value: GenericArray<Bool>) -> Array<Bool, 2> {}\n",
+            "fn generic_callback<const N: USize, U>(value: GenericCallback<U>) -> GenericCallback<U> {}\n",
+            "fn const_alias(value: GenericConst<4>) -> U8 {}\n",
+            "fn bounded_alias(value: Bounded<U8>) -> U8 {}\n",
+            "fn unused_alias(value: GenericUnused<U8, Bool>) -> U8 {}\n",
+            "fn nested_generic_alias(value: GenericChain<U8>) -> U8 {}\n",
+            "fn borrowed_generic_alias(value: GenericBorrow<U8>) -> U8 {}\n",
             "fn refined_alias(value: Refined) -> U8 {}\n",
             "fn chained_alias(value: AliasChain) -> U32 {}\n",
             "fn nested_alias(value: NestedAlias) -> (U32, U8) {}\n",
@@ -37449,6 +37442,9 @@ property "shared"() {}
             "fn recovered_alias(value: Recovered) -> U32 {}\n",
             "fn callback_alias(value: Callback) -> Callback {}\n",
             "fn callback_composition(value: fn(Callback) -> Callback) -> fn(Callback) -> Callback {}\n",
+            "fn generic_alias_missing(value: Generic) -> U8 {}\n",
+            "fn generic_alias_extra(value: Generic<U8, Bool>) -> U8 {}\n",
+            "fn generic_alias_const(value: Generic<4>) -> U8 {}\n",
         );
         let (mut database, module_tree, snapshot, _) = phase1_fixture(root.as_bytes(), b"");
         let target_cfg = target_cfg_for_check("wasm32-core").expect("target config is valid");
@@ -37463,7 +37459,7 @@ property "shared"() {}
         let resolved = database
             .resolve_function_owner_analyses(&collection, &module_tree, &snapshot)
             .expect("function owner analyses succeed");
-        assert_eq!(resolved.owners().len(), 12);
+        assert_eq!(resolved.owners().len(), 24);
 
         assert!(resolved.matches_collection(&collection));
 
@@ -37512,19 +37508,121 @@ property "shared"() {}
                 .expect("the function owner exists")
                 .clone()
         };
+        let generic_alias = unsupported(2);
+        let FunctionSignatureProjection::Supported(generic_alias) = generic_alias else {
+            panic!("an explicit type argument substitutes into a generic local alias");
+        };
+        assert!(matches!(
+            generic_alias.inputs()[0].kind(),
+            sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+        ));
+        assert!(generic_alias.inputs()[0].ptr_eq(generic_alias.output()));
+
+        let generic_alias_capture = unsupported(3);
+        let FunctionSignatureProjection::Supported(generic_alias_capture) = generic_alias_capture
+        else {
+            panic!("an alias binder substitutes with the caller's mixed-index type parameter");
+        };
         assert_eq!(
-            unsupported(2),
+            generic_alias_capture
+                .generic_params()
+                .iter()
+                .map(|parameter| match parameter {
+                    sai_ty::ty::FnSigGenericParam::Type(parameter) => {
+                        parameter.param.index
+                    }
+                    sai_ty::ty::FnSigGenericParam::Const(parameter) => parameter.param.index,
+                })
+                .collect::<Vec<_>>(),
+            [0, 1],
+            "the function const and type parameters retain shared source order"
+        );
+        let caller_parameter = match generic_alias_capture.generic_params()[1] {
+            sai_ty::ty::FnSigGenericParam::Type(parameter) => parameter.param,
+            sai_ty::ty::FnSigGenericParam::Const(_) => {
+                panic!("the second function binder is a type parameter")
+            }
+        };
+        assert_eq!(caller_parameter.index, 1);
+        assert_eq!(
+            generic_alias_capture.inputs()[0].kind(),
+            &sai_ty::ty::TyKind::Param(caller_parameter),
+            "the alias's index-zero binder substitutes to the caller's index-one parameter"
+        );
+        assert_eq!(
+            generic_alias_capture.output().kind(),
+            &sai_ty::ty::TyKind::Param(caller_parameter),
+            "the replacement is not recursively captured by the alias binder"
+        );
+
+        let generic_pair = unsupported(4);
+        let FunctionSignatureProjection::Supported(generic_pair) = generic_pair else {
+            panic!("multiple alias parameters substitute in their source order");
+        };
+        assert!(matches!(
+            generic_pair.inputs()[0].kind(),
+            sai_ty::ty::TyKind::Tuple(elements)
+                if matches!(
+                    elements[0].kind(),
+                    sai_ty::ty::TyKind::Uint(sai_ty::ty::UintTy::U8)
+                ) && matches!(elements[1].kind(), sai_ty::ty::TyKind::Bool)
+        ));
+        assert!(generic_pair.inputs()[0].ptr_eq(generic_pair.output()));
+
+        let generic_array = unsupported(5);
+        let FunctionSignatureProjection::Supported(generic_array) = generic_array else {
+            panic!("generic alias templates substitute through arrays");
+        };
+        assert!(matches!(
+            generic_array.inputs()[0].kind(),
+            sai_ty::ty::TyKind::Array(element, sai_ty::ty::Const::Value(2))
+                if matches!(element.kind(), sai_ty::ty::TyKind::Bool)
+        ));
+
+        let generic_callback = unsupported(6);
+        let FunctionSignatureProjection::Supported(generic_callback) = generic_callback else {
+            panic!("generic alias templates substitute through function pointers");
+        };
+        let sai_ty::ty::TyKind::FnPtr(callback) = generic_callback.inputs()[0].kind() else {
+            panic!("the alias retains its function pointer type");
+        };
+        assert_eq!(
+            callback.inputs()[0].kind(),
+            &sai_ty::ty::TyKind::Param(caller_parameter)
+        );
+        assert_eq!(
+            callback.output().kind(),
+            &sai_ty::ty::TyKind::Param(caller_parameter)
+        );
+        assert!(generic_callback.inputs()[0].ptr_eq(generic_callback.output()));
+
+        assert_eq!(
+            unsupported(7),
             FunctionSignatureProjection::Unsupported(
                 sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
                     index: 0,
-                    reason: sai_ty::lower_ty::UnsupportedTy::GenericArguments,
+                    reason: sai_ty::lower_ty::UnsupportedTy::Alias,
                 }
             ),
-            "generic aliases remain unsupported"
+            "aliases with const parameters remain unsupported"
         );
+        for index in 8..12 {
+            assert!(
+                matches!(
+                    unsupported(index),
+                    FunctionSignatureProjection::Unsupported(
+                        sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                            reason: sai_ty::lower_ty::UnsupportedTy::Alias,
+                            ..
+                        }
+                    )
+                ),
+                "bounded, unused, nested, region-bearing and refined generic aliases remain unsupported"
+            );
+        }
         assert!(
             matches!(
-                unsupported(3),
+                unsupported(12),
                 FunctionSignatureProjection::Unsupported(
                     sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
                         reason: sai_ty::lower_ty::UnsupportedTy::NominalType,
@@ -37534,7 +37632,7 @@ property "shared"() {}
             ),
             "refined aliases remain outside the type alias allowlist"
         );
-        for index in 4..10 {
+        for index in 13..19 {
             assert!(
                 matches!(
                     unsupported(index),
@@ -37550,7 +37648,7 @@ property "shared"() {}
         }
 
         let callback_alias = resolved
-            .signature_projection(&collection, resolved.owners()[10].owner())
+            .signature_projection(&collection, resolved.owners()[19].owner())
             .expect("the exact collection guards the projection")
             .expect("the function using the function-pointer alias exists");
         let FunctionSignatureProjection::Supported(callback_alias) = callback_alias else {
@@ -37569,7 +37667,7 @@ property "shared"() {}
         assert!(callback_alias.inputs()[0].ptr_eq(callback_alias.output()));
 
         let callback_composition = resolved
-            .signature_projection(&collection, resolved.owners()[11].owner())
+            .signature_projection(&collection, resolved.owners()[20].owner())
             .expect("the exact collection guards the projection")
             .expect("the function composing an alias with a function pointer exists");
         let FunctionSignatureProjection::Supported(callback_composition) = callback_composition
@@ -37582,6 +37680,29 @@ property "shared"() {}
         assert!(composed.inputs()[0].ptr_eq(&callback_alias.inputs()[0]));
         assert!(composed.output().ptr_eq(&callback_alias.inputs()[0]));
         assert!(callback_composition.inputs()[0].ptr_eq(callback_composition.output()));
+
+        for index in [21, 22] {
+            assert_eq!(
+                unsupported(index),
+                FunctionSignatureProjection::Unsupported(
+                    sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                        index: 0,
+                        reason: sai_ty::lower_ty::UnsupportedTy::WrongNumberOfGenericArguments,
+                    }
+                ),
+                "generic aliases require exactly one type argument"
+            );
+        }
+        assert_eq!(
+            unsupported(23),
+            FunctionSignatureProjection::Unsupported(
+                sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
+                    index: 0,
+                    reason: sai_ty::lower_ty::UnsupportedTy::GenericArgumentKind,
+                }
+            ),
+            "generic aliases reject const arguments"
+        );
 
         let stale_snapshot = snapshot_with_version(&snapshot, 18);
         let stale_collection = database
@@ -39872,7 +39993,7 @@ property "shared"() {}
         };
         assert_eq!(
             fields[0].ty(),
-            Err(sai_ty::lower_ty::UnsupportedTy::GenericArguments),
+            Err(sai_ty::lower_ty::UnsupportedTy::Alias),
             "the local alias named Array does not enter built-in array lowering"
         );
         assert!(
@@ -40357,7 +40478,7 @@ property "shared"() {}
         );
         assert_eq!(
             projection(10),
-            expected_unsupported(sai_ty::lower_ty::UnsupportedTy::GenericArguments),
+            expected_unsupported(sai_ty::lower_ty::UnsupportedTy::Alias),
             "a generic const alias stays outside the signature alias allowlist"
         );
     }
@@ -40390,10 +40511,10 @@ property "shared"() {}
             &FunctionSignatureProjection::Unsupported(
                 sai_ty::lower_ty::UnsupportedFnSig::ParameterType {
                     index: 0,
-                    reason: sai_ty::lower_ty::UnsupportedTy::GenericArguments,
+                    reason: sai_ty::lower_ty::UnsupportedTy::WrongNumberOfGenericArguments,
                 }
             ),
-            "the local alias does not enter the built-in array lowering path"
+            "the local generic alias arity is checked outside the built-in array lowering path"
         );
         let path_resolution = resolved.owners()[0]
             .type_path_resolution()
