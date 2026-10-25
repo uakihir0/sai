@@ -9672,7 +9672,10 @@ fn local_enum_variant_unannotated_fixed_local_type(
         return None;
     };
     let binding_kind = locals.bindings.get(&binding)?.kind;
-    if !matches!(binding_kind, BindingKind::Let | BindingKind::Var) {
+    if !matches!(
+        binding_kind,
+        BindingKind::Let | BindingKind::Var | BindingKind::Pattern { .. }
+    ) {
         return None;
     }
 
@@ -9690,29 +9693,19 @@ fn local_enum_variant_unannotated_fixed_local_type(
         else {
             continue;
         };
-        let PatKind::Binding {
-            mode,
-            name,
-            binding: declared_binding,
-            sub: None,
-        } = pat.kind
-        else {
+        let Some(binding_initializer) = local_enum_variant_simple_pattern_initializer(
+            pat,
+            init,
+            binding,
+            path.segments[0].name.sym,
+            locals,
+        ) else {
             continue;
         };
-        if declared_binding != binding {
-            continue;
-        }
-        if name.sym != path.segments[0].name.sym
-            || !matches!(
-                (binding_kind, mode),
-                (BindingKind::Let, sai_hir::patterns::BindingMode::Value)
-                    | (BindingKind::Var, sai_hir::patterns::BindingMode::Var)
-            )
-            || initializer.is_some()
-        {
+        if locals.bindings.get(&binding)?.kind != binding_kind || initializer.is_some() {
             return None;
         }
-        initializer = Some(init);
+        initializer = Some(binding_initializer);
     }
 
     match initializer?.kind {
@@ -9727,6 +9720,87 @@ fn local_enum_variant_unannotated_fixed_local_type(
         )),
         ExprKind::Tuple(elements) if elements.is_empty() => Some(ConstLiteralType::Unit),
         _ => None,
+    }
+}
+
+fn local_enum_variant_simple_pattern_initializer<'hir>(
+    pattern: &'hir HirPat<'hir>,
+    initializer: &'hir HirExpr<'hir>,
+    target_binding: sai_hir::BindingId,
+    target_name: Symbol,
+    locals: &LocalResolution,
+) -> Option<&'hir HirExpr<'hir>> {
+    use sai_hir::patterns::BindingMode;
+
+    let binding_mode_is_supported =
+        |binding: sai_hir::BindingId, mode: BindingMode, allow_pattern_binding: bool| {
+            let kind = locals.bindings.get(&binding)?.kind;
+            (matches!(
+                (kind, mode),
+                (BindingKind::Let, BindingMode::Value) | (BindingKind::Var, BindingMode::Var)
+            ) || (allow_pattern_binding
+                && matches!(
+                    (kind, mode),
+                    (BindingKind::Pattern { var: false }, BindingMode::Value)
+                        | (BindingKind::Pattern { var: true }, BindingMode::Var)
+                )))
+            .then_some(())
+        };
+
+    match pattern.kind {
+        PatKind::Binding {
+            mode,
+            name,
+            binding,
+            sub: None,
+        } => {
+            binding_mode_is_supported(binding, mode, false)?;
+            (binding == target_binding && name.sym == target_name).then_some(initializer)
+        }
+        PatKind::Tuple(patterns) => {
+            let ExprKind::Tuple(values) = initializer.kind else {
+                return None;
+            };
+            if patterns.len() != values.len()
+                || !values
+                    .iter()
+                    .all(local_enum_variant_fixed_tuple_initializer_leaf)
+            {
+                return None;
+            }
+
+            let mut binding_initializer = None;
+            for (pattern, value) in patterns.iter().zip(values) {
+                match pattern.kind {
+                    PatKind::Wild => {}
+                    PatKind::Binding {
+                        mode,
+                        name,
+                        binding,
+                        sub: None,
+                    } => {
+                        binding_mode_is_supported(binding, mode, true)?;
+                        if binding == target_binding {
+                            if name.sym != target_name || binding_initializer.is_some() {
+                                return None;
+                            }
+                            binding_initializer = Some(value);
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+            binding_initializer
+        }
+        _ => None,
+    }
+}
+
+fn local_enum_variant_fixed_tuple_initializer_leaf(value: &HirExpr<'_>) -> bool {
+    match value.kind {
+        ExprKind::Lit(Lit::Bool(_) | Lit::Byte(_) | Lit::Char(_)) => true,
+        ExprKind::Tuple(elements) => elements.is_empty(),
+        _ => false,
     }
 }
 
@@ -97617,6 +97691,19 @@ interface facade { use middle.{payload}; }"#;
             "fn tuple_call_unannotated_float_literal() {\n    let actual = 1.5\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_unannotated_computed_bool() {\n    let actual = true && false\n    Payload.Pair(actual, true)\n}\n",
             "fn tuple_call_inferred_destructuring() {\n    let (actual, _) = (true, false)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_tuple_destructure_ok() {\n    let (actual_bool, var actual_byte, actual_char, var actual_unit) = (true, b'x', 'x', ())\n    Payload.Fixed(actual_bool, actual_byte, actual_char, actual_unit)\n}\n",
+            "fn tuple_call_inferred_tuple_destructure_annotated() {\n    let (actual, other): (Bool, Bool) = (true, false)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_tuple_destructure_bool_mismatch() {\n    let (actual, other) = (true, b'x')\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_tuple_destructure_var_mismatch() {\n    let (other, var actual) = (false, b'x')\n    Payload.Pair(1, actual)\n}\n",
+            "fn tuple_call_inferred_tuple_destructure_shadowing(actual: Bool) {\n    let (actual, other) = (b'x', true)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_tuple_destructure_extra() {\n    let (extra, other) = (true, false)\n    Payload.Pair(1, true, extra)\n}\n",
+            "fn tuple_call_inferred_tuple_arity_mismatch() {\n    let (actual, other) = (true,)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_tuple_nested_pattern() {\n    let (actual, (nested, _)) = (true, (false, false))\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_tuple_numeric_leaf() {\n    let (actual, other) = (1, true)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_tuple_computed_leaf() {\n    let (actual, other) = (true && false, true)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_tuple_wildcard_numeric_leaf() {\n    let (actual, _) = (true, 1)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_tuple_wildcard_computed_leaf() {\n    let (actual, _) = (true, true && false)\n    Payload.Pair(actual, true)\n}\n",
+            "fn tuple_call_inferred_tuple_nested_scope() {\n    {\n        let (actual, other) = (true, false)\n        Payload.Pair(actual, true)\n    }\n}\n",
             "fn tuple_call_param_mismatch(actual: Bool) { Payload.Pair(actual, true) }\n",
             "fn tuple_call_unicode_param_mismatch(値: Bool) { Payload.Pair(値, true) }\n",
             "fn nested_call_param_mismatch(actual: USize) { NestedPayload.Nested(((actual, 'x'), ((), 2))) }\n",
@@ -98184,7 +98271,15 @@ interface facade { use middle.{payload}; }"#;
             "tuple_call_unannotated_integer_literal",
             "tuple_call_unannotated_float_literal",
             "tuple_call_unannotated_computed_bool",
-            "tuple_call_inferred_destructuring",
+            "tuple_call_inferred_tuple_destructure_ok",
+            "tuple_call_inferred_tuple_arity_mismatch",
+            "tuple_call_inferred_tuple_destructure_annotated",
+            "tuple_call_inferred_tuple_nested_pattern",
+            "tuple_call_inferred_tuple_numeric_leaf",
+            "tuple_call_inferred_tuple_computed_leaf",
+            "tuple_call_inferred_tuple_wildcard_numeric_leaf",
+            "tuple_call_inferred_tuple_wildcard_computed_leaf",
+            "tuple_call_inferred_tuple_nested_scope",
         ] {
             assert!(
                 paths_for(name).call_diagnostics().is_empty(),
@@ -98208,6 +98303,10 @@ interface facade { use middle.{payload}; }"#;
                 "expected `U8`, found `Bool`",
             ),
             (
+                "tuple_call_inferred_destructuring",
+                "expected `U8`, found `Bool`",
+            ),
+            (
                 "tuple_call_inferred_var_byte_mismatch",
                 "expected `Bool`, found `Byte`",
             ),
@@ -98221,6 +98320,18 @@ interface facade { use middle.{payload}; }"#;
             ),
             (
                 "tuple_call_inferred_shadowing",
+                "expected `U8`, found `Byte`",
+            ),
+            (
+                "tuple_call_inferred_tuple_destructure_bool_mismatch",
+                "expected `U8`, found `Bool`",
+            ),
+            (
+                "tuple_call_inferred_tuple_destructure_var_mismatch",
+                "expected `Bool`, found `Byte`",
+            ),
+            (
+                "tuple_call_inferred_tuple_destructure_shadowing",
                 "expected `U8`, found `Byte`",
             ),
             (
@@ -98238,7 +98349,12 @@ interface facade { use middle.{payload}; }"#;
             ),
         ] {
             let paths = paths_for(name);
-            assert_eq!(paths.call_diagnostics().len(), 1, "{name}");
+            assert_eq!(
+                paths.call_diagnostics().len(),
+                1,
+                "{name}: {:?}",
+                paths.call_diagnostics()
+            );
             assert_eq!(
                 paths.call_diagnostics()[0].code,
                 sai_diagnostics::Code::TypeMismatch
@@ -98300,12 +98416,17 @@ interface facade { use middle.{payload}; }"#;
                     | "tuple_call_inferred_char_mismatch"
                     | "tuple_call_inferred_unit_mismatch"
                     | "tuple_call_inferred_shadowing"
+                    | "tuple_call_inferred_destructuring"
+                    | "tuple_call_inferred_tuple_destructure_bool_mismatch"
+                    | "tuple_call_inferred_tuple_destructure_var_mismatch"
+                    | "tuple_call_inferred_tuple_destructure_shadowing"
             ) {
                 let function_start = root
                     .find(&format!("fn {name}"))
                     .expect("inferred local mismatch function exists");
                 let (call, argument_prefix_len) = match name {
-                    "tuple_call_inferred_var_byte_mismatch" => {
+                    "tuple_call_inferred_var_byte_mismatch"
+                    | "tuple_call_inferred_tuple_destructure_var_mismatch" => {
                         ("Payload.Pair(1, actual)", "Payload.Pair(1, ".len())
                     }
                     "tuple_call_inferred_char_mismatch" => (
@@ -98317,6 +98438,11 @@ interface facade { use middle.{payload}; }"#;
                         "NestedPayload.Nested(((1, 'x'), (".len(),
                     ),
                     "tuple_call_inferred_shadowing" => {
+                        ("Payload.Pair(actual, true)", "Payload.Pair(".len())
+                    }
+                    "tuple_call_inferred_destructuring"
+                    | "tuple_call_inferred_tuple_destructure_bool_mismatch"
+                    | "tuple_call_inferred_tuple_destructure_shadowing" => {
                         ("Payload.Pair(actual, true)", "Payload.Pair(".len())
                     }
                     _ => ("Payload.Pair(actual, true)", "Payload.Pair(".len()),
@@ -98377,6 +98503,13 @@ interface facade { use middle.{payload}; }"#;
             inferred_extra.call_diagnostics()[0].code,
             sai_diagnostics::Code::WrongArgumentCount,
             "an inferred local in an unmatched extra argument receives no expected-type check"
+        );
+        let tuple_destructure_extra = paths_for("tuple_call_inferred_tuple_destructure_extra");
+        assert_eq!(tuple_destructure_extra.call_diagnostics().len(), 1);
+        assert_eq!(
+            tuple_destructure_extra.call_diagnostics()[0].code,
+            sai_diagnostics::Code::WrongArgumentCount,
+            "a tuple-destructured local in an unmatched extra argument receives no expected-type check"
         );
 
         let tuple_call_mismatch = paths_for("tuple_call_mismatch");
