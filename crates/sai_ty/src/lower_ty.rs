@@ -66,6 +66,7 @@ pub struct LowerTyContext<'a> {
     owner: OwnerId,
     paths: &'a HashMap<HirId, PathRes>,
     unit_enums: Option<&'a HashSet<DefId>>,
+    local_nongeneric_nominals: Option<&'a HashSet<DefId>>,
     region_mode: RegionMode,
     next_region_index: u32,
     failed: bool,
@@ -92,6 +93,7 @@ impl<'a> LowerTyContext<'a> {
             owner,
             paths,
             unit_enums: None,
+            local_nongeneric_nominals: None,
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             failed: false,
@@ -116,6 +118,33 @@ impl<'a> LowerTyContext<'a> {
             owner,
             paths,
             unit_enums: Some(unit_enums),
+            local_nongeneric_nominals: None,
+            region_mode: RegionMode::Signature,
+            next_region_index: 0,
+            failed: false,
+        }
+    }
+
+    /// Create a signature context that can lower only validated local unit
+    /// enums and direct, nongeneric local records/enums from the same
+    /// collection as `paths`.
+    ///
+    /// The driver derives both sets from the exact current package collection,
+    /// source snapshot, and target-filtered HIR. This crate cannot establish
+    /// that provenance on its own.
+    pub fn for_signature_with_local_nongeneric_nominals(
+        interner: &'a TyInterner,
+        owner: OwnerId,
+        paths: &'a HashMap<HirId, PathRes>,
+        unit_enums: &'a HashSet<DefId>,
+        local_nongeneric_nominals: &'a HashSet<DefId>,
+    ) -> Self {
+        Self {
+            interner,
+            owner,
+            paths,
+            unit_enums: Some(unit_enums),
+            local_nongeneric_nominals: Some(local_nongeneric_nominals),
             region_mode: RegionMode::Signature,
             next_region_index: 0,
             failed: false,
@@ -140,6 +169,7 @@ impl<'a> LowerTyContext<'a> {
             owner,
             paths,
             unit_enums: None,
+            local_nongeneric_nominals: None,
             region_mode: RegionMode::Field {
                 has_implicit_region_parameter,
             },
@@ -159,6 +189,7 @@ impl<'a> LowerTyContext<'a> {
             owner,
             paths,
             unit_enums: None,
+            local_nongeneric_nominals: None,
             region_mode: RegionMode::Body,
             next_region_index: 0,
             failed: false,
@@ -341,11 +372,15 @@ fn lower_path_ty(
         return Err(UnsupportedTy::GenericArguments);
     }
 
-    if let Res::Def(DefKind::Enum, def_id) = resolution.base {
-        return if context
-            .unit_enums
-            .is_some_and(|unit_enums| unit_enums.contains(&def_id))
-        {
+    if let Res::Def(DefKind::Struct | DefKind::Enum, def_id) = resolution.base {
+        let local_nongeneric_nominal = context
+            .local_nongeneric_nominals
+            .is_some_and(|definitions| definitions.contains(&def_id));
+        let validated_unit_enum = matches!(resolution.base, Res::Def(DefKind::Enum, _))
+            && context
+                .unit_enums
+                .is_some_and(|unit_enums| unit_enums.contains(&def_id));
+        return if local_nongeneric_nominal || validated_unit_enum {
             Ok(context.interner.intern(TyKind::Adt(def_id)))
         } else {
             Err(UnsupportedTy::NominalType)
@@ -366,9 +401,14 @@ fn lower_path_ty(
         Res::Def(DefKind::TyParam, _) => Err(UnsupportedTy::GenericParameter),
         Res::Def(DefKind::ConstParam, _) => Err(UnsupportedTy::ConstParameter),
         Res::Def(DefKind::AssocTy, _) => Err(UnsupportedTy::Projection),
-        Res::Def(DefKind::Struct | DefKind::Distinct | DefKind::Refined | DefKind::Resource, _) => {
-            Err(UnsupportedTy::NominalType)
-        }
+        Res::Def(
+            DefKind::Struct
+            | DefKind::Enum
+            | DefKind::Distinct
+            | DefKind::Refined
+            | DefKind::Resource,
+            _,
+        ) => Err(UnsupportedTy::NominalType),
         Res::Def(_, _) => Err(UnsupportedTy::WrongNameKind),
         Res::Local(_) => Err(UnsupportedTy::LocalValue),
         Res::TestOnly(_) => Err(UnsupportedTy::TestOnlyPath),
