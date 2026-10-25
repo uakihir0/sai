@@ -1,0 +1,175 @@
+use acme:community-garden-harvest-planner/model.{
+    DailyCapacity
+    HarvestAllocation
+    HarvestPlan
+    NeedOutcome
+    OutcomeStatus
+    PantryNeed
+    SupplyBed
+}
+use acme:community-garden-harvest-planner/policy
+
+fn empty_plan() -> HarvestPlan {
+    HarvestPlan(
+        allocations: Array<Option<HarvestAllocation>, 18>.filled(None),
+        allocation_count: 0,
+        outcomes: Array<Option<NeedOutcome>, 6>.filled(None),
+    )
+}
+
+fn next_need_index(needs: Array<PantryNeed, 6>, processed: Array<Bool, 6>) -> Option<USize> {
+    var selected: Option<USize> = None
+    var index: USize = 0
+
+    for need in needs {
+        if not processed[index] {
+            match selected {
+                Some(current_index) => {
+                    if policy.precedes(need, needs[current_index]) {
+                        selected = Some(index)
+                    }
+                }
+                None => {
+                    selected = Some(index)
+                }
+            }
+        }
+        index += 1
+    }
+    selected
+}
+
+fn capacity_index(capacities: Array<DailyCapacity, 3>, day: U32) -> Option<USize> {
+    var index: USize = 0
+    for capacity in capacities {
+        if capacity.day == day {
+            return Some(index)
+        }
+        index += 1
+    }
+    None
+}
+
+fn has_bed_by_deadline(beds: Array<SupplyBed, 5>, need: PantryNeed) -> Bool {
+    for bed in beds {
+        if policy.has_pick_window(bed, need) {
+            return true
+        }
+    }
+    false
+}
+
+fn has_remaining_bed_by_deadline(beds: Array<SupplyBed, 5>, need: PantryNeed) -> Bool {
+    for bed in beds {
+        if policy.has_remaining_pick_window(bed, need) {
+            return true
+        }
+    }
+    false
+}
+
+pub fn build(
+    initial_beds: Array<SupplyBed, 5>,
+    needs: Array<PantryNeed, 6>,
+    initial_capacities: Array<DailyCapacity, 3>,
+) -> HarvestPlan {
+    var remaining_beds = initial_beds
+    var remaining_capacities = initial_capacities
+    var processed: Array<Bool, 6> = Array<Bool, 6>.filled(false)
+    var plan = empty_plan()
+    var planned_needs: USize = 0
+
+    while planned_needs < needs.len() {
+        match next_need_index(needs, processed) {
+            Some(need_index) => {
+                processed[need_index] = true
+                let need = needs[need_index]
+                let has_initial_window = has_bed_by_deadline(initial_beds, need)
+                let has_remaining_window = has_remaining_bed_by_deadline(remaining_beds, need)
+                var planned_kg: U32 = 0
+                var day: U32 = 1
+
+                while day <= need.due_day {
+                    match capacity_index(remaining_capacities, day) {
+                        Some(day_index) => {
+                            var capacity_remaining = policy.minimum_three(
+                                remaining_capacities[day_index].harvest_kg,
+                                remaining_capacities[day_index].wash_pack_kg,
+                                remaining_capacities[day_index].cold_chain_kg,
+                            )
+                            var planned_today: U32 = 0
+                            var bed_index: USize = 0
+
+                            for bed in remaining_beds {
+                                if (
+                                    planned_kg < need.requested_kg
+                                    and capacity_remaining > 0
+                                    and policy.usable_on_day(bed, need, day)
+                                ) {
+                                    let still_needed = need.requested_kg - planned_kg
+                                    let kilograms = policy.minimum_three(
+                                        still_needed,
+                                        bed.remaining_kg,
+                                        capacity_remaining,
+                                    )
+                                    if kilograms > 0 {
+                                        remaining_beds[bed_index].remaining_kg -= kilograms
+                                        remaining_capacities[day_index].harvest_kg -= kilograms
+                                        remaining_capacities[day_index].wash_pack_kg -= kilograms
+                                        remaining_capacities[day_index].cold_chain_kg -= kilograms
+                                        capacity_remaining -= kilograms
+                                        planned_today += kilograms
+                                        planned_kg += kilograms
+                                    }
+                                }
+                                bed_index += 1
+                            }
+
+                            if planned_today > 0 {
+                                plan.allocations[plan.allocation_count] = Some(
+                                    HarvestAllocation(
+                                        request_id: need.request_id,
+                                        recipient: need.recipient,
+                                        crop: need.crop,
+                                        day: day,
+                                        kilograms: planned_today,
+                                    ),
+                                )
+                                plan.allocation_count += 1
+                            }
+                        }
+                        None => {}
+                    }
+                    day += 1
+                }
+
+                let unfilled_kg = need.requested_kg - planned_kg
+                let status = if planned_kg == need.requested_kg {
+                    OutcomeStatus.Fulfilled
+                } else if planned_kg > 0 {
+                    OutcomeStatus.PartiallyPlanned
+                } else if not has_initial_window {
+                    OutcomeStatus.NoBedReadyByDeadline
+                } else if not has_remaining_window {
+                    OutcomeStatus.EarlierNeedUsedProduce
+                } else {
+                    OutcomeStatus.DailyCapacityReserved
+                }
+                plan.outcomes[need_index] = Some(
+                    NeedOutcome(
+                        request_id: need.request_id,
+                        recipient: need.recipient,
+                        crop: need.crop,
+                        requested_kg: need.requested_kg,
+                        planned_kg: planned_kg,
+                        unfilled_kg: unfilled_kg,
+                        status: status,
+                    ),
+                )
+            }
+            None => {}
+        }
+        planned_needs += 1
+    }
+    plan
+}

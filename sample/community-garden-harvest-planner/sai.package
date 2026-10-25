@@ -1,0 +1,5 @@
+package acme:community-garden-harvest-planner @ 0.1.0
+compiler ^0.1
+source "src"
+targets { wasm32-core }
+description "Plan a fixed community garden harvest against pantry needs and daily handling capacity"

@@ -1,0 +1,70 @@
+use acme:community-garden-harvest-planner/model.{NeedPriority, PantryNeed, SupplyBed}
+
+pub fn precedes(left: PantryNeed, right: PantryNeed) -> Bool {
+    let left_priority = priority_rank(left.priority)
+    let right_priority = priority_rank(right.priority)
+    if left_priority < right_priority {
+        return true
+    }
+    if left_priority > right_priority {
+        return false
+    }
+    if left.due_day < right.due_day {
+        return true
+    }
+    if left.due_day > right.due_day {
+        return false
+    }
+    left.request_id < right.request_id
+}
+
+fn priority_rank(priority: NeedPriority) -> U32 {
+    match priority {
+        NeedPriority.Immediate => 1
+        NeedPriority.Standard => 2
+        NeedPriority.Flexible => 3
+    }
+}
+
+pub fn has_pick_window(bed: SupplyBed, need: PantryNeed) -> Bool {
+    (
+        bed.crop == need.crop
+        and bed.available_kg > 0
+        and bed.ready_day <= need.due_day
+        and bed.ready_day <= bed.last_pick_day
+        and bed.last_pick_day >= 1
+    )
+}
+
+pub fn has_remaining_pick_window(bed: SupplyBed, need: PantryNeed) -> Bool {
+    (
+        bed.crop == need.crop
+        and bed.remaining_kg > 0
+        and bed.ready_day <= need.due_day
+        and bed.ready_day <= bed.last_pick_day
+        and bed.last_pick_day >= 1
+    )
+}
+
+pub fn usable_on_day(bed: SupplyBed, need: PantryNeed, day: U32) -> Bool {
+    (
+        bed.crop == need.crop
+        and bed.remaining_kg > 0
+        and bed.ready_day <= day
+        and day <= bed.last_pick_day
+        and day <= need.due_day
+    )
+}
+
+pub fn minimum_three(first: U32, second: U32, third: U32) -> U32 {
+    let first_two = if first < second {
+        first
+    } else {
+        second
+    }
+    if first_two < third {
+        first_two
+    } else {
+        third
+    }
+}

@@ -1,0 +1,113 @@
+use acme:community-garden-harvest-planner/model.{
+    Crop
+    DailyCapacity
+    NeedPriority
+    PantryNeed
+    SupplyBed
+}
+
+pub fn supply_beds() -> Array<SupplyBed, 5> {
+    [
+        SupplyBed(
+            bed_id: 101,
+            crop: Crop.Tomatoes,
+            available_kg: 18,
+            remaining_kg: 18,
+            ready_day: 1,
+            last_pick_day: 1,
+        ),
+        SupplyBed(
+            bed_id: 102,
+            crop: Crop.Tomatoes,
+            available_kg: 24,
+            remaining_kg: 24,
+            ready_day: 2,
+            last_pick_day: 3,
+        ),
+        SupplyBed(
+            bed_id: 201,
+            crop: Crop.LeafyGreens,
+            available_kg: 12,
+            remaining_kg: 12,
+            ready_day: 1,
+            last_pick_day: 1,
+        ),
+        SupplyBed(
+            bed_id: 301,
+            crop: Crop.Zucchini,
+            available_kg: 14,
+            remaining_kg: 14,
+            ready_day: 1,
+            last_pick_day: 2,
+        ),
+        SupplyBed(
+            bed_id: 401,
+            crop: Crop.Beans,
+            available_kg: 10,
+            remaining_kg: 10,
+            ready_day: 2,
+            last_pick_day: 3,
+        ),
+    ]
+}
+
+pub fn pantry_needs() -> Array<PantryNeed, 6> {
+    [
+        PantryNeed(
+            request_id: 606,
+            recipient: "East Pantry",
+            crop: Crop.LeafyGreens,
+            requested_kg: 6,
+            priority: NeedPriority.Flexible,
+            due_day: 1,
+        ),
+        PantryNeed(
+            request_id: 604,
+            recipient: "Community Kitchen",
+            crop: Crop.Zucchini,
+            requested_kg: 10,
+            priority: NeedPriority.Standard,
+            due_day: 2,
+        ),
+        PantryNeed(
+            request_id: 605,
+            recipient: "Senior Kitchen",
+            crop: Crop.Beans,
+            requested_kg: 12,
+            priority: NeedPriority.Standard,
+            due_day: 3,
+        ),
+        PantryNeed(
+            request_id: 602,
+            recipient: "South Kitchen",
+            crop: Crop.LeafyGreens,
+            requested_kg: 8,
+            priority: NeedPriority.Immediate,
+            due_day: 1,
+        ),
+        PantryNeed(
+            request_id: 603,
+            recipient: "School Pantry",
+            crop: Crop.Tomatoes,
+            requested_kg: 16,
+            priority: NeedPriority.Immediate,
+            due_day: 2,
+        ),
+        PantryNeed(
+            request_id: 601,
+            recipient: "North Pantry",
+            crop: Crop.Tomatoes,
+            requested_kg: 10,
+            priority: NeedPriority.Immediate,
+            due_day: 1,
+        ),
+    ]
+}
+
+pub fn daily_capacities() -> Array<DailyCapacity, 3> {
+    [
+        DailyCapacity(day: 1, harvest_kg: 22, wash_pack_kg: 20, cold_chain_kg: 16),
+        DailyCapacity(day: 2, harvest_kg: 24, wash_pack_kg: 22, cold_chain_kg: 18),
+        DailyCapacity(day: 3, harvest_kg: 20, wash_pack_kg: 18, cold_chain_kg: 12),
+    ]
+}
