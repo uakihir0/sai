@@ -10193,6 +10193,11 @@ fn check_local_enum_variant_literal_argument(
             && let Some(actual_primitive) = local_enum_variant_parameter_primitive(
                 value, hir_owner, body, locals, type_paths, symbols, inputs,
             )
+            .or_else(|| {
+                local_enum_variant_annotated_local_primitive(
+                    value, body, locals, type_paths, symbols, inputs,
+                )
+            })
         {
             diagnostics.push(const_literal_diagnostic(
                 owner,
@@ -98118,10 +98123,25 @@ interface facade { use middle.{payload}; }"#;
             "fn nested_call_tuple_param_unit_exclusion(actual: ()) { NestedPayload.Single(actual) }\n",
             "fn nested_call_tuple_param_nominal_exclusion(actual: Widget) { NestedPayload.Single(actual) }\n",
             "fn nested_call_tuple_param_tuple_path_exclusion(actual: (I8,)) { NestedPayload.Single(actual) }\n",
-            "fn nested_call_tuple_param_local_exclusion() {\n    let actual: Bool = true\n    NestedPayload.Single(actual)\n}\n",
-            "fn nested_call_tuple_param_shadow_exclusion(actual: Bool) {\n    let actual: I8 = 1\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_unannotated_local_exclusion() {\n    let actual = true\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_param_shadow_exclusion(actual: Bool) {\n    let actual = true\n    NestedPayload.Single(actual)\n}\n",
             "fn bool_factory() -> Bool { true }\n",
             "fn nested_call_tuple_param_call_exclusion() { NestedPayload.Single(bool_factory()) }\n",
+            "fn nested_call_tuple_annotated_let_outer_mismatch() {\n    let actual: Bool = 'x'\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_annotated_var_outer_mismatch() {\n    var actual: Byte = b'x'\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_annotated_nested_mismatch() {\n    let actual: USize = 'x'\n    NestedPayload.Nested((actual, ((), 2)))\n}\n",
+            "fn nested_call_tuple_annotated_sibling_order() {\n    var actual: Bool = 'x'\n    NestedPayload.Nested((actual, ((), true)))\n}\n",
+            "fn nested_call_tuple_annotated_shadow_mismatch(actual: Byte) {\n    let actual: Bool = 'x'\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_annotated_named_extra(extra: Bool) {\n    let actual: Bool = 'x'\n    NestedPayload.Single(value: actual, extra: extra)\n}\n",
+            "fn nested_call_tuple_annotated_extra_exclusion() {\n    let extra: Bool = true\n    NestedPayload.Single((1,), extra)\n}\n",
+            "fn nested_call_tuple_annotated_nested_scope_exclusion() {\n    {\n        let actual: Bool = 'x'\n        NestedPayload.Single(actual)\n    }\n}\n",
+            "fn nested_call_tuple_annotated_else_exclusion() {\n    let actual: Bool = 'x' else { return }\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_annotated_alias_exclusion() {\n    let actual: BoolAlias = true\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_annotated_str_exclusion() {\n    let actual: Str = \"text\"\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_annotated_unit_exclusion() {\n    let actual: () = ()\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_annotated_nominal_exclusion() {\n    let actual: Widget = true\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_type_exclusion() {\n    let actual: (I8,) = (1,)\n    NestedPayload.Single(actual)\n}\n",
+            "fn nested_call_tuple_annotated_tuple_pattern_exclusion() {\n    let (actual, _): (Bool, Bool) = (true, false)\n    NestedPayload.Single(actual)\n}\n",
             "fn nested_call_annotated_mismatch() {\n    let actual: USize = 2\n    NestedPayload.Nested(((actual, 'x'), ((), 2)))\n}\n",
             "fn tuple_call_shadowed(actual: Bool) { let actual: U8 = 1; Payload.Pair(actual, true) }\n",
             "fn tuple_call_named_param_mismatch(actual: Bool) { Payload.Pair(left: actual, true) }\n",
@@ -98716,9 +98736,17 @@ interface facade { use middle.{payload}; }"#;
             "nested_call_tuple_param_unit_exclusion",
             "nested_call_tuple_param_nominal_exclusion",
             "nested_call_tuple_param_tuple_path_exclusion",
-            "nested_call_tuple_param_local_exclusion",
             "nested_call_tuple_param_shadow_exclusion",
             "nested_call_tuple_param_call_exclusion",
+            "nested_call_tuple_unannotated_local_exclusion",
+            "nested_call_tuple_annotated_nested_scope_exclusion",
+            "nested_call_tuple_annotated_else_exclusion",
+            "nested_call_tuple_annotated_alias_exclusion",
+            "nested_call_tuple_annotated_str_exclusion",
+            "nested_call_tuple_annotated_unit_exclusion",
+            "nested_call_tuple_annotated_nominal_exclusion",
+            "nested_call_tuple_annotated_tuple_type_exclusion",
+            "nested_call_tuple_annotated_tuple_pattern_exclusion",
             "tuple_call_inferred_fixed_locals_ok",
             "tuple_call_inferred_nested_scope",
             "tuple_call_inferred_nested_scope_only",
@@ -98904,6 +98932,22 @@ interface facade { use middle.{payload}; }"#;
                 "expected tuple of arity 2, found `Byte`",
             ),
             (
+                "nested_call_tuple_annotated_let_outer_mismatch",
+                "expected tuple of arity 1, found `Bool`",
+            ),
+            (
+                "nested_call_tuple_annotated_var_outer_mismatch",
+                "expected tuple of arity 1, found `Byte`",
+            ),
+            (
+                "nested_call_tuple_annotated_nested_mismatch",
+                "expected tuple of arity 2, found `USize`",
+            ),
+            (
+                "nested_call_tuple_annotated_shadow_mismatch",
+                "expected tuple of arity 1, found `Bool`",
+            ),
+            (
                 "tuple_call_unicode_param_mismatch",
                 "expected `U8`, found `Bool`",
             ),
@@ -99082,6 +99126,40 @@ interface facade { use middle.{payload}; }"#;
             assert_primary_span(&paths.call_diagnostics()[0], argument_start, "actual".len());
         }
 
+        for (name, call, argument_prefix_len) in [
+            (
+                "nested_call_tuple_annotated_let_outer_mismatch",
+                "NestedPayload.Single(actual)",
+                "NestedPayload.Single(".len(),
+            ),
+            (
+                "nested_call_tuple_annotated_var_outer_mismatch",
+                "NestedPayload.Single(actual)",
+                "NestedPayload.Single(".len(),
+            ),
+            (
+                "nested_call_tuple_annotated_nested_mismatch",
+                "NestedPayload.Nested((actual, ((), 2)))",
+                "NestedPayload.Nested((".len(),
+            ),
+            (
+                "nested_call_tuple_annotated_shadow_mismatch",
+                "NestedPayload.Single(actual)",
+                "NestedPayload.Single(".len(),
+            ),
+        ] {
+            let paths = paths_for(name);
+            let function_start = root
+                .find(&format!("fn {name}"))
+                .expect("annotated tuple-expected local function exists");
+            let argument_start = function_start
+                + root[function_start..]
+                    .find(call)
+                    .expect("annotated tuple-expected local call exists")
+                + argument_prefix_len;
+            assert_primary_span(&paths.call_diagnostics()[0], argument_start, "actual".len());
+        }
+
         let parameter_sibling_order = paths_for("nested_call_tuple_param_sibling_order");
         let parameter_sibling_diagnostics = parameter_sibling_order
             .call_diagnostics()
@@ -99176,6 +99254,110 @@ interface facade { use middle.{payload}; }"#;
                 .count(),
             1,
             "outer arity diagnostics remain independent"
+        );
+
+        let annotated_sibling_order = paths_for("nested_call_tuple_annotated_sibling_order");
+        let annotated_sibling_diagnostics = annotated_sibling_order
+            .call_diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            annotated_sibling_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "expected tuple of arity 2, found `Bool`",
+                "expected `USize`, found a Bool literal",
+            ],
+            "an annotated local mismatch stops at its path and eligible siblings remain source ordered"
+        );
+        assert_eq!(
+            annotated_sibling_diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic_primary_text(diagnostic))
+                .collect::<Vec<_>>(),
+            ["actual", "true"]
+        );
+        let annotated_sibling_function_start = root
+            .find("fn nested_call_tuple_annotated_sibling_order()")
+            .expect("annotated sibling function exists");
+        let annotated_sibling_call_start = annotated_sibling_function_start
+            + root[annotated_sibling_function_start..]
+                .find("NestedPayload.Nested((actual, ((), true)))")
+                .expect("annotated sibling call exists");
+        assert_primary_span(
+            annotated_sibling_diagnostics[0],
+            annotated_sibling_call_start + "NestedPayload.Nested((".len(),
+            "actual".len(),
+        );
+        assert_primary_span(
+            annotated_sibling_diagnostics[1],
+            annotated_sibling_call_start + "NestedPayload.Nested((actual, ((), ".len(),
+            "true".len(),
+        );
+
+        let annotated_named_extra = paths_for("nested_call_tuple_annotated_named_extra");
+        assert_eq!(
+            annotated_named_extra
+                .call_diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+                .count(),
+            1,
+            "the signature-backed annotated local value is checked even on a named call"
+        );
+        assert_eq!(
+            annotated_named_extra
+                .call_diagnostics()
+                .iter()
+                .filter(
+                    |diagnostic| diagnostic.code == sai_diagnostics::Code::NamedArgumentOnFunction
+                )
+                .count(),
+            2,
+            "named-argument diagnostics remain independent for annotated locals"
+        );
+        assert_eq!(
+            annotated_named_extra
+                .call_diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.code == sai_diagnostics::Code::WrongArgumentCount)
+                .count(),
+            1,
+            "the unmatched named argument keeps its outer arity diagnostic"
+        );
+        let annotated_named_mismatch = annotated_named_extra
+            .call_diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.code == sai_diagnostics::Code::TypeMismatch)
+            .expect("the annotated named value receives a tuple mismatch");
+        assert_eq!(
+            annotated_named_mismatch.message,
+            "expected tuple of arity 1, found `Bool`"
+        );
+        assert_eq!(diagnostic_primary_text(annotated_named_mismatch), "actual");
+        let annotated_named_function_start = root
+            .find("fn nested_call_tuple_annotated_named_extra")
+            .expect("annotated named function exists");
+        let annotated_named_call = "NestedPayload.Single(value: actual, extra: extra)";
+        let annotated_named_call_start = annotated_named_function_start
+            + root[annotated_named_function_start..]
+                .find(annotated_named_call)
+                .expect("annotated named call exists");
+        assert_primary_span(
+            annotated_named_mismatch,
+            annotated_named_call_start + "NestedPayload.Single(value: ".len(),
+            "actual".len(),
+        );
+
+        let annotated_extra = paths_for("nested_call_tuple_annotated_extra_exclusion");
+        assert_eq!(annotated_extra.call_diagnostics().len(), 1);
+        assert_eq!(
+            annotated_extra.call_diagnostics()[0].code,
+            sai_diagnostics::Code::WrongArgumentCount,
+            "an annotated local in an unmatched extra argument receives no expected-type check"
         );
 
         let named_parameter_mismatch = paths_for("tuple_call_named_param_mismatch");
