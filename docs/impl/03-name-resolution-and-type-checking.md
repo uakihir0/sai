@@ -763,6 +763,31 @@ HIR keeps `a.b.C` as nested `Field` expressions over `Path(a)` ([impl/02](02-fro
 
 Type paths and pattern paths have explicit segments in HIR (`TyKind::Path`, `PatKind::Ctor`) and are resolved by the same procedure without the field-chain step.
 
+**Direct local enum variant heads (IR-921).** The driver also resolves a direct
+`E.V` expression, and a module-qualified enum head such as
+`module_alias.E.V`, when the source-map AST proves that the suffix is a bare
+field on an unparenthesized path/qualified-path chain with no generic
+arguments. The complete type prefix must consume through the existing module
+prefix resolver and identify the exact enum `DefId` and owner in the current
+validated local type-owner projection. The result retains the suffix `Field`
+HIR ID, the prefix expression and root path HIR IDs, both source spans, the
+enum owner/definition, and the exact variant `DefId`; a same-named variant in
+another enum cannot match. `UNKNOWN_VARIANT` is attached to the suffix name,
+and its suggestions come only from that enum. A positively resolved local
+nominal non-enum produces `UNKNOWN_VARIANT` with the non-enum explanation.
+Generic and otherwise unsupported local enums retain typed unsupported
+outcomes. The AST shape check rejects `(E).V`, while `(E.V)` still denotes the
+inner path; a trailing value field in `E.V.other` is not promoted to another
+variant candidate. When the field is a call callee, `E.V()` retains only the
+inner `E.V` path result; this slice does not type or check the call. A local
+receiver such as `e.V` remains a value member path.
+The resolver uses the current package collection, snapshot, active source
+member closure, WIT-view closure, and test-only import filtering. Unresolved,
+external, dependency/WIT, and type-alias heads remain outside this local
+subset. This records path identity only; it does not record
+`type_dependent_defs`, synthesize expression types, or change constructor-call
+checking.
+
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
 implements the segment-consumption step after a caller has resolved the first
 name. It follows module/interface members, stops before a suffix whose current
@@ -1793,6 +1818,50 @@ Predicates are stored unelaborated. Elaboration (spec/05 §5.7.4) is done once p
 
 Record constructors have no `type_of` as a value (spec/06 `RECORD_CONSTRUCTOR_AS_VALUE`).
 
+**Implemented subset (IR-921):** Function-owner resolution now exposes
+`LocalEnumVariantPathResolution`, including a scope-validated accessor. Each
+entry preserves the exact candidate `Field` node, base expression and root
+path HIR IDs, suffix/full spans, and a typed outcome. A direct bare `E.V`
+candidate resolves only when the full type prefix is consumed through the
+existing module-prefix resolver and matches the exact local enum owner and
+supported local enum ADT projection. The selected variant is matched by exact
+name within that projection and the returned outcome contains its exact
+variant `DefId`; unknown variants retain that enum's candidate names and emit
+`UNKNOWN_VARIANT` with suggestions drawn only from that enum. A validated
+local nominal non-enum receives a typed `NotEnum` outcome and diagnostic.
+That `UNKNOWN_VARIANT` diagnostic includes the specified `Note` child
+`` `P` is not an enum ``. If an invalid enum repeats a variant name, this
+path-recovery slice deterministically selects the earliest source-ordered
+declaration. The spec's `DUPLICATE_VARIANT` rule still applies to the later
+declaration under §3.6.4; this bounded path resolver does not add or claim to
+emit that diagnostic.
+Unsupported generic and other failed enum projections preserve typed reasons.
+The source-map AST check distinguishes `E.V` and `(E.V)` from `(E).V`, rejects
+generic field arguments and non-path/value receivers, and leaves a trailing
+value field such as `E.V.other` outside the variant result. Current collection,
+snapshot, source-member, WIT-view and test-only-import checks remain in force.
+This does not record expression types or type-dependent definitions, or add
+tuple constructor-call behavior.
+
+**IR-921 compatibility decisions and review record:** A direct enum-variant
+path is recognized from the source AST as well as HIR because HIR erases
+parentheses; this makes `(E).V` remain a value-field form while `(E.V)` keeps
+the inner direct path. Qualified module prefixes are accepted only when the
+existing resolver consumes the whole prefix to the exact validated local enum
+owner. Variant identity is exact and enum-local, and suggestions are likewise
+restricted to that enum. `NotEnum` is emitted only for a positively resolved
+local nominal type represented by the current validated type-owner collection.
+Generic/unsupported enums keep typed unsupported outcomes, while unresolved,
+dependency/WIT and type-alias heads remain deferred because this slice cannot
+prove their local owner/variant identity. The richer result retains the exact
+enum owner and variant `DefId` for the follow-up type-recording slice; it does not
+claim `type_of`, `type_dependent_defs`, call checking or broader source
+acceptance. **Review required:** verify the source-map parenthesis/full-span
+checks, exact prefix consumption and enum-owner pairing, enum-local candidate
+and diagnostic behavior, test-only/module/source/WIT provenance, and the
+deferred boundaries above. Focused verification is recorded in
+`docs/design/implementation-review.md` under IR-921.
+
 ### 3.6.4 `adt_def`
 
 `adt_def(def) -> Arc<AdtDef>` describes a nominal type:
@@ -2324,6 +2393,19 @@ A value path whose prefix resolves to a type, `Self`, a type parameter, a projec
 2. A LIDENT segment searches `inherent_impls(head(P))` for methods and associated functions alike; then the traits in scope (with rule 3 for `P` itself) for an item whose trait `P: Tr` does not fail; one trait selects it, two or more are `AMBIGUOUS_METHOD`. `R.try_from` on a refined type or a distinct type with a refinement clause is found at the inherent step, as the compiler-provided function `fn(B) -> Option<R>` (spec/09 N-C-41), recorded as `TypeDependentDef::RefinedTryFrom(R)`.
 3. `Tr.name` names the trait item; `Self` is a fresh `σ` with the obligation `σ: Tr<fresh>`, inferred from the arguments. A path `T.name` with `T` a type parameter searches only the traits of `T`'s bounds.
 4. Nothing found is `METHOD_NOT_FOUND` with the additions of §3.9.4. A `Drop.drop` path is `EXPLICIT_DROP_CALL`.
+
+IR-921 implements a bounded subset of rule 1 for direct, bare suffixes on
+validated local non-generic enum heads. It preserves the exact enum owner and
+variant `DefId` in the function-owner resolution so a later type-checking
+slice can pair the path with the validated variant value-type projection. A
+known local nominal non-enum receives the specified `UNKNOWN_VARIANT`
+non-enum diagnostic; an unsupported enum retains its reason. The
+implementation does not add a general type-relative query, record
+`type_dependent_defs`, type the expression, or change constructor calls.
+Parenthesized receivers, local value receivers, explicit generic arguments on
+the candidate path, and unresolved or external heads are not accepted as
+direct local enum paths; a validated local generic enum declaration without
+path arguments retains an `UnsupportedEnum` result.
 
 Path calls perform no auto-deref and no auto-reference; every argument, the receiver included, is an ordinary argument at a coercion site (spec/05 §5.13.6). The selected item and its arguments are recorded in `type_dependent_defs`. Further `Field` nodes after a resolved value segment are field accesses or method calls on that value.
 
