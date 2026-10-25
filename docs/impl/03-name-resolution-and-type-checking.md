@@ -781,9 +781,10 @@ inner path; a trailing value field in `E.V.other` is not promoted to another
 variant candidate. When the field is a call callee, `E.V()` retains only the
 inner `E.V` path result; a separate occurrence-keyed projection checks limited
 call semantics for supported local enum variant calls. IR-924 checks arity,
-IR-925 diagnoses named arguments, IR-926 checks direct literal arguments, and
-IR-927 checks aligned tuple-literal leaves at tuple-variant coercion sites. A
-local receiver such as `e.V` remains a value member path.
+IR-925 diagnoses named arguments, IR-926 checks direct literal arguments,
+IR-927 checks aligned tuple-literal leaves at tuple-variant coercion sites, and
+IR-928 checks direct primitive function-parameter paths by resolved binding
+identity. A local receiver such as `e.V` remains a value member path.
 The resolver uses the current package collection, snapshot, active source
 member closure, WIT-view closure, and test-only import filtering. Unresolved,
 external, dependency/WIT, and type-alias heads remain outside this local
@@ -1965,6 +1966,24 @@ shapes, and all IR-926 path exclusions remain outside this slice. No
 `call_kinds`, general expression type results, or source-acceptance claim is
 added; `sai check` remains behind its incomplete-stage gate.
 
+**Implemented subset (IR-928):** At the same direct local non-generic
+tuple-variant call sites, a single-segment plain path is checked when local
+resolution identifies it as a function parameter binding and both the
+constructor input and declared parameter type are supported primitives. The
+binding ID selects the body parameter, which must align by position, name, and
+mutability with its top-level HIR function signature parameter. Equal primitive
+types pass; different primitive types emit `TYPE_MISMATCH` at the argument path
+span. Both immutable and mutable parameters are eligible. The check applies at
+outer arguments and at leaves reached by IR-927's equal-arity tuple walk.
+Named arguments retain their written positional parameter. Same-spelled local
+bindings, fields, constants, method receivers, closure parameters, and
+non-primitive or unsupported parameter types are not checked. Raw or non-ASCII
+single-segment paths remain eligible when local resolution identifies the
+parameter binding. This does not add
+coercions, numeric widening, local type inference, general expression type
+results, `call_kinds`, or source acceptance; `sai check` remains behind its
+incomplete-stage gate.
+
 ### 3.6.4 `adt_def`
 
 `adt_def(def) -> Arc<AdtDef>` describes a nominal type:
@@ -2291,7 +2310,7 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 
 **Tuple variants and distinct construction** are calls of the constructor's `FnDef` (§3.6.3). `D(e)` with a refinement clause is a B→R conversion recorded for [impl/04](04-mir.md) (§3.13.1). Unit variants with an argument list are `WRONG_ARGUMENT_COUNT`.
 
-**IR-924/IR-925 local enum-call slices.** For a direct callee path to a
+**IR-924–IR-928 local enum-call slices.** For a direct callee path to a
 supported, local, non-generic enum variant, the owner result records a call
 entry under the call expression's `HirId`, retaining the exact callee field,
 enum owner, enum and variant `DefId`s, and source-ordered argument `HirId`s.
@@ -2302,11 +2321,14 @@ tuple and unit calls, each named argument emits `NAMED_ARGUMENT_ON_FUNCTION`
 on its exact name span; this is independent of arity, which still counts every
 argument positionally. Record variants remain on the named-field construction
 path and receive no positional call entry or named-function-argument
-diagnostic. This projection does not type-check argument expressions, bind
-named arguments to parameters, populate `TypeckResults::call_kinds`, or accept
-generic, external, dependency, or WIT variant paths. `sai check` reports these
-staged call diagnostics while retaining its existing incomplete-stage gate;
-it does not claim full check coverage or emit a success result for these inputs.
+diagnostic. IR-926/927 check direct primitive and unit literals plus aligned
+tuple-literal leaves against the constructor signature; IR-928 checks direct
+primitive parameter paths by resolved binding identity. These are limited
+argument checks: named arguments are not bound by their names, and general
+expression typing, `TypeckResults::call_kinds`, and generic, external,
+dependency, or WIT variant paths remain outside the projection. `sai check`
+reports the staged diagnostics while retaining its incomplete-stage gate; it
+does not claim full check coverage or emit a success result for these inputs.
 
 **Tuples and arrays.** A tuple with an expected tuple type of the same arity checks the elements against the element types; otherwise each element is synthesized. An array with an expected `Array<U, m>` checks the elements at coercion sites against `U` and reports `ARRAY_LENGTH_MISMATCH` when `m ≠ n` (with `m` an unresolved `κ`, the constant is unified with `n`); without an expectation the first element is synthesized and the rest are checked against it; `[]` without an expected element type is `TYPE_ANNOTATIONS_NEEDED`. `Array.filled(x)` is a call of the lang item `ArrayFilled`; its `T: Copy` bound is registered as `Goal::Copy(T, CopyOrigin::ArrayFilled)`, whose failure is `UNSATISFIED_BOUND` naming `Copy` and N-C-18.
 
