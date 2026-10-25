@@ -39,6 +39,9 @@ Establishment watering: 296/300 L reserved; 4 L remain
    It rejects species that do not fit a site's drainage or physical clearances,
    are out of stock, exceed the district cap, or need more than the remaining
    water budget. It reserves inventory and water only after choosing a tree.
+   When several constraints block different otherwise-compatible species, the
+   hold reason names the furthest eligibility stage reached: site fit, nursery
+   stock, district diversity, then water budget.
 4. When several species remain feasible, the planner picks the one least
    represented in that district, then the one with lower establishment water,
    then the lower species ID.
@@ -53,7 +56,8 @@ soil, utilities, roots, mature canopy, pests, climate, nursery deliveries,
 watering infrastructure, or maintenance crews. Every fit check assumes the
 fixture's measurements are correct. A selected tree is a candidate for
 professional review, not a recommendation to plant that species at a real
-site.
+site. The planner also expects site and species IDs to be unique; it does not
+validate arbitrary caller-provided identifiers.
 
 ## Review required
 
