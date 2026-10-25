@@ -814,7 +814,7 @@ subset. This path result records path identity only; it does not record
 `type_dependent_defs` or synthesize expression types. That sentence describes
 the original IR-921 recognition slice: IR-922/923 later add the value-type and
 type-dependent-definition projections to the per-owner result. IR-924 through
-IR-942 add limited constructor-call diagnostics without claiming general
+IR-943 add limited constructor-call diagnostics without claiming general
 expression types. IR-938 reports nonempty tuple literals supplied where
 supported primitive or unit payloads are expected. IR-939 reports direct
 fixed-type Bool, Byte, Char, or unit literals supplied where nonempty tuple
@@ -829,6 +829,11 @@ IR-942 adds direct paths to unannotated outer-block `let`/`var` locals only
 when their initializers are direct Bool, Byte, Char, or unit literals. It
 resolves the exact local binding and excludes tuple-pattern bindings,
 numeric/defaulted or floating literals, and computed initializers.
+IR-943 adds direct paths to unannotated tuple-pattern locals when the pattern
+and initializer recursively have the same shape and arity through at most
+three tuple nodes and every initializer leaf, including wildcard siblings, is
+a direct fixed-type Bool, Byte, Char, or unit literal. It retains exact
+`BindingId` and binding-mode checks; annotated tuple patterns remain separate.
 
 **Current module-prefix walker (IR-499).** `sai_resolve::module_path::resolve_module_prefix`
 implements the segment-consumption step after a caller has resolved the first
@@ -2084,6 +2089,26 @@ rule to a small fixed-type initializer set without extending general local or
 expression inference, coercions, `call_kinds`, expression type results, source
 acceptance, or the `sai check` incomplete-stage gate.
 
+**Implemented subset (IR-943):** At those same call sites, also accept a
+direct path resolving to a simple binding leaf in an unannotated tuple-pattern
+`let` declared directly in the function body's outer block. Resolve the path
+to its exact `BindingId` and require the matching `BindingKind::Pattern`,
+binding name, and `BindingMode`. The pattern and initializer must recursively
+have identical tuple shape and arity, with no more than three tuple nodes
+counting the outer tuple. Every leaf, including one matched by `_`, must be a
+direct fixed-type Bool, Byte, Char, or unit literal. A selected leaf path at a
+nonempty expected tuple input emits one `TYPE_MISMATCH` on its full path span;
+the check stops at that path. This applies to signature-backed outer
+arguments and nested leaves reached by equal-arity tuple traversal, while
+eligible sibling diagnostics remain in source order. Exclude annotated
+patterns, `else` declarations, nested scopes, depth-four patterns,
+shape/arity mismatches, complex patterns, numeric or computed leaves,
+unsupported wildcard siblings, and unmatched extra arguments. This reuses
+IR-935's bounded fixed-literal projection; it adds no general pattern typing,
+initializer inference, tuple-shape diagnostic, coercion, `call_kinds`,
+expression type results, source-acceptance claim, or change to the
+`sai check` incomplete-stage gate.
+
 **Implemented subset (IR-928):** At the same direct local non-generic
 tuple-variant call sites, a single-segment plain path is checked when local
 resolution identifies it as a function parameter binding and both the
@@ -2520,7 +2545,7 @@ pub enum BodyKind { Fn { is_main: bool, is_free_or_inherent: bool }, AsyncFn, Cl
 
 **Tuple variants and distinct construction** are calls of the constructor's `FnDef` (§3.6.3). `D(e)` with a refinement clause is a B→R conversion recorded for [impl/04](04-mir.md) (§3.13.1). Unit variants with an argument list are `WRONG_ARGUMENT_COUNT`.
 
-**IR-924–IR-942 local enum-call slices.** For a direct callee path to a
+**IR-924–IR-943 local enum-call slices.** For a direct callee path to a
 supported, local, non-generic enum variant, the owner result records a call
 entry under the call expression's `HirId`, retaining the exact callee field,
 enum owner, enum and variant `DefId`s, and source-ordered argument `HirId`s.
@@ -2563,9 +2588,16 @@ binding-mode checks while ignoring initializers. Both apply at outer arguments
 and nested leaves. IR-942 also checks direct paths to unannotated simple
 outer-block `let`/`var` locals when their initializers are fixed Bool, Byte,
 Char, or unit literals, after excluding tuple-pattern bindings and matching
-the exact resolved `BindingId`. Empty tuple/unit and `(e)` versus `(e,)` retain
-their distinct meanings; numeric defaulting, floating and computed initializers,
-other paths, nested locals, tuple patterns, calls, coercions, aliases, and
+the exact resolved `BindingId`. IR-943 additionally checks paths to simple
+binding leaves in unannotated outer-block tuple patterns when pattern and
+initializer recursively match in shape and arity through at most three tuple
+nodes and every initializer leaf, including wildcard siblings, is a direct
+fixed-type Bool, Byte, Char, or unit literal. The selected binding's exact
+`BindingId`, name, pattern kind, and mode must match. Annotated patterns,
+`else` declarations, nested scopes, depth-four patterns, shape/arity
+mismatches, complex patterns, numeric or computed leaves, and unsupported
+wildcard siblings remain excluded. Empty tuple/unit and `(e)` versus `(e,)`
+retain their distinct meanings; other paths, calls, coercions, aliases, and
 unsupported payload types remain excluded. These diagnostics preserve eligible
 sibling checks, independent named-argument and outer-arity errors, and the CLI
 incomplete-stage gate.
