@@ -1,14 +1,16 @@
 //! Interned semantic types shared by declaration and body checking.
 //!
 //! This is an early semantic type kernel. It represents primitive types,
-//! tuples, references, arrays with literal lengths, function pointers,
-//! owner-bound function type parameters, and nominal identities with explicit
-//! type arguments. Signature lowering currently limits arrays to the resolved
-//! built-in `Array` with a nonnegative target-fitting literal length, function
-//! pointers to signatures without effects or borrowed/generic children, and
-//! generic nominal applications to validated direct local records and enums
-//! with region-free fields or payloads. Projections, inference variables, and
-//! error types remain for later slices.
+//! tuples, references, arrays with literal or enclosing `USize` const lengths,
+//! function pointers, owner-bound function type parameters, and nominal
+//! identities with explicit type arguments. Signature lowering currently
+//! limits arrays to the resolved built-in `Array` with either a nonnegative
+//! target-fitting literal length or an exact enclosing function const parameter
+//! of type `USize`. Function pointers have no effects or borrowed children and
+//! may refer to their enclosing function's validated type and const parameters.
+//! Generic nominal applications are limited to validated direct local records
+//! and enums with region-free fields or payloads. Projections, inference
+//! variables, and error types remain for later slices.
 
 use sai_hir::{DefId, Mutability, Safety, Symbol};
 use std::collections::HashMap;
