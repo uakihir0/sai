@@ -86,6 +86,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`reproducible-pipeline-planner`](reproducible-pipeline-planner/README.md) | Validate workflow dependencies and schedule ready tasks in deterministic batches under worker and shared-resource limits, propagating invalid or failed prerequisites. |
 | Advanced | [`mentorship-matching`](mentorship-matching/README.md) | Match fictional mentees to mentors with bounded deferred acceptance, topic eligibility, capacities, strict preferences, and an auditable proposal trail. |
 | Advanced | [`multi-region-failover-planner`](multi-region-failover-planner/README.md) | Plan dependency-ordered service recovery waves under replica RPO freshness, dependency-aware RTO, ranked regional targets, capacity reservations, and explicit holds. |
+| Advanced | [`tool-library-loan-scheduler`](tool-library-loan-scheduler/README.md) | Schedule multi-day community tool loans against returning stock, repair capacity, safety badges, member loan limits, duplicate holds, and ordered rejection reasons. |
 | Advanced | [`urban-tree-planting-planner`](urban-tree-planting-planner/README.md) | Match urban planting sites to tree species under soil and clearance limits, district diversity, nursery stock, and a shared establishment-watering budget. |
 
 Most of the more involved examples use fixed fixtures and in-memory
