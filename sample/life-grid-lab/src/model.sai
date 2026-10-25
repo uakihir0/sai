@@ -1,0 +1,13 @@
+pub const SIDE: USize = 5
+pub const CELL_COUNT: USize = 25
+pub const MAX_GENERATIONS: USize = 8
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub type Board {
+    pub cells: Array<Bool, CELL_COUNT>
+}
+
+@derive(Copy, Clone, PartialEq, Eq)
+pub enum SimulationError {
+    TooManyGenerations
+}

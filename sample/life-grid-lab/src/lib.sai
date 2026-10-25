@@ -1,0 +1,61 @@
+use acme:life-grid-lab/fixtures
+use acme:life-grid-lab/model.{Board, CELL_COUNT, SimulationError}
+use acme:life-grid-lab/simulation
+
+pub fn evolve(board: Board, generations: USize) -> Result<Board, SimulationError> {
+    simulation.advance(board, generations)
+}
+
+pub fn step(board: Board) -> Board {
+    simulation.next_generation(board)
+}
+
+test "a blinker alternates orientation and returns after two generations" {
+    let start = fixtures.horizontal_blinker()
+    let vertical = step(start)
+    let after_two = evolve(start, 2).unwrap()
+
+    assert vertical.cells[7]
+    assert vertical.cells[12]
+    assert vertical.cells[17]
+    assert not vertical.cells[11]
+    assert not vertical.cells[13]
+    assert after_two == start
+}
+
+test "a stable block remains unchanged" {
+    let block = fixtures.block()
+    assert step(block) == block
+}
+
+test "a live cell with no neighbors dies" {
+    let isolated = fixtures.isolated_cell()
+    let next = step(isolated)
+
+    assert not next.cells[12]
+    assert next.cells == Array<Bool, CELL_COUNT>.filled(false)
+}
+
+test "a live cell with eight neighbors dies from overpopulation" {
+    let crowded = fixtures.overcrowded_block()
+    let next = step(crowded)
+
+    assert not next.cells[12]
+}
+
+test "the finite boundary does not wrap corner neighbors to the opposite edge" {
+    let triad = fixtures.opposite_edge_triad()
+    let next = step(triad)
+
+    assert next.cells == Array<Bool, CELL_COUNT>.filled(false)
+    assert not next.cells[24]
+}
+
+test "zero generations preserves the input and excess work is rejected" {
+    let start = fixtures.horizontal_blinker()
+
+    assert evolve(start, 0).unwrap() == start
+    assert evolve(start, 1).unwrap() == step(start)
+    assert evolve(fixtures.glider(), 8).unwrap() == fixtures.glider_after_eight()
+    assert evolve(start, 9) == Err(SimulationError.TooManyGenerations)
+}

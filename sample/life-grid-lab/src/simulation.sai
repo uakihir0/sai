@@ -1,0 +1,61 @@
+use acme:life-grid-lab/model.{Board, CELL_COUNT, MAX_GENERATIONS, SIDE, SimulationError}
+
+fn is_alive(board: Board, row: USize, column: USize) -> Bool {
+    if row >= SIDE or column >= SIDE {
+        return false
+    }
+    board.cells[row * SIDE + column]
+}
+
+fn adjacent(left: USize, right: USize) -> Bool {
+    left == right or left + 1 == right or right + 1 == left
+}
+
+fn neighbor_count(board: Board, row: USize, column: USize) -> USize {
+    var count: USize = 0
+    for other_row in 0..SIDE {
+        if adjacent(row, other_row) {
+            for other_column in 0..SIDE {
+                if (
+                    adjacent(column, other_column)
+                    and (other_row != row or other_column != column)
+                    and is_alive(board, other_row, other_column)
+                ) {
+                    count += 1
+                }
+            }
+        }
+    }
+    count
+}
+
+pub fn next_generation(board: Board) -> Board {
+    var cells = Array<Bool, CELL_COUNT>.filled(false)
+    for row in 0..SIDE {
+        for column in 0..SIDE {
+            let index = row * SIDE + column
+            let neighbors = neighbor_count(board, row, column)
+            let alive = is_alive(board, row, column)
+            cells[index] = if alive {
+                neighbors == 2 or neighbors == 3
+            } else {
+                neighbors == 3
+            }
+        }
+    }
+    Board(cells: cells)
+}
+
+pub fn advance(initial: Board, generations: USize) -> Result<Board, SimulationError> {
+    if generations > MAX_GENERATIONS {
+        return Err(SimulationError.TooManyGenerations)
+    }
+
+    var board = initial
+    var completed: USize = 0
+    while completed < generations {
+        board = next_generation(board)
+        completed += 1
+    }
+    Ok(board)
+}

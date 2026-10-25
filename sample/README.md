@@ -29,6 +29,7 @@ source repository before a package resolver can fetch them.
 | Intermediate | [`library-loan-policy`](library-loan-policy/README.md) | Enforce checkout, hold, and renewal rules with records, enums, and `Result`. |
 | Intermediate | [`marsh-survey-review`](marsh-survey-review/README.md) | Classify fixed field observations by correction, conservation review, confidence, and transect totals. |
 | Intermediate | [`corpus-search-ranker`](corpus-search-ranker/README.md) | Rank a fixed text corpus with whitespace-token matching, weighted title scores, and stable tie-breaking. |
+| Intermediate | [`life-grid-lab`](life-grid-lab/README.md) | Evolve a fixed 5×5 Conway's Game of Life board with bounded generations, finite dead boundaries, and neighbor-count rules. |
 | Intermediate | [`facility-maintenance-queue`](facility-maintenance-queue/README.md) | Schedule a fixed facilities backlog across qualified technicians, shift windows, due times, and a shared parts cupboard. |
 | Intermediate | [`neighborhood-bike-share-rebalancer`](neighborhood-bike-share-rebalancer/README.md) | Plan direct bike-share rebalancing trips by station need and donor inventory while preserving docks reserved for adaptive cycles. |
 | Advanced | [`event-planner`](event-planner/README.md) | Apply session capacity and waitlists, then detect conflicts between confirmed sessions. |
@@ -54,6 +55,7 @@ source repository before a package resolver can fetch them.
 | Advanced | [`bounded-gc-heap-lab`](bounded-gc-heap-lab/README.md) | Trace roots through cyclic object graphs, reclaim unreachable objects, and measure fragmentation before and after compaction in a fixed heap. |
 | Advanced | [`bounded-wal-key-value-store`](bounded-wal-key-value-store/README.md) | Replay a fixed write-ahead journal with transaction commit markers, ignore interrupted writes, preserve tombstones, and compact to a canonical snapshot. |
 | Advanced | [`two-phase-commit-lab`](two-phase-commit-lab/README.md) | Simulate coordinator commit and abort decisions, pre-log in-doubt participants, recorded decision replay, and partial delivery recovery. |
+| Advanced | [`quorum-replication-lab`](quorum-replication-lab/README.md) | Explore three-replica read/write quorums, partially applied writes with lost acknowledgements, deterministic version selection, and bounded read repair. |
 | Advanced | [`access-policy-review`](access-policy-review/README.md) | Evaluate role, action, and resource rules with deny-overrides, default-deny, and stable decision explanations. |
 | Advanced | [`flood-evacuation-planner`](flood-evacuation-planner/README.md) | Assign whole households to safe shelters under deadlines, closed roads, hazard limits, accessible-space, and medical-support capacity constraints. |
 | Advanced | [`insurance-claim-review`](insurance-claim-review/README.md) | Adjudicate fixed property claims through policy checks, duplicate-event prevention, per-claim deductibles, and policy-wide aggregate limits. |

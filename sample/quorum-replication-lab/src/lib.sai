@@ -1,0 +1,186 @@
+use acme:quorum-replication-lab/cluster
+use acme:quorum-replication-lab/fixtures
+use acme:quorum-replication-lab/model.{REPLICA_COUNT, ReadStatus, VersionedValue, WriteStatus}
+
+pub fn successful_write_report() -> cluster.WriteReport {
+    cluster.write(fixtures.successful_write_with_repair(), 5, 55)
+}
+
+pub fn repaired_read_report() -> cluster.ReadReport {
+    let write_report = successful_write_report()
+    cluster.read_and_repair(write_report.cluster)
+}
+
+pub fn ambiguous_write_report() -> cluster.WriteReport {
+    cluster.write(fixtures.ambiguous_write(), 5, 55)
+}
+
+test "the write threshold counts delivered acknowledgements" {
+    let report = successful_write_report()
+
+    assert cluster.cluster_is_valid(report.cluster)
+    assert report.status == WriteStatus.QuorumAcknowledged
+    assert report.acknowledgement_count == 2
+    assert report.applied_replica_count == 2
+    assert cluster.replica(report.cluster, REPLICA_COUNT) == None
+    assert (
+        cluster.replica(report.cluster, 0).unwrap().record
+        == Some(VersionedValue(version: 5, value: 55))
+    )
+    assert (
+        cluster.replica(report.cluster, 1).unwrap().record
+        == Some(VersionedValue(version: 4, value: 40))
+    )
+    assert (
+        cluster.replica(report.cluster, 2).unwrap().record
+        == Some(VersionedValue(version: 5, value: 55))
+    )
+}
+
+test "a lost response leaves an applied write ambiguous below quorum" {
+    let report = ambiguous_write_report()
+
+    assert report.status == WriteStatus.Ambiguous
+    assert report.acknowledgement_count == 1
+    assert report.applied_replica_count == 2
+    assert (
+        cluster.replica(report.cluster, 0).unwrap().record
+        == Some(VersionedValue(version: 5, value: 55))
+    )
+    assert (
+        cluster.replica(report.cluster, 1).unwrap().record
+        == Some(VersionedValue(version: 5, value: 55))
+    )
+    assert (
+        cluster.replica(report.cluster, 2).unwrap().record
+        == Some(VersionedValue(version: 4, value: 40))
+    )
+}
+
+test "no reachable write replica leaves the cluster untouched without ambiguity" {
+    let before = fixtures.no_write_progress()
+    let report = cluster.write(before, 5, 55)
+
+    assert report.status == WriteStatus.NoReplicaApplied
+    assert report.acknowledgement_count == 0
+    assert report.applied_replica_count == 0
+    assert report.cluster == before
+}
+
+test "a quorum read selects the newest record and repairs a reachable stale copy" {
+    let report = repaired_read_report()
+
+    assert report.status == ReadStatus.QuorumMet
+    assert report.record == Some(VersionedValue(version: 5, value: 55))
+    assert report.source_replica_id == Some(10)
+    assert not report.conflicting_latest_value
+    assert report.repaired_replica_count == 1
+    assert cluster.replica(report.cluster, 1).unwrap().record == report.record
+    assert (
+        cluster.replica(report.cluster, 2).unwrap().record
+        == Some(VersionedValue(version: 5, value: 55))
+    )
+}
+
+test "read repair requires its own reachable channel" {
+    var after_write = successful_write_report().cluster
+    var stale = after_write.replicas[1].unwrap()
+    stale.repair_reachable = false
+    after_write.replicas[1] = Some(stale)
+    var unreadable = after_write.replicas[2].unwrap()
+    unreadable.record = Some(VersionedValue(version: 3, value: 30))
+    unreadable.repair_reachable = true
+    after_write.replicas[2] = Some(unreadable)
+    let report = cluster.read_and_repair(after_write)
+
+    assert report.status == ReadStatus.QuorumMet
+    assert report.repaired_replica_count == 1
+    assert (
+        cluster.replica(report.cluster, 1).unwrap().record
+        == Some(VersionedValue(version: 4, value: 40))
+    )
+    assert (
+        cluster.replica(report.cluster, 2).unwrap().record
+        == Some(VersionedValue(version: 5, value: 55))
+    )
+}
+
+test "a quorum read can repair a reachable replica with no prior record" {
+    let report = cluster.read_and_repair(fixtures.empty_replica_needs_repair())
+
+    assert report.status == ReadStatus.QuorumMet
+    assert report.record == Some(VersionedValue(version: 5, value: 55))
+    assert report.repaired_replica_count == 1
+    assert cluster.replica(report.cluster, 1).unwrap().record == report.record
+}
+
+test "equal-version disagreement is deterministic but never silently repaired" {
+    let before = fixtures.equal_version_conflict()
+    let report = cluster.read_and_repair(before)
+
+    assert report.status == ReadStatus.ConflictingVersions
+    assert report.source_replica_id == Some(10)
+    assert report.record == Some(VersionedValue(version: 8, value: 999))
+    assert report.conflicting_latest_value
+    assert report.repaired_replica_count == 0
+    assert report.cluster == before
+}
+
+test "an empty quorum read is a not-found result rather than an invalid cluster" {
+    let report = cluster.read_and_repair(fixtures.empty_replicas())
+
+    assert report.status == ReadStatus.QuorumMet
+    assert report.record == None
+    assert report.source_replica_id == None
+    assert report.repaired_replica_count == 0
+}
+
+test "insufficient readable replicas do not return or repair a partial read" {
+    let before = fixtures.no_read_quorum()
+    let report = cluster.read_and_repair(before)
+
+    assert report.status == ReadStatus.NoReadQuorum
+    assert report.record == None
+    assert report.repaired_replica_count == 0
+    assert report.cluster == before
+}
+
+test "weak thresholds, duplicate identities, and impossible acknowledgements are rejected" {
+    let weak = cluster.write(fixtures.weak_quorums(), 5, 55)
+    let duplicate = cluster.read_and_repair(fixtures.duplicate_replica_id())
+    let impossible = cluster.write(fixtures.acknowledgement_without_write(), 5, 55)
+
+    assert weak.status == WriteStatus.InvalidInput
+    assert weak.applied_replica_count == 0
+    assert duplicate.status == ReadStatus.InvalidInput
+    assert duplicate.cluster == fixtures.duplicate_replica_id()
+    assert impossible.status == WriteStatus.InvalidInput
+    assert impossible.acknowledgement_count == 0
+}
+
+test "writes cannot reuse or move backward from a known version" {
+    let before = fixtures.successful_write_with_repair()
+    let report = cluster.write(before, 4, 99)
+
+    assert report.status == WriteStatus.StaleVersion
+    assert report.cluster == before
+    assert report.acknowledgement_count == 0
+    assert report.applied_replica_count == 0
+}
+
+test "version freshness includes a higher copy hidden by the current partition" {
+    let before = fixtures.higher_version_on_unavailable_replica()
+    let report = cluster.write(before, 4, 99)
+
+    assert report.status == WriteStatus.StaleVersion
+    assert report.cluster == before
+    assert report.applied_replica_count == 0
+}
+
+test "replica lookup rejects an index outside the fixed capacity on malformed input" {
+    var malformed = fixtures.successful_write_with_repair()
+    malformed.replica_count = REPLICA_COUNT + 1
+
+    assert not cluster.cluster_is_valid(malformed)
+    assert cluster.replica(malformed, 3) == None
+}
